@@ -38,20 +38,15 @@
 //!
 //! ## Concurrency and isolation
 //!
-//! The affected cache-MISS checks run CONCURRENTLY, each against its own
-//! copy-on-write clone of the sealed worktree ([`crate::execution::check_isolation`]).
-//! Isolation is universal — a formatter's writes physically cannot reach another
-//! check's view because they never share a filesystem — so a check can mutate
-//! freely and its changes are copied back into the real worktree, in plan order,
-//! only after every check finishes; the existing fold then folds them into the
-//! sealed commit. Every check therefore validates exactly the SEALED tree, one
-//! well-defined input, which is strictly more deterministic than the previous
-//! sequential in-place loop (where a check saw whatever tree the prior check left,
-//! in arbitrary plan order). When a cheap COW clone is unavailable (a non-APFS
-//! volume, a clone failure, disk full) the whole batch falls back to the original
-//! SEQUENTIAL in-place execution in the one shared checkout — the mode is decided
-//! once, up front. Isolated checks run unconfined (the disposable clone is the
-//! isolation); the shared fallback keeps the sandbox + check-command exemption.
+//! The affected cache-MISS checks run SEQUENTIALLY, in deterministic plan order,
+//! directly in the committing job's already-sealed checkout. Check declarations do
+//! not distinguish read-only verifies from formatters/fixers, so sharing the checkout
+//! is the correctness boundary: every later check observes the fully-settled tree
+//! left by earlier checks. Tracked mutations remain in place and the canonical
+//! post-check fold amends them into the just-sealed commit on every outcome path.
+//! `when:write` never allocates a check-clone suite, snapshots clone baselines, or
+//! rescans/copies mutations. Clone isolation is reserved for the asynchronous
+//! `when:review` cadence.
 //!
 //! ## Cache key
 //!
@@ -69,7 +64,7 @@
 //! reuse.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -78,7 +73,8 @@ use crate::execution::cache::{
     get_check_result, list_latest_check_results_for_project, store_check_result,
     CheckResultCacheEntry, CheckResultCacheWrite,
 };
-use crate::execution::check_isolation::{self, CheckExecMode, CheckMutation};
+use crate::execution::check_admission::CheckAdmissionController;
+use crate::execution::check_isolation::CheckExecMode;
 use crate::execution::check_parsers::{
     extract_running_tests, format_failure_excerpt, format_failure_names, parse_check_output,
     ParsedCheckResult, MAX_FAILURE_NAMES,
@@ -130,6 +126,10 @@ pub enum CheckFailureKind {
     SpawnError,
     /// Died by signal mid-run without hitting the budget (crash / OOM kill).
     Killed,
+    /// Positive evidence identifies a host, toolchain, or shared-service failure.
+    Infrastructure,
+    /// A recognized test runner exited abnormally without assertion failures.
+    RunnerError,
 }
 
 impl CheckFailureKind {
@@ -138,6 +138,8 @@ impl CheckFailureKind {
             CheckFailureKind::TimedOut => "timed_out",
             CheckFailureKind::SpawnError => "spawn_error",
             CheckFailureKind::Killed => "killed",
+            CheckFailureKind::Infrastructure => "infrastructure",
+            CheckFailureKind::RunnerError => "runner_error",
         }
     }
 
@@ -149,6 +151,8 @@ impl CheckFailureKind {
             "timed_out" => Some(CheckFailureKind::TimedOut),
             "spawn_error" => Some(CheckFailureKind::SpawnError),
             "killed" => Some(CheckFailureKind::Killed),
+            "infrastructure" => Some(CheckFailureKind::Infrastructure),
+            "runner_error" => Some(CheckFailureKind::RunnerError),
             _ => None,
         }
     }
@@ -162,6 +166,8 @@ impl CheckFailureKind {
             }
             CheckFailureKind::SpawnError => "failed to spawn".to_string(),
             CheckFailureKind::Killed => "killed (signal)".to_string(),
+            CheckFailureKind::Infrastructure => "infrastructure/toolchain failure".to_string(),
+            CheckFailureKind::RunnerError => "test runner failed".to_string(),
         }
     }
 }
@@ -178,6 +184,130 @@ pub(crate) fn format_timeout_budget(duration_ms: i64) -> String {
 
 /// Chars of combined check output retained in the cache row's `output_tail`.
 const OUTPUT_TAIL_CHARS: usize = 4_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureClassification {
+    kind: CheckFailureKind,
+    reason: String,
+    evidence_line: Option<usize>,
+}
+
+fn classify_check_failure(
+    exit_code: Option<i32>,
+    timed_out: bool,
+    spawn_error: bool,
+    parsed: Option<&ParsedCheckResult>,
+    output: &str,
+) -> Option<FailureClassification> {
+    if exit_code == Some(0) {
+        return None;
+    }
+    if spawn_error {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::SpawnError,
+            reason: "Cairn: check process failed to spawn".to_string(),
+            evidence_line: None,
+        });
+    }
+    if timed_out {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::TimedOut,
+            reason: "Cairn: check exceeded its timeout budget".to_string(),
+            evidence_line: None,
+        });
+    }
+    if exit_code.is_none() {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::Killed,
+            reason: "Cairn: check process died without an exit code".to_string(),
+            evidence_line: None,
+        });
+    }
+    if parsed.is_some_and(|result| result.failed > 0) {
+        return None;
+    }
+
+    let lines: Vec<&str> = output.lines().collect();
+    let transport = lines.iter().position(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("failed to send data to or receive data from server")
+            || line.contains("failed client/server communication")
+            || line.contains("failed to fill whole buffer")
+            || line.contains("server looks like it shut down unexpectedly")
+    });
+    let abnormal_254 = (exit_code == Some(254))
+        .then(|| {
+            lines.iter().position(|line| {
+                let line = line.to_ascii_lowercase();
+                (line.contains("rustc") || line.contains("sccache"))
+                    && (line.contains("exit status: 254")
+                        || line.contains("exited with status 254"))
+                    && (line.contains("process didn't exit successfully")
+                        || line.contains("failed to execute compile")
+                        || line.contains("compiler process"))
+            })
+        })
+        .flatten();
+    let missing_generated = lines.iter().position(|line| {
+        let line = line.replace('\\', "/").to_ascii_lowercase();
+        line.contains("target/")
+            && line.contains("/build/")
+            && line.contains("/out/")
+            && (line.contains("couldn't read")
+                || line.contains("failed to read")
+                || line.contains("no such file or directory"))
+    });
+    if let Some(evidence_line) = transport.or(abnormal_254).or(missing_generated) {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::Infrastructure,
+            reason:
+                "Cairn: infrastructure/toolchain failure matched reviewed abnormal-build evidence"
+                    .to_string(),
+            evidence_line: Some(evidence_line),
+        });
+    }
+
+    if let Some(result) = parsed.filter(|result| result.parser == "vitest" && result.failed == 0) {
+        let reason = if result.passed == 0 {
+            "Cairn: Vitest failed before reporting any test assertions".to_string()
+        } else {
+            format!(
+                "Cairn: Vitest runner failed after {} tests passed with no assertion failures",
+                result.passed
+            )
+        };
+        return Some(FailureClassification {
+            kind: CheckFailureKind::RunnerError,
+            reason,
+            evidence_line: None,
+        });
+    }
+    None
+}
+
+fn classified_output_excerpt(
+    output: &str,
+    classification: Option<&FailureClassification>,
+) -> String {
+    let Some(classification) = classification else {
+        return tail(output, OUTPUT_TAIL_CHARS);
+    };
+    let lines: Vec<&str> = output.lines().collect();
+    let context = classification.evidence_line.map(|index| {
+        let start = index.saturating_sub(2);
+        let end = (index + 3).min(lines.len());
+        lines[start..end].join("\n")
+    });
+    let mut prefix = classification.reason.clone();
+    if let Some(context) = context.filter(|context| !context.is_empty()) {
+        prefix.push_str("\nEvidence:\n");
+        prefix.push_str(&context);
+    }
+    prefix.push_str("\n\nFinal output:\n");
+    let remaining = OUTPUT_TAIL_CHARS.saturating_sub(prefix.chars().count());
+    prefix.push_str(&tail(output, remaining));
+    prefix.chars().take(OUTPUT_TAIL_CHARS).collect()
+}
 
 /// Cancel any in-flight `when:review` check suite for `job_id` when a commit
 /// seals mid-turn. The branch just advanced, so that suite — launched at the
@@ -233,150 +363,102 @@ pub async fn run_write_checks_after_seal(
         return None;
     }
 
-    // 2. Compute the node's changed files (fork..@) from the live sealed graph.
-    let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    // 2–5. VCS inspection, cargo-metadata planning, and the synchronous cache
+    // bridge all wait on subprocesses or joined threads. Gather the DB anchors
+    // asynchronously, then keep the complete synchronous planning unit off Tokio
+    // runtime workers.
     let (base_branch, base_commit) =
         load_node_vcs_anchors(&orch.db.local, &run_context.job_id).await;
-    let changed = node_changed_files(
-        &jj,
-        repo_root,
-        base_branch.as_deref(),
-        base_commit.as_deref(),
-    )?;
-    if changed.is_empty() {
-        return None;
-    }
-
-    // 3 + 4. Plan against the cumulative branch diff first. This remains the
-    // conservative impact gate: a cumulative match may over-apply a check, but the
-    // input-hash cache below turns unchanged inputs into hits so no command runs.
-    let plans = applicable_write_checks(&checks, &changed, repo_root);
-    if plans.is_empty() {
-        return None;
-    }
-
-    // 5. Resolve the sealed tree identity used as the cache key.
-    let tree_hash = sealed_tree_hash(&jj, repo_root).ok()?;
-
-    // Safety baseline for the post-check fold below. A `when:write` check is an
-    // OBSERVER of the just-sealed commit, but its command may rewrite tracked files
-    // (a formatter, `lint --fix`, regenerated snapshots) or leave tracked churn.
-    // Capture whether `@` is clean BEFORE any check runs: right after a seal `@` is
-    // empty (whole-`@` run-seal) or carries only pre-existing unrelated dirt
-    // (path-scoped write-seal). We fold `@` into the seal afterward ONLY when it was
-    // clean here, so the fold captures check-made changes and NOTHING ELSE — never
-    // pre-existing dirt a path-scoped seal deliberately left loose. A probe error
-    // defaults to "not clean" so a doubtful case never folds.
-    let clean_before = !crate::jj::is_working_copy_dirty(&jj, repo_root).unwrap_or(true);
-
-    // Per-check input hash: key each verdict by the content identity of ONLY the
-    // files matching that check's impact globs, so a commit touching none of a
-    // check's inputs (a doc-only commit after a src-tauri commit) reuses the
-    // stored verdict instead of re-running. Read the sealed tree once, and only
-    // when some applicable check is impact-scoped.
-    let entries = if plans
-        .iter()
-        .any(|p| checks.get(&p.name).is_some_and(|c| c.impact.is_some()))
-    {
-        sealed_tree_entries(&jj, repo_root).ok()
-    } else {
-        None
-    };
-    let latest_by_check: HashMap<String, CheckResultCacheEntry> =
-        list_latest_check_results_for_project(orch.db.local.clone(), &run_context.project_id)
-            .unwrap_or_default()
+    let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let planning_jj = jj.clone();
+    let planning_repo = repo_root.to_path_buf();
+    let planning_checks = checks.clone();
+    let planning_db = orch.db.local.clone();
+    let planning_project_id = run_context.project_id.clone();
+    let planned = tokio::task::spawn_blocking(move || {
+        let changed = node_changed_files(
+            &planning_jj,
+            &planning_repo,
+            base_branch.as_deref(),
+            base_commit.as_deref(),
+        )?;
+        if changed.is_empty() {
+            return None;
+        }
+        let plans = applicable_write_checks(&planning_checks, &changed, &planning_repo);
+        if plans.is_empty() {
+            return None;
+        }
+        let tree_hash = sealed_tree_hash(&planning_jj, &planning_repo).ok()?;
+        let clean_before =
+            !crate::jj::is_working_copy_dirty(&planning_jj, &planning_repo).unwrap_or(true);
+        let entries = if plans.iter().any(|plan| {
+            planning_checks
+                .get(&plan.name)
+                .is_some_and(|check| check.impact.is_some())
+        }) {
+            sealed_tree_entries(&planning_jj, &planning_repo).ok()
+        } else {
+            None
+        };
+        let latest_by_check: HashMap<String, CheckResultCacheEntry> =
+            list_latest_check_results_for_project(planning_db.clone(), &planning_project_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| (row.check_name.clone(), row))
+                .collect();
+        let keyed: Vec<(CheckPlan, String)> = plans
             .into_iter()
-            .map(|row| (row.check_name.clone(), row))
-            .collect();
-    let keyed: Vec<(CheckPlan, String)> = plans
-        .into_iter()
-        .map(|plan| {
-            let check = checks.get(&plan.name);
-            let impact = check.and_then(|c| c.impact.as_ref());
-            let input_hash = input_hash_for(impact, entries.as_deref(), &tree_hash);
-
-            // If this input is already cached, keep the cumulative plan: the runner
-            // will re-stamp the row and skip execution. Only a cache MISS needs a
-            // concrete selector. For misses, a PASSING latest baseline lets us
-            // narrow `{changedFiles}` / `{targets}` to the tree-vs-tree delta since
-            // that verdict; a failing or unreadable baseline falls back to the full
-            // cumulative branch diff. That fallback is required for soundness:
-            // structured failures name tests, not necessarily files, so we cannot
-            // feed a previous failure into file-based selectors like `vitest related`.
-            let should_reselect = get_check_result(
-                orch.db.local.clone(),
-                &run_context.project_id,
-                &plan.name,
-                &input_hash,
-            )
-            .ok()
-            .flatten()
-            .is_none();
-            let selected_plan = if should_reselect {
-                match check {
-                    Some(check) => {
-                        let selected_changed = selected_changed_files_for_miss(
-                            latest_by_check.get(&plan.name),
-                            entries.as_deref(),
-                            impact,
-                            &changed,
-                            &jj,
-                            repo_root,
-                        );
-                        replan_one_check(&plan.name, check, &selected_changed, repo_root)
-                            .unwrap_or(plan)
-                    }
-                    None => plan,
-                }
-            } else {
-                plan
-            };
-            (selected_plan, input_hash)
-        })
-        .collect();
-
-    // Decide the execution mode: give every cache-MISS check its own COW clone of
-    // the sealed worktree so the affected checks can run concurrently in
-    // isolation. Hits never execute, so they never need a clone. A single clone
-    // failure (non-APFS volume, disk full, cross-volume) routes the WHOLE batch to
-    // the sequential in-place fallback — the mode is decided once, up front. The
-    // guard removes the job's clone root on every exit path.
-    let clone_root =
-        check_isolation::clone_root_for_job(&orch.config_dir, run_context.job_id.as_str());
-    // Held for its Drop: removes the job's clone root on EVERY exit path below —
-    // partial clones after a mid-batch clone failure, or the full set after the
-    // fold. Created unconditionally; a no-op when no clone was ever made.
-    let _clone_guard = check_isolation::CloneGuard::new(clone_root.clone());
-    // Build the cache-MISS set (index + name); a hit never runs so it needs no
-    // clone. `decide_exec_mode` COW-clones each miss and returns `Isolated` on full
-    // success, or falls the whole batch back to `Shared` (empty clones) on any
-    // clone failure — the mode is decided once, up front, for both cadences.
-    let (mode, clones) = {
-        let misses: Vec<(usize, &str)> = keyed
-            .iter()
-            .enumerate()
-            .filter(|(_, (plan, input_hash))| {
-                get_check_result(
-                    orch.db.local.clone(),
-                    &run_context.project_id,
+            .map(|plan| {
+                let check = planning_checks.get(&plan.name);
+                let impact = check.and_then(|check| check.impact.as_ref());
+                let input_hash = input_hash_for(impact, entries.as_deref(), &tree_hash);
+                let should_reselect = get_check_result(
+                    planning_db.clone(),
+                    &planning_project_id,
                     &plan.name,
-                    input_hash,
+                    &input_hash,
                 )
                 .ok()
                 .flatten()
-                .is_none()
+                .is_none();
+                let selected_plan = if should_reselect {
+                    match check {
+                        Some(check) => {
+                            let selected_changed = selected_changed_files_for_miss(
+                                latest_by_check.get(&plan.name),
+                                entries.as_deref(),
+                                impact,
+                                &changed,
+                                &planning_jj,
+                                &planning_repo,
+                            );
+                            replan_one_check(&plan.name, check, &selected_changed, &planning_repo)
+                                .unwrap_or(plan)
+                        }
+                        None => plan,
+                    }
+                } else {
+                    plan
+                };
+                (selected_plan, input_hash)
             })
-            .map(|(index, (plan, _))| (index, plan.name.as_str()))
             .collect();
-        check_isolation::decide_exec_mode(&*orch.services.fs, repo_root, &clone_root, &misses)
-    };
-    // Snapshot each clone's baseline stat identity BEFORE any check runs, so the
-    // post-run fold can isolate exactly the check-made mutations. Empty (and the
-    // loop a no-op) in the `Shared` fallback, where nothing was cloned.
-    let mut baselines: BTreeMap<usize, BTreeMap<PathBuf, (u64, u64)>> = BTreeMap::new();
-    for (index, dir) in &clones {
-        baselines.insert(*index, check_isolation::baseline_index(dir));
-    }
+        Some((keyed, tree_hash, clean_before))
+    })
+    .await
+    .ok()??;
+    let (keyed, tree_hash, clean_before) = planned;
+
+    // Write checks intentionally share the existing sealed checkout. They run in
+    // deterministic plan order so a formatter/fixer's settled mutations are visible
+    // to later checks and remain available to the canonical fold below. This cadence
+    // does not create clone roots, snapshot clone baselines, or rescan/copy mutations.
+    log::info!(
+        "when:write checks: executing {} planned check(s) sequentially in-place; \
+         check clones=0, clone baseline scans=0, mutation rescans=0",
+        keyed.len()
+    );
 
     // The live status-line emitter. `run_planned_checks` calls this with a full
     // checklist snapshot on every state transition; we forward each snapshot to
@@ -385,7 +467,6 @@ pub async fn run_write_checks_after_seal(
     let emitter = orch.services.emitter.clone();
     let notify_run_id = run_context.run_id.clone();
     let notify_tool_use_id = tool_use_id.to_string();
-    let clones_ref = &clones;
     // Per-check effective timeout, aligned to plan index (the `execute` closure
     // is indexed the same way). A check's schema `timeout` overrides the write
     // cadence default.
@@ -403,21 +484,20 @@ pub async fn run_write_checks_after_seal(
         run_context.job_id.as_str(),
         &keyed,
         tool_use_id,
-        mode,
+        CheckExecMode::Shared,
+        &orch.check_admission,
+        Some(orch),
         move |index, command, stream_id| async move {
-            // Isolated: run in this check's own clone, unconfined. Shared: the real
-            // sealed worktree, sandboxed (the check-command exemption still lifts
-            // it for a declared check).
-            let (run_cwd, sandbox_enabled) =
-                check_isolation::resolve_check_exec(clones_ref, index, cwd);
+            // Write checks always run in the real sealed worktree. Keep the existing
+            // sandbox + declared-check exemption path unchanged.
             crate::mcp::handlers::run::run_check_command(
                 orch,
-                &run_cwd,
+                cwd,
                 &stream_id,
                 Some(run_context),
                 &command,
                 timeouts_ref[index],
-                sandbox_enabled,
+                true,
             )
             .await
         },
@@ -432,9 +512,6 @@ pub async fn run_write_checks_after_seal(
                 .unwrap_or(serde_json::Value::Null),
             );
         },
-        // Unbounded: the write cadence is deliberately thin (a handful of light
-        // checks), so every cache-miss runs at once.
-        None,
     )
     .await;
 
@@ -446,31 +523,6 @@ pub async fn run_write_checks_after_seal(
         "db-change",
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
     );
-
-    // Copy each isolated check's mutations back into the real worktree, in plan
-    // order, so the existing fold below folds them into the sealed commit exactly
-    // as it folds an in-place formatter's edits. A no-op in Shared mode (the
-    // checks already ran in place). `clones` is a BTreeMap, so `.iter()` is
-    // plan-index order — the deterministic conflict-resolution order.
-    if mode == CheckExecMode::Isolated && !clones.is_empty() {
-        let per_check: Vec<(String, Vec<CheckMutation>)> = clones
-            .iter()
-            .filter_map(|(index, dir)| {
-                let baseline = baselines.get(index)?;
-                let muts = check_isolation::detect_mutations(dir, baseline, repo_root);
-                Some((keyed[*index].0.name.clone(), muts))
-            })
-            .collect();
-        let touched = check_isolation::apply_mutations(repo_root, &per_check);
-        if !touched.is_empty() {
-            log::info!(
-                "when:write checks: copied {} isolated-check mutation(s) back into the worktree \
-                 before folding: {:?}",
-                touched.len(),
-                touched
-            );
-        }
-    }
 
     // Fold any tracked changes the checks made into the just-sealed commit, leaving
     // `@` clean == the amended tip. One mechanism, two jobs: a formatter's edits
@@ -517,17 +569,44 @@ async fn fold_worktree_after_checks(
     repo_root: &Path,
 ) -> Option<Vec<String>> {
     // Nothing to fold if the checks left `@` clean.
-    if !crate::jj::is_working_copy_dirty(jj, repo_root).unwrap_or(false) {
+    let dirty_jj = jj.clone();
+    let dirty_repo = repo_root.to_path_buf();
+    let dirty = tokio::task::spawn_blocking(move || {
+        crate::jj::is_working_copy_dirty(&dirty_jj, &dirty_repo).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if !dirty {
         return None;
     }
     let store_lock = store_lock_for_checks(orch, run_context, repo_root).await;
-    let _guard = match store_lock.as_ref() {
-        Some(lock) => Some(lock.lock().await),
+    let guard = match store_lock {
+        Some(lock) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(600), lock.lock_owned()).await
+            {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    log::warn!("when:write checks: skipped folding check changes because the version-control store stayed busy for 600s");
+                    return None;
+                }
+            }
+        }
         None => None,
     };
-    match crate::jj::fold_worktree_into_seal(jj, repo_root) {
-        Ok(outcome) => outcome.map(|o| o.folded_files),
-        Err(e) => {
+    let fold_jj = jj.clone();
+    let fold_repo = repo_root.to_path_buf();
+    let folded = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        crate::jj::fold_worktree_into_seal(&fold_jj, &fold_repo)
+    })
+    .await;
+    match folded {
+        Ok(Ok(outcome)) => outcome.map(|outcome| outcome.folded_files),
+        Err(error) => {
+            log::warn!("when:write checks: fold task failed: {error}");
+            None
+        }
+        Ok(Err(e)) => {
             log::warn!(
                 "when:write checks: failed to fold check changes into the sealed commit \
                  (the next seal's stale recovery is the backstop): {e}"
@@ -596,7 +675,13 @@ pub(crate) async fn load_live_project_checks(
         .await
         .ok()
         .and_then(|(path, _key)| path);
-    checks_from_source(project_repo.as_deref().map(Path::new), worktree_root)
+    let worktree_root = worktree_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        checks_from_source(project_repo.as_deref().map(Path::new), &worktree_root)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Pick the live `checks` contract given the optionally-resolved project repo
@@ -848,10 +933,9 @@ pub(crate) fn input_hash_for(
 /// depends on `mode`:
 ///
 /// - `Isolated`: each miss runs against its OWN copy-on-write clone of the sealed
-///   worktree (resolved by the caller's `execute` closure), so they run
-///   CONCURRENTLY — unbounded via `join_all` when `max_concurrency` is `None` (the
-///   thin write cadence), or capped at `n` in-flight via `buffer_unordered` when it
-///   is `Some(n)` (the heavy review cadence). A formatter's writes land in its
+///   worktree (resolved by the caller's `execute` closure). The futures are polled
+///   concurrently, but every process spawn first crosses the runner-wide fair
+///   admission controller. A formatter's writes land in its
 ///   private clone and are copied back only after every check finishes, so no check
 ///   ever observes another's half-written tree — every check validates exactly the
 ///   sealed tree.
@@ -894,12 +978,10 @@ pub(crate) async fn run_planned_checks<F, Fut, N>(
     plans: &[(CheckPlan, String)],
     tool_use_id: &str,
     mode: CheckExecMode,
+    admission: &CheckAdmissionController,
+    diagnostic_orch: Option<&Orchestrator>,
     execute: F,
     notify: N,
-    // Bound on concurrent cache-miss checks in `Isolated` mode: `None` runs them
-    // all at once (the thin `when:write` cadence), `Some(n)` caps in-flight misses
-    // at `n` (the heavy `when:review` cadence, to avoid oversubscribing CPU/IO).
-    max_concurrency: Option<usize>,
 ) -> Vec<CheckOutcome>
 where
     F: Fn(usize, String, String) -> Fut,
@@ -1014,40 +1096,93 @@ where
         let transition = &transition;
         async move {
             let (plan, input_hash) = &plans[index];
+            let permit = admission
+                .acquire(plan.resource_class)
+                .await
+                .expect("check admission semaphore must remain open");
             transition(index, "running", None);
             let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
             let started = Instant::now();
-            let (exit_code, passed, output, failure_kind) =
+            let (exit_code, output, timed_out, spawn_error) =
                 match execute(index, plan.command.clone(), stream_id).await {
                     Ok(CheckExecResult {
                         exit_code,
                         output,
                         timed_out,
-                    }) => {
-                        let passed = exit_code == Some(0);
-                        // Classify a failure by HOW it died: killed at its budget
-                        // (timeout), or a signal kill with no exit code (a crash
-                        // or OOM kill). A pass or an ordinary non-zero exit is
-                        // unclassified.
-                        let kind = if timed_out {
-                            Some(CheckFailureKind::TimedOut)
-                        } else if !passed && exit_code.is_none() {
-                            Some(CheckFailureKind::Killed)
-                        } else {
-                            None
-                        };
-                        (exit_code, passed, output, kind)
-                    }
+                    }) => (exit_code, output, timed_out, false),
                     // A spawn error / sandbox denial is a clear failure, never a
                     // silent pass — and a legible one: the process never ran.
-                    Err(err) => (None, false, err, Some(CheckFailureKind::SpawnError)),
+                    Err(err) => (None, err, false, true),
                 };
             let duration_ms = started.elapsed().as_millis() as i64;
+            let passed = exit_code == Some(0);
 
-            // Enrich (fail-closed): a parse only adds detail, never changes `passed`.
+            // Parse before classifying: positive assertion failures outrank any
+            // incidental infrastructure warning in the combined output.
             let parsed = parse_check_output(&plan.command, &output);
+            let classification =
+                classify_check_failure(exit_code, timed_out, spawn_error, parsed.as_ref(), &output);
+            let failure_kind = classification.as_ref().map(|c| c.kind);
             let target_results_json = parsed.as_ref().and_then(|p| serde_json::to_string(p).ok());
-            let output_tail = tail(&output, OUTPUT_TAIL_CHARS);
+            let mut output_tail = classified_output_excerpt(&output, classification.as_ref());
+
+            if failure_kind == Some(CheckFailureKind::Infrastructure) {
+                let admission_snapshot = admission.snapshot();
+                let resources = crate::pressure::platform::read_process_resources();
+                let host = crate::pressure::platform::read_host_resources();
+                let process_tree = crate::pressure::process_tree::sample_ps_rows()
+                    .map(|rows| {
+                        let mut rows = crate::pressure::process_tree::select_process_tree(
+                            &rows,
+                            std::process::id(),
+                        );
+                        rows.sort_by_key(|row| std::cmp::Reverse(row.rss_kb));
+                        rows.into_iter()
+                            .take(16)
+                            .map(|row| {
+                                serde_json::json!({
+                                    "pid": row.pid,
+                                    "parentPid": row.ppid,
+                                    "cpuPercent": row.cpu_percent,
+                                    "rssKb": row.rss_kb,
+                                    "command": row.command,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let build_service =
+                    diagnostic_orch.map(|orch| orch.build_service_diagnostic_snapshot("sccache"));
+                if let Some(snapshot) = &build_service {
+                    let evidence_head: String = output_tail.chars().take(1_500).collect();
+                    let diagnostic = format!("Cairn diagnostic: {}", snapshot.compact_summary());
+                    let reserved = evidence_head.chars().count() + diagnostic.chars().count() + 4;
+                    let final_tail = tail(&output_tail, OUTPUT_TAIL_CHARS.saturating_sub(reserved));
+                    output_tail = format!("{evidence_head}\n\n{diagnostic}\n\n{final_tail}");
+                }
+                log::warn!(
+                    "check infrastructure failure: {}",
+                    serde_json::json!({
+                        "check": plan.name,
+                        "jobId": job_id,
+                        "suiteId": tool_use_id,
+                        "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
+                        "resourceClass": plan.resource_class.as_str(),
+                        "queueWaitMs": permit.waited().as_millis(),
+                        "durationMs": duration_ms,
+                        "exitCode": exit_code,
+                        "timedOut": timed_out,
+                        "admission": admission_snapshot,
+                        "runnerRssBytes": resources.rss_bytes,
+                        "runnerPhysicalFootprintBytes": resources.phys_footprint_bytes,
+                        "hostTotalMemoryBytes": host.total_memory_bytes,
+                        "hostAvailableMemoryBytes": host.available_memory_bytes,
+                        "hostLoadAverage": host.load_average,
+                        "processTree": process_tree,
+                        "buildService": build_service,
+                    })
+                );
+            }
 
             let _ = store_check_result(
                 db.clone(),
@@ -1063,7 +1198,7 @@ where
                     target_results_json,
                     job_id: Some(job_id.to_string()),
                     cached: Some(false),
-                    failure_kind: failure_kind.map(|k| k.as_str().to_string()),
+                    failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
                 },
             );
 
@@ -1082,6 +1217,7 @@ where
                 if passed { "passed" } else { "failed" },
                 summary_annotation(&outcome),
             );
+            drop(permit);
             (index, outcome)
         }
     };
@@ -1090,29 +1226,10 @@ where
     // sharing the one checkout (the fallback correctness boundary).
     match mode {
         CheckExecMode::Isolated => {
-            // Concurrent, optionally bounded. `None` polls every miss at once (the
-            // thin write cadence); `Some(n)` keeps at most `n` heavy review checks
-            // in flight via `buffer_unordered`. The `run_miss` futures are lazy, so
-            // constructing them all and polling <= n at a time is correct, and the
-            // index-addressed `outcomes` vec still reassembles into plan order.
-            let done: Vec<(usize, CheckOutcome)> = match max_concurrency {
-                Some(n) => {
-                    use futures_util::StreamExt;
-                    // Collect the lazy per-miss futures eagerly (as `join_all`
-                    // does) before handing them to `buffer_unordered`; feeding the
-                    // borrowing `map` closure straight into the stream combinator
-                    // trips a higher-ranked-lifetime inference limit.
-                    let futs: Vec<_> = misses.iter().map(|&index| run_miss(index)).collect();
-                    futures_util::stream::iter(futs)
-                        .buffer_unordered(n.max(1))
-                        .collect()
-                        .await
-                }
-                None => {
-                    futures_util::future::join_all(misses.iter().map(|&index| run_miss(index)))
-                        .await
-                }
-            };
+            // Poll every isolated miss. Process spawn is globally bounded by the
+            // fair admission controller, shared across jobs and cadences.
+            let done: Vec<(usize, CheckOutcome)> =
+                futures_util::future::join_all(misses.iter().map(|&index| run_miss(index))).await;
             for (index, outcome) in done {
                 outcomes[index] = Some(outcome);
             }
@@ -1190,10 +1307,20 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
             None => {}
         }
     } else if let Some(kind) = o.failure_kind {
-        // A classified death (timeout / spawn error / signal kill) renders AS
-        // itself, never a bare `exit -1` the agent would mistake for a real test
-        // failure and go debugging tests that never failed.
-        parts.push(kind.describe(o.duration_ms));
+        // A classified death renders as itself, never a zero-failure assertion
+        // count the agent would chase into tests that never failed.
+        if kind == CheckFailureKind::RunnerError {
+            let passed = o.parsed.as_ref().map(|parsed| parsed.passed).unwrap_or(0);
+            if passed == 0 {
+                parts.push("test runner failed before reporting tests".to_string());
+            } else {
+                parts.push(format!(
+                    "test runner failed after {passed} tests passed with no assertion failures"
+                ));
+            }
+        } else {
+            parts.push(kind.describe(o.duration_ms));
+        }
     } else {
         match test_parse {
             Some(p) => {
@@ -1324,9 +1451,13 @@ pub(crate) async fn load_node_vcs_anchors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::project_settings::CheckPolicy;
+    use crate::config::project_settings::{CheckPolicy, CheckResourceClass};
     use crate::execution::selection::CheckScope;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn admission() -> CheckAdmissionController {
+        CheckAdmissionController::new(2)
+    }
 
     fn change(path: &str) -> GraphFileChange {
         GraphFileChange {
@@ -1344,6 +1475,7 @@ mod tests {
             impact: impact.map(|globs| globs.iter().map(|s| s.to_string()).collect()),
             policy: CheckPolicy::Advisory,
             when,
+            resource_class: CheckResourceClass::Shared,
             timeout: None,
         }
     }
@@ -1981,6 +2113,7 @@ mod tests {
             applies: true,
             command: command.to_string(),
             scope: CheckScope::Full,
+            resource_class: CheckResourceClass::Shared,
         }
     }
 
@@ -2026,6 +2159,11 @@ mod tests {
         )];
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
+        let controller = CheckAdmissionController::new(1);
+        let _blocker = controller
+            .acquire(CheckResourceClass::Shared)
+            .await
+            .unwrap();
         let results = run_planned_checks(
             db.clone(),
             "project-a",
@@ -2034,6 +2172,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &controller,
+            None,
             move |_index, _command, _stream_id| {
                 let counted = counted.clone();
                 async move {
@@ -2042,7 +2182,6 @@ mod tests {
                 }
             },
             |_| {},
-            None,
         )
         .await;
 
@@ -2055,6 +2194,56 @@ mod tests {
         assert_eq!(results[0].name, "frontend");
         assert!(results[0].passed);
         assert_eq!(results[0].exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_miss_spawns_nothing_and_stores_nothing() {
+        let db = cache_db().await;
+        let controller = Arc::new(CheckAdmissionController::new(1));
+        let blocker = controller
+            .acquire(CheckResourceClass::Shared)
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let db = db.clone();
+            let controller = controller.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                let plans = vec![(plan("queued", "run-queued"), "ih-queued".to_string())];
+                run_planned_checks(
+                    db,
+                    "project-a",
+                    "tree-cancelled",
+                    "job-a",
+                    &plans,
+                    "tool",
+                    CheckExecMode::Isolated,
+                    controller.as_ref(),
+                    None,
+                    move |_index, _command, _stream_id| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            exec_ok(Some(0), "should not run")
+                        }
+                    },
+                    |_| {},
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(controller.snapshot().queued_requests, 1);
+        task.abort();
+        let _ = task.await;
+        drop(blocker);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::execution::cache::list_check_results(db, "project-a", "tree-cancelled")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2071,6 +2260,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             move |_index, _command, _stream_id| {
                 let counted = counted.clone();
                 async move {
@@ -2079,7 +2270,6 @@ mod tests {
                 }
             },
             |_| {},
-            None,
         )
         .await;
 
@@ -2120,12 +2310,13 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             move |_index, _command, _stream_id| {
                 let out = nextest_output.clone();
                 async move { exec_ok(Some(100), out) }
             },
             |_| {},
-            None,
         )
         .await;
 
@@ -2169,6 +2360,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             move |_index, _command, _stream_id| {
                 let counted = counted.clone();
                 async move {
@@ -2177,7 +2370,6 @@ mod tests {
                 }
             },
             |_| {},
-            None,
         )
         .await;
         assert_eq!(r1.len(), 1);
@@ -2199,6 +2391,8 @@ mod tests {
             &plans2,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             move |_index, _command, _stream_id| {
                 let counted = counted.clone();
                 async move {
@@ -2207,7 +2401,6 @@ mod tests {
                 }
             },
             |_| {},
-            None,
         )
         .await;
         assert_eq!(r2.len(), 1);
@@ -2249,6 +2442,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             move |index, _command, _stream_id| async move {
                 match index {
                     // Killed at its budget, with a nextest SLOW line naming the
@@ -2270,7 +2465,6 @@ mod tests {
                 }
             },
             |_| {},
-            None,
         )
         .await;
 
@@ -2281,15 +2475,21 @@ mod tests {
 
         // The classification is persisted, so every downstream surface can render
         // the real death rather than re-deriving it from exit -1.
-        let kind_of = |name: &str, ih: &str| {
-            get_check_result(db.clone(), "project-a", name, ih)
-                .unwrap()
-                .unwrap()
-                .failure_kind
+        let stored =
+            crate::execution::cache::list_check_results(db.clone(), "project-a", "tree-cls")
+                .unwrap();
+        let kind_of = |name: &str| {
+            stored
+                .iter()
+                .find(|row| row.check_name == name)
+                .and_then(|row| row.failure_kind.as_deref())
         };
-        assert_eq!(kind_of("slow", "ih-slow").as_deref(), Some("timed_out"));
-        assert_eq!(kind_of("nogo", "ih-nogo").as_deref(), Some("spawn_error"));
-        assert_eq!(kind_of("crash", "ih-crash").as_deref(), Some("killed"));
+        assert_eq!(kind_of("slow"), Some("timed_out"));
+        assert_eq!(kind_of("nogo"), Some("spawn_error"));
+        assert_eq!(kind_of("crash"), Some("killed"));
+        assert!(get_check_result(db.clone(), "project-a", "slow", "ih-slow")
+            .unwrap()
+            .is_none());
 
         // The timeout summary names the timeout AND the still-running test; the
         // spawn error names itself.
@@ -2352,10 +2552,11 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             // typecheck misses and fails with a bare exit code.
             move |_index, _command, _stream_id| async move { exec_ok(Some(1), "boom") },
             move |checks| captured.lock().unwrap().push(checks),
-            None,
         )
         .await;
 
@@ -2413,9 +2614,10 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             move |_index, _command, _stream_id| async move { exec_ok(Some(0), String::new()) },
             |_| {},
-            None,
         )
         .await;
 
@@ -2431,11 +2633,11 @@ mod tests {
         );
     }
 
-    /// The `Shared` FALLBACK must never overlap two check commands in the one
-    /// checkout: a mutating check (a formatter / `--fix` lint) has to settle
-    /// before the next check observes the shared sealed worktree. Even when each
-    /// executor yields at an await, the concurrent-invocation high-water mark
-    /// stays 1. This guards the fallback path against the formatter/reader race.
+    /// `Shared` is the canonical write-check mode and must never overlap two check
+    /// commands in the one checkout: a mutating check (a formatter / `--fix` lint)
+    /// has to settle before the next check observes the shared sealed worktree.
+    /// Even when each executor yields at an await, the concurrent-invocation
+    /// high-water mark stays 1.
     #[tokio::test]
     async fn shared_mode_checks_stay_sequential() {
         let db = cache_db().await;
@@ -2455,6 +2657,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
+            &admission(),
+            None,
             move |_index, _command, _stream_id| {
                 let a = a.clone();
                 let hw = hw.clone();
@@ -2467,7 +2671,6 @@ mod tests {
                 }
             },
             |_| {},
-            None,
         )
         .await;
 
@@ -2475,6 +2678,86 @@ mod tests {
             high_water.load(Ordering::SeqCst),
             1,
             "shared-mode checks must not overlap; exactly one may run at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_mode_exposes_earlier_mutations_across_cache_hit_and_failure() {
+        let db = cache_db().await;
+        let plans = vec![
+            (plan("formatter", "format"), "ih-format".to_string()),
+            (plan("cached", "cached"), "ih-cached".to_string()),
+            (plan("reader", "read"), "ih-read".to_string()),
+        ];
+        store_check_result(
+            db.clone(),
+            CheckResultCacheWrite {
+                project_id: "project-a".to_string(),
+                tree_hash: "older-tree".to_string(),
+                input_hash: "ih-cached".to_string(),
+                check_name: "cached".to_string(),
+                exit_code: 0,
+                passed: true,
+                output_tail: String::new(),
+                duration_ms: 1,
+                target_results_json: None,
+                job_id: Some("job-a".to_string()),
+                cached: Some(false),
+                failure_kind: None,
+            },
+        )
+        .unwrap();
+
+        let checkout = Arc::new(tempfile::tempdir().unwrap());
+        let marker = checkout.path().join("formatted.txt");
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let marker_for_run = marker.clone();
+        let observed_for_run = observed.clone();
+        let results = run_planned_checks(
+            db,
+            "project-a",
+            "tree-shared",
+            "job-a",
+            &plans,
+            "tool",
+            CheckExecMode::Shared,
+            &admission(),
+            None,
+            move |index, _command, _stream_id| {
+                let marker = marker_for_run.clone();
+                let observed = observed_for_run.clone();
+                async move {
+                    observed.lock().unwrap().push(index);
+                    match index {
+                        0 => {
+                            std::fs::write(&marker, "settled formatter output").unwrap();
+                            exec_ok(Some(1), "formatter reported a failure")
+                        }
+                        2 => {
+                            let contents = std::fs::read_to_string(&marker)
+                                .expect("later check sees the earlier in-place mutation");
+                            assert_eq!(contents, "settled formatter output");
+                            exec_ok(Some(0), contents)
+                        }
+                        _ => panic!("the cached plan must not execute"),
+                    }
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(*observed.lock().unwrap(), vec![0, 2]);
+        assert!(
+            !results[0].passed,
+            "a failed mutating check is still recorded"
+        );
+        assert!(results[1].cached, "the middle plan remains a cache hit");
+        assert!(results[2].passed);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "settled formatter output",
+            "the mutation remains in the real checkout for the canonical fold"
         );
     }
 
@@ -2502,6 +2785,8 @@ mod tests {
                 &plans,
                 "tool",
                 CheckExecMode::Isolated,
+                &admission(),
+                None,
                 move |_index, _command, _stream_id| {
                     let b = b.clone();
                     async move {
@@ -2510,7 +2795,6 @@ mod tests {
                     }
                 },
                 |_| {},
-                None,
             ),
         )
         .await;
@@ -2540,6 +2824,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Isolated,
+            &admission(),
+            None,
             // index 0 sleeps longest, so completion order reverses plan order.
             move |index, _command, _stream_id| async move {
                 let delay = (3 - index as u64) * 20;
@@ -2547,7 +2833,6 @@ mod tests {
                 exec_ok(Some(0), String::new())
             },
             |_| {},
-            None,
         )
         .await;
 
@@ -2580,13 +2865,14 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Isolated,
+            &admission(),
+            None,
             // z fails, the others pass — mixed final states under concurrency.
             move |index, _command, _stream_id| async move {
                 let code = if index == 2 { 1 } else { 0 };
                 exec_ok(Some(code), String::new())
             },
             move |checks| captured.lock().unwrap().push(checks),
-            None,
         )
         .await;
 
@@ -2627,6 +2913,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Isolated,
+            &admission(),
+            None,
             move |_index, _command, _stream_id| {
                 let a = a.clone();
                 let hw = hw.clone();
@@ -2639,7 +2927,6 @@ mod tests {
                 }
             },
             |_| {},
-            Some(2),
         )
         .await;
 
@@ -2647,14 +2934,13 @@ mod tests {
         assert_eq!(
             high_water.load(Ordering::SeqCst),
             2,
-            "bounded isolated concurrency must reach but never exceed the cap of 2"
+            "global admission must reach but never exceed capacity 2"
         );
     }
 
-    /// A bound of `Some(1)` makes `Isolated` mode effectively sequential: at most
-    /// one miss runs at a time.
+    /// A one-permit global controller makes isolated shared checks sequential.
     #[tokio::test]
-    async fn bounded_isolated_one_is_sequential() {
+    async fn global_admission_capacity_one_is_sequential() {
         let db = cache_db().await;
         let plans = vec![
             (plan("a", "cmd-a"), "ih-a".to_string()),
@@ -2665,6 +2951,7 @@ mod tests {
         let high_water = Arc::new(AtomicUsize::new(0));
         let a = active.clone();
         let hw = high_water.clone();
+        let controller = CheckAdmissionController::new(1);
         run_planned_checks(
             db.clone(),
             "project-a",
@@ -2673,6 +2960,8 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Isolated,
+            &controller,
+            None,
             move |_index, _command, _stream_id| {
                 let a = a.clone();
                 let hw = hw.clone();
@@ -2685,14 +2974,155 @@ mod tests {
                 }
             },
             |_| {},
-            Some(1),
         )
         .await;
 
         assert_eq!(
             high_water.load(Ordering::SeqCst),
             1,
-            "a cap of 1 must serialize isolated misses"
+            "global capacity one must serialize isolated misses"
         );
+    }
+
+    #[tokio::test]
+    async fn independent_suites_share_one_global_controller() {
+        let db = cache_db().await;
+        let controller = Arc::new(CheckAdmissionController::new(1));
+        let active = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        let run_suite = |name: &'static str, tree: &'static str, job: &'static str| {
+            let db = db.clone();
+            let controller = controller.clone();
+            let active = active.clone();
+            let high_water = high_water.clone();
+            async move {
+                let plans = vec![(plan(name, "fixture"), format!("input-{name}"))];
+                run_planned_checks(
+                    db,
+                    "project-a",
+                    tree,
+                    job,
+                    &plans,
+                    "tool",
+                    CheckExecMode::Isolated,
+                    controller.as_ref(),
+                    None,
+                    move |_index, _command, _stream_id| {
+                        let active = active.clone();
+                        let high_water = high_water.clone();
+                        async move {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            high_water.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            exec_ok(Some(0), "ok")
+                        }
+                    },
+                    |_| {},
+                )
+                .await
+            }
+        };
+        let (first, second) = tokio::join!(
+            run_suite("first", "tree-first", "job-first"),
+            run_suite("second", "tree-second", "job-second")
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(high_water.load(Ordering::SeqCst), 1);
+    }
+
+    fn parsed(parser: &str, passed: usize, failed: usize) -> ParsedCheckResult {
+        ParsedCheckResult {
+            parser: parser.to_string(),
+            passed,
+            failed,
+            skipped: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failure_classifier_requires_positive_evidence_and_preserves_precedence() {
+        let warning = "sccache: warning: The server looks like it shut down unexpectedly";
+        assert_eq!(
+            classify_check_failure(Some(0), false, false, None, warning),
+            None
+        );
+        assert_eq!(
+            classify_check_failure(Some(254), false, false, None, "script exited 254"),
+            None
+        );
+
+        let abnormal = "error: process didn't exit successfully: sccache rustc --crate-name bytes (exit status: 254)";
+        assert_eq!(
+            classify_check_failure(Some(254), false, false, None, abnormal)
+                .map(|classification| classification.kind),
+            Some(CheckFailureKind::Infrastructure)
+        );
+        for signature in [
+            "Failed to send data to or receive data from server",
+            "failed client/server communication",
+            "failed to fill whole buffer",
+            "server looks like it shut down unexpectedly",
+        ] {
+            assert_eq!(
+                classify_check_failure(Some(1), false, false, None, signature)
+                    .map(|classification| classification.kind),
+                Some(CheckFailureKind::Infrastructure),
+                "signature: {signature}"
+            );
+        }
+        let missing =
+            "couldn't read target/debug/build/tree/out/generated.txt: No such file or directory";
+        assert_eq!(
+            classify_check_failure(Some(1), false, false, None, missing)
+                .map(|classification| classification.kind),
+            Some(CheckFailureKind::Infrastructure)
+        );
+        assert_eq!(
+            classify_check_failure(
+                Some(1),
+                false,
+                false,
+                Some(&parsed("vitest", 2, 1)),
+                warning
+            ),
+            None,
+            "real assertion failures outrank incidental infrastructure text"
+        );
+    }
+
+    #[test]
+    fn runner_error_is_vitest_only_and_reports_progress() {
+        let vitest = parsed("vitest", 12, 0);
+        let classification =
+            classify_check_failure(Some(1), false, false, Some(&vitest), "report complete")
+                .expect("abnormal Vitest exit");
+        assert_eq!(classification.kind, CheckFailureKind::RunnerError);
+        assert!(classification.reason.contains("12 tests passed"));
+        assert_eq!(
+            classify_check_failure(
+                Some(101),
+                false,
+                false,
+                Some(&parsed("nextest", 0, 0)),
+                "compile error"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn classified_excerpt_keeps_early_evidence_and_final_tail_bounded() {
+        let output = format!(
+            "failed to fill whole buffer\n{}\nFINAL-MARKER",
+            "noise\n".repeat(2000)
+        );
+        let classification = classify_check_failure(Some(1), false, false, None, &output);
+        let excerpt = classified_output_excerpt(&output, classification.as_ref());
+        assert!(excerpt.contains("failed to fill whole buffer"));
+        assert!(excerpt.contains("FINAL-MARKER"));
+        assert!(excerpt.chars().count() <= OUTPUT_TAIL_CHARS);
     }
 }

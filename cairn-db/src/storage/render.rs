@@ -218,9 +218,21 @@ fn line_continue_target(
 ) -> String {
     if let Some(chars) = char_offset {
         let target = target_with_query_param(uri, "offset", offset);
-        return target_with_query_param(&target, "char_offset", chars);
+        let prior_chars = split_target_query(uri)
+            .ok()
+            .and_then(|split| {
+                split
+                    .params
+                    .iter()
+                    .rev()
+                    .find(|param| param.key == "char_offset")
+                    .and_then(|param| param.value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        return target_with_query_param(&target, "char_offset", prior_chars + chars);
     }
-    let target = target_with_query_param(uri, "offset", offset + shown_lines);
+    let target = target_without_query_param(uri, "char_offset");
+    let target = target_with_query_param(&target, "offset", offset + shown_lines);
     match original_limit {
         None => target_without_query_param(&target, "limit"),
         Some(limit) if shown_lines < limit => {
@@ -550,21 +562,43 @@ fn render_record_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
         .map(|h| format!("\n\n{h}"))
         .unwrap_or_default();
 
-    let shown = meta.shown_units;
-    let more = meta
-        .total_units
-        .is_some_and(|total| meta.offset + shown < total);
-
-    let header_estimate = header(&meta, shown, true).len();
+    let produced_shown = meta.shown_units;
+    let header_estimate = header(&meta, produced_shown, true).len();
     let body_budget = budget.saturating_sub(header_estimate + 1 + history_suffix.len());
     let cut = cut_body(&body, body_budget, false, None);
+    let shown = match meta.record_prelude_lines {
+        Some(prelude_lines) if cut.budget_truncated => cut
+            .shown_lines
+            .saturating_sub(prelude_lines)
+            .min(produced_shown),
+        _ => produced_shown,
+    };
+    let blocked_oversized_record = meta.record_prelude_lines.is_some()
+        && cut.budget_truncated
+        && shown == 0
+        && (produced_shown > 0 || cut.char_offset.is_some());
+    let more = !blocked_oversized_record
+        && meta
+            .total_units
+            .is_some_and(|total| meta.offset + shown < total);
     let truncated = cut.budget_truncated || more;
 
+    meta.shown_units = shown;
     let head = header(&meta, shown, truncated);
-    let mut text = if cut.body.is_empty() {
+    let rendered_body = if blocked_oversized_record {
+        serde_json::json!({
+            "type": "error",
+            "error": "record exceeds read budget; select fewer columns or shorter values",
+            "offset": meta.offset,
+        })
+        .to_string()
+    } else {
+        cut.body
+    };
+    let mut text = if rendered_body.is_empty() {
         head
     } else {
-        format!("{head}\n{}", cut.body)
+        format!("{head}\n{rendered_body}")
     };
 
     if more {
@@ -606,6 +640,17 @@ pub(crate) fn estimate_len(segment: &ReadSegment) -> usize {
 /// through this one composer so a reconstructed read reproduces the live envelope
 /// byte-for-byte.
 pub fn assemble(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {
+    assemble_inner(segments, false)
+}
+
+/// Compose a batch while retaining each final, post-budget segment body in the
+/// envelope. The bodies exclude the generated `=== uri [suffix] ===` header but
+/// include continuation footers and history exactly as rendered in `text`.
+pub fn assemble_with_bodies(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {
+    assemble_inner(segments, true)
+}
+
+fn assemble_inner(segments: Vec<ReadSegment>, include_bodies: bool) -> ReadBatchEnvelope {
     let lengths: Vec<usize> = segments.iter().map(estimate_len).collect();
     let separator_budget = segments.len().saturating_sub(1);
     let total_budget = READ_BATCH_CHAR_BUDGET.saturating_sub(separator_budget);
@@ -614,6 +659,7 @@ pub fn assemble(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {
     let mut text = String::new();
     let mut images = Vec::new();
     let mut metas: Vec<SegmentMeta> = Vec::new();
+    let mut bodies = include_bodies.then(|| Vec::with_capacity(segments.len()));
     let mut affordances: Vec<Affordance> = Vec::new();
 
     for (segment, budget) in segments.into_iter().zip(budgets) {
@@ -622,6 +668,14 @@ pub fn assemble(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {
             text.push('\n');
         }
         text.push_str(&rendered.text);
+        if let Some(bodies) = &mut bodies {
+            let body = rendered
+                .text
+                .split_once('\n')
+                .map_or("", |(_, body)| body)
+                .to_string();
+            bodies.push(body);
+        }
         images.extend(rendered.images);
         metas.push(rendered.meta);
         if let Some(affordance) = rendered.affordance {
@@ -642,6 +696,7 @@ pub fn assemble(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {
         text,
         images,
         segments: metas,
+        bodies,
     }
 }
 
@@ -707,6 +762,36 @@ mod tests {
             .take_while(|c| c.is_ascii_digit())
             .collect();
         assert!(digits.parse::<usize>().unwrap() >= 1);
+    }
+
+    #[test]
+    fn char_continuation_preserves_projection_and_accumulates_offset() {
+        let target = line_continue_target(
+            "cairn://p/CAIRN/1/1/builder/chat/raw?format=json&offset=0&char_offset=120",
+            0,
+            1,
+            None,
+            Some(80),
+        );
+        assert_eq!(
+            target,
+            "cairn://p/CAIRN/1/1/builder/chat/raw?format=json&offset=0&char_offset=200"
+        );
+    }
+
+    #[test]
+    fn completed_char_fragment_drops_char_offset_before_next_line() {
+        let target = line_continue_target(
+            "cairn://p/CAIRN/1/1/builder/chat/raw?format=json&offset=0&char_offset=200",
+            0,
+            1,
+            Some(1),
+            None,
+        );
+        assert_eq!(
+            target,
+            "cairn://p/CAIRN/1/1/builder/chat/raw?format=json&offset=1&limit=1"
+        );
     }
 
     #[test]
@@ -805,6 +890,103 @@ mod tests {
             .text
             .contains("continue: cairn://p/CAIRN/issues?limit=10&offset=10"));
         assert!(out.meta.truncated);
+    }
+
+    #[test]
+    fn line_framed_record_budget_keeps_truthful_row_continuation() {
+        let schema = r#"{"type":"columns","columns":["value"]}"#;
+        let row = |value: char| {
+            format!(
+                r#"{{"type":"row","values":["{}"]}}"#,
+                value.to_string().repeat(180)
+            )
+        };
+        let body = format!("{schema}\n{}\n{}\n{}", row('a'), row('b'), row('c'));
+        let mut segment = record_seg(
+            "cairn://db?sql=SELECT value&format=json&limit=3",
+            &body,
+            Some(3),
+            3,
+            Some("rows"),
+            0,
+        );
+        segment.meta.limit = Some(3);
+        segment.meta.record_prelude_lines = Some(1);
+
+        let out = render_segment(segment, 500);
+
+        assert!(out.meta.truncated);
+        assert_eq!(out.meta.shown_units, 1);
+        assert!(out
+            .text
+            .starts_with("=== cairn://db?sql=SELECT value&format=json&limit=3 [1 of 3 rows] ==="));
+        assert!(out
+            .text
+            .contains("continue: cairn://db?sql=SELECT value&format=json&limit=3&offset=1"));
+        assert!(out.text.lines().any(|line| line == schema));
+        for line in out.text.lines().filter(|line| line.starts_with('{')) {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn line_framed_record_oversized_row_returns_parseable_error_without_loop() {
+        let schema = r#"{"type":"columns","columns":["value"]}"#;
+        let row = format!(r#"{{"type":"row","values":["{}"]}}"#, "x".repeat(2_000));
+        let body = format!("{schema}\n{row}");
+        let mut segment = record_seg(
+            "cairn://db?sql=SELECT value&format=json&limit=1",
+            &body,
+            Some(1),
+            1,
+            Some("rows"),
+            0,
+        );
+        segment.meta.record_prelude_lines = Some(1);
+
+        let out = render_segment(segment, 300);
+
+        assert!(out.meta.truncated);
+        assert_eq!(out.meta.shown_units, 0);
+        assert!(out
+            .text
+            .starts_with("=== cairn://db?sql=SELECT value&format=json&limit=1 [0 of 1 rows] ==="));
+        assert!(!out.text.contains("continue:"));
+        let error_line = out.text.lines().find(|line| line.starts_with('{')).unwrap();
+        let error: serde_json::Value = serde_json::from_str(error_line).unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(error["error"].as_str().unwrap().contains("read budget"));
+    }
+
+    #[test]
+    fn line_framed_record_oversized_prelude_returns_parseable_error() {
+        let schema = serde_json::json!({
+            "type": "columns",
+            "columns": ["x".repeat(2_000)],
+        })
+        .to_string();
+        let mut segment = record_seg(
+            "cairn://db?sql=SELECT value&format=json",
+            &schema,
+            Some(0),
+            0,
+            Some("rows"),
+            0,
+        );
+        segment.meta.record_prelude_lines = Some(1);
+
+        let out = render_segment(segment, 300);
+
+        assert!(out.meta.truncated);
+        assert_eq!(out.meta.shown_units, 0);
+        assert!(!out.meta.char_continuation);
+        assert!(out
+            .text
+            .starts_with("=== cairn://db?sql=SELECT value&format=json [0 of 0 rows] ==="));
+        assert!(!out.text.contains("continue:"));
+        let error_line = out.text.lines().find(|line| line.starts_with('{')).unwrap();
+        let error: serde_json::Value = serde_json::from_str(error_line).unwrap();
+        assert_eq!(error["type"], "error");
     }
 
     #[test]

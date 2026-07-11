@@ -17,6 +17,7 @@ pub struct Turn {
     pub predecessor_id: Option<String>,
     pub state: TurnState,
     pub yield_reason: Option<TurnYieldReason>,
+    pub end_reason: Option<TurnEndReason>,
     pub start_reason: TurnStartReason,
     pub created_at: i64,
     pub started_at: Option<i64>,
@@ -116,6 +117,38 @@ impl std::str::FromStr for TurnYieldReason {
     }
 }
 
+/// Notable reason a terminal turn ended. `None` means natural completion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEndReason {
+    ArtifactHandoff,
+    UserStop,
+    Crash,
+}
+
+impl std::fmt::Display for TurnEndReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TurnEndReason::ArtifactHandoff => write!(f, "artifact_handoff"),
+            TurnEndReason::UserStop => write!(f, "user_stop"),
+            TurnEndReason::Crash => write!(f, "crash"),
+        }
+    }
+}
+
+impl std::str::FromStr for TurnEndReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "artifact_handoff" => Ok(TurnEndReason::ArtifactHandoff),
+            "user_stop" => Ok(TurnEndReason::UserStop),
+            "crash" => Ok(TurnEndReason::Crash),
+            _ => Err(format!("Unknown turn end reason: {}", s)),
+        }
+    }
+}
+
 /// Reason a turn was created.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +211,7 @@ impl From<crate::db_records::DbTurn> for Turn {
             predecessor_id: db.predecessor_id,
             state: db.state.parse().unwrap_or(TurnState::Pending),
             yield_reason: db.yield_reason.and_then(|r| r.parse().ok()),
+            end_reason: db.end_reason.and_then(|r| r.parse().ok()),
             start_reason: db.start_reason.parse().unwrap_or(TurnStartReason::Initial),
             created_at: db.created_at as i64,
             started_at: db.started_at.map(|t| t as i64),
@@ -237,6 +271,18 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_end_reason_display_parse() {
+        for reason in [
+            TurnEndReason::ArtifactHandoff,
+            TurnEndReason::UserStop,
+            TurnEndReason::Crash,
+        ] {
+            let parsed: TurnEndReason = reason.to_string().parse().unwrap();
+            assert_eq!(parsed, reason);
+        }
+    }
+
+    #[test]
     fn roundtrip_start_reason_display_parse() {
         for reason in [
             TurnStartReason::Initial,
@@ -280,6 +326,7 @@ mod tests {
             predecessor_id: None,
             state: "GARBAGE".into(),
             yield_reason: None,
+            end_reason: None,
             start_reason: "initial".into(),
             created_at: 0,
             started_at: None,
@@ -301,6 +348,7 @@ mod tests {
             predecessor_id: None,
             state: "running".into(),
             yield_reason: None,
+            end_reason: None,
             start_reason: "GARBAGE".into(),
             created_at: 0,
             started_at: None,
@@ -322,6 +370,7 @@ mod tests {
             predecessor_id: None,
             state: "yielded".into(),
             yield_reason: Some("GARBAGE".into()),
+            end_reason: None,
             start_reason: "initial".into(),
             created_at: 0,
             started_at: None,

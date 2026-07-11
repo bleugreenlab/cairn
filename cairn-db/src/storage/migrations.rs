@@ -215,6 +215,39 @@ macro_rules! shared_tail_executions_runner_device_id {
         )
     };
 }
+
+/// CAIRN-2580: repair invalid empty/root worktree assignments left on historical
+/// child jobs. `jobs` is shared, so both private and team replicas apply the same
+/// data cleanup and represent these worktree-less records canonically as NULL.
+macro_rules! shared_tail_clear_invalid_job_worktree_paths {
+    () => {
+        Migration::new(
+            "0104",
+            "clear_invalid_job_worktree_paths",
+            include_str!("../../../../turso_migrations/0104_clear_invalid_job_worktree_paths.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_add_turn_end_reason {
+    () => {
+        Migration::new(
+            "0105",
+            "add_turn_end_reason",
+            include_str!("../../../../turso_migrations/0105_add_turn_end_reason.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_index_hot_gui_status_queries {
+    () => {
+        Migration::new(
+            "0106",
+            "index_hot_gui_status_queries",
+            include_str!("../../../../turso_migrations/0106_index_hot_gui_status_queries.sql"),
+        )
+    };
+}
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -232,6 +265,9 @@ macro_rules! team_lineage {
             shared_tail_workflow_progress!(),
             shared_tail_check_result_failure_kind!(),
             shared_tail_executions_runner_device_id!(),
+            shared_tail_clear_invalid_job_worktree_paths!(),
+            shared_tail_add_turn_end_reason!(),
+            shared_tail_index_hot_gui_status_queries!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -315,6 +351,7 @@ macro_rules! private_lineage {
             shared_tail_workflow_progress!(),
             shared_tail_check_result_failure_kind!(),
             shared_tail_executions_runner_device_id!(),
+            shared_tail_clear_invalid_job_worktree_paths!(),
             // CAIRN-2487: durable journal for the workflow harness's agent()
             // calls. A per-machine runner-transient replay cache (never synced),
             // so it lives ONLY in the private lineage's tail -- absent from
@@ -337,6 +374,8 @@ macro_rules! private_lineage {
                     "../../../../turso_migrations/0100_workflow_restart_durability.sql"
                 ),
             ),
+            shared_tail_add_turn_end_reason!(),
+            shared_tail_index_hot_gui_status_queries!(),
         ]
     };
 }
@@ -813,6 +852,13 @@ pub const TEAM_MIGRATIONS: &[Migration] = team_lineage![
         "0003",
         "device_presence",
         include_str!("../../../../turso_migrations_team/0003_device_presence.sql"),
+    ),
+    // Team-only durable inbox for remote clients. Canonical effects remain in
+    // shared tables; only the synced delivery envelope is team-specific.
+    Migration::new(
+        "0004",
+        "remote_intents",
+        include_str!("../../../../turso_migrations_team/0004_remote_intents.sql"),
     ),
 ];
 
@@ -1461,11 +1507,64 @@ mod tests {
                 "0101_workflow_progress".to_string(),
                 "0102_check_result_cache_failure_kind".to_string(),
                 "0103_executions_runner_device_id".to_string(),
+                "0104_clear_invalid_job_worktree_paths".to_string(),
                 "0099_workflow_journal".to_string(),
                 "0100_workflow_restart_durability".to_string(),
+                "0105_add_turn_end_reason".to_string(),
+                "0106_index_hot_gui_status_queries".to_string(),
             ]
         );
         Ok(db)
+    }
+
+    #[tokio::test]
+    async fn invalid_job_worktree_paths_are_cleared() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("invalid-worktree-paths.turso.db"))
+            .await
+            .unwrap();
+        let before_0104 = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version != "0104")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before_0104).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO jobs (id, project_id, status, worktree_path, branch, created_at, updated_at)
+             VALUES ('root', 'project', 'complete', '/', 'agent/root', 1, 1),
+                    ('empty', 'project', 'complete', '  ', 'agent/empty', 1, 1),
+                    ('valid', 'project', 'complete', '/managed/worktree', 'agent/valid', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        let cleanup = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == "0104")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MigrationRunner::new(cleanup).run(&db).await.unwrap(),
+            vec!["0104_clear_invalid_job_worktree_paths".to_string()]
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM jobs WHERE id IN ('root', 'empty') AND worktree_path IS NULL AND branch IS NULL"
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_text("SELECT worktree_path FROM jobs WHERE id = 'valid'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("/managed/worktree")
+        );
     }
 
     async fn explain_plan(db: &LocalDb, sql: &str) -> Vec<String> {
@@ -2767,6 +2866,7 @@ mod tests {
                 "0002_labels_read_completeness".to_string(),
                 // CAIRN-2629: team-only device_presence table (head migration).
                 "0003_device_presence".to_string(),
+                "0004_remote_intents".to_string(),
                 // Shared-tail migrations land in the team lineage after the team
                 // head, preserving one shared SQL source for project-scoped tables.
                 "0084_archival_pack_hash".to_string(),
@@ -2785,6 +2885,9 @@ mod tests {
                 "0102_check_result_cache_failure_kind".to_string(),
                 // CAIRN-2629: executions.runner_device_id is a shared column.
                 "0103_executions_runner_device_id".to_string(),
+                "0104_clear_invalid_job_worktree_paths".to_string(),
+                "0105_add_turn_end_reason".to_string(),
+                "0106_index_hot_gui_status_queries".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.
@@ -2883,7 +2986,11 @@ mod tests {
         // it is skipped here exactly as `teams` is, and re-added to the expected
         // team projection below.
         for (name, sql) in &team_tables {
-            if name == "teams" || name == "device_presence" || rerooted.contains(&name.as_str()) {
+            if matches!(
+                name.as_str(),
+                "teams" | "device_presence" | "remote_intents"
+            ) || rerooted.contains(&name.as_str())
+            {
                 continue;
             }
             let p = priv_tables.get(name).unwrap_or_else(|| {
@@ -2900,6 +3007,12 @@ mod tests {
             let priv_objs = schema_objects(&priv_db, kind).await;
             let team_objs = schema_objects(&team_db, kind).await;
             for (name, sql) in &team_objs {
+                if matches!(
+                    name.as_str(),
+                    "idx_remote_intents_pending" | "idx_remote_intents_execution"
+                ) {
+                    continue;
+                }
                 let p = priv_objs.get(name).unwrap_or_else(|| {
                     panic!("team {kind} `{name}` is missing from the private lineage")
                 });
@@ -2972,6 +3085,7 @@ mod tests {
             .collect();
         expected_team.insert("teams"); // present in both; classified specially
         expected_team.insert("device_presence"); // team-only (CAIRN-2629)
+        expected_team.insert("remote_intents"); // team-only remote delivery inbox
         let actual_team: std::collections::BTreeSet<&str> = team_tables
             .keys()
             .map(String::as_str)

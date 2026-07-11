@@ -72,6 +72,11 @@ impl ApiConfig {
         format!("{}/teams/{}/sync-token", self.base_url, team_id)
     }
 
+    /// Device-JWT-authenticated team attention push endpoint.
+    pub fn push_notify_url(&self) -> String {
+        format!("{}/push/notify", self.base_url)
+    }
+
     /// Per-team content-addressed store endpoint (PUT/GET, sync-token-authed).
     /// The broker proxies `hash`-keyed archival bytes to/from per-team object
     /// storage on the same auth boundary as team sync.
@@ -120,6 +125,10 @@ mod tests {
         assert_eq!(
             config.team_sync_token_url("team-1"),
             "https://api.cairn.computer/teams/team-1/sync-token"
+        );
+        assert_eq!(
+            config.push_notify_url(),
+            "https://api.cairn.computer/push/notify"
         );
     }
 

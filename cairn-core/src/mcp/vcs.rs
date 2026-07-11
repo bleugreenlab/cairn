@@ -35,7 +35,7 @@ impl VcsSnapshot {
     }
 }
 
-fn same_workspace_assignment_ignoring_branch(
+fn same_workspace_assignment_ignoring_branch_and_base(
     marker: &crate::jj::WorkspaceIdentity,
     expected: &crate::jj::WorkspaceIdentity,
 ) -> bool {
@@ -45,7 +45,6 @@ fn same_workspace_assignment_ignoring_branch(
         && marker.project_root == expected.project_root
         && marker.worktree_path == expected.worktree_path
         && marker.workspace_name == expected.workspace_name
-        && marker.base_commit == expected.base_commit
 }
 
 /// All worktree-mutating VCS operations on the commit-barrier and write paths.
@@ -512,6 +511,21 @@ fn lineage_mismatch_diagnostic(
     )
 }
 
+fn head_commit_healing_stale(jj: &crate::jj::JjEnv, cwd: &Path) -> Result<String, String> {
+    match crate::jj::head_commit(jj, cwd) {
+        Ok(head) => Ok(head),
+        Err(error) if crate::jj::is_stale_error(&error) => {
+            crate::jj::update_stale(jj, cwd).map_err(|heal_error| {
+                format!("working copy was stale and update-stale failed: {heal_error}")
+            })?;
+            crate::jj::head_commit(jj, cwd).map_err(|probe_error| {
+                format!("cannot resolve @- after staleness heal: {probe_error}")
+            })
+        }
+        Err(error) => Err(format!("cannot resolve @-: {error}")),
+    }
+}
+
 fn deterministic_rebind_branch(
     jj: &crate::jj::JjEnv,
     store: &Path,
@@ -579,7 +593,7 @@ pub(crate) async fn prepare_managed_workspace(
     let store = crate::jj::project_store_dir(&orch.config_dir, &identity.project_root);
     let mut marker = crate::jj::read_workspace_identity(cwd);
     if let Some(marker) = marker.as_ref() {
-        if !same_workspace_assignment_ignoring_branch(marker, &identity) {
+        if !same_workspace_assignment_ignoring_branch_and_base(marker, &identity) {
             return Err(lineage_mismatch_diagnostic(
                 &jj,
                 &context,
@@ -597,16 +611,66 @@ pub(crate) async fn prepare_managed_workspace(
             "project-root marker disagrees with the database assignment",
         ));
     }
-    let head = crate::jj::head_commit(&jj, cwd).map_err(|e| {
-        lineage_mismatch_diagnostic(&jj, &context, None, &format!("cannot resolve @-: {e}"))
-    })?;
+    let head = head_commit_healing_stale(&jj, cwd)
+        .map_err(|reason| lineage_mismatch_diagnostic(&jj, &context, None, &reason))?;
     if !crate::jj::revision_descends_from(&jj, &store, &head, &identity.base_commit) {
-        return Err(lineage_mismatch_diagnostic(
-            &jj,
-            &context,
-            marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
-            "recorded base is not an ancestor of the physical workspace @-",
-        ));
+        let repaired_base =
+            crate::jj::forward_resolve_ancestor(&jj, &store, &identity.base_commit, &head)
+                .filter(|commit| commit != &identity.base_commit);
+        let Some(repaired_base) = repaired_base else {
+            return Err(lineage_mismatch_diagnostic(
+                &jj,
+                &context,
+                marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
+                "recorded base is not an ancestor of the physical workspace @- and could not be proven as a rewritten predecessor",
+            ));
+        };
+        let old_base = identity.base_commit.clone();
+        crate::execution::jobs::workspace_identity::compare_and_swap_owner_base(
+            db.clone(),
+            identity.owner_job_id.clone(),
+            identity.worktree_path.to_string_lossy().to_string(),
+            old_base.clone(),
+            repaired_base.clone(),
+            chrono::Utc::now().timestamp() as i32,
+        )
+        .await
+        .map_err(|error| {
+            lineage_mismatch_diagnostic(
+                &jj,
+                &context,
+                marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
+                &format!(
+                    "recorded base {old_base} rewrote to {repaired_base}, but persisting the repaired lineage coordinate failed: {error}"
+                ),
+            )
+        })?;
+        identity.base_commit = repaired_base;
+        context.identity.base_commit = identity.base_commit.clone();
+        if let Some(actual) = marker.as_mut() {
+            actual.base_commit = identity.base_commit.clone();
+            crate::jj::write_workspace_identity(cwd, actual).map_err(|error| {
+                format!(
+                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} repaired the durable base coordinate but updating the physical identity marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
+                )
+            })?;
+        }
+    } else if let Some(actual) = marker.as_mut() {
+        if actual.base_commit != identity.base_commit {
+            let marker_base_matches =
+                crate::jj::forward_resolve_ancestor(&jj, &store, &actual.base_commit, &head)
+                    .is_some_and(|commit| commit == identity.base_commit);
+            if !marker_base_matches {
+                return Err(lineage_mismatch_diagnostic(
+                    &jj,
+                    &context,
+                    Some(&actual.lineage_root_job_id),
+                    "identity marker base differs from the database assignment and is not its rewritten predecessor",
+                ));
+            }
+            actual.base_commit = identity.base_commit.clone();
+            crate::jj::write_workspace_identity(cwd, actual)?;
+        }
     }
 
     let branch_marker = crate::jj::read_branch_marker(cwd);
@@ -1057,6 +1121,61 @@ mod tests {
         std::fs::write(repo.join("shared.rs"), "base\n").unwrap();
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "-q", "-m", "base"]);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn head_commit_probe_heals_a_genuinely_stale_workspace() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping head_commit_probe_heals_a_genuinely_stale_workspace: jj not resolvable"
+            );
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let branch = "agent/CAIRN-2730-builder-1";
+        let sibling = "agent/CAIRN-2731-builder-1";
+        let ws = wts.path().join("job");
+        let sibling_ws = wts.path().join("sibling");
+        crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+        crate::jj::add_workspace(&jj, &store, &sibling_ws, sibling, branch, None).unwrap();
+        std::fs::write(sibling_ws.join("sibling.rs"), "sibling work\n").unwrap();
+        crate::jj::seal(&jj, &sibling_ws, "sibling work", None).unwrap();
+        crate::jj::merge_into_bookmark(&jj, &store, branch, sibling).unwrap();
+        let branch_tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+
+        let workspace_name = crate::jj::workspace_name_for_branch(branch);
+        jj.run(
+            &store,
+            &[
+                "rebase",
+                "-s",
+                &format!("{workspace_name}@"),
+                "-o",
+                &branch_tip,
+                "--ignore-working-copy",
+            ],
+            "induce genuine staleness",
+        )
+        .unwrap();
+
+        let stale_probe = crate::jj::head_commit(&jj, &ws).unwrap_err();
+        assert!(
+            crate::jj::is_stale_error(&stale_probe),
+            "precondition: head probe must be refused as stale: {stale_probe}"
+        );
+
+        let healed_head = head_commit_healing_stale(&jj, &ws).unwrap();
+        assert_eq!(healed_head, branch_tip);
+        assert_eq!(crate::jj::head_commit(&jj, &ws).unwrap(), branch_tip);
+        assert!(ws.join("sibling.rs").exists());
     }
 
     /// `JjBackend::seal_all` lands one addressable commit AND pushes the
@@ -1525,6 +1644,205 @@ mod tests {
             tool_use_id: None,
         };
         (orch, request, repo_path, root)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(jj)]
+    async fn managed_preflight_repairs_a_rewritten_recorded_base_and_preserves_seals() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping managed_preflight_repairs_a_rewritten_recorded_base_and_preserves_seals: jj not resolvable"
+            );
+            return;
+        };
+        let root = TempDir::new().unwrap();
+        let config_dir = root.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_project(&repo);
+        let ws = root.path().join("ws");
+        let repo_path = repo.to_string_lossy().into_owned();
+        let ws_path = ws.to_string_lossy().into_owned();
+        let mut orch = orch_with_config("vcs_rewritten_base_recovery.db", config_dir.clone()).await;
+        orch.jj_binary_path = bin.clone();
+        let jj = crate::jj::JjEnv::resolve(&bin, &config_dir);
+        let store = crate::jj::project_store_dir(&config_dir, &repo);
+        crate::jj::ensure_project_store(&jj, &store, &repo).unwrap();
+        let branch = "agent/CAIRN-2730-builder-1";
+        crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+        let recorded_base = crate::jj::head_commit(&jj, &ws).unwrap();
+        std::fs::write(ws.join("agent.rs"), "preserved agent work\n").unwrap();
+        crate::jj::seal(&jj, &ws, "agent work", None).unwrap();
+        let sealed_before = crate::jj::head_commit(&jj, &ws).unwrap();
+
+        seed_worktree_run(
+            &orch.db.local,
+            "proj-1".to_string(),
+            repo_path.clone(),
+            ws_path.clone(),
+        )
+        .await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET branch = ?1, base_commit = ?2, pack_anchor = ?2 WHERE id = 'job-1'",
+                (branch, recorded_base.as_str()),
+            )
+            .await
+            .unwrap();
+        crate::jj::write_project_root_marker(&ws, &repo).unwrap();
+        let identity = crate::jj::WorkspaceIdentity::new(
+            "job-1",
+            "job-1",
+            "proj-1",
+            repo.clone(),
+            ws.clone(),
+            branch,
+            crate::jj::workspace_name_for_branch(branch),
+            recorded_base.clone(),
+        );
+        crate::jj::write_workspace_identity(&ws, &identity).unwrap();
+
+        jj.run(
+            &store,
+            &[
+                "describe",
+                "-r",
+                &recorded_base,
+                "-m",
+                "rewritten parent base",
+                "--ignore-working-copy",
+            ],
+            "rewrite recorded base from store",
+        )
+        .unwrap();
+        let rewritten_seal = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+        jj.run(
+            &store,
+            &["new", &rewritten_seal, "--ignore-working-copy"],
+            "create parent branch advance",
+        )
+        .unwrap();
+        jj.run(
+            &store,
+            &[
+                "describe",
+                "-m",
+                "parent branch advanced",
+                "--ignore-working-copy",
+            ],
+            "describe parent branch advance",
+        )
+        .unwrap();
+        jj.run(
+            &store,
+            &[
+                "bookmark",
+                "set",
+                branch,
+                "-r",
+                "@",
+                "--ignore-working-copy",
+            ],
+            "advance parent branch bookmark",
+        )
+        .unwrap();
+        let advanced_tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+        let workspace_name = crate::jj::workspace_name_for_branch(branch);
+        jj.run(
+            &store,
+            &[
+                "rebase",
+                "-s",
+                &format!("{workspace_name}@"),
+                "-o",
+                &advanced_tip,
+                "--ignore-working-copy",
+            ],
+            "leave rewritten-base workspace physically stale",
+        )
+        .unwrap();
+        assert!(
+            !crate::jj::revision_descends_from(&jj, &store, &advanced_tip, &recorded_base),
+            "the persisted base id is no longer an ancestor after the parent rewrite"
+        );
+        let physical_head = crate::jj::head_commit(&jj, &ws).unwrap();
+        let expected_repaired_base =
+            crate::jj::forward_resolve_ancestor(&jj, &store, &recorded_base, &physical_head)
+                .expect(
+                    "jj can forward-resolve the rewritten recorded base within physical ancestry",
+                );
+        assert!(
+            crate::jj::revision_descends_from(&jj, &store, &physical_head, &expected_repaired_base),
+            "forward base {expected_repaired_base} must be an ancestor of head {physical_head}"
+        );
+
+        // Physical staleness is covered independently by
+        // `head_commit_probe_heals_a_genuinely_stale_workspace`; this regression
+        // exercises the next shared-preflight layer after the working copy is
+        // readable: its persisted base id has been rewritten out of ancestry.
+        let request = CallbackRequest {
+            thread_id: None,
+            cwd: ws_path,
+            run_id: Some("run-1".to_string()),
+            tool: "run".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        };
+        let context = prepare_managed_workspace(&orch, &request)
+            .await
+            .expect("shared run/write/recovery preflight repairs the rewritten base")
+            .expect("managed context");
+        assert_ne!(context.identity.base_commit, recorded_base);
+        assert!(crate::jj::revision_descends_from(
+            &jj,
+            &store,
+            &crate::jj::head_commit(&jj, &ws).unwrap(),
+            &context.identity.base_commit,
+        ));
+        assert!(
+            ws.join("agent.rs").exists(),
+            "sealed agent bytes survive recovery"
+        );
+        assert_ne!(
+            crate::jj::head_commit(&jj, &ws).unwrap(),
+            sealed_before,
+            "the seal follows the rewritten base to its current commit id"
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_text("SELECT base_commit FROM jobs WHERE id = 'job-1'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(context.identity.base_commit.as_str()),
+            "the durable owner metadata is repaired"
+        );
+        assert_eq!(
+            crate::jj::read_workspace_identity(&ws).unwrap().base_commit,
+            context.identity.base_commit,
+            "the physical marker is repaired with the database"
+        );
+
+        // Simulate interruption after the database CAS but before the physical
+        // marker write. The next invocation of this same shared preflight proves
+        // the marker's old base is the rewritten predecessor of the already-valid
+        // database base and completes the transition.
+        let mut interrupted_marker = crate::jj::read_workspace_identity(&ws).unwrap();
+        interrupted_marker.base_commit = recorded_base;
+        crate::jj::write_workspace_identity(&ws, &interrupted_marker).unwrap();
+        let resumed = prepare_managed_workspace(&orch, &request)
+            .await
+            .expect("a DB-at-new/marker-at-old transition resumes in band")
+            .expect("managed context");
+        assert_eq!(resumed.identity.base_commit, context.identity.base_commit);
+        assert_eq!(
+            crate::jj::read_workspace_identity(&ws).unwrap().base_commit,
+            context.identity.base_commit,
+            "the resumed preflight completes the interrupted marker update"
+        );
     }
 
     /// Test A — key identity (the load-bearing wiring guarantee). The seal-side

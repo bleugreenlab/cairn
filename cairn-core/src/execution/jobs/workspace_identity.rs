@@ -197,6 +197,7 @@ pub(crate) async fn assign_workspace_if_unset_or_same(
     branch: String,
     now: i32,
 ) -> Result<(), String> {
+    crate::managed_worktrees::validate_path(std::path::Path::new(&path))?;
     db.write(|conn| {
         let job_id = job_id.clone();
         let expected_path = expected_path.clone();
@@ -231,6 +232,65 @@ pub(crate) async fn assign_workspace_if_unset_or_same(
     })
     .await
     .map_err(|e| db_error("Failed to assign managed workspace", e))
+}
+
+/// Compare-and-swap a rewritten base commit on the stable owner, then update
+/// every non-terminal job intentionally sharing the exact physical workspace and
+/// old base coordinate. The pack anchor remains historical; only the live lineage
+/// proof coordinate follows jj's stable change through its rewritten commit id.
+pub(crate) async fn compare_and_swap_owner_base(
+    db: Arc<LocalDb>,
+    owner_job_id: String,
+    worktree_path: String,
+    old_base: String,
+    new_base: String,
+    now: i32,
+) -> Result<(), String> {
+    db.write(|conn| {
+        let owner_job_id = owner_job_id.clone();
+        let worktree_path = worktree_path.clone();
+        let old_base = old_base.clone();
+        let new_base = new_base.clone();
+        Box::pin(async move {
+            let owner = load_job_conn(conn, &owner_job_id)
+                .await?
+                .ok_or_else(|| db_internal(format!("job not found: {owner_job_id}")))?;
+            let changed = conn
+                .execute(
+                    "UPDATE jobs SET base_commit = ?1, updated_at = ?2
+                     WHERE id = ?3 AND worktree_path = ?4 AND base_commit = ?5",
+                    (
+                        new_base.as_str(),
+                        now,
+                        owner_job_id.as_str(),
+                        worktree_path.as_str(),
+                        old_base.as_str(),
+                    ),
+                )
+                .await?;
+            if changed != 1 {
+                return Err(db_internal(format!(
+                    "workspace base assignment changed concurrently for owner {owner_job_id}"
+                )));
+            }
+            conn.execute(
+                "UPDATE jobs SET base_commit = ?1, updated_at = ?2
+                 WHERE project_id = ?3 AND worktree_path = ?4 AND base_commit = ?5
+                   AND status IN ('pending', 'running', 'blocked', 'idle')",
+                (
+                    new_base.as_str(),
+                    now,
+                    owner.project_id.as_str(),
+                    worktree_path.as_str(),
+                    old_base.as_str(),
+                ),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| db_error("Failed to refresh managed workspace base", e))
 }
 
 /// Compare-and-swap the stable owner, then update every non-terminal job that
@@ -319,6 +379,84 @@ mod tests {
         assert_eq!(context.identity.owner_job_id, "owner");
         assert_eq!(context.identity.branch, "agent/owner");
         assert_eq!(context.identity.base_commit, "base");
+    }
+
+    #[tokio::test]
+    async fn partial_workspace_assignment_without_branch_fails_closed() {
+        let db = Arc::new(migrated_test_db("workspace-missing-branch.db").await);
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO jobs (id, project_id, status, worktree_path, base_commit, created_at, updated_at)
+             VALUES ('owner', 'project', 'running', '/worktree', 'base', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        let error = resolve_managed_workspace_context(db, "owner".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("managed workspace owner owner has no branch assignment"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_base_refresh_is_compare_and_swap() {
+        let db = Arc::new(migrated_test_db("workspace-base-cas.db").await);
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO jobs (id, project_id, status, worktree_path, branch, base_commit, pack_anchor, created_at, updated_at)
+             VALUES ('owner', 'project', 'running', '/worktree', 'agent/branch', 'old-base', 'archive-anchor', 1, 1);
+             INSERT INTO jobs (id, parent_job_id, project_id, status, worktree_path, branch, base_commit, pack_anchor, created_at, updated_at)
+             VALUES ('child', 'owner', 'project', 'blocked', '/worktree', 'agent/branch', 'old-base', 'child-anchor', 2, 2);",
+        )
+        .await
+        .unwrap();
+        compare_and_swap_owner_base(
+            db.clone(),
+            "owner".into(),
+            "/worktree".into(),
+            "old-base".into(),
+            "new-base".into(),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.query_text("SELECT base_commit FROM jobs WHERE id = 'owner'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-base")
+        );
+        assert_eq!(
+            db.query_text("SELECT base_commit FROM jobs WHERE id = 'child'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-base")
+        );
+        assert_eq!(
+            db.query_text("SELECT pack_anchor FROM jobs WHERE id = 'owner'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("archive-anchor"),
+            "the archival anchor remains the historical coordinate"
+        );
+        assert!(compare_and_swap_owner_base(
+            db,
+            "owner".into(),
+            "/worktree".into(),
+            "old-base".into(),
+            "other-base".into(),
+            4,
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

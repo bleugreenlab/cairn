@@ -1,6 +1,6 @@
 //! Turn CRUD operations.
 
-use crate::models::{Turn, TurnStartReason, TurnState, TurnYieldReason};
+use crate::models::{Turn, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason};
 use crate::services::EventEmitter;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
@@ -28,6 +28,7 @@ pub struct UpdateTurnChangeset<'a> {
     pub run_id: Option<Option<&'a str>>,
     pub state: Option<&'a str>,
     pub yield_reason: Option<Option<&'a str>>,
+    pub end_reason: Option<Option<&'a str>>,
     pub started_at: Option<Option<i32>>,
     pub ended_at: Option<Option<i32>>,
     pub updated_at: Option<i32>,
@@ -84,10 +85,8 @@ pub async fn create_turn(
         .await
         .map_err(|e| format!("Failed to create turn: {e}"))?;
 
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "turns", "action": "insert"}),
-    );
+    let change = crate::notify::turn_db_change_for_id(db, &turn.id, "insert").await;
+    let _ = emitter.emit("db-change", change);
     Ok(turn)
 }
 
@@ -95,7 +94,7 @@ pub async fn get_turn(db: &LocalDb, turn_id: &str) -> Result<Turn, String> {
     let turn_id = turn_id.to_string();
     db.query_opt(
         "SELECT id, session_id, run_id, job_id, sequence,
-                predecessor_id, state, yield_reason, start_reason, created_at,
+                predecessor_id, state, yield_reason, end_reason, start_reason, created_at,
                 started_at, ended_at, updated_at
          FROM turns
          WHERE id = ?1",
@@ -111,7 +110,7 @@ pub async fn get_head_turn(db: &LocalDb, job_id: &str) -> Result<Option<Turn>, S
     load_one_turn_by_query(
         db,
         "SELECT t.id, t.session_id, t.run_id, t.job_id, t.sequence,
-                t.predecessor_id, t.state, t.yield_reason, t.start_reason, t.created_at,
+                t.predecessor_id, t.state, t.yield_reason, t.end_reason, t.start_reason, t.created_at,
                 t.started_at, t.ended_at, t.updated_at
          FROM jobs j
          LEFT JOIN turns current ON current.id = j.current_turn_id
@@ -137,7 +136,7 @@ pub async fn get_successor_turn(
     load_one_turn_by_query(
         db,
         "SELECT id, session_id, run_id, job_id, sequence,
-                predecessor_id, state, yield_reason, start_reason, created_at,
+                predecessor_id, state, yield_reason, end_reason, start_reason, created_at,
                 started_at, ended_at, updated_at
          FROM turns
          WHERE predecessor_id = ?1
@@ -178,6 +177,9 @@ pub async fn update_turn(
                 let yield_reason = changeset
                     .yield_reason
                     .unwrap_or_else(|| current.yield_reason.map(|reason| reason.to_string()));
+                let end_reason = changeset
+                    .end_reason
+                    .unwrap_or_else(|| current.end_reason.map(|reason| reason.to_string()));
                 let started_at = changeset
                     .started_at
                     .map(|value| value.map(i64::from))
@@ -192,13 +194,14 @@ pub async fn update_turn(
 
                 conn.execute(
                     "UPDATE turns
-                     SET run_id = ?1, state = ?2, yield_reason = ?3,
-                         started_at = ?4, ended_at = ?5, updated_at = ?6
-                     WHERE id = ?7",
+                     SET run_id = ?1, state = ?2, yield_reason = ?3, end_reason = ?4,
+                         started_at = ?5, ended_at = ?6, updated_at = ?7
+                     WHERE id = ?8",
                     params![
                         run_id.as_deref(),
                         state.as_str(),
                         yield_reason.as_deref(),
+                        end_reason.as_deref(),
                         started_at,
                         ended_at,
                         updated_at,
@@ -215,10 +218,8 @@ pub async fn update_turn(
         .await
         .map_err(|e| format!("Failed to update turn: {e}"))?;
 
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "turns", "action": "update"}),
-    );
+    let change = crate::notify::turn_db_change_for_id(db, &turn.id, "update").await;
+    let _ = emitter.emit("db-change", change);
     Ok(turn)
 }
 
@@ -299,10 +300,8 @@ pub async fn create_successor_turn(
         .await
         .map_err(|e| format!("Failed to create successor turn: {e}"))?;
 
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "turns", "action": "insert"}),
-    );
+    let change = crate::notify::turn_db_change_for_id(db, &turn.id, "insert").await;
+    let _ = emitter.emit("db-change", change);
     Ok(turn)
 }
 
@@ -414,11 +413,9 @@ pub async fn record_prompt_response(
         "db-change",
         serde_json::json!({"table": "prompts", "action": "update"}),
     );
-    if resume.successor_turn_id.is_some() {
-        let _ = emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "insert"}),
-        );
+    if let Some(turn_id) = resume.successor_turn_id.as_deref() {
+        let change = crate::notify::turn_db_change_for_id(db, turn_id, "insert").await;
+        let _ = emitter.emit("db-change", change);
     }
     Ok(resume)
 }
@@ -503,11 +500,9 @@ pub async fn record_permission_response(
         "db-change",
         serde_json::json!({"table": "permission_requests", "action": "update"}),
     );
-    if resume.successor_turn_id.is_some() {
-        let _ = emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "insert"}),
-        );
+    if let Some(turn_id) = resume.successor_turn_id.as_deref() {
+        let change = crate::notify::turn_db_change_for_id(db, turn_id, "insert").await;
+        let _ = emitter.emit("db-change", change);
     }
     Ok(resume)
 }
@@ -517,6 +512,7 @@ struct OwnedTurnChangeset {
     run_id: Option<Option<String>>,
     state: Option<String>,
     yield_reason: Option<Option<String>>,
+    end_reason: Option<Option<String>>,
     started_at: Option<Option<i32>>,
     ended_at: Option<Option<i32>>,
     updated_at: Option<i32>,
@@ -530,6 +526,7 @@ impl From<&UpdateTurnChangeset<'_>> for OwnedTurnChangeset {
             yield_reason: changeset
                 .yield_reason
                 .map(|value| value.map(str::to_string)),
+            end_reason: changeset.end_reason.map(|value| value.map(str::to_string)),
             started_at: changeset.started_at,
             ended_at: changeset.ended_at,
             updated_at: changeset.updated_at,
@@ -552,7 +549,7 @@ async fn list_by_column(db: &LocalDb, column: &str, value: &str) -> Result<Vec<T
     let value = value.to_string();
     let sql = format!(
         "SELECT id, session_id, run_id, job_id, sequence,
-                predecessor_id, state, yield_reason, start_reason, created_at,
+                predecessor_id, state, yield_reason, end_reason, start_reason, created_at,
                 started_at, ended_at, updated_at
          FROM turns
          WHERE {column} = ?1
@@ -712,7 +709,7 @@ async fn load_turn_conn(
     let mut rows = conn
         .query(
             "SELECT id, session_id, run_id, job_id, sequence,
-                    predecessor_id, state, yield_reason, start_reason, created_at,
+                    predecessor_id, state, yield_reason, end_reason, start_reason, created_at,
                     started_at, ended_at, updated_at
              FROM turns
              WHERE id = ?1",
@@ -732,7 +729,7 @@ async fn load_successor_turn_conn(
     let mut rows = conn
         .query(
             "SELECT id, session_id, run_id, job_id, sequence,
-                    predecessor_id, state, yield_reason, start_reason, created_at,
+                    predecessor_id, state, yield_reason, end_reason, start_reason, created_at,
                     started_at, ended_at, updated_at
              FROM turns
              WHERE predecessor_id = ?1
@@ -776,8 +773,12 @@ fn turn_from_row(row: &cairn_db::turso::Row) -> DbResult<Turn> {
         .opt_text(7)?
         .map(|value| value.parse::<TurnYieldReason>().map_err(DbError::Row))
         .transpose()?;
+    let end_reason = row
+        .opt_text(8)?
+        .map(|value| value.parse::<TurnEndReason>().map_err(DbError::Row))
+        .transpose()?;
     let start_reason = row
-        .text(8)?
+        .text(9)?
         .parse::<TurnStartReason>()
         .map_err(DbError::Row)?;
 
@@ -790,10 +791,91 @@ fn turn_from_row(row: &cairn_db::turso::Row) -> DbResult<Turn> {
         predecessor_id: row.opt_text(5)?,
         state,
         yield_reason,
+        end_reason,
         start_reason,
-        created_at: row.i64(9)?,
-        started_at: row.opt_i64(10)?,
-        ended_at: row.opt_i64(11)?,
-        updated_at: row.i64(12)?,
+        created_at: row.i64(10)?,
+        started_at: row.opt_i64(11)?,
+        ended_at: row.opt_i64(12)?,
+        updated_at: row.i64(13)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::EventEmitter;
+    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use serde_json::Value;
+
+    struct NoopEmitter;
+
+    impl EventEmitter for NoopEmitter {
+        fn emit(&self, _event: &str, _payload: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn emit_empty(&self, _event: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    async fn test_db() -> LocalDb {
+        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("turn-queries.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn seed_job_and_turn(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO jobs (id, project_id, status, current_turn_id, created_at, updated_at)
+             VALUES ('job', 'project', 'running', NULL, 1, 1);
+             INSERT INTO sessions (id, job_id, backend, status, created_at, updated_at)
+             VALUES ('session', 'job', 'claude', 'open', 1, 1);
+             INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('turn', 'session', 'job', 1, 'running', 'initial', 1, 1);
+             UPDATE jobs SET current_turn_id = 'turn' WHERE id = 'job';",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_head_turn_decodes_end_reason_projection() {
+        let db = test_db().await;
+        seed_job_and_turn(&db).await;
+
+        let turn = get_head_turn(&db, "job").await.unwrap().unwrap();
+        assert_eq!(turn.id, "turn");
+        assert_eq!(turn.start_reason, TurnStartReason::Initial);
+        assert_eq!(turn.end_reason, None);
+    }
+
+    #[tokio::test]
+    async fn update_turn_sets_and_clears_end_reason() {
+        let db = test_db().await;
+        seed_job_and_turn(&db).await;
+
+        let set = UpdateTurnChangeset {
+            end_reason: Some(Some("user_stop")),
+            ..Default::default()
+        };
+        let turn = update_turn(&db, "turn", &set, &NoopEmitter).await.unwrap();
+        assert_eq!(turn.end_reason, Some(TurnEndReason::UserStop));
+
+        let clear = UpdateTurnChangeset {
+            end_reason: Some(None),
+            ..Default::default()
+        };
+        let turn = update_turn(&db, "turn", &clear, &NoopEmitter)
+            .await
+            .unwrap();
+        assert_eq!(turn.end_reason, None);
+    }
 }

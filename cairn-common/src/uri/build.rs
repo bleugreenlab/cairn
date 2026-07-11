@@ -382,6 +382,49 @@ pub fn build_project_browser_uri(project: &str, slug: &str) -> String {
     format!("{}/browser/{}", build_project_uri(project), slug)
 }
 
+pub fn build_project_browser_network_request_uri(
+    project: &str,
+    slug: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "{}/network/{}",
+        build_project_browser_uri(project, slug),
+        request_id
+    )
+}
+
+pub fn build_node_browser_network_request_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    slug: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "{}/network/{}",
+        build_node_browser_uri(project, number, exec_seq, node_id, slug),
+        request_id
+    )
+}
+
+pub fn build_task_browser_network_request_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    slug: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "{}/network/{}",
+        build_task_browser_uri(project, number, exec_seq, node_id, task_name, slug),
+        request_id
+    )
+}
+
 fn append_path(base: String, path: &[String]) -> String {
     if path.is_empty() {
         base
@@ -634,6 +677,16 @@ impl CairnResource {
                 node_id,
                 slug,
             } => build_node_browser_uri(project, *number, *exec_seq, node_id, slug),
+            Self::NodeBrowserNetworkRequest {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                slug,
+                request_id,
+            } => build_node_browser_network_request_uri(
+                project, *number, *exec_seq, node_id, slug, request_id,
+            ),
             Self::TaskBrowser {
                 project,
                 number,
@@ -642,6 +695,17 @@ impl CairnResource {
                 task_name,
                 slug,
             } => build_task_browser_uri(project, *number, *exec_seq, node_id, task_name, slug),
+            Self::TaskBrowserNetworkRequest {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                slug,
+                request_id,
+            } => build_task_browser_network_request_uri(
+                project, *number, *exec_seq, node_id, task_name, slug, request_id,
+            ),
             Self::Task {
                 project,
                 number,
@@ -825,6 +889,11 @@ impl CairnResource {
             } => build_node_diff_uri(project, *number, *exec_seq, node_id),
             Self::ProjectTerminal { project, slug } => build_project_terminal_uri(project, slug),
             Self::ProjectBrowser { project, slug } => build_project_browser_uri(project, slug),
+            Self::ProjectBrowserNetworkRequest {
+                project,
+                slug,
+                request_id,
+            } => build_project_browser_network_request_uri(project, slug, request_id),
             Self::NodeSymbols {
                 project,
                 number,

@@ -51,23 +51,32 @@ pub fn advance_execution_impl(orch: &Orchestrator, execution_id: &str) -> Result
     })?;
 
     if !newly_ready.is_empty() {
-        // One scoped jobs event per newly-ready job; the frontend's invalidation
-        // batch dedupes them into the minimal scoped set. Executions/issues stay
-        // broad (this sweep moves an execution and possibly its issue wholesale).
+        // Emit one fully-scoped set per newly-ready job; the frontend's 75 ms
+        // batch dedupes jobs in the same execution/project to the minimal keys.
         for job in &newly_ready {
             let _ = orch
                 .services
                 .emitter
                 .emit("db-change", crate::notify::job_db_change(job, "update"));
+            if let Some(execution_id) = job.execution_id.as_deref() {
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    serde_json::json!({
+                        "table": "executions",
+                        "action": "update",
+                        "issueId": job.issue_id,
+                        "executionId": execution_id,
+                        "projectId": job.project_id,
+                    }),
+                );
+            }
+            if let Some(issue_id) = job.issue_id.as_deref() {
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    crate::notify::issue_db_change_ids("update", issue_id, Some(&job.project_id)),
+                );
+            }
         }
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "executions", "action": "update"}),
-        );
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "issues", "action": "update"}),
-        );
     }
 
     Ok(newly_ready)

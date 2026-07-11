@@ -471,6 +471,36 @@ pub async fn append_direct_message(
         content,
         escalate,
         None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn append_direct_message_for_remote_intent(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project_key: &str,
+    issue_number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: Option<&str>,
+    content: &str,
+    escalate: bool,
+    intent_id: &str,
+) -> Result<String, String> {
+    append_direct_message_with_urgency(
+        orch,
+        request,
+        project_key,
+        issue_number,
+        exec_seq,
+        node_name,
+        task_name,
+        content,
+        escalate,
+        None,
+        Some(intent_id),
     )
     .await
 }
@@ -487,6 +517,7 @@ pub async fn append_direct_message_with_urgency(
     content: &str,
     escalate: bool,
     payload_urgency: Option<crate::messages::queued::DeliveryUrgency>,
+    mutation_key: Option<&str>,
 ) -> Result<String, String> {
     if content.is_empty() {
         return Err("Message content cannot be empty".to_string());
@@ -545,7 +576,8 @@ pub async fn append_direct_message_with_urgency(
     } else {
         payload_urgency.unwrap_or(crate::messages::queued::DeliveryUrgency::Steer)
     };
-    let msg = msg_db::insert_message_with_urgency(
+    let stable_message_id = mutation_key.map(|key| format!("remote-intent-message:{key}"));
+    let msg = msg_db::insert_message_with_urgency_and_id(
         &owning_db,
         &ChannelType::Direct,
         None,
@@ -554,6 +586,7 @@ pub async fn append_direct_message_with_urgency(
         Some(&recipient_run_id),
         content,
         Some(urgency),
+        stable_message_id.as_deref(),
     )
     .map_err(|e| format!("Failed to send message: {e}"))?;
 
@@ -594,20 +627,30 @@ pub async fn append_direct_message_with_urgency(
         requested_wake,
     )
     .await?;
-    if let Err(e) = crate::orchestrator::attention_push::push(
-        &owning_db,
-        &job_id,
-        &addressed_uri,
-        effective_wake,
-        crate::orchestrator::attention_push::Boundary::Event,
-        &format!("direct:{}", msg.id),
-    )
-    .await
-    {
-        return Err(format!(
-            "Failed to queue direct message to {}: {}",
-            recipient_label, e
-        ));
+    let push_key = format!("direct:{}", msg.id);
+    let push_exists = if mutation_key.is_some() {
+        crate::orchestrator::attention_push::has_push_identity(&owning_db, &job_id, &push_key)
+            .await
+            .map_err(|e| format!("Failed to inspect direct-message delivery identity: {e}"))?
+    } else {
+        false
+    };
+    if !push_exists {
+        if let Err(e) = crate::orchestrator::attention_push::push(
+            &owning_db,
+            &job_id,
+            &addressed_uri,
+            effective_wake,
+            crate::orchestrator::attention_push::Boundary::Event,
+            &push_key,
+        )
+        .await
+        {
+            return Err(format!(
+                "Failed to queue direct message to {}: {}",
+                recipient_label, e
+            ));
+        }
     }
 
     // The user→child side-channel / catch-up notice for the watching parent is a
@@ -898,6 +941,7 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
             &payload.content,
             payload.escalate,
             payload.urgency,
+            None,
         )
         .await
         .unwrap_or_else(|e| e),

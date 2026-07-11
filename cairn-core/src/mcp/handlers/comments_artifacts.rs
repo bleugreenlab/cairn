@@ -21,12 +21,58 @@ pub async fn append_issue_comment(
     issue_number: i32,
     content: &str,
 ) -> Result<String, String> {
+    append_issue_comment_canonical(
+        orch,
+        request,
+        project_key,
+        issue_number,
+        content,
+        "agent",
+        None,
+    )
+    .await
+}
+
+pub async fn append_issue_comment_for_remote_intent(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project_key: &str,
+    issue_number: i32,
+    content: &str,
+    intent_id: &str,
+) -> Result<String, String> {
+    append_issue_comment_canonical(
+        orch,
+        request,
+        project_key,
+        issue_number,
+        content,
+        "user",
+        Some(intent_id),
+    )
+    .await
+}
+
+async fn append_issue_comment_canonical(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project_key: &str,
+    issue_number: i32,
+    content: &str,
+    source: &str,
+    intent_id: Option<&str>,
+) -> Result<String, String> {
     let services = &orch.services;
     let project_key_upper = project_key.to_uppercase();
-    let (_comment_id, issue_id, _now) =
-        append_issue_comment_db(orch, &project_key_upper, issue_number, content.to_string())
-            .await?;
-    let source = "agent";
+    let (_comment_id, issue_id, _now) = append_issue_comment_db(
+        orch,
+        &project_key_upper,
+        issue_number,
+        content.to_string(),
+        source,
+        intent_id,
+    )
+    .await?;
 
     let _ = services.emitter.emit(
         "db-change",
@@ -37,15 +83,22 @@ pub async fn append_issue_comment(
         .await
         .ok()
         .map(|ctx| ctx.job_id);
-    if let Err(error) = crate::messages::side_channel::record_issue_comment_side_channel_async(
-        orch,
-        &issue_id,
-        source,
-        content,
-        exclude_job_id.as_deref(),
-    )
-    .await
+    if let Err(error) =
+        crate::messages::side_channel::record_issue_comment_side_channel_for_intent_async(
+            orch,
+            &issue_id,
+            source,
+            content,
+            exclude_job_id.as_deref(),
+            intent_id,
+        )
+        .await
     {
+        if intent_id.is_some() {
+            return Err(format!(
+                "Failed to record issue comment side-channel notices: {error}"
+            ));
+        }
         log::warn!("Failed to record issue comment side-channel notices: {error}");
     }
 
@@ -553,7 +606,7 @@ pub(crate) async fn write_artifact_change(
 
     let verb = if is_patch { "patched" } else { "wrote" };
     Ok(format!(
-        "Artifact {} ({}, type: {}, version {}){}{}",
+        "Artifact {} ({}, type: {}, version {}){}{}{}",
         verb,
         artifact_uri,
         stored.artifact_type,
@@ -567,7 +620,8 @@ pub(crate) async fn write_artifact_change(
             " — synced PR title/body"
         } else {
             ""
-        }
+        },
+        terminal_handoff_suffix(should_arm_terminal_interrupt)
     ))
 }
 
@@ -689,8 +743,12 @@ async fn append_issue_comment_db(
     project_key_upper: &str,
     issue_number: i32,
     content: String,
+    source: &str,
+    intent_id: Option<&str>,
 ) -> Result<(String, String, i32), String> {
     let project_key_upper = project_key_upper.to_string();
+    let source = source.to_string();
+    let stable_comment_id = intent_id.map(|id| format!("remote-intent-comment:{id}"));
     // The comment row lives in the database that owns the project (CAIRN-2181):
     // a team project's issues/comments live in its team replica. Edit/delete
     // already route via `for_project`; append must match or an appended comment
@@ -700,6 +758,8 @@ async fn append_issue_comment_db(
         .write(|conn| {
             let project_key_upper = project_key_upper.clone();
             let content = content.clone();
+            let source = source.clone();
+            let stable_comment_id = stable_comment_id.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
@@ -720,26 +780,45 @@ async fn append_issue_comment_db(
                     ))
                 })?;
                 let issue_id = row.text(0)?;
-                let comment_id = ids::mint_child(&issue_id);
+                let comment_id = stable_comment_id.unwrap_or_else(|| ids::mint_child(&issue_id));
                 let now = chrono::Utc::now().timestamp() as i32;
                 let seq = crate::issues::comments::next_issue_comment_seq(conn, &issue_id).await?;
 
                 conn.execute(
                     "
-                    INSERT INTO comments (id, issue_id, content, source, created_at, seq)
-                    VALUES (?1, ?2, ?3, 'agent', ?4, ?5)
+                    INSERT OR IGNORE INTO comments (id, issue_id, content, source, created_at, seq)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                     ",
                     params![
                         comment_id.as_str(),
                         issue_id.as_str(),
                         content.as_str(),
+                        source.as_str(),
                         now,
                         seq
                     ],
                 )
                 .await?;
 
-                Ok((comment_id, issue_id, now))
+                let mut existing = conn
+                    .query(
+                        "SELECT issue_id, content, source, created_at FROM comments WHERE id=?1",
+                        params![comment_id.as_str()],
+                    )
+                    .await?;
+                let existing = existing.next().await?.ok_or_else(|| {
+                    DbError::Row("comment missing after idempotent insert".into())
+                })?;
+                if existing.text(0)? != issue_id
+                    || existing.text(1)? != content
+                    || existing.text(2)? != source
+                {
+                    return Err(DbError::Row(format!(
+                        "comment identity {comment_id} already exists with different content"
+                    )));
+                }
+                let durable_created_at = existing.i64(3)? as i32;
+                Ok((comment_id, issue_id, durable_created_at))
             })
         })
         .await
@@ -764,6 +843,14 @@ fn resolve_confirmed(is_patch: bool, prior_confirmed: Option<bool>, policy: Conf
         (_, Some(true)) => true,
         (true, Some(false)) => false,
         _ => matches!(policy, ConfirmPolicy::Auto),
+    }
+}
+
+fn terminal_handoff_suffix(should_arm_terminal_interrupt: bool) -> &'static str {
+    if should_arm_terminal_interrupt {
+        " — applied; this turn now ends for review (an intentional handoff by Cairn — any interruption notice that follows is the turn boundary, not a user abort)"
+    } else {
+        ""
     }
 }
 
@@ -1330,7 +1417,8 @@ mod tests {
     use super::{
         apply_artifact_patch, merge_artifact_payload, require_create_pr_branch_metadata,
         resolve_confirmed, should_arm_output_artifact_interrupt,
-        sweep_gate_and_publish_create_pr_branch_locked, validate_against_schema,
+        sweep_gate_and_publish_create_pr_branch_locked, terminal_handoff_suffix,
+        validate_against_schema,
     };
     use crate::models::ConfirmPolicy;
     use serde_json::json;
@@ -1658,6 +1746,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_handoff_suffix_only_describes_armed_writes() {
+        assert!(terminal_handoff_suffix(true).contains("intentional handoff by Cairn"));
+        assert_eq!(terminal_handoff_suffix(false), "");
+    }
     #[test]
     fn output_artifact_interrupt_arms_only_matching_creates() {
         assert!(should_arm_output_artifact_interrupt(

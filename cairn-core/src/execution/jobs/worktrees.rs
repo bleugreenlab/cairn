@@ -347,10 +347,8 @@ pub(crate) fn ensure_ephemeral_task_worktree(
     issue_id: Option<String>,
     base_ref: &str,
 ) -> Result<(String, String), String> {
-    let worktrees_dir = dirs::home_dir()
-        .ok_or("Could not find home directory")?
-        .join(".cairn")
-        .join("worktrees");
+    let worktrees_dir =
+        crate::managed_worktrees::base_dir().ok_or("Could not find managed worktrees directory")?;
     // The job id is globally unique, so a directory keyed on it never collides
     // with another task's ephemeral worktree.
     let safe_id: String = job_id

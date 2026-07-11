@@ -51,6 +51,10 @@ pub mod backends {
     pub use crate::backends::*;
 }
 
+pub mod browser_network {
+    pub use crate::browser_network::*;
+}
+
 pub mod browsers {
     pub use crate::browsers::*;
 }
@@ -133,6 +137,10 @@ pub mod storage {
 
 pub mod terminal_host {
     pub use crate::terminal_host::*;
+}
+
+pub mod team_remote_intents {
+    pub use crate::team_remote_intents::*;
 }
 
 pub mod workspace {

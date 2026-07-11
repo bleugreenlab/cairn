@@ -346,6 +346,9 @@ pub(super) async fn update_job_worktree(
     base_commit: Option<String>,
     now: i32,
 ) -> Result<(), String> {
+    if let Some(path) = worktree_path.as_deref() {
+        crate::managed_worktrees::validate_path(Path::new(path))?;
+    }
     db.write(|conn| {
         let job_id = job_id.clone();
         let worktree_path = worktree_path.clone();
@@ -735,6 +738,9 @@ pub(crate) async fn insert_child_job_session_run(
     db: Arc<LocalDb>,
     input: ChildInsert,
 ) -> Result<(), String> {
+    if let Some(path) = input.worktree_path.as_deref() {
+        crate::managed_worktrees::validate_path(Path::new(path))?;
+    }
     let seed_db = db.clone();
     let seed_job_id = input.job_id.clone();
     db.write(|conn| {
@@ -1035,6 +1041,14 @@ mod pack_anchor_tests {
     const CHILD_SHA: &str = "3333333333333333333333333333333333333333";
     const DEFAULT_SHA: &str = "4444444444444444444444444444444444444444";
 
+    fn managed_path(name: &str) -> String {
+        crate::managed_worktrees::base_dir()
+            .expect("test environment has a home directory")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     async fn job_anchors(db: &LocalDb, job_id: &str) -> (Option<String>, Option<String>) {
         let job_id = job_id.to_string();
         db.read(|conn| {
@@ -1076,7 +1090,7 @@ mod pack_anchor_tests {
         update_job_worktree(
             db.clone(),
             "job".to_string(),
-            Some("/wt/job".to_string()),
+            Some(managed_path("pack-anchor-job")),
             Some("agent/job".to_string()),
             Some(DEFAULT_SHA.to_string()),
             2,
@@ -1119,7 +1133,7 @@ mod pack_anchor_tests {
         update_job_worktree(
             db.clone(),
             "job-child".to_string(),
-            Some("/wt/child".to_string()),
+            Some(managed_path("pack-anchor-child")),
             Some("agent/child-int".to_string()),
             Some(CHILD_SHA.to_string()),
             2,
@@ -1169,7 +1183,7 @@ mod pack_anchor_tests {
         update_job_worktree(
             db.clone(),
             "job-p2".to_string(),
-            Some("/wt/p2".to_string()),
+            Some(managed_path("pack-anchor-p2")),
             Some("agent/p2-int".to_string()),
             Some(P2_SHA.to_string()),
             2,
@@ -1183,7 +1197,7 @@ mod pack_anchor_tests {
         update_job_worktree(
             db.clone(),
             "job-c".to_string(),
-            Some("/wt/c".to_string()),
+            Some(managed_path("pack-anchor-c")),
             Some("agent/c-int".to_string()),
             Some(CHILD_SHA.to_string()),
             3,

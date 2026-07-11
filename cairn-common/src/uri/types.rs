@@ -159,6 +159,14 @@ pub enum CairnResource {
         node_id: String,
         slug: String,
     },
+    NodeBrowserNetworkRequest {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        slug: String,
+        request_id: String,
+    },
     TaskBrowser {
         project: String,
         number: i32,
@@ -166,6 +174,15 @@ pub enum CairnResource {
         node_id: String,
         task_name: String,
         slug: String,
+    },
+    TaskBrowserNetworkRequest {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+        slug: String,
+        request_id: String,
     },
     /// A sub-agent task job's base (`.../{node}/task/{name}`). The task analogue
     /// of `Node` — a job is a job. `node_id` is the parent node; `task_name` is
@@ -392,6 +409,11 @@ pub enum CairnResource {
         project: String,
         slug: String,
     },
+    ProjectBrowserNetworkRequest {
+        project: String,
+        slug: String,
+        request_id: String,
+    },
     /// Contextual skills collection (workspace + current project).
     Skills,
     /// Contextual skill package (resolves project-first, then workspace).
@@ -564,6 +586,7 @@ impl CairnResource {
             Self::ProjectMessages { .. } => ResourceKind::ProjectMessages,
             Self::ProjectTerminal { .. } => ResourceKind::ProjectTerminal,
             Self::ProjectBrowser { .. } => ResourceKind::ProjectBrowser,
+            Self::ProjectBrowserNetworkRequest { .. } => ResourceKind::ProjectBrowserNetworkRequest,
             Self::Issue { .. } => ResourceKind::Issue,
             Self::Changed { .. } => ResourceKind::Changed,
             Self::IssueExecutions { .. } => ResourceKind::IssueExecutions,
@@ -585,7 +608,9 @@ impl CairnResource {
             Self::NodeRepl { .. } => ResourceKind::NodeRepl,
             Self::TaskTerminal { .. } => ResourceKind::TaskTerminal,
             Self::NodeBrowser { .. } => ResourceKind::NodeBrowser,
+            Self::NodeBrowserNetworkRequest { .. } => ResourceKind::NodeBrowserNetworkRequest,
             Self::TaskBrowser { .. } => ResourceKind::TaskBrowser,
+            Self::TaskBrowserNetworkRequest { .. } => ResourceKind::TaskBrowserNetworkRequest,
             Self::Task { .. } => ResourceKind::Task,
             Self::TaskChat { .. } => ResourceKind::TaskChat,
             Self::TaskChatRaw { .. } => ResourceKind::TaskChatRaw,

@@ -2,7 +2,7 @@
 //! completion. Sliced verbatim from the former `lifecycle.rs`.
 
 use crate::mcp::handlers::{emit_attention, AttentionEvent};
-use crate::models::{RunStatus, TurnState};
+use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, RowExt};
 
@@ -15,19 +15,35 @@ use super::review_push::{detach_onto_runtime, emit_for_turn_end, spawn_turn_end_
 /// Completes the current Turn and transitions process occupancy to Idle.
 ///
 /// Returns true if the process was successfully transitioned to warm.
-pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
+pub fn transition_to_warm_state(
+    orch: &Orchestrator,
+    run_id: &str,
+    end_reason: Option<TurnEndReason>,
+) -> bool {
     // Complete the current turn before transitioning occupancy
     let completed_turn_id = orch.process_state.get_current_turn_id(run_id);
     if let Some(turn_id) = completed_turn_id.as_deref() {
-        let _ = apply_turn_outcome(orch, turn_id, TurnState::Complete);
+        let _ = apply_turn_outcome(orch, turn_id, TurnState::Complete, end_reason);
     }
 
     if orch.process_state.transition_to_warm(run_id) {
-        // Emit turn db-change so frontend sees the turn completion
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "update"}),
-        );
+        // Emit the completed turn with its authoritative job/project scope.
+        if let Some(turn_id) = completed_turn_id.as_deref() {
+            let change = run_db_blocking({
+                let dbs = orch.db.clone();
+                let run_id = run_id.to_string();
+                let turn_id = turn_id.to_string();
+                move || async move {
+                    let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await)
+                }
+            });
+            if let Ok(change) = change {
+                let _ = orch.services.emitter.emit("db-change", change);
+            }
+        }
 
         log::info!(
             "Run {} transitioned to warm state (process retained for potential follow-up)",
@@ -42,16 +58,9 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
         // transition is the turn-complete signal and must drive the recompute.
         if let Some(job_id) = job_id_for_run(orch, run_id) {
             // Turn-end project checks (when:review), detached so the suite never
-            // blocks the turn from ending. This MUST precede `recompute_job`: the
-            // recompute review-readiness hook (fired when this job flips
-            // terminal/idle) detaches an `evaluate_review_readiness` that reads
-            // the turn-end-check single-flight markers. Claiming this job's slot
-            // synchronously first guarantees that hook sees checks in-flight and
-            // defers, instead of racing the launch and pushing a premature parent
-            // review before this job's own review-cadence suite has even started
-            // (CAIRN-2483). If the suite is skipped (memory-review turn, no
-            // worktree, no applicable checks) no slot is held and the hook fires
-            // correctly — there is genuinely nothing to wait for.
+            // blocks the turn from ending. Detached review-cadence checks are
+            // child feedback and do not gate the parent review wake; semantic
+            // liveness remains owned by `issue_settled` in the recompute hook.
             spawn_turn_end_checks(orch, &job_id);
             if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
                 log::error!(
@@ -489,7 +498,7 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
         .get_current_turn_id(run_id)
         .or_else(|| current_turn_id_for_run(orch, run_id));
     if let Some(turn_id) = turn_id {
-        if let Err(e) = apply_turn_outcome(orch, &turn_id, TurnState::Failed) {
+        if let Err(e) = apply_turn_outcome(orch, &turn_id, TurnState::Failed, None) {
             log::warn!(
                 "fail_run: failed to mark turn {} as Failed for run {}: {}",
                 turn_id,
@@ -606,14 +615,14 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
                 // Running (Pending) produced nothing, so fail it rather than
                 // leaving it live (which would keep the job derived as Running).
                 if turn_state.as_str() == "pending" {
-                    apply_turn_outcome(orch, turn_id, TurnState::Failed)
+                    apply_turn_outcome(orch, turn_id, TurnState::Failed, None)
                 } else {
-                    apply_turn_outcome(orch, turn_id, TurnState::Complete)
+                    apply_turn_outcome(orch, turn_id, TurnState::Complete, None)
                 }
             } else if turn_state.as_str() == "running" {
-                interrupt_turn(orch, turn_id)
+                interrupt_turn(orch, turn_id, Some(TurnEndReason::Crash))
             } else {
-                apply_turn_outcome(orch, turn_id, TurnState::Failed)
+                apply_turn_outcome(orch, turn_id, TurnState::Failed, None)
             };
 
             if let Err(e) = result {

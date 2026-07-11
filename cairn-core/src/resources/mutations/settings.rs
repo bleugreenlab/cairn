@@ -27,6 +27,8 @@ const PREF_KEYS: &[&str] = &[
     "repoTargetSweepDays",
     "bugReports",
     "thinkingDisplayMode",
+    "transcriptTextSize",
+    "transcriptDensity",
     "logLevel",
     "memoryReviewEnabled",
     "pendingMemoryThreshold",

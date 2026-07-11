@@ -70,21 +70,6 @@ pub enum IssueHistoryMode {
     Verbose,
 }
 
-/// Payload for update_issue tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateIssuePayload {
-    pub issue_number: String,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub depends_on: Option<Vec<String>>,
-    #[serde(default)]
-    pub labels: Option<Vec<String>>,
-    /// Project key (e.g., "CAIRN"). Falls back to issue_number prefix or CWD.
-    pub project: Option<String>,
-}
-
 /// Supported operations for the canonical change carrier.
 ///
 /// Defined once in `cairn-common` so the contract table and this dispatcher

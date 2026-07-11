@@ -71,38 +71,79 @@ pub async fn node_check_statuses(
         return Some(Vec::new());
     }
 
-    let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let live_rows = worktree_path.as_deref().and_then(|path| {
-        sealed_tree_hash(&jj, Path::new(path))
-            .ok()
-            .and_then(|tree_hash| {
-                list_check_results(db.clone(), &coords.project_id, &tree_hash).ok()
-            })
-            .filter(|rows| !rows.is_empty())
-    });
-    let rows = live_rows
-        .or_else(|| list_check_results_for_job(db.clone(), job_id).ok())
-        .unwrap_or_default();
-    let rows_by_name: HashMap<String, CheckResultCacheEntry> = rows
-        .into_iter()
-        .map(|row| (row.check_name.clone(), row))
-        .collect();
-
+    // Status resolution waits on jj, cargo metadata, and the synchronous cache
+    // bridge. Routing and config loading above stay async; the complete status
+    // snapshot below belongs on the blocking pool so rendering `/checks` cannot
+    // park a runtime worker.
     let in_flight = orch.turn_end_checks_in_flight(job_id);
-    let changed = worktree_path.as_deref().and_then(|path| {
-        node_changed_files(
-            &jj,
-            Path::new(path),
-            coords.base_branch.as_deref(),
-            coords.base_commit.as_deref(),
-        )
-    });
-    let plans_by_name = changed.as_ref().map(|changed| {
-        plan_checks(&checks, changed, worktree_root)
+    let runtime_status = orch.turn_end_check_runtime_status(job_id);
+    let status_db = db.clone();
+    let status_job_id = job_id.to_string();
+    let status_project_id = coords.project_id.clone();
+    let status_base_branch = coords.base_branch.clone();
+    let status_base_commit = coords.base_commit.clone();
+    let status_worktree = worktree_path.clone();
+    let status_root = worktree_root.to_path_buf();
+    let status_checks = checks.clone();
+    let status_jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let (rows_by_name, applicable_names) = tokio::task::spawn_blocking(move || {
+        // A running review suite publishes its sealed tree and applicable check
+        // names once planning finishes. The 1 Hz live-tail poll therefore needs
+        // only that immutable snapshot plus current-tree cache rows; re-running jj
+        // tree resolution and the cumulative diff on every tick is both redundant
+        // and, under repository load, orders of magnitude more expensive than the
+        // rest of this handler.
+        // Once the suite settles, take the full VCS-backed snapshot exactly once
+        // so not-applicable checks and cross-equivalent-tree cache hits are exact.
+        let (rows, applicable_names) = if in_flight {
+            match runtime_status {
+                Some(status) => (
+                    list_check_results(status_db, &status_project_id, &status.tree_hash)
+                        .unwrap_or_default(),
+                    Some(status.applicable_names),
+                ),
+                // Planning has not published its sealed-tree snapshot yet. Keep
+                // every review check pending rather than showing stale rows from
+                // an earlier run of this long-lived job.
+                None => (Vec::new(), None),
+            }
+        } else {
+            let live_rows = status_worktree.as_deref().and_then(|path| {
+                sealed_tree_hash(&status_jj, Path::new(path))
+                    .ok()
+                    .and_then(|tree_hash| {
+                        list_check_results(status_db.clone(), &status_project_id, &tree_hash).ok()
+                    })
+                    .filter(|rows| !rows.is_empty())
+            });
+            let rows = live_rows
+                .or_else(|| list_check_results_for_job(status_db, &status_job_id).ok())
+                .unwrap_or_default();
+            let changed = status_worktree.as_deref().and_then(|path| {
+                node_changed_files(
+                    &status_jj,
+                    Path::new(path),
+                    status_base_branch.as_deref(),
+                    status_base_commit.as_deref(),
+                )
+            });
+            let applicable_names = changed.as_ref().map(|changed| {
+                plan_checks(&status_checks, changed, &status_root)
+                    .into_iter()
+                    .filter(|plan| plan.applies)
+                    .map(|plan| plan.name)
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            (rows, applicable_names)
+        };
+        let rows_by_name: HashMap<String, CheckResultCacheEntry> = rows
             .into_iter()
-            .map(|plan| (plan.name.clone(), plan))
-            .collect::<HashMap<_, _>>()
-    });
+            .map(|row| (row.check_name.clone(), row))
+            .collect();
+        (rows_by_name, applicable_names)
+    })
+    .await
+    .ok()?;
 
     let mut names = checks.keys().cloned().collect::<Vec<_>>();
     names.sort();
@@ -118,10 +159,9 @@ pub async fn node_check_statuses(
                 // A review check does not apply when the impact gate excluded it
                 // from this tree's plan; it will never run, so it is neither
                 // running nor pending.
-                let not_applicable = plans_by_name
+                let not_applicable = applicable_names
                     .as_ref()
-                    .and_then(|plans| plans.get(&name))
-                    .is_some_and(|plan| !plan.applies);
+                    .is_some_and(|names| !names.contains(&name));
 
                 // Turn-end review checks run CONCURRENTLY in isolated COW clones
                 // (or sequentially in the shared worktree on the clone-unavailable
@@ -252,7 +292,16 @@ pub fn format_status_annotation(status: &NodeCheckStatus) -> Option<String> {
                 // A classified death renders AS itself ("timed out after 30m",
                 // "failed to spawn"), never a bare "N of M failed" the agent
                 // would chase into tests that never failed.
-                let mut s = kind.describe(status.duration_ms.unwrap_or(0));
+                let mut s = if kind == CheckFailureKind::RunnerError {
+                    match status.passed.unwrap_or(0) {
+                        0 => "test runner failed before reporting tests".to_string(),
+                        passed => format!(
+                            "test runner failed after {passed} tests passed with no assertion failures"
+                        ),
+                    }
+                } else {
+                    kind.describe(status.duration_ms.unwrap_or(0))
+                };
                 if kind == CheckFailureKind::TimedOut && !status.failure_names.is_empty() {
                     s.push_str(&format!(
                         "; still running: {}",

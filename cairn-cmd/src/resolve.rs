@@ -421,8 +421,9 @@ mod tests {
             "cairn://p/CAIRN/2691/1/builder/diff"
         );
         assert_eq!(
-            mcp.resolve_read_target("cairn:~/diff?view=check").unwrap(),
-            "cairn://p/CAIRN/2691/1/builder/diff?view=check"
+            mcp.resolve_read_target("cairn:~/diff?view=symbols&glob=src/**/*.rs")
+                .unwrap(),
+            "cairn://p/CAIRN/2691/1/builder/diff?view=symbols&glob=src/**/*.rs"
         );
         assert_eq!(
             mcp.resolve_read_target("cairn:~/messages").unwrap(),
@@ -454,6 +455,11 @@ mod tests {
             mcp.resolve_read_target_with("cairn:~/return?limit=5", true)
                 .unwrap(),
             "cairn:~/return?limit=5"
+        );
+        assert_eq!(
+            mcp.resolve_read_target_with("cairn:~/diff?view=symbols&glob=src/**/*.rs", true)
+                .unwrap(),
+            "cairn:~/diff?view=symbols&glob=src/**/*.rs"
         );
         // Canonical + file targets are unchanged on the pooled path.
         assert_eq!(

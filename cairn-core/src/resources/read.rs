@@ -38,6 +38,7 @@ use super::workflows::{read_workflow, read_workflows_collection};
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
+use base64::Engine;
 use cairn_common::query::{split_target_query, QueryParam};
 use cairn_common::read::{Affordance, ImageBlock, NaturalUnit, SegmentKind};
 use cairn_common::uri::{parse_uri, CairnResource};
@@ -68,10 +69,26 @@ pub(crate) struct RenderedResource {
     /// `Match`: real matches over the produced body (not context lines). Drives
     /// the `[N matches]` header suffix for a universal-grep result.
     pub match_count: Option<usize>,
+    pub record_prelude_lines: Option<usize>,
     pub affordance: Option<Affordance>,
     /// Image blocks (e.g. a browser screenshot) lifted into the read envelope
     /// alongside the text body. Empty for ordinary text resources.
     pub images: Vec<ImageBlock>,
+}
+
+fn apply_line_char_offset(content: &str, line_offset: usize, char_offset: usize) -> String {
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == line_offset {
+                line.chars().skip(char_offset).collect::<String>()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl RenderedResource {
@@ -91,6 +108,7 @@ impl RenderedResource {
             offset,
             limit,
             match_count: None,
+            record_prelude_lines: None,
             affordance,
             images: Vec::new(),
         }
@@ -109,29 +127,7 @@ impl RenderedResource {
             offset: None,
             limit: None,
             match_count: Some(match_count),
-            affordance,
-            images: Vec::new(),
-        }
-    }
-
-    /// A `Record`-unit result: the producer already applied item offset/limit.
-    fn records(
-        content: String,
-        unit_noun: &'static str,
-        shown_units: usize,
-        offset: usize,
-        limit: usize,
-        affordance: Option<Affordance>,
-    ) -> Self {
-        Self {
-            content,
-            natural_unit: NaturalUnit::Record,
-            unit_noun: Some(unit_noun),
-            total_units: None,
-            shown_units: Some(shown_units),
-            offset: Some(offset as i64),
-            limit: Some(limit),
-            match_count: None,
+            record_prelude_lines: None,
             affordance,
             images: Vec::new(),
         }
@@ -155,6 +151,7 @@ impl RenderedResource {
             offset: Some(offset as i64),
             limit,
             match_count: None,
+            record_prelude_lines: None,
             affordance,
             images: Vec::new(),
         }
@@ -182,11 +179,18 @@ fn rendered_chat_total_turns(content: &str) -> Option<usize> {
 const DB_SQL_DEFAULT_LIMIT: usize = 100;
 const DB_SQL_MAX_LIMIT: usize = 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbSqlFormat {
+    Text,
+    Json,
+}
+
 #[derive(Debug)]
 struct DbSqlProjection {
     sql: String,
     offset: usize,
     limit: usize,
+    format: DbSqlFormat,
 }
 
 fn parse_db_sql_projection(params: &[QueryParam]) -> Result<DbSqlProjection, String> {
@@ -217,9 +221,18 @@ fn parse_db_sql_projection_with(
         None => DB_SQL_DEFAULT_LIMIT,
     };
     let limit = requested_limit.min(DB_SQL_MAX_LIMIT);
+    let format = match find_query_value(params, "format") {
+        None => DbSqlFormat::Text,
+        Some("json") => DbSqlFormat::Json,
+        Some(value) => {
+            return Err(format!(
+                "Invalid value for query parameter 'format': {value} (accepted: json; omit format for tab-separated text)"
+            ))
+        }
+    };
 
     if let Some(unsupported) = params.iter().find(|param| {
-        !matches!(param.key.as_str(), "sql" | "offset" | "limit")
+        !matches!(param.key.as_str(), "sql" | "offset" | "limit" | "format")
             && !allowed_extra.contains(&param.key.as_str())
     }) {
         return Err(format!(
@@ -228,7 +241,12 @@ fn parse_db_sql_projection_with(
         ));
     }
     validate_read_only_sql(&sql)?;
-    Ok(DbSqlProjection { sql, offset, limit })
+    Ok(DbSqlProjection {
+        sql,
+        offset,
+        limit,
+        format,
+    })
 }
 
 fn validate_read_only_sql(sql: &str) -> Result<(), String> {
@@ -405,14 +423,19 @@ async fn produce_db_sql_resource(
         Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
     match run_db_sql_projection(orch, &projection).await {
-        Ok((body, shown)) => RenderedResource::records(
-            body,
-            "rows",
-            shown,
-            projection.offset,
-            projection.limit,
+        Ok((body, shown, total)) => RenderedResource {
+            content: body,
+            natural_unit: NaturalUnit::Record,
+            unit_noun: Some("rows"),
+            total_units: total,
+            shown_units: Some(shown),
+            offset: Some(projection.offset as i64),
+            limit: Some(projection.limit),
+            match_count: None,
+            record_prelude_lines: (projection.format == DbSqlFormat::Json).then_some(1),
             affordance,
-        ),
+            images: Vec::new(),
+        },
         Err(error) => {
             RenderedResource::line(format!("SQL query failed: {error}"), affordance, None, None)
         }
@@ -442,6 +465,15 @@ async fn produce_dev_db_sql_resource(
         Ok(projection) => projection,
         Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
+    if projection.format == DbSqlFormat::Json {
+        return RenderedResource::line(
+            "cairn://dev/db does not support format=json; query cairn://db on the selected dev instance directly"
+                .to_string(),
+            affordance,
+            None,
+            None,
+        );
+    }
     let instance = match dev_instances::resolve_instance(find_query_value(params, "at")).await {
         Ok(instance) => instance,
         Err(error) => return RenderedResource::line(error.message(), affordance, None, None),
@@ -488,7 +520,7 @@ async fn produce_dev_pid_resource(
 async fn run_db_sql_projection(
     orch: &Orchestrator,
     projection: &DbSqlProjection,
-) -> crate::storage::DbResult<(String, usize)> {
+) -> crate::storage::DbResult<(String, usize, Option<usize>)> {
     let sql = projection
         .sql
         .trim()
@@ -497,6 +529,7 @@ async fn run_db_sql_projection(
         .to_string();
     let offset = projection.offset;
     let limit = projection.limit;
+    let format = projection.format;
     orch.db
         .local
         .read(move |conn| {
@@ -509,23 +542,51 @@ async fn run_db_sql_projection(
                 let columns = rows.column_names();
                 let mut rendered_rows = Vec::new();
                 let mut seen = 0usize;
+                let mut has_more = false;
                 while let Some(row) = rows.next().await? {
                     if seen < offset {
                         seen += 1;
                         continue;
                     }
                     if rendered_rows.len() >= limit {
+                        has_more = true;
                         break;
                     }
-                    let mut rendered = Vec::with_capacity(row.column_count());
-                    for idx in 0..row.column_count() {
-                        rendered.push(render_sql_value(row.get_value(idx)?));
+                    match format {
+                        DbSqlFormat::Text => {
+                            let mut rendered = Vec::with_capacity(row.column_count());
+                            for idx in 0..row.column_count() {
+                                rendered.push(render_sql_value(row.get_value(idx)?));
+                            }
+                            rendered_rows.push(rendered.join("\t"));
+                        }
+                        DbSqlFormat::Json => {
+                            let mut values = Vec::with_capacity(row.column_count());
+                            for idx in 0..row.column_count() {
+                                values.push(sql_value_to_json(row.get_value(idx)?));
+                            }
+                            rendered_rows.push(
+                                serde_json::json!({ "type": "row", "values": values }).to_string(),
+                            );
+                        }
                     }
-                    rendered_rows.push(rendered.join("\t"));
                     seen += 1;
                 }
-                let body = render_sql_rows(columns, &rendered_rows);
-                Ok((body, rendered_rows.len()))
+                let total = if format == DbSqlFormat::Json && limit > 0 {
+                    while rows.next().await?.is_some() {
+                        seen += 1;
+                    }
+                    Some(seen + usize::from(has_more))
+                } else {
+                    None
+                };
+                let body = match format {
+                    DbSqlFormat::Text => render_sql_rows(columns, &rendered_rows),
+                    DbSqlFormat::Json => {
+                        render_sql_json_lines(columns, &rendered_rows, offset, limit, has_more)
+                    }
+                };
+                Ok((body, rendered_rows.len(), total))
             })
         })
         .await
@@ -558,6 +619,52 @@ fn render_sql_rows(columns: Vec<String>, rendered_rows: &[String]) -> String {
         rendered_rows.join("\n")
     } else {
         format!("{}\n{}", header, rendered_rows.join("\n"))
+    }
+}
+
+fn render_sql_json_lines(
+    columns: Vec<String>,
+    rendered_rows: &[String],
+    offset: usize,
+    limit: usize,
+    has_more: bool,
+) -> String {
+    let mut lines = Vec::with_capacity(rendered_rows.len() + 1);
+    lines.push(
+        serde_json::json!({
+            "type": "columns",
+            "columns": columns,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": has_more,
+        })
+        .to_string(),
+    );
+    lines.extend(rendered_rows.iter().cloned());
+    lines.join("\n")
+}
+
+fn sql_value_to_json(value: Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Integer(value) => serde_json::json!(value),
+        Value::Real(value) if value.is_finite() => serde_json::json!(value),
+        Value::Real(value) => serde_json::json!({
+            "$real": if value.is_nan() {
+                "NaN"
+            } else if value.is_sign_positive() {
+                "Infinity"
+            } else {
+                "-Infinity"
+            }
+        }),
+        Value::Text(value) => serde_json::Value::String(value),
+        Value::Blob(bytes) => serde_json::json!({
+            "$blob": {
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        }),
     }
 }
 
@@ -992,6 +1099,8 @@ pub(crate) async fn produce_cairn_resource(
     // Universal view-window params, consumed centrally.
     let view_offset = find_query_value(&split.params, "offset").and_then(|v| v.parse::<i64>().ok());
     let view_limit = find_query_value(&split.params, "limit").and_then(|v| v.parse::<usize>().ok());
+    let view_char_offset =
+        find_query_value(&split.params, "char_offset").and_then(|v| v.parse::<usize>().ok());
 
     // Universal grep: when `grep` is present this is a view projection over the
     // resource's produced text, not a per-resource feature. Render the full
@@ -1098,6 +1207,7 @@ pub(crate) async fn produce_cairn_resource(
                 offset: Some(page.offset as i64),
                 limit: view_limit,
                 match_count: None,
+                record_prelude_lines: None,
                 affordance,
                 images: Vec::new(),
             },
@@ -1128,6 +1238,7 @@ pub(crate) async fn produce_cairn_resource(
             offset: None,
             limit: view_limit,
             match_count: None,
+            record_prelude_lines: None,
             affordance,
             images: Vec::new(),
         };
@@ -1176,12 +1287,25 @@ pub(crate) async fn produce_cairn_resource(
             | CairnResource::ProjectBrowser { .. }
     );
 
+    let is_structured_raw_transcript = matches!(
+        resource,
+        CairnResource::NodeChatRaw { .. } | CairnResource::TaskChatRaw { .. }
+    ) && find_query_value(&split.params, "format")
+        == Some("json");
     let body_params = if renderer_owns_params || is_browser_resource {
         strip_params(&split.params, &["offset"])
+    } else if is_structured_raw_transcript {
+        strip_params(&split.params, &["offset", "limit", "char_offset"])
     } else {
         strip_params(&split.params, &["offset", "limit"])
     };
-    let content = render_resource_body(orch, request, &resource, body_params).await;
+    let mut content = render_resource_body(orch, request, &resource, body_params).await;
+    if is_structured_raw_transcript {
+        if let Some(char_offset) = view_char_offset {
+            let line_offset = view_offset.unwrap_or(0).max(0) as usize;
+            content = apply_line_char_offset(&content, line_offset, char_offset);
+        }
+    }
     RenderedResource::line(
         content,
         affordance,
@@ -1302,13 +1426,7 @@ async fn render_resource_body(
             number,
             exec_seq,
             node_id,
-        } => {
-            if let Some(error) = reject_query_params("node chat", &params) {
-                error
-            } else {
-                read_node_chat_raw(db, &project, number, exec_seq, &node_id).await
-            }
-        }
+        } => read_node_chat_raw(db, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::NodeChatTurn {
             project,
             number,
@@ -1389,11 +1507,10 @@ async fn render_resource_body(
             node_id,
             task_name,
         } => {
-            if let Some(error) = reject_query_params("task chat", &params) {
-                error
-            } else {
-                read_task_chat_raw(db, &project, number, exec_seq, &node_id, &task_name).await
-            }
+            read_task_chat_raw(
+                db, &project, number, exec_seq, &node_id, &task_name, &params,
+            )
+            .await
         }
         CairnResource::TaskChatTurn {
             project,
@@ -1977,6 +2094,11 @@ async fn render_resource_body(
                 Err(error) => error,
             }
         }
+        CairnResource::ProjectBrowserNetworkRequest { .. }
+        | CairnResource::NodeBrowserNetworkRequest { .. }
+        | CairnResource::TaskBrowserNetworkRequest { .. } => {
+            super::browsers::render_browser_network_request(orch, resource).await
+        }
         CairnResource::Bug => {
             "cairn://bug is write-only; use change with mode=append to submit reports".to_string()
         }
@@ -2029,6 +2151,19 @@ mod tests {
 
     fn db_params(query: &str) -> Vec<QueryParam> {
         parse_query_params(query).unwrap()
+    }
+
+    #[test]
+    fn structured_transcript_char_offset_resumes_inside_event_line() {
+        let body = "{\"payload\":{\"content\":\"abcdef\"}}\n{\"payload\":{\"content\":\"next\"}}";
+        assert_eq!(
+            apply_line_char_offset(body, 0, 11),
+            "{\"content\":\"abcdef\"}}\n{\"payload\":{\"content\":\"next\"}}"
+        );
+        assert_eq!(
+            apply_line_char_offset(body, 1, 11),
+            "{\"payload\":{\"content\":\"abcdef\"}}\n{\"content\":\"next\"}}"
+        );
     }
 
     #[test]
@@ -2116,6 +2251,13 @@ mod tests {
             parse_db_sql_projection(&db_params("sql=SELECT 1&offset=2&limit=5001")).unwrap();
         assert_eq!(parsed.offset, 2);
         assert_eq!(parsed.limit, DB_SQL_MAX_LIMIT);
+        assert_eq!(parsed.format, DbSqlFormat::Text);
+
+        let parsed = parse_db_sql_projection(&db_params("sql=SELECT 1&format=json")).unwrap();
+        assert_eq!(parsed.format, DbSqlFormat::Json);
+
+        let err = parse_db_sql_projection(&db_params("sql=SELECT 1&format=csv")).unwrap_err();
+        assert!(err.contains("format") && err.contains("json"), "{err}");
     }
 
     #[test]
@@ -2175,6 +2317,15 @@ mod tests {
         assert!(parse_db_sql_projection(&db_with_at)
             .unwrap_err()
             .contains("at"));
+    }
+
+    #[tokio::test]
+    async fn dev_db_projection_rejects_json_before_instance_resolution() {
+        let rendered =
+            produce_dev_db_sql_resource(&db_params("sql=SELECT 1&format=json&at=missing"), None)
+                .await;
+
+        assert!(rendered.content.contains("does not support format=json"));
     }
 
     #[test]
@@ -2270,6 +2421,210 @@ line2', X'0001020AFF', 2.5),
 
         assert_eq!(rendered.shown_units, Some(0));
         assert_eq!(rendered.content, "id\tlabel\n(0 rows)");
+    }
+
+    fn parse_db_json_lines(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn db_sql_json_projection_preserves_columns_and_typed_values() {
+        let (orch, _db_dir) = db_projection_orch().await;
+        let params = db_params(
+            "sql=SELECT a.id, b.id, a.note, 'null', 'NULL', a.amount, a.data FROM db_projection_rows a JOIN db_projection_rows b ON b.id = a.id WHERE a.id = 2&format=json",
+        );
+
+        let rendered = produce_db_sql_resource(&orch, &params, None).await;
+        let lines = parse_db_json_lines(&rendered.content);
+
+        assert_eq!(rendered.shown_units, Some(1));
+        assert_eq!(rendered.total_units, Some(1));
+        assert_eq!(
+            lines[0],
+            serde_json::json!({
+                "type": "columns",
+                "columns": ["id", "id", "note", "'null'", "'NULL'", "amount", "data"],
+                "offset": 0,
+                "limit": 100,
+                "hasMore": false,
+            })
+        );
+        assert_eq!(
+            lines[1],
+            serde_json::json!({
+                "type": "row",
+                "values": [
+                    2,
+                    2,
+                    "line1\nline2",
+                    "null",
+                    "NULL",
+                    2.5,
+                    { "$blob": { "encoding": "base64", "data": "AAECCv8=" } },
+                ],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn db_sql_json_projection_distinguishes_null_and_round_trips_text() {
+        let (orch, _db_dir) = db_projection_orch().await;
+        let params = db_params(
+            "sql=SELECT note, 'null', 'tab'||char(9)||'line'||char(10)||'\"quoted\"' FROM db_projection_rows WHERE id = 1&format=json",
+        );
+
+        let rendered = produce_db_sql_resource(&orch, &params, None).await;
+        let lines = parse_db_json_lines(&rendered.content);
+
+        assert_eq!(
+            lines[1]["values"],
+            serde_json::json!([null, "null", "tab\tline\n\"quoted\""])
+        );
+    }
+
+    #[tokio::test]
+    async fn db_sql_json_projection_preserves_non_finite_reals() {
+        let (orch, _db_dir) = db_projection_orch().await;
+        let rendered = produce_db_sql_resource(
+            &orch,
+            &db_params("sql=SELECT 1e999, -1e999&format=json"),
+            None,
+        )
+        .await;
+        let lines = parse_db_json_lines(&rendered.content);
+
+        assert_eq!(
+            lines[1]["values"],
+            serde_json::json!([
+                { "$real": "Infinity" },
+                { "$real": "-Infinity" },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn db_sql_json_projection_limit_zero_has_no_looping_continuation() {
+        let (orch, _db_dir) = db_projection_orch().await;
+        let page = produce_db_sql_resource(
+            &orch,
+            &db_params("sql=SELECT id FROM db_projection_rows ORDER BY id&limit=0&format=json"),
+            None,
+        )
+        .await;
+        let lines = parse_db_json_lines(&page.content);
+
+        assert_eq!(page.shown_units, Some(0));
+        assert_eq!(page.total_units, None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["hasMore"], true);
+
+        let mut meta = cairn_common::read::SegmentMeta::new(
+            "cairn://db?sql=SELECT id FROM db_projection_rows ORDER BY id&limit=0&format=json",
+            SegmentKind::Resource,
+            NaturalUnit::Record,
+        );
+        meta.shown_units = 0;
+        meta.total_units = page.total_units;
+        meta.unit_noun = Some("rows".to_string());
+        meta.limit = Some(0);
+        meta.record_prelude_lines = page.record_prelude_lines;
+        let rendered = crate::storage::render::render_segment(
+            cairn_common::read::ReadSegment::text(page.content, meta),
+            10_000,
+        );
+        assert!(!rendered.text.contains("continue:"));
+    }
+
+    async fn render_db_test_uri(orch: &Orchestrator, uri: &str) -> String {
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        };
+        let rendered = produce_cairn_resource(orch, &request, uri).await;
+        let mut meta =
+            cairn_common::read::SegmentMeta::new(uri, SegmentKind::Resource, rendered.natural_unit);
+        meta.total_units = rendered.total_units;
+        meta.shown_units = rendered.shown_units.unwrap_or(0);
+        meta.offset = rendered.offset.unwrap_or(0).max(0) as usize;
+        meta.limit = rendered.limit;
+        meta.unit_noun = rendered.unit_noun.map(str::to_string);
+        meta.record_prelude_lines = rendered.record_prelude_lines;
+        crate::storage::render::render_segment(
+            cairn_common::read::ReadSegment::text(rendered.content, meta),
+            10_000,
+        )
+        .text
+    }
+
+    #[tokio::test]
+    async fn db_sql_json_continuation_uri_round_trips_through_resource_parser() {
+        let (orch, _db_dir) = db_projection_orch().await;
+        let first = render_db_test_uri(
+            &orch,
+            "cairn://db?sql=SELECT id FROM db_projection_rows ORDER BY id&limit=1&format=json",
+        )
+        .await;
+        let marker = "continue: ";
+        let start = first.find(marker).unwrap() + marker.len();
+        let end = first[start..].find(']').unwrap() + start;
+        let continuation = &first[start..end];
+
+        assert!(continuation.contains("sql=SELECT id FROM db_projection_rows ORDER BY id"));
+        assert!(!continuation.contains("SELECT%20id"));
+
+        let second = render_db_test_uri(&orch, continuation).await;
+        let row = second
+            .lines()
+            .find(|line| line.starts_with("{\"type\":\"row\""))
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert_eq!(row["values"], serde_json::json!([2]));
+        assert!(!second.contains("SQL query failed"));
+    }
+
+    #[tokio::test]
+    async fn db_sql_json_projection_reports_empty_rows_and_pagination() {
+        let (orch, _db_dir) = db_projection_orch().await;
+        let empty = produce_db_sql_resource(
+            &orch,
+            &db_params("sql=SELECT id, label FROM db_projection_rows WHERE id > 99&format=json"),
+            None,
+        )
+        .await;
+        let empty_lines = parse_db_json_lines(&empty.content);
+        assert_eq!(empty.shown_units, Some(0));
+        assert_eq!(empty.total_units, Some(0));
+        assert_eq!(empty_lines.len(), 1);
+        assert_eq!(
+            empty_lines[0]["columns"],
+            serde_json::json!(["id", "label"])
+        );
+        assert_eq!(empty_lines[0]["hasMore"], false);
+
+        let page = produce_db_sql_resource(
+            &orch,
+            &db_params(
+                "sql=SELECT id FROM db_projection_rows ORDER BY id&offset=1&limit=1&format=json",
+            ),
+            None,
+        )
+        .await;
+        let page_lines = parse_db_json_lines(&page.content);
+        assert_eq!(page.offset, Some(1));
+        assert_eq!(page.limit, Some(1));
+        assert_eq!(page.shown_units, Some(1));
+        assert_eq!(page.total_units, Some(3));
+        assert_eq!(page.record_prelude_lines, Some(1));
+        assert_eq!(page_lines[0]["offset"], 1);
+        assert_eq!(page_lines[0]["limit"], 1);
+        assert_eq!(page_lines[0]["hasMore"], true);
+        assert_eq!(page_lines[1]["values"], serde_json::json!([2]));
     }
 
     // =========================================================================

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use cairn_db::turso::params;
+use serde::Serialize;
 
 use crate::storage::RowExt;
 
@@ -27,6 +28,78 @@ impl EventRow {
             self.event_type.clone(),
             self.data.clone(),
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RawTranscriptFormat {
+    Markdown,
+    Json,
+}
+
+pub(super) fn parse_raw_transcript_format(
+    params: &[cairn_common::query::QueryParam],
+) -> Result<RawTranscriptFormat, String> {
+    let unexpected: Vec<&str> = params
+        .iter()
+        .filter(|param| param.key != "format")
+        .map(|param| param.key.as_str())
+        .collect();
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "Query parameters are not supported on raw transcript resources: {}",
+            unexpected.join(", ")
+        ));
+    }
+
+    match params.iter().rev().find(|param| param.key == "format") {
+        None => Ok(RawTranscriptFormat::Markdown),
+        Some(param) if param.value == "json" => Ok(RawTranscriptFormat::Json),
+        Some(param) => Err(format!(
+            "Unsupported raw transcript format '{}'; expected json",
+            param.value
+        )),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructuredTranscriptEvent<'a> {
+    run_id: &'a str,
+    sequence: i32,
+    turn_id: Option<&'a str>,
+    event_type: &'a str,
+    created_at: i64,
+    payload: serde_json::Value,
+}
+
+/// Render reconstructed transcript rows for the raw resource. JSON mode is
+/// JSONL: one complete event value per line, so the shared line window pages by
+/// events and never applies digest preview/truncation rules to event payloads.
+pub(super) fn format_raw_transcript(events: &[EventRow], format: RawTranscriptFormat) -> String {
+    match format {
+        RawTranscriptFormat::Markdown => {
+            let rows: Vec<crate::transcripts::TranscriptRow> =
+                events.iter().map(EventRow::to_transcript_row).collect();
+            crate::transcripts::format_transcript_full(&rows)
+        }
+        RawTranscriptFormat::Json => events
+            .iter()
+            .map(|event| {
+                let payload = serde_json::from_str(&event.data)
+                    .unwrap_or_else(|_| serde_json::Value::String(event.data.clone()));
+                serde_json::to_string(&StructuredTranscriptEvent {
+                    run_id: &event.run_id,
+                    sequence: event.sequence,
+                    turn_id: event.turn_id.as_deref(),
+                    event_type: &event.event_type,
+                    created_at: event.created_at,
+                    payload,
+                })
+                .expect("structured transcript event serialization cannot fail")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -1669,6 +1742,219 @@ mod tests {
         let empty = serde_json::json!({ "toolResult": "   " }).to_string();
         let rendered = format_single_event("tool_result", &empty, None, None, None);
         assert!(rendered.contains("(empty result)"));
+    }
+
+    fn raw_event(
+        sequence: i32,
+        turn_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> EventRow {
+        EventRow {
+            run_id: "run-1".to_string(),
+            sequence,
+            event_type: event_type.to_string(),
+            data: payload.to_string(),
+            turn_id: Some(turn_id.to_string()),
+            created_at: 1_700_000_000 + i64::from(sequence),
+        }
+    }
+
+    #[test]
+    fn structured_raw_transcript_preserves_original_tool_input() {
+        let input = serde_json::json!({
+            "commands": [{
+                "command": "cargo test -p cairn-core resources::transcript::tests",
+                "description": "Run transcript tests"
+            }],
+            "sequential": true
+        });
+        let events = vec![raw_event(
+            7,
+            "turn-2",
+            "assistant",
+            serde_json::json!({
+                "content": "running tests",
+                "toolUses": [{ "id": "toolu_1", "name": "run", "input": input.clone() }]
+            }),
+        )];
+
+        let rendered = format_raw_transcript(&events, RawTranscriptFormat::Json);
+        let event: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(event["runId"], "run-1");
+        assert_eq!(event["sequence"], 7);
+        assert_eq!(event["turnId"], "turn-2");
+        assert_eq!(event["eventType"], "assistant");
+        assert_eq!(event["createdAt"], 1_700_000_007i64);
+        assert_eq!(event["payload"]["toolUses"][0]["id"], "toolu_1");
+        assert_eq!(event["payload"]["toolUses"][0]["name"], "run");
+        assert_eq!(event["payload"]["toolUses"][0]["input"], input);
+    }
+
+    #[test]
+    fn raw_transcript_format_param_is_opt_in_and_rejects_unknown_values() {
+        assert_eq!(
+            parse_raw_transcript_format(&[param("format", "json")]).unwrap(),
+            RawTranscriptFormat::Json
+        );
+        assert!(parse_raw_transcript_format(&[param("format", "markdown")])
+            .unwrap_err()
+            .contains("expected json"));
+        assert!(parse_raw_transcript_format(&[param("other", "value")])
+            .unwrap_err()
+            .contains("other"));
+    }
+
+    #[test]
+    fn raw_transcript_defaults_to_existing_markdown_renderer() {
+        let events = vec![raw_event(
+            1,
+            "turn-1",
+            "user",
+            serde_json::json!({ "content": "unchanged default" }),
+        )];
+        let legacy_rows = events
+            .iter()
+            .map(EventRow::to_transcript_row)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            format_raw_transcript(&events, RawTranscriptFormat::Markdown),
+            crate::transcripts::format_transcript_full(&legacy_rows)
+        );
+        assert_eq!(
+            parse_raw_transcript_format(&[]).unwrap(),
+            RawTranscriptFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn structured_raw_transcript_pages_one_event_per_line_with_truthful_continuation() {
+        use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
+
+        let events = vec![
+            raw_event(
+                1,
+                "turn-1",
+                "user",
+                serde_json::json!({ "content": "first" }),
+            ),
+            raw_event(
+                2,
+                "turn-2",
+                "assistant",
+                serde_json::json!({ "content": "second" }),
+            ),
+        ];
+        let jsonl = format_raw_transcript(&events, RawTranscriptFormat::Json);
+        assert_eq!(jsonl.lines().count(), 2);
+        for line in jsonl.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+
+        let window = crate::storage::render::window_text_lines(&jsonl, None, Some(1));
+        let mut meta = SegmentMeta::new(
+            "cairn://p/CAIRN/2703/1/builder/chat/raw?format=json&limit=1",
+            SegmentKind::Resource,
+            NaturalUnit::Line,
+        );
+        meta.total_units = Some(window.total);
+        meta.shown_units = window.shown;
+        meta.offset = window.offset;
+        meta.limit = Some(1);
+        let rendered =
+            crate::storage::render::render_segment(ReadSegment::text(window.body, meta), 10_000);
+
+        assert!(rendered.text.contains("\"turnId\":\"turn-1\""));
+        assert!(!rendered.text.contains("\"turnId\":\"turn-2\""));
+        assert!(rendered.text.contains(
+            "continue: cairn://p/CAIRN/2703/1/builder/chat/raw?format=json&offset=1&limit=1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_job_events_reconstructs_archived_and_live_for_structured_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.keep().join("structured-transcript-archival.db");
+        let db = LocalDb::open(path).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        let tool_input = serde_json::json!({
+            "commands": [{ "command": "echo archived" }]
+        });
+        let archived = serde_json::json!({
+            "content": "archived",
+            "toolUses": [{ "id": "toolu_archived", "name": "run", "input": tool_input.clone() }]
+        })
+        .to_string();
+        let live = serde_json::json!({ "content": "live" }).to_string();
+        let blob = crate::storage::compress(archived.as_bytes()).unwrap();
+        db.write(move |conn| {
+            let blob = blob.clone();
+            let live = live.clone();
+            Box::pin(async move {
+                for sql in [
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-mixed','default','Mixed','MIX','/tmp/mixed',1,1)",
+                    "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at) VALUES ('issue-mixed','project-mixed',1,'Mixed transcript','active',1,1)",
+                    "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('exec-mixed','recipe','issue-mixed','project-mixed','complete',1,1)",
+                    "INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, created_at, updated_at) VALUES ('job-mixed','exec-mixed','issue-mixed','project-mixed','complete','builder',1,1)",
+                    "INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at) VALUES ('run-mixed','job-mixed','issue-mixed','exited',1,1)",
+                ] {
+                    conn.execute(sql, ()).await?;
+                }
+                conn.execute(
+                    "INSERT INTO turns(id, session_id, run_id, sequence, created_at, updated_at) VALUES ('turn-a','sess','run-mixed',1,1,1), ('turn-b','sess','run-mixed',2,2,2)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id, storage_mode, data_blob, codec) VALUES ('ev-archived','run-mixed',1,1,'assistant','{\"_archived\":true}',1,'turn-a','zstd',?1,'zstd_v1')",
+                    (blob,),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id) VALUES ('ev-live','run-mixed',2,2,'user',?1,2,'turn-b')",
+                    (live,),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let rows = db
+            .read(|conn| {
+                Box::pin(async move {
+                    Ok::<Vec<EventRow>, crate::storage::DbError>(
+                        load_job_events_ordered(conn, "job-mixed", None, None).await,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        let rendered = format_raw_transcript(&rows, RawTranscriptFormat::Json);
+        let events = rendered
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["payload"]["content"], "archived");
+        assert_eq!(events[0]["payload"]["toolUses"][0]["input"], tool_input);
+        assert_eq!(events[1]["payload"]["content"], "live");
+        for event in &events {
+            assert!(event.get("runId").is_some());
+            assert!(event.get("sequence").is_some());
+            assert!(event.get("turnId").is_some());
+            assert!(event.get("eventType").is_some());
+            assert!(event.get("createdAt").is_some());
+            assert!(event.get("payload").is_some());
+        }
     }
 
     #[tokio::test]

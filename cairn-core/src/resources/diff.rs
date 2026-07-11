@@ -1,6 +1,6 @@
 //! Layered node workspace diff resource.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use cairn_common::query::QueryParam;
 use globset::GlobBuilder;
@@ -22,6 +22,7 @@ enum DiffView {
     Summary,
     Commits,
     Patch,
+    Symbols,
     Check,
 }
 
@@ -64,9 +65,160 @@ struct CheckData {
     whitespace_total: usize,
 }
 
-#[derive(Debug)]
+enum DiffContentSource {
+    Live {
+        worktree: PathBuf,
+    },
+    Archived {
+        repo_path: PathBuf,
+        pack: Option<(Vec<u8>, Vec<u8>)>,
+        tip_sha: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+enum DiffContentReader<'a> {
+    Live {
+        worktree: &'a Path,
+    },
+    Archived {
+        store: Box<ObjectStore>,
+        tip_sha: &'a str,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl DiffContentSource {
+    fn reader(&self) -> DiffContentReader<'_> {
+        match self {
+            Self::Live { worktree } => DiffContentReader::Live { worktree },
+            Self::Archived {
+                repo_path,
+                pack,
+                tip_sha,
+            } => match ObjectStore::new(repo_path, pack.clone()) {
+                Ok(store) => DiffContentReader::Archived {
+                    store: Box::new(store),
+                    tip_sha,
+                },
+                Err(error) => DiffContentReader::Unavailable {
+                    reason: format!("archived source store could not be opened: {error}"),
+                },
+            },
+            Self::Unavailable { reason } => DiffContentReader::Unavailable {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+impl DiffContentReader<'_> {
+    fn read_path(&self, path: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Live { worktree } => {
+                let relative = Path::new(path);
+                if relative.as_os_str().is_empty()
+                    || relative.is_absolute()
+                    || !relative
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err("invalid non-relative changed path".to_string());
+                }
+                read_live_source_no_follow(worktree, relative)
+            }
+            Self::Archived { store, tip_sha } => store
+                .resolve_path_at_commit(tip_sha, path)
+                .map_err(|error| format!("archived source could not be resolved: {error}")),
+            Self::Unavailable { reason } => Err(reason.clone()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_live_source_no_follow(worktree: &Path, relative: &Path) -> Result<Vec<u8>, String> {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn owned_fd(fd: libc::c_int, context: &str) -> Result<OwnedFd, String> {
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return Err("live source is a symlink and is not analyzed".to_string());
+            }
+            return Err(format!("live source could not open {context}: {error}"));
+        }
+        // SAFETY: `fd` is a newly opened descriptor and ownership transfers to
+        // the returned `OwnedFd`, which closes it exactly once.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    let root = CString::new(worktree.as_os_str().as_bytes())
+        .map_err(|_| "live worktree path contains a NUL byte".to_string())?;
+    // SAFETY: `root` is a valid NUL-terminated path. The returned descriptor is
+    // immediately wrapped in `OwnedFd`; `O_NOFOLLOW` rejects a symlink root.
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    let mut directory = owned_fd(root_fd, "worktree directory")?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => CString::new(name.as_bytes())
+                .map_err(|_| "live source path contains a NUL byte".to_string()),
+            _ => Err("invalid non-relative changed path".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (index, component) in components.iter().enumerate() {
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        };
+        // SAFETY: `directory` remains open for this call, `component` is a valid
+        // NUL-terminated single path component, and the result is immediately
+        // transferred to `OwnedFd`. Traversal never re-resolves an inspected path.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), component.as_ptr(), flags) };
+        let opened = owned_fd(fd, "changed path component")?;
+        if final_component {
+            let mut file = File::from(opened);
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("live source metadata is unavailable: {error}"))?;
+            if !metadata.is_file() {
+                return Err("live source is not a regular file".to_string());
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|error| format!("live source could not be read: {error}"))?;
+            return Ok(bytes);
+        }
+        directory = opened;
+    }
+
+    Err("invalid empty changed path".to_string())
+}
+
+#[cfg(not(unix))]
+fn read_live_source_no_follow(_worktree: &Path, _relative: &Path) -> Result<Vec<u8>, String> {
+    Err("atomic no-follow live source reads are unavailable on this platform".to_string())
+}
+
 struct DiffData {
     source_note: Option<String>,
+    content_source: DiffContentSource,
     base_branch: String,
     base_commit: Option<String>,
     current_revision: Option<String>,
@@ -110,7 +262,7 @@ pub(super) async fn read_node_diff(
 
     let mut data = match load_live_data(orch, &coords).await {
         Some(data) => data,
-        None => match load_archived_data(&conn, &coords).await {
+        None => match load_archived_data(&conn, &coords, request.view == DiffView::Symbols).await {
             Some(data) => data,
             None => load_cache_data(&conn, &job.id, &coords).await,
         },
@@ -121,17 +273,7 @@ pub(super) async fn read_node_diff(
             Ok(glob) => glob.compile_matcher(),
             Err(error) => return format!("Invalid glob '{pattern}': {error}"),
         };
-        data.rows.retain(|row| {
-            matcher.is_match(&row.0)
-                || row
-                    .4
-                    .as_deref()
-                    .map(|path| matcher.is_match(path))
-                    .unwrap_or(false)
-        });
-        if let Some(patch) = data.patch.take() {
-            data.patch = Some(filter_patch(&patch, None, Some(&matcher)));
-        }
+        filter_diff_data_by_glob(&mut data, &matcher);
     }
 
     match request.view {
@@ -154,6 +296,7 @@ pub(super) async fn read_node_diff(
                 request.glob,
             )
         }
+        DiffView::Symbols => render_symbols(project, number, node_id, &data, request.glob),
         DiffView::Check => render_check(project, number, node_id, &data),
     }
 }
@@ -178,10 +321,11 @@ fn parse_diff_request(params: &[QueryParam]) -> Result<DiffRequest<'_>, String> 
         None => DiffView::Summary,
         Some("commits") => DiffView::Commits,
         Some("patch") => DiffView::Patch,
+        Some("symbols") => DiffView::Symbols,
         Some("check") => DiffView::Check,
         Some(value) => {
             return Err(format!(
-                "Invalid node diff view '{value}'. Expected commits, patch, or check."
+                "Invalid node diff view '{value}'. Expected commits, patch, symbols, or check."
             ));
         }
     };
@@ -189,7 +333,9 @@ fn parse_diff_request(params: &[QueryParam]) -> Result<DiffRequest<'_>, String> 
         return Err("file=PATH is only valid with view=patch".to_string());
     }
     if glob.is_some() && matches!(view, DiffView::Commits | DiffView::Check) {
-        return Err("glob=PATTERN is only valid with the summary or patch view".to_string());
+        return Err(
+            "glob=PATTERN is only valid with the summary, patch, or symbols view".to_string(),
+        );
     }
     Ok(DiffRequest { view, file, glob })
 }
@@ -323,6 +469,9 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
         scan_added_lines(&patch, ScanKind::Whitespace, FINDING_CAP);
     Some(DiffData {
         source_note: None,
+        content_source: DiffContentSource::Live {
+            worktree: worktree.clone(),
+        },
         base_branch: coords.base_branch.clone(),
         base_commit: Some(fork),
         current_revision,
@@ -351,6 +500,7 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
 async fn load_archived_data(
     conn: &cairn_db::turso::Connection,
     coords: &DiffCoords,
+    retain_content_source: bool,
 ) -> Option<DiffData> {
     let execution_id = coords.execution_id.as_deref()?;
     let mut rows = conn
@@ -371,6 +521,8 @@ async fn load_archived_data(
         (Some(pack), Some(index)) => Some((pack, index)),
         _ => None,
     };
+    let content_source =
+        archived_content_source(&coords.repo_path, &tip, &pack, retain_content_source);
     let store = ObjectStore::new(Path::new(&coords.repo_path), pack).ok()?;
     let patch = render_range_diff(&store, &base, &tip).ok()?;
     let file_diffs = render_range_file_diffs(&store, &base, &tip).ok()?;
@@ -401,16 +553,18 @@ async fn load_archived_data(
     let (marker_findings, marker_total) = scan_added_lines(&patch, ScanKind::Marker, FINDING_CAP);
     let (whitespace_findings, whitespace_total) =
         scan_added_lines(&patch, ScanKind::Whitespace, FINDING_CAP);
+    let commits_ahead = count_commits_ahead(&store, &base, &tip);
     Some(DiffData {
         source_note: Some(
             "Workspace torn down; rendered from archived execution history. Renames may appear as delete + add."
                 .to_string(),
         ),
+        content_source,
         base_branch: coords.base_branch.clone(),
         base_commit: Some(base.clone()),
         current_revision: Some(tip.clone()),
         branch: coords.branch.clone(),
-        commits_ahead: Some(count_commits_ahead(&store, &base, &tip)),
+        commits_ahead: Some(commits_ahead),
         rows,
         patch: Some(patch),
         commits: Some(commits),
@@ -432,9 +586,12 @@ async fn load_cache_data(
 ) -> DiffData {
     DiffData {
         source_note: Some(
-            "Legacy cache fallback: patch, commit, revision, conflict, and whitespace views are unavailable because this execution has no archived history."
+            "Legacy cache fallback: patch, commit, revision, conflict, whitespace, and structural symbol views are unavailable because this execution has no archived history."
                 .to_string(),
         ),
+        content_source: DiffContentSource::Unavailable {
+            reason: "legacy cache records changed paths and counts but no file content".to_string(),
+        },
         base_branch: coords.base_branch.clone(),
         base_commit: coords.base_commit.clone(),
         current_revision: None,
@@ -511,7 +668,7 @@ fn render_summary(
         ));
     }
     out.push_str(&format!(
-        "\n## Drill down\n\n- `{diff_uri}?view=commits`\n- `{diff_uri}?view=patch`\n- `{diff_uri}?view=check`\n"
+        "\n## Drill down\n\n- `{diff_uri}?view=commits`\n- `{diff_uri}?view=patch`\n- `{diff_uri}?view=symbols`\n- `{diff_uri}?view=check`\n"
     ));
     out
 }
@@ -587,6 +744,106 @@ fn render_patch(
     } else {
         out.push_str(patch);
     }
+    out
+}
+
+fn archived_content_source(
+    repo_path: &str,
+    tip_sha: &str,
+    pack: &Option<(Vec<u8>, Vec<u8>)>,
+    retain: bool,
+) -> DiffContentSource {
+    if retain {
+        DiffContentSource::Archived {
+            repo_path: PathBuf::from(repo_path),
+            pack: pack.clone(),
+            tip_sha: tip_sha.to_string(),
+        }
+    } else {
+        DiffContentSource::Unavailable {
+            reason: "archived source was not requested for this projection".to_string(),
+        }
+    }
+}
+
+fn filter_diff_data_by_glob(data: &mut DiffData, matcher: &globset::GlobMatcher) {
+    data.rows.retain(|row| {
+        matcher.is_match(&row.0)
+            || row
+                .4
+                .as_deref()
+                .map(|path| matcher.is_match(path))
+                .unwrap_or(false)
+    });
+    if let Some(patch) = data.patch.take() {
+        data.patch = Some(filter_patch(&patch, None, Some(matcher)));
+    }
+}
+
+fn render_symbols(
+    project: &str,
+    number: i32,
+    node_id: &str,
+    data: &DiffData,
+    glob: Option<&str>,
+) -> String {
+    let mut out = format!("# Symbols - {project}-{number} / {node_id}");
+    if let Some(glob) = glob {
+        out.push_str(&format!(" / glob `{glob}`"));
+    }
+    out.push_str("\n\n");
+    if let Some(note) = &data.source_note {
+        out.push_str(&format!("> {note}\n\n"));
+    }
+
+    let rows = dedupe_file_changes_by_path(&data.rows);
+    if rows.is_empty() {
+        out.push_str("No changed files matched the symbols projection.\n");
+        return out;
+    }
+
+    let reader = data.content_source.reader();
+    let mut blocks = Vec::with_capacity(rows.len());
+    let mut rendered_count = 0usize;
+    for row in rows {
+        let path = &row.0;
+        let status = row.1.as_str();
+        let result = if matches!(status, "removed" | "deleted") {
+            "(no current outline: file was removed)".to_string()
+        } else if crate::symbols::engine::lang_for_path(Path::new(path)).is_none() {
+            "(no current outline: unsupported file grammar)".to_string()
+        } else {
+            match reader.read_path(path) {
+                Err(reason) => format!("(no current outline: source unavailable: {reason})"),
+                Ok(bytes) if bytes.contains(&0) => {
+                    "(no current outline: binary content contains NUL bytes)".to_string()
+                }
+                Ok(bytes) => {
+                    let source = String::from_utf8_lossy(&bytes);
+                    let outline = crate::symbols::outline::outline_text(
+                        &source,
+                        crate::symbols::engine::lang_for_path(Path::new(path)),
+                    );
+                    if outline.is_empty() {
+                        "(no current outline: supported file has no extractable outline entries)"
+                            .to_string()
+                    } else {
+                        rendered_count += 1;
+                        outline
+                    }
+                }
+            }
+        };
+        blocks.push(format!("{path}\n{result}"));
+    }
+
+    if rendered_count == 0 {
+        out.push_str(
+            "No structural outline entries were rendered; file-specific reasons follow.\n\n",
+        );
+    }
+    out.push_str(&blocks.join("\n\n"));
+    out.push('\n');
     out
 }
 
@@ -820,37 +1077,54 @@ fn parse_new_hunk_start(header: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_codec::packfile::build_execution_pack;
+    use cairn_codec::testutil::{commit_all, git, init_repo, write_file};
     use cairn_common::query::parse_query_params;
 
-    #[test]
-    fn summary_links_stay_on_the_addressed_node() {
-        let data = DiffData {
+    fn test_data(content_source: DiffContentSource, rows: Vec<FileChangeRow>) -> DiffData {
+        DiffData {
             source_note: None,
+            content_source,
             base_branch: "main".to_string(),
             base_commit: Some("0123456789abcdef".to_string()),
             current_revision: Some("fedcba9876543210".to_string()),
             branch: Some("agent/CAIRN-42-builder".to_string()),
             commits_ahead: Some(1),
-            rows: vec![(
-                "src/lib.rs".to_string(),
-                "modified".to_string(),
-                Some(2),
-                Some(1),
-                None,
-            )],
+            rows,
             patch: None,
             commits: None,
             check: CheckData {
                 workspace_state: "clean".to_string(),
                 ..CheckData::default()
             },
-        };
+        }
+    }
+
+    fn changed(path: &str, status: &str, previous_path: Option<&str>) -> FileChangeRow {
+        (
+            path.to_string(),
+            status.to_string(),
+            Some(2),
+            Some(1),
+            previous_path.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn summary_links_stay_on_the_addressed_node() {
+        let data = test_data(
+            DiffContentSource::Unavailable {
+                reason: "test source unavailable".to_string(),
+            },
+            vec![changed("src/lib.rs", "modified", None)],
+        );
 
         let rendered = render_summary("CAIRN", 42, 7, "sibling", &data);
         let base = "cairn://p/CAIRN/42/7/sibling/diff";
         assert!(rendered.contains(&format!("`{base}?view=patch&file=PATH`")));
         assert!(rendered.contains(&format!("`{base}?view=commits`")));
         assert!(rendered.contains(&format!("`{base}?view=patch`")));
+        assert!(rendered.contains(&format!("`{base}?view=symbols`")));
         assert!(rendered.contains(&format!("`{base}?view=check`")));
         assert!(!rendered.contains("cairn:~/diff"));
     }
@@ -869,8 +1143,290 @@ mod tests {
     fn dispatch_rejects_invalid_combinations() {
         let params = parse_query_params("view=check&file=x").unwrap();
         assert!(parse_diff_request(&params).is_err());
+        let params = parse_query_params("view=symbols&file=src/lib.rs").unwrap();
+        assert_eq!(
+            parse_diff_request(&params).unwrap_err(),
+            "file=PATH is only valid with view=patch"
+        );
         let params = parse_query_params("file=x&glob=*.rs").unwrap();
         assert!(parse_diff_request(&params).is_err());
+    }
+
+    #[test]
+    fn symbols_view_accepts_glob() {
+        let params = parse_query_params("view=symbols").unwrap();
+        assert_eq!(parse_diff_request(&params).unwrap().view, DiffView::Symbols);
+
+        let params = parse_query_params("view=symbols&glob=src/**/*.rs").unwrap();
+        let request = parse_diff_request(&params).unwrap();
+        assert_eq!(request.view, DiffView::Symbols);
+        assert_eq!(request.glob, Some("src/**/*.rs"));
+    }
+
+    #[test]
+    fn symbols_render_only_changed_supported_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        write_file(temp.path(), "src/changed.rs", b"pub fn changed() {}\n");
+        write_file(
+            temp.path(),
+            "src/changed.ts",
+            b"export class ChangedTs { run(): void {} }\n",
+        );
+        write_file(temp.path(), "src/unchanged.rs", b"pub fn unchanged() {}\n");
+        let data = test_data(
+            DiffContentSource::Live {
+                worktree: temp.path().to_path_buf(),
+            },
+            vec![
+                changed("src/changed.rs", "modified", None),
+                changed("src/changed.ts", "added", None),
+            ],
+        );
+
+        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        assert!(rendered.contains("src/changed.rs\n1:pub fn changed()"));
+        assert!(
+            rendered.contains("src/changed.ts\n1:class ChangedTs"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("unchanged"));
+    }
+
+    #[test]
+    fn live_symbols_reject_parent_traversal_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = test_data(
+            DiffContentSource::Live {
+                worktree: temp.path().to_path_buf(),
+            },
+            vec![changed("../escape.rs", "modified", None)],
+        );
+
+        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        assert!(rendered.contains("source unavailable: invalid non-relative changed path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_symbols_reject_symlinks_that_escape_the_worktree() {
+        use std::os::unix::fs::symlink;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_file(outside.path(), "secret.rs", b"pub fn outside_secret() {}\n");
+        symlink(
+            outside.path().join("secret.rs"),
+            worktree.path().join("leak.rs"),
+        )
+        .unwrap();
+        let data = test_data(
+            DiffContentSource::Live {
+                worktree: worktree.path().to_path_buf(),
+            },
+            vec![changed("leak.rs", "modified", None)],
+        );
+
+        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        assert!(rendered.contains("source unavailable: live source is a symlink"));
+        assert!(!rendered.contains("outside_secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_source_no_follow_resists_concurrent_symlink_swaps() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Barrier};
+
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = worktree.path().join("leak.rs");
+        let outside_path = outside.path().join("secret.rs");
+        let safe = b"pub fn safe() {}\n";
+        write_file(worktree.path(), "leak.rs", safe);
+        write_file(outside.path(), "secret.rs", b"pub fn outside_secret() {}\n");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_path = path.clone();
+        let writer_outside = outside_path.clone();
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            for index in 0..5_000 {
+                let candidate = writer_path.with_extension("candidate");
+                let _ = std::fs::remove_file(&candidate);
+                if index % 2 == 0 {
+                    std::fs::write(&candidate, safe).unwrap();
+                } else {
+                    symlink(&writer_outside, &candidate).unwrap();
+                }
+                std::fs::rename(&candidate, &writer_path).unwrap();
+            }
+        });
+
+        barrier.wait();
+        let mut successful_reads = 0usize;
+        for _ in 0..5_000 {
+            match read_live_source_no_follow(worktree.path(), Path::new("leak.rs")) {
+                Ok(bytes) => {
+                    successful_reads += 1;
+                    assert_eq!(bytes, safe, "a no-follow read escaped the worktree");
+                }
+                Err(_) => {
+                    // A concurrently installed symlink is rejected atomically.
+                }
+            }
+        }
+        writer.join().unwrap();
+        assert!(successful_reads > 0);
+    }
+
+    #[test]
+    fn symbols_accounts_for_every_non_rendered_file() {
+        let temp = tempfile::tempdir().unwrap();
+        write_file(temp.path(), "binary.rs", b"pub fn binary() {}\0");
+        write_file(temp.path(), "empty.rs", b"// no declarations\n");
+        let data = test_data(
+            DiffContentSource::Live {
+                worktree: temp.path().to_path_buf(),
+            },
+            vec![
+                changed("removed.rs", "removed", None),
+                changed("notes.txt", "modified", None),
+                changed("binary.rs", "modified", None),
+                changed("missing.rs", "modified", None),
+                changed("empty.rs", "modified", None),
+            ],
+        );
+
+        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        assert!(rendered.contains("removed.rs\n(no current outline: file was removed)"));
+        assert!(rendered.contains("notes.txt\n(no current outline: unsupported file grammar)"));
+        assert!(
+            rendered.contains("binary.rs\n(no current outline: binary content contains NUL bytes)")
+        );
+        assert!(rendered.contains("missing.rs\n(no current outline: source unavailable:"));
+        assert!(rendered.contains(
+            "empty.rs\n(no current outline: supported file has no extractable outline entries)"
+        ));
+        assert!(rendered.contains("No structural outline entries were rendered"));
+    }
+
+    #[test]
+    fn rename_glob_selects_previous_path_but_outlines_current_path() {
+        let temp = tempfile::tempdir().unwrap();
+        write_file(temp.path(), "src/new.rs", b"pub fn renamed() {}\n");
+        let mut data = test_data(
+            DiffContentSource::Live {
+                worktree: temp.path().to_path_buf(),
+            },
+            vec![changed("src/new.rs", "renamed", Some("legacy/selected.rs"))],
+        );
+        let matcher = GlobBuilder::new("legacy/**/*.rs")
+            .literal_separator(false)
+            .build()
+            .unwrap()
+            .compile_matcher();
+        filter_diff_data_by_glob(&mut data, &matcher);
+
+        let rendered = render_symbols("CAIRN", 42, "builder", &data, Some("legacy/**/*.rs"));
+        assert!(rendered.contains("src/new.rs\n1:pub fn renamed()"));
+        assert!(!rendered.contains("legacy/selected.rs\n"));
+    }
+
+    #[test]
+    fn archived_content_source_is_retained_only_when_requested() {
+        let pack = Some((vec![1, 2, 3], vec![4, 5]));
+        assert!(matches!(
+            archived_content_source("/repo", "tip", &pack, false),
+            DiffContentSource::Unavailable { .. }
+        ));
+        match archived_content_source("/repo", "tip", &pack, true) {
+            DiffContentSource::Archived {
+                repo_path,
+                pack: retained,
+                tip_sha,
+            } => {
+                assert_eq!(repo_path, PathBuf::from("/repo"));
+                assert_eq!(retained, pack);
+                assert_eq!(tip_sha, "tip");
+            }
+            _ => panic!("symbols view must retain archived source coordinates"),
+        }
+    }
+
+    #[test]
+    fn live_and_archived_sources_render_identical_outlines() {
+        let origin = tempfile::tempdir().unwrap();
+        init_repo(origin.path());
+        write_file(origin.path(), "README.md", b"base\n");
+        let anchor = commit_all(origin.path(), "base");
+
+        let worktree = tempfile::tempdir().unwrap();
+        git(
+            origin.path(),
+            &[
+                "clone",
+                "-q",
+                origin.path().to_str().unwrap(),
+                worktree.path().to_str().unwrap(),
+            ],
+        );
+        git(worktree.path(), &["checkout", "-q", "-b", "work"]);
+        write_file(worktree.path(), "src/lib.rs", b"pub struct Shared;\n");
+        let tip = commit_all(worktree.path(), "add shared source");
+        let (pack, index) = build_execution_pack(worktree.path(), &tip, &anchor, "main")
+            .unwrap()
+            .unwrap();
+        let rows = vec![changed("src/lib.rs", "added", None)];
+        let live = test_data(
+            DiffContentSource::Live {
+                worktree: worktree.path().to_path_buf(),
+            },
+            rows.clone(),
+        );
+        let archived = test_data(
+            DiffContentSource::Archived {
+                repo_path: origin.path().to_path_buf(),
+                pack: Some((pack, index)),
+                tip_sha: tip,
+            },
+            rows,
+        );
+
+        assert_eq!(
+            render_symbols("CAIRN", 42, "builder", &live, None),
+            render_symbols("CAIRN", 42, "builder", &archived, None)
+        );
+    }
+
+    #[test]
+    fn legacy_cache_symbols_degrade_without_changing_summary() {
+        let rows = vec![changed("src/lib.rs", "modified", None)];
+        let data = test_data(
+            DiffContentSource::Unavailable {
+                reason: "legacy cache records changed paths and counts but no file content"
+                    .to_string(),
+            },
+            rows,
+        );
+
+        let symbols = render_symbols("CAIRN", 42, "builder", &data, None);
+        assert!(symbols.contains("source unavailable: legacy cache records"));
+        let summary = render_summary("CAIRN", 42, 7, "builder", &data);
+        assert!(summary.contains("**1 files, +2 -1**"));
+    }
+
+    #[test]
+    fn symbols_distinguish_empty_changed_selection() {
+        let data = test_data(
+            DiffContentSource::Unavailable {
+                reason: "unused".to_string(),
+            },
+            Vec::new(),
+        );
+        let rendered = render_symbols("CAIRN", 42, "builder", &data, Some("src/**/*.rs"));
+        assert!(rendered.contains("No changed files matched the symbols projection."));
+        assert!(!rendered.contains("No structural outline entries were rendered"));
     }
 
     #[test]

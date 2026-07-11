@@ -217,6 +217,10 @@ fn folded_check_keeps_next_seal_clean_under_a_concurrent_advance() {
         .unwrap();
     let report = reconcile_siblings(&jj, &store, int, &[(branch.to_string(), ws.clone())]).unwrap();
     assert_eq!(report.rebased_clean, vec![branch.to_string()]);
+    assert!(
+        report.failed.is_empty(),
+        "a missing origin does not turn a completed local reconcile into a failure"
+    );
 
     // write2: the next seal must SUCCEED and leave `@` clean == tip.
     std::fs::write(ws.join("b.rs"), "fn b() {}\n").unwrap();
@@ -1383,6 +1387,34 @@ fn reconcile_siblings_auto_rebases_with_recorded_conflict() {
         .is_ok(),
         "the cleanly-rebased sibling pushes its advanced tip"
     );
+
+    // Advance the integration tip once more, then make origin unavailable. The
+    // local rebase still succeeds, but a failed PR-head push must classify the
+    // sibling as failed rather than sending a misleading clean-rebase note.
+    jj.run(&store, &["new", int], "second new on int").unwrap();
+    std::fs::write(store.join("second.rs"), "second advance\n").unwrap();
+    jj.run(
+        &store,
+        &["describe", "-m", "second integration advance"],
+        "describe second",
+    )
+    .unwrap();
+    jj.run(
+        &store,
+        &["bookmark", "set", int, "-r", "@"],
+        "advance int second",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(origin.path()).unwrap();
+
+    let failed_push =
+        reconcile_siblings(&jj, &store, int, &[(clean.to_string(), ws_clean.clone())]).unwrap();
+    assert_eq!(
+        failed_push.failed,
+        vec![clean.to_string()],
+        "configured-origin publication failure report: {failed_push:?}"
+    );
+    assert!(failed_push.rebased_clean.is_empty());
 }
 
 /// External default-branch advance: origin/main moves OUT OF BAND (a non-Cairn
@@ -5556,6 +5588,14 @@ fn induced_stale_clean_workspace_heals_via_update_stale() {
     assert!(
         probe.is_err() && is_stale_error(&probe.unwrap_err()),
         "precondition: a rebased-out workspace is genuinely stale"
+    );
+
+    // Bookmark/revset diagnostics must remain truthful even while the working
+    // copy is stale; resolving over the store must not try to snapshot `@`.
+    assert_eq!(
+        bookmark_commit(&jj, &ws_coord, &int),
+        Some(int_tip.clone()),
+        "an existing bookmark resolves from a stale workspace"
     );
 
     // update_stale heals it: clean working copy on the advanced commit.

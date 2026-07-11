@@ -253,7 +253,13 @@ pub(crate) fn prepare_workflow_run(
     );
     let _ = orch.services.emitter.emit(
         "db-change",
-        crate::notify::run_db_change_ids("insert", &run_id, Some(&job_id)),
+        crate::notify::run_db_change_ids(
+            "insert",
+            &run_id,
+            Some(&job_id),
+            issue_id.as_deref(),
+            Some(&project_id),
+        ),
     );
 
     // Seed the transcript with the invocation, anchoring the turn.

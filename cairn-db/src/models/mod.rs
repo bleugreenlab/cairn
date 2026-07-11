@@ -39,7 +39,7 @@ mod workspace;
 // Common enums
 pub use common::{
     MergeType, Model, ModelSelection, Preset, PresetOptionValue, RuntimeExtras,
-    ThinkingDisplayMode, ToolDetailLevel,
+    ThinkingDisplayMode, ToolDetailLevel, TranscriptDensity, TranscriptTextSize,
 };
 
 // Workspace and settings
@@ -49,8 +49,8 @@ pub use workspace::{
 
 // Project types
 pub use project::{
-    CheckCommand, CheckPolicy, CheckWhen, CreateProject, MoveProject, PopulateConfig, Project,
-    ProjectRemoteStatus, TerminalCommand, UpdateProject,
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckWhen, CreateProject, MoveProject,
+    PopulateConfig, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject,
 };
 
 // Context token snapshot types
@@ -90,7 +90,7 @@ pub use run::{
 pub use session::{Session, SessionStatus};
 
 // Turn types
-pub use turn::{Turn, TurnStartReason, TurnState, TurnYieldReason};
+pub use turn::{Turn, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason};
 
 // Recipe types
 pub use recipe::{

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cairn_core::internal::db::DbState;
+use cairn_core::internal::jj;
 use cairn_core::internal::mcp::handlers::run::handle_run;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
@@ -36,12 +37,16 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
     Orchestrator::builder(db_state, services, temp.path().join("config")).build()
 }
 
-fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+fn git_output(repo: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
         .args(args)
         .current_dir(repo)
         .output()
-        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"))
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = git_output(repo, args);
     assert!(output.status.success(), "git {args:?} failed");
 }
 
@@ -79,7 +84,14 @@ fn agent_snapshot() -> AgentSnapshot {
     }
 }
 
-async fn seed_run(db: &LocalDb, project_id: &str, worktree: &Path, run_id: &str) {
+async fn seed_run(
+    db: &LocalDb,
+    project_id: &str,
+    worktree: &Path,
+    branch: &str,
+    base_commit: &str,
+    run_id: &str,
+) {
     let mut agents = HashMap::new();
     agents.insert("agent-1".to_string(), agent_snapshot());
     let snapshot = ExecutionSnapshot::new(
@@ -109,6 +121,8 @@ async fn seed_run(db: &LocalDb, project_id: &str, worktree: &Path, run_id: &str)
     let exec_id = format!("exec-{run_id}");
     let job_id = format!("job-{run_id}");
     let worktree = worktree.display().to_string();
+    let branch = branch.to_string();
+    let base_commit = base_commit.to_string();
     let run_id = run_id.to_string();
     db.write(move |conn| {
         let project_id = project_id.clone();
@@ -116,6 +130,8 @@ async fn seed_run(db: &LocalDb, project_id: &str, worktree: &Path, run_id: &str)
         let exec_id = exec_id.clone();
         let job_id = job_id.clone();
         let worktree = worktree.clone();
+        let branch = branch.clone();
+        let base_commit = base_commit.clone();
         let run_id = run_id.clone();
         let snapshot = snapshot.clone();
         Box::pin(async move {
@@ -132,9 +148,17 @@ async fn seed_run(db: &LocalDb, project_id: &str, worktree: &Path, run_id: &str)
             )
             .await?;
             conn.execute(
-                "INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, node_name, status, uri_segment, worktree_path, created_at, updated_at)
-                 VALUES (?1, ?2, 'agent-1', ?3, ?4, 'builder', 'running', 'builder', ?5, 1, 1)",
-                params![job_id.as_str(), exec_id.as_str(), issue_id.as_str(), project_id.as_str(), worktree.as_str()],
+                "INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, node_name, status, uri_segment, worktree_path, branch, base_commit, created_at, updated_at)
+                 VALUES (?1, ?2, 'agent-1', ?3, ?4, 'builder', 'running', 'builder', ?5, ?6, ?7, 1, 1)",
+                params![
+                    job_id.as_str(),
+                    exec_id.as_str(),
+                    issue_id.as_str(),
+                    project_id.as_str(),
+                    worktree.as_str(),
+                    branch.as_str(),
+                    base_commit.as_str()
+                ],
             )
             .await?;
             conn.execute(
@@ -152,18 +176,34 @@ async fn seed_run(db: &LocalDb, project_id: &str, worktree: &Path, run_id: &str)
 
 async fn setup(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
     let (temp, db) = common::migrated_db().await;
-    let repo = temp.path().join("repo");
-    init_git_repo(&repo);
-    // These run-execution tests model commands launched from an agent worktree.
-    // Keep the Git repository for simple `git grep` assertions, but add the jj
-    // marker that makes the run handler treat the cwd as a worktree rather than
-    // the read-only live checkout.
-    std::fs::create_dir_all(repo.join(".jj")).unwrap();
+    let project_repo = temp.path().join("project");
+    init_git_repo(&project_repo);
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "RHG").await;
-    seed_run(&db, &project_id, &repo, run_id).await;
+    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
+    let worktree = temp.path().join("worktree");
+    let branch = "agent/RHG-1-builder-0";
+    let base_commit = common::head_sha(&project_repo);
+    seed_run(&db, &project_id, &worktree, branch, &base_commit, run_id).await;
     let orch = orchestrator(&temp, db.clone());
-    let cwd = repo.display().to_string();
+    common::provision_jj_workspace(
+        &temp.path().join("config"),
+        &project_repo,
+        &worktree,
+        branch,
+    );
+    let job_id = format!("job-{run_id}");
+    let identity = jj::WorkspaceIdentity::new(
+        job_id.clone(),
+        job_id,
+        &project_id,
+        project_repo,
+        worktree.clone(),
+        branch,
+        jj::workspace_name_for_branch(branch),
+        base_commit,
+    );
+    jj::write_workspace_identity(&worktree, &identity).unwrap();
+    let cwd = worktree.display().to_string();
     (temp, db, orch, cwd)
 }
 
@@ -504,6 +544,40 @@ async fn typescript_code_item_executes_via_bun() {
     );
 }
 
+// Managed identity applies only after the physical cwd proves it is a jj
+// workspace. A plain Git checkout remains a valid run cwd without branch or
+// base-commit metadata on its job.
+#[tokio::test]
+async fn plain_cwd_run_does_not_require_managed_workspace_identity() {
+    let (_temp, db, orch, _managed_cwd) = setup("run-plain-cwd").await;
+    let loose = tempfile::tempdir().unwrap();
+    init_git_repo(loose.path());
+    let loose_path = loose.path().display().to_string();
+    db.execute(
+        "UPDATE jobs SET worktree_path = ?1, branch = NULL, base_commit = NULL
+         WHERE id = 'job-run-plain-cwd'",
+        params![loose_path.as_str()],
+    )
+    .await
+    .unwrap();
+
+    let result = handle_run(
+        &orch,
+        &request(
+            &loose_path,
+            Some("run-plain-cwd"),
+            json!({ "commands": [{ "command": "printf unmanaged-cwd" }] }),
+        ),
+    )
+    .await;
+
+    assert!(result.contains("unmanaged-cwd"), "{result}");
+    assert!(
+        !result.contains("managed workspace owner"),
+        "plain cwd must bypass managed workspace identity resolution: {result}"
+    );
+}
+
 // Inline python routes through `uv run -` when uv resolves and falls back to
 // `python3 -c` otherwise. This end-to-end check is path-agnostic: both
 // uv-managed CPython and system python3 print `py3` for the major version, so it
@@ -659,13 +733,13 @@ async fn timed_out_code_item_promotes_to_terminal_with_partial_output() {
 #[tokio::test]
 async fn chained_commands_surface_all_segments() {
     let (_temp, _db, orch, cwd) = setup("run-chain").await;
-    // `||` chain: first git grep misses, second matches the committed README.
+    // `||` chain: the first grep misses, then the second matches README.
     let or_chain = handle_run(
         &orch,
         &request(
             &cwd,
             Some("run-chain"),
-            json!({ "commands": [{ "command": "git grep zzzNoMatch || git grep initial || echo none" }] }),
+            json!({ "commands": [{ "command": "grep zzzNoMatch README.md || grep initial README.md || echo none" }] }),
         ),
     )
     .await;

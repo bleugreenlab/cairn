@@ -140,7 +140,7 @@ async fn reconcile_jj_downstream(
     // Serialize every base-advance store mutation on this project store behind
     // one async mutex, held across the whole body (on-branch advance + sibling
     // reconcile). A single Cairn merge fires this spawn AND a GitHub push webhook
-    // for the same advance, and the 60s local sweep can overlap either;
+    // for the same advance, and startup/external reconciliation can overlap either;
     // concurrent jj rebase/import ops on the shared store mint divergent
     // conflicted copies of the integration tip. The inner helpers take no lock
     // (`TokioMutex` is not reentrant).
@@ -507,10 +507,18 @@ async fn reconcile_base_advance(
         }
     };
     log::info!(
-        "jj reconcile ({label}): {} rebased clean, {} recorded a conflict",
+        "jj reconcile ({label}): {} rebased clean, {} recorded a conflict, {} failed",
         report.rebased_clean.len(),
-        report.conflicted.len()
+        report.conflicted.len(),
+        report.failed.len()
     );
+
+    if !report.failed.is_empty() {
+        let note = format!(
+            "⛔ BLOCKING [Base branch update] The base advanced, but Cairn could not reconcile your workspace automatically. Your work was preserved. Retry a normal `run` tool call; its pre-flight reconcile will refresh a stale workspace. If that still fails, inspect the jj error and escalate rather than force-pushing. ({label})"
+        );
+        notify_failed_siblings(orch, db, &siblings, &report.failed, &note)?;
+    }
 
     // Re-read each touched sibling's commit id AFTER the rebase — conflicted and
     // cleanly-rebased alike — so we notify only the ones whose commit actually
@@ -896,6 +904,36 @@ fn append_conflicting_files(note: &str, files: Option<&Vec<String>>) -> String {
 /// `files_by_branch` supplies the conflicting file paths per branch, appended to
 /// the note so the agent knows exactly where to look. Cleanly-rebased siblings
 /// are not in `conflicted`; they receive a passive note via `notify_clean_siblings`.
+fn notify_failed_siblings(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    siblings: &[SiblingJob],
+    failed: &[String],
+    note: &str,
+) -> Result<(), String> {
+    for sibling in siblings {
+        let Some(branch) = sibling_branch(sibling) else {
+            continue;
+        };
+        if !failed.contains(&branch) {
+            continue;
+        }
+        let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
+            log::debug!(
+                "jj reconcile: no run for failed sibling {} to steer",
+                sibling.id
+            );
+            continue;
+        };
+        queue_system_direct(orch, &run_id, note, DeliveryUrgency::Steer)?;
+        log::info!(
+            "Steered jj sibling job {} after automatic reconcile failed",
+            sibling.id
+        );
+    }
+    Ok(())
+}
+
 fn notify_conflicted_siblings(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -1914,6 +1952,49 @@ mod tests {
             rewritten.contains(&"agent/missing-after".to_string()),
             "an unresolved snapshot notifies conservatively rather than dropping a change"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_reconcile_queues_waking_steer_note() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let siblings = vec![SiblingJob {
+            id: "job-overlap".to_string(),
+            worktree_path: "/wt/overlap".to_string(),
+            branch: Some("agent/PROJ-2-builder-0".to_string()),
+        }];
+        let failed = vec!["agent/PROJ-2-builder-0".to_string()];
+
+        notify_failed_siblings(
+            &orch,
+            &orch.db.local,
+            &siblings,
+            &failed,
+            "base advanced; retry a normal run",
+        )
+        .unwrap();
+
+        let (content, wake): (String, String) = orch
+            .db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut messages = conn
+                        .query("SELECT content FROM messages WHERE recipient_run_id = 'run-job-overlap'", ())
+                        .await?;
+                    let content = messages.next().await?.expect("failed sibling message").text(0)?;
+                    let mut pushes = conn
+                        .query("SELECT wake FROM attention_pushes WHERE recipient = 'job-overlap'", ())
+                        .await?;
+                    let wake = pushes.next().await?.expect("failed sibling attention push").text(0)?;
+                    Ok::<_, DbError>((content, wake))
+                })
+            })
+            .await
+            .unwrap();
+        assert!(content.contains("retry a normal run"));
+        assert_eq!(wake, "wake");
     }
 
     #[tokio::test(flavor = "current_thread")]

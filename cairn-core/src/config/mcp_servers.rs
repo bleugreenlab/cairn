@@ -268,28 +268,19 @@ pub fn upsert_workspace_mcp_server(
     name: &str,
     config: &McpServerConfig,
 ) -> Result<(), String> {
-    let path = super::settings::get_settings_path(config_dir);
-    upsert_mcp_server_in_file(&path, WORKSPACE_HEADER, name, config)?;
-    super::commit_and_maybe_push(
-        std::slice::from_ref(&path),
-        "cairn: update mcp servers",
-        Some(config_dir),
-    );
-    Ok(())
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update mcp servers", |root| {
+        upsert_mcp_server(root, name, config)
+    })
 }
 
 /// Remove one workspace MCP server by `name`. Succeeds even if the server (or
 /// the file) does not exist. Drops the `mcpServers` block entirely when it
 /// becomes empty so the file stays clean.
 pub fn delete_workspace_mcp_server(config_dir: &Path, name: &str) -> Result<(), String> {
-    let path = super::settings::get_settings_path(config_dir);
-    delete_mcp_server_from_file(&path, WORKSPACE_HEADER, name)?;
-    super::commit_and_maybe_push(
-        std::slice::from_ref(&path),
-        "cairn: update mcp servers",
-        Some(config_dir),
-    );
-    Ok(())
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update mcp servers", |root| {
+        delete_mcp_server(root, name);
+        Ok(())
+    })
 }
 
 /// Insert or replace one project MCP server in `[project]/.cairn/config.yaml`.
@@ -325,7 +316,6 @@ pub fn delete_project_mcp_server(project_path: &Path, name: &str) -> Result<(), 
     Ok(())
 }
 
-const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
 const PROJECT_HEADER: &str = "# Cairn Project Configuration";
 
 /// Insert or replace one MCP server in the `mcpServers` mapping of a YAML
@@ -338,19 +328,27 @@ fn upsert_mcp_server_in_file(
     config: &McpServerConfig,
 ) -> Result<(), String> {
     let mut root = load_settings_mapping(path)?;
+    upsert_mcp_server(&mut root, name, config)?;
+    write_settings_mapping(path, header, &root)
+}
 
+fn upsert_mcp_server(
+    root: &mut serde_yaml::Mapping,
+    name: &str,
+    config: &McpServerConfig,
+) -> Result<(), String> {
     let servers = root
         .entry(serde_yaml::Value::String("mcpServers".to_string()))
         .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
     let servers = servers
         .as_mapping_mut()
         .ok_or_else(|| "`mcpServers` in config is not a mapping".to_string())?;
-
-    let config_value =
-        serde_yaml::to_value(config).map_err(|e| format!("Failed to serialize server: {e}"))?;
-    servers.insert(serde_yaml::Value::String(name.to_string()), config_value);
-
-    write_settings_mapping(path, header, &root)
+    servers.insert(
+        serde_yaml::Value::String(name.to_string()),
+        serde_yaml::to_value(config)
+            .map_err(|error| format!("Failed to serialize server: {error}"))?,
+    );
+    Ok(())
 }
 
 /// Remove one MCP server from the `mcpServers` mapping of a YAML settings file.
@@ -360,16 +358,18 @@ fn delete_mcp_server_from_file(path: &Path, header: &str, name: &str) -> Result<
         return Ok(());
     }
     let mut root = load_settings_mapping(path)?;
+    delete_mcp_server(&mut root, name);
+    write_settings_mapping(path, header, &root)
+}
 
+fn delete_mcp_server(root: &mut serde_yaml::Mapping, name: &str) {
     let key = serde_yaml::Value::String("mcpServers".to_string());
-    if let Some(servers) = root.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
+    if let Some(servers) = root.get_mut(&key).and_then(|value| value.as_mapping_mut()) {
         servers.remove(serde_yaml::Value::String(name.to_string()));
         if servers.is_empty() {
             root.remove(&key);
         }
     }
-
-    write_settings_mapping(path, header, &root)
 }
 
 /// Parse a settings file into a YAML mapping, or an empty mapping if the file

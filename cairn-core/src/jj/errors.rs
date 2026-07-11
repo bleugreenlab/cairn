@@ -25,6 +25,12 @@ pub fn is_stale_error(msg: &str) -> bool {
     msg.contains("working copy is stale") || msg.contains("behind its branch tip")
 }
 
+/// Classify the stable error returned when Cairn kills a managed jj/git
+/// subprocess after its deadline.
+pub fn is_jj_timeout_error(msg: &str) -> bool {
+    msg.contains(" timed out after ") && msg.contains(" and was killed")
+}
+
 /// Stable marker phrase for a seal that captured no change because the working
 /// copy was reset under a concurrent store advance — the empty/divergent-seal
 /// data-loss mode. Carried in the `Err` [`seal_paths`] returns when its
@@ -78,4 +84,19 @@ pub fn update_stale(jj: &JjEnv, ws: &Path) -> Result<(), String> {
         "jj workspace update-stale",
     )
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::is_jj_timeout_error;
+
+    #[test]
+    fn recognizes_only_bounded_runner_timeout_errors() {
+        assert!(is_jj_timeout_error(
+            "jj git push timed out after 600s and was killed"
+        ));
+        assert!(!is_jj_timeout_error(
+            "jj git push failed: connection timed out"
+        ));
+    }
 }

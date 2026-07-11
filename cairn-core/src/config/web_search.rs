@@ -228,18 +228,18 @@ pub fn validate_options(
 /// Set (or clear) the active web-search provider scalar. `None` / empty clears
 /// it back to unconfigured.
 pub fn set_active_web_search(config_dir: &Path, name: Option<&str>) -> Result<(), String> {
-    let path = super::settings::get_settings_path(config_dir);
-    let mut root = super::web_fetch::load_settings_mapping(&path)?;
-    let key = serde_yaml::Value::String("activeWebSearch".to_string());
-    match name {
-        Some(n) if !n.trim().is_empty() => {
-            root.insert(key, serde_yaml::Value::String(n.to_string()));
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let key = serde_yaml::Value::String("activeWebSearch".to_string());
+        match name {
+            Some(name) if !name.trim().is_empty() => {
+                root.insert(key, serde_yaml::Value::String(name.to_string()));
+            }
+            _ => {
+                root.remove(&key);
+            }
         }
-        _ => {
-            root.remove(&key);
-        }
-    }
-    super::web_fetch::write_settings_mapping(&path, &root)
+        Ok(())
+    })
 }
 
 /// Insert or replace the stored options for one provider, after validating them
@@ -251,24 +251,20 @@ pub fn upsert_web_search_options(
     options: &HashMap<String, serde_yaml::Value>,
 ) -> Result<(), String> {
     validate_options(id, options)?;
-    let path = super::settings::get_settings_path(config_dir);
-    let mut root = super::web_fetch::load_settings_mapping(&path)?;
-
-    let search = root
-        .entry(serde_yaml::Value::String("webSearch".to_string()))
-        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    let search = search
-        .as_mapping_mut()
-        .ok_or_else(|| "`webSearch` in config is not a mapping".to_string())?;
-
-    let options_value =
-        serde_yaml::to_value(options).map_err(|e| format!("Failed to serialize options: {e}"))?;
-    search.insert(
-        serde_yaml::Value::String(id.as_str().to_string()),
-        options_value,
-    );
-
-    super::web_fetch::write_settings_mapping(&path, &root)
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let search = root
+            .entry(serde_yaml::Value::String("webSearch".to_string()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        let search = search
+            .as_mapping_mut()
+            .ok_or_else(|| "`webSearch` in config is not a mapping".to_string())?;
+        search.insert(
+            serde_yaml::Value::String(id.as_str().to_string()),
+            serde_yaml::to_value(options)
+                .map_err(|error| format!("Failed to serialize options: {error}"))?,
+        );
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -347,6 +343,45 @@ mod tests {
             &opts(&[("searchDepth", serde_yaml::Value::from("advanced"))])
         )
         .is_ok());
+    }
+
+    #[test]
+    fn provider_selection_and_options_survive_general_settings_save() {
+        let ws = TempDir::new().unwrap();
+        upsert_web_search_options(
+            ws.path(),
+            SearchProviderId::Brave,
+            &opts(&[("count", serde_yaml::Value::from(7))]),
+        )
+        .unwrap();
+        set_active_web_search(ws.path(), Some("brave")).unwrap();
+        super::super::pdf::upsert_pdf_options(
+            ws.path(),
+            super::super::pdf::PdfProviderId::Bmd,
+            &HashMap::new(),
+        )
+        .unwrap();
+        super::super::pdf::set_active_pdf(ws.path(), Some("bmd")).unwrap();
+
+        let settings = super::super::settings::load_settings(ws.path());
+        super::super::settings::save_settings(ws.path(), &settings).unwrap();
+
+        assert_eq!(active_web_search_name(ws.path()).as_deref(), Some("brave"));
+        assert_eq!(
+            load_web_search_options(ws.path(), SearchProviderId::Brave)
+                .get("count")
+                .and_then(serde_yaml::Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            super::super::pdf::active_pdf_name(ws.path()).as_deref(),
+            Some("bmd")
+        );
+        assert!(super::super::pdf::load_pdf_options(
+            ws.path(),
+            super::super::pdf::PdfProviderId::Bmd
+        )
+        .is_empty());
     }
 
     #[test]

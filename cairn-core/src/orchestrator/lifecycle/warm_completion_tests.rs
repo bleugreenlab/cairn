@@ -4,7 +4,7 @@ use super::{
 };
 use crate::agent_process::process::{wrap_plain_stdin, RunHandle};
 use crate::db::DbState;
-use crate::models::RunStatus;
+use crate::models::{RunStatus, TurnEndReason};
 use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
 use crate::services::testing::TestServicesBuilder;
 use crate::services::EventEmitter;
@@ -210,6 +210,40 @@ async fn durable_wait_preserves_warm_process_when_interrupt_delivery_fails() {
 }
 
 #[tokio::test]
+async fn warm_transition_persists_artifact_handoff_reason() {
+    let db = test_db().await;
+    seed_top_level_run(
+        &db,
+        "run-handoff",
+        "job-handoff",
+        "turn-handoff",
+        "needs_approval",
+    )
+    .await;
+    let (orch, _) = test_orchestrator_with_emitter(db, None);
+    register_warm_process(&orch, "run-handoff", Some("job-handoff"));
+    orch.process_state
+        .set_current_turn_id("run-handoff", Some("turn-handoff"));
+
+    assert!(transition_to_warm_state(
+        &orch,
+        "run-handoff",
+        Some(TurnEndReason::ArtifactHandoff),
+    ));
+
+    let reason = orch
+        .db
+        .local
+        .query_opt_text(
+            "SELECT end_reason FROM turns WHERE id = ?1",
+            ("turn-handoff".to_string(),),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reason.as_deref(), Some("artifact_handoff"));
+}
+
+#[tokio::test]
 async fn warm_transition_emits_completion_attention_for_top_level_run() {
     let db = test_db().await;
     // Issue still needs the driver (plan/PR awaiting confirmation looks like
@@ -220,7 +254,7 @@ async fn warm_transition_emits_completion_attention_for_top_level_run() {
     orch.process_state
         .set_current_turn_id("run-attn", Some("turn-attn"));
 
-    assert!(transition_to_warm_state(&orch, "run-attn"));
+    assert!(transition_to_warm_state(&orch, "run-attn", None));
 
     let completed = agent_attention_events(&emitter, "completed");
     assert_eq!(completed.len(), 1);
@@ -255,7 +289,7 @@ async fn warm_transition_without_actionable_work_skips_completed_attention() {
     orch.process_state
         .set_current_turn_id("run-quiet", Some("turn-quiet"));
 
-    assert!(transition_to_warm_state(&orch, "run-quiet"));
+    assert!(transition_to_warm_state(&orch, "run-quiet", None));
 
     assert!(agent_attention_events(&emitter, "completed").is_empty());
 }
@@ -276,7 +310,7 @@ async fn later_finalize_does_not_duplicate_completed_attention() {
     orch.process_state
         .set_current_turn_id("run-dedupe", Some("turn-dedupe"));
 
-    assert!(transition_to_warm_state(&orch, "run-dedupe"));
+    assert!(transition_to_warm_state(&orch, "run-dedupe", None));
     finalize_run(&orch, "run-dedupe", RunStatus::Exited);
 
     assert_eq!(agent_attention_events(&emitter, "completed").len(), 1);
@@ -316,7 +350,7 @@ async fn warm_transition_broadcasts_run_completion() {
     // fast-finishing child. A warmed child must broadcast on it just like
     // `finalize_run` does, or a sub-45s batch never returns inline.
     let mut rx = orch.run_completions.subscribe();
-    assert!(transition_to_warm_state(&orch, "run-bcast"));
+    assert!(transition_to_warm_state(&orch, "run-bcast", None));
 
     assert_eq!(rx.try_recv().ok(), Some("run-bcast".to_string()));
 }
@@ -390,7 +424,7 @@ async fn warm_completion_resumes_suspended_delegated_parent() {
     assert_eq!(turn_state(&orch, "succ").await, "pending");
 
     // The child completes through the warm path (CAIRN-1576), not finalize_run.
-    assert!(transition_to_warm_state(&orch, "run-child"));
+    assert!(transition_to_warm_state(&orch, "run-child", None));
 
     // The resume gate fired: the pending successor was claimed (flipped
     // terminal), the linkage finalize_run's try_resume_delegated_parent

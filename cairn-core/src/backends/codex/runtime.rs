@@ -7,7 +7,7 @@ use super::events::{
     extract_raw_response_message_text, finalize_agent_message, finalize_streaming,
     handle_agent_message_delta, handle_codex_interrupted_turn, handle_reasoning_delta,
     handle_turn_completed, store_event, summarize_command_result, summarize_file_change_result,
-    terminal_tool_called_for_run,
+    terminal_tool_called_for_run, TurnFailureDisposition,
 };
 use super::json_string;
 use super::permissions::{
@@ -20,7 +20,7 @@ use crate::agent_process::stream::{OutputTokensDetails, ToolUseInfo, TranscriptE
 use crate::models::ContextTokenState;
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
-use crate::storage::LocalDb;
+use crate::storage::{LocalDb, RowExt};
 use crate::transcripts::stream_store::append_chunks;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +32,278 @@ use uuid::Uuid;
 
 const CODEX_TURN_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CODEX_TURN_WATCHDOG_POLL: Duration = Duration::from_secs(1);
+const CAPACITY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(8),
+    Duration::from_secs(30),
+];
+
+fn normalize_capacity_error(message: &str) -> String {
+    message
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(super) fn is_selected_model_capacity_error(message: &str) -> bool {
+    normalize_capacity_error(message)
+        == "selected model is at capacity please try a different model"
+}
+
+#[derive(Debug, Default, Clone)]
+struct ProviderTurnFailureState {
+    capacity_message: Option<String>,
+    terminalized: bool,
+}
+
+#[derive(Debug)]
+struct CapacityRetryTarget {
+    job_id: String,
+    session_id: String,
+    cairn_turn_id: String,
+}
+
+fn provider_turn_id(msg: &Value, current_turn_id: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    msg.pointer("/params/turn/id")
+        .or_else(|| msg.pointer("/params/turnId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| current_turn_id.lock().ok().and_then(|guard| guard.clone()))
+}
+
+fn clear_provider_turn_if_current(
+    completed_turn_id: Option<&str>,
+    current_turn_id: &Arc<Mutex<Option<String>>>,
+    progress_watchdog: &Arc<Mutex<CodexTurnProgressWatchdog>>,
+) {
+    let Some(completed_turn_id) = completed_turn_id else {
+        return;
+    };
+    let is_current = current_turn_id
+        .lock()
+        .ok()
+        .is_some_and(|guard| guard.as_deref() == Some(completed_turn_id));
+    if !is_current {
+        return;
+    }
+
+    if let Ok(mut guard) = current_turn_id.lock() {
+        *guard = None;
+    }
+    if let Ok(mut watchdog) = progress_watchdog.lock() {
+        if watchdog.active_turn_id.as_deref() == Some(completed_turn_id) {
+            watchdog.clear_turn();
+        }
+    }
+}
+
+fn capacity_retry_target(
+    db: &Arc<LocalDb>,
+    run_id: &str,
+    orch: &Orchestrator,
+) -> Result<Option<CapacityRetryTarget>, String> {
+    let cairn_turn_id = orch
+        .process_state
+        .get_current_turn_id(run_id)
+        .ok_or_else(|| "capacity failure has no active Cairn turn".to_string())?;
+    crate::storage::run_db_blocking({
+        let db = db.clone();
+        let run_id = run_id.to_string();
+        let cairn_turn_id = cairn_turn_id.clone();
+        move || async move {
+            db.read(|conn| {
+                let run_id = run_id.clone();
+                let cairn_turn_id = cairn_turn_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT j.id, j.current_session_id, j.current_turn_id
+                               FROM runs r
+                               JOIN jobs j ON j.id = r.job_id
+                              WHERE r.id = ?1
+                                AND j.parent_job_id IS NULL
+                                AND j.recipe_node_id IS NULL
+                                AND COALESCE(j.agent_config_id, '') != 'workflow'
+                              LIMIT 1",
+                            (run_id.as_str(),),
+                        )
+                        .await?;
+                    let Some(row) = rows.next().await? else {
+                        return Ok(None);
+                    };
+                    let job_id = row.text(0)?;
+                    let session_id = row.opt_text(1)?;
+                    let head_turn_id = row.opt_text(2)?;
+                    if head_turn_id.as_deref() != Some(cairn_turn_id.as_str()) {
+                        return Ok(None);
+                    }
+                    Ok(session_id.map(|session_id| CapacityRetryTarget {
+                        job_id,
+                        session_id,
+                        cairn_turn_id,
+                    }))
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
+    })
+}
+
+fn handle_selected_model_capacity_failure(
+    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
+    run_id: &str,
+    session_id: Option<&str>,
+) -> bool {
+    let target = match capacity_retry_target(run_db, run_id, orch) {
+        Ok(Some(target)) => target,
+        Ok(None) => return false,
+        Err(error) => {
+            log::warn!(
+                "Unable to prepare Codex capacity retry for run {}: {}",
+                run_id,
+                error
+            );
+            return false;
+        }
+    };
+    let completed_retries = match crate::execution::jobs::consecutive_retry_turn_count(
+        run_db.clone(),
+        &target.cairn_turn_id,
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            log::warn!(
+                "Unable to count Codex capacity retries for run {}: {}",
+                run_id,
+                error
+            );
+            crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
+            return true;
+        }
+    };
+    let next_attempt = completed_retries + 1;
+    if next_attempt > CAPACITY_RETRY_DELAYS.len() as u32 {
+        insert_error_event(
+            orch,
+            run_id,
+            session_id,
+            "The selected Codex model remained at capacity after three automatic retries. You can continue this job manually to try again.",
+        );
+        crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
+        return true;
+    }
+
+    crate::orchestrator::lifecycle::fail_run(orch, run_id, "capacity_retry");
+    let retry_turn_id = match crate::execution::jobs::claim_retry_successor_if_head_matches(
+        orch,
+        run_db.clone(),
+        &target.job_id,
+        &target.session_id,
+        &target.cairn_turn_id,
+    ) {
+        Ok(Some(turn_id)) => turn_id,
+        Ok(None) => return true,
+        Err(error) => {
+            log::warn!(
+                "Failed to claim Codex capacity retry successor for run {}: {}",
+                run_id,
+                error
+            );
+            return true;
+        }
+    };
+    let delay = CAPACITY_RETRY_DELAYS[(next_attempt - 1) as usize];
+    let delay_seconds = delay.as_secs();
+    let status = format!(
+        "Codex is at capacity. Retrying in {} seconds ({}/3).",
+        delay_seconds, next_attempt
+    );
+    if let Err(error) = crate::messages::transcript::insert_system_message_sync(
+        orch,
+        run_id,
+        session_id,
+        Some(&target.cairn_turn_id),
+        &status,
+        serde_json::json!({
+            "provider": "codex",
+            "kind": "selected_model_capacity_retry",
+            "attempt": next_attempt,
+            "maxAttempts": CAPACITY_RETRY_DELAYS.len(),
+            "delaySeconds": delay_seconds,
+        }),
+    ) {
+        log::warn!(
+            "Failed to persist Codex capacity retry status for run {}: {}",
+            run_id,
+            error
+        );
+    }
+
+    let orch = orch.clone();
+    let retry_db = run_db.clone();
+    let job_id = target.job_id;
+    let retry_job_id = job_id.clone();
+    let retry_turn_for_thread = retry_turn_id.clone();
+    if let Err(error) = thread::Builder::new()
+        .name(format!("codex-capacity-retry-{next_attempt}"))
+        .spawn(move || {
+            thread::sleep(delay);
+            if let Err(error) = crate::execution::jobs::continue_automatic_retry(
+                &orch,
+                &retry_job_id,
+                &retry_turn_for_thread,
+            ) {
+                log::warn!(
+                    "Codex capacity retry for job {} did not launch: {}",
+                    retry_job_id,
+                    error
+                );
+                if let Err(cleanup_error) =
+                    crate::execution::jobs::abandon_pending_retry_if_head_matches(
+                        retry_db,
+                        &retry_job_id,
+                        &retry_turn_for_thread,
+                    )
+                {
+                    log::warn!(
+                        "Failed to release unstarted Codex retry turn {}: {}",
+                        retry_turn_for_thread,
+                        cleanup_error
+                    );
+                }
+            }
+        })
+    {
+        log::warn!(
+            "Failed to schedule Codex capacity retry for job {}: {}",
+            job_id,
+            error
+        );
+        if let Err(cleanup_error) = crate::execution::jobs::abandon_pending_retry_if_head_matches(
+            run_db.clone(),
+            &job_id,
+            &retry_turn_id,
+        ) {
+            log::warn!(
+                "Failed to release unscheduled Codex retry turn {}: {}",
+                retry_turn_id,
+                cleanup_error
+            );
+        }
+    }
+    true
+}
 
 fn u64_pointer_as_u32(value: &Value, pointer: &str) -> u32 {
     value.pointer(pointer).and_then(|v| v.as_u64()).unwrap_or(0) as u32
@@ -214,6 +486,7 @@ impl CodexBackend {
         let mut pending_tool_ids: HashSet<String> = HashSet::new();
         let mut tool_output_chars: HashMap<String, i32> = HashMap::new();
         let mut terminal_tool_suspended = false;
+        let mut provider_turn_failures: HashMap<String, ProviderTurnFailureState> = HashMap::new();
         let progress_watchdog = Arc::new(Mutex::new(CodexTurnProgressWatchdog::new(
             CODEX_TURN_NO_PROGRESS_TIMEOUT,
         )));
@@ -463,7 +736,7 @@ impl CodexBackend {
                                 error
                             );
                         }
-                        crate::orchestrator::lifecycle::transition_to_warm_state(orch, run_id);
+                        crate::orchestrator::lifecycle::transition_to_warm_state(orch, run_id, None);
                         crate::backends::codex::events::emit_codex_run_turn_completed(emitter, run_id);
                     }
                 };
@@ -914,6 +1187,7 @@ impl CodexBackend {
                     }
                 }
                 Some("turn/completed") => {
+                    let completed_provider_turn_id = provider_turn_id(&msg, &current_turn_id);
                     let status = msg
                         .pointer("/params/turn/status")
                         .and_then(|v| v.as_str())
@@ -951,6 +1225,34 @@ impl CodexBackend {
                             }
                         }
                     }
+                    let failure_disposition = if status == "completed" {
+                        if let Some(turn_id) = completed_provider_turn_id.as_deref() {
+                            provider_turn_failures.remove(turn_id);
+                        }
+                        TurnFailureDisposition::Unhandled
+                    } else if let Some(turn_id) = completed_provider_turn_id.as_deref() {
+                        let state = provider_turn_failures
+                            .entry(turn_id.to_string())
+                            .or_default();
+                        if status == "failed"
+                            && !state.terminalized
+                            && state.capacity_message.is_some()
+                        {
+                            state.terminalized = handle_selected_model_capacity_failure(
+                                orch,
+                                &run_db,
+                                run_id,
+                                session_id.as_deref(),
+                            );
+                        }
+                        if state.terminalized {
+                            TurnFailureDisposition::AlreadyHandled
+                        } else {
+                            TurnFailureDisposition::Unhandled
+                        }
+                    } else {
+                        TurnFailureDisposition::Unhandled
+                    };
                     handle_turn_completed(
                         orch,
                         &run_db,
@@ -962,13 +1264,13 @@ impl CodexBackend {
                         status,
                         pending_usage.take(),
                         ephemeral,
+                        failure_disposition,
                     );
-                    if let Ok(mut guard) = current_turn_id.lock() {
-                        *guard = None;
-                    }
-                    if let Ok(mut watchdog) = progress_watchdog.lock() {
-                        watchdog.clear_turn();
-                    }
+                    clear_provider_turn_if_current(
+                        completed_provider_turn_id.as_deref(),
+                        &current_turn_id,
+                        &progress_watchdog,
+                    );
                     // A pooled call is a single one-shot turn: its turn/completed
                     // is terminal, so stop consuming and let the thread exit.
                     if ephemeral {
@@ -976,6 +1278,7 @@ impl CodexBackend {
                     }
                 }
                 Some("turn/aborted") => {
+                    let aborted_provider_turn_id = provider_turn_id(&msg, &current_turn_id);
                     finalize_streaming(
                         orch,
                         &run_db,
@@ -1008,12 +1311,14 @@ impl CodexBackend {
                             crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_aborted");
                         }
                     }
-                    if let Ok(mut guard) = current_turn_id.lock() {
-                        *guard = None;
+                    if let Some(turn_id) = aborted_provider_turn_id.as_deref() {
+                        provider_turn_failures.remove(turn_id);
                     }
-                    if let Ok(mut watchdog) = progress_watchdog.lock() {
-                        watchdog.clear_turn();
-                    }
+                    clear_provider_turn_if_current(
+                        aborted_provider_turn_id.as_deref(),
+                        &current_turn_id,
+                        &progress_watchdog,
+                    );
                     // A pooled call's aborted turn is terminal (killed or
                     // failed): stop consuming and exit the thread.
                     if ephemeral {
@@ -1021,6 +1326,7 @@ impl CodexBackend {
                     }
                 }
                 Some("error") => {
+                    let error_provider_turn_id = provider_turn_id(&msg, &current_turn_id);
                     let message = msg
                         .pointer("/params/error/message")
                         .and_then(|v| v.as_str())
@@ -1031,7 +1337,46 @@ impl CodexBackend {
                         .unwrap_or(false);
                     if will_retry {
                         log::warn!("Codex retryable error: {}", message);
+                        if is_selected_model_capacity_error(message) {
+                            if let Some(turn_id) = error_provider_turn_id {
+                                provider_turn_failures
+                                    .entry(turn_id)
+                                    .or_default()
+                                    .capacity_message = Some(normalize_capacity_error(message));
+                            }
+                        }
                     } else {
+                        let already_terminalized = error_provider_turn_id
+                            .as_ref()
+                            .and_then(|turn_id| provider_turn_failures.get(turn_id))
+                            .is_some_and(|state| state.terminalized);
+                        if already_terminalized {
+                            continue;
+                        }
+                        if is_selected_model_capacity_error(message) {
+                            finalize_streaming(
+                                orch,
+                                &run_db,
+                                emitter,
+                                &mut streaming_state,
+                                session_id.as_deref(),
+                                &mut sequence,
+                            );
+                            if handle_selected_model_capacity_failure(
+                                orch,
+                                &run_db,
+                                run_id,
+                                session_id.as_deref(),
+                            ) {
+                                if let Some(turn_id) = error_provider_turn_id {
+                                    let state = provider_turn_failures.entry(turn_id).or_default();
+                                    state.capacity_message =
+                                        Some(normalize_capacity_error(message));
+                                    state.terminalized = true;
+                                }
+                                continue;
+                            }
+                        }
                         log::error!("Codex fatal error: {}", message);
                         finalize_streaming(
                             orch,
@@ -1050,6 +1395,12 @@ impl CodexBackend {
                         // Non-retryable fatal error: finalize task-aware so a
                         // delegated child fails terminally and resumes its parent.
                         crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
+                        if let Some(turn_id) = error_provider_turn_id {
+                            provider_turn_failures
+                                .entry(turn_id)
+                                .or_default()
+                                .terminalized = true;
+                        }
                         // A pooled call's fatal error is terminal: exit the thread.
                         if ephemeral {
                             break;
@@ -1289,5 +1640,45 @@ mod tests {
         assert_eq!(usage.input_tokens, 18_671);
         assert_eq!(usage.cache_read_input_tokens, Some(3_456));
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn selected_model_capacity_classifier_is_narrow_and_punctuation_tolerant() {
+        for message in [
+            "Selected model is at capacity. Please try a different model.",
+            "selected MODEL is at capacity; please try a different model!",
+            "Selected model is at capacity -- please try a different model...",
+        ] {
+            assert!(is_selected_model_capacity_error(message), "{message}");
+        }
+        for message in [
+            "You have exceeded your quota.",
+            "Authentication failed.",
+            "Context window exceeded.",
+            "The service is at capacity.",
+            "Selected model failed. Please try a different model.",
+        ] {
+            assert!(!is_selected_model_capacity_error(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn late_completion_does_not_clear_newer_provider_turn() {
+        let current = Arc::new(Mutex::new(Some("turn-2".to_string())));
+        let watchdog = Arc::new(Mutex::new(CodexTurnProgressWatchdog::new(
+            Duration::from_secs(10),
+        )));
+        watchdog
+            .lock()
+            .unwrap()
+            .start_turn("turn-2", Instant::now());
+
+        clear_provider_turn_if_current(Some("turn-1"), &current, &watchdog);
+
+        assert_eq!(current.lock().unwrap().as_deref(), Some("turn-2"));
+        assert_eq!(
+            watchdog.lock().unwrap().active_turn_id.as_deref(),
+            Some("turn-2")
+        );
     }
 }

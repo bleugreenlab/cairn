@@ -6,6 +6,14 @@ use super::types::{
 };
 use crate::query::parse_query_params;
 
+fn valid_opaque_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+}
+
 fn parse_positive_i32(value: &str) -> Option<i32> {
     value.parse::<i32>().ok().filter(|value| *value > 0)
 }
@@ -193,6 +201,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             project: canonical_project(project),
             slug: (*slug).to_string(),
         }),
+        [PROJECT_SCOPE, project, "browser", slug, "network", request_id]
+            if valid_opaque_id(request_id) =>
+        {
+            Some(CairnResource::ProjectBrowserNetworkRequest {
+                project: canonical_project(project),
+                slug: (*slug).to_string(),
+                request_id: (*request_id).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, "browser", slug] => Some(CairnResource::ProjectBrowser {
             project: canonical_project(project),
             slug: (*slug).to_string(),
@@ -447,6 +464,18 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 slug: (*slug).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "browser", slug, "network", request_id]
+            if valid_opaque_id(request_id) =>
+        {
+            Some(CairnResource::NodeBrowserNetworkRequest {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                slug: (*slug).to_string(),
+                request_id: (*request_id).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "browser", slug] => {
             Some(CairnResource::NodeBrowser {
                 project: canonical_project(project),
@@ -463,6 +492,19 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 exec_seq: parse_positive_i32(exec_seq)?,
                 node_id: (*node_id).to_string(),
                 slug: DEFAULT_BROWSER_SLUG.to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "browser", slug, "network", request_id]
+            if valid_opaque_id(request_id) =>
+        {
+            Some(CairnResource::TaskBrowserNetworkRequest {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                slug: (*slug).to_string(),
+                request_id: (*request_id).to_string(),
             })
         }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "browser", slug] => {

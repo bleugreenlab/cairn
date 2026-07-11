@@ -127,6 +127,60 @@ pub fn forward_resolve_commit(
     Some((change_id, current))
 }
 
+/// Forward-map a rewritten commit to the unique current incarnation that is an
+/// ancestor of `descendant`. Unlike the archival resolver above, this proof is
+/// store-scoped and anchored to an explicit physical head, so it cannot select a
+/// divergent incarnation from another workspace lineage.
+fn exactly_one_commit_id(output: &str) -> Option<String> {
+    let mut commits = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let commit = commits.next()?.to_string();
+    commits.next().is_none().then_some(commit)
+}
+
+pub fn forward_resolve_ancestor(
+    jj: &JjEnv,
+    store: &Path,
+    commit: &str,
+    descendant: &str,
+) -> Option<String> {
+    let change_id = jj
+        .run(
+            store,
+            &[
+                "log",
+                "-r",
+                commit,
+                "--no-graph",
+                "-T",
+                "change_id",
+                "--ignore-working-copy",
+            ],
+            "jj forward-resolve ancestor change_id",
+        )
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let revset = format!("latest(change_id({change_id}) & ::{descendant})");
+    let output = jj
+        .run(
+            store,
+            &[
+                "log",
+                "-r",
+                &revset,
+                "--no-graph",
+                "-T",
+                r#"commit_id ++ "\n""#,
+                "--ignore-working-copy",
+            ],
+            "jj forward-resolve ancestor commit_id",
+        )
+        .ok()?;
+    exactly_one_commit_id(&output)
+}
+
 /// Push the workspace's bookmark to origin. Callers choose whether publication
 /// is strict or best-effort by propagating or logging the returned error. Skips
 /// empty/`main`/`master` branches (the same guard the git path uses). jj 0.42
@@ -261,14 +315,21 @@ pub fn local_bookmarks_at(jj: &JjEnv, ws: &Path, rev: &str) -> Result<Vec<String
 /// it does not resolve. Used for both exact local bookmarks and remote-tracking
 /// bookmarks such as `main@origin`.
 pub fn revset_commit(jj: &JjEnv, store: &Path, revset: &str) -> Option<String> {
-    jj.run(
-        store,
-        &["log", "-r", revset, "--no-graph", "-T", "commit_id"],
-        "jj log revset commit",
-    )
-    .ok()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
+    let resolve = |ignore_working_copy: bool| {
+        let mut args = vec!["log", "-r", revset, "--no-graph", "-T", "commit_id"];
+        if ignore_working_copy {
+            args.push("--ignore-working-copy");
+        }
+        jj.run(store, &args, "jj log revset commit")
+    };
+
+    let output = match resolve(false) {
+        Ok(output) => output,
+        Err(error) if is_stale_error(&error) => resolve(true).ok()?,
+        Err(_) => return None,
+    };
+    let commit = output.trim();
+    (!commit.is_empty()).then(|| commit.to_string())
 }
 
 /// The commit id of an active workspace's working-copy commit (`<name>@`),
@@ -308,4 +369,17 @@ pub fn ensure_bookmark_on_origin(jj: &JjEnv, store: &Path, branch: &str) -> Resu
         "jj git push base bookmark",
     )
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod forward_resolve_ancestor_tests {
+    use super::exactly_one_commit_id;
+
+    #[test]
+    fn unique_commit_parser_fails_closed_on_ambiguous_output() {
+        assert_eq!(exactly_one_commit_id("abc123\n"), Some("abc123".into()));
+        assert_eq!(exactly_one_commit_id("\n abc123 \n"), Some("abc123".into()));
+        assert_eq!(exactly_one_commit_id(""), None);
+        assert_eq!(exactly_one_commit_id("abc123\ndef456\n"), None);
+    }
 }

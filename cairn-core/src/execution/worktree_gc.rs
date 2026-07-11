@@ -41,7 +41,7 @@
 //! [`crate::execution::teardown::teardown_worktrees`], which is landed-aware.
 
 use crate::execution::teardown::{
-    self, execute_target_cleanup, group_into_targets, worktrees_base_dir, TeardownTarget,
+    self, execute_target_cleanup, group_into_targets, TeardownTarget,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -234,7 +234,7 @@ async fn fs_pass(orch: &Orchestrator, cutoff: i64) {
         );
         return;
     }
-    let base = match worktrees_base_dir() {
+    let base = match crate::managed_worktrees::base_dir() {
         Some(b) => b,
         None => return,
     };

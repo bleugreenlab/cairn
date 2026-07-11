@@ -121,7 +121,10 @@ pub(crate) const NODE_CHAT_RAW_CONTRACT: ResourceContract = ResourceContract {
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/chat/raw",
     name: "Raw transcript",
     description: "Full unsummarized transcript stream; the digest's programmatic and grep fallback",
-    read_projections: NO_PROJECTIONS,
+    read_projections: &[ProjectionSpec {
+        key: "format",
+        values: "json (JSONL with one reconstructed event per line; Markdown by default)",
+    }],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
@@ -201,11 +204,11 @@ pub(crate) const NODE_DIFF_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::NodeDiff,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/diff",
     name: "Node workspace diff",
-    description: "Layered view of a node's jj workspace change against its resolved base, including revisions, changed files, commits, patch, and validation without requiring git or jj knowledge; a delegated task's home-relative diff projects to its owning node",
+    description: "Layered view of a node's jj workspace change against its resolved base, including revisions, changed files, commits, patch, structural outlines, and validation without requiring git or jj knowledge; a delegated task's home-relative diff projects to its owning node",
     read_projections: &[
         ProjectionSpec {
             key: "view",
-            values: "commits|patch|check (absent = summary)",
+            values: "commits|patch|symbols|check (absent = summary)",
         },
         ProjectionSpec {
             key: "file",
@@ -213,7 +216,7 @@ pub(crate) const NODE_DIFF_CONTRACT: ResourceContract = ResourceContract {
         },
         ProjectionSpec {
             key: "glob",
-            values: "PATTERN (scope changed files or patch sections)",
+            values: "PATTERN (scope changed files for summary/symbols or patch sections)",
         },
     ],
     related: NO_RELATED,
@@ -334,3 +337,14 @@ pub(crate) const NODE_BROWSER_CONTRACT: ResourceContract =
             },
         ],
     };
+
+pub(crate) const NODE_BROWSER_NETWORK_REQUEST_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeBrowserNetworkRequest,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/browser/{slug}/network/{request_id}",
+    name: "Node browser network request",
+    description: "Sanitized detail for one stable browser network capture handle. Request and response bodies are bounded, binary and cross-origin bodies are explicitly omitted, and portable redirect data is aggregate-only. Handles survive navigation but expire on browser close, runner restart, or bounded archive eviction.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[],
+};

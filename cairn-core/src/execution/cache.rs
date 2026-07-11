@@ -67,6 +67,7 @@ pub fn get_check_result(
                                job_id, cached, failure_kind
                         FROM check_result_cache
                         WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+                          AND failure_kind IS NULL
                         ",
                         params![
                             project_id.as_str(),
@@ -751,6 +752,33 @@ mod tests {
         assert_eq!(rows[1].check_name, "rust");
         assert_eq!(rows[1].tree_hash, "tree-new");
         assert_eq!(rows[1].cached, Some(true));
+    }
+
+    #[tokio::test]
+    async fn abnormal_rows_remain_visible_but_are_not_reusable() {
+        let db = cache_db().await;
+        let mut abnormal = test_result("project-a", "input-abnormal", "rust");
+        abnormal.tree_hash = "tree-abnormal".to_string();
+        abnormal.exit_code = 254;
+        abnormal.passed = false;
+        abnormal.failure_kind = Some("infrastructure".to_string());
+        store_check_result(db.clone(), abnormal).unwrap();
+
+        assert!(
+            get_check_result(db.clone(), "project-a", "rust", "input-abnormal")
+                .unwrap()
+                .is_none()
+        );
+        let visible = list_check_results(db.clone(), "project-a", "tree-abnormal").unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].failure_kind.as_deref(), Some("infrastructure"));
+
+        let mut pass = test_result("project-a", "input-abnormal", "rust");
+        pass.tree_hash = "tree-recovered".to_string();
+        store_check_result(db.clone(), pass).unwrap();
+        assert!(get_check_result(db, "project-a", "rust", "input-abnormal")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

@@ -46,8 +46,11 @@ pub async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), Str
         .await
         .map_err(|e| e.to_string())?;
 
-    // Resolve the canonical URI before the row is gone; used to evict the
-    // issue's embedding from the corpus.
+    // Resolve the project scope and canonical URI before the row is gone.
+    let issue = crud::get(&owning_db, issue_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Issue not found: {issue_id}"))?;
     let issue_uri = relations::issue_uri_for_id_db(&owning_db, issue_id)
         .await
         .ok();
@@ -76,7 +79,7 @@ pub async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), Str
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "issues", "action": "delete"}),
+        crate::notify::issue_db_change(&issue, "delete"),
     );
 
     log::info!("Deleted issue {}", issue_id);

@@ -15,7 +15,21 @@ use serde_json::{json, Value};
 
 use crate::models;
 use crate::services::EventEmitter;
-use crate::storage::{run_db_blocking, LocalDb};
+use crate::storage::{run_db_blocking, LocalDb, RowExt};
+
+/// Build a project-scoped `issues` db-change payload.
+pub fn issue_db_change_ids(action: &str, issue_id: &str, project_id: Option<&str>) -> Value {
+    json!({
+        "table": "issues",
+        "action": action,
+        "issueId": issue_id,
+        "projectId": project_id,
+    })
+}
+
+pub fn issue_db_change(issue: &models::Issue, action: &str) -> Value {
+    issue_db_change_ids(action, &issue.id, Some(&issue.project_id))
+}
 
 /// Build a fully-scoped `jobs` db-change payload.
 ///
@@ -65,24 +79,169 @@ pub fn job_db_change(job: &models::Job, action: &str) -> Value {
     )
 }
 
-/// Build a scoped `runs` db-change payload.
-///
-/// The runs branch only needs `jobId` to scope to the affected job's run list;
-/// a payload with no `jobId` degrades to a broad `["runs"]` invalidation.
-pub fn run_db_change_ids(action: &str, run_id: &str, job_id: Option<&str>) -> Value {
+/// Build a fully-scoped `runs` db-change payload.
+pub fn run_db_change_ids(
+    action: &str,
+    run_id: &str,
+    job_id: Option<&str>,
+    issue_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Value {
     json!({
         "table": "runs",
         "action": action,
         "runId": run_id,
         "jobId": job_id,
+        "issueId": issue_id,
+        "projectId": project_id,
     })
 }
 
-/// Build a scoped `runs` db-change payload from a `Run`.
-///
-/// See [`run_db_change_ids`].
+/// Build a fully-scoped `runs` db-change payload from a `Run`.
 pub fn run_db_change(run: &models::Run, action: &str) -> Value {
-    run_db_change_ids(action, &run.id, run.job_id.as_deref())
+    run_db_change_ids(
+        action,
+        &run.id,
+        run.job_id.as_deref(),
+        run.issue_id.as_deref(),
+        run.project_id.as_deref(),
+    )
+}
+
+/// Load the authoritative run scope after a write and build its payload. A
+/// missing row is reserved for recovery/delete paths and falls back to runId.
+pub async fn run_db_change_for_id(db: &LocalDb, run_id: &str, action: &str) -> Value {
+    let run_id_owned = run_id.to_string();
+    let scope = db
+        .read(|conn| {
+            let run_id = run_id_owned.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT job_id, issue_id, project_id FROM runs WHERE id = ?1 LIMIT 1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await;
+    match scope {
+        Ok(Some((job_id, issue_id, project_id))) => run_db_change_ids(
+            action,
+            run_id,
+            job_id.as_deref(),
+            issue_id.as_deref(),
+            project_id.as_deref(),
+        ),
+        Ok(None) => run_db_change_ids(action, run_id, None, None, None),
+        Err(error) => {
+            log::warn!("Failed to load run scope for db-change {run_id}: {error}");
+            run_db_change_ids(action, run_id, None, None, None)
+        }
+    }
+}
+
+pub fn turn_db_change_ids(
+    action: &str,
+    job_id: Option<&str>,
+    run_id: Option<&str>,
+    session_id: Option<&str>,
+    issue_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Value {
+    json!({
+        "table": "turns",
+        "action": action,
+        "jobId": job_id,
+        "runId": run_id,
+        "sessionId": session_id,
+        "issueId": issue_id,
+        "projectId": project_id,
+    })
+}
+
+pub async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) -> Value {
+    let turn_id_owned = turn_id.to_string();
+    let scope = db
+        .read(|conn| {
+            let turn_id = turn_id_owned.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT t.job_id, t.run_id, t.session_id, j.issue_id, j.project_id
+                         FROM turns t LEFT JOIN jobs j ON j.id = t.job_id
+                         WHERE t.id = ?1 LIMIT 1",
+                        (turn_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((
+                        row.opt_text(0)?,
+                        row.opt_text(1)?,
+                        row.opt_text(2)?,
+                        row.opt_text(3)?,
+                        row.opt_text(4)?,
+                    ))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await;
+    match scope {
+        Ok(Some((job_id, run_id, session_id, issue_id, project_id))) => turn_db_change_ids(
+            action,
+            job_id.as_deref(),
+            run_id.as_deref(),
+            session_id.as_deref(),
+            issue_id.as_deref(),
+            project_id.as_deref(),
+        ),
+        Ok(None) => turn_db_change_ids(action, None, None, None, None, None),
+        Err(error) => {
+            log::warn!("Failed to load turn scope for db-change {turn_id}: {error}");
+            turn_db_change_ids(action, None, None, None, None, None)
+        }
+    }
+}
+
+pub async fn turn_db_change_for_job_id(db: &LocalDb, job_id: &str, action: &str) -> Value {
+    let job_id_owned = job_id.to_string();
+    let scope = db
+        .read(|conn| {
+            let job_id = job_id_owned.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT issue_id, project_id, current_session_id FROM jobs WHERE id = ?1 LIMIT 1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await;
+    match scope {
+        Ok(Some((issue_id, project_id, session_id))) => turn_db_change_ids(
+            action,
+            Some(job_id),
+            None,
+            session_id.as_deref(),
+            issue_id.as_deref(),
+            project_id.as_deref(),
+        ),
+        Ok(None) => turn_db_change_ids(action, Some(job_id), None, None, None, None),
+        Err(error) => {
+            log::warn!("Failed to load job scope for turns db-change {job_id}: {error}");
+            turn_db_change_ids(action, Some(job_id), None, None, None, None)
+        }
+    }
 }
 
 /// Build a fully-scoped `events` db-change payload.
@@ -173,8 +332,10 @@ impl Notifier {
         self.emit_change("projects");
     }
 
-    pub fn issue(&self, _i: &models::Issue) {
-        self.emit_change("issues");
+    pub fn issue(&self, issue: &models::Issue) {
+        let _ = self
+            .emitter
+            .emit("db-change", issue_db_change(issue, "update"));
     }
 
     pub fn job(&self, j: &models::Job) {
@@ -302,6 +463,15 @@ mod tests {
     // ── Scoped payload builder tests ──
 
     #[test]
+    fn issue_db_change_carries_project_scope() {
+        let payload = issue_db_change(&test_issue(), "update");
+        assert_eq!(payload["table"], "issues");
+        assert_eq!(payload["action"], "update");
+        assert_eq!(payload["issueId"], "i-1");
+        assert_eq!(payload["projectId"], "p-1");
+    }
+
+    #[test]
     fn job_db_change_ids_carries_complete_scoping_set() {
         let payload = job_db_change_ids(
             "update",
@@ -356,17 +526,44 @@ mod tests {
 
     #[test]
     fn run_db_change_ids_carries_run_and_job() {
-        let payload = run_db_change_ids("update", "run-1", Some("job-1"));
+        let payload = run_db_change_ids(
+            "update",
+            "run-1",
+            Some("job-1"),
+            Some("issue-1"),
+            Some("project-1"),
+        );
         assert_eq!(payload["table"], "runs");
         assert_eq!(payload["action"], "update");
         assert_eq!(payload["runId"], "run-1");
         assert_eq!(payload["jobId"], "job-1");
+        assert_eq!(payload["issueId"], "issue-1");
+        assert_eq!(payload["projectId"], "project-1");
         assert!(payload.get("scoped").is_none());
     }
 
     #[test]
+    fn turn_db_change_ids_carries_job_run_and_project_scope() {
+        let payload = turn_db_change_ids(
+            "update",
+            Some("job-1"),
+            Some("run-1"),
+            Some("session-1"),
+            Some("issue-1"),
+            Some("project-1"),
+        );
+        assert_eq!(payload["table"], "turns");
+        assert_eq!(payload["action"], "update");
+        assert_eq!(payload["jobId"], "job-1");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["sessionId"], "session-1");
+        assert_eq!(payload["issueId"], "issue-1");
+        assert_eq!(payload["projectId"], "project-1");
+    }
+
+    #[test]
     fn run_db_change_ids_serializes_absent_job_as_null() {
-        let payload = run_db_change_ids("insert", "run-1", None);
+        let payload = run_db_change_ids("insert", "run-1", None, None, None);
         assert_eq!(payload["runId"], "run-1");
         assert!(payload.get("jobId").is_some());
         assert!(payload["jobId"].is_null());

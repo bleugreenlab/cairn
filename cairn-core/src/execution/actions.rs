@@ -618,6 +618,7 @@ async fn resolve_action_inputs(
 /// workspace is `.jj`-only with no `.git`, so gh/git resolve the repo and
 /// `origin` from the project checkout (`repo_path`), while push and head-sha
 /// reads run jj-side against the workspace.
+#[derive(Clone)]
 struct PrVcs {
     /// cwd for `gh`/`git`: the project checkout (the workspace has no `.git`).
     gh_cwd: PathBuf,
@@ -1103,86 +1104,96 @@ async fn open_or_update_github_pr(
     title: &str,
     body: Option<&str>,
 ) -> Result<String, String> {
-    log::info!("Creating PR for branch {}", branch_name);
-    vcs.push(worktree_path);
+    let vcs = vcs.clone();
+    let worktree_path = worktree_path.to_string();
+    let branch_name = branch_name.to_string();
+    let base_branch = base_branch.map(ToString::to_string);
+    let title = title.to_string();
+    let body = body.map(ToString::to_string);
+    tokio::task::spawn_blocking(move || {
+        log::info!("Creating PR for branch {}", branch_name);
+        vcs.push(&worktree_path);
 
-    if let Some(base) = base_branch {
-        ensure_base_branch_on_origin(vcs, base)?;
-    }
+        if let Some(base) = base_branch.as_deref() {
+            ensure_base_branch_on_origin(&vcs, base)?;
+        }
 
-    let body_str = body.unwrap_or("");
-    let mut args = vec!["pr", "create", "--title", title, "--body", body_str];
-    if let Some(base) = base_branch {
-        args.push("--base");
-        args.push(base);
-    }
-    // The PR is opened from the project checkout, which sits on the user's
-    // branch rather than the agent branch, so name the head branch explicitly.
-    args.push("--head");
-    args.push(branch_name);
+        let body_str = body.as_deref().unwrap_or("");
+        let mut args = vec!["pr", "create", "--title", &title, "--body", body_str];
+        if let Some(base) = base_branch.as_deref() {
+            args.push("--base");
+            args.push(base);
+        }
+        // The PR is opened from the project checkout, which sits on the user's
+        // branch rather than the agent branch, so name the head branch explicitly.
+        args.push("--head");
+        args.push(&branch_name);
 
-    let output = crate::env::gh()
-        .args(&args)
-        .current_dir(&vcs.gh_cwd)
-        .output()
-        .map_err(|e| format!("Failed to run gh: {}", e))?;
+        let output = crate::env::gh()
+            .args(&args)
+            .current_dir(&vcs.gh_cwd)
+            .output()
+            .map_err(|e| format!("Failed to run gh: {}", e))?;
 
-    if output.status.success() {
-        let pr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        log::info!("Created PR at {}", pr_url);
-        return Ok(pr_url);
-    }
+        if output.status.success() {
+            let pr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            log::info!("Created PR at {}", pr_url);
+            return Ok(pr_url);
+        }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !(stderr.contains("already exists") || stderr.contains("pull request for")) {
-        return Err(format!("gh pr create failed: {}", stderr));
-    }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !(stderr.contains("already exists") || stderr.contains("pull request for")) {
+            return Err(format!("gh pr create failed: {}", stderr));
+        }
 
-    log::info!(
-        "PR already exists for branch {}, updating instead",
-        branch_name
-    );
-    // From the project checkout the current branch is not the agent branch, so
-    // identify the existing PR by its head branch explicitly.
-    let mut view_args: Vec<&str> = vec!["pr", "view", branch_name];
-    view_args.extend(["--json", "number,url"]);
-    let view_output = crate::env::gh()
-        .args(&view_args)
-        .current_dir(&vcs.gh_cwd)
-        .output()
-        .map_err(|e| format!("Failed to run gh pr view: {}", e))?;
-    if !view_output.status.success() {
-        let view_stderr = String::from_utf8_lossy(&view_output.stderr);
-        return Err(format!(
-            "Failed to get existing PR details: {}",
-            view_stderr
-        ));
-    }
-    let view_json: serde_json::Value = serde_json::from_slice(&view_output.stdout)
-        .map_err(|e| format!("Failed to parse PR details: {}", e))?;
-    let pr_number = view_json
-        .get("number")
-        .and_then(|n| n.as_i64())
-        .ok_or("Missing PR number in response")?
-        .to_string();
-    let pr_url = view_json
-        .get("url")
-        .and_then(|u| u.as_str())
-        .ok_or("Missing PR URL in response")?
-        .to_string();
-    let edit_output = crate::env::gh()
-        .args([
-            "pr", "edit", &pr_number, "--title", title, "--body", body_str,
-        ])
-        .current_dir(&vcs.gh_cwd)
-        .output()
-        .map_err(|e| format!("Failed to run gh pr edit: {}", e))?;
-    if !edit_output.status.success() {
-        let edit_stderr = String::from_utf8_lossy(&edit_output.stderr);
-        return Err(format!("Failed to update PR: {}", edit_stderr));
-    }
-    log::info!("Updated PR #{} at {}", pr_number, pr_url);
-    Ok(pr_url)
+        log::info!(
+            "PR already exists for branch {}, updating instead",
+            branch_name
+        );
+        // From the project checkout the current branch is not the agent branch, so
+        // identify the existing PR by its head branch explicitly.
+        let mut view_args: Vec<&str> = vec!["pr", "view", &branch_name];
+        view_args.extend(["--json", "number,url"]);
+        let view_output = crate::env::gh()
+            .args(&view_args)
+            .current_dir(&vcs.gh_cwd)
+            .output()
+            .map_err(|e| format!("Failed to run gh pr view: {}", e))?;
+        if !view_output.status.success() {
+            let view_stderr = String::from_utf8_lossy(&view_output.stderr);
+            return Err(format!(
+                "Failed to get existing PR details: {}",
+                view_stderr
+            ));
+        }
+        let view_json: serde_json::Value = serde_json::from_slice(&view_output.stdout)
+            .map_err(|e| format!("Failed to parse PR details: {}", e))?;
+        let pr_number = view_json
+            .get("number")
+            .and_then(|n| n.as_i64())
+            .ok_or("Missing PR number in response")?
+            .to_string();
+        let pr_url = view_json
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or("Missing PR URL in response")?
+            .to_string();
+        let edit_output = crate::env::gh()
+            .args([
+                "pr", "edit", &pr_number, "--title", &title, "--body", body_str,
+            ])
+            .current_dir(&vcs.gh_cwd)
+            .output()
+            .map_err(|e| format!("Failed to run gh pr edit: {}", e))?;
+        if !edit_output.status.success() {
+            let edit_stderr = String::from_utf8_lossy(&edit_output.stderr);
+            return Err(format!("Failed to update PR: {}", edit_stderr));
+        }
+        log::info!("Updated PR #{} at {}", pr_number, pr_url);
+        Ok(pr_url)
+    })
+    .await
+    .map_err(|error| format!("PR subprocess task failed: {error}"))?
 }
 
 /// Ensure a non-default base branch exists on origin before opening a PR against
@@ -1303,11 +1314,16 @@ async fn handle_close_pr(
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
     let pr_number = load_mr_pr_number(&db, &mr_job_id).await?;
 
-    let output = crate::env::gh()
-        .args(close_pr_args(pr_number))
-        .current_dir(&vcs.gh_cwd)
-        .output()
-        .map_err(|e| format!("Failed to run gh pr close: {}", e))?;
+    let gh_cwd = vcs.gh_cwd.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        crate::env::gh()
+            .args(close_pr_args(pr_number))
+            .current_dir(gh_cwd)
+            .output()
+    })
+    .await
+    .map_err(|error| format!("PR close subprocess task failed: {error}"))?
+    .map_err(|e| format!("Failed to run gh pr close: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1352,9 +1368,13 @@ async fn handle_close_issue(
     .map_err(|e| format!("Failed to resolve issue as closed: {}", e))?;
     crate::execution::advancement::release_dependent_executions(orch, issue_id).await?;
 
+    let issue = crate::issues::crud::get(&db, issue_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Issue not found after close: {issue_id}"))?;
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
+        crate::notify::issue_db_change(&issue, "update"),
     );
 
     Ok(Some(serde_json::json!({ "closed": true })))

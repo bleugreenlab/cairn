@@ -80,10 +80,10 @@ async fn row_exists(db: &LocalDb, sql: &'static str, id: &str) -> Result<bool, C
     Ok(db.query_text(sql, (id,)).await?.is_some())
 }
 
-/// The LEGACY all-databases probe, retained ONLY for
-/// [`owning_db_for_parent_tool_use`], which routes by `parent_tool_use_id` — a
-/// provider tool-use id that is NOT a routable entity id and so cannot be
-/// prefix-parsed. Every id-keyed resolver now uses [`routing_db_for_id`] instead.
+/// The LEGACY all-databases probe, retained for [`owning_db_for_parent_tool_use`]
+/// and [`owning_db_for_session`]. Provider tool-use ids and bare session ids are
+/// not routable entity ids and so cannot be prefix-parsed. Every route-prefixed
+/// id resolver now uses [`routing_db_for_id`] instead.
 /// Scans every open database PRIVATE-FIRST, fail-closed on a miss.
 async fn resolve(
     dbs: &DbState,

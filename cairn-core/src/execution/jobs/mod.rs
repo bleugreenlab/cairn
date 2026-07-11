@@ -72,6 +72,7 @@ pub(crate) use inputs::{
     is_long_running_node, resolve_ctx_self_schemas_conn, resolve_ctx_self_schemas_with_snapshot,
     resolve_instruction_prompt_conn,
 };
+pub(crate) use lifecycle::continue_automatic_retry;
 #[cfg(any(test, feature = "test-utils"))]
 pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;
 pub use lifecycle::{
@@ -93,6 +94,10 @@ pub use workflow::{launch_standalone_workflow, LaunchedWorkflow};
 // The canonical, routing-aware turn-start. Host job-start paths call this
 // instead of hand-rolling the turns UPDATE against the private DB (CAIRN-2206).
 pub use turns::start_turn;
+pub(crate) use turns::{
+    abandon_pending_retry_if_head_matches, claim_retry_successor_if_head_matches,
+    claim_retry_turn_start, consecutive_retry_turn_count,
+};
 pub(crate) use worktrees::prepare_worktree_for_job;
 
 use config_loading::*;

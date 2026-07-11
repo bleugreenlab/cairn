@@ -85,8 +85,8 @@ async fn pending(orch: &Orchestrator, recipient: &str) -> Vec<Push> {
 
 async fn run_review_push(orch: &Orchestrator) {
     // Both trigger edges now run through the single readiness evaluator; this
-    // helper models the turn-end / checks-completion edge (fresh_red = false).
-    evaluate_review_readiness(orch, "i-rev", false).await;
+    // helper models any semantic or recovery re-evaluation edge.
+    evaluate_review_readiness(orch, "i-rev").await;
 }
 
 async fn run_pr_open(orch: &Orchestrator) {
@@ -596,36 +596,29 @@ async fn pr_open_after_idle_artifact_push_supersedes_to_pr_fingerprint() {
     );
 }
 
-// --- CAIRN-2483: the issue-quiescence and checks-settled gates -----------
+// --- CAIRN-2483: the issue-quiescence gate -------------------------------
 
 #[tokio::test]
-async fn fresh_red_defers_the_review() {
-    // A fresh (non-cached) failing check at the completion edge defers the parent
-    // review: that red is simultaneously waking the owning builder and the fix
-    // loop is live. A later settle (fresh_red = false, the stale-red case) fires.
+async fn review_check_outcome_does_not_gate_the_review() {
+    // Check outcomes are child feedback. A settled child with reviewable output
+    // wakes its parent without a second, check-specific readiness state.
     let db = test_db().await;
     seed(&db, "initial").await;
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    evaluate_review_readiness(&orch, "i-rev", true).await;
-    assert!(
-        pending(&orch, "j-watch").await.is_empty(),
-        "a fresh red must defer the parent review"
-    );
-
-    evaluate_review_readiness(&orch, "i-rev", false).await;
+    evaluate_review_readiness(&orch, "i-rev").await;
     assert_eq!(
         pending(&orch, "j-watch").await.len(),
         1,
-        "a stale red (fresh_red=false) settles-with-warning and the review fires"
+        "review readiness depends on semantic child state, not check outcome"
     );
 }
 
 #[tokio::test]
-async fn in_flight_turn_end_checks_defer_the_review() {
-    // While any job of the issue holds an in-flight turn-end run, checks are not
-    // settled, so the review defers until the suite completes.
+async fn in_flight_turn_end_checks_do_not_defer_the_review() {
+    // Detached advisory checks may outlive the child work. They must not suppress
+    // the coordinator's only durable wake once the issue itself is quiescent.
     let db = test_db().await;
     seed(&db, "initial").await;
     insert_open_pr(&db).await;
@@ -633,14 +626,22 @@ async fn in_flight_turn_end_checks_defer_the_review() {
 
     assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
     run_review_push(&orch).await;
-    assert!(
-        pending(&orch, "j-watch").await.is_empty(),
-        "an in-flight turn-end suite must hold the review"
+    let watcher = pending(&orch, "j-watch").await;
+    assert_eq!(
+        watcher.len(),
+        1,
+        "an in-flight turn-end suite must not hold the review"
     );
+    assert_eq!(watcher[0].wake, Wake::Wake);
+    assert!(pending(&orch, "j-prod").await.is_empty());
 
     orch.end_turn_end_checks("j-prod");
     run_review_push(&orch).await;
-    assert_eq!(pending(&orch, "j-watch").await.len(), 1);
+    assert_eq!(
+        pending(&orch, "j-watch").await.len(),
+        1,
+        "check completion re-evaluates idempotently without duplicating the wake"
+    );
 }
 
 #[tokio::test]

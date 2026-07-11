@@ -275,6 +275,7 @@ mod tests {
             impact: None,
             policy: CheckPolicy::Advisory,
             when: CheckWhen::Write,
+            resource_class: crate::config::project_settings::CheckResourceClass::Shared,
             timeout: None,
         }
     }

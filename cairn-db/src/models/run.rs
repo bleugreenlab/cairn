@@ -257,43 +257,6 @@ impl From<crate::db_records::DbPermissionRequest> for PermissionRequest {
     }
 }
 
-/// CI run status for local CI checks
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
-#[allow(dead_code)]
-pub enum CiStatus {
-    #[default]
-    None,
-    Pending,
-    Passed,
-    Failed,
-}
-
-impl std::fmt::Display for CiStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CiStatus::None => write!(f, "none"),
-            CiStatus::Pending => write!(f, "pending"),
-            CiStatus::Passed => write!(f, "passed"),
-            CiStatus::Failed => write!(f, "failed"),
-        }
-    }
-}
-
-impl std::str::FromStr for CiStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "none" => Ok(CiStatus::None),
-            "pending" => Ok(CiStatus::Pending),
-            "passed" => Ok(CiStatus::Passed),
-            "failed" => Ok(CiStatus::Failed),
-            _ => Err(format!("Unknown CI status: {}", s)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

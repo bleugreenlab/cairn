@@ -288,6 +288,50 @@ pub(crate) fn merge_client_env(
     env
 }
 
+/// Last health and restart observations recorded by the supervisor.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildServiceRuntimeDiagnostic {
+    pub last_health: Option<String>,
+    pub last_checked_at: Option<i64>,
+    pub last_restart_at: Option<i64>,
+    pub last_restart_reason: Option<String>,
+}
+
+/// Read-only build-service state captured at an infrastructure failure boundary.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildServiceDiagnosticSnapshot {
+    pub name: String,
+    pub configured: bool,
+    pub supervised_child: bool,
+    pub state_dir: Option<String>,
+    pub error_log_tail: Option<String>,
+    pub runtime: BuildServiceRuntimeDiagnostic,
+}
+
+impl BuildServiceDiagnosticSnapshot {
+    pub fn compact_summary(&self) -> String {
+        let error = self
+            .error_log_tail
+            .as_deref()
+            .and_then(|tail| tail.lines().last())
+            .map(|line| line.chars().take(200).collect::<String>())
+            .unwrap_or_else(|| "unavailable".to_string());
+        format!(
+            "build service {}: configured={}, supervisedChild={}, lastHealth={}, lastRestart={}, lastError={error}",
+            self.name,
+            self.configured,
+            self.supervised_child,
+            self.runtime.last_health.as_deref().unwrap_or("unknown"),
+            self.runtime
+                .last_restart_at
+                .map(|timestamp| timestamp.to_string())
+                .unwrap_or_else(|| "never".to_string())
+        )
+    }
+}
+
 /// Runtime status of one build service, for the settings UI.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -397,6 +441,17 @@ impl Orchestrator {
                     }
                 }
             };
+            let health_name = match health {
+                ServiceHealth::Healthy => "healthy",
+                ServiceHealth::Wedged => "wedged",
+                ServiceHealth::Down => "down",
+            };
+            {
+                let mut diagnostics = self.build_service_runtime.lock().unwrap();
+                let state = diagnostics.entry(name.clone()).or_default();
+                state.last_health = Some(health_name.to_string());
+                state.last_checked_at = Some(chrono::Utc::now().timestamp());
+            }
             match health {
                 ServiceHealth::Healthy => {
                     log::debug!("build service '{name}' healthy; not relaunching");
@@ -421,6 +476,12 @@ impl Orchestrator {
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     log::debug!("create build service state dir {dir:?}: {e}");
                 }
+            }
+            {
+                let mut diagnostics = self.build_service_runtime.lock().unwrap();
+                let state = diagnostics.entry(name.clone()).or_default();
+                state.last_restart_at = Some(chrono::Utc::now().timestamp());
+                state.last_restart_reason = Some(health_name.to_string());
             }
             match launch_service(
                 self.services.process.as_ref(),
@@ -549,6 +610,50 @@ impl Orchestrator {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Read-only failure-boundary snapshot. It never probes, restarts, or otherwise
+    /// mutates the service; the periodic supervisor remains the sole recovery owner.
+    pub fn build_service_diagnostic_snapshot(
+        &self,
+        service_name: &str,
+    ) -> BuildServiceDiagnosticSnapshot {
+        const ERROR_TAIL_CHARS: usize = 2_000;
+        let templates = self.build_service_templates();
+        let config = settings::load_build_services(&self.config_dir)
+            .into_iter()
+            .find(|(name, _)| name == service_name)
+            .map(|(_, config)| config);
+        let state_dir = config
+            .as_ref()
+            .and_then(|config| config.expanded_state_dir(&templates));
+        let error_log_tail = state_dir
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join("sccache-error.log")).ok())
+            .map(|contents| {
+                let chars: Vec<char> = contents.chars().collect();
+                chars[chars.len().saturating_sub(ERROR_TAIL_CHARS)..]
+                    .iter()
+                    .collect()
+            });
+        BuildServiceDiagnosticSnapshot {
+            name: service_name.to_string(),
+            configured: config.is_some(),
+            supervised_child: self
+                .build_service_children
+                .lock()
+                .unwrap()
+                .contains_key(service_name),
+            state_dir: state_dir.map(|dir| dir.to_string_lossy().to_string()),
+            error_log_tail,
+            runtime: self
+                .build_service_runtime
+                .lock()
+                .unwrap()
+                .get(service_name)
+                .cloned()
+                .unwrap_or_default(),
+        }
     }
 
     /// The merged client env for enabled build services, expanded for the given

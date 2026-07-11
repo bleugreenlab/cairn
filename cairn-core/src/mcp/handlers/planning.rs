@@ -74,6 +74,8 @@ pub async fn ask_questions(
         exec_seq,
         current_turn_id,
         owns_turn_loop,
+        issue_id,
+        project_id,
     ) = {
         // Owned-loop backends (OpenRouter) suspend the turn on a foreground
         // question instead of inline-waiting and entering AwaitingHost.
@@ -284,10 +286,11 @@ pub async fn ask_questions(
             None => None,
         };
         if yielded_turn {
-            let _ = services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "turns", "action": "update"}),
-            );
+            if let Some(turn_id) = current_turn_id.as_deref() {
+                let change =
+                    crate::notify::turn_db_change_for_id(&owning_db, turn_id, "update").await;
+                let _ = services.emitter.emit("db-change", change);
+            }
         }
 
         (
@@ -302,19 +305,23 @@ pub async fn ask_questions(
             ctx.exec_seq,
             current_turn_id,
             owns_turn_loop,
+            ctx.issue_id,
+            ctx.project_id,
         )
     };
 
     // Emit events for frontend
     let _ = services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "prompts", "action": "insert"}),
+        serde_json::json!({
+            "table": "prompts",
+            "action": "insert",
+            "issueId": issue_id,
+            "projectId": project_id,
+        }),
     );
-    let run_job_id = crate::messages::side_channel::job_id_for_run(&owning_db, &run_id).await;
-    let _ = services.emitter.emit(
-        "db-change",
-        crate::notify::run_db_change_ids("update", &run_id, run_job_id.as_deref()),
-    );
+    let run_change = crate::notify::run_db_change_for_id(&owning_db, &run_id, "update").await;
+    let _ = services.emitter.emit("db-change", run_change);
 
     if background {
         let question_uri = match (issue_number, node_segment.as_deref()) {
@@ -407,7 +414,8 @@ pub async fn ask_questions(
                 .await
                 {
                     Ok(Some(successor)) => {
-                        emit_successor_turn_events(&*services.emitter, &successor);
+                        emit_successor_turn_events(&owning_db, &*services.emitter, &successor)
+                            .await;
                         orch.process_state
                             .set_current_turn_id(&run_id, Some(&successor.turn_id));
                     }
@@ -419,29 +427,32 @@ pub async fn ask_questions(
             // Run stays Live — no status change needed on prompt response.
             // The successor turn handles the semantic state change.
 
-            match issue_id_for_run(&owning_db, &run_id).await {
+            let changed_issue = match issue_id_for_run(&owning_db, &run_id).await {
                 Ok(Some(issue_id)) => {
                     if let Err(e) = recompute_issue_status_for_issue(&owning_db, &issue_id).await {
                         log::warn!("Failed to recompute issue status {}: {}", issue_id, e);
                     }
                     // Answer recorded — attention likely cleared; wake `watch`.
                     orch.wake_for_issue(&issue_id).await;
+                    crate::issues::crud::get(&owning_db, &issue_id)
+                        .await
+                        .ok()
+                        .flatten()
                 }
-                Ok(None) => {}
+                Ok(None) => None,
                 Err(e) => {
                     log::warn!("Failed to look up issue for run {}: {}", run_id, e);
+                    None
                 }
+            };
+            let run_change =
+                crate::notify::run_db_change_for_id(&owning_db, &run_id, "update").await;
+            let _ = services.emitter.emit("db-change", run_change);
+            if let Some(issue) = changed_issue.as_ref() {
+                let _ = services
+                    .emitter
+                    .emit("db-change", crate::notify::issue_db_change(issue, "update"));
             }
-            let run_job_id =
-                crate::messages::side_channel::job_id_for_run(&owning_db, &run_id).await;
-            let _ = services.emitter.emit(
-                "db-change",
-                crate::notify::run_db_change_ids("update", &run_id, run_job_id.as_deref()),
-            );
-            let _ = services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "issues", "action": "update"}),
-            );
 
             response
         }
@@ -750,27 +761,41 @@ pub async fn answer_prompt_id(
             .process_state
             .is_awaiting_host(&resume.run_id, resume.predecessor_turn_id.as_deref());
 
-    let emit_job_id = resume.job_id.clone();
-    let job_id = if should_resume { resume.job_id } else { None };
+    let job_id = if should_resume {
+        resume.job_id.clone()
+    } else {
+        None
+    };
 
+    let changed_issue = match resume.issue_id.as_deref() {
+        Some(issue_id) => crate::issues::crud::get(&owning_db, issue_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "prompts", "action": "update"}),
+        serde_json::json!({
+            "table": "prompts",
+            "action": "update",
+            "issueId": changed_issue.as_ref().map(|issue| issue.id.as_str()),
+            "projectId": changed_issue.as_ref().map(|issue| issue.project_id.as_str()),
+        }),
     );
-    if resume.successor_turn_id.is_some() {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "update"}),
-        );
+    if let Some(turn_id) = resume.successor_turn_id.as_deref() {
+        let change = crate::notify::turn_db_change_for_id(&owning_db, turn_id, "update").await;
+        let _ = orch.services.emitter.emit("db-change", change);
     }
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
-    );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        crate::notify::run_db_change_ids("update", &resume.run_id, emit_job_id.as_deref()),
-    );
+    if let Some(issue) = changed_issue.as_ref() {
+        let _ = orch
+            .services
+            .emitter
+            .emit("db-change", crate::notify::issue_db_change(issue, "update"));
+    }
+    let run_change =
+        crate::notify::run_db_change_for_id(&owning_db, &resume.run_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", run_change);
 
     if let Some(job_id) = job_id {
         let suppress_user_event = if let (Some(tool_use_id), Some(session_id)) =
@@ -798,6 +823,7 @@ pub async fn answer_prompt_id(
 
         let prompt_resume = ResumeContext {
             suppress_user_event,
+            ..Default::default()
         };
         continue_job_impl(orch, &job_id, Some(&response), None, Some(prompt_resume))
             .map_err(|e| format!("Failed to resume prompt response: {}", e))?;

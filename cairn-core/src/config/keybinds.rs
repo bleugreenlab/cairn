@@ -49,15 +49,6 @@ fn default_version() -> i32 {
 }
 
 impl KeybindsFile {
-    /// Create a new empty keybinds file
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self {
-            version: 1,
-            keybinds: Vec::new(),
-        }
-    }
-
     /// Add or update a customization
     pub fn set_keybind(&mut self, action: &str, key: String, modifiers: Vec<Modifier>) {
         // Remove existing customization if present
@@ -75,12 +66,6 @@ impl KeybindsFile {
     /// Remove a customization (revert to default)
     pub fn remove_keybind(&mut self, action: &str) {
         self.keybinds.retain(|k| k.action != action);
-    }
-
-    /// Get customization for an action
-    #[allow(dead_code)]
-    pub fn get_keybind(&self, action: &str) -> Option<&KeybindCustomization> {
-        self.keybinds.iter().find(|k| k.action == action)
     }
 
     /// Clear all customizations
@@ -139,16 +124,16 @@ pub fn save_keybinds(config_dir: &Path, file: &KeybindsFile) -> Result<(), Strin
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_keybinds_file_new() {
-        let file = KeybindsFile::new();
-        assert_eq!(file.version, 1);
-        assert!(file.keybinds.is_empty());
+    fn keybinds_file() -> KeybindsFile {
+        KeybindsFile {
+            version: 1,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn test_set_keybind() {
-        let mut file = KeybindsFile::new();
+        let mut file = keybinds_file();
         file.set_keybind("issue.create", "n".to_string(), vec![Modifier::Meta]);
 
         assert_eq!(file.keybinds.len(), 1);
@@ -159,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_set_keybind_updates_existing() {
-        let mut file = KeybindsFile::new();
+        let mut file = keybinds_file();
         file.set_keybind("issue.create", "n".to_string(), vec![Modifier::Meta]);
         file.set_keybind("issue.create", "c".to_string(), vec![]);
 
@@ -170,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_remove_keybind() {
-        let mut file = KeybindsFile::new();
+        let mut file = keybinds_file();
         file.set_keybind("issue.create", "n".to_string(), vec![Modifier::Meta]);
         file.remove_keybind("issue.create");
 
@@ -178,20 +163,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_keybind() {
-        let mut file = KeybindsFile::new();
-        file.set_keybind("issue.create", "n".to_string(), vec![Modifier::Meta]);
-
-        let kb = file.get_keybind("issue.create");
-        assert!(kb.is_some());
-        assert_eq!(kb.unwrap().key, "n");
-
-        assert!(file.get_keybind("nonexistent").is_none());
-    }
-
-    #[test]
     fn test_reset() {
-        let mut file = KeybindsFile::new();
+        let mut file = keybinds_file();
         file.set_keybind("issue.create", "n".to_string(), vec![Modifier::Meta]);
         file.set_keybind("issue.open", "o".to_string(), vec![]);
         file.reset();
@@ -201,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_serialization() {
-        let mut file = KeybindsFile::new();
+        let mut file = keybinds_file();
         file.set_keybind(
             "issue.create",
             "n".to_string(),
@@ -223,11 +196,9 @@ mod tests {
 
     #[test]
     fn test_disabled_keybind() {
-        let mut file = KeybindsFile::new();
+        let mut file = keybinds_file();
         file.set_keybind("issue.create", "".to_string(), vec![]);
 
-        let kb = file.get_keybind("issue.create");
-        assert!(kb.is_some());
-        assert!(kb.unwrap().key.is_empty()); // Empty key = disabled
+        assert!(file.keybinds[0].key.is_empty()); // Empty key = disabled
     }
 }

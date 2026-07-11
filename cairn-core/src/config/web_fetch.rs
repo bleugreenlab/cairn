@@ -205,18 +205,18 @@ pub fn validate_fetch_options(
 /// Set (or clear) the active fetch provider. `None`, an empty string, or
 /// `regular` clears the scalar so the built-in regular fetch is the default.
 pub fn set_active_web_fetch(config_dir: &Path, name: Option<&str>) -> Result<(), String> {
-    let path = super::settings::get_settings_path(config_dir);
-    let mut root = load_settings_mapping(&path)?;
-    let key = serde_yaml::Value::String("activeWebFetch".to_string());
-    match name {
-        Some(n) if !n.trim().is_empty() && n != REGULAR => {
-            root.insert(key, serde_yaml::Value::String(n.to_string()));
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let key = serde_yaml::Value::String("activeWebFetch".to_string());
+        match name {
+            Some(name) if !name.trim().is_empty() && name != REGULAR => {
+                root.insert(key, serde_yaml::Value::String(name.to_string()));
+            }
+            _ => {
+                root.remove(&key);
+            }
         }
-        _ => {
-            root.remove(&key);
-        }
-    }
-    write_settings_mapping(&path, &root)
+        Ok(())
+    })
 }
 
 /// Insert or replace the stored options for one provider, after validating them.
@@ -227,60 +227,20 @@ pub fn upsert_web_fetch_options(
     options: &HashMap<String, serde_yaml::Value>,
 ) -> Result<(), String> {
     validate_fetch_options(id, options)?;
-    let path = super::settings::get_settings_path(config_dir);
-    let mut root = load_settings_mapping(&path)?;
-
-    let fetch = root
-        .entry(serde_yaml::Value::String("webFetch".to_string()))
-        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    let fetch = fetch
-        .as_mapping_mut()
-        .ok_or_else(|| "`webFetch` in config is not a mapping".to_string())?;
-
-    let options_value =
-        serde_yaml::to_value(options).map_err(|e| format!("Failed to serialize options: {e}"))?;
-    fetch.insert(
-        serde_yaml::Value::String(id.as_str().to_string()),
-        options_value,
-    );
-
-    write_settings_mapping(&path, &root)
-}
-
-pub(crate) const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
-
-/// Parse a settings file into a YAML mapping, or an empty mapping if the file is
-/// absent or holds only `null`. Shared with the typed web-search and PDF
-/// registries so all three do surgical, comment-preserving writes.
-pub(crate) fn load_settings_mapping(path: &Path) -> Result<serde_yaml::Mapping, String> {
-    if !path.exists() {
-        return Ok(serde_yaml::Mapping::new());
-    }
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read settings file: {e}"))?;
-    match serde_yaml::from_str::<serde_yaml::Value>(&content)
-        .map_err(|e| format!("Failed to parse settings file: {e}"))?
-    {
-        serde_yaml::Value::Mapping(m) => Ok(m),
-        serde_yaml::Value::Null => Ok(serde_yaml::Mapping::new()),
-        _ => Err("settings file root is not a mapping".to_string()),
-    }
-}
-
-/// Serialize a YAML mapping back to `settings.yaml`, re-adding the leading
-/// header comment (serde_yaml does not preserve comments).
-pub(crate) fn write_settings_mapping(
-    path: &Path,
-    root: &serde_yaml::Mapping,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config directory: {e}"))?;
-    }
-    let yaml =
-        serde_yaml::to_string(root).map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    let content = format!("{WORKSPACE_HEADER}\n{yaml}");
-    std::fs::write(path, content).map_err(|e| format!("Failed to write settings file: {e}"))
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let fetch = root
+            .entry(serde_yaml::Value::String("webFetch".to_string()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        let fetch = fetch
+            .as_mapping_mut()
+            .ok_or_else(|| "`webFetch` in config is not a mapping".to_string())?;
+        fetch.insert(
+            serde_yaml::Value::String(id.as_str().to_string()),
+            serde_yaml::to_value(options)
+                .map_err(|error| format!("Failed to serialize options: {error}"))?,
+        );
+        Ok(())
+    })
 }
 
 #[cfg(test)]

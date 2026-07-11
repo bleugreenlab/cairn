@@ -396,15 +396,43 @@ pub fn flatten_branch_recovery(
     })
 }
 
+/// Publish a reconciled bookmark when this project has an `origin` remote. Local-only
+/// projects have nothing to publish, so absence of `origin` is success rather than a
+/// blocking reconcile failure. If remote discovery itself fails, attempt the push:
+/// preserving the existing configured-origin failure signal is safer than silently
+/// treating an unreadable remote configuration as local-only.
+fn publish_reconciled_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
+    let has_origin = jj
+        .run(
+            store,
+            &["git", "remote", "list"],
+            "jj git remote list (reconcile publish)",
+        )
+        .map(|remotes| {
+            remotes.lines().any(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|name| name == "origin")
+            })
+        })
+        .unwrap_or(true);
+    if !has_origin {
+        return Ok(());
+    }
+    push_store_bookmark(jj, store, branch)
+}
+
 /// Classify one sibling that is already positioned on `dest_commit` (either it was
 /// just rebased there, or it already descended from it) into the reconcile report,
 /// applying proactive flatten recovery for the clean-tip / conflicted-intermediate
 /// case. `dest_commit` is `None` only when the reconcile dest was unresolvable, in
 /// which case this falls back to the bare tip-conflict check (liveness over
-/// strictness). `push_clean` advances a cleanly-rebased sibling's PR head on
-/// origin; a FLATTENED sibling is always pushed regardless, because the flatten
-/// rewrote its commit id and origin's PR head must follow. The caller holds the
-/// per-store lock, so the flatten cannot fork.
+/// strictness). `push_clean` advances a cleanly-rebased sibling's PR head when an
+/// `origin` remote is configured. A local-only project has nothing to publish and
+/// remains clean; failure to reach a configured origin is reported as blocking so
+/// the PR head cannot silently remain stale. A FLATTENED sibling always attempts
+/// publication because its commit id changed. The caller holds the per-store lock,
+/// so the flatten cannot fork.
 fn classify_reconciled_sibling(
     jj: &JjEnv,
     store: &Path,
@@ -421,21 +449,25 @@ fn classify_reconciled_sibling(
             Ok(true) => report.conflicted.push(branch.to_string()),
             Ok(false) => {
                 if push_clean {
-                    if let Err(e) = push_store_bookmark(jj, store, branch) {
+                    if let Err(e) = publish_reconciled_bookmark(jj, store, branch) {
                         log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
+                        report.failed.push(branch.to_string());
+                        return;
                     }
                 }
                 report.rebased_clean.push(branch.to_string());
             }
             Err(e) => {
                 log::warn!("jj reconcile: conflict check for {branch} failed: {e}");
-                report.rebased_clean.push(branch.to_string());
+                report.failed.push(branch.to_string());
             }
         },
         Some(FlattenState::Clean) => {
             if push_clean {
-                if let Err(e) = push_store_bookmark(jj, store, branch) {
+                if let Err(e) = publish_reconciled_bookmark(jj, store, branch) {
                     log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
+                    report.failed.push(branch.to_string());
+                    return;
                 }
             }
             report.rebased_clean.push(branch.to_string());
@@ -469,11 +501,15 @@ fn classify_reconciled_sibling(
                         log::warn!(
                             "jj reconcile: re-parent workspace {branch} onto flattened tip failed: {e}"
                         );
+                        report.failed.push(branch.to_string());
+                        return;
                     }
                     // The flatten rewrote the commit id, so the PR head must move
                     // even when a plain clean rebase would have been skipped.
-                    if let Err(e) = push_store_bookmark(jj, store, branch) {
+                    if let Err(e) = publish_reconciled_bookmark(jj, store, branch) {
                         log::warn!("jj reconcile: push flattened sibling {branch} failed: {e}");
+                        report.failed.push(branch.to_string());
+                        return;
                     }
                     log::info!(
                         "jj reconcile: flattened {branch} ({} conflicted intermediate(s) collapsed, {} twin(s) abandoned)",
@@ -622,6 +658,7 @@ pub fn reconcile_siblings(
         }
         if let Err(e) = rebase_branch_onto(jj, store, branch, integration_branch) {
             log::warn!("jj reconcile: rebase {branch} onto {integration_branch} failed: {e}");
+            report.failed.push(branch.clone());
             continue;
         }
         if let Err(e) = update_stale(jj, ws_path) {
@@ -629,6 +666,8 @@ pub fn reconcile_siblings(
                 "jj reconcile: update-stale {} failed: {e}",
                 ws_path.display()
             );
+            report.failed.push(branch.clone());
+            continue;
         }
         classify_reconciled_sibling(
             jj,

@@ -93,11 +93,12 @@ impl IssueSideChannelKind {
         job_id: &str,
         issue_uri: &str,
         rendered: &str,
+        stable_id: Option<&str>,
     ) -> Result<(), String> {
         match self {
             Self::Comment => {
-                crate::orchestrator::wakes::record_live_comment_side_channel_message(
-                    db, job_id, issue_uri, rendered,
+                crate::orchestrator::wakes::record_live_comment_side_channel_message_with_key(
+                    db, job_id, issue_uri, rendered, stable_id,
                 )
                 .await?;
             }
@@ -247,6 +248,25 @@ pub async fn record_issue_comment_side_channel_async(
     content: &str,
     exclude_job_id: Option<&str>,
 ) -> Result<usize, String> {
+    record_issue_comment_side_channel_for_intent_async(
+        orch,
+        issue_id,
+        source,
+        content,
+        exclude_job_id,
+        None,
+    )
+    .await
+}
+
+pub async fn record_issue_comment_side_channel_for_intent_async(
+    orch: &Orchestrator,
+    issue_id: &str,
+    source: &str,
+    content: &str,
+    exclude_job_id: Option<&str>,
+    intent_id: Option<&str>,
+) -> Result<usize, String> {
     record_issue_side_channel_async(
         orch,
         issue_id,
@@ -254,6 +274,7 @@ pub async fn record_issue_comment_side_channel_async(
         content,
         exclude_job_id,
         IssueSideChannelKind::Comment,
+        intent_id,
     )
     .await
 }
@@ -265,6 +286,7 @@ async fn record_issue_side_channel_async(
     content: &str,
     exclude_job_id: Option<&str>,
     kind: IssueSideChannelKind,
+    intent_id: Option<&str>,
 ) -> Result<usize, String> {
     // A team issue's rows — the issue/project URI lookup, the active-agent job
     // scan, and the suppressed-wake ledger this writes — live wholly in its
@@ -300,8 +322,15 @@ async fn record_issue_side_channel_async(
             created_at: 0,
             delivered_at: None,
         };
-        kind.record(&db, &job_id, &issue_uri, &notice.render())
-            .await?;
+        let stable_id = intent_id.map(|id| format!("remote-intent-wake:{id}:{job_id}"));
+        kind.record(
+            &db,
+            &job_id,
+            &issue_uri,
+            &notice.render(),
+            stable_id.as_deref(),
+        )
+        .await?;
         delivered += 1;
     }
 
@@ -351,6 +380,7 @@ pub async fn record_issue_message_side_channel_async(
         content,
         exclude_job_id,
         IssueSideChannelKind::Message,
+        None,
     )
     .await
 }

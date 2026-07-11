@@ -23,6 +23,10 @@ pub struct ReconcileReport {
     /// a recorded conflict — never handed a conflicted base. Cleared on the next
     /// reconcile once the base re-seals conflict-free.
     pub held: Vec<String>,
+    /// Sibling bookmarks whose local rebase, flatten recovery, live-workspace
+    /// refresh, or publication to a configured origin failed. A local-only project
+    /// with no origin does not require publication and remains clean.
+    pub failed: Vec<String>,
 }
 
 /// Fold a child's real commit into the integration bookmark over the shared
@@ -278,7 +282,7 @@ pub fn track_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), Stri
 /// PR head; jj's remote-tracking model accepts a rewritten bookmark without a
 /// force-push.
 pub fn push_store_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
-    jj.run(
+    jj.run_with_timeout(
         store,
         &[
             "git",
@@ -290,6 +294,7 @@ pub fn push_store_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(),
             branch,
         ],
         "jj git push store bookmark",
+        JJ_NETWORK_TIMEOUT,
     )
     .map(|_| ())
 }

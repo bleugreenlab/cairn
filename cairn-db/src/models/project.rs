@@ -149,6 +149,13 @@ pub struct CheckCommand {
         skip_serializing_if = "is_default_check_when"
     )]
     pub when: CheckWhen,
+    /// Host resource admission class. Shared checks consume one global permit;
+    /// exclusive checks consume the controller's full capacity.
+    #[serde(
+        default = "default_check_resource_class",
+        skip_serializing_if = "is_default_check_resource_class"
+    )]
+    pub resource_class: CheckResourceClass,
     /// Maximum wall-clock SECONDS this check may run before it is killed at its
     /// budget and recorded AS a timeout (not an opaque failure). `None` uses the
     /// cadence default — 10 min for `write`, 30 min for `review`. Clamped to a
@@ -162,6 +169,13 @@ pub struct CheckCommand {
 pub enum CheckPolicy {
     Advisory,
     Gate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckResourceClass {
+    Shared,
+    Exclusive,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,6 +199,14 @@ fn is_default_check_policy(policy: &CheckPolicy) -> bool {
     *policy == default_check_policy()
 }
 
+fn default_check_resource_class() -> CheckResourceClass {
+    CheckResourceClass::Shared
+}
+
+fn is_default_check_resource_class(resource_class: &CheckResourceClass) -> bool {
+    *resource_class == default_check_resource_class()
+}
+
 fn default_check_when() -> CheckWhen {
     CheckWhen::Write
 }
@@ -198,6 +220,15 @@ impl CheckPolicy {
         match self {
             CheckPolicy::Advisory => "advisory",
             CheckPolicy::Gate => "gate",
+        }
+    }
+}
+
+impl CheckResourceClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckResourceClass::Shared => "shared",
+            CheckResourceClass::Exclusive => "exclusive",
         }
     }
 }

@@ -64,9 +64,13 @@ pub async fn resolve_issue(
         .await
         .map_err(|e| e.to_string())?;
 
+    let issue = crud::get(db, issue_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Issue not found after resolution: {issue_id}"))?;
     let _ = emitter.emit(
         "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
+        crate::notify::issue_db_change(&issue, "update"),
     );
     let _ = emitter.emit(
         "db-change",
@@ -84,9 +88,13 @@ pub async fn unresolve_issue(
         .await
         .map_err(|e| e.to_string())?;
 
+    let issue = crud::get(db, issue_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Issue not found after resolution: {issue_id}"))?;
     let _ = emitter.emit(
         "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
+        crate::notify::issue_db_change(&issue, "update"),
     );
     Ok(())
 }
@@ -190,11 +198,12 @@ pub async fn transition_job_readiness(
     );
     let _ = emitter.emit(
         "db-change",
-        serde_json::json!({
-            "table": "issues",
-            "action": "update",
-            "issueId": issue_id.as_deref(),
-        }),
+        issue_id.as_deref().map_or_else(
+            || serde_json::json!({"table": "issues", "action": "update"}),
+            |issue_id| {
+                crate::notify::issue_db_change_ids("update", issue_id, Some(&job.project_id))
+            },
+        ),
     );
     Ok(())
 }

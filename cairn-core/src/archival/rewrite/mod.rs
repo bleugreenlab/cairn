@@ -199,14 +199,23 @@ pub async fn archive_target(
         return Ok(ArchiveSummary::default());
     }
 
-    // Classify synchronously: the non-Send `ObjectStore` lives only inside this
-    // call and is dropped before the apply await.
+    // Classification shells out to git, constructs the execution pack, walks
+    // git objects, and compresses fallback payloads. Keep that synchronous unit
+    // off the async runtime; the non-Send `ObjectStore` is created and dropped
+    // entirely inside the blocking worker before the apply await.
+    let worktree_path = worktree_path.to_string();
+    let repo_path = repo_path.to_string();
+    let jj = jj.cloned();
     let Classified {
         updates,
         summary,
         history,
         blobs,
-    } = classify(worktree_path, repo_path, &loaded, jj)?;
+    } = tokio::task::spawn_blocking(move || {
+        classify(&worktree_path, &repo_path, &loaded, jj.as_ref())
+    })
+    .await
+    .map_err(|error| format!("archival classification task failed: {error}"))??;
 
     if updates.is_empty() && history.is_none() && blobs.is_empty() {
         return Ok(summary);

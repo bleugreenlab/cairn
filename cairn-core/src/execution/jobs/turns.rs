@@ -6,6 +6,685 @@ pub(super) struct TurnHead {
     state: TurnState,
 }
 
+async fn claim_retry_turn_start_conn(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+    run_id: &str,
+) -> DbResult<bool> {
+    let now = chrono::Utc::now().timestamp() as i32;
+    let changed = conn
+        .execute(
+            "UPDATE turns
+                SET state = 'running', run_id = ?1,
+                    started_at = ?2, updated_at = ?2
+              WHERE id = ?3
+                AND state = 'pending'
+                AND start_reason = 'retry'
+                AND job_id IS NOT NULL
+                AND id = (SELECT current_turn_id FROM jobs WHERE id = turns.job_id)",
+            params![run_id, now, turn_id],
+        )
+        .await?;
+    Ok(changed > 0)
+}
+
+/// Atomically reserve an automatic retry turn for this run.
+///
+/// Manual continuation can only reclassify a pending retry. Once this conditional
+/// transition wins, the turn is running and the user-facing path queues steering
+/// rather than launching the same turn concurrently.
+pub(crate) fn claim_retry_turn_start(
+    orch: &Orchestrator,
+    turn_id: &str,
+    run_id: &str,
+) -> Result<bool, String> {
+    let (db, claimed) = run_db({
+        let dbs = orch.db.clone();
+        let turn_id = turn_id.to_string();
+        let run_id = run_id.to_string();
+        async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let claimed = db
+                .write(|conn| {
+                    let turn_id = turn_id.clone();
+                    let run_id = run_id.clone();
+                    Box::pin(
+                        async move { claim_retry_turn_start_conn(conn, &turn_id, &run_id).await },
+                    )
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((db, claimed))
+        }
+    })?;
+    if claimed {
+        let change = run_db({
+            let db = db.clone();
+            let turn_id = turn_id.to_string();
+            async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await) }
+        })?;
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+
+    Ok(claimed)
+}
+
+async fn supersede_pending_retry_conn(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+) -> DbResult<bool> {
+    let now = chrono::Utc::now().timestamp() as i32;
+    let changed = conn
+        .execute(
+            "UPDATE turns
+                SET start_reason = 'follow_up', updated_at = ?1
+              WHERE id = ?2 AND state = 'pending' AND start_reason = 'retry'",
+            params![now, turn_id],
+        )
+        .await?;
+    Ok(changed > 0)
+}
+
+#[cfg(test)]
+mod capacity_retry_tests {
+    use super::*;
+    use crate::storage::migrated_test_db;
+
+    async fn seed_job(db: &LocalDb) {
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO jobs (id, project_id, status, current_session_id, created_at, updated_at) VALUES ('j','p','running','s',1,1)",
+            "INSERT INTO sessions (id, job_id, backend, status, created_at, updated_at) VALUES ('s','j','codex','open',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+    }
+
+    async fn insert_turn(
+        db: &LocalDb,
+        id: &str,
+        predecessor: Option<&str>,
+        reason: TurnStartReason,
+        state: TurnState,
+    ) {
+        let id = id.to_string();
+        let predecessor = predecessor.map(str::to_string);
+        db.write(|conn| {
+            let id = id.clone();
+            let predecessor = predecessor.clone();
+            let reason = reason.clone();
+            let state = state.clone();
+            Box::pin(async move {
+                create_turn_conn(conn, &id, "s", "j", predecessor.as_deref(), reason).await?;
+                conn.execute(
+                    "UPDATE turns SET state = ?1, ended_at = 2, updated_at = 2 WHERE id = ?2",
+                    params![state.to_string(), id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consecutive_retries_count_and_manual_turn_resets_budget() {
+        let db = migrated_test_db("capacity-retry-count").await;
+        seed_job(&db).await;
+        insert_turn(
+            &db,
+            "t0",
+            None,
+            TurnStartReason::Initial,
+            TurnState::Interrupted,
+        )
+        .await;
+        insert_turn(
+            &db,
+            "t1",
+            Some("t0"),
+            TurnStartReason::Retry,
+            TurnState::Interrupted,
+        )
+        .await;
+        insert_turn(
+            &db,
+            "t2",
+            Some("t1"),
+            TurnStartReason::Retry,
+            TurnState::Interrupted,
+        )
+        .await;
+        insert_turn(
+            &db,
+            "t3",
+            Some("t2"),
+            TurnStartReason::Retry,
+            TurnState::Interrupted,
+        )
+        .await;
+
+        let count = db
+            .read(|conn| {
+                Box::pin(async move { consecutive_retry_turn_count_conn(conn, "t3").await })
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+
+        insert_turn(
+            &db,
+            "t4",
+            Some("t3"),
+            TurnStartReason::FollowUp,
+            TurnState::Interrupted,
+        )
+        .await;
+        let reset = db
+            .read(|conn| {
+                Box::pin(async move { consecutive_retry_turn_count_conn(conn, "t4").await })
+            })
+            .await
+            .unwrap();
+        assert_eq!(reset, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_claim_is_single_and_fails_closed_when_head_changes() {
+        let db = migrated_test_db("capacity-retry-claim").await;
+        seed_job(&db).await;
+        insert_turn(
+            &db,
+            "t0",
+            None,
+            TurnStartReason::Initial,
+            TurnState::Interrupted,
+        )
+        .await;
+
+        let first = db
+            .write(|conn| {
+                Box::pin(async move {
+                    claim_retry_successor_if_head_matches_conn(conn, "j", "s", "t0").await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(first.is_some());
+        let second = db
+            .write(|conn| {
+                Box::pin(async move {
+                    claim_retry_successor_if_head_matches_conn(conn, "j", "s", "t0").await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(second, None);
+
+        let retry_id = first.unwrap();
+        let actual = db
+            .read(|conn| {
+                let retry_id = retry_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT predecessor_id, state, start_reason FROM turns WHERE id = ?1",
+                            (retry_id.as_str(),),
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("retry row");
+                    Ok((row.text(0)?, row.text(1)?, row.text(2)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            actual,
+            ("t0".to_string(), "pending".to_string(), "retry".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_continue_reclassifies_pending_retry_and_resets_budget() {
+        let db = migrated_test_db("capacity-retry-manual-reset").await;
+        seed_job(&db).await;
+        insert_turn(
+            &db,
+            "t0",
+            None,
+            TurnStartReason::Initial,
+            TurnState::Interrupted,
+        )
+        .await;
+        let retry_id = db
+            .write(|conn| {
+                Box::pin(async move {
+                    claim_retry_successor_if_head_matches_conn(conn, "j", "s", "t0").await
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_for_update = retry_id.clone();
+        assert!(db
+            .write(|conn| {
+                let retry_id = retry_for_update.clone();
+                Box::pin(async move { supersede_pending_retry_conn(conn, &retry_id).await })
+            })
+            .await
+            .unwrap());
+
+        let (reason, count) = db
+            .read(|conn| {
+                let retry_id = retry_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT start_reason FROM turns WHERE id = ?1",
+                            (retry_id.as_str(),),
+                        )
+                        .await?;
+                    let reason = rows.next().await?.expect("retry row").text(0)?;
+                    let count = consecutive_retry_turn_count_conn(conn, &retry_id).await?;
+                    Ok((reason, count))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(reason, "follow_up");
+        assert_eq!(count, 0);
+        assert!(!pending_retry_head_matches(Arc::new(db), "j", &retry_id).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_supersession_after_retry_read_prevents_automatic_start() {
+        let db = migrated_test_db("capacity-retry-reservation-race").await;
+        seed_job(&db).await;
+        db.execute(
+            "INSERT INTO runs (id, job_id, project_id, status, created_at, updated_at)
+             VALUES ('r-auto', 'j', 'p', 'starting', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        insert_turn(
+            &db,
+            "t0",
+            None,
+            TurnStartReason::Initial,
+            TurnState::Interrupted,
+        )
+        .await;
+        let retry_id = db
+            .write(|conn| {
+                Box::pin(async move {
+                    claim_retry_successor_if_head_matches_conn(conn, "j", "s", "t0").await
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let retry_was_pending = db
+            .read(|conn| {
+                let retry_id = retry_id.clone();
+                Box::pin(async move {
+                    let Some(head) = get_head_turn_conn(conn, "j").await? else {
+                        return Ok(false);
+                    };
+                    Ok(head.id == retry_id && head.state == TurnState::Pending)
+                })
+            })
+            .await
+            .unwrap();
+        assert!(retry_was_pending);
+        let manual_id = retry_id.clone();
+        assert!(db
+            .write(|conn| {
+                let retry_id = manual_id.clone();
+                Box::pin(async move { supersede_pending_retry_conn(conn, &retry_id).await })
+            })
+            .await
+            .unwrap());
+        let automatic_id = retry_id.clone();
+        assert!(!db
+            .write(|conn| {
+                let retry_id = automatic_id.clone();
+                Box::pin(
+                    async move { claim_retry_turn_start_conn(conn, &retry_id, "r-auto").await },
+                )
+            })
+            .await
+            .unwrap());
+
+        db.execute(
+            "UPDATE turns SET state = 'pending', start_reason = 'retry', run_id = NULL WHERE id = ?1",
+            (retry_id.as_str(),),
+        )
+        .await
+        .unwrap();
+        let automatic_id = retry_id.clone();
+        assert!(db
+            .write(|conn| {
+                let retry_id = automatic_id.clone();
+                Box::pin(
+                    async move { claim_retry_turn_start_conn(conn, &retry_id, "r-auto").await },
+                )
+            })
+            .await
+            .unwrap());
+        let manual_id = retry_id.clone();
+        assert!(!db
+            .write(|conn| {
+                let retry_id = manual_id.clone();
+                Box::pin(async move { supersede_pending_retry_conn(conn, &retry_id).await })
+            })
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reserved_retry_can_be_abandoned_to_interrupted() {
+        let db = migrated_test_db("capacity-retry-abandon-running").await;
+        seed_job(&db).await;
+        db.execute(
+            "INSERT INTO runs (id, job_id, project_id, status, created_at, updated_at)
+             VALUES ('r-auto', 'j', 'p', 'starting', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        insert_turn(
+            &db,
+            "t0",
+            None,
+            TurnStartReason::Initial,
+            TurnState::Interrupted,
+        )
+        .await;
+        let retry_id = db
+            .write(|conn| {
+                Box::pin(async move {
+                    claim_retry_successor_if_head_matches_conn(conn, "j", "s", "t0").await
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let reserved_id = retry_id.clone();
+        assert!(db
+            .write(|conn| {
+                let retry_id = reserved_id.clone();
+                Box::pin(
+                    async move { claim_retry_turn_start_conn(conn, &retry_id, "r-auto").await },
+                )
+            })
+            .await
+            .unwrap());
+        let retry_arc = Arc::new(db);
+        assert!(abandon_pending_retry_if_head_matches(retry_arc.clone(), "j", &retry_id,).unwrap());
+        let state = retry_arc
+            .read(|conn| {
+                let retry_id = retry_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT state FROM turns WHERE id = ?1",
+                            (retry_id.as_str(),),
+                        )
+                        .await?;
+                    rows.next().await?.expect("retry row").text(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "interrupted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_terminal_head_cannot_be_claimed() {
+        let db = migrated_test_db("capacity-retry-nonterminal").await;
+        seed_job(&db).await;
+        insert_turn(
+            &db,
+            "t0",
+            None,
+            TurnStartReason::Initial,
+            TurnState::Running,
+        )
+        .await;
+        let claimed = db
+            .write(|conn| {
+                Box::pin(async move {
+                    claim_retry_successor_if_head_matches_conn(conn, "j", "s", "t0").await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(claimed, None);
+    }
+}
+
+async fn claim_retry_successor_if_head_matches_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    session_id: &str,
+    expected_head_turn_id: &str,
+) -> DbResult<Option<String>> {
+    let Some(head) = get_head_turn_conn(conn, job_id).await? else {
+        return Ok(None);
+    };
+    if head.id != expected_head_turn_id || !head.state.is_terminal() {
+        return Ok(None);
+    }
+    let mut active_rows = conn
+        .query(
+            "SELECT 1 FROM turns WHERE job_id = ?1 AND state IN ('pending', 'running') LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    if active_rows.next().await?.is_some() {
+        return Ok(None);
+    }
+    let mut successor_rows = conn
+        .query(
+            "SELECT 1 FROM turns WHERE predecessor_id = ?1 LIMIT 1",
+            (expected_head_turn_id,),
+        )
+        .await?;
+    if successor_rows.next().await?.is_some() {
+        return Ok(None);
+    }
+    let retry_turn_id = ids::mint_child(job_id);
+    create_successor_turn_conn(
+        conn,
+        &retry_turn_id,
+        session_id,
+        job_id,
+        expected_head_turn_id,
+        TurnStartReason::Retry,
+    )
+    .await?;
+    Ok(Some(retry_turn_id))
+}
+
+pub(crate) async fn consecutive_retry_turn_count_conn(
+    conn: &cairn_db::turso::Connection,
+    head_turn_id: &str,
+) -> DbResult<u32> {
+    let mut count = 0;
+    let mut turn_id = Some(head_turn_id.to_string());
+    while let Some(id) = turn_id {
+        let mut rows = conn
+            .query(
+                "SELECT start_reason, predecessor_id FROM turns WHERE id = ?1",
+                (id.as_str(),),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            break;
+        };
+        if row.text(0)? != TurnStartReason::Retry.to_string() {
+            break;
+        }
+        count += 1;
+        turn_id = row.opt_text(1)?;
+    }
+    Ok(count)
+}
+
+pub(crate) fn consecutive_retry_turn_count(
+    db: Arc<LocalDb>,
+    head_turn_id: &str,
+) -> Result<u32, String> {
+    run_db({
+        let head_turn_id = head_turn_id.to_string();
+        async move {
+            db.read(|conn| {
+                let head_turn_id = head_turn_id.clone();
+                Box::pin(
+                    async move { consecutive_retry_turn_count_conn(conn, &head_turn_id).await },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
+    })
+}
+
+/// Atomically claims one retry successor for the expected terminal job head.
+///
+/// The predecessor identity is the idempotency boundary: if a user continuation
+/// or another retry claimant has already changed the head, this returns no work.
+pub(crate) fn claim_retry_successor_if_head_matches(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    job_id: &str,
+    session_id: &str,
+    expected_head_turn_id: &str,
+) -> Result<Option<String>, String> {
+    let claimed = run_db({
+        let job_id = job_id.to_string();
+        let session_id = session_id.to_string();
+        let expected_head_turn_id = expected_head_turn_id.to_string();
+        let db = db.clone();
+        async move {
+            db.write(|conn| {
+                let job_id = job_id.clone();
+                let session_id = session_id.clone();
+                let expected_head_turn_id = expected_head_turn_id.clone();
+                Box::pin(async move {
+                    claim_retry_successor_if_head_matches_conn(
+                        conn,
+                        &job_id,
+                        &session_id,
+                        &expected_head_turn_id,
+                    )
+                    .await
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
+    })?;
+    if let Some(turn_id) = claimed.as_deref() {
+        let change = run_db({
+            let db = db.clone();
+            let turn_id = turn_id.to_string();
+            async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "insert").await) }
+        })?;
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+    Ok(claimed)
+}
+
+pub(crate) fn pending_retry_head_matches(
+    db: Arc<LocalDb>,
+    job_id: &str,
+    retry_turn_id: &str,
+) -> Result<bool, String> {
+    run_db({
+        let job_id = job_id.to_string();
+        let retry_turn_id = retry_turn_id.to_string();
+        async move {
+            db.read(|conn| {
+                let job_id = job_id.clone();
+                let retry_turn_id = retry_turn_id.clone();
+                Box::pin(async move {
+                    let Some(head) = get_head_turn_conn(conn, &job_id).await? else {
+                        return Ok(false);
+                    };
+                    if head.id != retry_turn_id
+                        || !matches!(head.state, TurnState::Pending | TurnState::Running)
+                    {
+                        return Ok(false);
+                    }
+                    let mut rows = conn
+                        .query(
+                            "SELECT start_reason FROM turns WHERE id = ?1",
+                            (retry_turn_id.as_str(),),
+                        )
+                        .await?;
+                    Ok(rows
+                        .next()
+                        .await?
+                        .map(|row| row.text(0))
+                        .transpose()?
+                        .as_deref()
+                        == Some("retry"))
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
+    })
+}
+
+pub(crate) fn abandon_pending_retry_if_head_matches(
+    db: Arc<LocalDb>,
+    job_id: &str,
+    retry_turn_id: &str,
+) -> Result<bool, String> {
+    run_db({
+        let job_id = job_id.to_string();
+        let retry_turn_id = retry_turn_id.to_string();
+        async move {
+            db.write(|conn| {
+                let job_id = job_id.clone();
+                let retry_turn_id = retry_turn_id.clone();
+                Box::pin(async move {
+                    let Some(head) = get_head_turn_conn(conn, &job_id).await? else {
+                        return Ok(false);
+                    };
+                    if head.id != retry_turn_id
+                        || !matches!(head.state, TurnState::Pending | TurnState::Running)
+                    {
+                        return Ok(false);
+                    }
+                    let now = chrono::Utc::now().timestamp() as i32;
+                    let changed = conn
+                        .execute(
+                            "UPDATE turns
+                                SET state = 'interrupted', ended_at = ?1, updated_at = ?1
+                              WHERE id = ?2
+                                AND state IN ('pending', 'running')
+                                AND start_reason = 'retry'",
+                            params![now, retry_turn_id.as_str()],
+                        )
+                        .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
+    })
+}
+
 pub(super) async fn next_turn_sequence_conn(
     conn: &cairn_db::turso::Connection,
     session_id: &str,
@@ -180,20 +859,17 @@ pub(super) fn create_initial_turn(
         }
     })?;
     run_db(create_initial_turn_db(
-        db,
+        db.clone(),
         turn_id.to_string(),
         session_id.to_string(),
         job_id.to_string(),
     ))?;
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({
-            "table": "turns",
-            "action": "insert",
-            "jobId": job_id,
-            "sessionId": session_id,
-        }),
-    );
+    let change = run_db({
+        let db = db.clone();
+        let turn_id = turn_id.to_string();
+        async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "insert").await) }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", change);
     Ok(())
 }
 
@@ -293,8 +969,9 @@ pub(super) fn create_followup_turn(
     session_id: &str,
     job_id: &str,
     user_initiated: bool,
+    supersede_pending_retry: bool,
 ) -> Result<String, String> {
-    let (turn_id, created) = run_db({
+    let (db, turn_id, created) = run_db({
         let dbs = orch.db.clone();
         let session_id = session_id.to_string();
         let job_id = job_id.to_string();
@@ -302,72 +979,74 @@ pub(super) fn create_followup_turn(
             let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
                 .await
                 .map_err(|e| e.to_string())?;
-            db.write(|conn| {
-                let session_id = session_id.clone();
-                let job_id = job_id.clone();
-                Box::pin(async move {
-                    let head_turn = get_head_turn_conn(conn, &job_id).await?;
-                    let start_reason =
-                        followup_start_reason_conn(conn, &job_id, user_initiated).await?;
-                    let new_turn_id = ids::mint_child(&job_id);
-                    if let Some(head) = head_turn {
-                        if head.state == TurnState::Pending {
-                            return Ok((head.id, false));
-                        }
-                        match create_successor_turn_conn(
-                            conn,
-                            &new_turn_id,
-                            &session_id,
-                            &job_id,
-                            &head.id,
-                            start_reason.clone(),
-                        )
-                        .await
-                        {
-                            Ok(_) => Ok((new_turn_id, true)),
-                            Err(error) => {
-                                log::warn!("Failed to create successor turn: {}", error);
-                                let fallback_id = ids::mint_child(&job_id);
-                                create_turn_conn(
-                                    conn,
-                                    &fallback_id,
-                                    &session_id,
-                                    &job_id,
-                                    None,
-                                    start_reason.clone(),
-                                )
-                                .await?;
-                                Ok((fallback_id, true))
+            let (turn_id, created) = db
+                .write(|conn| {
+                    let session_id = session_id.clone();
+                    let job_id = job_id.clone();
+                    Box::pin(async move {
+                        let head_turn = get_head_turn_conn(conn, &job_id).await?;
+                        let start_reason =
+                            followup_start_reason_conn(conn, &job_id, user_initiated).await?;
+                        let new_turn_id = ids::mint_child(&job_id);
+                        if let Some(head) = head_turn {
+                            if head.state == TurnState::Pending {
+                                if supersede_pending_retry {
+                                    supersede_pending_retry_conn(conn, &head.id).await?;
+                                }
+                                return Ok((head.id, false));
                             }
+                            match create_successor_turn_conn(
+                                conn,
+                                &new_turn_id,
+                                &session_id,
+                                &job_id,
+                                &head.id,
+                                start_reason.clone(),
+                            )
+                            .await
+                            {
+                                Ok(_) => Ok((new_turn_id, true)),
+                                Err(error) => {
+                                    log::warn!("Failed to create successor turn: {}", error);
+                                    let fallback_id = ids::mint_child(&job_id);
+                                    create_turn_conn(
+                                        conn,
+                                        &fallback_id,
+                                        &session_id,
+                                        &job_id,
+                                        None,
+                                        start_reason.clone(),
+                                    )
+                                    .await?;
+                                    Ok((fallback_id, true))
+                                }
+                            }
+                        } else {
+                            create_turn_conn(
+                                conn,
+                                &new_turn_id,
+                                &session_id,
+                                &job_id,
+                                None,
+                                start_reason,
+                            )
+                            .await?;
+                            Ok((new_turn_id, true))
                         }
-                    } else {
-                        create_turn_conn(
-                            conn,
-                            &new_turn_id,
-                            &session_id,
-                            &job_id,
-                            None,
-                            start_reason,
-                        )
-                        .await?;
-                        Ok((new_turn_id, true))
-                    }
+                    })
                 })
-            })
-            .await
-            .map_err(|e| e.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok((db, turn_id, created))
         }
     })?;
     if created {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({
-                "table": "turns",
-                "action": "insert",
-                "jobId": job_id,
-                "sessionId": session_id,
-            }),
-        );
+        let change = run_db({
+            let db = db.clone();
+            let turn_id = turn_id.clone();
+            async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "insert").await) }
+        })?;
+        let _ = orch.services.emitter.emit("db-change", change);
     }
     Ok(turn_id)
 }
@@ -380,7 +1059,7 @@ pub(super) fn create_followup_turn(
 /// hand-rolled duplicate in the Tauri layer that wrote the `turns` UPDATE
 /// unconditionally to the private DB, stranding a team job's turn (CAIRN-2206).
 pub fn start_turn(orch: &Orchestrator, turn_id: &str, run_id: &str) -> Result<(), String> {
-    let (session_id, job_id) = run_db({
+    let (db, _session_id, _job_id) = run_db({
         let dbs = orch.db.clone();
         let turn_id = turn_id.to_string();
         let run_id = run_id.to_string();
@@ -388,57 +1067,55 @@ pub fn start_turn(orch: &Orchestrator, turn_id: &str, run_id: &str) -> Result<()
             let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
                 .await
                 .map_err(|e| e.to_string())?;
-            db.write(|conn| {
-                let turn_id = turn_id.clone();
-                let run_id = run_id.clone();
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT state, session_id, job_id FROM turns WHERE id = ?1",
-                            (turn_id.as_str(),),
+            let (session_id, job_id) = db
+                .write(|conn| {
+                    let turn_id = turn_id.clone();
+                    let run_id = run_id.clone();
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT state, session_id, job_id FROM turns WHERE id = ?1",
+                                (turn_id.as_str(),),
+                            )
+                            .await?;
+                        let row = rows
+                            .next()
+                            .await?
+                            .ok_or_else(|| db_internal("turn not found"))?;
+                        let current = row.text(0)?;
+                        let session_id = row.text(1)?;
+                        let job_id = row.opt_text(2)?;
+                        let from: TurnState = current.parse().map_err(|_| {
+                            db_internal(format!("unparseable current state: {}", current))
+                        })?;
+                        if from != TurnState::Pending {
+                            return Err(db_internal(format!(
+                                "turn {} can only start from pending, got {}",
+                                turn_id, from
+                            )));
+                        }
+                        let now = chrono::Utc::now().timestamp() as i32;
+                        conn.execute(
+                            "UPDATE turns
+                             SET state = 'running', run_id = ?1, started_at = ?2, updated_at = ?2
+                             WHERE id = ?3",
+                            params![run_id.as_str(), now, turn_id.as_str()],
                         )
                         .await?;
-                    let row = rows
-                        .next()
-                        .await?
-                        .ok_or_else(|| db_internal("turn not found"))?;
-                    let current = row.text(0)?;
-                    let session_id = row.text(1)?;
-                    let job_id = row.opt_text(2)?;
-                    let from: TurnState = current.parse().map_err(|_| {
-                        db_internal(format!("unparseable current state: {}", current))
-                    })?;
-                    if from != TurnState::Pending {
-                        return Err(db_internal(format!(
-                            "turn {} can only start from pending, got {}",
-                            turn_id, from
-                        )));
-                    }
-                    let now = chrono::Utc::now().timestamp() as i32;
-                    conn.execute(
-                        "UPDATE turns
-                         SET state = 'running', run_id = ?1, started_at = ?2, updated_at = ?2
-                         WHERE id = ?3",
-                        params![run_id.as_str(), now, turn_id.as_str()],
-                    )
-                    .await?;
-                    Ok((session_id, job_id))
+                        Ok((session_id, job_id))
+                    })
                 })
-            })
-            .await
-            .map_err(|e| e.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok((db, session_id, job_id))
         }
     })?;
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({
-            "table": "turns",
-            "action": "update",
-            "jobId": job_id,
-            "runId": run_id,
-            "sessionId": session_id,
-        }),
-    );
+    let change = run_db({
+        let db = db.clone();
+        let turn_id = turn_id.to_string();
+        async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await) }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", change);
     Ok(())
 }
 
@@ -555,16 +1232,15 @@ pub(super) fn transition_job_to_running(orch: &Orchestrator, job_id: &str) -> Re
             "action": "update",
             "issueId": issue_id.as_deref(),
             "executionId": execution_id.as_deref(),
+            "projectId": job.project_id,
         }),
     );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({
-            "table": "issues",
-            "action": "update",
-            "issueId": issue_id.as_deref(),
-        }),
-    );
+    if let Some(issue_id) = issue_id.as_deref() {
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            crate::notify::issue_db_change_ids("update", issue_id, Some(&job.project_id)),
+        );
+    }
     Ok(())
 }
 

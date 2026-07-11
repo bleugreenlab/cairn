@@ -52,6 +52,9 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "head_limit",
     "offset",
     "limit",
+    // Shared read-view continuation for a single line larger than the batch
+    // budget. Producers consume it together with offset to resume within a line.
+    "char_offset",
     "multiline",
     "issue_history",
     "search",
@@ -69,7 +72,7 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "role",
     "issue",
     "branch",
-    // Live-database (cairn://db) read-only SQL projection key.
+    // Live-database (cairn://db) read-only SQL projection keys.
     "sql",
     // Dev-instance selector (cairn://dev/db?at=..., cairn://dev/pid?at=...).
     "at",
@@ -81,6 +84,9 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     // Blocking long-poll on a call/task-artifact URI (`?wait`): the workflow
     // harness `agent()` await. Bare key (no value).
     "wait",
+    // Content representation shared by browser reads, structured raw
+    // transcript reads, and the cairn://db JSON projection.
+    "format",
     // Node/task transcript digest projections: turn ordering (latest) and the
     // opt-in reseed-fidelity knobs (messages=full, diffs=true).
     "latest",
@@ -152,11 +158,12 @@ pub fn encode_query_params(params: &[QueryParam]) -> String {
     params
         .iter()
         .map(|param| {
-            format!(
-                "{}={}",
-                encode_query_component(&param.key),
+            let value = if RAW_VALUE_KEYS.contains(&param.key.as_str()) {
+                param.value.clone()
+            } else {
                 encode_query_component(&param.value)
-            )
+            };
+            format!("{}={value}", encode_query_component(&param.key))
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -421,6 +428,21 @@ mod tests {
             ]
         );
 
+        let split = split_target_query("cairn://db?sql=SELECT 1&format=json").unwrap();
+        assert_eq!(
+            split.params,
+            vec![
+                QueryParam {
+                    key: "sql".to_string(),
+                    value: "SELECT 1".to_string(),
+                },
+                QueryParam {
+                    key: "format".to_string(),
+                    value: "json".to_string(),
+                },
+            ]
+        );
+
         // Web search `q` is a raw-value key too: `100%` no longer breaks parsing.
         let split = split_target_query("cairn://websearch?q=100% uptime claims").unwrap();
         assert_eq!(
@@ -442,6 +464,34 @@ mod tests {
             .iter()
             .any(|p| p.key == "grep" && p.value == "100%done"));
         assert!(split_target_query("file:lib.rs?grep=100%done").is_err());
+    }
+
+    #[test]
+    fn encode_query_params_preserves_raw_values_for_parser_symmetry() {
+        let params = vec![
+            QueryParam {
+                key: "sql".to_string(),
+                value: "SELECT * FROM issues WHERE title LIKE '%bug%'".to_string(),
+            },
+            QueryParam {
+                key: "limit".to_string(),
+                value: "5".to_string(),
+            },
+        ];
+        let encoded = encode_query_params(&params);
+        assert_eq!(
+            encoded,
+            "sql=SELECT * FROM issues WHERE title LIKE '%bug%'&limit=5"
+        );
+        assert_eq!(parse_query_params(&encoded).unwrap(), params);
+
+        let websearch = vec![QueryParam {
+            key: "q".to_string(),
+            value: "100% uptime claims".to_string(),
+        }];
+        let encoded = encode_query_params(&websearch);
+        assert_eq!(encoded, "q=100% uptime claims");
+        assert_eq!(parse_query_params(&encoded).unwrap(), websearch);
     }
 
     #[test]

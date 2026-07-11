@@ -1400,3 +1400,31 @@ fn routes_only_navigate_supported_resources() {
         None
     );
 }
+
+#[test]
+fn browser_network_request_uris_round_trip_in_all_scopes() {
+    let cases = [
+        "cairn://p/CAIRN/browser/default/network/realm-1",
+        "cairn://p/CAIRN/42/2/builder/browser/dev/network/realm_2.3~x",
+        "cairn://p/CAIRN/42/2/builder/task/review/browser/default/network/realm-4",
+    ];
+    for uri in cases {
+        let resource = parse_uri(uri).expect(uri);
+        assert_eq!(resource.to_uri(), uri);
+        assert!(matches!(
+            resource.kind(),
+            ResourceKind::ProjectBrowserNetworkRequest
+                | ResourceKind::NodeBrowserNetworkRequest
+                | ResourceKind::TaskBrowserNetworkRequest
+        ));
+    }
+    assert_eq!(parse_uri("cairn://p/CAIRN/browser/default/network/"), None);
+    assert_eq!(
+        parse_uri("cairn://p/CAIRN/browser/default/network/not%2Fsafe"),
+        None
+    );
+    assert_eq!(
+        parse_uri("cairn://p/CAIRN/browser/default/network/has space"),
+        None
+    );
+}

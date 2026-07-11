@@ -76,11 +76,8 @@ pub async fn transition_run(
         reason: format!("DB error: {error}"),
     })?;
 
-    let job_id = crate::messages::side_channel::job_id_for_run(db, run_id).await;
-    let _ = emitter.emit(
-        "db-change",
-        crate::notify::run_db_change_ids("update", run_id, job_id.as_deref()),
-    );
+    let change = crate::notify::run_db_change_for_id(db, run_id, "update").await;
+    let _ = emitter.emit("db-change", change);
 
     Ok(from)
 }

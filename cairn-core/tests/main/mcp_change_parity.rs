@@ -50,6 +50,7 @@ fn sample_uri(contract: &ResourceContract) -> String {
         .replace("{event_seq}", "2")
         .replace("{skill_id}", "ui")
         .replace("{segment}", "q-1")
+        .replace("{request_id}", "realm-1")
 }
 
 /// Minimal payload satisfying a mutation's required keys (canonical names).

@@ -29,12 +29,6 @@ use cairn_db::turso::params;
 use serde::Serialize;
 use std::collections::HashMap;
 
-// Re-export execution queries with _impl aliases for backward compatibility.
-#[allow(unused_imports)]
-pub use super::queries::get_execution_for_issue as get_execution_for_issue_impl;
-#[allow(unused_imports)]
-pub use super::queries::list_executions_for_issue as list_executions_for_issue_impl;
-
 pub fn create_jobs_for_execution(
     orch: &Orchestrator,
     execution_id: &str,
@@ -441,12 +435,6 @@ pub fn start_event_triggered_execution(
         runner_device_id: Some(orch.anon_device_manager.device_id()),
     })
 }
-
-#[allow(unused_imports)]
-pub use super::queries::{
-    get_execution_detail as get_execution_detail_impl,
-    list_all_executions as list_all_executions_impl,
-};
 
 // ===========================================================================
 // Launch-composer resolution contract

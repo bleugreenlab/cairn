@@ -30,7 +30,7 @@
 //! Rebuilding search over pulled rows is a deferred slice; this loop stays purely
 //! push/pull plus the generic `db-change` emit.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::json;
@@ -44,9 +44,15 @@ use crate::storage::LocalDb;
 /// cache); injected into the pull task so `storage` stays ignorant of the
 /// projects/routing layer. A `None` reconciler (every test, the static path)
 /// makes the pull task pure push/pull as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamSyncScope {
+    pub team_id: String,
+    pub project_ids: Vec<String>,
+}
+
 #[async_trait::async_trait]
 pub trait RouteReconcile: Send + Sync {
-    async fn reconcile(&self);
+    async fn reconcile(&self) -> Result<TeamSyncScope, String>;
 }
 
 /// Cadence knobs for one team's push and pull tasks. The defaults target prompt
@@ -196,6 +202,37 @@ pub async fn run_push_task(db: Arc<LocalDb>, cadence: SyncCadence) {
 /// desktop re-queries the pulled data (a headless host may inject a no-op
 /// emitter). The reconcile runs BEFORE the emit so the route cache is current
 /// when the frontend re-queries.
+static PULL_APPLIED: OnceLock<tokio::sync::broadcast::Sender<String>> = OnceLock::new();
+
+fn pull_applied_sender() -> &'static tokio::sync::broadcast::Sender<String> {
+    PULL_APPLIED.get_or_init(|| tokio::sync::broadcast::channel(64).0)
+}
+
+/// Subscribe to team IDs whose pull applied frames and completed route
+/// reconciliation. This process-local notification complements the periodic
+/// owner sweep; physical WAL replay itself cannot fire receiver SQL triggers.
+pub fn subscribe_team_pull_applied() -> tokio::sync::broadcast::Receiver<String> {
+    pull_applied_sender().subscribe()
+}
+
+fn notify_team_pull_applied(scope: &Option<TeamSyncScope>) {
+    if let Some(scope) = scope {
+        let _ = pull_applied_sender().send(scope.team_id.clone());
+    }
+}
+
+fn team_sync_change(scope: Option<TeamSyncScope>) -> serde_json::Value {
+    match scope {
+        Some(scope) => json!({
+            "table": "team_sync",
+            "action": "update",
+            "teamId": scope.team_id,
+            "projectIds": scope.project_ids,
+        }),
+        None => json!({ "table": "team_sync", "action": "update" }),
+    }
+}
+
 pub async fn run_pull_task(
     db: Arc<LocalDb>,
     emitter: Arc<dyn EventEmitter>,
@@ -206,13 +243,62 @@ pub async fn run_pull_task(
     loop {
         tokio::time::sleep(cadence.pull_interval).await;
         if pull_until_ok(&db, &mut backoff).await {
-            if let Some(reconciler) = &reconciler {
-                reconciler.reconcile().await;
-            }
+            let scope = match &reconciler {
+                Some(reconciler) => match reconciler.reconcile().await {
+                    Ok(scope) => Some(scope),
+                    Err(error) => {
+                        log::warn!(
+                            "team sync route/scope reconciliation failed; emitting conservative unscoped refresh: {error}"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             // Physical WAL replay re-fires no triggers and carries no per-table
-            // detail, so the frontend maps this `team_sync` poke to a broad
-            // shared-family refresh (see packages/ui/src/invalidation.ts).
-            let _ = emitter.emit("db-change", json!({ "table": "team_sync" }));
+            // detail. Route reconciliation above is authoritative for which
+            // projects belong to this replica; when it fails, omitting scope is
+            // an intentional conservative fallback in the frontend.
+            notify_team_pull_applied(&scope);
+            let _ = emitter.emit("db-change", team_sync_change(scope));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn team_sync_change_carries_authoritative_replica_scope() {
+        let payload = team_sync_change(Some(TeamSyncScope {
+            team_id: "team-1".to_string(),
+            project_ids: vec!["project-1".to_string(), "project-2".to_string()],
+        }));
+
+        assert_eq!(payload["table"], "team_sync");
+        assert_eq!(payload["action"], "update");
+        assert_eq!(payload["teamId"], "team-1");
+        assert_eq!(payload["projectIds"], json!(["project-1", "project-2"]));
+    }
+
+    #[test]
+    fn team_sync_change_omits_scope_for_conservative_fallback() {
+        let payload = team_sync_change(None);
+
+        assert_eq!(payload, json!({ "table": "team_sync", "action": "update" }));
+    }
+
+    #[tokio::test]
+    async fn pull_applied_notification_targets_reconciled_team() {
+        let mut receiver = subscribe_team_pull_applied();
+        notify_team_pull_applied(&Some(TeamSyncScope {
+            team_id: "team-target".to_string(),
+            project_ids: vec!["project-1".to_string()],
+        }));
+        assert_eq!(receiver.recv().await.unwrap(), "team-target");
+
+        notify_team_pull_applied(&None);
+        assert!(receiver.try_recv().is_err());
     }
 }

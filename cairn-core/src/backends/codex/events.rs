@@ -18,6 +18,12 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TurnFailureDisposition {
+    Unhandled,
+    AlreadyHandled,
+}
+
 pub(super) fn extract_app_server_delta(msg: &Value) -> Option<&str> {
     msg.pointer("/params/delta")
         .and_then(|v| v.as_str())
@@ -316,6 +322,7 @@ pub(super) fn handle_turn_completed(
     // after its turn, so on success it finalizes explicitly (never warm). Ordinary
     // node/task sessions pass `false` and keep the warm/task branching.
     ephemeral_call: bool,
+    failure_disposition: TurnFailureDisposition,
 ) {
     finalize_streaming(orch, run_db, emitter, streaming_state, session_id, sequence);
     let counts = TokenCounts::from_optional_usage(usage.as_ref());
@@ -356,6 +363,7 @@ pub(super) fn handle_turn_completed(
                 // explicitly — driving `on_call_run_finalized` (slot release,
                 // workflow journal, parent resume) — rather than warming a
                 // process that no longer maps 1:1 to this run.
+                crate::orchestrator::lifecycle::transition_to_warm_state(orch, run_id, None);
                 crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Exited);
                 return;
             }
@@ -365,7 +373,7 @@ pub(super) fn handle_turn_completed(
                 crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Exited);
                 orch.process_state.transition_to_warm(run_id);
             } else {
-                crate::orchestrator::lifecycle::transition_to_warm_state(orch, run_id);
+                crate::orchestrator::lifecycle::transition_to_warm_state(orch, run_id, None);
                 let _ = emitter.emit(
                     "run-turn-completed",
                     serde_json::json!({
@@ -381,6 +389,9 @@ pub(super) fn handle_turn_completed(
             handle_codex_interrupted_turn(orch, run_db, emitter, run_id);
         }
         _ => {
+            if failure_disposition == TurnFailureDisposition::AlreadyHandled {
+                return;
+            }
             insert_error_event(
                 orch,
                 run_id,
@@ -477,18 +488,28 @@ pub(super) fn handle_codex_interrupted_turn(
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
 ) {
+    let terminal_tool_called = terminal_tool_called_for_run(orch, run_id);
     if should_finalize_task_run_on_interrupted_turn(
-        terminal_tool_called_for_run(orch, run_id),
+        terminal_tool_called,
         is_task_spawned_run(CODEX_BACKEND_NAME, run_db, run_id),
     ) {
         log::info!(
             "codex interrupted after terminal tool for task-spawned run {}; finalizing as completed",
             &run_id[..run_id.len().min(8)]
         );
+        crate::orchestrator::lifecycle::transition_to_warm_state(
+            orch,
+            run_id,
+            Some(crate::models::TurnEndReason::ArtifactHandoff),
+        );
         crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Exited);
         orch.process_state.transition_to_warm(run_id);
     } else {
-        crate::orchestrator::lifecycle::transition_to_warm_state(orch, run_id);
+        crate::orchestrator::lifecycle::transition_to_warm_state(
+            orch,
+            run_id,
+            terminal_tool_called.then_some(crate::models::TurnEndReason::ArtifactHandoff),
+        );
         emit_codex_run_turn_completed(emitter, run_id);
     }
 }

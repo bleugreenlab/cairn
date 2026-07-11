@@ -1,15 +1,13 @@
 //! Issue-related MCP handlers.
 //!
-//! Handles: update_issue
-
 use crate::orchestrator::Orchestrator;
 use cairn_common::ids;
 use cairn_db::turso::params;
 
-use super::{parse_issue_identifier, ProjectContext};
+use super::ProjectContext;
 use crate::issues::relations;
 use crate::labels::attach;
-use crate::mcp::types::{McpCallbackRequest, UpdateIssuePayload};
+use crate::mcp::types::McpCallbackRequest;
 use crate::models::{Issue, IssueAttention, IssueProgress, IssueStatus};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
@@ -79,14 +77,19 @@ async fn insert_issue_with_context(
 
     if let Err(e) = services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
+        crate::notify::issue_db_change(&issue, "update"),
     ) {
         log::error!("Failed to emit db-change event: {}", e);
     }
     if !issue.labels.is_empty() {
         if let Err(e) = services.emitter.emit(
             "db-change",
-            serde_json::json!({"table": "issue_labels", "action": "insert"}),
+            serde_json::json!({
+                "table": "issue_labels",
+                "action": "insert",
+                "issueId": issue.id,
+                "projectId": issue.project_id,
+            }),
         ) {
             log::error!("Failed to emit db-change event: {}", e);
         }
@@ -748,14 +751,19 @@ pub async fn update_issue_by_project_number(
 
     if let Err(e) = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
+        crate::notify::issue_db_change(&issue, "update"),
     ) {
         log::error!("Failed to emit db-change event: {}", e);
     }
     if labels_changed {
         if let Err(e) = orch.services.emitter.emit(
             "db-change",
-            serde_json::json!({"table": "issue_labels", "action": "update"}),
+            serde_json::json!({
+                "table": "issue_labels",
+                "action": "update",
+                "issueId": issue.id,
+                "projectId": issue.project_id,
+            }),
         ) {
             log::error!("Failed to emit db-change event: {}", e);
         }
@@ -780,48 +788,6 @@ pub async fn update_issue_by_project_number(
         issue.number,
         status.map(|s| format!(" (status={s})")).unwrap_or_default()
     ))
-}
-
-/// Handle update_issue tool call
-pub async fn handle_update_issue(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: UpdateIssuePayload = match super::parse_payload(request) {
-        Ok(payload) => payload,
-        Err(error) => return error,
-    };
-
-    let (project_key_opt, issue_num) = match parse_issue_identifier(&payload.issue_number) {
-        Some(parsed) => parsed,
-        None => {
-            return format!(
-                "Invalid issue number: '{}'. Use formats like: 37, #37, or CAIRN-37",
-                payload.issue_number
-            )
-        }
-    };
-
-    log::info!("update_issue: #{}", issue_num);
-
-    match update_issue_by_project_number(
-        orch,
-        request,
-        project_key_opt.as_deref().unwrap_or(""),
-        issue_num,
-        IssuePatchFields {
-            title: payload.title,
-            description: payload.description,
-            depends_on: payload.depends_on,
-            labels: payload.labels,
-            // The legacy update_issue tool does not change resolution.
-            status: None,
-            // The legacy update_issue tool does not re-parent.
-            parent: None,
-        },
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => error,
-    }
 }
 
 #[cfg(test)]

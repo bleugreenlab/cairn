@@ -243,7 +243,13 @@ pub(crate) fn prepare_call_run(
     );
     let _ = orch.services.emitter.emit(
         "db-change",
-        crate::notify::run_db_change_ids("insert", &run_id, Some(&job_id)),
+        crate::notify::run_db_change_ids(
+            "insert",
+            &run_id,
+            Some(&job_id),
+            issue_id.as_deref(),
+            Some(&project_id),
+        ),
     );
 
     // Link this call's run to its workflow journal key (private, runner-
@@ -739,7 +745,13 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
     ))?;
     let _ = orch.services.emitter.emit(
         "db-change",
-        crate::notify::run_db_change_ids("insert", &run_id, Some(call_job_id)),
+        crate::notify::run_db_change_ids(
+            "insert",
+            &run_id,
+            Some(call_job_id),
+            job.issue_id.as_deref(),
+            Some(&job.project_id),
+        ),
     );
     store_user_event(orch, &run_id, &session_id, &prompt, now, -1)?;
 

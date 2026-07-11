@@ -11,6 +11,7 @@ pub mod action_runs;
 pub mod analytics;
 pub mod archival;
 pub mod artifacts;
+pub mod browser_network;
 pub mod browsers;
 pub mod config_disables;
 pub mod issues;
@@ -76,6 +77,7 @@ mod env;
 mod execution;
 mod git;
 mod jj;
+mod managed_worktrees;
 mod markdown_frontmatter;
 mod mcp;
 mod node_segments;
@@ -84,6 +86,7 @@ mod orchestrator;
 mod resources;
 mod services;
 mod storage;
+mod team_remote_intents;
 mod workspace;
 
 // Cross-engine parity tests comparing the fff worktree index (cairn-symbols)

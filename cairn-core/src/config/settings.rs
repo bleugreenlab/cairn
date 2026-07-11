@@ -5,13 +5,16 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use cairn_common::logging::LogLevel;
 
 use crate::config::presets::{default_presets_config, PresetsConfig};
 use crate::models::{
     ExternalReplyMode, MergeType, Model, OpenRouterRouting, Preset, Settings, ThinkingDisplayMode,
+    TranscriptDensity, TranscriptTextSize, UpdateSettings,
 };
 
 /// Custom deserializer for max_thinking_tokens to distinguish between:
@@ -78,6 +81,12 @@ pub struct SettingsFile {
     /// Thinking block display mode in chat transcripts
     #[serde(default)]
     pub thinking_display_mode: Option<ThinkingDisplayMode>,
+    /// Base text scale for transcript markdown.
+    #[serde(default)]
+    pub transcript_text_size: Option<TranscriptTextSize>,
+    /// Vertical rhythm preset for transcript markdown.
+    #[serde(default)]
+    pub transcript_density: Option<TranscriptDensity>,
     /// File-log verbosity level. Absent = the light `Standard` default; `verbose`
     /// is the opt-in full-debug + profiler level (today's behavior).
     #[serde(default)]
@@ -97,6 +106,11 @@ pub struct SettingsFile {
     /// `docs/worktree-fence.md`.
     #[serde(default)]
     pub sandbox_deny_read: Option<Vec<String>>,
+    /// Extra case-insensitive names redacted from browser network headers,
+    /// query parameters, JSON fields, and form fields. The built-in sensitive
+    /// names always apply; this config-only list can only add to them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_network_sensitive_names: Option<Vec<String>>,
     /// Managed Build Services: Cairn-supervised shared daemons (e.g. an sccache
     /// server) that run under a service sandbox and inject client env into fenced
     /// agent spawns. Config-only (YAML, not in the Settings DTO). Absent = the
@@ -290,6 +304,8 @@ impl SettingsFile {
                 .thinking_display_mode
                 .clone()
                 .unwrap_or(ThinkingDisplayMode::Full),
+            transcript_text_size: self.transcript_text_size.unwrap_or_default(),
+            transcript_density: self.transcript_density.unwrap_or_default(),
             memory_review_enabled: self.memory_review_enabled.unwrap_or(true),
             pending_memory_threshold: self.pending_memory_threshold.unwrap_or(5).max(1),
             external_replies: self
@@ -321,6 +337,8 @@ impl SettingsFile {
             repo_target_sweep_days: Some(settings.repo_target_sweep_days.max(0)),
             bug_reports: Some(settings.bug_reports),
             thinking_display_mode: Some(settings.thinking_display_mode.clone()),
+            transcript_text_size: Some(settings.transcript_text_size),
+            transcript_density: Some(settings.transcript_density),
             log_level: Some(settings.log_level),
             memory_review_enabled: Some(settings.memory_review_enabled),
             pending_memory_threshold: Some(settings.pending_memory_threshold.max(1)),
@@ -339,6 +357,7 @@ impl SettingsFile {
             route_calls_via_openrouter: settings.route_calls_via_openrouter.then_some(true),
             // Config-only (YAML, not in the DTO); preserved across saves.
             sandbox_deny_read: None,
+            browser_network_sensitive_names: None,
             build_services: None,
             accepted_fence_commands: None,
             web_fetch: None,
@@ -354,6 +373,72 @@ impl SettingsFile {
 /// Get the path to the settings file
 pub fn get_settings_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join("settings.yaml")
+}
+
+const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
+static WORKSPACE_SETTINGS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Mutate the workspace settings mapping as one serialized, atomic transaction.
+///
+/// The runner is the sole process owner of the Cairn home, so one process-wide
+/// lock is the canonical concurrency boundary for all `settings.yaml` writers.
+/// The current document is read exactly once while holding that lock. Missing or
+/// YAML-null documents start empty; every other read or parse failure is fatal.
+pub(crate) fn mutate_workspace_settings<T>(
+    config_dir: &std::path::Path,
+    commit_message: &str,
+    mutate: impl FnOnce(&mut serde_yaml::Mapping) -> Result<T, String>,
+) -> Result<T, String> {
+    let lock = WORKSPACE_SETTINGS_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = get_settings_path(config_dir);
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Failed to read settings file: {error}")),
+    };
+    let mut root = match content.as_deref() {
+        None => serde_yaml::Mapping::new(),
+        Some(content) => match serde_yaml::from_str::<serde_yaml::Value>(content)
+            .map_err(|error| format!("Failed to parse settings file: {error}"))?
+        {
+            serde_yaml::Value::Mapping(mapping) => mapping,
+            serde_yaml::Value::Null => serde_yaml::Mapping::new(),
+            _ => return Err("settings file root is not a mapping".to_string()),
+        },
+    };
+    let original = root.clone();
+    let result = mutate(&mut root)?;
+
+    if root == original {
+        return Ok(result);
+    }
+
+    std::fs::create_dir_all(config_dir)
+        .map_err(|error| format!("Failed to create config directory: {error}"))?;
+    let yaml = serde_yaml::to_string(&root)
+        .map_err(|error| format!("Failed to serialize settings: {error}"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(config_dir)
+        .map_err(|error| format!("Failed to create temporary settings file: {error}"))?;
+    write!(temporary, "{WORKSPACE_HEADER}\n{yaml}")
+        .map_err(|error| format!("Failed to write temporary settings file: {error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("Failed to sync temporary settings file: {error}"))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| format!("Failed to replace settings file: {}", error.error))?;
+
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        commit_message,
+        Some(config_dir),
+    );
+    Ok(result)
 }
 
 /// The file-log verbosity level (default `Standard`). Read once at process
@@ -381,6 +466,13 @@ pub fn load_settings(config_dir: &std::path::Path) -> Settings {
 /// `sandboxDenyRead` paths (with `~` expanded) if present, otherwise the
 /// conservative built-in default. An empty configured list disables the
 /// denylist (writes are still confined).
+pub fn load_browser_network_sensitive_names(config_dir: &std::path::Path) -> Vec<String> {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.browser_network_sensitive_names)
+        .unwrap_or_default()
+}
+
 pub fn load_sandbox_deny_read(config_dir: &std::path::Path) -> Vec<PathBuf> {
     let configured = load_settings_file(config_dir)
         .ok()
@@ -435,17 +527,29 @@ pub fn set_accepted_fence_command(
     command: &str,
     accepted: bool,
 ) -> Result<(), String> {
-    let mut map = load_accepted_fence_commands(config_dir);
     let command = command.trim().to_string();
-    let entry = map.entry(project_id.to_string()).or_default();
-    entry.retain(|c| c != &command);
-    if accepted && !command.is_empty() {
-        entry.push(command);
-    }
-    if entry.is_empty() {
-        map.remove(project_id);
-    }
-    write_accepted_fence_commands_map(config_dir, &map)
+    mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let key = serde_yaml::Value::String("acceptedFenceCommands".to_string());
+        let mut map: HashMap<String, Vec<String>> = match root.get(&key).cloned() {
+            None | Some(serde_yaml::Value::Null) => HashMap::new(),
+            Some(value) => serde_yaml::from_value(value)
+                .map_err(|error| format!("Failed to parse accepted fence commands: {error}"))?,
+        };
+        let entry = map.entry(project_id.to_string()).or_default();
+        entry.retain(|existing| existing != &command);
+        if accepted && !command.is_empty() {
+            entry.push(command.clone());
+        }
+        if entry.is_empty() {
+            map.remove(project_id);
+        }
+        root.insert(
+            key,
+            serde_yaml::to_value(map)
+                .map_err(|error| format!("Failed to serialize accepted fence commands: {error}"))?,
+        );
+        Ok(())
+    })
 }
 
 /// Persist the `enabled` flag for one build service into the `buildServices`
@@ -458,13 +562,13 @@ pub fn set_build_service_enabled(
     name: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    // Start from the effective map (configured or built-in default).
-    let mut map = load_build_services(config_dir);
-    let cfg = map
-        .get_mut(name)
-        .ok_or_else(|| format!("unknown build service: {name}"))?;
-    cfg.enabled = enabled;
-    write_build_services_map(config_dir, &map)
+    mutate_build_services(config_dir, |map| {
+        let config = map
+            .get_mut(name)
+            .ok_or_else(|| format!("unknown build service: {name}"))?;
+        config.enabled = enabled;
+        Ok(())
+    })
 }
 
 /// Insert or replace one build service. Starts from the effective map
@@ -475,77 +579,50 @@ pub fn upsert_build_service(
     name: &str,
     config: &crate::config::build_services::BuildServiceConfig,
 ) -> Result<(), String> {
-    let mut map = load_build_services(config_dir);
-    map.insert(name.to_string(), config.clone());
-    write_build_services_map(config_dir, &map)
+    mutate_build_services(config_dir, |map| {
+        map.insert(name.to_string(), config.clone());
+        Ok(())
+    })
 }
 
 /// Remove one build service by name. Writes the remaining map verbatim — an
 /// empty result persists as `buildServices: {}` (explicitly no services),
 /// distinct from an absent block (which yields the built-in default).
 pub fn delete_build_service(config_dir: &std::path::Path, name: &str) -> Result<(), String> {
-    let mut map = load_build_services(config_dir);
-    map.remove(name);
-    write_build_services_map(config_dir, &map)
+    mutate_build_services(config_dir, |map| {
+        map.remove(name);
+        Ok(())
+    })
 }
 
-/// Surgically write the `buildServices` mapping into `settings.yaml`, leaving
-/// every other key and the header comment intact.
-fn write_build_services_map(
+fn mutate_build_services<T>(
     config_dir: &std::path::Path,
-    map: &HashMap<String, crate::config::build_services::BuildServiceConfig>,
-) -> Result<(), String> {
-    let value = serde_yaml::to_value(map)
-        .map_err(|e| format!("Failed to serialize build services: {e}"))?;
-    write_settings_key(config_dir, "buildServices", value)
-}
-
-/// Surgically write the `acceptedFenceCommands` mapping into `settings.yaml`.
-fn write_accepted_fence_commands_map(
-    config_dir: &std::path::Path,
-    map: &HashMap<String, Vec<String>>,
-) -> Result<(), String> {
-    let value = serde_yaml::to_value(map)
-        .map_err(|e| format!("Failed to serialize accepted fence commands: {e}"))?;
-    write_settings_key(config_dir, "acceptedFenceCommands", value)
-}
-
-/// Surgically write one top-level `key` into `settings.yaml`, leaving every other
-/// key and the header comment intact. The canonical UI write path for config-only
-/// settings (build services, fence acceptance) that the worktree fence blocks
-/// agents from editing directly.
-fn write_settings_key(
-    config_dir: &std::path::Path,
-    key: &str,
-    value: serde_yaml::Value,
-) -> Result<(), String> {
-    let path = get_settings_path(config_dir);
-    let mut root = match std::fs::read_to_string(&path) {
-        Ok(content) => match serde_yaml::from_str::<serde_yaml::Value>(&content)
-            .map_err(|e| format!("Failed to parse settings file: {e}"))?
-        {
-            serde_yaml::Value::Mapping(m) => m,
-            serde_yaml::Value::Null => serde_yaml::Mapping::new(),
-            _ => return Err("settings file root is not a mapping".to_string()),
-        },
-        Err(_) => serde_yaml::Mapping::new(),
-    };
-    root.insert(serde_yaml::Value::String(key.to_string()), value);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config directory: {e}"))?;
-    }
-    let yaml =
-        serde_yaml::to_string(&root).map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    std::fs::write(&path, format!("# Cairn Workspace Settings\n{yaml}"))
-        .map_err(|e| format!("Failed to write settings file: {e}"))?;
-    super::commit_and_maybe_push(
-        std::slice::from_ref(&path),
-        "cairn: update settings",
-        Some(config_dir),
-    );
-    Ok(())
+    mutate: impl FnOnce(
+        &mut HashMap<String, crate::config::build_services::BuildServiceConfig>,
+    ) -> Result<T, String>,
+) -> Result<T, String> {
+    mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let key = serde_yaml::Value::String("buildServices".to_string());
+        let mut map = match root.get(&key).cloned() {
+            Some(value) if !value.is_null() => serde_yaml::from_value(value)
+                .map_err(|error| format!("Failed to parse build services: {error}"))?,
+            None | Some(_) => {
+                let mut defaults = HashMap::new();
+                defaults.insert(
+                    "sccache".to_string(),
+                    crate::config::build_services::default_sccache_service(),
+                );
+                defaults
+            }
+        };
+        let result = mutate(&mut map)?;
+        root.insert(
+            key,
+            serde_yaml::to_value(map)
+                .map_err(|error| format!("Failed to serialize build services: {error}"))?,
+        );
+        Ok(result)
+    })
 }
 
 /// Resolve the template variables for build-service config expansion.
@@ -596,80 +673,142 @@ pub(crate) fn load_settings_file(config_dir: &std::path::Path) -> Result<Setting
     serde_yaml::from_str(&content).map_err(|e| format!("Failed to parse settings file: {}", e))
 }
 
-/// Save settings to file
-pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Result<(), String> {
-    let path = get_settings_path(config_dir);
+const SETTINGS_DTO_KEYS: &[&str] = &[
+    "activeBackend",
+    "tiers",
+    "backends",
+    "branchPrefix",
+    "maxThinkingTokens",
+    "mergeType",
+    "pullOnMerge",
+    "orphanCleanupDays",
+    "repoTargetSweepDays",
+    "bugReports",
+    "thinkingDisplayMode",
+    "logLevel",
+    "memoryReviewEnabled",
+    "pendingMemoryThreshold",
+    "externalReplies",
+    "subscriptionFees",
+    "openrouterRouting",
+    "routeCallsViaOpenRouter",
+    // Legacy DTO-owned fields are removed once their values have migrated.
+    "defaultModel",
+    "preferredModels",
+    "autoStartJobs",
+];
 
-    // Ensure directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config directory: {}", e))?;
+fn merge_settings_keys(root: &mut serde_yaml::Mapping, settings: &Settings) -> Result<(), String> {
+    let target = serde_yaml::to_value(SettingsFile::from_settings(settings))
+        .map_err(|error| format!("Failed to serialize settings: {error}"))?;
+    let target = target
+        .as_mapping()
+        .ok_or_else(|| "serialized settings root is not a mapping".to_string())?;
+    for name in SETTINGS_DTO_KEYS {
+        let key = serde_yaml::Value::String((*name).to_string());
+        match target.get(&key) {
+            Some(value) => {
+                root.insert(key, value.clone());
+            }
+            None => {
+                root.remove(&key);
+            }
+        }
     }
-
-    let mut file = SettingsFile::from_settings(settings);
-
-    // Preserve the external MCP server registry: it is config-only (edited in
-    // YAML, not exposed through the Settings DTO), so carry the on-disk value
-    // forward rather than dropping it on every settings save.
-    file.mcp_servers = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.mcp_servers);
-
-    // The sandbox read denylist is likewise config-only (YAML, not in the DTO):
-    // carry the on-disk value forward rather than dropping it on every save.
-    file.sandbox_deny_read = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.sandbox_deny_read);
-
-    // Managed Build Services are config-only too: preserve the on-disk value.
-    file.build_services = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.build_services);
-
-    // Fence-command acceptance is config-only too: preserve the on-disk value.
-    file.accepted_fence_commands = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.accepted_fence_commands);
-
-    // The typed web-fetch registry and its active selector are config-only
-    // too: carry the on-disk values forward rather than dropping them on save.
-    file.web_fetch = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.web_fetch);
-    file.active_web_fetch = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.active_web_fetch);
-
-    // The typed web-search registry and its active selector are config-only too:
-    // carry the on-disk values forward rather than dropping them on save.
-    file.web_search = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.web_search);
-    file.active_web_search = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.active_web_search);
-
-    // The typed PDF registry and its active selector are config-only too:
-    // carry the on-disk values forward rather than dropping them on save.
-    file.pdf = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.pdf);
-    file.active_pdf = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.active_pdf);
-
-    // Add header comment
-    let yaml =
-        serde_yaml::to_string(&file).map_err(|e| format!("Failed to serialize settings: {}", e))?;
-    let content = format!("# Cairn Workspace Settings\n{}", yaml);
-
-    std::fs::write(&path, content).map_err(|e| format!("Failed to write settings file: {}", e))?;
-    super::commit_and_maybe_push(
-        std::slice::from_ref(&path),
-        "cairn: update settings",
-        Some(config_dir),
-    );
     Ok(())
+}
+
+/// Save only the top-level keys owned by the general Settings DTO.
+pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Result<(), String> {
+    mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        merge_settings_keys(root, settings)
+    })
+}
+
+/// Apply a partial general-settings update to the latest on-disk document.
+///
+/// Loading the effective DTO, applying the patch, and merging its owned keys all
+/// happen under the workspace settings lock. Concurrent partial requests can
+/// therefore update disjoint fields without restoring stale values.
+pub fn update_settings(
+    config_dir: &std::path::Path,
+    input: UpdateSettings,
+) -> Result<Settings, String> {
+    mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let file: SettingsFile =
+            serde_yaml::from_value(serde_yaml::Value::Mapping(root.clone()))
+                .map_err(|error| format!("Failed to parse settings file: {error}"))?;
+        let mut current = file.to_settings();
+        apply_settings_update(&mut current, input);
+        merge_settings_keys(root, &current)?;
+        Ok(current)
+    })
+}
+
+fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
+    if let Some(value) = input.active_backend {
+        current.active_backend = value;
+    }
+    if let Some(value) = input.tiers {
+        current.tiers = value;
+    }
+    if let Some(value) = input.backends {
+        current.backends = value;
+    }
+    if let Some(value) = input.branch_prefix {
+        current.branch_prefix = value;
+    }
+    if let Some(value) = input.max_thinking_tokens {
+        current.max_thinking_tokens = value;
+    }
+    if let Some(value) = input.merge_type {
+        current.merge_type = value;
+    }
+    if let Some(value) = input.pull_on_merge {
+        current.pull_on_merge = value;
+    }
+    if let Some(value) = input.orphan_cleanup_days {
+        current.orphan_cleanup_days = value.clamp(1, 30);
+    }
+    if let Some(value) = input.repo_target_sweep_days {
+        current.repo_target_sweep_days = value.max(0);
+    }
+    if let Some(value) = input.bug_reports {
+        current.bug_reports = value;
+    }
+    if let Some(value) = input.thinking_display_mode {
+        current.thinking_display_mode = value;
+    }
+    if let Some(value) = input.transcript_text_size {
+        current.transcript_text_size = value;
+    }
+    if let Some(value) = input.transcript_density {
+        current.transcript_density = value;
+    }
+    if let Some(value) = input.memory_review_enabled {
+        current.memory_review_enabled = value;
+    }
+    if let Some(value) = input.pending_memory_threshold {
+        current.pending_memory_threshold = value.max(1);
+    }
+    if let Some(value) = input.external_replies {
+        current.external_replies = value;
+    }
+    if let Some(value) = input.log_level {
+        current.log_level = value;
+    }
+    if let Some(value) = input.openrouter_routing {
+        current.openrouter_routing = value;
+    }
+    if let Some(value) = input.route_calls_via_openrouter {
+        current.route_calls_via_openrouter = value;
+    }
+    if let Some(value) = input.subscription_fees {
+        current.subscription_fees = value
+            .into_iter()
+            .filter(|(_, fee)| fee.is_finite() && *fee > 0.0)
+            .collect();
+    }
 }
 
 #[cfg(test)]
@@ -798,14 +937,20 @@ mod tests {
     }
 
     #[test]
-    fn write_settings_key_commits_scoped() {
+    fn workspace_settings_transaction_commits_scoped() {
         let temp = TempDir::new().unwrap();
         let home = temp.path();
         git_init(home);
-        // Build-service / fence saves funnel through write_settings_key.
         std::fs::write(home.join("unrelated.txt"), "dirty").unwrap();
 
-        write_settings_key(home, "buildServices", serde_yaml::Value::Null).unwrap();
+        mutate_workspace_settings(home, "cairn: update settings", |root| {
+            root.insert(
+                serde_yaml::Value::String("buildServices".to_string()),
+                serde_yaml::Value::Null,
+            );
+            Ok(())
+        })
+        .unwrap();
 
         assert_eq!(git_head_subject(home), "cairn: update settings");
         let status = git_status(home);
@@ -850,6 +995,8 @@ mod tests {
         assert_eq!(settings.repo_target_sweep_days, 0);
         assert!(settings.auto_start_jobs); // Always true
         assert_eq!(settings.thinking_display_mode, ThinkingDisplayMode::Full);
+        assert_eq!(settings.transcript_text_size, TranscriptTextSize::Default);
+        assert_eq!(settings.transcript_density, TranscriptDensity::Comfortable);
         assert_eq!(settings.external_replies, ExternalReplyMode::Watchers);
     }
 
@@ -874,6 +1021,8 @@ externalReplies: disabled
             merge_type: MergeType::Rebase,
             pull_on_merge: false,
             repo_target_sweep_days: 14,
+            transcript_text_size: TranscriptTextSize::Large,
+            transcript_density: TranscriptDensity::Relaxed,
             ..test_settings()
         };
 
@@ -892,6 +1041,8 @@ externalReplies: disabled
             restored.thinking_display_mode,
             settings.thinking_display_mode
         );
+        assert_eq!(restored.transcript_text_size, TranscriptTextSize::Large);
+        assert_eq!(restored.transcript_density, TranscriptDensity::Relaxed);
     }
 
     #[test]
@@ -1198,23 +1349,172 @@ webFetch:
   firecrawl:
     onlyMainContent: false
 activeWebFetch: jina
+webSearch:
+  brave:
+    count: 7
+activeWebSearch: brave
+pdf:
+  bmd: {}
 activePdf: bmd
+futureUserKey:
+  nested: preserved
 "#;
         std::fs::write(get_settings_path(dir), yaml).unwrap();
 
-        // The config-only fields parse off the file.
-        let file = load_settings_file(dir).unwrap();
-        assert!(file.web_fetch.as_ref().unwrap().contains_key("firecrawl"));
-        assert_eq!(file.active_web_fetch.as_deref(), Some("jina"));
-        assert_eq!(file.active_pdf.as_deref(), Some("bmd"));
-
-        // Saving settings (which never touches these) carries them forward.
         let settings = load_settings(dir);
         save_settings(dir, &settings).unwrap();
         let after = load_settings_file(dir).unwrap();
         assert!(after.web_fetch.as_ref().unwrap().contains_key("firecrawl"));
         assert_eq!(after.active_web_fetch.as_deref(), Some("jina"));
+        assert!(after.web_search.as_ref().unwrap().contains_key("brave"));
+        assert_eq!(after.active_web_search.as_deref(), Some("brave"));
+        assert!(after.pdf.as_ref().unwrap().contains_key("bmd"));
         assert_eq!(after.active_pdf.as_deref(), Some("bmd"));
+
+        let raw: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(get_settings_path(dir)).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw.get("futureUserKey")
+                .and_then(|value| value.get("nested"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn general_save_removes_legacy_owned_keys_but_preserves_unknown_keys() {
+        let temp = TempDir::new().unwrap();
+        let path = get_settings_path(temp.path());
+        std::fs::write(
+            &path,
+            "defaultModel: opus\npreferredModels: [opus]\nautoStartJobs: false\nfutureKey: keep\n",
+        )
+        .unwrap();
+
+        save_settings(temp.path(), &load_settings(temp.path())).unwrap();
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(root.get("defaultModel").is_none());
+        assert!(root.get("preferredModels").is_none());
+        assert!(root.get("autoStartJobs").is_none());
+        assert_eq!(
+            root.get("futureKey").and_then(serde_yaml::Value::as_str),
+            Some("keep")
+        );
+    }
+
+    #[test]
+    fn malformed_settings_fail_closed_without_changing_bytes() {
+        let temp = TempDir::new().unwrap();
+        let path = get_settings_path(temp.path());
+        let malformed = b"branchPrefix: [unterminated\n";
+        std::fs::write(&path, malformed).unwrap();
+
+        let error = save_settings(temp.path(), &test_settings()).unwrap_err();
+        assert!(error.contains("Failed to parse settings file"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn concurrent_partial_settings_updates_preserve_disjoint_fields() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempDir::new().unwrap();
+        save_settings(temp.path(), &test_settings()).unwrap();
+        let home = Arc::new(temp.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(3));
+
+        let prefix_home = Arc::clone(&home);
+        let prefix_barrier = Arc::clone(&barrier);
+        let prefix = std::thread::spawn(move || {
+            prefix_barrier.wait();
+            update_settings(
+                &prefix_home,
+                UpdateSettings {
+                    branch_prefix: Some("concurrent-prefix".to_string()),
+                    ..UpdateSettings::default()
+                },
+            )
+            .unwrap();
+        });
+
+        let reports_home = Arc::clone(&home);
+        let reports_barrier = Arc::clone(&barrier);
+        let reports = std::thread::spawn(move || {
+            reports_barrier.wait();
+            update_settings(
+                &reports_home,
+                UpdateSettings {
+                    bug_reports: Some(false),
+                    ..UpdateSettings::default()
+                },
+            )
+            .unwrap();
+        });
+
+        barrier.wait();
+        prefix.join().unwrap();
+        reports.join().unwrap();
+
+        let settings = load_settings(&home);
+        assert_eq!(settings.branch_prefix, "concurrent-prefix");
+        assert!(!settings.bug_reports);
+    }
+
+    #[test]
+    fn concurrent_workspace_mutations_preserve_both_keys() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempDir::new().unwrap();
+        let home = Arc::new(temp.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for (key, value) in [("first", "one"), ("second", "two")] {
+            let home = Arc::clone(&home);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                mutate_workspace_settings(&home, "cairn: update settings", |root| {
+                    root.insert(
+                        serde_yaml::Value::String(key.to_string()),
+                        serde_yaml::Value::String(value.to_string()),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(get_settings_path(&home)).unwrap())
+                .unwrap();
+        assert_eq!(
+            root.get("first").and_then(serde_yaml::Value::as_str),
+            Some("one")
+        );
+        assert_eq!(
+            root.get("second").and_then(serde_yaml::Value::as_str),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn atomic_workspace_write_leaves_valid_yaml_without_temporary_artifacts() {
+        let temp = TempDir::new().unwrap();
+        save_settings(temp.path(), &test_settings()).unwrap();
+
+        let raw = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        serde_yaml::from_str::<serde_yaml::Value>(&raw).unwrap();
+        let entries = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("settings.yaml")]);
     }
 
     #[test]

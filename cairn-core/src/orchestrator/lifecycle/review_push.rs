@@ -58,10 +58,9 @@ pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
     };
     let issue_uri = ctx.issue_uri();
     // CAIRN-2483: this edge no longer creates the review push. Review firing is
-    // now gated on the whole issue being quiescent AND its checks settled, owned
-    // end-to-end by the checks pipeline (`evaluate_review_readiness`, invoked from
-    // the turn-end checks completion, the job-terminal recompute hook, and the
-    // PR-open edge). This function keeps only its idle-fact / `AttentionEvent`
+    // gated on the whole issue being quiescent, with readiness re-evaluated from
+    // turn-end checks completion, the job-terminal recompute hook, and the PR-open
+    // edge. This function keeps only its idle-fact / `AttentionEvent`
     // half, which still drives the desktop "completed" toast and `cairn watch`;
     // `needs_attention` semantics are untouched.
     //
@@ -187,20 +186,16 @@ pub(crate) fn detach_onto_runtime(
 }
 
 /// The shared review-readiness evaluator (CAIRN-2483). A review fires when
-/// **(reviewable output exists) AND (producing node not in memory-review) AND
-/// (issue quiescent) AND (checks settled)**, at the moment the last of those
-/// becomes true. Multiple trigger edges (turn-end checks completion, the
+/// **(reviewable output exists) AND (issue quiescent)**, at the moment the last
+/// of those becomes true. Multiple trigger edges (turn-end checks completion, the
 /// job-terminal recompute hook, and the PR-open edge) may evaluate at different
 /// moments; the per-watcher fingerprint dedupe inside [`create_review_push_rows`]
 /// guarantees at most one wake per reviewed state.
 ///
-/// `fresh_red` is supplied by the invoking edge: `true` when the launch that just
-/// completed produced a *non-cached* failing verdict. A fresh red defers — that
-/// red is simultaneously waking the owning agent and the fix loop is live, and the
-/// next settle re-evaluates. A cached/stale red counts as settled-with-warning
-/// (the agent was already woken and idled anyway) so a perma-red advisory suite
-/// never silences parent wakes forever. Non-checks edges pass `false`.
-pub async fn evaluate_review_readiness(orch: &Orchestrator, issue_id: &str, fresh_red: bool) {
+/// Detached turn-end checks are feedback for the producing child, not semantic
+/// child liveness. They deliberately do not participate in this gate: a slow or
+/// stranded advisory suite must not suppress the coordinator's durable wake.
+pub async fn evaluate_review_readiness(orch: &Orchestrator, issue_id: &str) {
     let db = match crate::issues::crud::owning_db_for_issue(&orch.db, issue_id).await {
         Ok(db) => db,
         Err(e) => {
@@ -232,11 +227,7 @@ pub async fn evaluate_review_readiness(orch: &Orchestrator, issue_id: &str, fres
             return;
         }
     }
-    // 3. Checks must be settled (with the fresh-red / stale-red rule).
-    if !checks_settled(orch, &db, issue_id, fresh_red).await {
-        return;
-    }
-    // 4. Resolve the issue context and create the deduped review push rows.
+    // 3. Resolve the issue context and create the deduped review push rows.
     let ctx = match crate::orchestrator::attention::read_issue_for_attention(&db, issue_id).await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -255,58 +246,6 @@ pub async fn evaluate_review_readiness(orch: &Orchestrator, issue_id: &str, fres
             e
         ),
     }
-}
-
-/// Checks are settled for an issue iff no job of the issue holds an in-flight
-/// turn-end run (the review agent inherits the builder's worktree, so its own
-/// turn-end suite counts too), subject to the fresh-red rule. A `fresh_red` from
-/// the invoking edge always defers. Fail-closed (a lookup error reads as
-/// not-settled) so a transient read never fires a premature wake — another edge
-/// re-evaluates. Check policy (`gate`/`advisory`) is deliberately ignored: every
-/// review-cadence check holds the wake equally, since the coordinator wants
-/// information, not enforcement.
-async fn checks_settled(
-    orch: &Orchestrator,
-    db: &crate::storage::LocalDb,
-    issue_id: &str,
-    fresh_red: bool,
-) -> bool {
-    if fresh_red {
-        return false;
-    }
-    match job_ids_for_issue(db, issue_id).await {
-        Ok(job_ids) => !job_ids.iter().any(|j| orch.turn_end_checks_in_flight(j)),
-        Err(e) => {
-            log::warn!("review readiness: job ids for checks-settled failed: {e}");
-            false
-        }
-    }
-}
-
-/// The job ids of an issue's executions (used by the checks-settled gate).
-async fn job_ids_for_issue(
-    db: &crate::storage::LocalDb,
-    issue_id: &str,
-) -> Result<Vec<String>, String> {
-    let issue_id = issue_id.to_string();
-    db.read(|conn| {
-        let issue_id = issue_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT id FROM jobs WHERE issue_id = ?1",
-                    (issue_id.as_str(),),
-                )
-                .await?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next().await? {
-                ids.push(row.text(0)?);
-            }
-            Ok::<_, DbError>(ids)
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
 }
 
 /// Resolve the job that owns an issue's reviewable output — a create-pr /
@@ -437,11 +376,11 @@ async fn rearm_candidate_jobs(db: &crate::storage::LocalDb) -> Result<Vec<String
 /// `handle_pr_node`) observes the PR opening and routes here.
 ///
 /// This edge now defers to [`evaluate_review_readiness`], which carries the full
-/// issue-quiescence and checks-settled gates. `source_branch` is retained for the
+/// issue-quiescence gate. `source_branch` is retained for the
 /// caller's signature and logging; the evaluator resolves the producing job from
 /// the issue itself. At PR-open time the review agent or the checks suite is
 /// usually still live, so this edge typically defers and a later settled edge
-/// (checks completion or the job-terminal recompute hook) fires the wake; it
+/// (the job-terminal recompute hook or checks completion) fires the wake; it
 /// covers the case where the MR row lands only after everything else has settled.
 pub async fn create_review_push_for_pr_open(
     orch: &Orchestrator,
@@ -453,7 +392,7 @@ pub async fn create_review_push_for_pr_open(
         &issue_id[..issue_id.len().min(8)],
         source_branch,
     );
-    evaluate_review_readiness(orch, issue_id, false).await;
+    evaluate_review_readiness(orch, issue_id).await;
 }
 
 /// Create the review push rows for an issue's watchers — the single shared

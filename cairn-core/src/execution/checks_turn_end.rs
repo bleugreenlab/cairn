@@ -36,12 +36,12 @@
 //! ## Concurrency and isolation
 //!
 //! The cache-miss checks run CONCURRENTLY, each in its own copy-on-write clone of
-//! the sealed worktree ([`crate::execution::check_isolation`]) — the same engine
-//! ([`crate::execution::checks::run_planned_checks`]) and isolation machinery the
-//! write cadence uses. Because the review suites are heavy and each is internally
-//! multi-threaded (two full Rust compiles among them, each cloning its own
-//! `target`), the parallelism is BOUNDED by [`review_max_concurrency`] rather than
-//! unbounded like the thin write cadence. When a cheap clone is unavailable the
+//! the sealed worktree ([`crate::execution::check_isolation`]). They share the
+//! scheduling/result engine ([`crate::execution::checks::run_planned_checks`]) with
+//! write checks, but clone isolation is review-only. Process spawn is admitted
+//! through the runner-wide fair
+//! controller; full suites normally request `exclusive`, while lighter work uses
+//! one shared permit. When a cheap clone is unavailable the
 //! whole batch falls back to SEQUENTIAL in-place execution in the one shared
 //! checkout ([`check_isolation::decide_exec_mode`]). Isolation is fold-free here:
 //! a stray tracked write lands in a disposable clone and is discarded, so it can
@@ -58,6 +58,7 @@
 //!   check is already cached, and nothing relaunches — so the agent is resumed at
 //!   most ONCE per failing tree.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use cairn_common::uri::build_node_checks_uri;
@@ -86,31 +87,23 @@ const LOG_TAIL_CHARS: usize = 2_000;
 /// lifecycle) has already claimed the slot via `try_begin_turn_end_checks`; this
 /// function is responsible for releasing it on every path.
 pub async fn run_turn_end_checks(orch: Orchestrator, job_id: String, cancel: TurnEndCancel) {
-    // `fresh_red` is true only when this launch ran a check that freshly failed
-    // (a non-cached failing verdict). Early-exit paths (no worktree, no checks, no
-    // changed files, all-cached) yield `false`, so a planner writing a plan still
-    // yields a prompt parent wake at the completion edge.
-    let fresh_red = match run_turn_end_checks_inner(&orch, &job_id, &cancel).await {
-        Ok(fresh_red) => fresh_red,
-        Err(e) => {
-            log::warn!(
-                "turn-end checks for job {}: {}",
-                &job_id[..job_id.len().min(8)],
-                e
-            );
-            false
-        }
-    };
-    // Release the single-flight slot BEFORE evaluating review readiness so the
-    // checks-settled gate does not see this job's own in-flight marker.
+    if let Err(e) = run_turn_end_checks_inner(&orch, &job_id, &cancel).await {
+        log::warn!(
+            "turn-end checks for job {}: {}",
+            &job_id[..job_id.len().min(8)],
+            e
+        );
+    }
+    // Release the single-flight slot before the idempotent readiness recovery
+    // edge. Review creation no longer waits for detached checks, but completion
+    // remains a useful re-evaluation point if another semantic gate settled too.
     orch.end_turn_end_checks(&job_id);
-    // The checks pipeline owns review evaluation end-to-end (CAIRN-2483): every
-    // exit path lands here, so a green completion, an all-cached exit, an empty
-    // changed set, or an inner error all re-evaluate whether the reviewed issue
-    // has settled and, if so, wake its watchers.
+    // Every exit path lands here, so a green completion, an all-cached exit, an
+    // empty changed set, or an inner error re-evaluates whether the reviewed
+    // issue has settled. Fingerprint dedupe makes this recovery edge harmless
+    // when an earlier semantic transition already created the wake.
     if let Some(issue_id) = issue_id_for_job(&orch.db.local, &job_id).await {
-        crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, &issue_id, fresh_red)
-            .await;
+        crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, &issue_id).await;
     }
 }
 
@@ -231,14 +224,24 @@ async fn run_turn_end_checks_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 4. Compute the node's changed files (fork..@).
+    // 4. Compute the node's changed files (fork..@). This waits on jj, so the
+    // detached async review path must not run it on a Tokio worker.
     let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let Some(changed) = node_changed_files(
-        &jj,
-        repo_root,
-        coords.base_branch.as_deref(),
-        coords.base_commit.as_deref(),
-    ) else {
+    let changed_jj = jj.clone();
+    let changed_repo = repo_root.to_path_buf();
+    let base_branch = coords.base_branch.clone();
+    let base_commit = coords.base_commit.clone();
+    let Some(changed) = tokio::task::spawn_blocking(move || {
+        node_changed_files(
+            &changed_jj,
+            &changed_repo,
+            base_branch.as_deref(),
+            base_commit.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("turn-end changed-file task failed: {error}"))?
+    else {
         log::debug!(
             "turn-end checks for job {}: changed-file set unresolvable; nothing to run",
             short_id(job_id)
@@ -253,8 +256,16 @@ async fn run_turn_end_checks_inner(
         return Ok(false);
     }
 
-    // 5. Select the applicable turn-end checks (cadence + impact gate).
-    let plans = applicable_turn_end_checks(&checks, &changed, repo_root);
+    // 5. Select the applicable turn-end checks (cadence + impact gate). Target
+    // expansion may run cargo metadata, so planning belongs on the blocking pool.
+    let planning_checks = checks.clone();
+    let planning_changed = changed.clone();
+    let planning_repo = repo_root.to_path_buf();
+    let plans = tokio::task::spawn_blocking(move || {
+        applicable_turn_end_checks(&planning_checks, &planning_changed, &planning_repo)
+    })
+    .await
+    .map_err(|error| format!("turn-end check planning task failed: {error}"))?;
     if plans.is_empty() {
         log::debug!(
             "turn-end checks for job {}: no applicable review check; nothing to run",
@@ -263,8 +274,22 @@ async fn run_turn_end_checks_inner(
         return Ok(false);
     }
 
+    let applicable_names = plans
+        .iter()
+        .map(|plan| plan.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+
     // 6. Resolve the sealed tree identity used as the cache key.
-    let tree_hash = sealed_tree_hash(&jj, repo_root).map_err(|e| e.to_string())?;
+    let hash_jj = jj.clone();
+    let hash_repo = repo_root.to_path_buf();
+    let tree_hash = tokio::task::spawn_blocking(move || sealed_tree_hash(&hash_jj, &hash_repo))
+        .await
+        .map_err(|error| format!("turn-end tree-hash task failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+    // Publish the immutable facts the 1 Hz status poll needs. They remain valid
+    // until the single-flight slot is released because this suite is pinned to
+    // the sealed tree.
+    cancel.set_runtime_status(tree_hash.clone(), applicable_names);
 
     // 7. Loop-break gate: drop any plan already cached for its INPUT hash (the
     // content of just that check's impact-matched files). A covered plan is
@@ -273,49 +298,62 @@ async fn run_turn_end_checks_inner(
     // tree has already been fully checked (e.g. a resume that committed nothing) —
     // return WITHOUT launching so the agent is never nagged on the same break.
     let db = orch.db.local.clone();
-    let entries = if plans
-        .iter()
-        .any(|p| checks.get(&p.name).is_some_and(|c| c.impact.is_some()))
-    {
-        sealed_tree_entries(&jj, repo_root).ok()
-    } else {
-        None
-    };
-    let mut to_run: Vec<(CheckPlan, String)> = Vec::new();
-    for plan in plans {
-        let input_hash = input_hash_for(
-            checks.get(&plan.name).and_then(|c| c.impact.as_ref()),
-            entries.as_deref(),
-            &tree_hash,
-        );
-        match get_check_result(db.clone(), &coords.project_id, &plan.name, &input_hash)
-            .ok()
-            .flatten()
-        {
-            Some(entry) => {
-                // Covered for this input; re-stamp onto the current tree so the
-                // `/checks` listing surfaces it, then skip (no re-run).
-                let _ = store_check_result(
-                    db.clone(),
-                    CheckResultCacheWrite {
-                        project_id: coords.project_id.clone(),
-                        tree_hash: tree_hash.clone(),
-                        input_hash,
-                        check_name: plan.name.clone(),
-                        exit_code: entry.exit_code,
-                        passed: entry.passed,
-                        output_tail: entry.output_tail,
-                        duration_ms: entry.duration_ms,
-                        target_results_json: entry.target_results_json,
-                        job_id: Some(job_id.to_string()),
-                        cached: Some(true),
-                        failure_kind: entry.failure_kind,
-                    },
-                );
+    let cache_db = db.clone();
+    let cache_checks = checks.clone();
+    let cache_jj = jj.clone();
+    let cache_repo = repo_root.to_path_buf();
+    let cache_tree_hash = tree_hash.clone();
+    let cache_project_id = coords.project_id.clone();
+    let cache_job_id = job_id.to_string();
+    let to_run = tokio::task::spawn_blocking(move || {
+        let entries = if plans.iter().any(|plan| {
+            cache_checks
+                .get(&plan.name)
+                .is_some_and(|check| check.impact.is_some())
+        }) {
+            sealed_tree_entries(&cache_jj, &cache_repo).ok()
+        } else {
+            None
+        };
+        let mut to_run: Vec<(CheckPlan, String)> = Vec::new();
+        for plan in plans {
+            let input_hash = input_hash_for(
+                cache_checks
+                    .get(&plan.name)
+                    .and_then(|check| check.impact.as_ref()),
+                entries.as_deref(),
+                &cache_tree_hash,
+            );
+            match get_check_result(cache_db.clone(), &cache_project_id, &plan.name, &input_hash)
+                .ok()
+                .flatten()
+            {
+                Some(entry) => {
+                    let _ = store_check_result(
+                        cache_db.clone(),
+                        CheckResultCacheWrite {
+                            project_id: cache_project_id.clone(),
+                            tree_hash: cache_tree_hash.clone(),
+                            input_hash,
+                            check_name: plan.name.clone(),
+                            exit_code: entry.exit_code,
+                            passed: entry.passed,
+                            output_tail: entry.output_tail,
+                            duration_ms: entry.duration_ms,
+                            target_results_json: entry.target_results_json,
+                            job_id: Some(cache_job_id.clone()),
+                            cached: Some(true),
+                            failure_kind: entry.failure_kind,
+                        },
+                    );
+                }
+                None => to_run.push((plan, input_hash)),
             }
-            None => to_run.push((plan, input_hash)),
         }
-    }
+        to_run
+    })
+    .await
+    .map_err(|error| format!("turn-end cache planning task failed: {error}"))?;
     if to_run.is_empty() {
         log::debug!(
             "turn-end checks for job {}: every applicable check is already cached for this tree; nothing to run",
@@ -348,21 +386,32 @@ async fn run_turn_end_checks_inner(
 
     // 9. Decide the execution mode: give every cache-miss check its own COW clone
     // of the sealed worktree so the review suite runs concurrently in isolation,
-    // BOUNDED (the suites are heavy). A clone failure routes the whole batch to
+    // with process spawn governed by global admission. A clone failure routes the whole batch to
     // sequential in-place execution in the shared worktree. The guard removes the
     // review clone root on every exit path — including the fallback. Review is
     // FOLD-FREE by contract: the clones are discarded, never copied back, so a
     // stray tracked write lands in a disposable clone rather than dirtying `@`.
-    let clone_root = check_isolation::turn_end_clone_root_for_job(&orch.config_dir, job_id);
+    let suite_id = check_isolation::new_suite_id();
+    let clone_root =
+        check_isolation::turn_end_clone_root_for_suite(&orch.config_dir, job_id, &suite_id);
     let _clone_guard = check_isolation::CloneGuard::new(clone_root.clone());
-    let (mode, clones) = {
-        let misses: Vec<(usize, &str)> = to_run
+    let clone_fs = orch.services.fs.clone();
+    let clone_repo = repo_root.to_path_buf();
+    let clone_target = clone_root.clone();
+    let clone_misses: Vec<(usize, String)> = to_run
+        .iter()
+        .enumerate()
+        .map(|(index, (plan, _))| (index, plan.name.clone()))
+        .collect();
+    let (mode, clones) = tokio::task::spawn_blocking(move || {
+        let misses: Vec<(usize, &str)> = clone_misses
             .iter()
-            .enumerate()
-            .map(|(index, (plan, _))| (index, plan.name.as_str()))
+            .map(|(index, name)| (*index, name.as_str()))
             .collect();
-        check_isolation::decide_exec_mode(&*orch.services.fs, repo_root, &clone_root, &misses)
-    };
+        check_isolation::decide_exec_mode(&*clone_fs, &clone_repo, &clone_target, &misses)
+    })
+    .await
+    .map_err(|error| format!("turn-end check clone task failed: {error}"))?;
 
     // Isolated checks run in `.jj`-stripped clones, so a diff-scoped check
     // (rust-lint, dead-code) can't resolve its own changed-file set from the
@@ -402,7 +451,6 @@ async fn run_turn_end_checks_inner(
     // parses per-test detail exactly as the old inline loop did. `notify` is a
     // no-op — review has no `check-status` frontend consumer; its live surface is
     // the per-check log tail plus the bracketing `db-change`s.
-    let cap = review_max_concurrency().min(to_run.len());
     let clones_ref = &clones;
     let to_run_ref = &to_run;
     // Per-check effective timeout, aligned to plan index. A check's schema
@@ -445,6 +493,8 @@ async fn run_turn_end_checks_inner(
         &to_run,
         &checks_tool_id,
         mode,
+        &orch.check_admission,
+        Some(orch),
         move |index, command, stream_id| {
             let worktree = worktree.clone();
             async move {
@@ -476,7 +526,6 @@ async fn run_turn_end_checks_inner(
             }
         },
         |_| {},
-        Some(cap.max(1)),
     ) => outcomes,
     };
 
@@ -560,20 +609,6 @@ fn delivery_wake(any_failed: bool) -> attention_push::Wake {
     } else {
         attention_push::Wake::Passive
     }
-}
-
-/// A modest cap on how many review checks run concurrently under COW isolation.
-/// The review suite carries heavy, internally-multithreaded compiles (two full
-/// Rust builds among them), each cloning its own `src-tauri/target`, so the real
-/// contention is a handful of concurrent heavy compiles rather than the raw check
-/// count. Derive the cap from the core count (divided by 4, clamped to `[2, 4]`):
-/// an 8-core host runs 2 at a time, a 16-core host runs 4 — enough parallelism to
-/// win wall-clock without oversubscribing CPU/IO. A tunable constant; adjust the
-/// divisor/clamp if the mix of heavy suites changes.
-fn review_max_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 4).clamp(2, 4))
-        .unwrap_or(2)
 }
 
 /// First 8 chars of a job id for log lines (mirrors the ids elsewhere in this
@@ -772,10 +807,27 @@ pub(crate) fn read_turn_end_log_tail(
 }
 
 /// Last `max_chars` chars of a log file at `path`, or `None` when it is missing or
-/// blank. Split from [`read_turn_end_log_tail`] so the missing/empty-vs-content
-/// boundary is unit-testable without an [`Orchestrator`].
+/// blank. Reads only enough bytes from the end to hold that many UTF-8 characters,
+/// so polling a multi-megabyte cargo or vitest log stays constant-cost.
+///
+/// Split from [`read_turn_end_log_tail`] so the missing/empty-vs-content boundary
+/// and large-file behavior are unit-testable without an [`Orchestrator`].
 fn read_log_tail(path: &Path, max_chars: usize) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    if max_chars == 0 {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let max_bytes = max_chars.saturating_mul(4) as u64;
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    // A concurrent writer can leave the sampled suffix on a partial UTF-8 code
+    // point. Lossy decoding preserves the useful tail instead of dropping the
+    // whole update; the next poll replaces any transient replacement character.
+    let content = String::from_utf8_lossy(&bytes);
     let trimmed = content.trim_end();
     if trimmed.is_empty() {
         return None;
@@ -891,6 +943,60 @@ mod tests {
     }
 
     #[test]
+    fn large_log_tail_is_bounded_and_fast() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cairn-checks-tail-large-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rust-full.log");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..16 {
+            std::io::Write::write_all(&mut file, &chunk).unwrap();
+        }
+        std::io::Write::write_all(&mut file, b"\nfinal cargo line\n").unwrap();
+        drop(file);
+
+        let started = std::time::Instant::now();
+        let output = read_log_tail(&path, LOG_TAIL_CHARS).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(output.ends_with("final cargo line"));
+        assert_eq!(output.chars().count(), LOG_TAIL_CHARS);
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "16 MiB log tail took {elapsed:?}; expected a bounded low-tens-of-ms read"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_tail_preserves_multibyte_utf8_boundary() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cairn-checks-tail-utf8-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frontend.log");
+        std::fs::write(&path, format!("{}DONE\n", "é".repeat(3_000))).unwrap();
+
+        let output = read_log_tail(&path, 8).unwrap();
+        assert_eq!(output, "ééééDONE");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sanitize_log_name_slugs_unsafe_chars() {
         assert_eq!(sanitize_log_name("frontend-build"), "frontend-build");
         assert_eq!(sanitize_log_name("rust_full.v2"), "rust_full.v2");
@@ -916,8 +1022,8 @@ mod tests {
     }
 
     #[test]
-    fn review_max_concurrency_is_a_sane_bound() {
-        let n = review_max_concurrency();
+    fn global_check_capacity_is_a_sane_bound() {
+        let n = crate::execution::check_admission::CheckAdmissionController::capacity_for_host();
         assert!(
             (2..=4).contains(&n),
             "review concurrency cap {n} must stay in [2, 4]"

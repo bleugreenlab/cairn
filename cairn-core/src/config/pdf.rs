@@ -108,18 +108,18 @@ pub fn validate_pdf_options(
 /// Set (or clear) the active PDF provider. `None`, an empty string, or `local`
 /// clears the scalar so the local extractor is the default.
 pub fn set_active_pdf(config_dir: &Path, name: Option<&str>) -> Result<(), String> {
-    let path = super::settings::get_settings_path(config_dir);
-    let mut root = super::web_fetch::load_settings_mapping(&path)?;
-    let key = serde_yaml::Value::String("activePdf".to_string());
-    match name {
-        Some(n) if !n.trim().is_empty() && n != LOCAL => {
-            root.insert(key, serde_yaml::Value::String(n.to_string()));
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let key = serde_yaml::Value::String("activePdf".to_string());
+        match name {
+            Some(name) if !name.trim().is_empty() && name != LOCAL => {
+                root.insert(key, serde_yaml::Value::String(name.to_string()));
+            }
+            _ => {
+                root.remove(&key);
+            }
         }
-        _ => {
-            root.remove(&key);
-        }
-    }
-    super::web_fetch::write_settings_mapping(&path, &root)
+        Ok(())
+    })
 }
 
 /// Insert or replace the stored options for one provider, after validating them.
@@ -129,24 +129,20 @@ pub fn upsert_pdf_options(
     options: &HashMap<String, serde_yaml::Value>,
 ) -> Result<(), String> {
     validate_pdf_options(id, options)?;
-    let path = super::settings::get_settings_path(config_dir);
-    let mut root = super::web_fetch::load_settings_mapping(&path)?;
-
-    let pdf = root
-        .entry(serde_yaml::Value::String("pdf".to_string()))
-        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    let pdf = pdf
-        .as_mapping_mut()
-        .ok_or_else(|| "`pdf` in config is not a mapping".to_string())?;
-
-    let options_value =
-        serde_yaml::to_value(options).map_err(|e| format!("Failed to serialize options: {e}"))?;
-    pdf.insert(
-        serde_yaml::Value::String(id.as_str().to_string()),
-        options_value,
-    );
-
-    super::web_fetch::write_settings_mapping(&path, &root)
+    super::settings::mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let pdf = root
+            .entry(serde_yaml::Value::String("pdf".to_string()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        let pdf = pdf
+            .as_mapping_mut()
+            .ok_or_else(|| "`pdf` in config is not a mapping".to_string())?;
+        pdf.insert(
+            serde_yaml::Value::String(id.as_str().to_string()),
+            serde_yaml::to_value(options)
+                .map_err(|error| format!("Failed to serialize options: {error}"))?,
+        );
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -168,6 +164,39 @@ mod tests {
         assert_eq!(resolve_active_pdf(ws.path()), PdfProviderId::Local);
         set_active_pdf(ws.path(), Some("ghost")).unwrap();
         assert_eq!(resolve_active_pdf(ws.path()), PdfProviderId::Local);
+    }
+
+    #[test]
+    fn bmd_selection_and_registry_survive_general_settings_save() {
+        let ws = TempDir::new().unwrap();
+        upsert_pdf_options(ws.path(), PdfProviderId::Bmd, &HashMap::new()).unwrap();
+        set_active_pdf(ws.path(), Some("bmd")).unwrap();
+        super::super::web_search::upsert_web_search_options(
+            ws.path(),
+            super::super::web_search::SearchProviderId::Brave,
+            &HashMap::from([("count".to_string(), serde_yaml::Value::from(7))]),
+        )
+        .unwrap();
+        super::super::web_search::set_active_web_search(ws.path(), Some("brave")).unwrap();
+
+        let settings = super::super::settings::load_settings(ws.path());
+        super::super::settings::save_settings(ws.path(), &settings).unwrap();
+
+        assert_eq!(active_pdf_name(ws.path()).as_deref(), Some("bmd"));
+        assert!(load_pdf_options(ws.path(), PdfProviderId::Bmd).is_empty());
+        assert_eq!(
+            super::super::web_search::active_web_search_name(ws.path()).as_deref(),
+            Some("brave")
+        );
+        assert_eq!(
+            super::super::web_search::load_web_search_options(
+                ws.path(),
+                super::super::web_search::SearchProviderId::Brave
+            )
+            .get("count")
+            .and_then(serde_yaml::Value::as_i64),
+            Some(7)
+        );
     }
 
     #[test]

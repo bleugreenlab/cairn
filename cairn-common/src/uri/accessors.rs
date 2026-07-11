@@ -69,7 +69,10 @@ impl CairnResource {
             | ProjectAgent { project, .. }
             | ProjectActions { project, .. }
             | ProjectAction { project, .. }
-            | ProjectSettings { project, .. } => Some(project.as_str()),
+            | ProjectSettings { project, .. }
+            | ProjectBrowserNetworkRequest { project, .. }
+            | NodeBrowserNetworkRequest { project, .. }
+            | TaskBrowserNetworkRequest { project, .. } => Some(project.as_str()),
             _ => None,
         }
     }
@@ -141,11 +144,26 @@ impl CairnResource {
                 node_id,
                 slug,
                 ..
+            }
+            | Self::NodeBrowserNetworkRequest {
+                number,
+                exec_seq,
+                node_id,
+                slug,
+                ..
             } => Some(format!(
                 "/p/{}/i/{}/{}/{}?browserId={}",
                 project, number, exec_seq, node_id, slug
             )),
             Self::TaskBrowser {
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                slug,
+                ..
+            }
+            | Self::TaskBrowserNetworkRequest {
                 number,
                 exec_seq,
                 node_id,
@@ -195,7 +213,7 @@ impl CairnResource {
             Self::ProjectTerminal { slug, .. } => {
                 Some(format!("/p/{}/terminal?terminalId={}", project, slug))
             }
-            Self::ProjectBrowser { slug, .. } => {
+            Self::ProjectBrowser { slug, .. } | Self::ProjectBrowserNetworkRequest { slug, .. } => {
                 Some(format!("/p/{}/browser?browserId={}", project, slug))
             }
             Self::NodeChatRaw { .. }
@@ -283,7 +301,9 @@ impl CairnResource {
             | Self::NodeRepl { project, .. }
             | Self::TaskTerminal { project, .. }
             | Self::NodeBrowser { project, .. }
+            | Self::NodeBrowserNetworkRequest { project, .. }
             | Self::TaskBrowser { project, .. }
+            | Self::TaskBrowserNetworkRequest { project, .. }
             | Self::Task { project, .. }
             | Self::TaskChat { project, .. }
             | Self::TaskChatRaw { project, .. }
@@ -314,6 +334,7 @@ impl CairnResource {
             | Self::NodeDiff { project, .. }
             | Self::ProjectTerminal { project, .. }
             | Self::ProjectBrowser { project, .. }
+            | Self::ProjectBrowserNetworkRequest { project, .. }
             | Self::ProjectSkills { project }
             | Self::ProjectSkill { project, .. }
             | Self::ProjectReferences { project }
@@ -368,7 +389,9 @@ impl CairnResource {
             | Self::NodeRepl { number, .. }
             | Self::TaskTerminal { number, .. }
             | Self::NodeBrowser { number, .. }
+            | Self::NodeBrowserNetworkRequest { number, .. }
             | Self::TaskBrowser { number, .. }
+            | Self::TaskBrowserNetworkRequest { number, .. }
             | Self::Task { number, .. }
             | Self::TaskChat { number, .. }
             | Self::TaskChatRaw { number, .. }
@@ -404,6 +427,7 @@ impl CairnResource {
             | Self::ProjectMessages { .. }
             | Self::ProjectTerminal { .. }
             | Self::ProjectBrowser { .. }
+            | Self::ProjectBrowserNetworkRequest { .. }
             | Self::Skills
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
@@ -453,7 +477,9 @@ impl CairnResource {
             | Self::NodeRepl { node_id, .. }
             | Self::TaskTerminal { node_id, .. }
             | Self::NodeBrowser { node_id, .. }
+            | Self::NodeBrowserNetworkRequest { node_id, .. }
             | Self::TaskBrowser { node_id, .. }
+            | Self::TaskBrowserNetworkRequest { node_id, .. }
             | Self::Task { node_id, .. }
             | Self::TaskChat { node_id, .. }
             | Self::TaskChatRaw { node_id, .. }

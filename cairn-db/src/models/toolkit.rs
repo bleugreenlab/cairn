@@ -1,7 +1,5 @@
 //! Toolkit and MCP server types.
 
-use serde::{Deserialize, Serialize};
-
 /// Tools that are always disallowed for every agent, regardless of config.
 ///
 /// Two categories live here.
@@ -81,16 +79,3 @@ pub const ALL_NATIVE_TOOLS: &[&str] = &[
     "Skill",
     "NotebookEdit",
 ];
-
-/// A toolkit override stored in the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct Toolkit {
-    pub id: String,
-    pub stage: String, // "plan", "implementation", "chat"
-    pub allowed_tools: Option<Vec<String>>,
-    pub disallowed_tools: Option<Vec<String>>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}

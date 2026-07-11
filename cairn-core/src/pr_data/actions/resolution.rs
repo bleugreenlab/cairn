@@ -228,10 +228,10 @@ pub async fn resolve_pr_node(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
-    if merge_context.issue_id.is_some() {
+    if let Some(issue_id) = merge_context.issue_id.as_deref() {
         let _ = orch.services.emitter.emit(
             "db-change",
-            serde_json::json!({"table": "issues", "action": "update"}),
+            crate::notify::issue_db_change_ids("update", issue_id, Some(&merge_context.project_id)),
         );
     }
 

@@ -92,7 +92,6 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         Some(exec_id) => run_db(load_execution_seq(owning_db.clone(), exec_id.clone()))?,
         None => None,
     };
-
     // ---- Display ID (issue number or sequential run counter) ------------
     let display_id = run_db(load_display_id(
         owning_db.clone(),
@@ -240,10 +239,8 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             .trim_matches('-')
             .to_string();
 
-        let worktrees_dir = dirs::home_dir()
-            .ok_or("Could not find home directory")?
-            .join(".cairn")
-            .join("worktrees");
+        let worktrees_dir = crate::managed_worktrees::base_dir()
+            .ok_or("Could not find managed worktrees directory")?;
 
         let initial_name = if let Some(ref existing) = job.branch {
             job.worktree_path
@@ -539,7 +536,13 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "runs", "action": "insert", "runId": run_id.as_str(), "jobId": job_id}),
+        crate::notify::run_db_change_ids(
+            "insert",
+            &run_id,
+            Some(job_id),
+            job.issue_id.as_deref(),
+            Some(&job.project_id),
+        ),
     );
 
     // ---- Create initial turn ------------------------------------------------
@@ -661,7 +664,16 @@ pub fn continue_job_or_enqueue(
             }
         }
     }
-    continue_job_impl(orch, job_id, message, identity_override, None)
+    continue_job_impl(
+        orch,
+        job_id,
+        message,
+        identity_override,
+        Some(ResumeContext {
+            supersede_pending_retry: true,
+            ..Default::default()
+        }),
+    )
 }
 
 // ============================================================================
@@ -678,6 +690,31 @@ pub fn continue_job_or_enqueue(
 pub struct ResumeContext {
     /// When true, skip storing the resume message as a `user` transcript event.
     pub suppress_user_event: bool,
+    /// Consume this already-claimed pending retry turn instead of creating a
+    /// follow-up. Used only by best-effort automatic backend retries.
+    pub preclaimed_retry_turn_id: Option<String>,
+    /// User-facing continuation may take over an unstarted automatic retry.
+    /// Reclassifying that pending head as a follow-up resets the retry budget
+    /// and makes the sleeping timer's retry-head check fail.
+    pub supersede_pending_retry: bool,
+}
+
+pub(crate) fn continue_automatic_retry(
+    orch: &Orchestrator,
+    job_id: &str,
+    retry_turn_id: &str,
+) -> Result<Run, String> {
+    continue_job_impl(
+        orch,
+        job_id,
+        None,
+        None,
+        Some(ResumeContext {
+            suppress_user_event: true,
+            preclaimed_retry_turn_id: Some(retry_turn_id.to_string()),
+            supersede_pending_retry: false,
+        }),
+    )
 }
 
 /// Continue an existing job with an optional follow-up message.
@@ -709,6 +746,19 @@ pub fn continue_job_impl(
         orch.db.clone(),
         job_id.to_string(),
     ))?;
+
+    let preclaimed_retry_turn_id = prompt_resume
+        .as_ref()
+        .and_then(|context| context.preclaimed_retry_turn_id.clone());
+    if let Some(retry_turn_id) = preclaimed_retry_turn_id.as_deref() {
+        if job.parent_job_id.is_some()
+            || job.recipe_node_id.is_some()
+            || job.agent_config_id.as_deref() == Some("workflow")
+            || !pending_retry_head_matches(owning_db.clone(), job_id, retry_turn_id)?
+        {
+            return Err("automatic retry was superseded or is ineligible".to_string());
+        }
+    }
 
     // CAIRN-2629: same device-ownership guard as the start/claim path — refuse to
     // resume an execution owned by another machine (its runner owns the lifecycle).
@@ -946,6 +996,13 @@ pub fn continue_job_impl(
     };
 
     // ---- Find or create run ---------------------------------------------
+    // A delayed retry is best-effort. Recheck its durable claim immediately
+    // before allocating or waking a run so a superseding action wins cleanly.
+    if let Some(retry_turn_id) = preclaimed_retry_turn_id.as_deref() {
+        if !pending_retry_head_matches(owning_db.clone(), job_id, retry_turn_id)? {
+            return Err("automatic retry was superseded before run launch".to_string());
+        }
+    }
     // Reconcile a reusable process against the job's requested model *before*
     // deciding to reuse it. `jobs.model` is the source of truth: a model change
     // restarts the process (cold resume with the new model) so the persisted
@@ -1003,7 +1060,13 @@ pub fn continue_job_impl(
         ))?;
         let _ = orch.services.emitter.emit(
             "db-change",
-            serde_json::json!({"table": "runs", "action": "insert", "runId": new_run_id.as_str(), "jobId": job_id}),
+            crate::notify::run_db_change_ids(
+                "insert",
+                &new_run_id,
+                Some(job_id),
+                issue_id.as_deref(),
+                Some(&project_id),
+            ),
         );
         (new_run_id, false)
     };
@@ -1014,8 +1077,33 @@ pub fn continue_job_impl(
     // memory-review reflection. The pending-queued-message case (a user steer
     // that arrives without an explicit message) is detected inside
     // `create_followup_turn` against the rows the claim below sweeps up.
-    let user_initiated = message.is_some() || prompt_resume.is_some();
-    let turn_id = create_followup_turn(orch, &session_id, job_id, user_initiated)?;
+    let user_initiated = message.is_some()
+        || prompt_resume
+            .as_ref()
+            .is_some_and(|context| context.preclaimed_retry_turn_id.is_none());
+    let supersede_pending_retry = prompt_resume
+        .as_ref()
+        .is_some_and(|context| context.supersede_pending_retry);
+    let turn_id = if let Some(retry_turn_id) = preclaimed_retry_turn_id {
+        if !pending_retry_head_matches(owning_db.clone(), job_id, &retry_turn_id)? {
+            return Err("automatic retry was superseded before launch".to_string());
+        }
+        retry_turn_id
+    } else {
+        create_followup_turn(
+            orch,
+            &session_id,
+            job_id,
+            user_initiated,
+            supersede_pending_retry,
+        )?
+    };
+    let retry_turn_prestarted = prompt_resume
+        .as_ref()
+        .is_some_and(|context| context.preclaimed_retry_turn_id.is_some());
+    if retry_turn_prestarted && !claim_retry_turn_start(orch, &turn_id, &run_id)? {
+        return Err("automatic retry was superseded before turn reservation".to_string());
+    }
 
     // ---- Artifact schema ------------------------------------------------
     let artifact_schema_info = run_db(find_job_downstream_artifact_schema(
@@ -1146,9 +1234,18 @@ pub fn continue_job_impl(
         .as_ref()
         .map(|ctx| ctx.suppress_user_event)
         .unwrap_or(false);
-    let resume_note = suppress_user_event.then_some(RESUME_AFTER_SELF_SUSPEND_NOTE);
+    let artifact_handoff_note = artifact_handoff_resume_note(owning_db.clone(), job_id)?;
+    let resume_note = match (
+        suppress_user_event.then_some(RESUME_AFTER_SELF_SUSPEND_NOTE),
+        artifact_handoff_note.as_deref(),
+    ) {
+        (Some(self_suspend), Some(handoff)) => Some(format!("{self_suspend}\n\n{handoff}")),
+        (Some(self_suspend), None) => Some(self_suspend.to_string()),
+        (None, Some(handoff)) => Some(handoff.to_string()),
+        (None, None) => None,
+    };
     let prompt = assemble_resume_prompt(
-        resume_note,
+        resume_note.as_deref(),
         queued_block,
         &base_prompt,
         side_channel_block,
@@ -1258,7 +1355,9 @@ pub fn continue_job_impl(
         // that window: a tool call produced on resume always observes
         // `ServingTurn(turn)`, never `Busy`.
         orch.process_state.transition_to_active(&run_id);
-        let _ = start_turn(orch, &turn_id, &run_id);
+        if !retry_turn_prestarted {
+            start_turn(orch, &turn_id, &run_id)?;
+        }
         orch.process_state
             .set_current_turn_id(&run_id, Some(&turn_id));
 
@@ -1297,7 +1396,9 @@ pub fn continue_job_impl(
         // this point — the turn is always established before the session emits a
         // crossing. (`set_current_turn_id` needs the handle to exist, which is
         // why this follows the spawn rather than preceding it.)
-        let _ = start_turn(orch, &turn_id, &run_id);
+        if !retry_turn_prestarted {
+            start_turn(orch, &turn_id, &run_id)?;
+        }
         orch.process_state
             .set_current_turn_id(&run_id, Some(&turn_id));
     }
@@ -1309,6 +1410,49 @@ pub fn continue_job_impl(
         "Run not found after creation",
     ))?;
     Ok(run)
+}
+
+fn artifact_handoff_resume_note(
+    owning_db: Arc<LocalDb>,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    let job_id = job_id.to_string();
+    run_db(async move {
+        owning_db
+            .query_opt(
+                "SELECT a.output_name, a.artifact_type, a.version, a.confirmed
+                   FROM jobs j
+                   JOIN turns t ON t.id = j.current_turn_id
+                   JOIN artifacts a ON a.job_id = j.id
+                  WHERE j.id = ?1 AND t.end_reason = 'artifact_handoff'
+                  ORDER BY a.created_at DESC, a.rowid DESC
+                  LIMIT 1",
+                (job_id,),
+                |row| {
+                    Ok((
+                        row.opt_text(0)?,
+                        row.text(1)?,
+                        row.i64(2)? as i32,
+                        row.i64(3)? != 0,
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| format!("Failed to resolve artifact handoff resume note: {error}"))
+            .map(|artifact| {
+                artifact.map(|(output_name, artifact_type, version, confirmed)| {
+                    let name = output_name.unwrap_or(artifact_type);
+                    let state = if confirmed {
+                        "applied successfully"
+                    } else {
+                        "applied successfully and is awaiting user confirmation"
+                    };
+                    format!(
+                        "Resuming after an artifact handoff. Your previous turn ended because you wrote your terminal output artifact (cairn:~/{name}, version {version}) — the write was {state} and the session paused for review. Any interruption notice in the prior transcript was Cairn ending the turn at that boundary, not a user abort. The message that resumes you follows."
+                    )
+                })
+            })
+    })
 }
 
 /// Short note that leads the forwarded prompt on a durable self-suspend resume.
@@ -1764,15 +1908,19 @@ pub(super) fn reconcile_stale_active_turn_for_continue(
         turn_id,
         job_id
     );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "turns", "action": "update"}),
-    );
-    if run_id.is_some() {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "runs", "action": "update"}),
-        );
+    let turn_change = run_db({
+        let db = owning_db.clone();
+        let turn_id = turn_id.clone();
+        async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await) }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", turn_change);
+    if let Some(run_id) = run_id.as_deref() {
+        let run_change = run_db({
+            let db = owning_db.clone();
+            let run_id = run_id.to_string();
+            async move { Ok(crate::notify::run_db_change_for_id(&db, &run_id, "update").await) }
+        })?;
+        let _ = orch.services.emitter.emit("db-change", run_change);
     }
     Ok(true)
 }

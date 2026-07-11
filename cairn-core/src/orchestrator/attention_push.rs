@@ -231,6 +231,25 @@ pub fn render_pushes(pushes: &[Push]) -> Option<String> {
 /// which may be `Passive` even though `Wake` was requested, when the recipient
 /// has muted the push's source (see [`push_with_fingerprint`]). Callers key
 /// their nudge decision off the effective wake via [`Wake::wakes_idle`].
+pub async fn has_push_identity(db: &LocalDb, recipient: &str, key: &str) -> DbResult<bool> {
+    let recipient = recipient.to_string();
+    let key = key.to_string();
+    db.read(|conn| {
+        let recipient = recipient.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM attention_pushes WHERE recipient=?1 AND key=?2 LIMIT 1",
+                    params![recipient.as_str(), key.as_str()],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        })
+    })
+    .await
+}
+
 pub async fn push(
     db: &LocalDb,
     recipient: &str,
@@ -242,7 +261,8 @@ pub async fn push(
     push_with_fingerprint(db, recipient, content_ref, wake, boundary, key, None).await
 }
 
-/// Downgrade an issue-sourced push (`review` / `question` / `permission`) to
+/// Downgrade an issue-sourced push (`review` / `question` / `permission` /
+/// rousing `resolved`) to
 /// `Passive` when the recipient holds an active **mute** on the subject issue.
 /// This is the creation-time sibling of [`lazy_resolve_live`]'s drain-time issue
 /// resolution: applying it centrally in [`push_with_fingerprint`] makes the
@@ -251,7 +271,7 @@ pub async fn push(
 /// (`{prefix}:{issue_uri}`), which is exactly the `source_ref` an issue
 /// subscription stores, so no DB lookup of the issue is needed. Non-`Wake`
 /// levels (`Passive` already lowest, `Interrupt` never downgraded) and non-issue
-/// prefixes (`catchup` / `resolved` / `direct`) short-circuit without a query.
+/// prefixes (`catchup` / `direct`) short-circuit without a query.
 /// A direct's source is its sender (peer/user axis), not the subject URI, so the
 /// direct creator applies the same [`crate::orchestrator::wakes::mute_downgrade`]
 /// rule explicitly at its own site rather than here.
@@ -267,7 +287,7 @@ async fn issue_mute_downgrade(
     let Some((prefix, issue_uri)) = key.split_once(':') else {
         return Ok(requested);
     };
-    if !matches!(prefix, "review" | "question" | "permission") {
+    if !matches!(prefix, "review" | "question" | "permission" | "resolved") {
         return Ok(requested);
     }
     crate::orchestrator::wakes::mute_downgrade(
@@ -379,9 +399,9 @@ pub async fn push_with_fingerprint(
 
 /// The `fingerprint` of the most recent push (delivered OR undelivered) for
 /// `(recipient, key)`, newest by `created_at`. Outer `None` = no such push
-/// exists; `Some(None)` = a push with a NULL fingerprint. The review creator
-/// uses this to skip re-firing a review when the reviewable state is unchanged
-/// since the last review push to the recipient (CAIRN-1889).
+/// exists; `Some(None)` = a push with a NULL fingerprint. Content-state creators
+/// use this to skip re-firing unchanged review and terminal-resolution pushes,
+/// including after the prior row has already been delivered.
 pub async fn latest_push_fingerprint(
     db: &LocalDb,
     recipient: &str,

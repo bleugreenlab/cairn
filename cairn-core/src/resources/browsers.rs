@@ -10,15 +10,18 @@ use std::time::Duration;
 
 use cairn_common::query::QueryParam;
 use cairn_common::read::ImageBlock;
-use cairn_common::uri::{CairnResource, DEFAULT_BROWSER_SLUG};
+use cairn_common::uri::{
+    build_node_browser_network_request_uri, build_project_browser_network_request_uri,
+    build_task_browser_network_request_uri, CairnResource, DEFAULT_BROWSER_SLUG,
+};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::browser_network::{BrowserNetworkEntry, BrowserNetworkRecord, CapturedBody};
 use crate::browsers::{
     ensure_open_browser, find_browser_by_scope_and_slug, find_most_recently_active_open_browser,
     get_browser, BridgeFormat, BridgeRequest, BridgeResponse, BrowserCommand, BrowserNavEvent,
-    BrowserScope, ConsoleEntry, InteractiveElement, JobBrowser, NavPhase, NetworkEntry,
-    STATUS_OPEN,
+    BrowserScope, ConsoleEntry, InteractiveElement, JobBrowser, NavPhase, STATUS_OPEN,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -56,6 +59,14 @@ pub(crate) async fn resolve_browser_scope(
                     exec_seq,
                     node_id,
                     slug,
+                }
+                | CairnResource::NodeBrowserNetworkRequest {
+                    project,
+                    number,
+                    exec_seq,
+                    node_id,
+                    slug,
+                    ..
                 } => {
                     let job_id =
                         find_node_job_id(conn, &project, number, exec_seq, &node_id)
@@ -74,6 +85,15 @@ pub(crate) async fn resolve_browser_scope(
                     node_id,
                     task_name,
                     slug,
+                }
+                | CairnResource::TaskBrowserNetworkRequest {
+                    project,
+                    number,
+                    exec_seq,
+                    node_id,
+                    task_name,
+                    slug,
+                    ..
                 } => {
                     let job_id = find_task_job_id(
                         conn, &project, number, exec_seq, &node_id, &task_name,
@@ -86,7 +106,8 @@ pub(crate) async fn resolve_browser_scope(
                     })?;
                     Ok((BrowserScope::Job(job_id), slug))
                 }
-                CairnResource::ProjectBrowser { project, slug } => {
+                CairnResource::ProjectBrowser { project, slug }
+                | CairnResource::ProjectBrowserNetworkRequest { project, slug, .. } => {
                     let lookup_key = project.to_uppercase();
                     let mut rows = conn
                         .query(
@@ -586,6 +607,8 @@ fn bridge_failed_message(header: &str, url: &str) -> String {
 /// the reqId match matters, and a fresh uuid avoids cross-talk with concurrent
 /// bridge/capture awaiters on the same broadcast.
 async fn open_for_read(orch: &Orchestrator, browser: &JobBrowser, ack_timeout: Duration) {
+    orch.browser_network
+        .activate(&browser.id, &browser.webview_label);
     let Some(tx) = &orch.browser_command_tx else {
         return;
     };
@@ -866,27 +889,6 @@ async fn console_roundtrip(
     }
 }
 
-async fn network_roundtrip(
-    orch: &Orchestrator,
-    browser_id: &str,
-    limit: Option<u32>,
-) -> Result<Vec<NetworkEntry>, String> {
-    let response = browser_bridge_roundtrip(
-        orch,
-        browser_id,
-        &BridgeRequest::GetNetwork { limit },
-        BRIDGE_TIMEOUT,
-    )
-    .await?;
-    if response.ok {
-        Ok(response.requests.unwrap_or_default())
-    } else {
-        Err(response
-            .error
-            .unwrap_or_else(|| "unknown error reading network".to_string()))
-    }
-}
-
 /// Fetch a live browser's captured console buffer by id (frontend panel path).
 /// Rehydrates the webview first, then round-trips. Headless hosts and pages
 /// without the content script surface as errors.
@@ -899,14 +901,25 @@ pub async fn fetch_browser_console(
     console_roundtrip(orch, browser_id, limit).await
 }
 
-/// Fetch a live browser's captured network buffer by id (frontend panel path).
+/// Fetch sanitized network summaries from the runner-owned archive.
 pub async fn fetch_browser_network(
     orch: &Orchestrator,
     browser_id: &str,
     limit: Option<u32>,
-) -> Result<Vec<NetworkEntry>, String> {
-    rehydrate_browser(orch, browser_id).await;
-    network_roundtrip(orch, browser_id, limit).await
+) -> Result<Vec<BrowserNetworkEntry>, String> {
+    Ok(orch
+        .browser_network
+        .list(browser_id, limit.map(|value| value as usize)))
+}
+
+pub async fn fetch_browser_network_request(
+    orch: &Orchestrator,
+    browser_id: &str,
+    request_id: &str,
+) -> Result<BrowserNetworkRecord, String> {
+    orch.browser_network.get(browser_id, request_id).ok_or_else(|| {
+        "Network request handle expired: the browser was closed, the runner restarted, or the bounded archive evicted it.".to_string()
+    })
 }
 
 /// Render a browser console read: the url/title/status header plus the page's
@@ -949,44 +962,120 @@ pub(crate) async fn render_browser_console(
     }
 }
 
-/// Render a browser network read: the url/title/status header plus the page's
-/// captured request summaries as a compact markdown table.
+/// Render network summaries from the runner-owned archive. Unlike page content,
+/// the archive does not require a live bridge and survives full-page navigation.
 pub(crate) async fn render_browser_network(
     orch: &Orchestrator,
     resource: &CairnResource,
     limit: Option<u32>,
 ) -> String {
-    let (browser, header) = match prepare_live_browser(orch, resource).await {
-        LiveBrowser::Ready { browser, header } => (browser, header),
-        LiveBrowser::Message(message) => return message,
+    let Some((browser, header)) = prepare_archive_browser(orch, resource).await else {
+        return "Browser network archive is unavailable for this resource.".to_string();
     };
-    match read_bridge_with_readiness(
-        orch,
-        &browser,
-        &header,
-        &BridgeRequest::GetNetwork { limit },
-        READINESS_TIMEOUT,
-        BRIDGE_TIMEOUT,
-        OPEN_ACK_TIMEOUT,
+    let entries = orch
+        .browser_network
+        .list(&browser.id, limit.map(|value| value as usize));
+    let link_resource = concrete_browser_resource(resource, &browser.slug);
+    format!(
+        "{header}\n\n---\n\n### Network ({} requests)\n\n{}\n\nCaptures are sanitized and bounded in memory. Handles survive navigation and expire on browser close, runner restart, or archive eviction.",
+        entries.len(),
+        format_network_body(&link_resource, &entries)
     )
-    .await
-    {
-        Ok(response) if response.ok => {
-            let entries = response.requests.unwrap_or_default();
-            format!(
-                "{header}\n\n---\n\n### Network ({} requests)\n\n{}",
-                entries.len(),
-                format_network_body(&entries)
-            )
+}
+
+fn concrete_browser_resource(resource: &CairnResource, slug: &str) -> CairnResource {
+    match resource {
+        CairnResource::ProjectBrowser { project, .. }
+        | CairnResource::ProjectBrowserNetworkRequest { project, .. } => {
+            CairnResource::ProjectBrowser {
+                project: project.clone(),
+                slug: slug.to_string(),
+            }
         }
-        Ok(response) => format!(
-            "{header}\n\n(Could not read network: {})",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        ),
-        Err(message) => message,
+        CairnResource::NodeBrowser {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            ..
+        }
+        | CairnResource::NodeBrowserNetworkRequest {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            ..
+        } => CairnResource::NodeBrowser {
+            project: project.clone(),
+            number: *number,
+            exec_seq: *exec_seq,
+            node_id: node_id.clone(),
+            slug: slug.to_string(),
+        },
+        CairnResource::TaskBrowser {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            ..
+        }
+        | CairnResource::TaskBrowserNetworkRequest {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            ..
+        } => CairnResource::TaskBrowser {
+            project: project.clone(),
+            number: *number,
+            exec_seq: *exec_seq,
+            node_id: node_id.clone(),
+            task_name: task_name.clone(),
+            slug: slug.to_string(),
+        },
+        _ => resource.clone(),
     }
+}
+
+pub(crate) async fn render_browser_network_request(
+    orch: &Orchestrator,
+    resource: &CairnResource,
+) -> String {
+    let request_id = match resource {
+        CairnResource::ProjectBrowserNetworkRequest { request_id, .. }
+        | CairnResource::NodeBrowserNetworkRequest { request_id, .. }
+        | CairnResource::TaskBrowserNetworkRequest { request_id, .. } => request_id,
+        _ => return "Resource is not a browser network request URI.".to_string(),
+    };
+    let Some((browser, header)) = prepare_archive_browser(orch, resource).await else {
+        return expired_network_handle(request_id);
+    };
+    match orch.browser_network.get(&browser.id, request_id) {
+        Some(record) => format!("{header}\n\n---\n\n{}", format_network_detail(&record)),
+        None => expired_network_handle(request_id),
+    }
+}
+
+async fn prepare_archive_browser(
+    orch: &Orchestrator,
+    resource: &CairnResource,
+) -> Option<(JobBrowser, String)> {
+    let routed_db = match resource.project_key() {
+        Some(key) => orch.db.for_project(key).await,
+        None => orch.db.local.clone(),
+    };
+    let (scope, slug) = resolve_browser_target(&routed_db, resource).await.ok()?;
+    let browser = find_browser_by_scope_and_slug(&routed_db, scope, &slug)
+        .await
+        .ok()??;
+    let header = format_browser_header(&browser);
+    Some((browser, header))
+}
+
+fn expired_network_handle(request_id: &str) -> String {
+    format!("# Browser network request `{request_id}`\n\nNetwork request handle expired: the browser was closed, the runner restarted, or the bounded archive evicted it.")
 }
 
 /// Render a browser interactive read: the url/title/status header plus the
@@ -1095,7 +1184,7 @@ fn format_console_body(entries: &[ConsoleEntry]) -> String {
     out.trim_end().to_string()
 }
 
-fn format_size(size: Option<i64>) -> String {
+fn format_size(size: Option<u64>) -> String {
     match size {
         None => "–".to_string(),
         Some(bytes) if bytes < 1024 => format!("{bytes} B"),
@@ -1106,37 +1195,234 @@ fn format_size(size: Option<i64>) -> String {
 
 /// Format captured network summaries as a compact markdown table. A failed
 /// request shows `ERR` in the status column and its error message inline.
-fn format_network_body(entries: &[NetworkEntry]) -> String {
+fn format_network_body(resource: &CairnResource, entries: &[BrowserNetworkEntry]) -> String {
     if entries.is_empty() {
-        return "(No network activity captured on this page yet.)".to_string();
+        return "(No network activity captured yet.)".to_string();
     }
     let mut out = String::from(
-        "| Method | Type | URL | Status | Duration | Size |\n|---|---|---|---|---|---|\n",
+        "| Handle | Method | Type | URL | Status | Duration | Size |\n|---|---|---|---|---|---|---|\n",
     );
     for entry in entries {
         let status = match (&entry.error, entry.status) {
-            (Some(error), _) => format!("ERR ({})", error.trim()),
+            (Some(error), _) => format!("ERR ({})", markdown_cell(error.trim())),
             (None, Some(code)) => code.to_string(),
             (None, None) => "–".to_string(),
         };
-        let duration = match entry.duration_ms {
-            Some(ms) => format!("{ms} ms"),
-            None => "–".to_string(),
-        };
-        let kind = entry.kind.as_deref().unwrap_or("–");
-        // Escape pipes so a URL with a query string never breaks the table.
-        let url = entry.url.replace('|', "%7C");
+        let duration = entry
+            .duration_ms
+            .map(|ms| format!("{ms:.1} ms"))
+            .unwrap_or_else(|| "–".to_string());
+        let uri = network_detail_uri(resource, &entry.id);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
-            entry.method,
-            kind,
-            url,
+            "| [`{}`]({}) | {} | {} | {} | {} | {} | {} |\n",
+            markdown_cell(&entry.id),
+            uri,
+            markdown_cell(&entry.method),
+            markdown_cell(entry.kind.as_deref().unwrap_or("–")),
+            markdown_cell(&entry.url),
             status,
             duration,
             format_size(entry.size),
         ));
     }
     out.trim_end().to_string()
+}
+
+fn network_detail_uri(resource: &CairnResource, request_id: &str) -> String {
+    match resource {
+        CairnResource::ProjectBrowser { project, slug }
+        | CairnResource::ProjectBrowserNetworkRequest { project, slug, .. } => {
+            build_project_browser_network_request_uri(project, slug, request_id)
+        }
+        CairnResource::NodeBrowser {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            slug,
+        }
+        | CairnResource::NodeBrowserNetworkRequest {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            slug,
+            ..
+        } => build_node_browser_network_request_uri(
+            project, *number, *exec_seq, node_id, slug, request_id,
+        ),
+        CairnResource::TaskBrowser {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            slug,
+        }
+        | CairnResource::TaskBrowserNetworkRequest {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            slug,
+            ..
+        } => build_task_browser_network_request_uri(
+            project, *number, *exec_seq, node_id, task_name, slug, request_id,
+        ),
+        _ => String::new(),
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+fn format_network_detail(record: &BrowserNetworkRecord) -> String {
+    let mut out = format!(
+        "# Network request `{}`\n\n- Method: `{}`\n- URL: {}\n- Type: {}\n- Timestamp: {}\n- Status: {}\n- Error: {}\n- Redirected: {}\n- Final URL: {}\n- Redirect hops: unavailable in portable browser APIs\n",
+        record.id, record.method, record.url,
+        record.kind.as_deref().unwrap_or("unknown"), record.ts,
+        record.status.map(|status| status.to_string()).unwrap_or_else(|| "unavailable".to_string()),
+        record.error.as_deref().unwrap_or("none"), record.redirect.redirected,
+        record.redirect.final_url.as_deref().unwrap_or("unavailable"),
+    );
+    out.push_str("\n## Request headers\n\n");
+    out.push_str(&format_headers(&record.request_headers));
+    out.push_str("\n\n## Request body\n\n");
+    out.push_str(&format_captured_body(&record.request_body));
+    out.push_str("\n\n## Response headers\n\n");
+    out.push_str(&format_headers(&record.response_headers));
+    out.push_str("\n\n## Response body\n\n");
+    out.push_str(&format_captured_body(&record.response_body));
+    out.push_str("\n\n## Timing and sizes\n\n");
+    out.push_str(&format!(
+        "- Total: {}\n- Redirect aggregate: {}\n- DNS: {}\n- Connect: {}\n- TLS: {}\n- Request: {}\n- Response: {}\n- Protocol: {}\n- Transfer: {}\n- Encoded body: {}\n- Decoded body: {}\n",
+        format_ms(record.timing.total_ms), format_ms(record.timing.redirect_ms),
+        format_ms(record.timing.dns_ms), format_ms(record.timing.connect_ms),
+        format_ms(record.timing.tls_ms), format_ms(record.timing.request_ms),
+        format_ms(record.timing.response_ms), record.timing.protocol.as_deref().unwrap_or("unavailable"),
+        format_size(record.timing.transfer_size), format_size(record.timing.encoded_body_size),
+        format_size(record.timing.decoded_body_size),
+    ));
+    out.push_str("\n## Initiator\n\n");
+    out.push_str(&format!(
+        "- Type: {}\n- Document/frame URL: {}\n",
+        record
+            .initiator
+            .initiator_type
+            .as_deref()
+            .unwrap_or("unavailable"),
+        record
+            .initiator
+            .document_url
+            .as_deref()
+            .unwrap_or("unavailable")
+    ));
+    if let Some(stack) = &record.initiator.stack {
+        out.push_str("- Stack:\n\n");
+        out.push_str(&indent_block(stack));
+    }
+    out.push_str("\n\nCapture is sanitized and bounded. This handle expires on browser close, runner restart, or bounded archive eviction.");
+    out
+}
+
+fn format_headers(headers: &[(String, String)]) -> String {
+    if headers.is_empty() {
+        return "(Unavailable or none.)".to_string();
+    }
+    headers
+        .iter()
+        .map(|(name, value)| format!("- **{}:** {}", markdown_cell(name), markdown_cell(value)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_captured_body(body: &CapturedBody) -> String {
+    match body {
+        CapturedBody::Json {
+            value,
+            truncated,
+            original_size,
+        } => {
+            let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            format!(
+                "JSON{}{}\n\n{}",
+                truncation_label(*truncated),
+                original_size_label(*original_size),
+                indent_block(&pretty)
+            )
+        }
+        CapturedBody::Text {
+            text,
+            truncated,
+            original_size,
+        } => format!(
+            "Text{}{}\n\n{}",
+            truncation_label(*truncated),
+            original_size_label(*original_size),
+            indent_block(text)
+        ),
+        CapturedBody::Form {
+            fields,
+            truncated,
+            original_size,
+        } => {
+            let pretty = serde_json::to_string_pretty(fields).unwrap_or_default();
+            format!(
+                "Form data{}{}\n\n{}",
+                truncation_label(*truncated),
+                original_size_label(*original_size),
+                indent_block(&pretty)
+            )
+        }
+        CapturedBody::BinaryOmitted { mime_type, size } => format!(
+            "Binary body omitted (type: {}, size: {}).",
+            mime_type.as_deref().unwrap_or("unknown"),
+            format_size(*size)
+        ),
+        CapturedBody::CrossOriginOmitted => {
+            "Cross-origin body omitted by policy/browser visibility limits.".to_string()
+        }
+        CapturedBody::Unsupported { description } => format!(
+            "Unsupported body type{}.",
+            description
+                .as_deref()
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default()
+        ),
+        CapturedBody::Unavailable { reason } => format!(
+            "Body unavailable{}.",
+            reason
+                .as_deref()
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default()
+        ),
+    }
+}
+
+fn format_ms(value: Option<f64>) -> String {
+    value
+        .map(|ms| format!("{ms:.1} ms"))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+fn truncation_label(truncated: bool) -> &'static str {
+    if truncated {
+        " (truncated)"
+    } else {
+        ""
+    }
+}
+fn original_size_label(size: Option<u64>) -> String {
+    size.map(|size| format!("; original size {size} bytes"))
+        .unwrap_or_default()
+}
+fn indent_block(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn emit_browser_db_change(orch: &Orchestrator, action: &str) {
@@ -1510,38 +1796,50 @@ mod tests {
 
     #[test]
     fn format_network_body_tabulates_requests_and_errors() {
+        let resource = CairnResource::ProjectBrowser {
+            project: "CAIRN".to_string(),
+            slug: "default".to_string(),
+        };
         assert!(
-            format_network_body(&[]).starts_with("(No network activity captured"),
+            format_network_body(&resource, &[]).starts_with("(No network activity captured"),
             "{}",
-            format_network_body(&[])
+            format_network_body(&resource, &[])
         );
         let entries = vec![
-            NetworkEntry {
+            BrowserNetworkEntry {
+                id: "realm-1".to_string(),
                 ts: 1,
                 method: "GET".to_string(),
                 url: "https://api.example.com/data?a=1|2".to_string(),
                 kind: Some("fetch".to_string()),
                 status: Some(200),
-                duration_ms: Some(12),
-                ok: Some(true),
+                duration_ms: Some(12.0),
                 error: None,
                 size: Some(2048),
+                has_details: true,
+                truncated: false,
             },
-            NetworkEntry {
+            BrowserNetworkEntry {
+                id: "realm-2".to_string(),
                 ts: 2,
                 method: "POST".to_string(),
                 url: "https://api.example.com/send".to_string(),
                 kind: None,
                 status: None,
-                duration_ms: Some(5),
-                ok: Some(false),
+                duration_ms: Some(5.0),
                 error: Some("connection refused".to_string()),
                 size: None,
+                has_details: true,
+                truncated: false,
             },
         ];
-        let body = format_network_body(&entries);
+        let body = format_network_body(&resource, &entries);
         assert!(
-            body.contains("| Method | Type | URL | Status | Duration | Size |"),
+            body.contains("| Handle | Method | Type | URL | Status | Duration | Size |"),
+            "{body}"
+        );
+        assert!(
+            body.contains("cairn://p/CAIRN/browser/default/network/realm-1"),
             "{body}"
         );
         assert!(body.contains("| GET |"), "{body}");
@@ -1551,7 +1849,39 @@ mod tests {
         assert!(body.contains("ERR (connection refused)"), "{body}");
         // The pipe in the query string is escaped so the table stays intact.
         assert!(!body.contains("a=1|2"), "{body}");
-        assert!(body.contains("a=1%7C2"), "{body}");
+        assert!(body.contains("a=1\\|2"), "{body}");
+    }
+
+    #[test]
+    fn network_detail_formats_explicit_body_states_and_timing() {
+        let record = BrowserNetworkRecord {
+            id: "realm-1".to_string(),
+            ts: 1,
+            method: "GET".to_string(),
+            url: "https://example.test/data".to_string(),
+            kind: Some("fetch".to_string()),
+            request_headers: Vec::new(),
+            request_body: CapturedBody::Unavailable {
+                reason: Some("no body".to_string()),
+            },
+            status: Some(200),
+            response_headers: Vec::new(),
+            response_body: CapturedBody::BinaryOmitted {
+                mime_type: Some("application/octet-stream".to_string()),
+                size: Some(42),
+            },
+            error: None,
+            timing: crate::browser_network::NetworkTiming {
+                dns_ms: Some(1.5),
+                ..Default::default()
+            },
+            redirect: crate::browser_network::RedirectMetadata::default(),
+            initiator: crate::browser_network::InitiatorMetadata::default(),
+        };
+        let body = format_network_detail(&record);
+        assert!(body.contains("Binary body omitted"), "{body}");
+        assert!(body.contains("DNS: 1.5 ms"), "{body}");
+        assert!(body.contains("Redirect hops: unavailable"), "{body}");
     }
 
     #[tokio::test]
@@ -1774,6 +2104,63 @@ mod tests {
         );
     }
 
+    /// A host that knows it could not deliver the command publishes a correlated
+    /// page-shaped error immediately. The backstop timeout is reserved for a
+    /// command that was actually delivered but never produced a reply.
+    #[tokio::test]
+    async fn bridge_roundtrip_returns_host_rejection_promptly_and_balances_priming() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected2 = collected.clone();
+        let responses = orch.browser_bridge_responses.clone();
+        let task = tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let BrowserCommand::Bridge { ref request_id, .. } = cmd {
+                    let _ = responses.send((
+                        request_id.clone(),
+                        "{\"ok\":false,\"error\":\"no live webview for browser bid\"}".to_string(),
+                    ));
+                }
+                collected2.lock().unwrap().push(cmd);
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let response = browser_bridge_roundtrip(
+            &orch,
+            "bid",
+            &BridgeRequest::RenderAnnotations {
+                annotations: Vec::new(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("no live webview for browser bid")
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "known host rejection should not consume the timeout: {:?}",
+            started.elapsed()
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(orch);
+        let _ = task.await;
+        let cmds = collected.lock().unwrap().clone();
+        assert!(matches!(
+            cmds.as_slice(),
+            [
+                BrowserCommand::BeginRenderPriming { .. },
+                BrowserCommand::Bridge { .. },
+                BrowserCommand::EndRenderPriming { .. }
+            ]
+        ));
+    }
+
     /// Part 1: EndRenderPriming is emitted even when the round-trip times out —
     /// the RAII guard must release the off-screen hold on every exit path.
     #[tokio::test]
@@ -1787,6 +2174,7 @@ mod tests {
                 collected2.lock().unwrap().push(cmd);
             }
         });
+        let started = tokio::time::Instant::now();
         let err = browser_bridge_roundtrip(
             &orch,
             "bid",
@@ -1798,6 +2186,11 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(70),
+            "a dispatched request without a reply should consume its backstop: {:?}",
+            started.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(orch);
         let _ = task.await;

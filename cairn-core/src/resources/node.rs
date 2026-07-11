@@ -11,8 +11,9 @@ use super::common::{
     reject_query_params, resolve_issue_id, visible_job_node_segment, ResourceActionRun,
 };
 use super::transcript::{
-    format_transcript_digest_with, get_nth_run_id, get_single_event, load_job_events_ordered,
-    load_turn_events, DigestMeta, DigestOptions, EventRow,
+    format_raw_transcript, format_transcript_digest_with, get_nth_run_id, get_single_event,
+    load_job_events_ordered, load_turn_events, parse_raw_transcript_format, DigestMeta,
+    DigestOptions, RawTranscriptFormat,
 };
 
 use crate::storage::{LocalDb, RowExt};
@@ -1421,7 +1422,12 @@ pub(super) async fn read_node_chat_raw(
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    params: &[QueryParam],
 ) -> String {
+    let format = match parse_raw_transcript_format(params) {
+        Ok(format) => format,
+        Err(error) => return error,
+    };
     let (conn, job) =
         match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
             Ok(resolved) => resolved,
@@ -1436,14 +1442,13 @@ pub(super) async fn read_node_chat_raw(
     )
     .await;
     if event_rows.is_empty() {
-        return "No runs found for this node.".to_string();
+        return match format {
+            RawTranscriptFormat::Markdown => "No runs found for this node.".to_string(),
+            RawTranscriptFormat::Json => String::new(),
+        };
     }
 
-    // The raw stream is the verbose, unsummarized transcript — the digest's
-    // programmatic/grep fallback.
-    let rows: Vec<crate::transcripts::TranscriptRow> =
-        event_rows.iter().map(EventRow::to_transcript_row).collect();
-    crate::transcripts::format_transcript_full(&rows)
+    format_raw_transcript(&event_rows, format)
 }
 
 /// Read a turn-scoped transcript slice.
@@ -1969,7 +1974,12 @@ pub(super) async fn read_task_chat_raw(
     exec_seq: i32,
     node_name: &str,
     task_name: &str,
+    params: &[QueryParam],
 ) -> String {
+    let format = match parse_raw_transcript_format(params) {
+        Ok(format) => format,
+        Err(error) => return error,
+    };
     let (conn, _parent_job, task_job) =
         match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
             .await
@@ -1986,12 +1996,13 @@ pub(super) async fn read_task_chat_raw(
     )
     .await;
     if event_rows.is_empty() {
-        return "No runs found for this task.".to_string();
+        return match format {
+            RawTranscriptFormat::Markdown => "No runs found for this task.".to_string(),
+            RawTranscriptFormat::Json => String::new(),
+        };
     }
 
-    let rows: Vec<crate::transcripts::TranscriptRow> =
-        event_rows.iter().map(EventRow::to_transcript_row).collect();
-    crate::transcripts::format_transcript_full(&rows)
+    format_raw_transcript(&event_rows, format)
 }
 
 pub(super) async fn read_task_chat_turn(

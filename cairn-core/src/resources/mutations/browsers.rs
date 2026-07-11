@@ -79,6 +79,8 @@ pub(super) async fn apply_browser_ensure(
     let now = chrono::Utc::now().timestamp();
     let (browser, inserted) =
         ensure_open_browser(&orch.db.local, scope, &slug, url.clone(), now).await?;
+    orch.browser_network
+        .activate(&browser.id, &browser.webview_label);
     // Open is create-or-rehydrate-or-reuse host-side: it recreates a webview a
     // restart wiped (loading the stored url) and no-ops a live one. The follow-up
     // Navigate drives a live webview to the requested url (a harmless reload on a
@@ -121,6 +123,8 @@ pub(crate) async fn apply_browser_action(
     let (scope, slug) = resolve_browser_target(&orch.db.local, resource).await?;
     let now = chrono::Utc::now().timestamp();
     let (browser, _) = ensure_open_browser(&orch.db.local, scope, &slug, None, now).await?;
+    orch.browser_network
+        .activate(&browser.id, &browser.webview_label);
     send_command(
         orch,
         BrowserCommand::Open {
@@ -350,6 +354,7 @@ pub(super) async fn apply_browser_delete(
         .ok_or_else(|| format!("No browser open at slug '{slug}'"))?;
     let now = chrono::Utc::now().timestamp();
     mark_browser_closed(&orch.db.local, &browser.id, now).await?;
+    orch.browser_network.clear(&browser.id);
     send_command(
         orch,
         BrowserCommand::Close {

@@ -579,6 +579,7 @@ mod tests {
             text: "=== file:a.rs [lines 1\u{2013}1 of 1] ===\n     1\ta".to_string(),
             images: vec![],
             segments: vec![],
+            bodies: None,
         };
         let response = CallbackResponse {
             result: serde_json::to_string(&envelope).unwrap(),

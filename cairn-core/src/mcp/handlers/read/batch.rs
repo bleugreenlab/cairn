@@ -25,6 +25,9 @@ type ReadCursorState = Mutex<HashMap<String, usize>>;
 struct ReadBatchPayload {
     #[serde(default)]
     paths: Vec<String>,
+    /// Opt in to final per-segment bodies alongside the composed batch text.
+    #[serde(default)]
+    include_bodies: bool,
 }
 
 /// Handle a `read_batch` callback: classify, produce, dedup, and assemble.
@@ -133,7 +136,11 @@ pub async fn handle_read_batch(
         }
     }
 
-    let envelope = view::assemble(segments);
+    let envelope = if payload.include_bodies {
+        view::assemble_with_bodies(segments)
+    } else {
+        view::assemble(segments)
+    };
     serde_json::to_string(&envelope)
         .unwrap_or_else(|error| format!("Failed to serialize read batch: {error}"))
 }
@@ -407,6 +414,7 @@ async fn produce_resource_segment(
                 .shown_units
                 .unwrap_or_else(|| rendered.content.lines().count());
             meta.unit_noun = rendered.unit_noun.map(str::to_string);
+            meta.record_prelude_lines = rendered.record_prelude_lines;
             meta.offset = rendered.offset.unwrap_or(0).max(0) as usize;
             meta.limit = rendered.limit;
             ReadSegment {
@@ -424,6 +432,7 @@ async fn produce_resource_segment(
                 .shown_units
                 .unwrap_or_else(|| rendered.content.matches("\n## Turn ").count());
             meta.unit_noun = rendered.unit_noun.map(str::to_string);
+            meta.record_prelude_lines = rendered.record_prelude_lines;
             meta.offset = rendered.offset.unwrap_or(0).max(0) as usize;
             meta.limit = rendered.limit;
             ReadSegment {
@@ -766,6 +775,62 @@ mod tests {
         assert_eq!(envelope.segments[0].total_units, Some(40));
         assert_eq!(envelope.segments[0].offset, 2);
         assert_eq!(envelope.segments[0].shown_units, 3);
+    }
+
+    #[tokio::test]
+    async fn read_batch_include_bodies_surfaces_order_errors_and_truncation() {
+        let orch = seeded_orch().await;
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("small.rs"), "hello\nworld").unwrap();
+        let huge = format!("single huge line: {}", "x".repeat(100_000));
+        std::fs::write(worktree.path().join("huge.rs"), huge).unwrap();
+        let paths = serde_json::json!(["file:small.rs", "file:huge.rs", "file:missing.rs"]);
+
+        let structured_request = McpCallbackRequest {
+            thread_id: None,
+            cwd: worktree.path().display().to_string(),
+            run_id: None,
+            tool: "read_batch".to_string(),
+            payload: serde_json::json!({
+                "paths": paths,
+                "include_bodies": true
+            }),
+            tool_use_id: None,
+        };
+        let cursors = Mutex::new(HashMap::new());
+        let structured_raw = handle_read_batch(&orch, &structured_request, &cursors).await;
+        let structured: ReadBatchEnvelope = serde_json::from_str(&structured_raw).unwrap();
+        let bodies = structured.bodies.as_ref().expect("opt-in bodies");
+
+        assert_eq!(structured.segments.len(), 3);
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(structured.segments[0].uri, "file:small.rs");
+        assert!(bodies[0].contains("hello"));
+        assert_eq!(structured.segments[1].uri, "file:huge.rs");
+        assert!(structured.segments[1].truncated);
+        assert!(structured.segments[1].char_continuation);
+        assert!(bodies[1].contains("output truncated to fit budget"));
+        assert!(bodies[1].contains("continue: file:huge.rs?"));
+        assert!(bodies[1].contains("char_offset="));
+        assert_eq!(structured.segments[2].kind, SegmentKind::Error);
+        assert_eq!(structured.segments[2].uri, "file:missing.rs");
+        assert!(bodies[2].contains("Invalid file target"), "{}", bodies[2]);
+        assert!(bodies[2].contains("does not exist"), "{}", bodies[2]);
+        for body in bodies {
+            assert!(structured.text.contains(body));
+        }
+
+        let plain_request = McpCallbackRequest {
+            payload: serde_json::json!({
+                "paths": ["file:small.rs", "file:huge.rs", "file:missing.rs"]
+            }),
+            ..structured_request
+        };
+        let plain_raw = handle_read_batch(&orch, &plain_request, &cursors).await;
+        let plain_json: serde_json::Value = serde_json::from_str(&plain_raw).unwrap();
+        assert!(plain_json.get("bodies").is_none());
+        let plain: ReadBatchEnvelope = serde_json::from_str(&plain_raw).unwrap();
+        assert!(plain.bodies.is_none());
     }
 
     /// Run a `read_batch` with an explicit worktree `cwd`, returning the

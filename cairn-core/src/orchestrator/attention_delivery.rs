@@ -3,7 +3,8 @@
 //! Creates and renders attention pushes. Two responsibilities:
 //!
 //! 1. **Create pushes.** [`create_resolved_push`] turns a terminal `Resolved`
-//!    fact into a passive `resolved:{issue}` push to the issue's watchers;
+//!    fact into a `resolved:{issue}` push to the issue's watchers. Failure is
+//!    rousing; successful resolution remains passive.
 //!    [`create_catchup_push`] creates the passive `catchup:{child-job}` push at
 //!    the user→child message moment, resolved at delivery against the parent's
 //!    read cursor. Question and permission pushes are created at their own emit
@@ -21,19 +22,29 @@ use super::Orchestrator;
 use crate::orchestrator::{AttentionEvent, AttentionFact};
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
 
-/// Create the passive `resolved:{issue}` push at a terminal-resolution emit.
+/// Create the normalized `resolved:{issue}` push at a terminal-resolution emit.
 ///
 /// The single creator of the resolved push, fed by every
 /// `AttentionFact::Resolved` emit (the recompute terminal sweep, the work-turn
 /// idle edge, the PR webhook, and `wake_for_issue`) through the
 /// `emit_attention_event` funnel. Non-`Resolved` facts are ignored — question
 /// and permission pushes are created at their own emit sites where the producing
-/// node is known. Informational: passive, never wakes; supersede-by-key
-/// collapses repeat emits to one undelivered row. Fire-and-forget.
+/// node is known. Failed resolution wakes subscribed idle watchers; merged and
+/// closed resolution remain passive ride-along information. Supersede-by-key
+/// collapses repeat undelivered emits, while a status/update fingerprint prevents
+/// the same terminal resolution from re-firing after delivery. The resolved child
+/// issue's own jobs are excluded so a child never receives its own notification.
 pub fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) {
-    if !matches!(event.fact, AttentionFact::Resolved { .. }) {
-        return;
-    }
+    let final_status = match &event.fact {
+        AttentionFact::Resolved { final_status } => final_status.clone(),
+        _ => return,
+    };
+    let wake = if final_status == crate::models::IssueStatus::Failed {
+        Wake::Wake
+    } else {
+        Wake::Passive
+    };
+    let fingerprint = format!("status:{final_status}:{}", event.updated_at);
     let dbs = orch.db.clone();
     let issue_id = event.issue_id.clone();
     let issue_uri = event.issue_uri.clone();
@@ -42,27 +53,82 @@ pub fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) {
             .await
             .map_err(|e| e.to_string())?;
         let key = format!("resolved:{issue_uri}");
-        // Resolved is issue-wide; there is no single producing node to exclude.
-        push_to_issue_watchers(
-            &db,
-            &issue_uri,
-            None,
-            &issue_uri,
-            Wake::Passive,
-            Boundary::Event,
-            &key,
-        )
-        .await
+        let watchers = subscriber_jobs_for_issue(&db, &issue_uri).await?;
+        let mut pushed = Vec::new();
+        for recipient in watchers {
+            if job_belongs_to_issue(&db, &recipient, &issue_id).await? {
+                continue;
+            }
+            if let Some(Some(previous)) =
+                super::attention_push::latest_push_fingerprint(&db, &recipient, &key)
+                    .await
+                    .map_err(|e| e.to_string())?
+            {
+                if previous == fingerprint {
+                    continue;
+                }
+            }
+            let (_, effective) = super::attention_push::push_with_fingerprint(
+                &db,
+                &recipient,
+                &issue_uri,
+                wake,
+                Boundary::Event,
+                &key,
+                Some(&fingerprint),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            if effective.wakes_idle() {
+                pushed.push(recipient);
+            }
+        }
+        Ok::<_, String>(pushed)
     });
     match result {
-        Ok(_) => orch.notifier.emit_change("attention_pushes"),
+        Ok(recipients) => {
+            orch.notifier.emit_change("attention_pushes");
+            for recipient in recipients {
+                if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
+                    orch,
+                    &recipient,
+                    crate::messages::queued::DeliveryUrgency::Steer,
+                ) {
+                    log::warn!(
+                        "resolved push wake for {} failed: {}",
+                        &recipient[..recipient.len().min(8)],
+                        e
+                    );
+                }
+            }
+        }
         Err(e) => log::warn!("resolved push creation failed: {}", e),
     }
 }
 
+async fn job_belongs_to_issue(db: &LocalDb, job_id: &str, issue_id: &str) -> Result<bool, String> {
+    let job_id = job_id.to_string();
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM jobs WHERE id=?1 AND issue_id=?2 LIMIT 1",
+                    params![job_id.as_str(), issue_id.as_str()],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Push to every watcher of `issue_uri`, optionally excluding the producing
-/// node. The shared creator for the question / permission / resolved push
-/// sources (the review push has its own creator at the work-turn idle edge).
+/// node. The shared creator for question and permission push sources; review and
+/// resolved pushes each have outcome-specific creators.
 /// Supersede-by-key collapses repeats to one undelivered row per recipient; the
 /// delivery layer drains, lazy-resolves, and stamps each push.
 ///
@@ -305,24 +371,32 @@ async fn resolve_uri_to_markdown(orch: &Orchestrator, uri: &str) -> Option<Strin
 const PUSH_CONTENT_CAP: usize = 4000;
 
 async fn resolved_issue_confirmation(orch: &Orchestrator, issue_uri: &str) -> Option<String> {
+    let project_key = cairn_common::uri::parse_uri(issue_uri)?
+        .project_key()?
+        .to_string();
+    let db = orch.db.for_project(&project_key).await;
     let issue_uri = issue_uri.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let issue_uri = issue_uri.clone();
-            Box::pin(async move {
-                let issue = crate::issues::relations::resolve_issue_uri(conn, &issue_uri).await?;
-                let status = issue.map(|issue| issue.status);
-                let message = match status {
-                    Some(crate::models::IssueStatus::Merged) => "Issue Merged Successfully",
-                    Some(crate::models::IssueStatus::Closed) => "Issue Closed Successfully",
-                    _ => "Issue Resolved Successfully",
-                };
-                Ok(message.to_string())
-            })
+    db.read(|conn| {
+        let issue_uri = issue_uri.clone();
+        Box::pin(async move {
+            let Some(issue) = crate::issues::relations::resolve_issue_uri(conn, &issue_uri).await?
+            else {
+                return Ok(None);
+            };
+            let message = match issue.status {
+                crate::models::IssueStatus::Merged => "Issue Merged Successfully",
+                crate::models::IssueStatus::Closed => "Issue Closed Successfully",
+                crate::models::IssueStatus::Failed => {
+                    "Issue Failed — inspect the child and retry or delegate a fix"
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(message.to_string()))
         })
-        .await
-        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Render a drained attention push with its referent content resolved inline
@@ -343,10 +417,10 @@ pub async fn render_push_resolved(
         push.content_ref
     );
     if push.key.starts_with("resolved:") {
-        let body = resolved_issue_confirmation(orch, &push.content_ref)
-            .await
-            .unwrap_or_else(|| "Issue Resolved Successfully".to_string());
-        return format!("{header}\n\n{body}");
+        return match resolved_issue_confirmation(orch, &push.content_ref).await {
+            Some(body) => format!("{header}\n\n{body}"),
+            None => header,
+        };
     }
 
     // A `direct:` push carries frozen message content, not an idempotent
@@ -539,6 +613,69 @@ mod tests {
         assert!(!rendered.contains("This long child issue description"));
     }
 
+    #[tokio::test]
+    async fn render_failed_resolution_routes_to_team_replica() {
+        let local = migrated_db().await;
+        let team = std::sync::Arc::new(migrated_db().await);
+        team.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('team-project','default','Team Project','TEAM','/tmp/team',1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('team-issue','team-project',9,'Failed child','failed','failed','none',1,2);
+            ",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(local);
+        orch.db
+            .register_team_db_for_test("team-1".to_string(), team)
+            .await;
+        orch.db.set_route("TEAM", Some("team-1".to_string())).await;
+        let issue_uri = "cairn://p/TEAM/9";
+        let push = crate::orchestrator::attention_push::Push {
+            id: "team-push".into(),
+            recipient: "coordinator".into(),
+            content_ref: issue_uri.into(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: format!("resolved:{issue_uri}"),
+            created_at: 2,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(rendered.contains("Issue Failed"), "{rendered}");
+        assert!(rendered.contains("retry or delegate a fix"), "{rendered}");
+        assert!(!rendered.contains("Successfully"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn render_unconfirmed_resolution_is_bare_header() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        let orch = test_orchestrator(db);
+
+        for issue_uri in [CHILD_URI, "cairn://p/PROJ/999"] {
+            let push = crate::orchestrator::attention_push::Push {
+                id: format!("unconfirmed-{issue_uri}"),
+                recipient: "coordinator".into(),
+                content_ref: issue_uri.into(),
+                wake: Wake::Wake,
+                boundary: Boundary::Event,
+                key: format!("resolved:{issue_uri}"),
+                created_at: 2,
+                delivered_event_id: None,
+            };
+
+            let rendered = render_push_resolved(&orch, &push).await;
+
+            assert_eq!(rendered, format!("Attention update (wake): {issue_uri}"));
+            assert!(!rendered.contains("Successfully"), "{rendered}");
+        }
+    }
+
     /// Subscribe `job_id` to the child issue (`CHILD_URI`).
     async fn add_issue_sub(db: &LocalDb, job_id: &str) {
         let job_id = job_id.to_string();
@@ -594,7 +731,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_resolved_push_pushes_passive_resolved_to_watcher() {
+    async fn create_resolved_push_keeps_successful_resolution_passive() {
+        use crate::models::{IssueAttention, IssueStatus};
+        use crate::orchestrator::attention::{AttentionEvent, AttentionFact};
+        use crate::orchestrator::attention_push::list_pending;
+        for final_status in [IssueStatus::Merged, IssueStatus::Closed] {
+            let db = migrated_db().await;
+            seed(&db, "active", None, None).await;
+            let orch = test_orchestrator(db);
+
+            super::create_resolved_push(
+                &orch,
+                &AttentionEvent {
+                    issue_id: "issue-1".into(),
+                    issue_uri: CHILD_URI.into(),
+                    fact: AttentionFact::Resolved {
+                        final_status: final_status.clone(),
+                    },
+                    attention: IssueAttention::None,
+                    status: final_status,
+                    updated_at: 1,
+                },
+            );
+
+            let watcher = list_pending(&orch.db.local, "watcher").await.unwrap();
+            assert_eq!(watcher.len(), 1);
+            // Successful resolution is informational: passive, rides along.
+            assert_eq!(watcher[0].wake, Wake::Passive);
+            assert_eq!(watcher[0].key, format!("resolved:{CHILD_URI}"));
+            assert_eq!(watcher[0].content_ref, CHILD_URI);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_resolved_push_wakes_watcher_for_failed_child() {
         use crate::models::{IssueAttention, IssueStatus};
         use crate::orchestrator::attention::{AttentionEvent, AttentionFact};
         use crate::orchestrator::attention_push::list_pending;
@@ -608,20 +778,80 @@ mod tests {
                 issue_id: "issue-1".into(),
                 issue_uri: CHILD_URI.into(),
                 fact: AttentionFact::Resolved {
-                    final_status: IssueStatus::Merged,
+                    final_status: IssueStatus::Failed,
                 },
                 attention: IssueAttention::None,
-                status: IssueStatus::Merged,
+                status: IssueStatus::Failed,
                 updated_at: 1,
             },
         );
 
         let watcher = list_pending(&orch.db.local, "watcher").await.unwrap();
         assert_eq!(watcher.len(), 1);
-        // Resolved is informational: passive, rides along, never wakes.
-        assert_eq!(watcher[0].wake, Wake::Passive);
+        assert_eq!(watcher[0].wake, Wake::Wake);
         assert_eq!(watcher[0].key, format!("resolved:{CHILD_URI}"));
-        assert_eq!(watcher[0].content_ref, CHILD_URI);
+    }
+
+    #[tokio::test]
+    async fn muted_failed_resolution_is_passive() {
+        use crate::models::{IssueAttention, IssueStatus};
+        use crate::orchestrator::attention::{AttentionEvent, AttentionFact};
+        use crate::orchestrator::attention_push::list_pending;
+        let db = migrated_db().await;
+        seed(&db, "muted", Some(r#"["resolved"]"#), None).await;
+        let orch = test_orchestrator(db);
+
+        super::create_resolved_push(
+            &orch,
+            &AttentionEvent {
+                issue_id: "issue-1".into(),
+                issue_uri: CHILD_URI.into(),
+                fact: AttentionFact::Resolved {
+                    final_status: IssueStatus::Failed,
+                },
+                attention: IssueAttention::None,
+                status: IssueStatus::Failed,
+                updated_at: 1,
+            },
+        );
+
+        let watcher = list_pending(&orch.db.local, "watcher").await.unwrap();
+        assert_eq!(watcher.len(), 1);
+        assert_eq!(watcher[0].wake, Wake::Passive);
+    }
+
+    #[tokio::test]
+    async fn resolved_child_does_not_push_to_its_own_subscribed_job() {
+        use crate::models::{IssueAttention, IssueStatus};
+        use crate::orchestrator::attention::{AttentionEvent, AttentionFact};
+        use crate::orchestrator::attention_push::list_pending;
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        add_issue_sub(&db, "child-job").await;
+        let orch = test_orchestrator(db);
+
+        super::create_resolved_push(
+            &orch,
+            &AttentionEvent {
+                issue_id: "issue-1".into(),
+                issue_uri: CHILD_URI.into(),
+                fact: AttentionFact::Resolved {
+                    final_status: IssueStatus::Failed,
+                },
+                attention: IssueAttention::None,
+                status: IssueStatus::Failed,
+                updated_at: 1,
+            },
+        );
+
+        assert!(list_pending(&orch.db.local, "child-job")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_pending(&orch.db.local, "watcher").await.unwrap().len(),
+            1
+        );
     }
 
     // ---- Catch-up push creator (CAIRN-1894) ----------------------------------

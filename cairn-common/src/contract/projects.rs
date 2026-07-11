@@ -294,3 +294,14 @@ pub(crate) const PROJECT_BROWSER_CONTRACT: ResourceContract =
             },
         ],
     };
+
+pub(crate) const PROJECT_BROWSER_NETWORK_REQUEST_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectBrowserNetworkRequest,
+    uri_template: "cairn://p/{project}/browser/{slug}/network/{request_id}",
+    name: "Project browser network request",
+    description: "Sanitized detail for one stable browser network capture handle. Request and response bodies are bounded, binary and cross-origin bodies are explicitly omitted, and portable redirect data is aggregate-only. Handles live in the runner's bounded in-memory archive until browser close, runner restart, or eviction; an expired handle is reported explicitly.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[],
+};

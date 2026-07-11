@@ -17,7 +17,7 @@ use crate::account::team_token_minter::TeamTokenMinter;
 use crate::services::EventEmitter;
 use crate::storage::{
     run_pull_task, run_push_task, DbError, DbResult, LocalDb, MigrationRunner, RouteReconcile,
-    RowExt, SearchIndex, SyncCadence, TEAM_MIGRATIONS,
+    RowExt, SearchIndex, SyncCadence, TeamSyncScope, TEAM_MIGRATIONS,
 };
 use crate::storage::{ContentStoreFactory, TeamReplicaContext};
 
@@ -730,7 +730,7 @@ async fn reconcile_team_routes(
     team_db: &LocalDb,
     routes: &RwLock<RouteMap>,
     team_id: &TeamId,
-) -> DbResult<usize> {
+) -> DbResult<Vec<String>> {
     // Auto-provision the team's workspace project row, first-writer-wins. The
     // team workspace COMES WITH the team (a twin of the personal ~/.cairn), so
     // an existing team gains it on next open/pull and a new team has it from the
@@ -757,24 +757,73 @@ async fn reconcile_team_routes(
         .read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
-                    .query("SELECT key, repo_path FROM projects", ())
+                    .query("SELECT id, key, repo_path FROM projects", ())
                     .await?;
                 let mut projects = Vec::new();
                 while let Some(row) = rows.next().await? {
-                    projects.push((row.text(0)?, row.text(1)?));
+                    projects.push((row.text(0)?, row.text(1)?, row.text(2)?));
                 }
                 Ok(projects)
             })
         })
         .await?;
+    // Serialize reconciliation across team replicas with the same lock that owns
+    // the live route cache. A project key can move between replicas; holding this
+    // guard through the durable updates keeps the cache and catalog in one order.
+    let mut routes = routes.write().await;
+    let project_ids = projects
+        .iter()
+        .map(|(project_id, _, _)| project_id.clone())
+        .collect::<Vec<_>>();
+    let project_keys = projects
+        .iter()
+        .map(|(_, project_key, _)| project_key.to_uppercase())
+        .collect::<std::collections::HashSet<_>>();
+    let stale_keys = local
+        .read(|conn| {
+            let team_id = team_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT project_key FROM project_routes WHERE team_id = ?1",
+                        [team_id],
+                    )
+                    .await?;
+                let mut keys = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    keys.push(row.text(0)?);
+                }
+                Ok(keys)
+            })
+        })
+        .await?
+        .into_iter()
+        .filter(|key| !project_keys.contains(key))
+        .collect::<Vec<_>>();
+    for key in &stale_keys {
+        // Keep the machine-local clone path while clearing ownership. If another
+        // replica now owns this key, its upsert below reassigns the same row; the
+        // result is order-independent whether the old or new team reconciles first.
+        let cleared = local
+            .execute(
+                "UPDATE project_routes SET team_id = NULL
+                 WHERE project_key = ?1 AND team_id = ?2",
+                (key.clone(), team_id.clone()),
+            )
+            .await?;
+        if cleared > 0 {
+            routes.insert(key.clone(), None);
+        }
+    }
+
     let now = chrono::Utc::now().timestamp();
-    let mut added = 0;
-    for (project_key, repo_path) in projects {
+    for (_, project_key, repo_path) in projects {
         let key = project_key.to_uppercase();
         local
             .execute(
-                "INSERT OR IGNORE INTO project_routes(project_key, team_id, created_at)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO project_routes(project_key, team_id, created_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(project_key) DO UPDATE SET team_id = excluded.team_id",
                 (key.clone(), team_id.clone(), now),
             )
             .await?;
@@ -788,10 +837,9 @@ async fn reconcile_team_routes(
                 )
                 .await?;
         }
-        routes.write().await.insert(key, Some(team_id.clone()));
-        added += 1;
+        routes.insert(key, Some(team_id.clone()));
     }
-    Ok(added)
+    Ok(project_ids)
 }
 
 fn path_is_git_repo(path: &Path) -> bool {
@@ -810,15 +858,20 @@ struct TeamRouteReconciler {
 
 #[async_trait::async_trait]
 impl RouteReconcile for TeamRouteReconciler {
-    async fn reconcile(&self) {
-        if let Err(error) =
-            reconcile_team_routes(&self.local, &self.team_db, &self.routes, &self.team_id).await
-        {
-            log::warn!(
-                "pull-triggered route reconcile for team `{}` failed: {error}",
-                self.team_id
-            );
-        }
+    async fn reconcile(&self) -> Result<TeamSyncScope, String> {
+        let project_ids =
+            reconcile_team_routes(&self.local, &self.team_db, &self.routes, &self.team_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "pull-triggered route reconcile for team `{}` failed: {error}",
+                        self.team_id
+                    )
+                })?;
+        Ok(TeamSyncScope {
+            team_id: self.team_id.clone(),
+            project_ids,
+        })
     }
 }
 
@@ -1013,9 +1066,13 @@ mod tests {
             .await
             .unwrap();
 
-        reconcile_team_routes(&dbs.local, &team_db, &dbs.routes, &"teamABC123".to_string())
-            .await
-            .unwrap();
+        let project_ids =
+            reconcile_team_routes(&dbs.local, &team_db, &dbs.routes, &"teamABC123".to_string())
+                .await
+                .unwrap();
+        assert!(
+            project_ids.contains(&"teamABC123~00000000-0000-4000-8000-000000000001".to_string())
+        );
 
         let stored = dbs
             .local
@@ -1030,6 +1087,155 @@ mod tests {
             dbs.route_scope_for_project("legacy").await,
             RouteScope::Team("teamABC123".to_string())
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_team_routes_returns_current_projects_and_removes_stale_routes() {
+        let dbs = db_state("db-bridge-route-scope.db").await;
+        let team_db = migrated_team_db("db-bridge-route-scope-team.db").await;
+        let team_id = "teamABC123".to_string();
+
+        team_db
+            .execute_script(
+                "
+                INSERT INTO teams(id, name, created_at, updated_at) VALUES ('teamABC123', 'Team', 1, 1);
+                INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('teamABC123~00000000-0000-4000-8000-000000000011', 'teamABC123', 'One', 'ONE', '', 1, 1);
+                INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('teamABC123~00000000-0000-4000-8000-000000000012', 'teamABC123', 'Two', 'TWO', '', 1, 1);
+                ",
+            )
+            .await
+            .unwrap();
+        dbs.local
+            .execute_script(
+                "
+                INSERT INTO teams(id, name, sync_url, replica_path, created_at)
+                 VALUES ('teamABC123', 'Team', 'http://sync', '/tmp/team.db', 1);
+                INSERT INTO project_routes(project_key, team_id, created_at)
+                 VALUES ('STALE', 'teamABC123', 1);
+                ",
+            )
+            .await
+            .unwrap();
+        dbs.routes
+            .write()
+            .await
+            .insert("STALE".to_string(), Some(team_id.clone()));
+
+        let project_ids = reconcile_team_routes(&dbs.local, &team_db, &dbs.routes, &team_id)
+            .await
+            .unwrap();
+
+        assert!(
+            project_ids.contains(&"teamABC123~00000000-0000-4000-8000-000000000011".to_string())
+        );
+        assert!(
+            project_ids.contains(&"teamABC123~00000000-0000-4000-8000-000000000012".to_string())
+        );
+        assert_eq!(
+            dbs.route_scope_for_project("ONE").await,
+            RouteScope::Team(team_id.clone())
+        );
+        assert_eq!(
+            dbs.route_scope_for_project("TWO").await,
+            RouteScope::Team(team_id)
+        );
+        assert_eq!(
+            dbs.route_scope_for_project("STALE").await,
+            RouteScope::Local
+        );
+        assert_eq!(
+            dbs.local
+                .query_opt_text(
+                    "SELECT team_id FROM project_routes WHERE project_key = 'STALE'",
+                    (),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_team_routes_reassigns_between_teams_in_either_order() {
+        for old_team_first in [true, false] {
+            let dbs = db_state(if old_team_first {
+                "db-bridge-route-move-old-first.db"
+            } else {
+                "db-bridge-route-move-new-first.db"
+            })
+            .await;
+            let old_db = migrated_team_db("db-bridge-route-move-old.db").await;
+            let new_db = migrated_team_db("db-bridge-route-move-new.db").await;
+            let old_team = "teamOLD123".to_string();
+            let new_team = "teamNEW123".to_string();
+            let local_path = "/tmp/local-foo";
+
+            new_db
+                .execute_script(
+                    "INSERT INTO teams(id, name, created_at, updated_at) VALUES ('teamNEW123', 'New', 1, 1);
+                     INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('teamNEW123~00000000-0000-4000-8000-000000000021', 'teamNEW123', 'Foo', 'FOO', '', 1, 1);",
+                )
+                .await
+                .unwrap();
+            dbs.local
+                .execute_script(
+                    "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
+                     VALUES ('teamOLD123', 'Old', 'http://old', '/tmp/old.db', 1);
+                     INSERT INTO teams(id, name, sync_url, replica_path, created_at)
+                     VALUES ('teamNEW123', 'New', 'http://new', '/tmp/new.db', 1);",
+                )
+                .await
+                .unwrap();
+            dbs.local
+                .execute(
+                    "INSERT INTO project_routes(project_key, team_id, local_repo_path, created_at)
+                     VALUES ('FOO', 'teamOLD123', ?1, 1)",
+                    [local_path],
+                )
+                .await
+                .unwrap();
+            dbs.routes
+                .write()
+                .await
+                .insert("FOO".to_string(), Some(old_team.clone()));
+
+            let reconcile_old =
+                || reconcile_team_routes(&dbs.local, &old_db, &dbs.routes, &old_team);
+            let reconcile_new =
+                || reconcile_team_routes(&dbs.local, &new_db, &dbs.routes, &new_team);
+            if old_team_first {
+                reconcile_old().await.unwrap();
+                reconcile_new().await.unwrap();
+            } else {
+                reconcile_new().await.unwrap();
+                reconcile_old().await.unwrap();
+            }
+
+            assert_eq!(
+                dbs.route_scope_for_project("FOO").await,
+                RouteScope::Team(new_team.clone())
+            );
+            let stored = dbs
+                .local
+                .read(|conn| {
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT team_id, local_repo_path FROM project_routes WHERE project_key = 'FOO'",
+                                (),
+                            )
+                            .await?;
+                        let row = rows.next().await?.expect("FOO route");
+                        Ok((row.text(0)?, row.text(1)?))
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(stored, (new_team.clone(), local_path.to_string()));
+        }
     }
 
     /// A team replica whose `action_configs` table predates `workspace_id` (an

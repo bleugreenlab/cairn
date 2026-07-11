@@ -97,6 +97,7 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
 
 # Linux: keyring (secret-service) for MCP secrets + landlock for the OS-level
 # worktree-fence sandbox (origin/main).

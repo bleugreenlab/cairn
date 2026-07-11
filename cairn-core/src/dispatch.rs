@@ -14,6 +14,11 @@ pub struct DispatchOutput {
     pub reminders: Vec<String>,
 }
 
+/// `process_info` response when the windowless runner has no desktop connected.
+/// This must never fall back to the runner's own pid: callers use the value to
+/// target the native GUI, and the daemon cannot own that window.
+pub(crate) const NO_ATTACHED_UI_PID: &str = "No desktop UI is attached";
+
 /// Dispatch a tool call to the appropriate cairn-core handler.
 ///
 /// On the way out, queued user follow-ups, child side-channel notices, and this
@@ -160,12 +165,12 @@ async fn execute_tool(
         // a dev instance so an external tool (e.g. Axon accessibility) can target
         // the instance's window. Since the runner-daemon split the callback is
         // served by the windowless `cairn-runner`, so return the desktop UI pid
-        // it registered over `/ws` when a window is attached, and fall back to
-        // this server's own pid otherwise (headless, or no desktop connected).
+        // it registered over `/ws` when a window is attached. A runner pid is
+        // never a valid substitute because the daemon owns no native window.
         "process_info" => orch
             .attached_ui_pid()
-            .unwrap_or_else(std::process::id)
-            .to_string(),
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| NO_ATTACHED_UI_PID.to_string()),
 
         // Run tool
         "run" => crate::mcp::handlers::run::handle_run(orch, request).await,

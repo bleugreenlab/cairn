@@ -78,6 +78,54 @@ pub async fn insert_attention_push_events(
     }
 }
 
+/// Insert a general quiet system message with structured metadata.
+pub fn insert_system_message_sync(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+    content: &str,
+    raw: serde_json::Value,
+) -> Result<(), String> {
+    let db = crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })?;
+    let event = TranscriptEvent {
+        event_type: "system:message".to_string(),
+        session_id: session_id.map(str::to_string),
+        parent_tool_use_id: None,
+        content: Some(content.to_string()),
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error: false,
+        thinking_ms: None,
+        raw: Some(raw),
+    };
+    let data = serde_json::to_string(&event).map_err(|error| error.to_string())?;
+    insert_system_event_sync(
+        &db,
+        &orch.services.emitter,
+        &ids::mint_child(run_id),
+        run_id,
+        session_id,
+        "system:message",
+        &data,
+        chrono::Utc::now().timestamp() as i32,
+        turn_id,
+    )?;
+    Ok(())
+}
+
 /// Insert a `user` transcript event per delivered queued user message, so the
 /// follow-ups the user queued show up as normal "You" blocks once delivered.
 /// Used by the tool-boundary `steer` delivery path in `dispatch`.

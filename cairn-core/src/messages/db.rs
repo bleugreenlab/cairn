@@ -120,15 +120,41 @@ pub fn insert_message_with_urgency(
     content: &str,
     urgency: Option<DeliveryUrgency>,
 ) -> Result<Message, String> {
+    insert_message_with_urgency_and_id(
+        db,
+        channel_type,
+        channel_id,
+        sender_run_id,
+        sender_name,
+        recipient_run_id,
+        content,
+        urgency,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_message_with_urgency_and_id(
+    db: &LocalDb,
+    channel_type: &ChannelType,
+    channel_id: Option<&str>,
+    sender_run_id: Option<&str>,
+    sender_name: &str,
+    recipient_run_id: Option<&str>,
+    content: &str,
+    urgency: Option<DeliveryUrgency>,
+    stable_id: Option<&str>,
+) -> Result<Message, String> {
     let channel_type = channel_type.clone();
     let channel_id = channel_id.map(str::to_string);
     let sender_run_id = sender_run_id.map(str::to_string);
     let sender_name = sender_name.to_string();
     let recipient_run_id = recipient_run_id.map(str::to_string);
     let content = content.to_string();
+    let stable_id = stable_id.map(str::to_string);
 
     run_db_blocking(move || async move {
-        insert_message_async(
+        insert_message_async_with_id(
             db,
             &channel_type,
             channel_id.as_deref(),
@@ -137,13 +163,15 @@ pub fn insert_message_with_urgency(
             recipient_run_id.as_deref(),
             &content,
             urgency,
+            stable_id.as_deref(),
         )
         .await
     })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn insert_message_async(
+async fn insert_message_async(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
@@ -153,8 +181,34 @@ pub(super) async fn insert_message_async(
     content: &str,
     urgency: Option<DeliveryUrgency>,
 ) -> Result<Message, String> {
+    insert_message_async_with_id(
+        db,
+        channel_type,
+        channel_id,
+        sender_run_id,
+        sender_name,
+        recipient_run_id,
+        content,
+        urgency,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_message_async_with_id(
+    db: &LocalDb,
+    channel_type: &ChannelType,
+    channel_id: Option<&str>,
+    sender_run_id: Option<&str>,
+    sender_name: &str,
+    recipient_run_id: Option<&str>,
+    content: &str,
+    urgency: Option<DeliveryUrgency>,
+    stable_id: Option<&str>,
+) -> Result<Message, String> {
     let now = chrono::Utc::now().timestamp();
-    insert_message_at_async(
+    insert_message_at_async_with_id(
         db,
         channel_type,
         channel_id,
@@ -164,6 +218,7 @@ pub(super) async fn insert_message_async(
         content,
         urgency,
         now,
+        stable_id,
     )
     .await
 }
@@ -184,7 +239,37 @@ pub(super) async fn insert_message_at_async(
     urgency: Option<DeliveryUrgency>,
     created_at: i64,
 ) -> Result<Message, String> {
-    let id = Uuid::new_v4().to_string();
+    insert_message_at_async_with_id(
+        db,
+        channel_type,
+        channel_id,
+        sender_run_id,
+        sender_name,
+        recipient_run_id,
+        content,
+        urgency,
+        created_at,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_message_at_async_with_id(
+    db: &LocalDb,
+    channel_type: &ChannelType,
+    channel_id: Option<&str>,
+    sender_run_id: Option<&str>,
+    sender_name: &str,
+    recipient_run_id: Option<&str>,
+    content: &str,
+    urgency: Option<DeliveryUrgency>,
+    created_at: i64,
+    stable_id: Option<&str>,
+) -> Result<Message, String> {
+    let id = stable_id
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let channel_type = channel_type.to_string();
     let channel_id = channel_id.map(str::to_string);
     let sender_run_id = sender_run_id.map(str::to_string);
@@ -204,7 +289,7 @@ pub(super) async fn insert_message_at_async(
         let urgency = urgency.clone();
         Box::pin(async move {
             conn.execute(
-                "INSERT INTO messages (
+                "INSERT OR IGNORE INTO messages (
                     id, channel_type, channel_id, sender_run_id, sender_name,
                     recipient_run_id, content, created_at, urgency
                  )
@@ -223,7 +308,20 @@ pub(super) async fn insert_message_at_async(
             )
             .await?;
 
-            load_message_by_id(conn, &id).await
+            let message = load_message_by_id(conn, &id).await?;
+            if message.channel_type.to_string() != channel_type
+                || message.channel_id != channel_id
+                || message.sender_run_id != sender_run_id
+                || message.sender_name != sender_name
+                || message.recipient_run_id != recipient_run_id
+                || message.content != content
+                || message.urgency.as_ref().map(|value| value.as_str()) != urgency.as_deref()
+            {
+                return Err(DbError::Row(format!(
+                    "message identity {id} already exists with different content"
+                )));
+            }
+            Ok(message)
         })
     })
     .await

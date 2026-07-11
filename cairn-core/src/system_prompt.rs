@@ -242,6 +242,18 @@ mod tests {
     }
 
     #[test]
+    fn every_tier_carries_visual_markdown_guidance() {
+        for ambient in [false, true] {
+            let prompt = cairn_system_prompt(ambient);
+            assert!(prompt.contains("`mermaid` and `vega-lite` fenced code blocks"));
+            assert!(prompt.contains("inline data with `data.values`"));
+            assert!(prompt.contains("not remote `data.url` sources"));
+            assert!(prompt.contains("`inlinehtml` fences render as live sandboxed HTML previews"));
+            assert!(prompt.contains("plain `html` fences stay code"));
+        }
+    }
+
+    #[test]
     fn tiers_are_two_deterministic_variants() {
         // Exactly two variants, each deterministic (content-addressable) per call.
         assert_ne!(cairn_system_prompt(false), cairn_system_prompt(true));

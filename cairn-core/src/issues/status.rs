@@ -112,9 +112,13 @@ pub async fn update_status(
         }
     }
 
+    let issue = crud::get(&owning_db, id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Issue not found after status update: {id}"))?;
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
+        crate::notify::issue_db_change(&issue, "update"),
     );
 
     orch.wake_for_issue(id).await;

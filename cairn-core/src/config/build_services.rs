@@ -285,7 +285,7 @@ pub fn default_sccache_service() -> BuildServiceConfig {
         // dir it is building. Three roots need it:
         //   1. `{worktrees}/**/target/**` — ordinary fenced agent builds.
         //   2/3. the two COW-clone roots the project-check isolation compiles in
-        //        (`check_isolation::{clone_root_for_job, turn_end_clone_root_for_job}`
+        //        (`check_isolation::{clone_root_for_suite, turn_end_clone_root_for_suite}`
         //        → `{cairnHome}/check-clones`, `{cairnHome}/turn-check-clones`).
         // The clone roots are SIBLINGS of `{worktrees}`, so the worktrees glob
         // does not cover them; without these two grants a turn-end `rust-full` /

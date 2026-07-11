@@ -21,6 +21,7 @@ pub mod recipes;
 pub mod session;
 pub mod settings;
 pub mod skills;
+mod team_attention_push;
 pub mod wakes;
 pub mod workflow_configs;
 
@@ -87,6 +88,7 @@ pub struct OrchestratorBuilder {
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
+    team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
 }
 
 impl OrchestratorBuilder {
@@ -140,6 +142,7 @@ impl OrchestratorBuilder {
             model_catalog: Arc::new(RwLock::new(HashMap::new())),
             provider_usage_snapshots: Arc::new(RwLock::new(HashMap::new())),
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
         }
     }
 
@@ -250,6 +253,15 @@ impl OrchestratorBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn team_attention_sender(
+        mut self,
+        sender: Arc<dyn team_attention_push::TeamAttentionSender>,
+    ) -> Self {
+        self.team_attention_sender = sender;
+        self
+    }
+
     pub fn effect_tx(
         mut self,
         effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
@@ -276,6 +288,7 @@ impl OrchestratorBuilder {
         // (CAIRN-2196). Idempotent and `Once`-guarded; see
         // `storage::install_crypto_provider`.
         crate::storage::install_crypto_provider();
+        crate::execution::check_isolation::cleanup_abandoned_clone_roots(&self.config_dir);
 
         // Register the archived-file renderer so archival reconstruction (in
         // `storage`, below the mcp read layer) can reproduce archived reads
@@ -300,11 +313,15 @@ impl OrchestratorBuilder {
             repl_state: self.repl_state,
             worktree_search: Arc::new(crate::worktree_search::WorktreeSearchPool::default()),
             call_admission: Arc::new(crate::execution::jobs::CallAdmission::default()),
+            check_admission: Arc::new(
+                crate::execution::check_admission::CheckAdmissionController::default(),
+            ),
             permission_responses: self.permission_responses,
             run_completions: self.run_completions,
             prompt_responses: self.prompt_responses,
             browser_bridge_responses: self.browser_bridge_responses,
             browser_nav_events: self.browser_nav_events,
+            browser_network: Arc::new(crate::browser_network::BrowserNetworkArchive::default()),
             trigger_events: self.trigger_events,
             attention_changed: self.attention_changed,
             session_allowed_tools: self.session_allowed_tools,
@@ -330,10 +347,13 @@ impl OrchestratorBuilder {
             model_catalog: self.model_catalog,
             provider_usage_snapshots: self.provider_usage_snapshots,
             context_token_snapshots: self.context_token_snapshots,
+            team_attention_sender: self.team_attention_sender,
+            team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
+            build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
@@ -355,6 +375,13 @@ pub struct TurnEndCancel {
 struct TurnEndCancelInner {
     cancelled: AtomicBool,
     notify: tokio::sync::Notify,
+    status: Mutex<Option<TurnEndCheckRuntimeStatus>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TurnEndCheckRuntimeStatus {
+    pub tree_hash: String,
+    pub applicable_names: HashSet<String>,
 }
 
 impl Default for TurnEndCancel {
@@ -363,6 +390,7 @@ impl Default for TurnEndCancel {
             inner: Arc::new(TurnEndCancelInner {
                 cancelled: AtomicBool::new(false),
                 notify: tokio::sync::Notify::new(),
+                status: Mutex::new(None),
             }),
         }
     }
@@ -391,6 +419,19 @@ impl TurnEndCancel {
             }
             self.inner.notify.notified().await;
         }
+    }
+
+    pub(crate) fn set_runtime_status(&self, tree_hash: String, applicable_names: HashSet<String>) {
+        if let Ok(mut status) = self.inner.status.lock() {
+            *status = Some(TurnEndCheckRuntimeStatus {
+                tree_hash,
+                applicable_names,
+            });
+        }
+    }
+
+    fn runtime_status(&self) -> Option<TurnEndCheckRuntimeStatus> {
+        self.inner.status.lock().ok()?.clone()
     }
 }
 
@@ -474,6 +515,11 @@ pub struct Orchestrator {
     /// without a webview never publish on it.
     pub browser_nav_events: broadcast::Sender<crate::browsers::BrowserNavEvent>,
 
+    /// Runtime-only, bounded archive of sanitized browser network captures. It
+    /// survives page navigation and is cleared when the browser closes or the
+    /// runner restarts; payloads are never written to the database.
+    pub browser_network: Arc<crate::browser_network::BrowserNetworkArchive>,
+
     /// Trigger event channel for event-driven recipe dispatch.
     /// Emission sites send lean `TriggerEvent` values; each host subscribes
     /// and dispatches through `process_trigger_event`.
@@ -521,7 +567,12 @@ pub struct Orchestrator {
     /// reads to show a "running" state; and the lever a merge/close pulls to quit a
     /// minutes-long suite mid-flight ([`Orchestrator::cancel_turn_end_checks`]).
     /// Runtime-only; never persisted.
+    pub build_service_runtime: Arc<
+        Mutex<HashMap<String, crate::orchestrator::build_services::BuildServiceRuntimeDiagnostic>>,
+    >,
     pub turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
+    /// Fair, runner-wide resource admission shared by write and review checks.
+    pub check_admission: Arc<crate::execution::check_admission::CheckAdmissionController>,
     /// Pool of long-lived Codex app-servers for EPHEMERAL CALLS (CAIRN-2549).
     /// Each pooled call is a `thread/start` on a shared process rather than a
     /// process of its own. Deliberately owned HERE and NOT in
@@ -564,6 +615,8 @@ pub struct Orchestrator {
     // === Cloud API ===
     /// Cloud API endpoint configuration (account, sync, bug reports)
     pub api_config: ApiConfig,
+    team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
+    team_attention_push_dedupe: Arc<TokioMutex<HashMap<String, String>>>,
 
     /// Typed effect queue for async draining.
     ///
@@ -805,6 +858,7 @@ impl Orchestrator {
                 crate::orchestrator::attention_delivery::create_resolved_push(self, &event);
             }
         }
+        team_attention_push::maybe_notify(self, &event);
         let _ = self.attention_changed.send(event);
     }
 
@@ -902,6 +956,17 @@ impl Orchestrator {
             .lock()
             .map(|map| map.contains_key(job_id))
             .unwrap_or(false)
+    }
+
+    pub(crate) fn turn_end_check_runtime_status(
+        &self,
+        job_id: &str,
+    ) -> Option<TurnEndCheckRuntimeStatus> {
+        self.turn_end_checks_in_flight
+            .lock()
+            .ok()?
+            .get(job_id)?
+            .runtime_status()
     }
 
     /// Signal any in-flight turn-end check suite for `job_id` to quit. Best-effort

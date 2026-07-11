@@ -2,7 +2,7 @@
 //! and small db-change helpers. Sliced verbatim from the former single-file
 //! `lifecycle.rs`; the module overview lives on the `lifecycle` facade.
 
-use crate::models::{RunStatus, TurnState};
+use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError};
 
@@ -38,6 +38,7 @@ pub(super) fn apply_turn_outcome(
     orch: &Orchestrator,
     turn_id: &str,
     outcome: TurnState,
+    end_reason: Option<TurnEndReason>,
 ) -> Result<(), String> {
     if !matches!(
         outcome,
@@ -54,6 +55,7 @@ pub(super) fn apply_turn_outcome(
 
     let turn_id = turn_id.to_string();
     let outcome_str = outcome.to_string();
+    let end_reason = end_reason.map(|reason| reason.to_string());
     run_db_blocking({
         let dbs = orch.db.clone();
         move || async move {
@@ -63,6 +65,7 @@ pub(super) fn apply_turn_outcome(
             db.write(|conn| {
                 let turn_id = turn_id.clone();
                 let outcome_str = outcome_str.clone();
+                let end_reason = end_reason.clone();
                 Box::pin(async move {
                     let mut rows = conn
                         .query(
@@ -125,10 +128,16 @@ pub(super) fn apply_turn_outcome(
                     conn.execute(
                         "UPDATE turns
                      SET state = ?1,
-                         ended_at = ?2,
-                         updated_at = ?2
-                     WHERE id = ?3",
-                        (outcome.to_string().as_str(), now, turn_id.as_str()),
+                         end_reason = ?2,
+                         ended_at = ?3,
+                         updated_at = ?3
+                     WHERE id = ?4",
+                        (
+                            outcome.to_string().as_str(),
+                            end_reason.as_deref(),
+                            now,
+                            turn_id.as_str(),
+                        ),
                     )
                     .await?;
                     Ok(())
@@ -142,8 +151,13 @@ pub(super) fn apply_turn_outcome(
     Ok(())
 }
 
-pub(super) fn interrupt_turn(orch: &Orchestrator, turn_id: &str) -> Result<(), String> {
+pub(super) fn interrupt_turn(
+    orch: &Orchestrator,
+    turn_id: &str,
+    end_reason: Option<TurnEndReason>,
+) -> Result<(), String> {
     let turn_id = turn_id.to_string();
+    let end_reason = end_reason.map(|reason| reason.to_string());
     run_db_blocking({
         let dbs = orch.db.clone();
         move || async move {
@@ -152,6 +166,7 @@ pub(super) fn interrupt_turn(orch: &Orchestrator, turn_id: &str) -> Result<(), S
                 .map_err(|e| e.to_string())?;
             db.write(|conn| {
                 let turn_id = turn_id.clone();
+                let end_reason = end_reason.clone();
                 Box::pin(async move {
                     let mut rows = conn
                         .query(
@@ -208,10 +223,11 @@ pub(super) fn interrupt_turn(orch: &Orchestrator, turn_id: &str) -> Result<(), S
                     conn.execute(
                         "UPDATE turns
                      SET state = 'interrupted',
-                         ended_at = ?1,
-                         updated_at = ?1
-                     WHERE id = ?2",
-                        (now, turn_id.as_str()),
+                         end_reason = ?1,
+                         ended_at = ?2,
+                         updated_at = ?2
+                     WHERE id = ?3",
+                        (end_reason.as_deref(), now, turn_id.as_str()),
                     )
                     .await?;
                     Ok(())
@@ -333,11 +349,17 @@ pub(super) fn transition_run(
             .map_err(|e| e.to_string())
         }
     })?;
-    let job_id = job_id_for_run(orch, &emit_run_id);
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        crate::notify::run_db_change_ids("update", &emit_run_id, job_id.as_deref()),
-    );
+    let change = run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = emit_run_id.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(crate::notify::run_db_change_for_id(&db, &run_id, "update").await)
+        }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", change);
     Ok(from)
 }
 

@@ -172,7 +172,10 @@ pub(crate) const TASK_CHAT_RAW_CONTRACT: ResourceContract = ResourceContract {
     name: "Raw task transcript",
     description:
         "Full unsummarized sub-task transcript stream; the digest's programmatic and grep fallback",
-    read_projections: NO_PROJECTIONS,
+    read_projections: &[ProjectionSpec {
+        key: "format",
+        values: "json (JSONL with one reconstructed event per line; Markdown by default)",
+    }],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
@@ -236,3 +239,14 @@ pub(crate) const TASK_ARTIFACT_CONTRACT: ResourceContract =
             },
         ],
     };
+
+pub(crate) const TASK_BROWSER_NETWORK_REQUEST_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::TaskBrowserNetworkRequest,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/browser/{slug}/network/{request_id}",
+    name: "Task browser network request",
+    description: "Sanitized detail for one stable task-browser network capture handle. Request and response bodies are bounded, binary and cross-origin bodies are explicitly omitted, and portable redirect data is aggregate-only. Handles survive navigation but expire on browser close, runner restart, or bounded archive eviction.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[],
+};

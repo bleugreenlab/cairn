@@ -320,9 +320,10 @@ pub(crate) async fn query_db(
 
 /// Ask a running dev instance for its window's OS process id over its MCP
 /// callback server. The instance answers the `process_info` tool with the pid
-/// its desktop app registered over `/ws` (the window's `std::process::id()`),
-/// falling back to the serving runner's own pid when no window is attached — no
-/// `lsof`, and it proves liveness in the same round trip the db relay uses.
+/// its desktop app registered over `/ws` (the window's `std::process::id()`). A
+/// windowless runner is reported as unavailable rather than returning the
+/// daemon's unrelated pid — no `lsof`, and the callback proves liveness in the
+/// same round trip the db relay uses.
 /// Errors are short fragments composed into a `pid_line`.
 pub(crate) async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
     let token = cairn_common::auth::load_mcp_token_from(&instance.home).ok_or_else(|| {
@@ -379,6 +380,9 @@ pub(crate) async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
 
 /// Parse the `process_info` callback result — a bare process id — into a pid.
 fn parse_pid_body(result: &str) -> Result<u32, String> {
+    if result.trim() == crate::dispatch::NO_ATTACHED_UI_PID {
+        return Err("no desktop UI is attached; launch or reconnect the dev GUI".to_string());
+    }
     result
         .trim()
         .parse::<u32>()
@@ -660,5 +664,13 @@ mod tests {
         // A framed/error body (not a bare pid) is rejected rather than silently
         // yielding a bogus pid.
         assert!(parse_pid_body("Unknown tool: process_info").is_err());
+    }
+
+    #[test]
+    fn parse_pid_body_explains_when_runner_has_no_gui() {
+        assert_eq!(
+            parse_pid_body(crate::dispatch::NO_ATTACHED_UI_PID).unwrap_err(),
+            "no desktop UI is attached; launch or reconnect the dev GUI"
+        );
     }
 }

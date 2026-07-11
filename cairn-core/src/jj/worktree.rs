@@ -103,7 +103,15 @@ pub fn revision_descends_from(jj: &JjEnv, store: &Path, revision: &str, ancestor
     let revset = format!("{ancestor}::{revision} & {revision}");
     jj.run(
         store,
-        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "commit_id",
+            "--ignore-working-copy",
+        ],
         "jj ancestry proof",
     )
     .map(|out| !out.trim().is_empty())
@@ -162,15 +170,16 @@ pub(crate) fn sealed_tree_hash_via_git(
     commit: &str,
 ) -> Result<String, String> {
     let git_dir = git_backend_root(jj, ws)?;
-    let out = crate::env::git()
-        .args([
+    let out = bounded_command_output(
+        crate::env::git().args([
             "--git-dir",
             &git_dir,
             "rev-parse",
             &format!("{commit}^{{tree}}"),
-        ])
-        .output()
-        .map_err(|e| format!("git rev-parse tree: {e}"))?;
+        ]),
+        JJ_DEFAULT_TIMEOUT,
+        "git rev-parse tree",
+    )?;
     if !out.status.success() {
         return Err(format!(
             "git rev-parse tree failed: {}",
@@ -203,10 +212,11 @@ pub fn sealed_tree_entries(jj: &JjEnv, ws: &Path) -> Result<Vec<(String, String)
 /// tree even when that baseline was re-stamped by another branch or node.
 pub fn tree_entries(jj: &JjEnv, ws: &Path, treeish: &str) -> Result<Vec<(String, String)>, String> {
     let git_dir = git_backend_root(jj, ws)?;
-    let out = crate::env::git()
-        .args(["--git-dir", &git_dir, "ls-tree", "-r", "-z", treeish])
-        .output()
-        .map_err(|e| format!("git ls-tree: {e}"))?;
+    let out = bounded_command_output(
+        crate::env::git().args(["--git-dir", &git_dir, "ls-tree", "-r", "-z", treeish]),
+        JJ_DEFAULT_TIMEOUT,
+        "git ls-tree",
+    )?;
     if !out.status.success() {
         return Err(format!(
             "git ls-tree failed for {treeish}: {}",

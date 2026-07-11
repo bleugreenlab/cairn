@@ -16,8 +16,8 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
 /// The durable mirror of a native webview pane. No run_id/session_id/exit_code/
-/// command — those are PTY concepts. `webview_label` is the stable Tauri
-/// webview label used as the `BrowserRegistry` key.
+/// command — those are PTY concepts. `webview_label` identifies the current
+/// webview generation and is used as the `BrowserRegistry` key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobBrowser {
     pub id: String,
@@ -42,6 +42,10 @@ pub struct JobBrowser {
 pub const STATUS_OPEN: &str = "open";
 pub const STATUS_CLOSED: &str = "closed";
 
+fn fresh_webview_label(browser_id: &str) -> String {
+    format!("browser:{browser_id}:{}", uuid::Uuid::new_v4())
+}
+
 /// The owning scope of a browser: a job (node/task browsers) or a project
 /// (the user's own persistent project browsers).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,11 +55,12 @@ pub enum BrowserScope {
 }
 
 impl JobBrowser {
-    /// Build a fresh open browser row for a scope, generating the id and the
-    /// stable `browser:{id}` webview label.
+    /// Build a fresh open browser row for a scope. The browser id remains durable,
+    /// while the webview label includes an opaque generation that rotates on
+    /// reopen so late events from a destroyed page can be rejected.
     pub fn new(scope: &BrowserScope, slug: &str, url: Option<String>, now: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let webview_label = format!("browser:{id}");
+        let webview_label = fresh_webview_label(&id);
         let (job_id, project_id) = match scope {
             BrowserScope::Job(job_id) => (Some(job_id.clone()), None),
             BrowserScope::Project(project_id) => (None, Some(project_id.clone())),
@@ -336,17 +341,29 @@ pub async fn ensure_open_browser(
 
             match existing {
                 Some(mut browser) => {
+                    let webview_label = if browser.status == STATUS_CLOSED {
+                        fresh_webview_label(&browser.id)
+                    } else {
+                        browser.webview_label.clone()
+                    };
                     // Reopen-if-closed and overwrite-url-if-given in one UPDATE so
-                    // the result is open regardless of the row's prior status.
+                    // the result is open regardless of the row's prior status. A
+                    // reopened browser receives a new webview generation label.
                     conn.execute(
                         "UPDATE job_browsers
-                         SET status = ?1, closed_at = NULL, url = COALESCE(?2, url)
-                         WHERE id = ?3",
-                        params![STATUS_OPEN, url.as_deref(), browser.id.as_str()],
+                         SET status = ?1, closed_at = NULL, url = COALESCE(?2, url), webview_label = ?3
+                         WHERE id = ?4",
+                        params![
+                            STATUS_OPEN,
+                            url.as_deref(),
+                            webview_label.as_str(),
+                            browser.id.as_str()
+                        ],
                     )
                     .await?;
                     browser.status = STATUS_OPEN.to_string();
                     browser.closed_at = None;
+                    browser.webview_label = webview_label;
                     if url.is_some() {
                         browser.url = url.clone();
                     }
@@ -772,12 +789,6 @@ pub enum BridgeRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
-    /// Return the page's captured network ring buffer (oldest first), capped to
-    /// the most recent `limit` entries when given.
-    GetNetwork {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
     /// List the page's actionable elements, each with an ordinal handle, a
     /// durable selector+snippet anchor, and a descriptor. Caps to `limit`
     /// (default 200 page-side).
@@ -817,31 +828,6 @@ pub struct ConsoleEntry {
     pub stack: Option<String>,
 }
 
-/// One captured network request summary from the page's ring buffer. Bodies are
-/// never captured — only the method/url and the response shape (status, duration,
-/// ok, optional content-length size, or an error string on failure).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NetworkEntry {
-    pub ts: i64,
-    pub method: String,
-    pub url: String,
-    /// Resource type / initiator: document, script, img, css, font, fetch, xhr,
-    /// beacon, other. From Resource Timing's `initiatorType` where available.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
-    pub kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ok: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<i64>,
-}
-
 /// The result the content script posts back over IPC, parsed from the
 /// `browser_bridge_message` payload string. All fields are optional so a partial
 /// or error result still deserializes.
@@ -866,9 +852,6 @@ pub struct BridgeResponse {
     /// Captured console entries for a `GetConsole` request.
     #[serde(default)]
     pub logs: Option<Vec<ConsoleEntry>>,
-    /// Captured network summaries for a `GetNetwork` request.
-    #[serde(default)]
-    pub requests: Option<Vec<NetworkEntry>>,
     /// Actionable elements for a `ListInteractive` request.
     #[serde(default)]
     pub elements: Option<Vec<InteractiveElement>>,
@@ -988,6 +971,53 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn runner_restart_restores_open_browser_capture_generation() {
+        let db = test_db().await;
+        seed_project(&db, "p-restart").await;
+        let scope = BrowserScope::Project("p-restart".to_string());
+        let (browser, _) = ensure_open_browser(&db, scope, "main", None, 10)
+            .await
+            .unwrap();
+
+        // A restarted runner has a fresh runtime archive while the desktop's
+        // webview and its persisted open row retain the existing generation.
+        let archive = crate::browser_network::BrowserNetworkArchive::default();
+        assert_eq!(
+            crate::browser_network::restore_open_generations(&db, &archive)
+                .await
+                .unwrap(),
+            1
+        );
+        archive
+            .insert_json_for_generation(
+                &browser.id,
+                &browser.webview_label,
+                r#"{"id":"restart-1","ts":1,"method":"GET","url":"https://example.test/data"}"#,
+                &crate::browser_network::RedactionPolicy::default(),
+            )
+            .unwrap();
+        assert!(archive.get(&browser.id, "restart-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn reopening_rotates_the_webview_generation_label() {
+        let db = test_db().await;
+        seed_project(&db, "p-reopen").await;
+        let scope = BrowserScope::Project("p-reopen".to_string());
+        let (opened, inserted) = ensure_open_browser(&db, scope.clone(), "main", None, 10)
+            .await
+            .unwrap();
+        assert!(inserted);
+        mark_browser_closed(&db, &opened.id, 11).await.unwrap();
+        let (reopened, inserted) = ensure_open_browser(&db, scope, "main", None, 12)
+            .await
+            .unwrap();
+        assert!(!inserted);
+        assert_eq!(reopened.id, opened.id);
+        assert_ne!(reopened.webview_label, opened.webview_label);
     }
 
     #[tokio::test]
@@ -1294,14 +1324,10 @@ mod tests {
             serde_json::to_value(BridgeRequest::GetConsole { limit: None }).unwrap(),
             serde_json::json!({"kind": "getConsole"})
         );
-        assert_eq!(
-            serde_json::to_value(BridgeRequest::GetNetwork { limit: None }).unwrap(),
-            serde_json::json!({"kind": "getNetwork"})
-        );
     }
 
     #[test]
-    fn bridge_response_parses_console_and_network_buffers() {
+    fn bridge_response_parses_console_buffer() {
         use super::BridgeResponse;
         let console: BridgeResponse = serde_json::from_str(
             r#"{"ok":true,"logs":[{"ts":1700000000000,"level":"error","message":"boom","stack":"at x"},{"ts":1700000000001,"level":"log","message":"hi"}]}"#,
@@ -1313,18 +1339,6 @@ mod tests {
         assert_eq!(logs[0].stack.as_deref(), Some("at x"));
         assert_eq!(logs[1].message, "hi");
         assert_eq!(logs[1].stack, None);
-
-        let network: BridgeResponse = serde_json::from_str(
-            r#"{"ok":true,"requests":[{"ts":1700000000000,"method":"GET","url":"https://a/b","status":200,"durationMs":12,"ok":true,"size":1234},{"ts":1700000000001,"method":"POST","url":"https://a/c","status":null,"ok":false,"durationMs":5,"error":"refused"}]}"#,
-        )
-        .unwrap();
-        let reqs = network.requests.unwrap();
-        assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0].status, Some(200));
-        assert_eq!(reqs[0].size, Some(1234));
-        assert_eq!(reqs[0].ok, Some(true));
-        assert_eq!(reqs[1].status, None);
-        assert_eq!(reqs[1].error.as_deref(), Some("refused"));
     }
 
     #[test]

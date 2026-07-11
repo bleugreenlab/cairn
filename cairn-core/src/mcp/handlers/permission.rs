@@ -224,10 +224,11 @@ pub(crate) async fn await_permission_decision(
         serde_json::json!({"table": "permission_requests", "action": "insert"}),
     );
     if yielded_turn {
-        let _ = services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "update"}),
-        );
+        if let Some(turn_id) = current_turn_id.as_deref() {
+            let change =
+                crate::notify::turn_db_change_for_id(&orch.db.local, turn_id, "update").await;
+            let _ = services.emitter.emit("db-change", change);
+        }
     }
 
     emit_permission_attention(
@@ -275,7 +276,8 @@ pub(crate) async fn await_permission_decision(
                 .await
                 {
                     Ok(Some(successor)) => {
-                        emit_successor_turn_events(&*services.emitter, &successor);
+                        emit_successor_turn_events(&orch.db.local, &*services.emitter, &successor)
+                            .await;
                         orch.process_state
                             .set_current_turn_id(run_id, Some(&successor.turn_id));
                     }
@@ -1018,11 +1020,9 @@ pub async fn resolve_permission_request(
         "db-change",
         serde_json::json!({"table": "permission_requests", "action": "update"}),
     );
-    if resume.successor_turn_id.is_some() {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "update"}),
-        );
+    if let Some(turn_id) = resume.successor_turn_id.as_deref() {
+        let change = crate::notify::turn_db_change_for_id(&owning_db, turn_id, "update").await;
+        let _ = orch.services.emitter.emit("db-change", change);
     }
 
     // Slow path: no inline waiter was present before the answer was broadcast,
@@ -1287,6 +1287,7 @@ async fn resume_suspended_permission(
 
     let prompt_resume = crate::execution::jobs::ResumeContext {
         suppress_user_event: true,
+        ..Default::default()
     };
     crate::execution::jobs::continue_job_impl(
         orch,
@@ -1618,21 +1619,18 @@ pub struct SuccessorTurnUpdate {
     started: bool,
 }
 
-pub(super) fn emit_successor_turn_events(
+pub(super) async fn emit_successor_turn_events(
+    db: &LocalDb,
     emitter: &dyn crate::services::EventEmitter,
     update: &SuccessorTurnUpdate,
 ) {
     if update.inserted {
-        let _ = emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "insert"}),
-        );
+        let change = crate::notify::turn_db_change_for_id(db, &update.turn_id, "insert").await;
+        let _ = emitter.emit("db-change", change);
     }
     if update.started {
-        let _ = emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "update"}),
-        );
+        let change = crate::notify::turn_db_change_for_id(db, &update.turn_id, "update").await;
+        let _ = emitter.emit("db-change", change);
     }
 }
 

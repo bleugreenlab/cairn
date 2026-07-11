@@ -1,7 +1,10 @@
 //! jj subprocess driver (`JjEnv`), repo/file probes, per-project store
 //! provisioning, and populate/auto-track fileset translation.
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -12,8 +15,84 @@ use crate::mcp::git::GitAuthor;
 /// is injected via `--config user.{name,email}=…` on each seal.
 const JJ_DEFAULT_USER_NAME: &str = "Cairn Agent";
 const JJ_DEFAULT_USER_EMAIL: &str = "agent@cairn.local";
+pub(crate) const JJ_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const JJ_NETWORK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Run a subprocess with drained output pipes and a hard deadline. The child is
+/// placed in its own process group on Unix so timeout cleanup also reaches git,
+/// ssh, credential helpers, and any other descendants spawned by jj.
+pub(crate) fn bounded_command_output(
+    command: &mut Command,
+    timeout: Duration,
+    ctx: &str,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command.spawn().map_err(|e| format!("{ctx}: {e}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = stdout;
+        reader.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = stderr;
+        reader.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        match child.try_wait().map_err(|e| format!("{ctx}: {e}"))? {
+            Some(status) => break (status, false),
+            None if Instant::now() >= deadline => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let status = child.wait().map_err(|e| format!("{ctx}: {e}"))?;
+                break (status, true);
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| format!("{ctx}: stdout reader panicked"))?
+        .map_err(|e| format!("{ctx}: read stdout: {e}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| format!("{ctx}: stderr reader panicked"))?
+        .map_err(|e| format!("{ctx}: read stderr: {e}"))?;
+    if timed_out {
+        return Err(format!(
+            "{ctx} timed out after {}s and was killed",
+            timeout.as_secs_f64()
+        ));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 /// Drives a bundled, non-interactive `jj` binary.
+#[derive(Clone)]
 pub struct JjEnv {
     bin: String,
     config_path: PathBuf,
@@ -45,7 +124,11 @@ impl JjEnv {
             return "jj".to_string();
         }
 
-        match crate::env::command(bundled_bin).arg("--version").output() {
+        match bounded_command_output(
+            crate::env::command(bundled_bin).arg("--version"),
+            JJ_DEFAULT_TIMEOUT,
+            "bundled jj --version",
+        ) {
             Ok(output) if output.status.success() => bundled_bin.to_string(),
             Ok(output) => {
                 log::warn!(
@@ -89,7 +172,9 @@ impl JjEnv {
         c.current_dir(cwd)
             .env("JJ_CONFIG", &self.config_path)
             .env("EDITOR", "true")
-            .env("JJ_EDITOR", "true");
+            .env("JJ_EDITOR", "true")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "true");
         c
     }
 
@@ -109,6 +194,8 @@ impl JjEnv {
             ),
             ("EDITOR".into(), "true".into()),
             ("JJ_EDITOR".into(), "true".into()),
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+            ("GIT_ASKPASS".into(), "true".into()),
         ]
     }
 
@@ -142,16 +229,22 @@ impl JjEnv {
         args: &[&str],
         ctx: &str,
     ) -> Result<Vec<u8>, String> {
+        self.run_bytes_with_timeout(cwd, args, ctx, JJ_DEFAULT_TIMEOUT)
+    }
+
+    pub(crate) fn run_bytes_with_timeout(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        ctx: &str,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
         #[cfg(test)]
         let _guard = jj_subprocess_lock()
             .lock()
             .expect("jj subprocess test lock poisoned");
 
-        let out = self
-            .cmd(cwd)
-            .args(args)
-            .output()
-            .map_err(|e| format!("{ctx}: {e}"))?;
+        let out = bounded_command_output(self.cmd(cwd).args(args), timeout, ctx)?;
         if !out.status.success() {
             return Err(format!(
                 "{ctx} failed: {}",
@@ -164,6 +257,17 @@ impl JjEnv {
     /// Run a jj command, returning trimmed stdout or a contextual error.
     pub(crate) fn run(&self, cwd: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
         let out = self.run_bytes(cwd, args, ctx)?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    pub(crate) fn run_with_timeout(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        ctx: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let out = self.run_bytes_with_timeout(cwd, args, ctx, timeout)?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 }
@@ -263,10 +367,11 @@ pub fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
 /// checkout's branch, so a sibling can rebase onto `<default>@origin`. Mirrors
 /// `import_git`: a one-liner over the store's backing git.
 pub fn fetch_remote(jj: &JjEnv, store_dir: &Path, remote: &str) -> Result<(), String> {
-    jj.run(
+    jj.run_with_timeout(
         store_dir,
         &["git", "fetch", "--remote", remote],
         "jj git fetch",
+        JJ_NETWORK_TIMEOUT,
     )
     .map(|_| ())
 }
@@ -358,6 +463,66 @@ pub fn set_populate_auto_track(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(jj)]
+    fn managed_command_times_out_and_kills_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TempDir::new().unwrap();
+        let script = home.path().join("slow-jj");
+        let pid_file = home.path().join("pid");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let jj = JjEnv {
+            bin: script.to_string_lossy().into_owned(),
+            config_path: home.path().join("config.toml"),
+        };
+
+        let started = Instant::now();
+        let error = jj
+            .run_bytes_with_timeout(home.path(), &[], "slow jj", Duration::from_millis(500))
+            .unwrap_err();
+        assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "timed-out child is still alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(jj)]
+    fn managed_command_disables_git_prompts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TempDir::new().unwrap();
+        let script = home.path().join("env-jj");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s:%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_ASKPASS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let jj = JjEnv {
+            bin: script.to_string_lossy().into_owned(),
+            config_path: home.path().join("config.toml"),
+        };
+
+        assert_eq!(jj.run(home.path(), &[], "env jj").unwrap(), "0:true");
+    }
 
     #[test]
     #[serial_test::serial(jj)]

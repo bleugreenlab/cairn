@@ -67,9 +67,10 @@ pub(in crate::backends) fn transition_run_to_live(
     run_id: &str,
 ) -> Result<(), String> {
     let db = db.clone();
+    let emit_db = db.clone();
     let run_id = run_id.to_string();
     let emit_run_id = run_id.clone();
-    let job_id = run_backend_db(backend_name, async move {
+    let _job_id = run_backend_db(backend_name, async move {
         db.write(|conn| {
             let run_id = run_id.clone();
             Box::pin(async move {
@@ -119,10 +120,10 @@ pub(in crate::backends) fn transition_run_to_live(
         .await
         .map_err(|e| e.to_string())
     })?;
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        crate::notify::run_db_change_ids("update", &emit_run_id, job_id.as_deref()),
-    );
+    let change = run_backend_db(backend_name, async move {
+        Ok(crate::notify::run_db_change_for_id(&emit_db, &emit_run_id, "update").await)
+    })?;
+    let _ = orch.services.emitter.emit("db-change", change);
     Ok(())
 }
 

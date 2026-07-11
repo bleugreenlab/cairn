@@ -387,7 +387,7 @@ pub async fn execute_programmatic_checkpoint(
     worktree_path: &str,
     command: &str,
 ) -> Result<CheckpointRunOutput, String> {
-    use std::process::Command;
+    use tokio::process::Command;
 
     log::info!(
         "Running programmatic checkpoint: '{}' in {}",
@@ -401,6 +401,7 @@ pub async fn execute_programmatic_checkpoint(
         .current_dir(worktree_path)
         .env("PATH", crate::env::get_user_path())
         .output()
+        .await
         .map_err(|e| format!("Failed to execute checkpoint command: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

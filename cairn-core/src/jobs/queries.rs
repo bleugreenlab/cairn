@@ -774,6 +774,9 @@ pub struct IssueAgentRef {
     pub node_name: Option<String>,
     pub agent_config_id: Option<String>,
     pub activity: NodeActivity,
+    /// Timestamp of the head turn that produced this activity. Consumers use it
+    /// to choose the most recently active agent when several jobs are live.
+    pub activity_updated_at: i64,
 }
 
 /// The cached pull-request facts for an issue's current execution, mirrored
@@ -821,6 +824,10 @@ pub struct IssueStatusIndicator {
     /// from `job_ids`. Kept on this struct (rather than layered on later) so the
     /// serialized payload is whole.
     pub checks_running: bool,
+    /// Whether a latest non-PR artifact version is awaiting human confirmation.
+    /// This deliberately excludes `create-pr`: open PR attention is represented
+    /// by `pr`, not by the generic artifact-review glyph.
+    pub artifact_waiting: bool,
 }
 
 /// Roll several jobs' activities into one issue-level signal with
@@ -861,6 +868,58 @@ fn rollup_activity(activities: impl IntoIterator<Item = NodeActivity>) -> NodeAc
 /// checks are in flight is an in-memory orchestrator fact with no DB column, so
 /// the transport command fills it from `Orchestrator::turn_end_checks_in_flight`
 /// using the returned `job_ids`.
+const ISSUE_STATUS_JOB_ROWS_SQL: &str = "SELECT
+    i.id AS issue_id,
+    j.id AS job_id,
+    j.node_name,
+    j.agent_config_id,
+    COALESCE(
+        (SELECT ct.state FROM turns ct WHERE ct.id = j.current_turn_id),
+        (SELECT t.state
+           FROM turns t
+          WHERE t.job_id = j.id
+          ORDER BY t.created_at DESC, t.sequence DESC
+          LIMIT 1)
+    ) AS head_turn_state,
+    MAX(
+        COALESCE((
+            SELECT MAX(ms.updated_at)
+              FROM message_streams ms
+             WHERE ms.turn_id = j.current_turn_id
+        ), 0),
+        COALESCE((
+            SELECT MAX(ev.created_at)
+              FROM events ev
+             WHERE ev.turn_id = j.current_turn_id
+        ), 0),
+        COALESCE((
+            SELECT ct.updated_at
+              FROM turns ct
+             WHERE ct.id = j.current_turn_id
+        ), j.updated_at)
+    ) AS activity_updated_at,
+    EXISTS (
+        SELECT 1 FROM prompts p
+         WHERE p.turn_id = j.current_turn_id
+           AND p.response IS NULL
+    ) AS has_pending_prompt,
+    EXISTS (
+        SELECT 1 FROM permission_requests pr
+         LEFT JOIN runs r ON pr.run_id = r.id
+         WHERE COALESCE(pr.job_id, r.job_id) = j.id
+           AND pr.status = 'pending'
+    ) AS has_pending_permission
+ FROM issues i
+ JOIN jobs j ON j.issue_id = i.id
+ WHERE i.project_id = ?1
+   AND i.status IN ('active', 'waiting')
+   AND j.execution_id = (
+       SELECT e.id FROM executions e
+        WHERE e.issue_id = i.id
+        ORDER BY e.seq DESC
+        LIMIT 1
+   )";
+
 pub async fn issue_status_indicators(
     db: &LocalDb,
     project_id: &str,
@@ -895,48 +954,11 @@ pub async fn issue_status_indicators(
                 node_name: Option<String>,
                 agent_config_id: Option<String>,
                 activity: NodeActivity,
+                activity_updated_at: i64,
             }
             let mut job_rows: Vec<JobRow> = Vec::new();
             let mut rows = conn
-                .query(
-                    "SELECT
-                        i.id AS issue_id,
-                        j.id AS job_id,
-                        j.node_name,
-                        j.agent_config_id,
-                        COALESCE(
-                            (SELECT ct.state
-                               FROM turns ct
-                              WHERE ct.id = j.current_turn_id),
-                            (SELECT t.state
-                               FROM turns t
-                              WHERE t.job_id = j.id
-                              ORDER BY t.created_at DESC, t.sequence DESC
-                              LIMIT 1)
-                        ) AS head_turn_state,
-                        EXISTS (
-                            SELECT 1 FROM prompts p
-                             WHERE p.turn_id = j.current_turn_id
-                               AND p.response IS NULL
-                        ) AS has_pending_prompt,
-                        EXISTS (
-                            SELECT 1 FROM permission_requests pr
-                             LEFT JOIN runs r ON pr.run_id = r.id
-                             WHERE COALESCE(pr.job_id, r.job_id) = j.id
-                               AND pr.status = 'pending'
-                        ) AS has_pending_permission
-                     FROM issues i
-                     JOIN jobs j ON j.issue_id = i.id
-                     WHERE i.project_id = ?1
-                       AND i.status IN ('active', 'waiting')
-                       AND j.execution_id = (
-                           SELECT e.id FROM executions e
-                            WHERE e.issue_id = i.id
-                            ORDER BY e.seq DESC
-                            LIMIT 1
-                       )",
-                    params![project_id.as_str()],
-                )
+                .query(ISSUE_STATUS_JOB_ROWS_SQL, params![project_id.as_str()])
                 .await?;
             while let Some(row) = rows.next().await? {
                 let issue_id = row.text(0)?;
@@ -944,8 +966,9 @@ pub async fn issue_status_indicators(
                 let node_name = row.opt_text(2)?;
                 let agent_config_id = row.opt_text(3)?;
                 let head_turn_state = row.opt_text(4)?;
-                let has_pending_prompt = row.i64(5)? != 0;
-                let has_pending_permission = row.i64(6)? != 0;
+                let activity_updated_at = row.i64(5)?;
+                let has_pending_prompt = row.i64(6)? != 0;
+                let has_pending_permission = row.i64(7)? != 0;
                 job_rows.push(JobRow {
                     issue_id,
                     job_id,
@@ -956,6 +979,7 @@ pub async fn issue_status_indicators(
                         has_pending_prompt,
                         has_pending_permission,
                     ),
+                    activity_updated_at,
                 });
             }
 
@@ -1039,11 +1063,44 @@ pub async fn issue_status_indicators(
                 pr_by_issue.entry(pr_row.issue_id).or_insert(pr_row.pr);
             }
 
+            // (4) Issues whose current execution has a latest non-PR artifact
+            // version still awaiting confirmation. An older unconfirmed version
+            // does not count once a newer version in the same output chain exists.
+            let mut artifact_waiting_issues = std::collections::HashSet::new();
+            let mut rows = conn
+                .query(
+                    "SELECT DISTINCT i.id
+                       FROM issues i
+                       JOIN jobs j ON j.issue_id = i.id
+                       JOIN artifacts a ON a.job_id = j.id
+                      WHERE i.project_id = ?1
+                        AND i.status IN ('active', 'waiting')
+                        AND j.execution_id = (
+                            SELECT e.id FROM executions e
+                             WHERE e.issue_id = i.id
+                             ORDER BY e.seq DESC
+                             LIMIT 1
+                        )
+                        AND a.artifact_type != 'create-pr'
+                        AND a.confirmed = 0
+                        AND NOT EXISTS (
+                            SELECT 1 FROM artifacts newer
+                             WHERE newer.job_id = a.job_id
+                               AND newer.output_name IS a.output_name
+                               AND newer.version > a.version
+                        )",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                artifact_waiting_issues.insert(row.text(0)?);
+            }
+
             let mut out = Vec::with_capacity(issue_ids.len());
             for issue_id in issue_ids {
                 let jobs = jobs_by_issue.remove(&issue_id).unwrap_or_default();
                 let activity = rollup_activity(jobs.iter().map(|job| job.activity));
-                let agents = jobs
+                let mut agents: Vec<_> = jobs
                     .iter()
                     .filter(|job| job.activity != NodeActivity::Idle)
                     .map(|job| IssueAgentRef {
@@ -1051,8 +1108,14 @@ pub async fn issue_status_indicators(
                         node_name: job.node_name.clone(),
                         agent_config_id: job.agent_config_id.clone(),
                         activity: job.activity,
+                        activity_updated_at: job.activity_updated_at,
                     })
                     .collect();
+                agents.sort_by(|a, b| {
+                    b.activity_updated_at
+                        .cmp(&a.activity_updated_at)
+                        .then_with(|| a.job_id.cmp(&b.job_id))
+                });
                 let job_ids = jobs.iter().map(|job| job.job_id.clone()).collect();
                 out.push(IssueStatusIndicator {
                     issue_id: issue_id.clone(),
@@ -1061,6 +1124,7 @@ pub async fn issue_status_indicators(
                     pr: pr_by_issue.remove(&issue_id),
                     job_ids,
                     checks_running: false,
+                    artifact_waiting: artifact_waiting_issues.contains(&issue_id),
                 });
             }
             Ok::<Vec<IssueStatusIndicator>, DbError>(out)
@@ -1110,8 +1174,10 @@ fn has_single_downstream_action(snapshot_json: &str, node_id: &str) -> Result<bo
 mod tests {
     use super::{
         derive_node_activity, issue_status_indicators, node_status_indicators, NodeActivity,
+        ISSUE_STATUS_JOB_ROWS_SQL,
     };
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
     use std::collections::HashMap;
 
     #[test]
@@ -1196,6 +1262,78 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn issue_status_job_rows_use_hot_lookup_indexes() {
+        let db = test_db().await;
+        let jobs_issue_index: (String, Vec<String>) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut table_rows = conn
+                        .query(
+                            "SELECT tbl_name FROM sqlite_master
+                              WHERE type = 'index' AND name = 'idx_jobs_issue_id'",
+                            (),
+                        )
+                        .await?;
+                    let table = table_rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| DbError::Row("idx_jobs_issue_id is missing".to_string()))?
+                        .text(0)?;
+
+                    let mut column_rows = conn
+                        .query("PRAGMA index_info('idx_jobs_issue_id')", ())
+                        .await?;
+                    let mut columns = Vec::new();
+                    while let Some(row) = column_rows.next().await? {
+                        columns.push(row.text(2)?);
+                    }
+                    Ok((table, columns))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs_issue_index,
+            ("jobs".to_string(), vec!["issue_id".to_string()]),
+            "the migration must retain the exact jobs(issue_id) index"
+        );
+
+        let sql = format!("EXPLAIN QUERY PLAN {ISSUE_STATUS_JOB_ROWS_SQL}");
+        let plan: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, params!["p"]).await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps)
+                })
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH j USING INDEX idx_jobs_")),
+            "jobs must use an indexed search, got {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| { step.contains("SEARCH ms USING INDEX idx_message_streams_turn_id") }),
+            "message streams must be searched by turn_id, got {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN j")),
+            "issue status must not scan jobs, got {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN ms")),
+            "issue status must not scan message streams, got {plan:?}"
+        );
     }
 
     #[tokio::test]
@@ -1457,7 +1595,7 @@ mod tests {
     async fn issue_awaiting_input_outranks_a_running_sibling_job() {
         let db = test_db().await;
         seed_active_issue(&db).await;
-        // A running sibling job.
+        // A running sibling whose turn started first but later emitted streamed output.
         exec(
             &db,
             "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
@@ -1466,15 +1604,15 @@ mod tests {
         .await;
         exec(
             &db,
-            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
-             VALUES ('j-run', 'e', 'i', 'p', 'Run', 'running', 1, 1, 'run')",
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, current_turn_id)
+             VALUES ('j-run', 'e', 'i', 'p', 'Run', 'running', 1, 1, 'run', 't-run')",
         )
         .await;
-        // A job whose head turn yielded on a pending prompt (the durable wait).
+        // A later-started job whose head turn yielded on a pending prompt.
         exec(
             &db,
             "INSERT INTO turns(id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at)
-             VALUES ('t-prompt', 's-prompt', 'j-prompt', 1, 'yielded', 'user_input', 'initial', 1, 1)",
+             VALUES ('t-prompt', 's-prompt', 'j-prompt', 1, 'yielded', 'user_input', 'initial', 2, 2)",
         )
         .await;
         exec(
@@ -1486,7 +1624,19 @@ mod tests {
         exec(
             &db,
             "INSERT INTO runs(id, job_id, issue_id, created_at, updated_at)
-             VALUES ('run-prompt', 'j-prompt', 'i', 1, 1)",
+             VALUES ('run-running', 'j-run', 'i', 1, 5)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO message_streams(id, run_id, turn_id, backend, sequence, status, created_at, updated_at)
+             VALUES ('stream-running', 'run-running', 't-run', 'codex', 1, 'open', 1, 5)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO runs(id, job_id, issue_id, created_at, updated_at)
+             VALUES ('run-prompt', 'j-prompt', 'i', 2, 2)",
         )
         .await;
         exec(
@@ -1500,8 +1650,12 @@ mod tests {
         assert_eq!(indicators.len(), 1);
         let ind = &indicators[0];
         assert_eq!(ind.activity, NodeActivity::AwaitingInput);
-        // Both live jobs surface as agents (neither is idle).
+        // Both live jobs surface as agents (neither is idle), newest activity first.
         assert_eq!(ind.agents.len(), 2);
+        assert_eq!(ind.agents[0].job_id, "j-run");
+        assert_eq!(ind.agents[0].activity_updated_at, 5);
+        assert_eq!(ind.agents[1].job_id, "j-prompt");
+        assert_eq!(ind.agents[1].activity_updated_at, 2);
         assert_eq!(ind.job_ids.len(), 2);
     }
 
@@ -1664,6 +1818,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_waiting_excludes_pr_output_and_tracks_latest_non_pr_version() {
+        let db = test_db().await;
+        seed_active_issue(&db).await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j', 'e', 'i', 'p', 'Builder', 'blocked', 1, 1, 'builder')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO artifacts(id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES ('pr-artifact', 'j', 'create-pr', 1, '{}', 1, 'create-pr', 0, 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, checks_status, is_local, opened_at, updated_at)
+             VALUES ('mr', 'j', 'p', 'i', 'PR', 'feature', 'main', 'open', 'PENDING', 0, 1, 1)",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert!(
+            !indicators[0].artifact_waiting,
+            "PR output is not a generic artifact wait"
+        );
+
+        exec(
+            &db,
+            "INSERT INTO artifacts(id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES ('plan-v1', 'j', 'plan', 1, '{}', 1, 'plan', 0, 2, 2)",
+        )
+        .await;
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert!(
+            indicators[0].artifact_waiting,
+            "unconfirmed non-PR artifact is waiting"
+        );
+
+        exec(
+            &db,
+            "INSERT INTO artifacts(id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES ('plan-v2', 'j', 'plan', 1, '{}', 2, 'plan', 1, 3, 3)",
+        )
+        .await;
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert!(
+            !indicators[0].artifact_waiting,
+            "confirmed latest version supersedes old wait"
+        );
+    }
+
+    #[tokio::test]
     async fn active_issue_with_no_jobs_is_present_and_idle() {
         let db = test_db().await;
         exec(
@@ -1689,6 +1897,7 @@ mod tests {
         assert!(ind.job_ids.is_empty());
         assert!(ind.pr.is_none());
         assert!(!ind.checks_running);
+        assert!(!ind.artifact_waiting);
     }
 
     #[tokio::test]

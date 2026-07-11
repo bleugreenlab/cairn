@@ -25,7 +25,7 @@ pub struct WorktreeSettings {
 // The check/worktree-populate config value types now live in `models::project`
 // (pure serde data, no upward dependency on config). Re-exported here so every
 // `project_settings::CheckCommand`-style path keeps resolving.
-pub use crate::models::{CheckCommand, CheckPolicy, CheckWhen, PopulateConfig};
+pub use crate::models::{CheckCommand, CheckPolicy, CheckResourceClass, CheckWhen, PopulateConfig};
 
 /// Project settings as stored in YAML file.
 /// All fields are optional - missing fields use defaults.

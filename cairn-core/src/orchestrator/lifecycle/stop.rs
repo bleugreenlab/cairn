@@ -2,7 +2,7 @@
 //! and durable-wait suspension. Sliced verbatim from the former `lifecycle.rs`.
 
 use crate::agent_process::stream::TranscriptEvent;
-use crate::models::{RunStatus, TurnState};
+use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbResult, RowExt};
 use crate::transcripts::stream_store::{self, EventInsert};
@@ -211,8 +211,13 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str) {
     }
 
     let result = match state.as_str() {
-        "running" => interrupt_turn(orch, &turn_id),
-        "pending" => apply_turn_outcome(orch, &turn_id, TurnState::Cancelled),
+        "running" => interrupt_turn(orch, &turn_id, Some(TurnEndReason::UserStop)),
+        "pending" => apply_turn_outcome(
+            orch,
+            &turn_id,
+            TurnState::Cancelled,
+            Some(TurnEndReason::UserStop),
+        ),
         _ => Ok(()),
     };
 
@@ -547,10 +552,17 @@ pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
         "db-change",
         serde_json::json!({"table": "prompts", "action": "update"}),
     );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "turns", "action": "update"}),
-    );
+    let change = run_db_blocking({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(crate::notify::turn_db_change_for_job_id(&db, &job_id, "update").await)
+        }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", change);
 
     Ok(())
 }

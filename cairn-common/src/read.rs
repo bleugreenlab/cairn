@@ -8,10 +8,10 @@
 //!
 //! The envelope is the lossless *internal* contract over the cairn-cmd↔cairn-core
 //! HTTP boundary: it carries the fully composed `=== uri [suffix] ===` text, any
-//! image blocks, and the per-segment metadata used in tests and (later) by the
-//! frontend. The agent- and frontend-facing channel is the composed `text`
-//! itself; the enriched header suffix is a terse, deterministic projection of
-//! each segment's metadata, parseable without scraping body text.
+//! image blocks, and per-segment metadata. Programmatic callers may opt into the
+//! final post-budget segment bodies; they are omitted by default so agent-facing
+//! reads keep their existing response size and serialization. The enriched header
+//! suffix remains a terse, deterministic projection of each segment's metadata.
 
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,11 @@ pub struct SegmentMeta {
     /// `Record`/`Turn` unit: the plural noun for the header suffix (`"issues"`,
     /// `"messages"`, `"turns"`). `None` for other segments.
     pub unit_noun: Option<String>,
+    /// For line-framed record bodies, the number of leading physical lines that
+    /// are metadata rather than records. This lets budget truncation translate
+    /// retained lines back into truthful record counts and continuation offsets.
+    #[serde(default)]
+    pub record_prelude_lines: Option<usize>,
     pub truncated: bool,
     /// True when a sub-line character fallback was used (single-huge-line case).
     pub char_continuation: bool,
@@ -101,6 +106,7 @@ impl SegmentMeta {
             match_count: None,
             file_count: None,
             unit_noun: None,
+            record_prelude_lines: None,
             truncated: false,
             char_continuation: false,
         }
@@ -143,6 +149,10 @@ pub struct ReadBatchEnvelope {
     pub images: Vec<ImageBlock>,
     /// Lossless per-segment metadata; never surfaced as its own content block.
     pub segments: Vec<SegmentMeta>,
+    /// Final per-segment bodies, in the same order as `segments`. Present only
+    /// when the `read_batch` caller opts in with `include_bodies: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bodies: Option<Vec<String>>,
 }
 
 /// The `run` callback result over the cairn-cmd↔cairn-core boundary.

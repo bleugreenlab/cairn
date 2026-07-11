@@ -10,8 +10,19 @@ pub async fn record_live_comment_side_channel_message(
     issue_uri: &str,
     rendered: &str,
 ) -> Result<SuppressedWake, String> {
+    record_live_comment_side_channel_message_with_key(db, job_id, issue_uri, rendered, None).await
+}
+
+pub async fn record_live_comment_side_channel_message_with_key(
+    db: &LocalDb,
+    job_id: &str,
+    issue_uri: &str,
+    rendered: &str,
+    stable_id: Option<&str>,
+) -> Result<SuppressedWake, String> {
     insert_message_wake_row(
         db,
+        stable_id,
         None,
         job_id,
         SOURCE_KIND_ISSUE_COMMENT,
@@ -31,6 +42,7 @@ pub async fn record_live_issue_message_side_channel_message(
 ) -> Result<SuppressedWake, String> {
     insert_message_wake_row(
         db,
+        None,
         None,
         job_id,
         SOURCE_KIND_ISSUE_MESSAGE,
@@ -113,6 +125,7 @@ async fn select_pending_live_side_channel(
 #[allow(clippy::too_many_arguments)]
 async fn insert_message_wake_row(
     db: &LocalDb,
+    stable_id: Option<&str>,
     subscription_id: Option<&str>,
     job_id: &str,
     source_kind: &str,
@@ -121,7 +134,9 @@ async fn insert_message_wake_row(
     detail_uri: Option<&str>,
     content: &str,
 ) -> Result<SuppressedWake, String> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = stable_id
+        .map(ToString::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let now = chrono::Utc::now().timestamp();
     let subscription_id = subscription_id.map(ToString::to_string);
     let job_id = job_id.to_string();
@@ -141,7 +156,7 @@ async fn insert_message_wake_row(
         let content = content.clone();
         Box::pin(async move {
             conn.execute(
-                "INSERT INTO suppressed_wakes
+                "INSERT OR IGNORE INTO suppressed_wakes
                  (id, subscription_id, job_id, source_kind, source_ref, fact_kind,
                   occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?9, NULL)",

@@ -56,7 +56,7 @@ pub(crate) const DEV_PID_CONTRACT: ResourceContract =
         kind: ResourceKind::DevPid,
         uri_template: "cairn://dev/pid",
         name: "Dev instance process id",
-        description: "The OS process id(s) of running `bun run dev:instance`(s). Each instance reports its own std::process::id() over its MCP callback server (authoritative, no lsof), so a caller can target the process with external tools such as Axon accessibility without shelling out. read cairn://dev/pid lists every running instance's pid; ?at=<branch-or-key> selects one.",
+        description: "The OS process id(s) of the desktop GUI attached to running `bun run dev:instance`(s). Each desktop registers its own std::process::id() with its runner over WebSocket (authoritative, no lsof), so a caller can target the window with external tools such as Axon accessibility without shelling out. A windowless runner is reported as unavailable, never as the GUI pid. read cairn://dev/pid lists every running instance; ?at=<branch-or-key> selects one.",
         read_projections: &[
             ProjectionSpec { key: "at", values: "branch name or slug key of the dev instance to target" },
         ],

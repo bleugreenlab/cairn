@@ -35,7 +35,27 @@ pub use types::{
     RunOutputPayload, RunPayload,
 };
 
-use commit_barrier::run_commit_barrier;
+use commit_barrier::{run_commit_barrier, CommitBarrierOutcome};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex as TokioMutex, MutexGuard};
+
+const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+const STORE_BUSY_MESSAGE: &str =
+    "The project's version-control store is busy behind a long-running operation; retry this run.";
+
+async fn acquire_store_lock<'a>(
+    lock: Option<&'a Arc<TokioMutex<()>>>,
+    timeout: Duration,
+) -> Result<Option<MutexGuard<'a, ()>>, ()> {
+    match lock {
+        Some(lock) => tokio::time::timeout(timeout, lock.lock())
+            .await
+            .map(Some)
+            .map_err(|_| ()),
+        None => Ok(None),
+    }
+}
 use hygiene::{
     check_cd_commands, checkout_has_tracked_changes, verify_branch_checkout_clean_after_run,
 };
@@ -203,9 +223,9 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // failure leaves the seal-time stale arm as the mid-batch fallback.
     let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
     let managed_context = {
-        let _guard = match store_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+        let _guard = match acquire_store_lock(store_lock.as_ref(), STORE_LOCK_TIMEOUT).await {
+            Ok(guard) => guard,
+            Err(()) => return run_envelope(STORE_BUSY_MESSAGE.to_string(), Vec::new()),
         };
         match crate::mcp::vcs::prepare_managed_workspace(orch, request).await {
             Ok(context) => context,
@@ -218,9 +238,9 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         managed_context.as_ref(),
     );
     {
-        let _guard = match store_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+        let _guard = match acquire_store_lock(store_lock.as_ref(), STORE_LOCK_TIMEOUT).await {
+            Ok(guard) => guard,
+            Err(()) => return run_envelope(STORE_BUSY_MESSAGE.to_string(), Vec::new()),
         };
         if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&cwd)) {
             if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) {
@@ -425,19 +445,21 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // and per-item command execution above stay outside it (per-workspace reads /
     // FS work, not shared-store rebase/import). `None` for a non-worktree cwd.
     // `store_lock` is the same handle resolved for the pre-flight reconcile above.
-    let barrier = {
-        let _store_guard = match store_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        run_commit_barrier(
+    let barrier = match acquire_store_lock(store_lock.as_ref(), STORE_LOCK_TIMEOUT).await {
+        Ok(_store_guard) => run_commit_barrier(
             vcs.as_ref(),
             worktree_path,
             payload.commit_msg.as_deref(),
             all_ok,
             status_before.as_ref(),
             author.as_ref(),
-        )
+        ),
+        Err(()) => CommitBarrierOutcome {
+            message: "⚠️ The project's version-control store stayed busy behind a long-running operation. Nothing was committed and the working copy was PRESERVED exactly. Retry with a trivial `run` carrying the same `commit_msg`; the commit barrier will seal any remaining dirty worktree.".to_string(),
+            worktree_changed: false,
+            committed: false,
+            committed_patch: None,
+        },
     };
     // Record the sealed commit's file changes so a run-path commit populates the
     // same `file_changes` cache the write path does. This is what makes the
@@ -543,4 +565,18 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     };
     let images = collect_run_images(outcomes);
     run_envelope(text, images)
+}
+
+#[cfg(test)]
+mod store_lock_timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn acquisition_returns_timeout_instead_of_waiting_forever() {
+        let lock = Arc::new(TokioMutex::new(()));
+        let _held = lock.lock().await;
+        let result = acquire_store_lock(Some(&lock), Duration::from_millis(10)).await;
+        assert!(result.is_err());
+        assert!(STORE_BUSY_MESSAGE.contains("retry"));
+    }
 }

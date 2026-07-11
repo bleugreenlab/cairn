@@ -200,7 +200,7 @@ async fn latest_run_status_conn(
             (job_id,),
         )
         .await?;
-    Ok(rows.next().await?.map(|r| r.text(0)).transpose()?)
+    rows.next().await?.map(|r| r.text(0)).transpose()
 }
 
 /// Terminal stored run statuses (the process has exited). Mirrors
@@ -1352,7 +1352,6 @@ pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Resu
                 crate::orchestrator::lifecycle::evaluate_review_readiness(
                     &orch_for_review,
                     &issue_id,
-                    false,
                 )
                 .await;
             },

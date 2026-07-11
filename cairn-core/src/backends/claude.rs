@@ -1867,7 +1867,7 @@ impl ClaudeBackend {
                                 orch.process_state.transition_to_warm(run_id);
                             } else {
                                 crate::orchestrator::lifecycle::transition_to_warm_state(
-                                    orch, run_id,
+                                    orch, run_id, None,
                                 );
                                 let _ = emitter.emit(
                                     "run-turn-completed",
@@ -2162,7 +2162,7 @@ impl ClaudeBackend {
                                     &run_id[..run_id.len().min(8)]
                                 );
                                 crate::orchestrator::lifecycle::transition_to_warm_state(
-                                    orch, run_id,
+                                    orch, run_id, None,
                                 );
                                 let _ = emitter.emit(
                                     "run-turn-completed",
@@ -2196,7 +2196,7 @@ impl ClaudeBackend {
                                 );
                             } else {
                                 crate::orchestrator::lifecycle::transition_to_warm_state(
-                                    orch, run_id,
+                                    orch, run_id, None,
                                 );
 
                                 let _ = emitter.emit(
@@ -2239,7 +2239,11 @@ impl ClaudeBackend {
                         // may resume before that ack arrives — flag it so the ack is
                         // swallowed rather than crashing the review turn.
                         terminal_interrupt_ack_pending = true;
-                        crate::orchestrator::lifecycle::transition_to_warm_state(orch, run_id);
+                        crate::orchestrator::lifecycle::transition_to_warm_state(
+                            orch,
+                            run_id,
+                            Some(crate::models::TurnEndReason::ArtifactHandoff),
+                        );
                         let _ = emitter.emit(
                             "run-turn-completed",
                             serde_json::json!({

@@ -101,12 +101,16 @@ fn checkout_tracked_status(
                 )
             });
     }
-    let output = crate::env::git()
-        .arg("-C")
-        .arg(checkout)
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .output()
-        .map_err(|error| format!("git status failed for {}: {error}", checkout.display()))?;
+    let ctx = format!("git status for {}", checkout.display());
+    let output = crate::jj::bounded_command_output(
+        crate::env::git().arg("-C").arg(checkout).args([
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ]),
+        crate::jj::JJ_DEFAULT_TIMEOUT,
+        &ctx,
+    )?;
     if !output.status.success() {
         return Err(format!(
             "git status failed for {}: {}",

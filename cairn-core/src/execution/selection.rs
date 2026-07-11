@@ -57,6 +57,8 @@ pub struct CheckPlan {
     pub command: String,
     /// Whether `command` runs the whole check or a selected subset.
     pub scope: CheckScope,
+    /// Process-wide admission class used immediately before process spawn.
+    pub resource_class: crate::config::project_settings::CheckResourceClass,
 }
 
 /// Plan every check against a change set.
@@ -89,6 +91,7 @@ fn plan_one(
         applies,
         command: check.command.clone(),
         scope,
+        resource_class: check.resource_class,
     };
 
     // Coarse gate: does this check apply at all? With no `impact`, any change
@@ -120,6 +123,7 @@ fn plan_one(
             applies: true,
             command,
             scope: CheckScope::Partial,
+            resource_class: check.resource_class,
         }
     } else if check.command.contains(TARGETS_PLACEHOLDER) {
         // `{targets}` → crate-graph targets resolved from the matched files. On
@@ -138,6 +142,7 @@ fn plan_one(
                     applies: true,
                     command,
                     scope: CheckScope::Partial,
+                    resource_class: check.resource_class,
                 }
             }
             _ => {
@@ -149,6 +154,7 @@ fn plan_one(
                     applies: true,
                     command,
                     scope: CheckScope::Full,
+                    resource_class: check.resource_class,
                 }
             }
         }
@@ -411,6 +417,7 @@ mod tests {
             impact: impact.map(|globs| globs.iter().map(|s| s.to_string()).collect()),
             policy: crate::config::project_settings::CheckPolicy::Advisory,
             when: crate::config::project_settings::CheckWhen::Write,
+            resource_class: crate::config::project_settings::CheckResourceClass::Shared,
             timeout: None,
         }
     }

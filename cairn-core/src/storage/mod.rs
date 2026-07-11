@@ -12,4 +12,7 @@
 pub use cairn_db::storage::*;
 
 mod team_sync;
-pub use team_sync::{run_pull_task, run_push_task, RouteReconcile, SyncCadence};
+pub use team_sync::{
+    run_pull_task, run_push_task, subscribe_team_pull_applied, RouteReconcile, SyncCadence,
+    TeamSyncScope,
+};

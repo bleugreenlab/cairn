@@ -10,6 +10,96 @@
 //! reading — the alloc counters and tokio metrics still carry useful signal
 //! there, and a native Windows memory path is future work.
 
+/// A lightweight host memory and load snapshot for failure diagnostics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostResourceReading {
+    pub total_memory_bytes: Option<u64>,
+    pub available_memory_bytes: Option<u64>,
+    pub load_average: Option<[f64; 3]>,
+}
+
+pub fn read_host_resources() -> HostResourceReading {
+    let (total_memory_bytes, available_memory_bytes) = host_memory();
+    HostResourceReading {
+        total_memory_bytes,
+        available_memory_bytes,
+        load_average: host_load_average(),
+    }
+}
+
+#[cfg(unix)]
+fn host_load_average() -> Option<[f64; 3]> {
+    let mut load = [0.0_f64; 3];
+    // SAFETY: `getloadavg` writes at most the requested three doubles.
+    (unsafe { libc::getloadavg(load.as_mut_ptr(), 3) } == 3).then_some(load)
+}
+
+#[cfg(not(unix))]
+fn host_load_average() -> Option<[f64; 3]> {
+    // Windows has no native equivalent of Unix's 1, 5, and 15 minute load
+    // averages. CPU utilization requires samples over time and is a distinct
+    // metric, so do not manufacture load-average values from a single read.
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn host_memory() -> (Option<u64>, Option<u64>) {
+    let name = std::ffi::CString::new("hw.memsize").expect("static sysctl name");
+    let mut value = 0_u64;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: the output buffer and length match a u64 `hw.memsize` value.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ((rc == 0).then_some(value), None)
+}
+
+#[cfg(target_os = "linux")]
+fn host_memory() -> (Option<u64>, Option<u64>) {
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return (None, None);
+    };
+    let value = |key: &str| {
+        meminfo.lines().find_map(|line| {
+            let rest = line.strip_prefix(key)?;
+            rest.split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+                .map(|kb| kb * 1024)
+        })
+    };
+    (value("MemTotal:"), value("MemAvailable:"))
+}
+
+#[cfg(target_os = "windows")]
+fn host_memory() -> (Option<u64>, Option<u64>) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: `MEMORYSTATUSEX` is a plain C data structure whose required
+    // `dwLength` field is initialized before the operating-system call.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is a valid, writable `MEMORYSTATUSEX` for the duration
+    // of the call.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return (None, None);
+    }
+
+    (Some(status.ullTotalPhys), Some(status.ullAvailPhys))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn host_memory() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
 /// A single read of this process's resource usage.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResourceReading {
@@ -126,6 +216,21 @@ mod tests {
             reading.phys_footprint_bytes.unwrap_or(0) > 0,
             "phys_footprint should be nonzero on macOS"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reads_host_memory_on_windows() {
+        let reading = read_host_resources();
+        let total = reading
+            .total_memory_bytes
+            .expect("Windows should report total physical memory");
+        let available = reading
+            .available_memory_bytes
+            .expect("Windows should report available physical memory");
+        assert!(total > 0);
+        assert!(available <= total);
+        assert_eq!(reading.load_average, None);
     }
 
     #[test]

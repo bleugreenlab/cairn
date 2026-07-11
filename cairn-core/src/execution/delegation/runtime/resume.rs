@@ -34,14 +34,16 @@ pub(super) fn prepare_parent_for_delegated_wait(
             })?
         };
         block_on(prepare_parent_for_delegated_wait_db(
-            db,
+            db.clone(),
             pred_turn_id.to_string(),
             parent_ctx.job_id.clone(),
         ))?;
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "turns", "action": "update"}),
-        );
+        let change = block_on({
+            let db = db.clone();
+            let turn_id = pred_turn_id.to_string();
+            async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await) }
+        })?;
+        let _ = orch.services.emitter.emit("db-change", change);
     }
 
     Ok(())
@@ -803,6 +805,7 @@ pub fn resume_suspended_parent_after_task_completion(
     }
     let resume_context = suppress_user_event.then_some(crate::execution::jobs::ResumeContext {
         suppress_user_event: true,
+        ..Default::default()
     });
     crate::execution::jobs::continue_job_impl(
         orch,

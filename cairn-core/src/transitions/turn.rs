@@ -1,6 +1,6 @@
 //! Turn state transitions.
 
-use crate::models::{TurnState, TurnYieldReason};
+use crate::models::{TurnEndReason, TurnState, TurnYieldReason};
 use crate::services::EventEmitter;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
@@ -43,7 +43,7 @@ pub async fn start_turn(
     .await
     .map_err(|error| turn_db_error(&turn_id, "pending", "running", error))?;
 
-    emit_turn_update(emitter);
+    emit_turn_update(db, &turn_id, emitter).await;
     Ok(())
 }
 
@@ -51,6 +51,7 @@ pub async fn apply_turn_outcome(
     db: &LocalDb,
     turn_id: &str,
     outcome: TurnState,
+    end_reason: Option<TurnEndReason>,
     emitter: &dyn EventEmitter,
 ) -> Result<(), TransitionError> {
     if !matches!(
@@ -91,8 +92,8 @@ pub async fn apply_turn_outcome(
         }
     }
 
-    update_terminal_turn(db, turn_id, outcome.clone(), None).await?;
-    emit_turn_update(emitter);
+    update_terminal_turn(db, turn_id, outcome.clone(), None, end_reason).await?;
+    emit_turn_update(db, turn_id, emitter).await;
     Ok(())
 }
 
@@ -112,14 +113,15 @@ pub async fn yield_turn(
         ));
     }
 
-    update_terminal_turn(db, turn_id, TurnState::Yielded, Some(reason)).await?;
-    emit_turn_update(emitter);
+    update_terminal_turn(db, turn_id, TurnState::Yielded, Some(reason), None).await?;
+    emit_turn_update(db, turn_id, emitter).await;
     Ok(())
 }
 
 pub async fn interrupt_turn(
     db: &LocalDb,
     turn_id: &str,
+    end_reason: Option<TurnEndReason>,
     emitter: &dyn EventEmitter,
 ) -> Result<(), TransitionError> {
     let from = load_turn_state(db, turn_id, "interrupted").await?;
@@ -143,8 +145,8 @@ pub async fn interrupt_turn(
         ));
     }
 
-    update_terminal_turn(db, turn_id, TurnState::Interrupted, None).await?;
-    emit_turn_update(emitter);
+    update_terminal_turn(db, turn_id, TurnState::Interrupted, None, end_reason).await?;
+    emit_turn_update(db, turn_id, emitter).await;
     Ok(())
 }
 
@@ -193,21 +195,24 @@ async fn update_terminal_turn(
     turn_id: &str,
     state: TurnState,
     reason: Option<TurnYieldReason>,
+    end_reason: Option<TurnEndReason>,
 ) -> Result<(), TransitionError> {
     let turn_id_owned = turn_id.to_string();
     db.write(|conn| {
         let turn_id = turn_id_owned.clone();
         let state = state.clone();
         let reason = reason.clone();
+        let end_reason = end_reason.clone();
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp();
             conn.execute(
                 "UPDATE turns
-                 SET state = ?1, yield_reason = ?2, ended_at = ?3, updated_at = ?4
-                 WHERE id = ?5",
+                 SET state = ?1, yield_reason = ?2, end_reason = ?3, ended_at = ?4, updated_at = ?5
+                 WHERE id = ?6",
                 params![
                     state.to_string(),
                     reason.map(|value| value.to_string()),
+                    end_reason.map(|value| value.to_string()),
                     now,
                     now,
                     turn_id.as_str()
@@ -246,9 +251,7 @@ fn turn_db_error(turn_id: &str, from: &str, to: &str, error: DbError) -> Transit
     }
 }
 
-fn emit_turn_update(emitter: &dyn EventEmitter) {
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "turns", "action": "update"}),
-    );
+async fn emit_turn_update(db: &LocalDb, turn_id: &str, emitter: &dyn EventEmitter) {
+    let change = crate::notify::turn_db_change_for_id(db, turn_id, "update").await;
+    let _ = emitter.emit("db-change", change);
 }

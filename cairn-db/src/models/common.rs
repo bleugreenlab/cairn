@@ -472,6 +472,27 @@ impl std::fmt::Display for ToolDetailLevel {
     }
 }
 
+/// Base text scale for transcript markdown.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptTextSize {
+    Small,
+    #[default]
+    Default,
+    Large,
+    Largest,
+}
+
+/// Vertical rhythm preset for transcript markdown.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptDensity {
+    Compact,
+    #[default]
+    Comfortable,
+    Relaxed,
+}
+
 /// Display mode for thinking blocks in chat transcripts
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
