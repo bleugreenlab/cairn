@@ -376,6 +376,15 @@ macro_rules! private_lineage {
             ),
             shared_tail_add_turn_end_reason!(),
             shared_tail_index_hot_gui_status_queries!(),
+            // Token usage rows and analytics backfill state are local/private.
+            // Re-normalize OpenAI-style history and force a complete rollup fold.
+            Migration::new(
+                "0107",
+                "normalize_openai_token_usage_components",
+                include_str!(
+                    "../../../../turso_migrations/0107_normalize_openai_token_usage_components.sql"
+                ),
+            ),
         ]
     };
 }
@@ -1512,6 +1521,7 @@ mod tests {
                 "0100_workflow_restart_durability".to_string(),
                 "0105_add_turn_end_reason".to_string(),
                 "0106_index_hot_gui_status_queries".to_string(),
+                "0107_normalize_openai_token_usage_components".to_string(),
             ]
         );
         Ok(db)

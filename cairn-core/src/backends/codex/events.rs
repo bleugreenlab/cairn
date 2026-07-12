@@ -329,34 +329,18 @@ pub(super) fn handle_turn_completed(
 
     match status {
         "completed" => {
-            let result_event = TranscriptEvent {
-                event_type: "result:success".to_string(),
-                session_id: session_id.map(|s| s.to_string()),
-                parent_tool_use_id: None,
-                content: None,
-                thinking: None,
-                tool_name: None,
-                tool_input: None,
-                tool_uses: None,
-                tool_use_id: None,
-                tool_result: None,
-                is_error: false,
-                thinking_ms: None,
-                raw: None,
-            };
-            let event_id = ids::mint_child(run_id);
-            store_event_with_id(
+            store_usage_result_event(
                 orch,
                 run_db,
                 emitter,
                 run_id,
                 session_id,
-                *sequence,
-                &event_id,
-                &result_event,
+                sequence,
+                "result:success",
+                false,
                 counts,
+                true,
             );
-            *sequence += 1;
 
             if ephemeral_call {
                 // The pooled thread is abandoned after this turn. Finalize
@@ -386,9 +370,33 @@ pub(super) fn handle_turn_completed(
             }
         }
         "interrupted" => {
+            store_usage_result_event(
+                orch,
+                run_db,
+                emitter,
+                run_id,
+                session_id,
+                sequence,
+                "result:interrupted",
+                false,
+                counts,
+                false,
+            );
             handle_codex_interrupted_turn(orch, run_db, emitter, run_id);
         }
         _ => {
+            store_usage_result_event(
+                orch,
+                run_db,
+                emitter,
+                run_id,
+                session_id,
+                sequence,
+                "result:error",
+                true,
+                counts,
+                false,
+            );
             if failure_disposition == TurnFailureDisposition::AlreadyHandled {
                 return;
             }
@@ -403,6 +411,49 @@ pub(super) fn handle_turn_completed(
             crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_usage_result_event(
+    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
+    emitter: &Arc<dyn crate::services::EventEmitter>,
+    run_id: &str,
+    session_id: Option<&str>,
+    sequence: &mut i32,
+    event_type: &str,
+    is_error: bool,
+    counts: TokenCounts,
+    store_when_empty: bool,
+) {
+    let has_usage = counts.input.unwrap_or(0) != 0
+        || counts.output.unwrap_or(0) != 0
+        || counts.cache_read.unwrap_or(0) != 0
+        || counts.cache_create.unwrap_or(0) != 0
+        || counts.thinking.unwrap_or(0) != 0;
+    if !store_when_empty && !has_usage {
+        return;
+    }
+    let event = TranscriptEvent {
+        event_type: event_type.to_string(),
+        session_id: session_id.map(str::to_string),
+        parent_tool_use_id: None,
+        content: None,
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error,
+        thinking_ms: None,
+        raw: None,
+    };
+    let event_id = ids::mint_child(run_id);
+    store_event_with_id(
+        orch, run_db, emitter, run_id, session_id, *sequence, &event_id, &event, counts,
+    );
+    *sequence += 1;
 }
 
 pub(super) fn emit_codex_run_turn_completed(

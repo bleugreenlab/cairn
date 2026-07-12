@@ -72,7 +72,7 @@ fn usage_maps_token_counts() {
     assert_eq!(
         usage.token_counts(),
         TokenCounts {
-            input: Some(10),
+            input: Some(7),
             output: Some(5),
             cache_read: Some(3),
             cache_create: None,

@@ -16,7 +16,6 @@ pub mod actions;
 pub mod advancement;
 pub mod cache;
 pub mod check_admission;
-pub mod check_isolation;
 pub mod check_parsers;
 pub mod checkpoint_runs;
 pub mod checkpoints;

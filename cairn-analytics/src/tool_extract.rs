@@ -13,10 +13,41 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent_process::stream::TranscriptEvent;
-use crate::models::Event;
+use cairn_db::models::Event;
+
+/// Analytics-owned wire projection kept structurally identical to the stored
+/// transcript event so extraction preserves the existing deserialization boundary.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolUseInfo {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptEvent {
+    event_type: String,
+    session_id: Option<String>,
+    parent_tool_use_id: Option<String>,
+    content: Option<String>,
+    thinking: Option<String>,
+    tool_name: Option<String>,
+    tool_input: Option<Value>,
+    tool_uses: Option<Vec<ToolUseInfo>>,
+    tool_use_id: Option<String>,
+    tool_result: Option<String>,
+    is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_ms: Option<i64>,
+    raw: Option<Value>,
+}
 
 /// Max stored length of a representative target path.
 const MAX_TARGET_LEN: usize = 300;

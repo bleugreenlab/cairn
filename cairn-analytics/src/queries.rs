@@ -1,11 +1,10 @@
 //! SQL for Tier A token-economics analytics.
 //!
 //! Everything hangs off the [`TOKEN_EVENTS_CTE`]: one row per top-level turn
-//! event carrying its per-backend billable token total, broken out by
-//! component, with project / model / role / backend joined in. The backend rule
-//! mirrors `models::context_tokens`: Claude bills `assistant` events
-//! (`input + cache_create + cache_read + output`); codex bills `result%` events
-//! (`input + output`, since codex `input` already subsumes cache).
+//! event carrying its billable token total, broken out by component, with
+//! project / model / role / backend joined in. Codex bills `result%` events;
+//! Claude and OpenRouter bill `assistant` events. Every backend stores disjoint
+//! token components and shares the same total formula.
 //!
 //! These functions return raw component aggregates; pricing and role
 //! normalization happen in the parent module so the price table stays in one
@@ -15,8 +14,8 @@ use cairn_db::turso::{params, Connection, Value};
 
 use super::tool_extract::{self, ToolInvocation};
 use super::types::{Bucket, Scope, TimeRange, ToolBackfillSummary, TopTargetRow};
-use crate::models::Event;
-use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_db::models::Event;
+use cairn_db::storage::{DbResult, LocalDb, RowExt};
 
 // --- Tier A: token/cost rollup (incremental fold + read queries) ---
 //
@@ -49,14 +48,11 @@ const BILLABLE_PREDICATE: &str = "e.parent_tool_use_id IS NULL
                 AND e.event_type = 'assistant')
         )";
 
-/// The backend-shaped billable token total for one event (codex subsumes cache
-/// into input, so it never re-adds cache).
-const BILLABLE_TOTAL: &str = "CASE
-            WHEN LOWER(COALESCE(s.backend, 'claude')) = 'codex'
-                THEN COALESCE(e.input_tokens, 0) + COALESCE(e.output_tokens, 0)
-            ELSE COALESCE(e.input_tokens, 0) + COALESCE(e.cache_create_tokens, 0)
-                 + COALESCE(e.cache_read_tokens, 0) + COALESCE(e.output_tokens, 0)
-        END";
+/// The billable token total for one event. Persisted components are disjoint.
+const BILLABLE_TOTAL: &str = "COALESCE(e.input_tokens, 0)
+            + COALESCE(e.cache_create_tokens, 0)
+            + COALESCE(e.cache_read_tokens, 0)
+            + COALESCE(e.output_tokens, 0)";
 
 /// Runs whose newest rollup-relevant event (a billable token event for either
 /// backend rule, or any event carrying a real `cost_usd`) is past the rollup
@@ -303,7 +299,7 @@ fn token_rollup_event_upsert_sql() -> String {
 /// assistant event's tool uses or links a `tool_result`'s error. Both are O(1)
 /// in the event. The conn already has the event row written, so Tier A's SELECT
 /// by id sees it.
-pub(crate) async fn maintain_rollups_on_insert(
+pub async fn maintain_rollups_on_insert(
     conn: &Connection,
     event_id: &str,
     run_id: &str,
@@ -393,12 +389,9 @@ token_events AS (
         j.node_name AS node_name,
         j.agent_config_id AS agent_config_id,
         LOWER(COALESCE(s.backend, 'claude')) AS backend,
-        CASE
-            WHEN LOWER(COALESCE(s.backend, 'claude')) = 'codex'
-                THEN COALESCE(e.input_tokens, 0) + COALESCE(e.output_tokens, 0)
-            ELSE COALESCE(e.input_tokens, 0) + COALESCE(e.cache_create_tokens, 0)
-                 + COALESCE(e.cache_read_tokens, 0) + COALESCE(e.output_tokens, 0)
-        END AS billable_tokens,
+        COALESCE(e.input_tokens, 0) + COALESCE(e.cache_create_tokens, 0)
+            + COALESCE(e.cache_read_tokens, 0) + COALESCE(e.output_tokens, 0)
+            AS billable_tokens,
         COALESCE(e.input_tokens, 0) AS input_tokens,
         COALESCE(e.cache_read_tokens, 0) AS cache_read_tokens,
         COALESCE(e.cache_create_tokens, 0) AS cache_create_tokens,
@@ -1351,13 +1344,13 @@ async fn load_run_events(db: &LocalDb, run_id: &str) -> DbResult<Vec<Event>> {
         .query_all(
             format!(
                 "SELECT {cols} FROM events WHERE run_id = ?1 ORDER BY sequence ASC",
-                cols = crate::runs::queries::EVENT_COLUMNS
+                cols = cairn_db::storage::events::columns::EVENT_COLUMNS
             ),
             params![run_id],
-            crate::runs::queries::event_from_row,
+            cairn_db::storage::events::columns::event_from_row,
         )
         .await?;
-    Ok(crate::storage::reconstruct_events(db, events).await)
+    Ok(cairn_db::storage::reconstruct_events(db, events).await)
 }
 
 async fn upsert_run_invocations(

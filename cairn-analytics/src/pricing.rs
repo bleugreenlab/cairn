@@ -42,7 +42,7 @@ const OPUS_LEGACY: ModelPrice = ModelPrice::new(15.0, 1.50, 18.75, 75.0); // Opu
 const SONNET: ModelPrice = ModelPrice::new(3.0, 0.30, 3.75, 15.0);
 const HAIKU: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 5.0); // Haiku 4.5
 
-// GPT-5 / codex tiers (cache_write unused for codex cost).
+// GPT-5 / Codex tiers.
 const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 30.0);
 const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.50, 0.25, 3.125, 15.0);
 const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 6.0);
@@ -103,11 +103,10 @@ fn is_legacy_opus(model: &str) -> bool {
         || model.contains("opus-4-0")
 }
 
-/// Compute USD cost for a token-component bundle, mirroring the backend-shaped
-/// billable rule. Codex `input` already subsumes cache, so codex cost is
-/// `input + output` only; Claude prices each cache component separately.
+/// Compute USD cost for a normalized token-component bundle. Persisted
+/// components are disjoint, so every backend uses the same componentwise math.
 pub fn cost_usd(
-    backend: &str,
+    _backend: &str,
     model: Option<&str>,
     input: i64,
     cache_read: i64,
@@ -118,15 +117,11 @@ pub fn cost_usd(
         return 0.0;
     };
     let per = 1_000_000.0;
-    if backend.eq_ignore_ascii_case("codex") {
-        (input as f64 * price.input + output as f64 * price.output) / per
-    } else {
-        (input as f64 * price.input
-            + cache_read as f64 * price.cache_read
-            + cache_create as f64 * price.cache_write
-            + output as f64 * price.output)
-            / per
-    }
+    (input as f64 * price.input
+        + cache_read as f64 * price.cache_read
+        + cache_create as f64 * price.cache_write
+        + output as f64 * price.output)
+        / per
 }
 
 #[cfg(test)]
@@ -173,8 +168,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_cost_ignores_cache_components() {
-        // gpt-5.4: 1M input($2.50) + 1M output($15), cache ignored.
+    fn codex_cost_prices_cache_components() {
+        // gpt-5.4: 1M input($2.50) + 0.5M cache read($0.125)
+        // + 0.5M cache write($1.25) + 1M output($15).
         let cost = cost_usd(
             "codex",
             Some("gpt-5"),
@@ -183,7 +179,7 @@ mod tests {
             500_000,
             1_000_000,
         );
-        assert!((cost - 17.50).abs() < 1e-9, "got {cost}");
+        assert!((cost - 18.875).abs() < 1e-9, "got {cost}");
     }
 
     #[test]

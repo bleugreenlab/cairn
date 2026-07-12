@@ -33,19 +33,13 @@
 //! not fixers; a verify that dirties tracked files would leave the worktree != HEAD
 //! and is out of contract for this cadence.
 //!
-//! ## Concurrency and isolation
+//! ## Slot-backed concurrency
 //!
-//! The cache-miss checks run CONCURRENTLY, each in its own copy-on-write clone of
-//! the sealed worktree ([`crate::execution::check_isolation`]). They share the
-//! scheduling/result engine ([`crate::execution::checks::run_planned_checks`]) with
-//! write checks, but clone isolation is review-only. Process spawn is admitted
-//! through the runner-wide fair
-//! controller; full suites normally request `exclusive`, while lighter work uses
-//! one shared permit. When a cheap clone is unavailable the
-//! whole batch falls back to SEQUENTIAL in-place execution in the one shared
-//! checkout ([`check_isolation::decide_exec_mode`]). Isolation is fold-free here:
-//! a stray tracked write lands in a disposable clone and is discarded, so it can
-//! never dirty `@` and wedge the next write's seal.
+//! Cache-miss review checks run concurrently through persistent build slots. The
+//! slot scheduler owns admission and backpressure; the shared check engine still
+//! owns caching, parsing, ordered results, cancellation, and wake delivery. There
+//! is no clone or in-place fallback. Substrate failures become infrastructure
+//! verdicts and the command is never invoked elsewhere.
 //!
 //! ## Two guards keep it from looping
 //!
@@ -63,11 +57,12 @@ use std::path::{Path, PathBuf};
 
 use cairn_common::uri::build_node_checks_uri;
 
+use crate::build_slots::{BuildSlotOutcome, BuildSlotPriority, BuildSlotRequest, MutationPolicy};
 use crate::execution::cache::{get_check_result, store_check_result, CheckResultCacheWrite};
-use crate::execution::check_isolation;
 use crate::execution::checks::{
-    applicable_turn_end_checks, input_hash_for, load_live_project_checks, resolve_check_timeout_ms,
-    run_planned_checks, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
+    applicable_turn_end_checks, check_platform_identity, check_result_key,
+    check_toolchain_identity, load_live_project_checks, resolve_check_timeout_ms,
+    run_planned_checks, CheckExecMode, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::selection::CheckPlan;
 use crate::jj::{node_changed_files, sealed_tree_entries, sealed_tree_hash, JjEnv};
@@ -187,7 +182,7 @@ async fn run_turn_end_checks_inner(
     };
     // The issue already reached a terminal (merged/closed) state before this suite
     // launched — its verdicts would validate a tree nobody will review again, so
-    // return before setting up any COW clones. The mid-flight case (the issue
+    // return before submitting any slot requests. The mid-flight case (the issue
     // resolving WHILE a check runs) is handled by the `cancel` race around the
     // suite below (CAIRN-2648).
     if matches!(coords.issue_status.as_str(), "merged" | "closed") {
@@ -286,6 +281,22 @@ async fn run_turn_end_checks_inner(
         .await
         .map_err(|error| format!("turn-end tree-hash task failed: {error}"))?
         .map_err(|error| error.to_string())?;
+    let commit_jj = jj.clone();
+    let commit_repo = repo_root.to_path_buf();
+    let sealed_commit = tokio::task::spawn_blocking(move || {
+        commit_jj.run(
+            &commit_repo,
+            &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+            "resolve sealed check commit",
+        )
+    })
+    .await
+    .map_err(|error| format!("turn-end commit-id task failed: {error}"))??;
+    let canonical_repo = crate::config::get_project_path(&orch.db.local, &coords.project_id)
+        .await?
+        .to_string_lossy()
+        .into_owned();
+
     // Publish the immutable facts the 1 Hz status poll needs. They remain valid
     // until the single-flight slot is released because this suite is pinned to
     // the sealed tree.
@@ -305,7 +316,7 @@ async fn run_turn_end_checks_inner(
     let cache_tree_hash = tree_hash.clone();
     let cache_project_id = coords.project_id.clone();
     let cache_job_id = job_id.to_string();
-    let to_run = tokio::task::spawn_blocking(move || {
+    let mut to_run = tokio::task::spawn_blocking(move || {
         let entries = if plans.iter().any(|plan| {
             cache_checks
                 .get(&plan.name)
@@ -317,12 +328,14 @@ async fn run_turn_end_checks_inner(
         };
         let mut to_run: Vec<(CheckPlan, String)> = Vec::new();
         for plan in plans {
-            let input_hash = input_hash_for(
-                cache_checks
-                    .get(&plan.name)
-                    .and_then(|check| check.impact.as_ref()),
+            let check = cache_checks.get(&plan.name);
+            let input_hash = check_result_key(
+                check.and_then(|check| check.impact.as_ref()),
                 entries.as_deref(),
                 &cache_tree_hash,
+                check.map_or(plan.command.as_str(), |check| check.command.as_str()),
+                &check_platform_identity(),
+                check_toolchain_identity(),
             );
             match get_check_result(cache_db.clone(), &cache_project_id, &plan.name, &input_hash)
                 .ok()
@@ -384,66 +397,27 @@ async fn run_turn_end_checks_inner(
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
     );
 
-    // 9. Decide the execution mode: give every cache-miss check its own COW clone
-    // of the sealed worktree so the review suite runs concurrently in isolation,
-    // with process spawn governed by global admission. A clone failure routes the whole batch to
-    // sequential in-place execution in the shared worktree. The guard removes the
-    // review clone root on every exit path — including the fallback. Review is
-    // FOLD-FREE by contract: the clones are discarded, never copied back, so a
-    // stray tracked write lands in a disposable clone rather than dirtying `@`.
-    let suite_id = check_isolation::new_suite_id();
-    let clone_root =
-        check_isolation::turn_end_clone_root_for_suite(&orch.config_dir, job_id, &suite_id);
-    let _clone_guard = check_isolation::CloneGuard::new(clone_root.clone());
-    let clone_fs = orch.services.fs.clone();
-    let clone_repo = repo_root.to_path_buf();
-    let clone_target = clone_root.clone();
-    let clone_misses: Vec<(usize, String)> = to_run
+    // 9. Build the changed-files override consumed by diff-scoped check scripts.
+    // Slot workspaces are materialized at the immutable request base, so the
+    // already-computed agent delta remains the canonical attribution source.
+    let changed_files_path = log_dir.join("changed-files.txt");
+    let changed_files_body = changed
         .iter()
-        .enumerate()
-        .map(|(index, (plan, _))| (index, plan.name.clone()))
-        .collect();
-    let (mode, clones) = tokio::task::spawn_blocking(move || {
-        let misses: Vec<(usize, &str)> = clone_misses
-            .iter()
-            .map(|(index, name)| (*index, name.as_str()))
-            .collect();
-        check_isolation::decide_exec_mode(&*clone_fs, &clone_repo, &clone_target, &misses)
-    })
-    .await
-    .map_err(|error| format!("turn-end check clone task failed: {error}"))?;
-
-    // Isolated checks run in `.jj`-stripped clones, so a diff-scoped check
-    // (rust-lint, dead-code) can't resolve its own changed-file set from the
-    // clone's VCS and would fall back to full-strict, gating on pre-existing base
-    // findings. Hand them the already-computed set via a file + env override so
-    // attribution stays diff-scoped without the clone ever shelling jj. The Shared
-    // fallback runs in the real worktree, where jj resolution works, so it needs
-    // no override (empty env, unchanged behavior).
-    let extra_env: Vec<(String, String)> = if mode == check_isolation::CheckExecMode::Isolated {
-        let path = log_dir.join("changed-files.txt");
-        let body = changed
-            .iter()
-            .map(|c| c.path.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        match std::fs::write(&path, body) {
-            Ok(()) => vec![(
+        .map(|change| change.path.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let extra_env = std::fs::write(&changed_files_path, changed_files_body)
+        .map(|()| {
+            vec![(
                 CHANGED_FILES_ENV.to_string(),
-                path.to_string_lossy().into_owned(),
-            )],
-            Err(e) => {
-                log::warn!(
-                    "turn-end checks for job {}: failed to write changed-files override ({e}); \
-                     isolated diff-scoped checks will run full-strict",
-                    short_id(job_id)
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+                changed_files_path.to_string_lossy().into_owned(),
+            )]
+        })
+        .map_err(|error| format!("failed to write review changed-files input: {error}"))?;
+
+    for (plan, _) in &mut to_run {
+        plan.externally_admitted = true;
+    }
 
     // 10. Run the misses through the shared engine, concurrently and bounded.
     // `to_run` is already miss-only, so the engine's cache-hit branch never fires:
@@ -451,7 +425,6 @@ async fn run_turn_end_checks_inner(
     // parses per-test detail exactly as the old inline loop did. `notify` is a
     // no-op — review has no `check-status` frontend consumer; its live surface is
     // the per-check log tail plus the bracketing `db-change`s.
-    let clones_ref = &clones;
     let to_run_ref = &to_run;
     // Per-check effective timeout, aligned to plan index. A check's schema
     // `timeout` overrides the review cadence default (sized for a cold, uncached
@@ -464,7 +437,16 @@ async fn run_turn_end_checks_inner(
         .collect();
     let timeouts_ref = &timeouts;
     let extra_env_ref = &extra_env;
-    let worktree = worktree_path.clone();
+    let slot_config = crate::config::settings::load_build_slots(&orch.config_dir);
+    let acquisition_deadline_ms = slot_config
+        .acquisition_deadline_seconds
+        .saturating_mul(1_000);
+    let slot_pool = orch.build_slots.clone();
+    let slot_project_id = coords.project_id.clone();
+    let slot_repository = canonical_repo;
+    let slot_commit = sealed_commit;
+    let slot_job_id = job_id.to_string();
+    let slot_cancel = cancel.clone();
     // Hoisted out of the `select!` below: a `&format!(...)` temporary passed inline
     // would be dropped at the end of the (macro-expanded) statement while still
     // borrowed by `run_planned_checks`.
@@ -483,6 +465,12 @@ async fn run_turn_end_checks_inner(
                 short_id(job_id),
                 to_run.len()
             );
+            if orch.build_slots.cancel_job_requests(job_id) > 0 {
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    serde_json::json!({"table": "build_slots", "action": "cancel"}),
+                );
+            }
             return Ok(false);
         }
         outcomes = run_planned_checks(
@@ -492,37 +480,60 @@ async fn run_turn_end_checks_inner(
         job_id,
         &to_run,
         &checks_tool_id,
-        mode,
+        CheckExecMode::Isolated,
         &orch.check_admission,
         Some(orch),
-        move |index, command, stream_id| {
-            let worktree = worktree.clone();
+        move |index, command, _stream_id| {
+            let slot_pool = slot_pool.clone();
+            let slot_project_id = slot_project_id.clone();
+            let slot_repository = slot_repository.clone();
+            let slot_commit = slot_commit.clone();
+            let slot_job_id = slot_job_id.clone();
+            let slot_cancel = slot_cancel.clone();
+            let name = to_run_ref[index].0.name.clone();
+            let log_path = turn_end_log_path(orch, job_id, &name);
             async move {
-                // Isolated: run in this check's clone; Shared fallback: the real
-                // worktree. Review always runs UNSANDBOXED (an idle agent can't
-                // answer a fence prompt), so the sandbox flag is ignored.
-                let (cwd, _sandbox) =
-                    check_isolation::resolve_check_exec(clones_ref, index, &worktree);
-                let name = to_run_ref[index].0.name.clone();
-                let log_path = turn_end_log_path(orch, job_id, &name);
-                // Mark this check started the instant it begins (file-exists =
-                // running, even before its first line), then nudge any live
-                // `/checks` view to (re)start its tail poll.
                 let _ = std::fs::write(&log_path, b"");
                 let _ = orch.services.emitter.emit(
                     "db-change",
                     serde_json::json!({"table": "check_result_cache", "action": "update"}),
                 );
-                crate::mcp::handlers::run::run_check_command_unsandboxed(
-                    orch,
-                    &cwd,
-                    &stream_id,
-                    &command,
-                    timeouts_ref[index],
-                    &log_path,
-                    extra_env_ref,
-                )
-                .await
+                let request = BuildSlotRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                    project_id: slot_project_id.clone(),
+                    repository: slot_repository.clone(),
+                    base_commit: slot_commit.clone(),
+                    command,
+                    cwd: String::new(),
+                    env: extra_env_ref.clone(),
+                    priority: BuildSlotPriority::ReviewCheck,
+                    deadline_unix_ms: unix_time_ms() + acquisition_deadline_ms,
+                    timeout_ms: timeouts_ref[index],
+                    mutation_policy: MutationPolicy::PureVerdict,
+                    requesting_job_id: Some(slot_job_id.clone()),
+                    affinity_key: None,
+                };
+                match slot_pool.submit(orch, request).await {
+                    BuildSlotOutcome::Completed { exit_code, output, timed_out, mutation_delta: None, .. } => {
+                        let _ = std::fs::write(&log_path, &output);
+                        Ok(crate::mcp::handlers::run::CheckExecResult { exit_code, output, timed_out })
+                    }
+                    BuildSlotOutcome::Completed { mutation_delta: Some(delta), .. } => Err(format!(
+                        "Cairn check infrastructure failure: build slot produced mutation delta {} based on {}",
+                        delta.delta_commit, delta.base_commit
+                    )),
+                    BuildSlotOutcome::FailedAfterExecution { diagnostic, .. } => Err(format!(
+                        "Cairn check infrastructure failure: slot result publication failed: {diagnostic}"
+                    )),
+                    BuildSlotOutcome::Cancelled { .. } => {
+                        slot_cancel.cancel();
+                        std::future::pending().await
+                    }
+                    BuildSlotOutcome::Unavailable { reason, diagnostic } => Err(format!(
+                        "Cairn check infrastructure failure: {reason:?}: {diagnostic}"
+                    )),
+                }
             }
         },
         |_| {},
@@ -842,6 +853,13 @@ fn tail(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     s.chars().skip(count - max_chars).collect()
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

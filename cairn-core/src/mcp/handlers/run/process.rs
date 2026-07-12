@@ -88,7 +88,7 @@ pub(crate) fn scrub_dev_instance_routing_pty(cmd: &mut CommandBuilder) {
 /// Run a single resolved item: execute it, format its body, and (for shell
 /// items only) cache checkpoint results and auto-push on `git commit`.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_one(
+pub(crate) async fn run_one(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     cwd: &str,
@@ -96,6 +96,7 @@ pub(super) async fn run_one(
     run_context: Option<&RunContext>,
     _commit_present: bool,
     branch_scoped_run: bool,
+    promote_on_timeout: bool,
     header: String,
     spec: Result<RunSpec, String>,
 ) -> ItemOutcome {
@@ -180,7 +181,7 @@ pub(super) async fn run_one(
         stdin.as_deref(),
         true,
         branch_scoped_run,
-        true, // promote_on_timeout: agent run items detach to a terminal
+        promote_on_timeout,
     )
     .await
     {
@@ -229,7 +230,7 @@ pub(super) async fn run_one(
                         stdin.as_deref(),
                         false,
                         branch_scoped_run,
-                        true, // promote_on_timeout: agent run items detach to a terminal
+                        promote_on_timeout,
                     )
                     .await
                     {

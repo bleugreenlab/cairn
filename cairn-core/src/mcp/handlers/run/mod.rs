@@ -19,10 +19,7 @@ mod sandbox_policy;
 mod tip;
 mod types;
 
-pub(crate) use checks::{
-    check_stream_id, run_check_command, run_check_command_unsandboxed, run_item_stream_id,
-    CheckExecResult,
-};
+pub(crate) use checks::{check_stream_id, run_check_command, run_item_stream_id, CheckExecResult};
 pub(crate) use process::{
     apply_non_interactive_pager_env_to_pty, build_agent_spawn_config,
     scrub_dev_instance_routing_pty, MAX_BUFFER_SIZE,
@@ -56,6 +53,37 @@ async fn acquire_store_lock<'a>(
         None => Ok(None),
     }
 }
+
+fn materialize_slot_delta(
+    orch: &Orchestrator,
+    worktree: &std::path::Path,
+    delta: &crate::build_slots::MutationDelta,
+) -> Result<(), String> {
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let current = crate::jj::head_commit(&jj, worktree)?;
+    if current != delta.base_commit {
+        return Err(format!(
+            "build-slot publication conflict: workspace base changed from {} to {}",
+            delta.base_commit, current
+        ));
+    }
+    if checkout_has_tracked_changes(orch, worktree)? {
+        return Err(
+            "build-slot publication conflict: agent workspace is no longer clean".to_string(),
+        );
+    }
+    jj.run(
+        worktree,
+        &["restore", "--from", &delta.delta_commit, "--into", "@"],
+        "materialize build-slot delta",
+    )?;
+    if crate::jj::head_commit(&jj, worktree)? != delta.base_commit {
+        return Err(
+            "build-slot publication conflict: materialization changed the sealed base".to_string(),
+        );
+    }
+    Ok(())
+}
 use hygiene::{
     check_cd_commands, checkout_has_tracked_changes, verify_branch_checkout_clean_after_run,
 };
@@ -64,6 +92,105 @@ use process::run_one;
 use resolve::resolve_run_item;
 use types::{ItemOutcome, RunSpec};
 
+fn apply_default_process_timeout(
+    resolved: &mut [(String, Result<RunSpec, String>)],
+    default_timeout_seconds: u32,
+) {
+    for (_, spec) in resolved {
+        match spec {
+            Ok(RunSpec::Shell { timeout, .. } | RunSpec::Script { timeout, .. })
+                if timeout.is_none() =>
+            {
+                *timeout = Some(default_timeout_seconds);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedRunBatch {
+    pub request: McpCallbackRequest,
+    pub run_context: Option<crate::mcp::handlers::RunContext>,
+    pub resolved: Vec<(String, Result<RunSpec, String>)>,
+    pub tool_use_id: String,
+    pub stop_on_error: bool,
+    pub originally_sequential: bool,
+    pub commit_present: bool,
+}
+
+/// Execute a routed batch in one leased working directory while preserving the
+/// public scheduling contract: sequential payloads run in order and all other
+/// payloads run concurrently. Outcomes remain ordered for stable presentation.
+pub(crate) async fn execute_resolved_slot_batch(
+    orch: &Orchestrator,
+    cwd: &str,
+    batch: ResolvedRunBatch,
+) -> Vec<ItemOutcome> {
+    if batch.originally_sequential {
+        let mut outcomes = Vec::with_capacity(batch.resolved.len());
+        for (index, (header, spec)) in batch.resolved.into_iter().enumerate() {
+            let outcome = run_one(
+                orch,
+                &batch.request,
+                cwd,
+                &run_item_stream_id(&batch.tool_use_id, index),
+                batch.run_context.as_ref(),
+                batch.commit_present,
+                false,
+                false,
+                header,
+                spec,
+            )
+            .await;
+            let stop = outcome.suspended || (!outcome.succeeded && batch.stop_on_error);
+            outcomes.push(outcome);
+            if stop {
+                break;
+            }
+        }
+        return outcomes;
+    }
+
+    let mut handles = Vec::with_capacity(batch.resolved.len());
+    for (index, (header, spec)) in batch.resolved.into_iter().enumerate() {
+        let orch = orch.clone();
+        let cwd = cwd.to_string();
+        let stream_id = run_item_stream_id(&batch.tool_use_id, index);
+        let run_context = batch.run_context.clone();
+        let request = batch.request.clone();
+        let commit_present = batch.commit_present;
+        handles.push(AbortOnDrop(tokio::spawn(async move {
+            run_one(
+                &orch,
+                &request,
+                &cwd,
+                &stream_id,
+                run_context.as_ref(),
+                commit_present,
+                false,
+                false,
+                header,
+                spec,
+            )
+            .await
+        })));
+    }
+
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for handle in &mut handles {
+        match (&mut handle.0).await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(error) => outcomes.push(ItemOutcome::failed(
+                "<item>".to_string(),
+                format!("Failed to join run task: {error}"),
+            )),
+        }
+    }
+    outcomes
+}
+
+use crate::build_slots::{BuildSlotOutcome, BuildSlotPriority, BuildSlotRequest, MutationPolicy};
 use crate::mcp::git::GitAuthor;
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
@@ -232,6 +359,8 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             Err(error) => return run_envelope(error, Vec::new()),
         }
     };
+    let bookmark_observation =
+        crate::mcp::vcs::observe_managed_bookmark(orch, managed_context.as_ref());
     let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
         orch,
         std::path::Path::new(&cwd),
@@ -298,7 +427,135 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     let sequential = payload.sequential.unwrap_or(false);
     let stop_on_error = payload.stop_on_error.unwrap_or(true);
 
-    let outcomes = if sequential {
+    // Placement is a preflight batch invariant. A call may contain exactly one
+    // execution class: tree-bound processes, host MCP gateway calls, or persistent
+    // REPL sends. Splitting a mixed call here would violate batch ordering and the
+    // single commit barrier, so reject before any item starts.
+    let has_process = resolved
+        .iter()
+        .any(|(_, spec)| matches!(spec, Ok(RunSpec::Shell { .. } | RunSpec::Script { .. })));
+    let has_mcp = resolved
+        .iter()
+        .any(|(_, spec)| matches!(spec, Ok(RunSpec::McpCall(_))));
+    let has_repl = resolved
+        .iter()
+        .any(|(_, spec)| matches!(spec, Ok(RunSpec::ReplSend { .. })));
+    if usize::from(has_process) + usize::from(has_mcp) + usize::from(has_repl) > 1 {
+        return run_envelope(
+            "A run batch may not mix tree-bound shell/script items with MCP gateway or REPL items. Split them into separate run calls.".to_string(),
+            Vec::new(),
+        );
+    }
+
+    let mut routed_delta = None;
+    let mut routed_outcomes = None;
+    let mut executed_in_slot = false;
+    if has_process && !branch_scoped_run {
+        if let Some(context) = managed_context.as_ref() {
+            if checkout_has_tracked_changes(orch, std::path::Path::new(&cwd)).unwrap_or(true) {
+                return run_envelope(
+                    "A managed process batch requires a clean workspace before build-slot placement.".to_string(),
+                    Vec::new(),
+                );
+            }
+            let slot_config = crate::config::settings::load_build_slots(&orch.config_dir);
+            apply_default_process_timeout(
+                &mut resolved,
+                slot_config.default_timeout_seconds.min(u32::MAX as u64) as u32,
+            );
+            let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+            let base_commit = match crate::jj::head_commit(&jj, std::path::Path::new(&cwd)) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    return run_envelope(
+                        format!("Run infrastructure failure: could not resolve the immutable slot base: {error}"),
+                        Vec::new(),
+                    )
+                }
+            };
+            let relative_cwd = std::path::Path::new(&cwd)
+                .strip_prefix(&context.identity.worktree_path)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let slot_request = BuildSlotRequest {
+                request_id: Uuid::new_v4().to_string(),
+                attempt_id: Uuid::new_v4().to_string(),
+                project_id: context.identity.project_id.clone(),
+                repository: context.identity.project_root.to_string_lossy().into_owned(),
+                base_commit,
+                command: format!("run batch ({} items)", resolved.len()),
+                cwd: relative_cwd,
+                env: Vec::new(),
+                priority: BuildSlotPriority::AgentInteractive,
+                deadline_unix_ms: crate::build_slots::unix_time_ms()
+                    + slot_config
+                        .acquisition_deadline_seconds
+                        .saturating_mul(1_000),
+                timeout_ms: slot_config
+                    .default_timeout_seconds
+                    .saturating_mul(1_000)
+                    .min(u32::MAX as u64) as u32,
+                mutation_policy: MutationPolicy::AllowDelta,
+                requesting_job_id: run_context.as_ref().map(|ctx| ctx.job_id.clone()),
+                affinity_key: run_context.as_ref().map(|ctx| ctx.run_id.clone()),
+            };
+            let batch = ResolvedRunBatch {
+                request: request.clone(),
+                run_context: run_context.clone(),
+                resolved: resolved.clone(),
+                tool_use_id: tool_use_id.clone(),
+                stop_on_error,
+                originally_sequential: sequential,
+                commit_present,
+            };
+            match orch
+                .build_slots
+                .submit_run_batch(orch, slot_request, batch)
+                .await
+            {
+                BuildSlotOutcome::Unavailable { reason, diagnostic } => {
+                    return run_envelope(
+                        format!("Run infrastructure failure ({reason:?}): {diagnostic}. The batch was not executed locally."),
+                        Vec::new(),
+                    );
+                }
+                BuildSlotOutcome::FailedAfterExecution { diagnostic, .. } => {
+                    return run_envelope(
+                        format!("Build-slot run executed but could not publish its result: {diagnostic}. The batch was not rerun locally."),
+                        Vec::new(),
+                    );
+                }
+                BuildSlotOutcome::Cancelled { .. } => {
+                    return run_envelope(
+                        "Run cancelled while waiting for or executing in a build slot.".to_string(),
+                        Vec::new(),
+                    );
+                }
+                BuildSlotOutcome::Completed {
+                    output,
+                    mutation_delta,
+                    ..
+                } => match serde_json::from_str::<Vec<ItemOutcome>>(&output) {
+                    Ok(outcomes) => {
+                        routed_outcomes = Some(outcomes);
+                        routed_delta = mutation_delta;
+                        executed_in_slot = true;
+                    }
+                    Err(error) => {
+                        return run_envelope(
+                                format!("Build-slot run completed but its result could not be decoded: {error}"),
+                                Vec::new(),
+                            );
+                    }
+                },
+            }
+        }
+    }
+
+    let outcomes = if let Some(outcomes) = routed_outcomes {
+        outcomes
+    } else if sequential {
         let mut outcomes: Vec<ItemOutcome> = Vec::with_capacity(resolved.len());
         for (index, (header, spec)) in resolved.into_iter().enumerate() {
             let stream_id = run_item_stream_id(&tool_use_id, index);
@@ -310,6 +567,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 run_context.as_ref(),
                 commit_present,
                 branch_scoped_run,
+                true,
                 header,
                 spec,
             )
@@ -346,6 +604,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     run_context.as_ref(),
                     commit_present,
                     branch_scoped_run,
+                    true,
                     header,
                     spec,
                 )
@@ -446,14 +705,28 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // FS work, not shared-store rebase/import). `None` for a non-worktree cwd.
     // `store_lock` is the same handle resolved for the pre-flight reconcile above.
     let barrier = match acquire_store_lock(store_lock.as_ref(), STORE_LOCK_TIMEOUT).await {
-        Ok(_store_guard) => run_commit_barrier(
-            vcs.as_ref(),
-            worktree_path,
-            payload.commit_msg.as_deref(),
-            all_ok,
-            status_before.as_ref(),
-            author.as_ref(),
-        ),
+        Ok(_store_guard) => {
+            let publication = match (payload.commit_msg.as_deref(), routed_delta.as_ref()) {
+                (Some(_), Some(delta)) => materialize_slot_delta(orch, worktree_path, delta),
+                _ => Ok(()),
+            };
+            match publication {
+                Ok(()) => run_commit_barrier(
+                    vcs.as_ref(),
+                    worktree_path,
+                    payload.commit_msg.as_deref(),
+                    all_ok,
+                    status_before.as_ref(),
+                    author.as_ref(),
+                ),
+                Err(error) => CommitBarrierOutcome {
+                    message: format!("⚠️ {error}. The routed batch was not rerun locally."),
+                    worktree_changed: false,
+                    committed: false,
+                    committed_patch: None,
+                },
+            }
+        }
         Err(()) => CommitBarrierOutcome {
             message: "⚠️ The project's version-control store stayed busy behind a long-running operation. Nothing was committed and the working copy was PRESERVED exactly. Retry with a trivial `run` carrying the same `commit_msg`; the commit barrier will seal any remaining dirty worktree.".to_string(),
             worktree_changed: false,
@@ -461,6 +734,22 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             committed_patch: None,
         },
     };
+    // The barrier guard is gone before propagation: the canonical reconciler
+    // takes the same per-store mutex. Observe the actual bookmark, not just the
+    // barrier's committed flag, so a plain `jj rebase` in a clean run batch also
+    // propagates its new parent tip.
+    if let Err(error) =
+        crate::mcp::vcs::propagate_observed_bookmark_advance(orch, bookmark_observation.as_ref())
+            .await
+    {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(&format!(
+            "⚠️ Your managed branch advanced and remains committed, but downstream workspace reconciliation failed: {error}"
+        ));
+    }
+
     // Record the sealed commit's file changes so a run-path commit populates the
     // same `file_changes` cache the write path does. This is what makes the
     // node's diff facet appear, keeps the per-node change summary correct after
@@ -543,6 +832,13 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             result.push_str("\n\n");
         }
         result.push_str(note);
+    }
+
+    if executed_in_slot {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str("Executed in an isolated build slot; ignored and untracked outputs remain in that slot and are not available in this workspace.");
     }
 
     if !cd_advisory.is_empty() {

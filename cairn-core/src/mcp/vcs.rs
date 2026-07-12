@@ -463,6 +463,63 @@ pub fn resolve_worktree_vcs(
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedBookmarkObservation {
+    project_id: String,
+    repo_path: std::path::PathBuf,
+    branch: String,
+    source_job_id: String,
+    before_tip: Option<String>,
+}
+
+pub(crate) fn observe_managed_bookmark(
+    orch: &crate::orchestrator::Orchestrator,
+    context: Option<&crate::execution::jobs::workspace_identity::ManagedWorkspaceContext>,
+) -> Option<ManagedBookmarkObservation> {
+    let context = context?;
+    let identity = &context.identity;
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, &identity.project_root);
+    Some(ManagedBookmarkObservation {
+        project_id: identity.project_id.clone(),
+        repo_path: identity.project_root.clone(),
+        branch: identity.branch.clone(),
+        source_job_id: context.current_job_id.clone(),
+        before_tip: crate::jj::bookmark_commit(&jj, &store, &identity.branch),
+    })
+}
+
+pub(crate) async fn propagate_observed_bookmark_advance(
+    orch: &crate::orchestrator::Orchestrator,
+    observation: Option<&ManagedBookmarkObservation>,
+) -> Result<Option<crate::orchestrator::base_advance::BranchAdvanceOutcome>, String> {
+    let Some(observation) = observation else {
+        return Ok(None);
+    };
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, &observation.repo_path);
+    let after_tip = crate::jj::bookmark_commit(&jj, &store, &observation.branch);
+    if after_tip == observation.before_tip {
+        return Ok(None);
+    }
+    let new_tip = after_tip.ok_or_else(|| {
+        format!(
+            "managed bookmark `{}` disappeared after publication; downstream workspaces were not reconciled",
+            observation.branch
+        )
+    })?;
+    crate::orchestrator::base_advance::reconcile_managed_branch_advance(
+        orch,
+        &observation.project_id,
+        &observation.repo_path.to_string_lossy(),
+        &observation.branch,
+        &new_tip,
+        Some(&observation.source_job_id),
+    )
+    .await
+    .map(Some)
+}
+
 pub(crate) fn resolve_managed_worktree_vcs(
     orch: &crate::orchestrator::Orchestrator,
     worktree: &Path,
@@ -499,7 +556,7 @@ fn lineage_mismatch_diagnostic(
         .map(|v| v.to_string())
         .unwrap_or_else(|e| format!("unavailable ({e})"));
     format!(
-        "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} {reason}; job={}; lineage={}; project={}; path={}; workspace={}; recorded_base={}; current_at={current}; current_head={head}; branch_marker={}; bookmark_tip={bookmark}; prior_owner={}; dirty={dirty}; conflicted={conflicted}; recovery=cairn:~/workspace-recovery action=rebind",
+        "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} {reason}; job={}; lineage={}; project={}; path={}; workspace={}; recorded_base={}; current_at={current}; current_head={head}; branch_marker={}; bookmark_tip={bookmark}; prior_owner={}; dirty={dirty}; conflicted={conflicted}; recovery: `workspace-recovery rebind` only repairs proven workspace identity/bookmark lineage or a uniquely rewritten base ID; it does not rebase a child onto an advanced parent. For an ordinary stale parent, run plain `jj rebase` for the child stack onto the current parent bookmark, run `jj workspace update-stale` if requested, then patch/rewrite the `create-pr` artifact to publish the rebased bookmark.",
         context.current_job_id,
         identity.lineage_root_job_id,
         identity.project_id,
@@ -602,6 +659,60 @@ pub(crate) async fn prepare_managed_workspace(
             ));
         }
     }
+    // Complete an interrupted reconciler-owned base transition before ordinary
+    // ancestry proof. The marker is the write-ahead record: either the database
+    // is still at old_base (finish the CAS) or already at new_base (finalize only).
+    if let Some(actual) = marker.as_mut() {
+        if let Some(pending) = actual.pending_base_transition.clone() {
+            if actual.base_commit != pending.old_base && actual.base_commit != pending.new_base {
+                return Err(lineage_mismatch_diagnostic(
+                    &jj,
+                    &context,
+                    Some(&actual.lineage_root_job_id),
+                    "pending base transition disagrees with the physical marker base",
+                ));
+            }
+            if identity.base_commit == pending.old_base {
+                crate::execution::jobs::workspace_identity::compare_and_swap_owner_base(
+                    db.clone(),
+                    identity.owner_job_id.clone(),
+                    identity.worktree_path.to_string_lossy().to_string(),
+                    pending.old_base.clone(),
+                    pending.new_base.clone(),
+                    chrono::Utc::now().timestamp() as i32,
+                )
+                .await
+                .map_err(|error| {
+                    lineage_mismatch_diagnostic(
+                        &jj,
+                        &context,
+                        Some(&actual.lineage_root_job_id),
+                        &format!(
+                            "could not resume pending base transition {} -> {}: {error}",
+                            pending.old_base, pending.new_base
+                        ),
+                    )
+                })?;
+                identity.base_commit = pending.new_base.clone();
+                context.identity.base_commit = pending.new_base.clone();
+            } else if identity.base_commit != pending.new_base {
+                return Err(lineage_mismatch_diagnostic(
+                    &jj,
+                    &context,
+                    Some(&actual.lineage_root_job_id),
+                    "database base is neither endpoint of the pending base transition",
+                ));
+            }
+            actual.base_commit = pending.new_base;
+            actual.pending_base_transition = None;
+            crate::jj::write_workspace_identity(cwd, actual).map_err(|error| {
+                format!(
+                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} database base transition completed, but finalizing its physical marker failed: {error}; retry the same write or run to finish the recorded transition"
+                )
+            })?;
+        }
+    }
+
     let project_marker = crate::jj::read_project_root_marker(cwd);
     if project_marker.as_deref() != Some(identity.project_root.as_path()) {
         return Err(lineage_mismatch_diagnostic(
@@ -837,7 +948,7 @@ pub(crate) async fn workspace_recovery_status(
         "recovery inspection",
     );
     format!(
-        "# Managed workspace recovery\n\n{diagnostic}\n\n## Safe action\nwrite {{target:\"cairn:~/workspace-recovery\", mode:\"patch\", payload:{{action:\"rebind\"}}}}\n\nThe action only creates a fresh bookmark at the current `@-` after the database assignment, physical path/markers, and recorded-base ancestry are proven. It never resets, moves, or deletes the conflicting bookmark and never changes working-copy files."
+        "# Managed workspace recovery\n\n{diagnostic}\n\n## Identity-lineage repair\nwrite {{target:\"cairn:~/workspace-recovery\", mode:\"patch\", payload:{{action:\"rebind\"}}}}\n\n`rebind` only repairs a proven workspace identity/bookmark collision or a uniquely forward-resolvable rewritten base ID. It never resets, moves, or deletes the conflicting bookmark and never changes working-copy files.\n\n## Advanced-parent recovery\nThis resource does not rebase a child onto a parent branch that advanced. For that case, run plain `jj rebase` for the child stack onto the current parent bookmark, run `jj workspace update-stale` if jj requests it, then patch/rewrite the `create-pr` artifact so publication uses the rebased bookmark."
     )
 }
 

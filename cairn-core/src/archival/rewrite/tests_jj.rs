@@ -293,6 +293,7 @@ fn resolve_coord_forward_maps_short_id_in_noncolocated_jj_workspace() {
 #[tokio::test]
 #[serial_test::serial(jj)]
 async fn jj_forward_maps_churned_write_coordinate() {
+    crate::mcp::handlers::read::register_archived_file_renderer();
     let Some(bin) = jj_bin() else {
         eprintln!("skipping jj_forward_maps_churned_write_coordinate: jj not resolvable");
         return;

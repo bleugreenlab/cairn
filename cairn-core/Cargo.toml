@@ -67,6 +67,7 @@ cairn-symbols = { path = "../cairn-symbols" }
 # diff rendering) is quarantined behind cairn-codec so cairn-core no longer
 # compiles gix or zstd directly. Its hex-sha-keyed API keeps gix types out of
 # cairn-core entirely; the load-bearing gix rationale now lives in that manifest.
+cairn-analytics = { path = "../cairn-analytics" }
 cairn-codec = { path = "../cairn-codec" }
 
 # The database layer (domain models, table records, and the storage engine with

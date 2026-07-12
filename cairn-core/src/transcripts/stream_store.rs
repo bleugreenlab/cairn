@@ -566,7 +566,7 @@ pub async fn insert_event_conn(conn: &Connection, event: &EventInsert) -> DbResu
         // logged and swallowed so it can never roll back (lose) the event that
         // just landed; the one-time historical backfill and the fold/backfill
         // safety nets reconcile any miss.
-        if let Err(e) = crate::analytics::queries::maintain_rollups_on_insert(
+        if let Err(e) = cairn_analytics::queries::maintain_rollups_on_insert(
             conn,
             &event.id,
             &event.run_id,

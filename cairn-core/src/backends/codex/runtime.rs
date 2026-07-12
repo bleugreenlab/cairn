@@ -5,9 +5,9 @@ use super::events::{
     emit_codex_command_complete, emit_codex_command_output_delta, emit_streaming_delta,
     extract_app_server_delta, extract_command_execution, extract_mcp_result,
     extract_raw_response_message_text, finalize_agent_message, finalize_streaming,
-    handle_agent_message_delta, handle_codex_interrupted_turn, handle_reasoning_delta,
-    handle_turn_completed, store_event, summarize_command_result, summarize_file_change_result,
-    terminal_tool_called_for_run, TurnFailureDisposition,
+    handle_agent_message_delta, handle_reasoning_delta, handle_turn_completed, store_event,
+    summarize_command_result, summarize_file_change_result, terminal_tool_called_for_run,
+    TurnFailureDisposition,
 };
 use super::json_string;
 use super::permissions::{
@@ -313,6 +313,125 @@ fn u64_pointer_as_i64(value: &Value, pointer: &str) -> i64 {
     value.pointer(pointer).and_then(|v| v.as_u64()).unwrap_or(0) as i64
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CodexUsageBreakdown {
+    input_tokens: u32,
+    cached_input_tokens: u32,
+    output_tokens: u32,
+    reasoning_output_tokens: u32,
+}
+
+impl CodexUsageBreakdown {
+    fn from_value(value: &Value) -> Self {
+        Self {
+            input_tokens: u64_pointer_as_u32(value, "/inputTokens"),
+            cached_input_tokens: u64_pointer_as_u32(value, "/cachedInputTokens"),
+            output_tokens: u64_pointer_as_u32(value, "/outputTokens"),
+            reasoning_output_tokens: u64_pointer_as_u32(value, "/reasoningOutputTokens"),
+        }
+    }
+
+    fn checked_delta(self, previous: Self) -> Option<Self> {
+        Some(Self {
+            input_tokens: self.input_tokens.checked_sub(previous.input_tokens)?,
+            cached_input_tokens: self
+                .cached_input_tokens
+                .checked_sub(previous.cached_input_tokens)?,
+            output_tokens: self.output_tokens.checked_sub(previous.output_tokens)?,
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .checked_sub(previous.reasoning_output_tokens)?,
+        })
+    }
+
+    fn into_usage(self) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens.saturating_sub(self.cached_input_tokens),
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(self.cached_input_tokens),
+            output_tokens_details: Some(OutputTokensDetails {
+                thinking_tokens: Some(self.reasoning_output_tokens),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexTurnUsageAccumulator {
+    turn_usage: Option<Usage>,
+    last_seen_total: Option<CodexUsageBreakdown>,
+}
+
+impl CodexTurnUsageAccumulator {
+    fn start_turn(&mut self) {
+        self.turn_usage = None;
+    }
+
+    fn observe(&mut self, params: &Value) -> Option<Usage> {
+        let last = CodexUsageBreakdown::from_value(params.pointer("/tokenUsage/last")?);
+        let total = params
+            .pointer("/tokenUsage/total")
+            .map(CodexUsageBreakdown::from_value);
+        let delta = match (total, self.last_seen_total) {
+            (Some(current), Some(previous)) => {
+                self.last_seen_total = Some(current);
+                current.checked_delta(previous).unwrap_or(last)
+            }
+            (Some(current), None) => {
+                self.last_seen_total = Some(current);
+                last
+            }
+            (None, _) => {
+                // Without a cumulative baseline the next total cannot be safely
+                // differenced against an older snapshot without double-counting.
+                self.last_seen_total = None;
+                last
+            }
+        };
+        add_usage(&mut self.turn_usage, delta.into_usage());
+        self.turn_usage.clone()
+    }
+
+    fn take_turn_usage(&mut self) -> Option<Usage> {
+        self.turn_usage.take()
+    }
+}
+
+fn add_usage(accumulated: &mut Option<Usage>, delta: Usage) {
+    let usage = accumulated.get_or_insert_with(|| Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: Some(0),
+        output_tokens_details: Some(OutputTokensDetails {
+            thinking_tokens: Some(0),
+        }),
+    });
+    usage.input_tokens = usage.input_tokens.saturating_add(delta.input_tokens);
+    usage.output_tokens = usage.output_tokens.saturating_add(delta.output_tokens);
+    usage.cache_read_input_tokens = Some(
+        usage
+            .cache_read_input_tokens
+            .unwrap_or(0)
+            .saturating_add(delta.cache_read_input_tokens.unwrap_or(0)),
+    );
+    let thinking = usage
+        .output_tokens_details
+        .get_or_insert(OutputTokensDetails {
+            thinking_tokens: Some(0),
+        });
+    thinking.thinking_tokens = Some(
+        thinking.thinking_tokens.unwrap_or(0).saturating_add(
+            delta
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.thinking_tokens)
+                .unwrap_or(0),
+        ),
+    );
+}
+
 /// Extract Codex's token notification into the per-turn DB usage columns and
 /// normalized context state. Codex sends both `total` (cumulative across turns)
 /// and `last` (current context occupancy). Cairn's context gauge must use
@@ -326,10 +445,9 @@ fn codex_context_tokens_from_notification(
     captured_at: i64,
 ) -> Option<(Usage, ContextTokenState)> {
     let last = params.pointer("/tokenUsage/last")?;
-    let input_tokens = u64_pointer_as_u32(last, "/inputTokens");
-    let cached_input_tokens = u64_pointer_as_u32(last, "/cachedInputTokens");
-    let output_tokens = u64_pointer_as_u32(last, "/outputTokens");
-    let reasoning_output_tokens = u64_pointer_as_i64(last, "/reasoningOutputTokens");
+    let breakdown = CodexUsageBreakdown::from_value(last);
+    let output_tokens = breakdown.output_tokens;
+    let reasoning_output_tokens = breakdown.reasoning_output_tokens as i64;
     let last_total_tokens = u64_pointer_as_i64(last, "/totalTokens");
     let context_window = params
         .pointer("/tokenUsage/modelContextWindow")
@@ -337,15 +455,7 @@ fn codex_context_tokens_from_notification(
         .and_then(|v| v.as_u64())
         .map(|v| v as i64);
 
-    let usage = Usage {
-        input_tokens,
-        output_tokens,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: Some(cached_input_tokens),
-        output_tokens_details: Some(OutputTokensDetails {
-            thinking_tokens: Some(reasoning_output_tokens as u32),
-        }),
-    };
+    let usage = breakdown.into_usage();
     let state = ContextTokenState {
         run_id: run_id.to_string(),
         session_id,
@@ -481,7 +591,7 @@ impl CodexBackend {
         let ephemeral = ephemeral_cleanup.is_some();
         let mut sequence: i32 = initial_sequence;
         let mut streaming_state: Option<StreamingState> = None;
-        let mut pending_usage: Option<Usage> = None;
+        let mut usage_accumulator = CodexTurnUsageAccumulator::default();
         let mut last_direct_assistant_text: Option<String> = None;
         let mut pending_tool_ids: HashSet<String> = HashSet::new();
         let mut tool_output_chars: HashMap<String, i32> = HashMap::new();
@@ -752,7 +862,7 @@ impl CodexBackend {
                             watchdog.start_turn(turn_id, Instant::now());
                         }
                     }
-                    pending_usage = None;
+                    usage_accumulator.start_turn();
                 }
                 Some("item/agentMessage/delta") => {
                     if let Some(delta) = extract_app_server_delta(&msg) {
@@ -1262,7 +1372,7 @@ impl CodexBackend {
                         &mut streaming_state,
                         &mut sequence,
                         status,
-                        pending_usage.take(),
+                        usage_accumulator.take_turn_usage(),
                         ephemeral,
                         failure_disposition,
                     );
@@ -1279,38 +1389,31 @@ impl CodexBackend {
                 }
                 Some("turn/aborted") => {
                     let aborted_provider_turn_id = provider_turn_id(&msg, &current_turn_id);
-                    finalize_streaming(
-                        orch,
-                        &run_db,
-                        emitter,
-                        &mut streaming_state,
-                        session_id.as_deref(),
-                        &mut sequence,
-                    );
                     let reason = msg
                         .pointer("/params/reason")
                         .and_then(|v| v.as_str())
                         .or_else(|| msg.pointer("/params/message").and_then(|v| v.as_str()))
                         .unwrap_or("unknown");
-                    pending_usage = None;
-                    match reason {
+                    let status = match reason {
                         "interrupted" | "replaced" | "review_ended" => {
                             log::info!("codex turn aborted ({}), handling interrupt", reason);
-                            handle_codex_interrupted_turn(orch, &run_db, emitter, run_id);
+                            "interrupted"
                         }
-                        _ => {
-                            insert_error_event(
-                                orch,
-                                run_id,
-                                session_id.as_deref(),
-                                &format!("Turn aborted: {}", reason),
-                            );
-                            // Not one of the recoverable aborts handled above
-                            // (interrupted/replaced/review_ended): this is an
-                            // unrecoverable failure, so finalize task-aware.
-                            crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_aborted");
-                        }
-                    }
+                        _ => "error",
+                    };
+                    handle_turn_completed(
+                        orch,
+                        &run_db,
+                        emitter,
+                        run_id,
+                        session_id.as_deref(),
+                        &mut streaming_state,
+                        &mut sequence,
+                        status,
+                        usage_accumulator.take_turn_usage(),
+                        ephemeral,
+                        TurnFailureDisposition::Unhandled,
+                    );
                     if let Some(turn_id) = aborted_provider_turn_id.as_deref() {
                         provider_turn_failures.remove(turn_id);
                     }
@@ -1392,6 +1495,19 @@ impl CodexBackend {
                             session_id.as_deref(),
                             &format!("Codex error: {}", message),
                         );
+                        handle_turn_completed(
+                            orch,
+                            &run_db,
+                            emitter,
+                            run_id,
+                            session_id.as_deref(),
+                            &mut streaming_state,
+                            &mut sequence,
+                            "error",
+                            usage_accumulator.take_turn_usage(),
+                            ephemeral,
+                            TurnFailureDisposition::AlreadyHandled,
+                        );
                         // Non-retryable fatal error: finalize task-aware so a
                         // delegated child fails terminally and resumes its parent.
                         crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
@@ -1410,7 +1526,7 @@ impl CodexBackend {
                 Some("thread/tokenUsage/updated") => {
                     if let Some(params) = msg.pointer("/params") {
                         let model = orch.process_state.get_model(run_id);
-                        if let Some((usage, state)) = codex_context_tokens_from_notification(
+                        if let Some((_usage, state)) = codex_context_tokens_from_notification(
                             params,
                             run_id,
                             session_id.clone(),
@@ -1418,7 +1534,7 @@ impl CodexBackend {
                             model,
                             chrono::Utc::now().timestamp(),
                         ) {
-                            pending_usage = Some(usage);
+                            usage_accumulator.observe(params);
                             orch.store_context_token_snapshot(state);
                         }
                     }
@@ -1491,25 +1607,40 @@ mod tests {
     use serde_json::json;
 
     fn notification(total_tokens: i64, last_tokens: i64) -> Value {
-        json!({
-            "tokenUsage": {
-                "total": {
-                    "totalTokens": total_tokens,
-                    "inputTokens": 39_995,
-                    "cachedInputTokens": 9_999,
-                    "outputTokens": 5,
-                    "reasoningOutputTokens": 0
-                },
-                "last": {
-                    "totalTokens": last_tokens,
-                    "inputTokens": 18_671,
-                    "cachedInputTokens": 3_456,
-                    "outputTokens": 5,
-                    "reasoningOutputTokens": 0
-                },
-                "modelContextWindow": 258_400
-            }
-        })
+        usage_notification(
+            Some((39_995, 9_999, 5, 0)),
+            (18_671, 3_456, 5, 0),
+            last_tokens,
+            total_tokens,
+        )
+    }
+
+    fn usage_notification(
+        total: Option<(u32, u32, u32, u32)>,
+        last: (u32, u32, u32, u32),
+        last_total_tokens: i64,
+        total_tokens: i64,
+    ) -> Value {
+        let mut token_usage = json!({
+            "last": {
+                "totalTokens": last_total_tokens,
+                "inputTokens": last.0,
+                "cachedInputTokens": last.1,
+                "outputTokens": last.2,
+                "reasoningOutputTokens": last.3
+            },
+            "modelContextWindow": 258_400
+        });
+        if let Some(total) = total {
+            token_usage["total"] = json!({
+                "totalTokens": total_tokens,
+                "inputTokens": total.0,
+                "cachedInputTokens": total.1,
+                "outputTokens": total.2,
+                "reasoningOutputTokens": total.3
+            });
+        }
+        json!({ "tokenUsage": token_usage })
     }
 
     #[test]
@@ -1613,7 +1744,7 @@ mod tests {
         )
         .expect("token usage");
 
-        assert_eq!(usage.input_tokens, 18_671);
+        assert_eq!(usage.input_tokens, 15_215);
         assert_eq!(usage.cache_read_input_tokens, Some(3_456));
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.output_tokens, 5);
@@ -1625,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_token_usage_ignores_cumulative_total() {
+    fn codex_token_usage_total_does_not_drive_context_gauge() {
         let (usage, state) = codex_context_tokens_from_notification(
             &notification(40_000, 18_676),
             "run-1",
@@ -1637,9 +1768,82 @@ mod tests {
         .expect("token usage");
 
         assert_eq!(state.used_tokens, 18_676);
-        assert_eq!(usage.input_tokens, 18_671);
+        assert_eq!(usage.input_tokens, 15_215);
         assert_eq!(usage.cache_read_input_tokens, Some(3_456));
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn codex_usage_accumulates_multi_response_deltas_and_deduplicates_snapshots() {
+        let first = usage_notification(Some((100, 80, 10, 4)), (100, 80, 10, 4), 110, 110);
+        let second = usage_notification(Some((160, 120, 20, 7)), (60, 40, 10, 3), 70, 180);
+        let mut accumulator = CodexTurnUsageAccumulator::default();
+
+        accumulator.observe(&first);
+        accumulator.observe(&first);
+        let usage = accumulator.observe(&second).expect("accumulated usage");
+
+        assert_eq!(usage.input_tokens, 40);
+        assert_eq!(usage.cache_read_input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(
+            usage.output_tokens_details.unwrap().thinking_tokens,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn codex_usage_preserves_total_baseline_across_turns() {
+        let first = usage_notification(Some((100, 80, 10, 4)), (100, 80, 10, 4), 110, 110);
+        let next_turn = usage_notification(Some((160, 120, 20, 7)), (60, 40, 10, 3), 70, 180);
+        let mut accumulator = CodexTurnUsageAccumulator::default();
+        accumulator.observe(&first);
+        accumulator.start_turn();
+        let usage = accumulator.observe(&next_turn).expect("next turn usage");
+
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, Some(40));
+        assert_eq!(usage.output_tokens, 10);
+    }
+
+    #[test]
+    fn codex_usage_first_snapshot_after_resume_uses_last_response() {
+        let resumed = usage_notification(
+            Some((10_100, 8_080, 510, 204)),
+            (100, 80, 10, 4),
+            110,
+            10_610,
+        );
+        let mut accumulator = CodexTurnUsageAccumulator::default();
+        let usage = accumulator.observe(&resumed).expect("usage");
+
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        assert_eq!(usage.output_tokens, 10);
+    }
+
+    #[test]
+    fn codex_usage_total_reset_falls_back_to_last_response() {
+        let before_reset = usage_notification(Some((500, 400, 50, 20)), (100, 80, 10, 4), 110, 550);
+        let after_reset = usage_notification(Some((60, 40, 10, 3)), (60, 40, 10, 3), 70, 70);
+        let mut accumulator = CodexTurnUsageAccumulator::default();
+        accumulator.observe(&before_reset);
+        let usage = accumulator.observe(&after_reset).expect("usage");
+
+        assert_eq!(usage.input_tokens, 40);
+        assert_eq!(usage.cache_read_input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn codex_usage_without_total_adds_last_response() {
+        let notification = usage_notification(None, (100, 80, 10, 4), 110, 0);
+        let mut accumulator = CodexTurnUsageAccumulator::default();
+        let usage = accumulator.observe(&notification).expect("usage");
+
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        assert_eq!(usage.output_tokens, 10);
     }
 
     #[test]

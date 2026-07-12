@@ -1,7 +1,7 @@
 //! Token-economics analytics: tokens per session, token-to-line efficiency, and
 //! token-composition over time.
 
-use crate::storage::{DbResult, LocalDb};
+use cairn_db::storage::{DbResult, LocalDb};
 
 use super::cost::exact_or_priced;
 use super::queries;

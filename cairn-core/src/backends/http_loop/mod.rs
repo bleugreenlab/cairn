@@ -98,14 +98,17 @@ pub(in crate::backends) struct TurnUsage {
 
 impl TurnUsage {
     pub(in crate::backends) fn token_counts(&self) -> TokenCounts {
+        let cache_read = self.prompt_tokens_details.as_ref().and_then(|v| {
+            v.get("cached_tokens")
+                .and_then(Value::as_i64)
+                .map(|n| n as i32)
+        });
         TokenCounts {
-            input: self.prompt_tokens,
+            input: self
+                .prompt_tokens
+                .map(|input| input.saturating_sub(cache_read.unwrap_or(0))),
             output: self.completion_tokens,
-            cache_read: self.prompt_tokens_details.as_ref().and_then(|v| {
-                v.get("cached_tokens")
-                    .and_then(Value::as_i64)
-                    .map(|n| n as i32)
-            }),
+            cache_read,
             cache_create: None,
             thinking: self.reasoning_tokens.or_else(|| {
                 self.completion_tokens_details.as_ref().and_then(|v| {
@@ -794,9 +797,9 @@ fn emit_context_snapshot(
         session_id: Some(session_id.to_string()),
         backend: backend_key.to_string(),
         model: Some(model.to_string()),
-        // OpenAI-style usage: prompt_tokens already includes any cached input, so
-        // full input plus output is the occupancy (adding cache_read double counts).
-        used_tokens: input + output,
+        // Persisted usage components are disjoint, so occupancy is the complete
+        // input prompt (uncached + cached) plus the response output.
+        used_tokens: input + counts.cache_read.unwrap_or(0) as i64 + output,
         context_window,
         auto_compact_limit: None,
         reasoning_tokens: counts.thinking.map(|thinking| thinking as i64),

@@ -1,5 +1,6 @@
 use super::*;
-use crate::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+use cairn_db::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+use cairn_db::turso::params;
 use std::collections::HashMap;
 use tempfile::tempdir;
 
@@ -49,7 +50,8 @@ async fn fixture_db() -> LocalDb {
              VALUES ('c3', 'run-claude', 'sess-claude', 3, 3, 'result:success', '{}',
                 NULL, 90002, 99999, 99999, 99999, 99999, 0);
 
-            -- Codex: two result events count (110 + 220 = 330); assistant skipped.
+            -- Codex: two result events count all disjoint components
+            -- (160 + 300 = 460); assistant skipped.
             INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens)
@@ -97,10 +99,10 @@ async fn economics_applies_backend_billable_rule() {
 
     // Claude assistant billable = input + cache_read + cache_create + output.
     assert_eq!(econ(&out.by_model, "sonnet").billable_tokens, 155);
-    // Codex result billable = input + output (cache subsumed, never re-added).
-    assert_eq!(econ(&out.by_model, "gpt-5").billable_tokens, 330);
+    // Codex result rows use the same disjoint component formula.
+    assert_eq!(econ(&out.by_model, "gpt-5").billable_tokens, 460);
     assert_eq!(econ(&out.by_role, "Builder").billable_tokens, 155);
-    assert_eq!(econ(&out.by_role, "Planner").billable_tokens, 330);
+    assert_eq!(econ(&out.by_role, "Planner").billable_tokens, 460);
     assert_eq!(econ(&out.by_model, "sonnet").runs, 1);
     assert_eq!(out.price_source_date, pricing::PRICE_SOURCE_DATE);
     // Both priced models produce a positive cost.
@@ -242,8 +244,8 @@ async fn avg_tokens_per_session_buckets_by_day() {
     // 90000s falls in day bucket starting at 86400.
     assert_eq!(rows[0].bucket_start, 86400);
     assert_eq!(rows[0].session_count, 2);
-    // (155 + 330) / 2 = 242.5
-    assert!((rows[0].avg_tokens - 242.5).abs() < 1e-9);
+    // (155 + 460) / 2 = 307.5
+    assert!((rows[0].avg_tokens - 307.5).abs() < 1e-9);
 }
 
 #[tokio::test]
@@ -1325,7 +1327,7 @@ async fn oracle_db() -> LocalDb {
         None,
     )
     .await;
-    // codex: x1 (day1) billable 110, x2 (day2) billable 220, x3 assistant skipped.
+    // codex: x1 (day1) billable 160, x2 (day2) billable 300, x3 assistant skipped.
     ins_ev(
         &db,
         "x1",
@@ -1846,14 +1848,71 @@ async fn fold_token_rollup_concurrent_matches_single() {
 
 // --- Per-event maintenance equality + sub-day (hourly) read path ---
 
-/// Insert one event through the real durable-event seam
-/// (`insert_event_conn`), so the per-event rollup maintenance runs exactly as
-/// it does in production.
-async fn seam_insert(db: &LocalDb, ev: crate::transcripts::stream_store::EventInsert) {
+#[derive(Clone)]
+struct EventInsert {
+    id: String,
+    run_id: String,
+    session_id: Option<String>,
+    sequence: i32,
+    timestamp: i32,
+    event_type: String,
+    data: String,
+    parent_tool_use_id: Option<String>,
+    created_at: i32,
+    input_tokens: Option<i32>,
+    cache_read_tokens: Option<i32>,
+    cache_create_tokens: Option<i32>,
+    output_tokens: Option<i32>,
+    thinking_tokens: Option<i32>,
+    turn_id: Option<String>,
+    cost_usd: Option<f64>,
+}
+
+/// Exercise the same event insert and analytics maintenance transaction as the
+/// production transcript seam without depending upward on cairn-core.
+async fn seam_insert(db: &LocalDb, ev: EventInsert) {
     db.write(|conn| {
         let ev = ev.clone();
         Box::pin(async move {
-            crate::transcripts::stream_store::insert_event_conn(conn, &ev).await?;
+            let count = conn
+                .execute(
+                    "INSERT INTO events(
+                    id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    params![
+                        ev.id.as_str(),
+                        ev.run_id.as_str(),
+                        ev.session_id.as_deref(),
+                        ev.sequence,
+                        ev.timestamp,
+                        ev.event_type.as_str(),
+                        ev.data.as_str(),
+                        ev.parent_tool_use_id.as_deref(),
+                        ev.created_at,
+                        ev.input_tokens,
+                        ev.cache_read_tokens,
+                        ev.cache_create_tokens,
+                        ev.output_tokens,
+                        ev.thinking_tokens,
+                        ev.turn_id.as_deref(),
+                        ev.cost_usd
+                    ],
+                )
+                .await?;
+            if count > 0 {
+                queries::maintain_rollups_on_insert(
+                    conn,
+                    &ev.id,
+                    &ev.run_id,
+                    ev.created_at as i64,
+                    &ev.event_type,
+                    &ev.data,
+                    ev.cost_usd,
+                )
+                .await?;
+            }
             Ok(())
         })
     })
@@ -1875,8 +1934,8 @@ fn ev_insert(
     output: i32,
     thinking: i32,
     cost: Option<f64>,
-) -> crate::transcripts::stream_store::EventInsert {
-    crate::transcripts::stream_store::EventInsert {
+) -> EventInsert {
+    EventInsert {
         id: id.to_string(),
         run_id: run.to_string(),
         session_id: Some(sess.to_string()),
@@ -2275,7 +2334,7 @@ async fn token_composition_sums_components_per_bucket() {
     assert_eq!(r.bucket_start, 86400);
     // Claude c1 (10/100/20/5/3) + c2 (12/0/0/8/1); codex x1 (100/50/0/10/0)
     // + x2 (200/80/0/20/0). Columns are input/cache_read/cache_create/output/
-    // thinking. (codex cache subsumed in billing but components still stored.)
+    // thinking. Every backend stores and bills disjoint components.
     assert_eq!(r.input, 322); // 10 + 12 + 100 + 200
     assert_eq!(r.cache_read, 230); // 100 + 50 + 80
     assert_eq!(r.cache_create, 20); // 20 only

@@ -41,6 +41,13 @@ pub struct WorkspaceRebindTransition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkspaceBaseTransition {
+    pub old_base: String,
+    pub new_base: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceIdentity {
     pub version: u32,
     pub lineage_root_job_id: String,
@@ -53,6 +60,8 @@ pub struct WorkspaceIdentity {
     pub base_commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_rebind: Option<WorkspaceRebindTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_base_transition: Option<WorkspaceBaseTransition>,
 }
 
 impl WorkspaceIdentity {
@@ -78,6 +87,7 @@ impl WorkspaceIdentity {
             workspace_name: workspace_name.into(),
             base_commit: base_commit.into(),
             pending_rebind: None,
+            pending_base_transition: None,
         }
     }
 }

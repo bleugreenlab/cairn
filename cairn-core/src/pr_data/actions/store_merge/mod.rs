@@ -249,6 +249,21 @@ pub(super) async fn store_merge_child(
             // on origin while the PR head still points at the abandoned commit —
             // that would land the content but leave the PR unmerged. A retry is
             // idempotent (the source already sits on the fetched tip).
+            if let Err(e) =
+                validate_source_publishability(&jj, &store, target_branch, source_branch)
+            {
+                return Err(rollback_merge(
+                    orch,
+                    project_id,
+                    &jj,
+                    &store,
+                    &op_id,
+                    source_branch,
+                    None,
+                    e,
+                )
+                .await);
+            }
             if let Err(e) = crate::jj::track_bookmark(&jj, &store, source_branch) {
                 log::debug!("jj store merge: track {source_branch} (continuing): {e}");
             }
@@ -545,6 +560,21 @@ pub(super) async fn store_merge_child(
             // origin while the PR head is stale), then advance the target.
             // Defensively track each bookmark, since its `@origin` ref may have been
             // created outside this store's jj (best-effort).
+            if let Err(e) =
+                validate_source_publishability(&jj, &store, target_branch, source_branch)
+            {
+                return Err(rollback_merge(
+                    orch,
+                    project_id,
+                    &jj,
+                    &store,
+                    &op_id,
+                    source_branch,
+                    None,
+                    e,
+                )
+                .await);
+            }
             if let Err(e) = crate::jj::track_bookmark(&jj, &store, source_branch) {
                 log::debug!("jj store merge: track {source_branch} (continuing): {e}");
             }
@@ -593,6 +623,55 @@ pub(super) async fn store_merge_child(
 
     crate::jj::bookmark_commit(&jj, &store, target_branch)
         .ok_or_else(|| format!("target bookmark `{target_branch}` did not resolve after the fold"))
+}
+
+fn validate_source_publishability(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    target_branch: &str,
+    source_branch: &str,
+) -> Result<(), String> {
+    let revset = format!("bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})");
+    let template = "commit_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\x1f\" ++ if(empty, \"1\", \"0\") ++ \"\\n\"";
+    let output = jj.run(
+        store,
+        &[
+            "log",
+            "--ignore-working-copy",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            template,
+        ],
+        "jj log source publishability",
+    )?;
+    let mut malformed = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split('\u{1f}');
+        let commit_id = fields.next().unwrap_or_default().trim();
+        let description = fields.next().unwrap_or_default().trim();
+        let empty = fields.next().unwrap_or_default().trim() == "1";
+        if !commit_id.is_empty() && (description.is_empty() || empty) {
+            malformed.push(format!(
+                "{commit_id} ({})",
+                if description.is_empty() && empty {
+                    "empty tree and blank description"
+                } else if description.is_empty() {
+                    "blank description"
+                } else {
+                    "empty tree"
+                }
+            ));
+        }
+    }
+    if malformed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Refusing to publish source `{source_branch}`: its final source stack contains malformed/debris commit(s): {}. Amend or abandon those commits, ensure `{source_branch}` points to the surviving stack, then retry the merge.",
+        malformed.join(", ")
+    ))
 }
 
 /// `update-stale` every live workspace on `branch` so its on-disk files match the

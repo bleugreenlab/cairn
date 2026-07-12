@@ -367,24 +367,10 @@ pub(crate) async fn execute_target_cleanup(
     }
 
     // Reclaim each referencing job's scratch dir alongside the worktree.
-    // Worktrees aren't 1:1 with jobs (inheritance fan-out), so a target may carry
-    // several job ids; remove every one's scratch dir. Idempotent and
-    // best-effort (a missing dir is fine). Also remove any `when:write` check-clone
-    // root for the job, so a crash mid-check never outlives the job (the isolated
-    // check runner also removes it per batch via its scope guard).
+    // Worktrees are not one-to-one with jobs, so remove every referenced scratch
+    // directory best-effort.
     for job_id in &target.job_ids {
         crate::scratch::remove_job_scratch_dir(job_id);
-        for namespace in ["check-clones", "turn-check-clones"] {
-            let clone_job_root = orch.config_dir.join(namespace).join(job_id);
-            if let Err(error) = std::fs::remove_dir_all(&clone_job_root) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!(
-                        "Teardown: failed to remove check clone job root {}: {error}",
-                        clone_job_root.display()
-                    );
-                }
-            }
-        }
     }
     true
 }

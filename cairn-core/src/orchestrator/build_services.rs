@@ -748,8 +748,7 @@ mod tests {
                 policy.writable_regex,
                 vec![
                     "^/home/u/\\.cairn/worktrees/.*/target/.*".to_string(),
-                    "^/home/u/\\.cairn/check-clones/.*/target/.*".to_string(),
-                    "^/home/u/\\.cairn/turn-check-clones/.*/target/.*".to_string(),
+                    "^/home/u/\\.cairn/build-slots/.*/target/.*".to_string(),
                 ]
             );
         }

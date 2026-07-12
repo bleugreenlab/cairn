@@ -88,7 +88,8 @@ pub struct RunItemPayload {
 }
 
 /// A resolved, ready-to-execute run item.
-pub(super) enum RunSpec {
+#[derive(Clone)]
+pub(crate) enum RunSpec {
     /// A shell command run through `bash -c` (or `cmd /c` on Windows).
     Shell {
         command: String,
@@ -123,7 +124,8 @@ pub(super) enum RunSpec {
 }
 
 /// Resolved payload for a proxied MCP `tools/call`.
-pub(super) struct McpCallSpec {
+#[derive(Clone)]
+pub(crate) struct McpCallSpec {
     pub(super) credential_key: String,
     pub(super) tool: String,
     pub(super) args: serde_json::Value,
@@ -132,19 +134,20 @@ pub(super) struct McpCallSpec {
 }
 
 /// Per-item execution result used to compose the batch output.
-pub(super) struct ItemOutcome {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ItemOutcome {
     /// Header shown above this item's output (`=== <header> ===`): the command
     /// or the skill-script target URI.
-    pub(super) header: String,
-    pub(super) body: String,
-    pub(super) succeeded: bool,
+    pub(crate) header: String,
+    pub(crate) body: String,
+    pub(crate) succeeded: bool,
     /// The item durably suspended on a worktree-fence approval; the whole batch
     /// re-runs on resume. Carried so `handle_run` can surface the suspend marker.
-    pub(super) suspended: bool,
+    pub(crate) suspended: bool,
     /// Image content blocks this item produced. Only an external MCP `tools/call`
     /// returns them today; collected across the batch into the run envelope so the
     /// transport edge delivers them as real image content blocks (read-path mirror).
-    pub(super) images: Vec<ImageBlock>,
+    pub(crate) images: Vec<ImageBlock>,
 }
 
 impl ItemOutcome {

@@ -699,6 +699,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         }
     }
 
+    let mut bookmark_observation = None;
+
     // Pre-flight staleness reconcile for a file-touching write: heal a stale /
     // behind-its-branch-tip working copy BEFORE applying edits (which land on disk,
     // then seal), serialized on the per-store jj lock the base-advance reconcile
@@ -745,6 +747,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"));
             }
         };
+        bookmark_observation = crate::mcp::vcs::observe_managed_bookmark(orch, context.as_ref());
         let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
             orch,
             std::path::Path::new(&request.cwd),
@@ -1041,6 +1044,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         .map(|(_, _, _, promoted)| promoted.memory_uri.clone())
         .collect();
 
+    let first_file_change_index = first_file_change.as_ref().map(|change| change.index);
     let had_file_change = first_file_change.is_some();
     if let Some(first_file_change) = first_file_change {
         // Serialize the seal/discard (and its stale-recovery: update-stale →
@@ -1161,6 +1165,32 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 failures.push(failure);
             }
         }
+    }
+
+    // The file-seal guard has been released. Propagation takes the same store
+    // mutex, so it must run here rather than inside finalize_file_commit.
+    if let Err(error) =
+        crate::mcp::vcs::propagate_observed_bookmark_advance(orch, bookmark_observation.as_ref())
+            .await
+    {
+        let index = first_file_change_index.unwrap_or(0);
+        failures.push(ChangeFailure {
+            index,
+            target: payload
+                .changes
+                .get(index)
+                .map(|change| change.target.clone())
+                .unwrap_or_else(|| "file:".to_string()),
+            mode: payload
+                .changes
+                .get(index)
+                .map(|change| mode_name(change.mode).to_string())
+                .unwrap_or_else(|| "patch".to_string()),
+            kind: "reconciliation".to_string(),
+            error: format!(
+                "Managed branch advancement was committed, but downstream workspace reconciliation failed: {error}"
+            ),
+        });
     }
 
     // Synchronous when:write check runner: a write that sealed a source-touching

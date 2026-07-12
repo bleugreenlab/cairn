@@ -192,6 +192,26 @@ pub(crate) fn validate_run_input(input: &RunInput) -> Result<(), String> {
             ));
         }
     }
+    let mut placements = std::collections::BTreeSet::new();
+    for item in &input.commands {
+        if item.repl.is_some() {
+            placements.insert("REPL");
+        } else if item
+            .target
+            .as_deref()
+            .is_some_and(|target| target.starts_with("cairn://mcp/"))
+        {
+            placements.insert("MCP gateway");
+        } else {
+            placements.insert("tree-bound");
+        }
+    }
+    if placements.len() > 1 {
+        return Err(
+            "a run batch may not mix tree-bound shell/inline/skill items with MCP-target or REPL items; split them into separate run calls"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -200,7 +220,9 @@ pub(crate) fn validate_run_input(input: &RunInput) -> Result<(), String> {
 pub(crate) struct RunInput {
     /// Ordered list of invocations. Each item is exactly one of three shapes: a
     /// shell `command`, inline `code` (with an `interpreter`), or a `target`
-    /// skill-script/MCP URI. Must contain at least one item.
+    /// skill-script/MCP URI. Must contain at least one item. A batch may not mix
+    /// tree-bound items (shell, inline code, skill scripts) with MCP gateway or
+    /// REPL items; split different placement classes into separate run calls.
     pub(crate) commands: Vec<RunItemInput>,
     /// Run items in input order instead of concurrently (default: false = parallel).
     #[serde(default, skip_serializing_if = "Option::is_none")]

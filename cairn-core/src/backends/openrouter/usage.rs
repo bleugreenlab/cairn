@@ -11,9 +11,9 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{openrouter_api_key, OPENROUTER_BACKEND_KEY};
-use crate::analytics::{self, types::Scope, types::TimeRange};
 use crate::models::{ProviderCreditsSnapshot, ProviderModelUsageRow, ProviderUsageSnapshot};
 use crate::orchestrator::Orchestrator;
+use cairn_analytics::{self as analytics, types::Scope, types::TimeRange};
 
 /// Snapshot source tag for the OpenRouter per-model breakdown. The frontend
 /// treats this as a canonical usage source, so a loaded breakdown is not

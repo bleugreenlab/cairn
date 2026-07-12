@@ -2,7 +2,7 @@
 //! tool-call and tool-time mixes, run wall-time composition, command durations,
 //! and session durations.
 
-use crate::storage::{DbResult, LocalDb};
+use cairn_db::storage::{DbResult, LocalDb};
 
 use super::queries;
 use super::types::{

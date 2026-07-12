@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::storage::{DbResult, LocalDb};
+use cairn_db::storage::{DbResult, LocalDb};
 
 use super::pricing;
 use super::queries;

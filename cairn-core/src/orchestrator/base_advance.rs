@@ -40,6 +40,7 @@ struct SiblingJob {
     id: String,
     worktree_path: String,
     branch: Option<String>,
+    base_commit: Option<String>,
 }
 
 #[derive(Debug)]
@@ -122,6 +123,62 @@ pub async fn notify_downstream_of_base_advance(
 /// id, so `j.id != ''` excludes nothing.
 const EXCLUDE_NONE: &str = "";
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BranchAdvanceOutcome {
+    pub eligible: usize,
+    pub rebased_clean: usize,
+    pub conflicted: usize,
+    pub failed: usize,
+}
+
+/// Canonical propagation seam for a managed branch whose local bookmark advanced.
+/// The destination is pinned to the observed commit so a later bookmark movement
+/// cannot silently change the base being adopted by downstream jobs.
+pub async fn reconcile_managed_branch_advance(
+    orch: &Orchestrator,
+    project_id: &str,
+    repo_path: &str,
+    advanced_branch: &str,
+    new_tip: &str,
+    source_job_to_exclude: Option<&str>,
+) -> Result<BranchAdvanceOutcome, String> {
+    let db = owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+    let store_lock = orch.jj_store_lock(&store);
+    let _store_guard = store_lock.lock().await;
+
+    advance_on_branch_workspaces(orch, &db, project_id, advanced_branch, repo_path).await;
+    let siblings = load_sibling_jobs(
+        &db,
+        project_id,
+        advanced_branch,
+        source_job_to_exclude.unwrap_or(EXCLUDE_NONE),
+    )
+    .await?;
+    let eligible = siblings.len();
+    if siblings.is_empty() {
+        return Ok(BranchAdvanceOutcome::default());
+    }
+    let notes = BaseAdvanceNotes {
+        conflict: build_jj_conflict_note(advanced_branch, None, None),
+        clean: build_jj_clean_note(advanced_branch, None, None),
+    };
+    let mut outcome = reconcile_base_advance(
+        orch,
+        &db,
+        &format!("managed branch {advanced_branch} advanced to {new_tip}"),
+        repo_path,
+        new_tip,
+        siblings,
+        notes,
+    )
+    .await?;
+    outcome.eligible = eligible;
+    Ok(outcome)
+}
+
 /// Reconcile in-flight siblings of a merged jj job by auto-rebasing each onto
 /// the locally-advanced integration tip over the shared store and pushing the
 /// cleanly-rebased ones so their PR heads advance. Non-blocking: conflicts are
@@ -192,6 +249,7 @@ async fn reconcile_jj_downstream(
         notes,
     )
     .await
+    .map(|_| ())
 }
 
 fn remote_default_revset(default_branch: &str) -> String {
@@ -282,6 +340,7 @@ async fn reconcile_default_advance(
         notes,
     )
     .await
+    .map(|_| ())
 }
 
 /// One-time startup catch-up for remote default-branch advances that landed while
@@ -381,6 +440,7 @@ async fn reconcile_startup_remote_default_advance(
         notes,
     )
     .await
+    .map(|_| ())
 }
 
 fn project_has_origin(orch: &Orchestrator, repo_path: &Path) -> bool {
@@ -413,7 +473,7 @@ async fn reconcile_base_advance(
     rebase_dest: &str,
     siblings: Vec<SiblingJob>,
     notes: BaseAdvanceNotes,
-) -> Result<(), String> {
+) -> Result<BranchAdvanceOutcome, String> {
     let specs: Vec<(String, std::path::PathBuf)> = siblings
         .iter()
         .filter_map(|sibling| {
@@ -423,11 +483,14 @@ async fn reconcile_base_advance(
         .collect();
     if specs.is_empty() {
         log::debug!("jj base advance ({label}): no in-flight siblings with a branch to reconcile");
-        return Ok(());
+        return Ok(BranchAdvanceOutcome::default());
     }
 
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+    let pinned_dest = crate::jj::revset_commit(&jj, &store, rebase_dest).ok_or_else(|| {
+        format!("jj base advance ({label}): destination `{rebase_dest}` did not resolve")
+    })?;
 
     // Store-truth precheck BEFORE any per-sibling jj work. `load_sibling_jobs`
     // returns rows straight from the DB, including long-dead `agent/…` siblings
@@ -447,7 +510,7 @@ async fn reconcile_base_advance(
     }
     if specs.is_empty() {
         log::debug!("jj base advance ({label}): all in-flight siblings had missing bookmarks");
-        return Ok(());
+        return Ok(BranchAdvanceOutcome::default());
     }
 
     // Heal any PRE-EXISTING divergent twin on a sibling bookmark BEFORE the
@@ -499,13 +562,43 @@ async fn reconcile_base_advance(
         })
         .collect();
 
-    let report = match crate::jj::reconcile_siblings(&jj, &store, rebase_dest, &specs) {
+    let mut report = match crate::jj::reconcile_siblings(&jj, &store, &pinned_dest, &specs) {
         Ok(report) => report,
         Err(error) => {
             log::warn!("jj sibling reconcile ({label}) failed: {error}");
-            return Ok(());
+            return Err(format!("jj sibling reconcile ({label}) failed: {error}"));
         }
     };
+    // Graph movement and durable lineage advancement are one reconciliation.
+    // A child that rebased cleanly or with recorded conflicts now has the pinned
+    // destination as its base; persist that coordinate before any success note.
+    let touched: Vec<String> = report
+        .rebased_clean
+        .iter()
+        .chain(report.conflicted.iter())
+        .cloned()
+        .collect();
+    for branch in touched {
+        let Some(sibling) = siblings
+            .iter()
+            .find(|candidate| sibling_branch(candidate).as_deref() == Some(branch.as_str()))
+        else {
+            continue;
+        };
+        if let Err(error) = advance_sibling_durable_base(db, sibling, &pinned_dest).await {
+            log::warn!(
+                "jj reconcile ({label}): branch {branch} moved but durable base advancement failed: {error}"
+            );
+            report
+                .rebased_clean
+                .retain(|candidate| candidate != &branch);
+            report.conflicted.retain(|candidate| candidate != &branch);
+            if !report.failed.contains(&branch) {
+                report.failed.push(branch);
+            }
+        }
+    }
+
     log::info!(
         "jj reconcile ({label}): {} rebased clean, {} recorded a conflict, {} failed",
         report.rebased_clean.len(),
@@ -572,7 +665,12 @@ async fn reconcile_base_advance(
         notify_clean_siblings(orch, db, &siblings, &clean_rewritten, &notes.clean)?;
     }
 
-    Ok(())
+    Ok(BranchAdvanceOutcome {
+        eligible: siblings.len(),
+        rebased_clean: clean_rewritten.len(),
+        conflicted: conflicted_rewritten.len(),
+        failed: report.failed.len(),
+    })
 }
 
 /// Filter a set of reconciled sibling branches down to those this reconcile
@@ -581,6 +679,148 @@ async fn reconcile_base_advance(
 /// so the commit id is unchanged → the branch is filtered out and not re-notified
 /// (conflicted or clean). When either snapshot is missing (an unexpected resolve
 /// failure), notify conservatively rather than silently dropping a real change.
+async fn advance_sibling_durable_base(
+    db: &LocalDb,
+    sibling: &SiblingJob,
+    new_base: &str,
+) -> Result<(), String> {
+    let recorded_base = sibling.base_commit.as_deref().ok_or_else(|| {
+        format!(
+            "job {} has no recorded base_commit; cannot advance to {new_base}",
+            sibling.id
+        )
+    })?;
+    let worktree = Path::new(&sibling.worktree_path);
+    let mut marker = crate::jj::read_workspace_identity(worktree).ok_or_else(|| {
+        format!(
+            "workspace {} has no .jj/cairn-workspace-identity marker (recorded base {recorded_base}, new base {new_base})",
+            sibling.worktree_path
+        )
+    })?;
+    if marker.project_id.is_empty() || marker.worktree_path != worktree {
+        return Err(format!(
+            "workspace identity coordinate mismatch for job {}: marker owner={}, path={}; expected path={}; refused base {new_base}",
+            sibling.id,
+            marker.owner_job_id,
+            marker.worktree_path.display(),
+            sibling.worktree_path,
+        ));
+    }
+
+    let (old_base, transition_already_pending) = match marker.pending_base_transition.as_ref() {
+        Some(pending) if pending.new_base == new_base => {
+            if marker.base_commit != pending.old_base && marker.base_commit != pending.new_base {
+                return Err(format!(
+                    "pending base transition {} -> {} disagrees with marker base {}",
+                    pending.old_base, pending.new_base, marker.base_commit
+                ));
+            }
+            (pending.old_base.clone(), true)
+        }
+        Some(pending) => {
+            return Err(format!(
+                "workspace already has a different pending base transition {} -> {}; refused {new_base}",
+                pending.old_base, pending.new_base
+            ))
+        }
+        None if marker.base_commit == new_base && recorded_base == new_base => return Ok(()),
+        None if marker.base_commit == recorded_base => (recorded_base.to_string(), false),
+        None => {
+            return Err(format!(
+                "workspace marker base {} disagrees with database base {recorded_base}; refused adoption of {new_base}",
+                marker.base_commit
+            ))
+        }
+    };
+
+    if !transition_already_pending {
+        marker.pending_base_transition = Some(crate::jj::WorkspaceBaseTransition {
+            old_base: old_base.clone(),
+            new_base: new_base.to_string(),
+        });
+        crate::jj::write_workspace_identity(worktree, &marker).map_err(|error| {
+            format!(
+                "could not record pending base transition {old_base} -> {new_base} at {} before database update: {error}",
+                sibling.worktree_path
+            )
+        })?;
+    }
+
+    let owner_job_id = marker.owner_job_id.clone();
+    let project_id = marker.project_id.clone();
+    let worktree_path = sibling.worktree_path.clone();
+    let new_base_owned = new_base.to_string();
+    db.write(|conn| {
+        let owner_job_id = owner_job_id.clone();
+        let project_id = project_id.clone();
+        let worktree_path = worktree_path.clone();
+        let old_base = old_base.clone();
+        let new_base = new_base_owned.clone();
+        Box::pin(async move {
+            let changed = conn
+                .execute(
+                    "UPDATE jobs SET base_commit = ?1, updated_at = ?2
+                     WHERE id = ?3 AND worktree_path = ?4 AND base_commit = ?5",
+                    params![
+                        new_base.as_str(),
+                        chrono::Utc::now().timestamp() as i32,
+                        owner_job_id.as_str(),
+                        worktree_path.as_str(),
+                        old_base.as_str()
+                    ],
+                )
+                .await?;
+            if changed == 0 {
+                let mut rows = conn
+                    .query(
+                        "SELECT base_commit FROM jobs WHERE id = ?1 AND worktree_path = ?2",
+                        params![owner_job_id.as_str(), worktree_path.as_str()],
+                    )
+                    .await?;
+                let current = match rows.next().await? {
+                    Some(row) => Some(row.text(0)?),
+                    None => None,
+                };
+                if current.as_deref() != Some(new_base.as_str()) {
+                    return Err(DbError::Internal(format!(
+                        "workspace base assignment changed concurrently for owner {owner_job_id}; expected {old_base} or completed {new_base}, found {}",
+                        current.as_deref().unwrap_or("missing")
+                    )));
+                }
+            }
+            conn.execute(
+                "UPDATE jobs SET base_commit = ?1, updated_at = ?2
+                 WHERE project_id = ?3 AND worktree_path = ?4 AND base_commit = ?5
+                   AND status IN ('pending', 'running', 'blocked', 'idle')",
+                params![
+                    new_base.as_str(),
+                    chrono::Utc::now().timestamp() as i32,
+                    project_id.as_str(),
+                    worktree_path.as_str(),
+                    old_base.as_str()
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| {
+        format!(
+            "pending base transition {old_base} -> {new_base} remains recorded for retry after database update failed: {error}"
+        )
+    })?;
+
+    marker.base_commit = new_base.to_string();
+    marker.pending_base_transition = None;
+    crate::jj::write_workspace_identity(worktree, &marker).map_err(|error| {
+        format!(
+            "database base reached {new_base}; pending marker transition {old_base} -> {new_base} remains recoverable at {} because finalization failed: {error}",
+            sibling.worktree_path
+        )
+    })
+}
+
 fn siblings_rewritten(
     branches: &[String],
     before: &HashMap<String, String>,
@@ -1294,7 +1534,7 @@ async fn load_sibling_jobs(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.id, j.worktree_path, j.branch
+                    "SELECT j.id, j.worktree_path, j.branch, j.base_commit
                          FROM jobs j
                          WHERE j.project_id = ?1
                            AND j.base_branch = ?2
@@ -1320,6 +1560,7 @@ async fn load_sibling_jobs(
                     id: row.text(0)?,
                     worktree_path: row.text(1)?,
                     branch: row.opt_text(2)?,
+                    base_commit: row.opt_text(3)?,
                 });
             }
             Ok(siblings)
@@ -1350,7 +1591,7 @@ async fn load_on_branch_workspaces(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.id, j.worktree_path, j.branch
+                    "SELECT j.id, j.worktree_path, j.branch, j.base_commit
                          FROM jobs j
                          WHERE j.project_id = ?1
                            AND j.branch = ?2
@@ -1371,6 +1612,7 @@ async fn load_on_branch_workspaces(
                     id: row.text(0)?,
                     worktree_path: row.text(1)?,
                     branch: row.opt_text(2)?,
+                    base_commit: row.opt_text(3)?,
                 });
             }
             Ok(workspaces)
@@ -1883,6 +2125,50 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_base_transition_completes_after_database_cas_interruption() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join(".jj")).unwrap();
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        db.execute(
+            "UPDATE jobs SET worktree_path = ?1, base_commit = 'new-base' WHERE id = 'job-overlap'",
+            params![workspace_path.as_str()],
+        )
+        .await
+        .unwrap();
+        let mut identity = crate::jj::WorkspaceIdentity::new(
+            "job-overlap",
+            "job-overlap",
+            "proj-1",
+            std::path::PathBuf::from("/repo"),
+            workspace.path().to_path_buf(),
+            "branch-overlap",
+            "branch-overlap",
+            "old-base",
+        );
+        identity.pending_base_transition = Some(crate::jj::WorkspaceBaseTransition {
+            old_base: "old-base".to_string(),
+            new_base: "new-base".to_string(),
+        });
+        crate::jj::write_workspace_identity(workspace.path(), &identity).unwrap();
+
+        let sibling = SiblingJob {
+            id: "job-overlap".to_string(),
+            worktree_path: workspace_path,
+            branch: Some("branch-overlap".to_string()),
+            base_commit: Some("new-base".to_string()),
+        };
+        advance_sibling_durable_base(&db, &sibling, "new-base")
+            .await
+            .unwrap();
+
+        let finalized = crate::jj::read_workspace_identity(workspace.path()).unwrap();
+        assert_eq!(finalized.base_commit, "new-base");
+        assert!(finalized.pending_base_transition.is_none());
+    }
+
     #[test]
     fn external_advance_note_carries_no_pr_or_rebase_commands() {
         let note = build_external_advance_conflict_note("main");
@@ -1963,6 +2249,7 @@ mod tests {
             id: "job-overlap".to_string(),
             worktree_path: "/wt/overlap".to_string(),
             branch: Some("agent/PROJ-2-builder-0".to_string()),
+            base_commit: None,
         }];
         let failed = vec!["agent/PROJ-2-builder-0".to_string()];
 
@@ -2008,11 +2295,13 @@ mod tests {
                 id: "job-overlap".to_string(),
                 worktree_path: "/wt/overlap".to_string(),
                 branch: Some("agent/PROJ-2-builder-0".to_string()),
+                base_commit: None,
             },
             SiblingJob {
                 id: "job-clean".to_string(),
                 worktree_path: "/wt/clean".to_string(),
                 branch: Some("agent/PROJ-3-builder-0".to_string()),
+                base_commit: None,
             },
         ];
         let conflicted = vec!["agent/PROJ-2-builder-0".to_string()];
@@ -2118,6 +2407,7 @@ mod tests {
             id: job_id.to_string(),
             worktree_path: "/wt/team-overlap".to_string(),
             branch: Some("agent/TEAM-9-builder-0".to_string()),
+            base_commit: None,
         }];
         let conflicted = vec!["agent/TEAM-9-builder-0".to_string()];
         let note = build_jj_conflict_note("integration", Some(42), None);
@@ -2172,11 +2462,13 @@ mod tests {
                 id: "job-overlap".to_string(),
                 worktree_path: "/wt/overlap".to_string(),
                 branch: Some("agent/PROJ-2-builder-0".to_string()),
+                base_commit: None,
             },
             SiblingJob {
                 id: "job-clean".to_string(),
                 worktree_path: "/wt/clean".to_string(),
                 branch: Some("agent/PROJ-3-builder-0".to_string()),
+                base_commit: None,
             },
         ];
         let ambiguous = vec![AmbiguousDivergence {
@@ -2262,6 +2554,7 @@ mod tests {
             id: "job-clean".to_string(),
             worktree_path: "/wt/clean".to_string(),
             branch: Some("agent/PROJ-3-builder-0".to_string()),
+            base_commit: None,
         }];
         let clean = vec!["agent/PROJ-3-builder-0".to_string()];
         let note = build_jj_clean_note("integration", Some(42), None);

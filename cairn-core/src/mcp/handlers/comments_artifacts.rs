@@ -460,8 +460,15 @@ pub(crate) async fn write_artifact_change(
             job.worktree_path.as_deref(),
             job.branch.as_deref(),
         )?;
-        sweep_gate_and_publish_create_pr_branch(orch, worktree, branch, job.base_branch.as_deref())
-            .await?;
+        sweep_gate_and_publish_create_pr_branch(
+            orch,
+            &job.project_id,
+            &job_id,
+            worktree,
+            branch,
+            job.base_branch.as_deref(),
+        )
+        .await?;
     }
 
     let data_json = serde_json::to_string(&effective_payload)
@@ -892,6 +899,8 @@ fn should_arm_output_artifact_interrupt(
 /// edits and the like): there is nothing to sweep, gate, or publish.
 async fn sweep_gate_and_publish_create_pr_branch(
     orch: &Orchestrator,
+    project_id: &str,
+    job_id: &str,
     worktree_path: &str,
     branch: &str,
     base_branch: Option<&str>,
@@ -910,14 +919,54 @@ async fn sweep_gate_and_publish_create_pr_branch(
     // marker (the same store `resolve_store_lock` targets). Best-effort resolution:
     // a worktree missing its marker seals without the guard, matching the
     // resolve_store_lock None fallback.
-    let store_lock = crate::jj::read_project_root_marker(worktree)
-        .map(|root| orch.jj_store_lock(&crate::jj::project_store_dir(&orch.config_dir, &root)));
-    let _guard = match store_lock.as_ref() {
-        Some(lock) => Some(lock.lock().await),
-        None => None,
+    let project_root = crate::jj::read_project_root_marker(worktree);
+    let store = project_root
+        .as_ref()
+        .map(|root| crate::jj::project_store_dir(&orch.config_dir, root));
+    let store_lock = store.as_ref().map(|store| orch.jj_store_lock(store));
+    let (before_tip, after_tip) = {
+        let _guard = match store_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let before_tip = store
+            .as_ref()
+            .and_then(|store| crate::jj::bookmark_commit(&jj, store, branch));
+        sweep_gate_and_publish_create_pr_branch_locked(
+            &jj,
+            &backend,
+            worktree,
+            branch,
+            base_branch,
+        )?;
+        let after_tip = store
+            .as_ref()
+            .and_then(|store| crate::jj::bookmark_commit(&jj, store, branch));
+        (before_tip, after_tip)
     };
 
-    sweep_gate_and_publish_create_pr_branch_locked(&jj, &backend, worktree, branch, base_branch)
+    if before_tip != after_tip {
+        let project_root = project_root.ok_or_else(|| {
+            "create-pr advanced the managed bookmark but its project-root marker was missing; downstream reconciliation could not be routed".to_string()
+        })?;
+        let new_tip = after_tip
+            .ok_or_else(|| format!("create-pr publication removed managed bookmark `{branch}`"))?;
+        crate::orchestrator::base_advance::reconcile_managed_branch_advance(
+            orch,
+            project_id,
+            &project_root.to_string_lossy(),
+            branch,
+            &new_tip,
+            Some(job_id),
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "create-pr sealed and published `{branch}`, but downstream workspace reconciliation failed: {error}"
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn require_create_pr_branch_metadata<'a>(

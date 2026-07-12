@@ -31,6 +31,31 @@ where
     Ok(Some(value))
 }
 
+/// Load the runner-owned build-slot capability. An absent block is the disabled
+/// default, including the canonical acquisition and execution timeouts.
+pub fn load_build_slots(config_dir: &std::path::Path) -> crate::build_slots::BuildSlotsConfig {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.build_slots)
+        .unwrap_or_default()
+}
+
+/// Replace the runner-owned build-slot capability in `settings.yaml` without
+/// routing it through the general Settings DTO. Only `buildSlots` is touched.
+pub fn set_build_slots(
+    config_dir: &std::path::Path,
+    config: &crate::build_slots::BuildSlotsConfig,
+) -> Result<(), String> {
+    mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        root.insert(
+            serde_yaml::Value::String("buildSlots".to_string()),
+            serde_yaml::to_value(config)
+                .map_err(|error| format!("Failed to serialize build slots: {error}"))?,
+        );
+        Ok(())
+    })
+}
+
 /// Settings as stored in YAML file.
 /// All fields are optional - missing fields use defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -118,6 +143,10 @@ pub struct SettingsFile {
     /// `docs/worktree-fence.md` — Managed Build Services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_services: Option<HashMap<String, crate::config::build_services::BuildServiceConfig>>,
+    /// Runner-owned persistent build-slot capability. Project configuration may
+    /// request slot routing, but only this workspace-owned section grants it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_slots: Option<crate::build_slots::BuildSlotsConfig>,
     /// Typed web-fetch provider options, keyed by provider id
     /// (`bmd`/`jina`/`firecrawl`) then option key. Config-only (YAML, not in the
     /// Settings DTO). Validated against the per-provider descriptor in
@@ -359,6 +388,7 @@ impl SettingsFile {
             sandbox_deny_read: None,
             browser_network_sensitive_names: None,
             build_services: None,
+            build_slots: None,
             accepted_fence_commands: None,
             web_fetch: None,
             active_web_fetch: None,
@@ -1868,5 +1898,66 @@ thinkingDisplayMode: full
         assert_eq!(restored.active_backend, "codex");
         assert!(restored.backends.contains_key("claude"));
         assert!(restored.backends.contains_key("codex"));
+    }
+}
+
+#[cfg(test)]
+mod build_slot_settings_tests {
+    use super::SettingsFile;
+
+    #[test]
+    fn build_slots_are_config_only_and_round_trip() {
+        let yaml = r#"
+buildSlots:
+  projects:
+    CAIRN: 3
+  acquisitionDeadlineSeconds: 15
+  defaultTimeoutSeconds: 1800
+  globalCapacity: 2
+"#;
+        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let slots = file.build_slots.as_ref().unwrap();
+        assert_eq!(slots.slots_for("CAIRN"), 2);
+        assert_eq!(slots.slots_for("OTHER"), 2);
+        assert_eq!(slots.acquisition_deadline_seconds, 15);
+        assert_eq!(slots.default_timeout_seconds, 1800);
+        let serialized = serde_yaml::to_string(&file).unwrap();
+        let reparsed: SettingsFile = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.build_slots, file.build_slots);
+    }
+
+    #[test]
+    fn set_build_slots_preserves_unrelated_settings_and_reopens() {
+        use crate::build_slots::BuildSlotsConfig;
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        std::fs::write(
+            super::get_settings_path(dir),
+            "branchPrefix: custom\nlogLevel: standard\n",
+        )
+        .unwrap();
+        let config = BuildSlotsConfig {
+            projects: HashMap::from([("CAIRN".to_string(), 3)]),
+            acquisition_deadline_seconds: 12,
+            default_timeout_seconds: 900,
+            global_capacity: Some(4),
+        };
+
+        super::set_build_slots(dir, &config).unwrap();
+
+        assert_eq!(super::load_build_slots(dir), config);
+        let reopened = super::load_settings_file(dir).unwrap();
+        assert_eq!(reopened.branch_prefix.as_deref(), Some("custom"));
+        let yaml = std::fs::read_to_string(super::get_settings_path(dir)).unwrap();
+        assert!(yaml.contains("logLevel: standard"));
+        assert!(yaml.contains("projects:"));
+
+        let defaults = super::load_build_slots(tempfile::TempDir::new().unwrap().path());
+        assert_eq!(defaults.slots_for("arbitrary-project"), 2);
+        let default_yaml = serde_yaml::to_string(&defaults).unwrap();
+        assert!(default_yaml.contains("projects: {}"));
     }
 }

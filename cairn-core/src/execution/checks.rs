@@ -50,11 +50,10 @@
 //!
 //! ## Cache key
 //!
-//! Each check's verdict is keyed by its INPUT hash: the content identity of only
-//! the files in the sealed tree matching that check's `impact` globs (see
-//! [`input_hash_for`] / [`crate::execution::selection::check_input_hash`]). A
-//! commit that changed none of a check's inputs — a doc-only commit landing after
-//! a source commit — hits the cache even though the whole-tree hash moved, so the
+//! Each check's verdict is keyed by [`check_result_key`]: the impact-filtered
+//! sealed-tree content, configured command, platform, and cached toolchain
+//! identity. A commit that changed none of a check's inputs — a doc-only commit
+//! landing after a source commit — hits the cache even though the whole-tree hash moved, so the
 //! check is not re-run. A check with no `impact` globs keeps whole-tree keying
 //! ([`crate::jj::sealed_tree_hash`]). The row also stores that whole-tree hash and
 //! re-stamps it on every evaluation (run OR hit), so the `/checks` listing — which
@@ -65,7 +64,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::config::project_settings::{load_checks, CheckCommand, CheckWhen};
@@ -74,7 +73,12 @@ use crate::execution::cache::{
     CheckResultCacheEntry, CheckResultCacheWrite,
 };
 use crate::execution::check_admission::CheckAdmissionController;
-use crate::execution::check_isolation::CheckExecMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckExecMode {
+    Isolated,
+    Shared,
+}
 use crate::execution::check_parsers::{
     extract_running_tests, format_failure_excerpt, format_failure_names, parse_check_output,
     ParsedCheckResult, MAX_FAILURE_NAMES,
@@ -203,9 +207,18 @@ fn classify_check_failure(
         return None;
     }
     if spawn_error {
+        let infrastructure = output.starts_with("Cairn check infrastructure failure:");
         return Some(FailureClassification {
-            kind: CheckFailureKind::SpawnError,
-            reason: "Cairn: check process failed to spawn".to_string(),
+            kind: if infrastructure {
+                CheckFailureKind::Infrastructure
+            } else {
+                CheckFailureKind::SpawnError
+            },
+            reason: if infrastructure {
+                "Cairn: check execution substrate failed before producing a verdict".to_string()
+            } else {
+                "Cairn: check process failed to spawn".to_string()
+            },
             evidence_line: None,
         });
     }
@@ -412,7 +425,15 @@ pub async fn run_write_checks_after_seal(
             .map(|plan| {
                 let check = planning_checks.get(&plan.name);
                 let impact = check.and_then(|check| check.impact.as_ref());
-                let input_hash = input_hash_for(impact, entries.as_deref(), &tree_hash);
+                let command = check.map_or(plan.command.as_str(), |check| check.command.as_str());
+                let input_hash = check_result_key(
+                    impact,
+                    entries.as_deref(),
+                    &tree_hash,
+                    command,
+                    &check_platform_identity(),
+                    check_toolchain_identity(),
+                );
                 let should_reselect = get_check_result(
                     planning_db.clone(),
                     &planning_project_id,
@@ -896,27 +917,76 @@ pub struct CheckOutcome {
     pub duration_ms: i64,
 }
 
-/// The cache key for one check's verdict: the content identity of ONLY the files
-/// in the sealed tree matching that check's impact globs (its "input hash"). A
-/// check with NO impact globs keeps whole-tree keying (`tree_hash`), since every
-/// change is one of its inputs. When the sealed tree can't be read (`entries` is
-/// `None` after a git hiccup), an impact-scoped check falls back to the whole-tree
-/// hash — conservative: it re-runs on any change and never falsely reuses a
-/// verdict. Glob matching reuses the planner's globset
-/// ([`crate::execution::selection::check_input_hash`]), so there is one glob
-/// semantics in the codebase.
-pub(crate) fn input_hash_for(
+/// Versioned identity of the host tools that can affect project-check outcomes.
+/// Probes run at most once per runner process; cache lookups never shell out.
+static CHECK_TOOLCHAIN_IDENTITY: OnceLock<String> = OnceLock::new();
+const CHECK_RESULT_KEY_VERSION: &str = "check-result-v2";
+
+pub(crate) fn check_platform_identity() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+pub(crate) fn check_toolchain_identity() -> &'static str {
+    CHECK_TOOLCHAIN_IDENTITY
+        .get_or_init(|| {
+            fn version(program: &str, args: &[&str]) -> String {
+                std::process::Command::new(program)
+                    .args(args)
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .filter(|output| !output.is_empty())
+                    .unwrap_or_else(|| "unavailable".to_string())
+            }
+
+            format!(
+                "rustc={};bun={}",
+                version("rustc", &["--version", "--verbose"]),
+                version("bun", &["--version"])
+            )
+        })
+        .as_str()
+}
+
+/// Canonical identity for one project-check result. This is deliberately the
+/// single composition seam shared by cache lookups today and in-flight request
+/// coalescing later: `(impact-filtered tree, command, platform, toolchain)`.
+///
+/// A check with no impact globs uses the whole sealed tree. When tree entries
+/// cannot be read, an impact-scoped check also falls back to the whole-tree hash,
+/// conservatively over-invalidating rather than falsely reusing a verdict.
+/// Length-prefixing every component makes the tuple encoding unambiguous, and the
+/// version prefix guarantees existing input-only rows invalidate by miss.
+pub(crate) fn check_result_key(
     impact: Option<&Vec<String>>,
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
+    command: &str,
+    platform: &str,
+    toolchain: &str,
 ) -> String {
-    match impact {
+    use sha2::{Digest, Sha256};
+
+    let filtered_tree = match impact {
         None => tree_hash.to_string(),
         Some(globs) => match entries {
             Some(entries) => crate::execution::selection::check_input_hash(entries, globs),
             None => tree_hash.to_string(),
         },
+    };
+    let mut hasher = Sha256::new();
+    for component in [
+        CHECK_RESULT_KEY_VERSION,
+        filtered_tree.as_str(),
+        command,
+        platform,
+        toolchain,
+    ] {
+        hasher.update(component.len().to_be_bytes());
+        hasher.update(component.as_bytes());
     }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Execute the planned checks against the sealed tree, consulting the cache
@@ -1089,17 +1159,27 @@ where
     // yielding `(index, outcome)` so the caller can reassemble into plan order.
     // Borrows shared state by reference so the returned future is not tied to a
     // moved closure capture (mirrors how `orch`/`run_context` flow through
-    // `execute`), letting `Isolated` mode hold many of these futures at once.
+    // `execute`), letting concurrent mode hold many of these futures at once.
     let run_miss = |index: usize| {
         let db = &db;
         let execute = &execute;
         let transition = &transition;
         async move {
             let (plan, input_hash) = &plans[index];
-            let permit = admission
-                .acquire(plan.resource_class)
-                .await
-                .expect("check admission semaphore must remain open");
+            // Slot scheduling owns its own priority-aware admission. Acquiring the
+            // legacy FIFO permit before entering that queue would let a review
+            // request hold host capacity while blocking a later interactive/write
+            // request. Local checks retain the existing controller unchanged.
+            let permit = if plan.externally_admitted {
+                None
+            } else {
+                Some(
+                    admission
+                        .acquire(plan.resource_class)
+                        .await
+                        .expect("check admission semaphore must remain open"),
+                )
+            };
             transition(index, "running", None);
             let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
             let started = Instant::now();
@@ -1168,7 +1248,7 @@ where
                         "suiteId": tool_use_id,
                         "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
                         "resourceClass": plan.resource_class.as_str(),
-                        "queueWaitMs": permit.waited().as_millis(),
+                        "queueWaitMs": permit.as_ref().map_or(0, |permit| permit.waited().as_millis()),
                         "durationMs": duration_ms,
                         "exitCode": exit_code,
                         "timedOut": timed_out,
@@ -1222,12 +1302,12 @@ where
         }
     };
 
-    // Phase 2: execute the misses — concurrently when isolated, sequentially when
-    // sharing the one checkout (the fallback correctness boundary).
+    // Phase 2: execute misses concurrently when the caller owns independent
+    // execution substrates, or sequentially when they share one mutable checkout.
     match mode {
         CheckExecMode::Isolated => {
-            // Poll every isolated miss. Process spawn is globally bounded by the
-            // fair admission controller, shared across jobs and cadences.
+            // Poll every independently placed miss. Admission is owned either by the
+            // external substrate or by the shared host controller.
             let done: Vec<(usize, CheckOutcome)> =
                 futures_util::future::join_all(misses.iter().map(|&index| run_miss(index))).await;
             for (index, outcome) in done {
@@ -1453,10 +1533,193 @@ mod tests {
     use super::*;
     use crate::config::project_settings::{CheckPolicy, CheckResourceClass};
     use crate::execution::selection::CheckScope;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
 
     fn admission() -> CheckAdmissionController {
         CheckAdmissionController::new(2)
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git should run in cache-key fixture");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn git_tree_entries(repo: &Path, revision: &str) -> Vec<(String, String)> {
+        git(repo, &["ls-tree", "-r", revision])
+            .lines()
+            .map(|line| {
+                let (metadata, path) = line.split_once('\t').expect("ls-tree row has a path");
+                let blob = metadata
+                    .split_whitespace()
+                    .nth(2)
+                    .expect("ls-tree row has an object id");
+                (path.to_string(), blob.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn result_key_is_impact_filtered_and_includes_command_platform_and_toolchain() {
+        let impact = vec!["src/**".to_string()];
+        let base = vec![
+            ("src/lib.rs".to_string(), "blob-a".to_string()),
+            ("docs/readme.md".to_string(), "docs-a".to_string()),
+        ];
+        let key = check_result_key(
+            Some(&impact),
+            Some(&base),
+            "whole-tree-a",
+            "cargo test",
+            "macos-aarch64",
+            "rustc=1;bun=1",
+        );
+
+        assert_ne!(
+            key,
+            check_result_key(
+                Some(&impact),
+                Some(&base),
+                "whole-tree-a",
+                "cargo test --all",
+                "macos-aarch64",
+                "rustc=1;bun=1",
+            ),
+            "changing command text must miss"
+        );
+        assert_ne!(
+            key,
+            check_result_key(
+                Some(&impact),
+                Some(&base),
+                "whole-tree-a",
+                "cargo test",
+                "linux-x86_64",
+                "rustc=1;bun=1",
+            ),
+            "platform must participate in the key"
+        );
+        assert_ne!(
+            key,
+            check_result_key(
+                Some(&impact),
+                Some(&base),
+                "whole-tree-a",
+                "cargo test",
+                "macos-aarch64",
+                "rustc=2;bun=1",
+            ),
+            "toolchain must participate in the key"
+        );
+
+        let inside_changed = vec![
+            ("src/lib.rs".to_string(), "blob-b".to_string()),
+            ("docs/readme.md".to_string(), "docs-a".to_string()),
+        ];
+        assert_ne!(
+            key,
+            check_result_key(
+                Some(&impact),
+                Some(&inside_changed),
+                "whole-tree-b",
+                "cargo test",
+                "macos-aarch64",
+                "rustc=1;bun=1",
+            ),
+            "content changes inside impact globs must miss"
+        );
+
+        let outside_changed = vec![
+            ("src/lib.rs".to_string(), "blob-a".to_string()),
+            ("docs/readme.md".to_string(), "docs-b".to_string()),
+        ];
+        assert_eq!(
+            key,
+            check_result_key(
+                Some(&impact),
+                Some(&outside_changed),
+                "whole-tree-b",
+                "cargo test",
+                "macos-aarch64",
+                "rustc=1;bun=1",
+            ),
+            "content changes outside impact globs must hit"
+        );
+    }
+
+    #[test]
+    fn result_key_uses_tree_content_not_commit_history() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path();
+        git(repo, &["init", "--quiet"]);
+        git(repo, &["config", "user.name", "Cairn Test"]);
+        git(repo, &["config", "user.email", "cairn@example.test"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "--quiet", "-m", "first message"]);
+
+        let first_commit = git(repo, &["rev-parse", "HEAD"]);
+        let tree = git(repo, &["rev-parse", "HEAD^{tree}"]);
+        let second_commit = {
+            let mut child = Command::new("git")
+                .args(["commit-tree", tree.as_str(), "-p", first_commit.as_str()])
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", "Cairn Test")
+                .env("GIT_AUTHOR_EMAIL", "cairn@example.test")
+                .env("GIT_COMMITTER_NAME", "Cairn Test")
+                .env("GIT_COMMITTER_EMAIL", "cairn@example.test")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"different message and parent\n")
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert_ne!(first_commit, second_commit);
+
+        let impact = vec!["src/**".to_string()];
+        let first_entries = git_tree_entries(repo, &first_commit);
+        let second_entries = git_tree_entries(repo, &second_commit);
+        assert_eq!(
+            check_result_key(
+                Some(&impact),
+                Some(&first_entries),
+                &tree,
+                "cargo test",
+                "test-platform",
+                "test-toolchain",
+            ),
+            check_result_key(
+                Some(&impact),
+                Some(&second_entries),
+                &tree,
+                "cargo test",
+                "test-platform",
+                "test-toolchain",
+            ),
+            "identical impact-filtered trees must hit despite different commit history"
+        );
     }
 
     fn change(path: &str) -> GraphFileChange {
@@ -2114,6 +2377,7 @@ mod tests {
             command: command.to_string(),
             scope: CheckScope::Full,
             resource_class: CheckResourceClass::Shared,
+            externally_admitted: false,
         }
     }
 

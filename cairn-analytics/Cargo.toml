@@ -1,0 +1,20 @@
+[package]
+name = "cairn-analytics"
+version.workspace = true
+edition = "2021"
+description = "Agent-economics SQL aggregates, pricing, and tool extraction quarantined from cairn-core"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "analytics"]
+
+[dependencies]
+cairn-db = { path = "../cairn-db" }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+cairn-db = { path = "../cairn-db", features = ["test-utils"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

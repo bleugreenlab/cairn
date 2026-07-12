@@ -335,10 +335,9 @@ pub fn flatten_branch_recovery(
     }
 
     // Re-point every rider sibling onto the flattened commit BEFORE the twin
-    // cleanup, so a rider that happened to sit on the pre-flatten tip is moved off
-    // it before that lineage is abandoned. Best-effort per bookmark with logging: a
-    // failed re-point leaves the rider on the orphaned lineage (the same state as
-    // before this recovery existed), so the good flatten still stands.
+    // cleanup. Bookmark preservation is fail-closed: abandoning a bookmark head
+    // and its parent together can delete the bookmark, so no candidate lineage is
+    // abandoned unless every affected bookmark has a proven surviving target.
     let mut repointed_bookmarks = Vec::new();
     for rider in riders {
         match jj.run(
@@ -362,7 +361,11 @@ pub fn flatten_branch_recovery(
                 );
                 repointed_bookmarks.push(rider);
             }
-            Err(e) => log::warn!("flatten: re-pointing rider bookmark {rider} failed: {e}"),
+            Err(e) => {
+                return Err(fail(format!(
+                    "flatten: could not safely re-point bookmark `{rider}` to surviving commit {post_tip}; no orphaned lineage was abandoned: {e}"
+                )))
+            }
         }
     }
 
@@ -376,6 +379,35 @@ pub fn flatten_branch_recovery(
         for commit in visible_commit_ids_for_change(jj, store, &pre_change_id) {
             if commit == post_tip {
                 continue;
+            }
+            let affected = local_bookmarks_in_range(jj, store, &commit, branch);
+            for bookmark in &affected {
+                jj.run(
+                    store,
+                    &[
+                        "bookmark",
+                        "set",
+                        bookmark,
+                        "-r",
+                        &post_tip,
+                        "--allow-backwards",
+                        "--ignore-working-copy",
+                    ],
+                    "flatten: preserve twin bookmark",
+                )
+                .map_err(|error| {
+                    fail(format!(
+                        "flatten: refusing to abandon {commit}: bookmark `{bookmark}` could not be moved to proven survivor {post_tip}: {error}"
+                    ))
+                })?;
+                if bookmark_commit(jj, store, bookmark).as_deref() != Some(post_tip.as_str()) {
+                    return Err(fail(format!(
+                        "flatten: refusing to abandon {commit}: bookmark `{bookmark}` did not resolve to proven survivor {post_tip} after re-point"
+                    )));
+                }
+                if !repointed_bookmarks.contains(bookmark) {
+                    repointed_bookmarks.push(bookmark.clone());
+                }
             }
             match jj.run(
                 store,

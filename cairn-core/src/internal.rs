@@ -55,6 +55,10 @@ pub mod browser_network {
     pub use crate::browser_network::*;
 }
 
+pub mod build_slots {
+    pub use crate::build_slots::*;
+}
+
 pub mod browsers {
     pub use crate::browsers::*;
 }

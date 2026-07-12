@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::storage::{DbResult, LocalDb};
+use cairn_db::storage::{DbResult, LocalDb};
 
 use super::cost::exact_or_priced;
 use super::pricing;
@@ -45,6 +45,7 @@ fn finalize(map: HashMap<String, Acc>) -> Vec<EconomicsRow> {
     let mut rows: Vec<EconomicsRow> = map
         .into_iter()
         .map(|(key, a)| {
+            // Persisted prompt components are disjoint for every backend.
             let total_input = a.input + a.cache_read + a.cache_create;
             let cache_hit_ratio = if total_input > 0 {
                 a.cache_read as f64 / total_input as f64

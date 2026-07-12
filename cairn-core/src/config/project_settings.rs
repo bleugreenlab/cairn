@@ -404,6 +404,27 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn removed_executor_keys_are_accepted_and_dropped_on_rewrite() {
+        let yaml = r#"
+run:
+  executor: build-slot
+checks:
+  frontend:
+    command: vitest run
+    when: review
+    executor: build-slot
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let frontend = settings.checks.as_ref().unwrap().get("frontend").unwrap();
+        assert_eq!(frontend.command, "vitest run");
+        assert_eq!(frontend.when, CheckWhen::Review);
+
+        let serialized = serde_yaml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("run:"));
+        assert!(!serialized.contains("executor:"));
+    }
+
+    #[test]
     fn resolve_default_branch_precedence() {
         let mut config = ProjectSettingsFile::default();
         // Nothing configured: hard fallback.
@@ -457,6 +478,7 @@ checks:
       - packages/ui/**
     policy: gate
     when: idle
+    executor: build-slot
   typecheck:
     command: tsc --noEmit
 "#;

@@ -43,19 +43,11 @@ impl ContextTokenEventSnapshot {
     pub fn into_state(self, context_window: Option<i64>) -> ContextTokenState {
         let input_tokens = self.input_tokens.unwrap_or(0);
         let output_tokens = self.output_tokens.unwrap_or(0);
-        // Codex and OpenRouter report OpenAI-style usage where prompt/input already
-        // includes cached input, so occupancy is input + output. Claude reports
-        // cache tokens separately from input, so they add in.
-        let used_tokens = if self.backend.eq_ignore_ascii_case("codex")
-            || self.backend.eq_ignore_ascii_case("openrouter")
-        {
-            input_tokens + output_tokens
-        } else {
-            input_tokens
-                + self.cache_create_tokens.unwrap_or(0)
-                + self.cache_read_tokens.unwrap_or(0)
-                + output_tokens
-        };
+        // Persisted token components are disjoint for every backend.
+        let used_tokens = input_tokens
+            + self.cache_create_tokens.unwrap_or(0)
+            + self.cache_read_tokens.unwrap_or(0)
+            + output_tokens;
 
         ContextTokenState {
             run_id: self.run_id,
@@ -95,10 +87,7 @@ pub async fn get_latest_context_token_event(
          LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
          WHERE e.session_id = ?1
            AND e.parent_tool_use_id IS NULL
-           AND NOT (
-                LOWER(COALESCE(s.backend, 'claude')) = 'claude'
-            AND e.event_type LIKE 'result%'
-           )
+           AND e.event_type NOT LIKE 'result%'
            AND (
                 e.input_tokens IS NOT NULL
              OR e.cache_read_tokens IS NOT NULL
@@ -167,18 +156,16 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_occupancy_excludes_cache_to_avoid_double_count() {
-        // OpenAI-style: prompt_tokens (input) already includes cached input, so
-        // occupancy is input + output, not input + cache_read + output.
+    fn openrouter_occupancy_sums_disjoint_cache() {
         let state = snapshot("openrouter").into_state(Some(200_000));
-        assert_eq!(state.used_tokens, 1_200);
+        assert_eq!(state.used_tokens, 1_000 + 50 + 400 + 200);
         assert_eq!(state.context_window, Some(200_000));
     }
 
     #[test]
-    fn codex_occupancy_is_input_plus_output() {
+    fn codex_occupancy_sums_disjoint_cache() {
         let state = snapshot("codex").into_state(Some(258_400));
-        assert_eq!(state.used_tokens, 1_200);
+        assert_eq!(state.used_tokens, 1_000 + 50 + 400 + 200);
     }
 
     #[test]

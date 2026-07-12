@@ -756,9 +756,11 @@ async fn full_sandbox_run_without_commit_msg_is_not_gated_or_reverted() {
         !result.contains("no commit_msg was given"),
         "result: {result}"
     );
-    assert!(Path::new(&cwd).join("full-sandbox.txt").exists());
-    // A full-sandbox run is not gated, so its new dirt is left un-sealed.
-    assert!(!ws_clean(&temp.path().join("config"), Path::new(&cwd)));
+    assert!(
+        !Path::new(&cwd).join("full-sandbox.txt").exists(),
+        "ignored and untracked slot outputs must not leak into the agent workspace"
+    );
+    assert!(ws_clean(&temp.path().join("config"), Path::new(&cwd)));
 }
 
 #[tokio::test]

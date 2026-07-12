@@ -1,7 +1,7 @@
 //! Analytics rollup backfill: the on-demand tool-invocation backfill and the
 //! startup historical repair passes with their completion markers.
 
-use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_db::storage::{DbResult, LocalDb, RowExt};
 
 use super::queries;
 use super::types::ToolBackfillSummary;

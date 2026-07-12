@@ -8,7 +8,6 @@
 // ── Domain operations ──────────────────────────────────
 pub mod action_configs;
 pub mod action_runs;
-pub mod analytics;
 pub mod archival;
 pub mod artifacts;
 pub mod browser_network;
@@ -69,6 +68,7 @@ pub mod transcripts;
 // ── Internal implementation modules ────────────────────
 mod agent_process;
 mod backends;
+pub(crate) mod build_slots;
 mod db;
 pub use cairn_db::db_records;
 mod effects;

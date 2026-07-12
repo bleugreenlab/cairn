@@ -288,7 +288,6 @@ impl OrchestratorBuilder {
         // (CAIRN-2196). Idempotent and `Once`-guarded; see
         // `storage::install_crypto_provider`.
         crate::storage::install_crypto_provider();
-        crate::execution::check_isolation::cleanup_abandoned_clone_roots(&self.config_dir);
 
         // Register the archived-file renderer so archival reconstruction (in
         // `storage`, below the mcp read layer) can reproduce archived reads
@@ -316,6 +315,7 @@ impl OrchestratorBuilder {
             check_admission: Arc::new(
                 crate::execution::check_admission::CheckAdmissionController::default(),
             ),
+            build_slots: Arc::new(crate::build_slots::BuildSlotPool::default()),
             permission_responses: self.permission_responses,
             run_completions: self.run_completions,
             prompt_responses: self.prompt_responses,
@@ -573,6 +573,8 @@ pub struct Orchestrator {
     pub turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
     /// Fair, runner-wide resource admission shared by write and review checks.
     pub check_admission: Arc<crate::execution::check_admission::CheckAdmissionController>,
+    /// Runner-owned persistent commit-addressed execution workspaces.
+    pub build_slots: Arc<crate::build_slots::BuildSlotPool>,
     /// Pool of long-lived Codex app-servers for EPHEMERAL CALLS (CAIRN-2549).
     /// Each pooled call is a `thread/start` on a shared process rather than a
     /// process of its own. Deliberately owned HERE and NOT in
@@ -710,6 +712,21 @@ fn resolve_embed_token(account: &AccountManager, anon: &AnonDeviceManager) -> Op
 }
 
 impl Orchestrator {
+    pub fn build_slot_snapshot(&self) -> crate::build_slots::BuildSlotPoolSnapshot {
+        self.build_slots.snapshot()
+    }
+
+    pub fn cancel_build_slot_request(&self, request_id: &str) -> bool {
+        let cancelled = self.build_slots.cancel_request(request_id);
+        if cancelled {
+            let _ = self.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "build_slots", "action": "cancel", "requestId": request_id}),
+            );
+        }
+        cancelled
+    }
+
     pub fn builder(
         db: Arc<DbState>,
         services: Arc<Services>,
@@ -1069,7 +1086,7 @@ impl Orchestrator {
     pub fn spawn_analytics_rollup_backfill(&self) {
         let db = self.db.local.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::analytics::run_historical_backfill(&db).await {
+            if let Err(e) = cairn_analytics::run_historical_backfill(&db).await {
                 log::warn!("analytics rollup backfill failed: {e}");
             }
         });
@@ -1916,7 +1933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_token_state_falls_back_to_latest_event_tokens() {
+    async fn codex_context_token_state_does_not_fall_back_to_turn_sum() {
         let db = test_db().await;
         db.local
             .execute_script(
@@ -1976,15 +1993,10 @@ mod tests {
             },
         );
 
-        let state = orch.get_context_token_state("session-ctx").await.unwrap();
-        assert_eq!(state.run_id, "run-ctx");
-        assert_eq!(state.backend, "codex");
-        assert_eq!(state.model, Some("gpt-5".to_string()));
-        assert_eq!(state.used_tokens, 250);
-        assert_eq!(state.context_window, Some(258_400));
-        assert_eq!(state.reasoning_tokens, Some(7));
-        assert_eq!(state.last_output_tokens, Some(50));
-        assert_eq!(state.captured_at, 20);
+        // Codex result rows now contain the sum of every model response in the
+        // turn, not context occupancy. After restart the gauge remains empty
+        // until the next live token notification supplies a real snapshot.
+        assert!(orch.get_context_token_state("session-ctx").await.is_none());
     }
 
     #[tokio::test]

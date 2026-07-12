@@ -234,23 +234,23 @@ async fn count(db: &LocalDb, sql: &'static str) -> i64 {
     common::query_i64(db, sql).await.unwrap()
 }
 
-// Two parallel items on a single-threaded tokio runtime (the `#[tokio::test]`
-// default) overlap only if the wait is non-blocking: the old try_wait +
-// thread::sleep loop monopolized the one worker, serializing the batch (~sum),
-// while the async sleep yields so both sleeps run at once (~max).
+// Each item waits for a marker written by the other. Concurrent execution lets
+// both succeed; serialization makes the first item fail before the second starts.
+// This proves overlap without relying on wall-clock timing under a loaded suite.
 #[tokio::test]
-async fn parallel_items_do_not_block_each_other() {
+async fn process_batch_uses_one_slot_and_preserves_parallel_execution() {
     let (_temp, _db, orch, cwd) = setup("run-parallel").await;
     let payload = json!({
-        "commands": [{ "command": "sleep 2" }, { "command": "sleep 2" }],
+        "commands": [
+            { "command": "touch first.started; for _ in $(seq 1 100); do test -f second.started && exit 0; sleep 0.05; done; exit 9" },
+            { "command": "touch second.started; for _ in $(seq 1 100); do test -f first.started && exit 0; sleep 0.05; done; exit 9" }
+        ],
         "sequential": false,
     });
-    let start = Instant::now();
-    let _ = handle_run(&orch, &request(&cwd, Some("run-parallel"), payload)).await;
-    let elapsed = start.elapsed();
+    let result = handle_run(&orch, &request(&cwd, Some("run-parallel"), payload)).await;
     assert!(
-        elapsed < Duration::from_millis(3500),
-        "two parallel `sleep 2` items took {elapsed:?}; a blocking wait would serialize to ~4s"
+        !result.contains("Exit code: 9"),
+        "items sharing one lease did not overlap: {result}"
     );
 }
 
@@ -265,97 +265,27 @@ async fn parallel_items_do_not_block_each_other() {
 const PARTIAL_OUTPUT_TIMEOUT_MS: u32 = 3000;
 
 #[tokio::test]
-async fn timed_out_item_with_run_context_promotes_to_terminal() {
+async fn timed_out_slot_item_is_killed_without_terminal_promotion() {
     let (_temp, db, orch, cwd) = setup("run-promote").await;
     let payload = json!({
         "commands": [{ "command": "echo started; sleep 30", "timeout": PARTIAL_OUTPUT_TIMEOUT_MS }],
     });
     let result = handle_run(&orch, &request(&cwd, Some("run-promote"), payload)).await;
 
-    // Partial output + a readable, canonical terminal URI.
     assert!(
         result.contains("started"),
         "missing partial output: {result}"
     );
     assert!(
-        result.contains("terminal/run-1"),
-        "missing terminal URI: {result}"
+        result.contains("timed out"),
+        "missing timeout result: {result}"
     );
     assert!(
-        result.contains("You will be notified when the command exits"),
-        "timeout result should report the automatic wake subscription: {result}"
+        !result.contains("terminal/run-1"),
+        "slot execution must not detach its leased process: {result}"
     );
-    assert!(
-        !result.contains("subscribe via cairn:~/wakes"),
-        "timeout result should not ask the agent to manually subscribe: {result}"
-    );
-
-    // The job_terminals row exists.
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM job_terminals WHERE slug = 'run-1'"
-        )
-        .await,
-        1
-    );
-
-    // The session is in pty_state as a pipe-backed (no PTY master) session with
-    // its buffer seeded by the still-running readers.
-    let session_arc = {
-        let sessions = orch.pty_state.sessions.lock().unwrap();
-        assert_eq!(sessions.len(), 1, "expected exactly one promoted session");
-        sessions.values().next().unwrap().clone()
-    };
-    {
-        let session = session_arc.lock().unwrap();
-        assert!(
-            session.master.is_none(),
-            "promoted session must have no PTY master"
-        );
-        assert!(
-            session.writer.is_none(),
-            "promoted session must have no PTY writer"
-        );
-        let buf = session.output_buffer.as_ref().unwrap().lock().unwrap();
-        let content = String::from_utf8_lossy(&buf.iter().copied().collect::<Vec<_>>()).to_string();
-        assert!(
-            content.contains("started"),
-            "buffer missing live output: {content}"
-        );
-    }
-
-    // Promotion automatically subscribes the current job to the terminal exit,
-    // keyed on the canonical terminal URI, so the agent does not need to poll or
-    // append its own cairn:~/wakes mutation after ending the turn.
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM wake_subscriptions
-             WHERE job_id = 'job-run-promote'
-               AND source_kind = 'process'
-               AND source_ref LIKE '%/terminal/run-1'
-               AND fact_kinds_json = '[\"terminal_exit\"]'
-               AND state = 'active'
-               AND one_shot = 1"
-        )
-        .await,
-        1,
-        "promoted item must subscribe a one-shot terminal-exit wake"
-    );
-
-    // The checkpoint cache must NOT record a detached item.
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM checkpoint_command_cache WHERE job_id = 'job-run-promote'"
-        )
-        .await,
-        0,
-        "promoted item must not cache a checkpoint result"
-    );
-
-    kill_all_sessions(&orch);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM job_terminals").await, 0);
+    assert!(orch.pty_state.sessions.lock().unwrap().is_empty());
 }
 
 /// Sub-task jobs promote on timeout to a canonical task terminal URI. This keeps
@@ -424,7 +354,7 @@ async fn timed_out_item_in_subtask_job_kills_instead_of_promoting() {
 }
 
 #[tokio::test]
-async fn sequential_stop_on_error_halts_after_promoted_item() {
+async fn sequential_stop_on_error_halts_after_timed_out_slot_item() {
     let (_temp, _db, orch, cwd) = setup("run-halt").await;
     let payload = json!({
         "commands": [
@@ -436,12 +366,12 @@ async fn sequential_stop_on_error_halts_after_promoted_item() {
     let result = handle_run(&orch, &request(&cwd, Some("run-halt"), payload)).await;
 
     assert!(
-        result.contains("terminal/run-1"),
-        "missing terminal URI: {result}"
+        result.contains("timed out"),
+        "missing timeout result: {result}"
     );
     assert!(
         !result.contains("SHOULD_NOT_RUN"),
-        "promoted (not-succeeded) item must halt a stop_on_error batch: {result}"
+        "timed-out item must halt a stop_on_error batch: {result}"
     );
 
     kill_all_sessions(&orch);
@@ -490,8 +420,10 @@ async fn timed_out_item_without_run_context_kills_and_returns() {
 
 // A child that calls setsid escapes the SIGKILL'd process group and holds the
 // stdout pipe write end open, so an unbounded reader join would hang forever.
-// The bounded reaping must return within timeout + ~2s grace with partial
-// output. (Uses perl for setsid so it works on macOS, which lacks the binary.)
+// The bounded reaping must return before the 8s escapee exits naturally, with
+// partial output. The public call also includes lazy slot acquisition and
+// materialization, so its wall-clock bound leaves room for substrate setup.
+// (Uses perl for setsid so it works on macOS, which lacks the binary.)
 #[tokio::test]
 async fn setsid_escapee_does_not_hang_the_call() {
     let (_temp, _db, orch, cwd) = setup("run-setsid").await;
@@ -504,8 +436,8 @@ async fn setsid_escapee_does_not_hang_the_call() {
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(5),
-        "a setsid escapee holding the pipe must not hang the call; took {elapsed:?}"
+        elapsed < Duration::from_secs(7),
+        "a setsid escapee holding the pipe must return before natural exit; took {elapsed:?}"
     );
     assert!(
         result.contains("started"),
@@ -640,19 +572,44 @@ async fn code_item_resolves_bare_package_import_from_worktree_node_modules() {
         eprintln!("skipping code_item_resolves_bare_package_import_from_worktree_node_modules: bun not resolvable");
         return;
     }
-    let (_temp, _db, orch, cwd) = setup("run-code-sdk").await;
-    let pkg = Path::new(&cwd).join("node_modules/@cairn/sdk");
-    std::fs::create_dir_all(&pkg).unwrap();
+    let (temp, _db, orch, cwd) = setup("run-code-sdk").await;
+    let project_repo = temp.path().join("project");
+    std::fs::create_dir_all(project_repo.join(".cairn")).unwrap();
+    std::fs::write(project_repo.join(".gitignore"), "node_modules/\n").unwrap();
     std::fs::write(
-        pkg.join("package.json"),
-        r#"{"name":"@cairn/sdk","type":"module","exports":{".":"./index.ts"}}"#,
+        project_repo.join(".cairn/config.yaml"),
+        r#"setupCommands:
+  - mkdir -p node_modules/@cairn/sdk && printf '%s' '{"name":"@cairn/sdk","type":"module","exports":{".":"./index.ts"}}' > node_modules/@cairn/sdk/package.json && printf '%s\n' 'export const marker = "SDK_IMPORT_OK";' > node_modules/@cairn/sdk/index.ts
+"#,
     )
     .unwrap();
-    std::fs::write(
-        pkg.join("index.ts"),
-        "export const marker = \"SDK_IMPORT_OK\";\n",
-    )
-    .unwrap();
+    git(
+        &project_repo,
+        &["add", "-f", ".cairn/config.yaml", ".gitignore"],
+    );
+    git(&project_repo, &["commit", "-m", "add slot setup fixture"]);
+    let fixture_commit = common::head_sha(&project_repo);
+    let jj_bin = common::jj_bin().expect("jj is required for managed run tests");
+    let import = Command::new(&jj_bin)
+        .args(["git", "import"])
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "jj git import failed: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let output = Command::new(jj_bin)
+        .args(["new", fixture_commit.as_str()])
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "jj new failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let payload = json!({
         "commands": [{
             "code": "import { marker } from \"@cairn/sdk\"; console.log(marker)",
@@ -696,9 +653,11 @@ async fn code_item_nonzero_exit_is_reported_as_failure() {
 /// promote-to-terminal path as a shell timeout — the timeout machinery is
 /// per-spawn and kind-agnostic, so inline code inherits it unchanged.
 #[tokio::test]
-async fn timed_out_code_item_promotes_to_terminal_with_partial_output() {
+async fn timed_out_code_item_is_killed_with_partial_output() {
     if !binary_available("python3") {
-        eprintln!("skipping timed_out_code_item_promotes_to_terminal_with_partial_output: python3 not resolvable");
+        eprintln!(
+            "skipping timed_out_code_item_is_killed_with_partial_output: python3 not resolvable"
+        );
         return;
     }
     let (_temp, db, orch, cwd) = setup("run-code-timeout").await;
@@ -715,19 +674,15 @@ async fn timed_out_code_item_promotes_to_terminal_with_partial_output() {
         "missing partial output: {result}"
     );
     assert!(
-        result.contains("terminal/run-1"),
-        "missing terminal URI: {result}"
+        result.contains("timed out"),
+        "missing timeout result: {result}"
     );
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM job_terminals WHERE slug = 'run-1'"
-        )
-        .await,
-        1,
-        "a timed-out code item must promote to a terminal like a shell timeout"
+    assert!(
+        !result.contains("terminal/run-1"),
+        "slot code execution must not detach: {result}"
     );
-    kill_all_sessions(&orch);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM job_terminals").await, 0);
+    assert!(orch.pty_state.sessions.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
