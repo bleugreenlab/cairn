@@ -2,7 +2,7 @@
 //! per-item outcomes, the promoted-terminal marker, and streaming payloads.
 
 use crate::config::mcp_servers::McpServerConfig;
-use cairn_common::read::ImageBlock;
+use cairn_common::{executor_protocol::PlacementConstraints, read::ImageBlock};
 use serde::{Deserialize, Serialize};
 
 /// Payload for run tool from MCP server.
@@ -25,11 +25,14 @@ pub struct RunPayload {
     /// `run_commit_barrier`).
     #[serde(default)]
     pub commit_msg: Option<String>,
-    /// Run the batch in the live checkout holding this branch/ref. Branch-scoped
-    /// runs never commit, refuse initially dirty checkouts, and warn if tracked
-    /// changes appear during the run.
+    /// Resolve this branch/ref to its head commit and run the batch in a leased
+    /// verdict-only build slot. Cannot be combined with commit_msg.
     #[serde(default)]
     pub branch: Option<String>,
+    /// Hard executor placement requirements for the entire batch. Omitted batches
+    /// retain the colocated-executor compatibility path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<PlacementConstraints>,
 }
 
 /// A single run invocation: exactly one of three kinds — a shell `command`, a

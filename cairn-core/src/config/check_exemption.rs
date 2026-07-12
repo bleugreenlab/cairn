@@ -277,6 +277,7 @@ mod tests {
             when: CheckWhen::Write,
             resource_class: crate::config::project_settings::CheckResourceClass::Shared,
             timeout: None,
+            constraints: None,
         }
     }
 

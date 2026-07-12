@@ -187,6 +187,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::type_complexity)]
     fn scripted_stdin(
         turn_id: Option<&str>,
         responses: Vec<Result<Value, String>>,

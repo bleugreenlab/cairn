@@ -399,19 +399,19 @@ pub async fn commit_user_file_edit(
     // reconcile and concurrent agent seals hold. `None` only where there is no
     // shared store to protect (no owning job), matching the agent path's
     // best-effort fallback.
-    let store_lock = project.as_ref().map(|p| {
-        orch.jj_store_lock(&crate::jj::project_store_dir(
-            &orch.config_dir,
-            Path::new(&p.repo_path),
-        ))
-    });
-    let _guard = match store_lock.as_ref() {
-        Some(lock) => Some(lock.lock().await),
+    let store = project
+        .as_ref()
+        .map(|p| crate::jj::project_store_dir(&orch.config_dir, Path::new(&p.repo_path)));
+    let _guard = match store.as_deref() {
+        Some(store) => Some(
+            orch.acquire_jj_store_lock(store, "host file edit seal")
+                .await,
+        ),
         None => None,
     };
     log::info!(
         "host file edit: worktree={worktree_path} file=`{repo_rel}` store_lock_held={} branch_marker={:?}",
-        store_lock.is_some(),
+        store.is_some(),
         crate::jj::read_branch_marker(worktree)
     );
 

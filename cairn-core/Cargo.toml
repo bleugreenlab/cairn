@@ -44,6 +44,7 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 futures-util = "0.3"
 async-trait = "0.1"
 cairn-common = { path = "../cairn-common" }
+cairn-sandbox = { path = "../cairn-sandbox" }
 ignore = "0.4"
 globset = "0.4"
 reflink-copy = "0.1.30"
@@ -104,7 +105,6 @@ windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] 
 # worktree-fence sandbox (origin/main).
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
-landlock = "0.4"
 
 # Process enumeration for the worktree process reaper (execution::teardown /
 # worktree_gc): resolve each pid's cwd to SIGKILL detached process trees rooted
@@ -125,6 +125,7 @@ tempfile = "3"
 cairn-core = { path = ".", features = ["test-utils"] }
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
 cairn-db = { path = "../cairn-db", features = ["test-utils"] }
+cairn-executor = { path = "../../cairn-executor" }
 
 [features]
 internal-api = []

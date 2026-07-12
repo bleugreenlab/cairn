@@ -21,7 +21,10 @@ use super::context::{
 };
 use super::refresh::refresh_pr_for_job;
 use super::resolution::{persist_merged_commit, resolve_pr_node};
-use super::store_merge::store_merge_child;
+use super::store_merge::{
+    land_verified_store_merge_child, prospective_store_merge_child, store_merge_child,
+    VerifiedLanding,
+};
 
 /// Resolve a PR owner id to the `jobs.id` used by `file_changes.job_id`.
 async fn resolve_file_change_job_id(
@@ -624,16 +627,78 @@ pub async fn merge_pr_for_job(
     // sealed commit.
     let method = effective_merge_method(&merge_context, merge_method);
     let fold_started = std::time::Instant::now();
-    // Serialize the fold behind the per-store mutex so a merge-fold and a
+    // Serialize the fold behind the per-store mutex so a merge fold and a
     // base-advance reconcile on the same shared store never run jj ops
     // concurrently (which would mint divergent conflicted copies). The detached
     // downstream reconcile spawned later inside `resolve_pr_node` acquires the
     // same lock, after this guard drops — no nested acquisition.
     let merge_store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-    let merge_store_lock = orch.jj_store_lock(&merge_store);
-    let merged_commit = {
-        let _store_guard = merge_store_lock.lock().await;
+    let merged_commit = if merge_context.target_branch == resolved_default {
+        let _store_guard = orch
+            .acquire_jj_store_lock(
+                &merge_store,
+                format!("merge fold for {}", merge_context.source_branch),
+            )
+            .await;
         store_merge_child(orch, &merge_context, &method).await?
+    } else {
+        const MAX_VERIFY_ATTEMPTS: usize = 8;
+        let mut landed = None;
+        for _attempt in 0..MAX_VERIFY_ATTEMPTS {
+            let prospective = {
+                let _store_guard = orch
+                    .acquire_jj_store_lock(
+                        &merge_store,
+                        format!("prospective merge fold for {}", merge_context.source_branch),
+                    )
+                    .await;
+                prospective_store_merge_child(orch, &merge_context, &method).await?
+            };
+            match crate::execution::checks::verify_review_tree(
+                orch,
+                &merge_context.project_id,
+                &repo_path,
+                Path::new(&repo_path),
+                &prospective.commit_id,
+                &prospective.tree_hash,
+                &prospective.tree_entries,
+                &prospective.changed_files,
+                job_id,
+                crate::build_slots::BuildSlotPriority::ReviewCheck,
+            )
+            .await
+            {
+                crate::execution::checks::ReviewTreeGateResult::Green => {}
+                crate::execution::checks::ReviewTreeGateResult::CheckFailed { name, detail } => {
+                    return Err(format!("Combined-tree check '{name}' failed: {detail}"));
+                }
+                crate::execution::checks::ReviewTreeGateResult::InfrastructureFailure(error) => {
+                    return Err(format!(
+                        "Combined-tree verification infrastructure failure: {error}. Retry the merge."
+                    ));
+                }
+            }
+            let landing = {
+                let _store_guard = orch
+                    .acquire_jj_store_lock(
+                        &merge_store,
+                        format!("verified merge landing for {}", merge_context.source_branch),
+                    )
+                    .await;
+                land_verified_store_merge_child(orch, &merge_context, &method, &prospective).await?
+            };
+            match landing {
+                VerifiedLanding::Landed(commit) => {
+                    landed = Some(commit);
+                    break;
+                }
+                VerifiedLanding::Stale => continue,
+            }
+        }
+        landed.ok_or_else(|| {
+            "Combined-tree verification could not stabilize because the source or integration branch kept moving. Retry the merge."
+                .to_string()
+        })?
     };
     persist_merged_commit(&db, &merge_context.mr.mr_id, &merged_commit).await?;
     log::info!(

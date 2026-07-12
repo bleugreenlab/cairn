@@ -12,7 +12,7 @@ use super::context::MergeMrContext;
 #[cfg(test)]
 mod tests;
 
-/// Perform a jj source→target merge entirely in the shared store: fold the
+/// Perform a jj source-to-target merge entirely in the shared store: fold the
 /// source's commit into the target bookmark, then (for a project with a
 /// remote) push the target to origin. The push advances the target branch and —
 /// because the source's head commit is now an ancestor of the target —
@@ -49,6 +49,166 @@ pub(super) async fn store_merge_child(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
+) -> Result<String, String> {
+    store_merge_child_inner(orch, merge_context, method, true).await
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProspectiveMerge {
+    pub source_tip: String,
+    pub target_tip: String,
+    pub commit_id: String,
+    pub tree_hash: String,
+    pub tree_entries: Vec<(String, String)>,
+    pub changed_files: Vec<crate::jj::GraphFileChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VerifiedLanding {
+    Landed(String),
+    Stale,
+}
+
+pub(super) async fn prospective_store_merge_child(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+    method: &str,
+) -> Result<ProspectiveMerge, String> {
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    let operation = crate::jj::operation_id(&jj, &store)?;
+    let source_tip = crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch)
+        .ok_or_else(|| {
+            format!(
+                "source bookmark `{}` did not resolve",
+                merge_context.source_branch
+            )
+        })?;
+    let target_tip = crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch)
+        .ok_or_else(|| {
+            format!(
+                "target bookmark `{}` did not resolve",
+                merge_context.target_branch
+            )
+        })?;
+    let mut local = merge_context.clone();
+    local.mr.is_local = true;
+    let transformed = store_merge_child_inner(orch, &local, method, false).await;
+    let result = transformed.and_then(|commit_id| {
+        let tree_hash = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit_id)?;
+        let tree_entries = crate::jj::tree_entries(&jj, &store, &commit_id)?;
+        let patch = jj.run(
+            &store,
+            &[
+                "diff",
+                "--ignore-working-copy",
+                "--git",
+                "--from",
+                &target_tip,
+                "--to",
+                &commit_id,
+            ],
+            "jj diff prospective merge",
+        )?;
+        Ok(ProspectiveMerge {
+            source_tip,
+            target_tip,
+            commit_id,
+            tree_hash,
+            tree_entries,
+            changed_files: crate::jj::parse_git_diff(&patch),
+        })
+    });
+    let restore = crate::jj::restore_operation(&jj, &store, &operation);
+    match (result, restore) {
+        (Ok(plan), Ok(())) => Ok(plan),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!(
+            "failed to restore prospective merge operation: {error}"
+        )),
+        (Err(error), Err(restore_error)) => Err(format!(
+            "{error} (also failed to restore prospective merge operation: {restore_error})"
+        )),
+    }
+}
+
+pub(super) async fn land_verified_store_merge_child(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+    method: &str,
+    verified: &ProspectiveMerge,
+) -> Result<VerifiedLanding, String> {
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    if crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch).as_deref()
+        != Some(&verified.source_tip)
+        || crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch).as_deref()
+            != Some(&verified.target_tip)
+    {
+        return Ok(VerifiedLanding::Stale);
+    }
+    let operation = crate::jj::operation_id(&jj, &store)?;
+    let mut local = merge_context.clone();
+    local.mr.is_local = true;
+    let commit = match store_merge_child_inner(orch, &local, method, false).await {
+        Ok(commit) => commit,
+        Err(error) => return Err(error),
+    };
+    let actual_tree = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit)?;
+    if actual_tree != verified.tree_hash {
+        crate::jj::restore_operation(&jj, &store, &operation)?;
+        return Ok(VerifiedLanding::Stale);
+    }
+    if !merge_context.mr.is_local {
+        if let Err(error) = publish_integration_merge(
+            &jj,
+            &store,
+            &merge_context.source_branch,
+            &merge_context.target_branch,
+        ) {
+            return Err(rollback_merge(
+                orch,
+                &merge_context.project_id,
+                &jj,
+                &store,
+                &operation,
+                &merge_context.source_branch,
+                Some(&merge_context.target_branch),
+                error,
+            )
+            .await);
+        }
+    }
+    refresh_worktrees_on_branch(
+        orch,
+        &merge_context.project_id,
+        &jj,
+        &merge_context.target_branch,
+    )
+    .await;
+    Ok(VerifiedLanding::Landed(commit))
+}
+
+fn publish_integration_merge(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    source_branch: &str,
+    target_branch: &str,
+) -> Result<(), String> {
+    validate_source_publishability(jj, store, target_branch, source_branch)?;
+    let _ = crate::jj::track_bookmark(jj, store, source_branch);
+    crate::jj::push_store_bookmark(jj, store, source_branch)?;
+    let _ = crate::jj::track_bookmark(jj, store, target_branch);
+    reflect_child_merge_on_github(jj, store, target_branch)
+}
+
+async fn store_merge_child_inner(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+    method: &str,
+    materialize_conflicts: bool,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.as_str();
     let target_branch = merge_context.target_branch.as_str();
@@ -104,7 +264,9 @@ pub(super) async fn store_merge_child(
                 // under it and is now stale: materialize the markers (as
                 // `reconcile_siblings` does) so resolve-and-retry is actionable,
                 // and let the merge gate keep blocking until they are resolved.
-                refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
+                if materialize_conflicts {
+                    refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
+                }
                 return Err(format!(
                     "Refusing to merge: rebasing `{source_branch}` onto the advanced default branch `{target_branch}` recorded a conflict.{detail}{hint}",
                     detail = conflicted_history_detail(
@@ -206,7 +368,9 @@ pub(super) async fn store_merge_child(
                 // default bookmark was NOT moved. The source's live workspace `@`
                 // is now stale: materialize the markers so resolve-and-retry is
                 // actionable, and keep the merge blocked until they are resolved.
-                refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
+                if materialize_conflicts {
+                    refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
+                }
                 return Err(format!(
                     "Refusing to merge: rebasing `{source_branch}` onto the advanced default branch `{target_branch}` recorded a conflict, and this PR preserves every commit (its history cannot be flattened).{detail}{hint}",
                     detail = conflicted_history_detail(
@@ -393,7 +557,7 @@ pub(super) async fn store_merge_child(
                     }
                     // Re-parent every workspace on the integration branch onto the
                     // flattened tip so the coordinator's `@` follows the collapse.
-                    if let (Ok(worktrees), Some(flattened)) = (
+                    if materialize_conflicts { if let (Ok(worktrees), Some(flattened)) = (
                         load_worktrees_on_branch(&orch.db.local, project_id, target_branch).await,
                         crate::jj::bookmark_commit(&jj, &store, target_branch),
                     ) {
@@ -414,6 +578,7 @@ pub(super) async fn store_merge_child(
                                 );
                             }
                         }
+                    }
                     }
                     // Publish the repair to origin FAIL-CLOSED. If it cannot land,
                     // roll the flatten (and worktree re-parent) back to the
@@ -461,7 +626,9 @@ pub(super) async fn store_merge_child(
             // refusal: no rollback (the conflicted rebased source IS the
             // resolve-and-reseal artifact) and no target push — origin is not left
             // behind.
-            refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
+            if materialize_conflicts {
+                refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
+            }
             return Err(format!(
                 "Refusing to merge: rebasing `{source_branch}` onto the advanced integration branch `{target_branch}` recorded a conflict.{detail}{hint}",
                 detail = conflicted_history_detail(

@@ -303,39 +303,10 @@ impl WorktreeVcs for JjBackend {
 
     fn reconcile_workspace(&self, worktree: &Path) -> Result<(), String> {
         self.validate_identity(worktree)?;
-        // 1. Heal an on-disk STALE working copy. `jj workspace update-stale` is the
-        //    one op staleness does not block; on a fresh (non-stale) workspace it
-        //    is a fast no-op (exits 0, "not stale"). This is exactly the heal the
-        //    incident's agent hand-ran — but here it is serialized on the per-store
-        //    lock the caller holds, so it can never race a concurrent rebase.
-        crate::jj::update_stale(&self.jj, worktree)?;
-
         let Some(branch) = crate::jj::read_branch_marker(worktree) else {
             return Ok(());
         };
-
-        // 2. Convert the clean "behind its branch tip" seal refusal into automatic
-        //    recovery: when the working copy is CLEAN, the bookmark has advanced
-        //    PAST `@` (seal would not fast-forward), and the branch tip carries no
-        //    conflict, re-parent `@` onto the workspace's own bookmark tip. A dirty
-        //    tree or a conflicted tip is left untouched — seal-time handling and the
-        //    conflicted-branch preservation path already own those, and re-parenting
-        //    a dirty tree would mint a divergent recovery commit.
-        match crate::jj::is_working_copy_dirty(&self.jj, worktree) {
-            Ok(false) => {}
-            // Dirty (or unprobeable) — leave it to seal-time handling.
-            _ => return Ok(()),
-        }
-        if crate::jj::seal_is_fast_forward(&self.jj, worktree, &branch)? {
-            return Ok(()); // Bookmark not ahead of `@`; nothing to re-parent.
-        }
-        if crate::jj::branch_has_conflict(&self.jj, worktree, &branch).unwrap_or(true) {
-            return Ok(()); // Conflicted tip — the preservation path owns it.
-        }
-        let Some(tip) = crate::jj::bookmark_commit(&self.jj, worktree, &branch) else {
-            return Ok(());
-        };
-        crate::jj::advance_workspace_onto(&self.jj, worktree, worktree, &branch, &tip)?;
+        crate::jj::reconcile_managed_workspace(&self.jj, worktree, worktree, &branch, None)?;
         Ok(())
     }
 
@@ -969,7 +940,7 @@ pub(crate) async fn workspace_recovery_status(
 pub async fn resolve_store_lock(
     orch: &crate::orchestrator::Orchestrator,
     request: &cairn_common::protocol::CallbackRequest,
-) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
+) -> Option<std::path::PathBuf> {
     let cwd = Path::new(&request.cwd);
     if !crate::jj::is_jj_dir(cwd) {
         return None; // NonWorktreeVcs — never touches a shared store.
@@ -980,8 +951,10 @@ pub async fn resolve_store_lock(
     let repo_path = crate::mcp::handlers::run_context::project_path(&db, &run.project_id)
         .await
         .ok()??;
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-    Some(orch.jj_store_lock(&store))
+    Some(crate::jj::project_store_dir(
+        &orch.config_dir,
+        Path::new(&repo_path),
+    ))
 }
 
 /// Env that makes a bare `git`/`jj` shell command run through the run tool
@@ -1967,25 +1940,21 @@ mod tests {
         let (orch, request, repo_path, _root) =
             worktree_run_fixture("vcs_store_lock_key_identity.db").await;
 
-        let seal_lock = crate::mcp::vcs::resolve_store_lock(&orch, &request)
+        let seal_store = crate::mcp::vcs::resolve_store_lock(&orch, &request)
             .await
             .expect("a worktree cwd resolves a store lock");
-        // The exact key reconcile/fold derive.
-        let reconcile_lock = orch.jj_store_lock(&crate::jj::project_store_dir(
-            &orch.config_dir,
-            Path::new(&repo_path),
-        ));
-        assert!(
-            Arc::ptr_eq(&seal_lock, &reconcile_lock),
-            "seal/discard must serialize on the SAME lock instance as reconcile/fold"
+        let reconcile_store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+        assert_eq!(
+            seal_store, reconcile_store,
+            "seal/discard must resolve the SAME store identity as reconcile/fold"
         );
     }
 
     /// Test B — mutual exclusion through the real lock. With an in-flight
     /// reconcile holding the store lock, a seal-side acquisition via
-    /// `resolve_store_lock(...).lock()` must block until the reconcile guard
-    /// drops, then proceed. Proves serialization is exercised through the real
-    /// `jj_store_lock`, not merely keyed the same.
+    /// the canonical instrumented acquisition must block until the reconcile
+    /// guard drops, then proceed. Proves serialization is exercised through the
+    /// real per-store mutex, not merely keyed the same.
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_store_lock_serializes_behind_in_flight_reconcile() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1996,7 +1965,7 @@ mod tests {
 
         // Simulate an in-flight reconcile/fold holding the store lock.
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-        let reconcile_lock = orch.jj_store_lock(&store);
+        let reconcile_lock = orch.raw_jj_store_lock_for_test(&store);
         let reconcile_guard = reconcile_lock.lock().await;
 
         let acquired = Arc::new(AtomicBool::new(false));
@@ -2005,10 +1974,12 @@ mod tests {
             let request = request.clone();
             let acquired = acquired.clone();
             tokio::spawn(async move {
-                let lock = crate::mcp::vcs::resolve_store_lock(&orch, &request)
+                let store = crate::mcp::vcs::resolve_store_lock(&orch, &request)
                     .await
                     .expect("a worktree cwd resolves a store lock");
-                let _guard = lock.lock().await;
+                let _guard = orch
+                    .acquire_jj_store_lock(&store, "test seal-side acquisition")
+                    .await;
                 acquired.store(true, Ordering::SeqCst);
             })
         };

@@ -21,6 +21,47 @@ pub(crate) struct BranchResolution {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct RunBranchResolution {
+    pub project_id: String,
+    pub repository_path: PathBuf,
+    pub rev: String,
+    pub commit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BranchRefResolutionError {
+    Invalid {
+        requested: String,
+    },
+    Unresolvable {
+        requested: String,
+        diagnostic: String,
+    },
+    Ambiguous {
+        requested: String,
+    },
+}
+
+impl std::fmt::Display for BranchRefResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid { requested } => write!(f, "Invalid branch ref '{requested}'"),
+            Self::Unresolvable {
+                requested,
+                diagnostic,
+            } => write!(
+                f,
+                "Could not resolve branch ref '{requested}' to a commit: {diagnostic}"
+            ),
+            Self::Ambiguous { requested } => write!(
+                f,
+                "Branch ref '{requested}' is ambiguous; exactly one commit is required"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ProjectBranchContext {
     project_id: String,
     project_path: Option<PathBuf>,
@@ -32,6 +73,7 @@ struct JobBranchContext {
     branch: Option<String>,
     worktree_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
+    project_id: String,
 }
 
 pub(crate) async fn resolve_for_read(
@@ -64,42 +106,105 @@ pub(crate) async fn resolve_for_run(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     branch: &str,
-) -> Result<BranchResolution, String> {
-    if let Some(job) = resolve_node_uri(orch, branch).await? {
-        let rev = job
-            .branch
-            .ok_or_else(|| format!("Node URI '{branch}' has no recorded branch"))?;
-        let checkout = live_checkout(job.worktree_path, branch)?;
-        return Ok(BranchResolution {
-            rev,
-            checkout: Some(checkout),
-            project_path: job.project_path,
-        });
+) -> Result<RunBranchResolution, BranchRefResolutionError> {
+    let requested = branch.to_string();
+    if branch.trim().is_empty() {
+        return Err(BranchRefResolutionError::Invalid { requested });
     }
 
-    let project = project_context_for_request(orch, request).await?;
-    let requested = branch.trim();
-    if requested == project.default_branch || requested == "main" {
-        let checkout = live_checkout(project.project_path.clone(), branch)?;
-        return Ok(BranchResolution {
-            rev: project.default_branch,
-            checkout: Some(checkout),
-            project_path: project.project_path,
-        });
-    }
+    let (project, rev) = match resolve_node_uri(orch, branch).await.map_err(|diagnostic| {
+        BranchRefResolutionError::Unresolvable {
+            requested: requested.clone(),
+            diagnostic,
+        }
+    })? {
+        Some(job) => {
+            let rev = job
+                .branch
+                .ok_or_else(|| BranchRefResolutionError::Unresolvable {
+                    requested: requested.clone(),
+                    diagnostic: "the node has no recorded branch".into(),
+                })?;
+            let project =
+                project_context_by_id(orch, &job.project_id)
+                    .await
+                    .map_err(|diagnostic| BranchRefResolutionError::Unresolvable {
+                        requested: requested.clone(),
+                        diagnostic,
+                    })?;
+            (project, rev)
+        }
+        None => {
+            let project =
+                project_context_for_request(orch, request)
+                    .await
+                    .map_err(|diagnostic| BranchRefResolutionError::Unresolvable {
+                        requested: requested.clone(),
+                        diagnostic,
+                    })?;
+            let rev = if branch.trim() == "main" {
+                project.default_branch.clone()
+            } else {
+                branch.trim().to_string()
+            };
+            (project, rev)
+        }
+    };
 
-    if let Some(job) = job_by_branch(orch, &project.project_id, requested).await? {
-        let checkout = live_checkout(job.worktree_path, branch)?;
-        return Ok(BranchResolution {
-            rev: job.branch.unwrap_or_else(|| requested.to_string()),
-            checkout: Some(checkout),
-            project_path: job.project_path,
-        });
-    }
+    let repository_path =
+        project
+            .project_path
+            .ok_or_else(|| BranchRefResolutionError::Unresolvable {
+                requested: requested.clone(),
+                diagnostic: format!("project '{}' has no local repository", project.project_id),
+            })?;
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let managed_store = crate::jj::project_store_dir(&orch.config_dir, &repository_path);
+    let revision_store = if crate::jj::is_jj_dir(&managed_store) {
+        managed_store.as_path()
+    } else {
+        repository_path.as_path()
+    };
+    let output = jj
+        .run(
+            revision_store,
+            &[
+                "log",
+                "-r",
+                &rev,
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+            "resolve branch ref to immutable commit",
+        )
+        .map_err(|diagnostic| BranchRefResolutionError::Unresolvable {
+            requested: requested.clone(),
+            diagnostic,
+        })?;
+    let commits: Vec<_> = output
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    let commit_id = match commits.as_slice() {
+        [commit] => (*commit).to_string(),
+        [] => {
+            return Err(BranchRefResolutionError::Unresolvable {
+                requested,
+                diagnostic: "the revision selected no commits".into(),
+            })
+        }
+        _ => return Err(BranchRefResolutionError::Ambiguous { requested }),
+    };
 
-    Err(format!(
-        "No live checkout found for branch '{branch}'. Branch-scoped run is a cd stand-in and cannot materialize a checkout."
-    ))
+    Ok(RunBranchResolution {
+        project_id: project.project_id,
+        repository_path,
+        rev,
+        commit_id,
+    })
 }
 
 pub(crate) fn jj_command_dir(resolution: &BranchResolution, fallback_cwd: &str) -> PathBuf {
@@ -112,21 +217,6 @@ pub(crate) fn jj_command_dir(resolution: &BranchResolution, fallback_cwd: &str) 
         .clone()
         .or_else(|| resolution.project_path.clone())
         .unwrap_or(fallback)
-}
-
-fn live_checkout(path: Option<PathBuf>, branch: &str) -> Result<PathBuf, String> {
-    let Some(path) = path else {
-        return Err(format!(
-            "No live checkout found for branch '{branch}'. Branch-scoped run is a cd stand-in and cannot materialize a checkout."
-        ));
-    };
-    if !path.is_dir() {
-        return Err(format!(
-            "Live checkout for branch '{branch}' does not exist on disk: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
 }
 
 async fn project_context_for_request(
@@ -213,40 +303,6 @@ async fn resolve_node_uri(
     }
 }
 
-async fn job_by_branch(
-    orch: &Orchestrator,
-    project_id: &str,
-    branch: &str,
-) -> Result<Option<JobBranchContext>, String> {
-    let project_id = project_id.to_string();
-    let branch = branch.to_string();
-    orch.db
-        .local
-        .read(move |conn| {
-            let project_id = project_id.clone();
-            let branch = branch.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT j.branch, j.worktree_path, p.repo_path
-                         FROM jobs j
-                         JOIN projects p ON j.project_id = p.id
-                         WHERE j.project_id = ?1 AND j.branch = ?2
-                         ORDER BY j.created_at DESC
-                         LIMIT 1",
-                        params![project_id.as_str(), branch.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| job_context_from_row(&row))
-                    .transpose()
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
-}
-
 async fn job_by_node_uri(
     orch: &Orchestrator,
     project: &str,
@@ -267,7 +323,7 @@ async fn job_by_node_uri(
             Box::pin(async move {
                 let mut rows = if let Some(task_name) = task_name {
                     conn.query(
-                        "SELECT child.branch, child.worktree_path, p.repo_path
+                        "SELECT child.branch, child.worktree_path, p.repo_path, p.id
                          FROM jobs parent
                          JOIN jobs child ON child.parent_job_id = parent.id
                          JOIN issues i ON parent.issue_id = i.id
@@ -292,7 +348,7 @@ async fn job_by_node_uri(
                     .await?
                 } else {
                     conn.query(
-                        "SELECT j.branch, j.worktree_path, p.repo_path
+                        "SELECT j.branch, j.worktree_path, p.repo_path, p.id
                          FROM jobs j
                          JOIN issues i ON j.issue_id = i.id
                          JOIN projects p ON i.project_id = p.id
@@ -328,5 +384,6 @@ fn job_context_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<
         branch: row.opt_text(0)?,
         worktree_path: row.opt_text(1)?.map(PathBuf::from),
         project_path: row.opt_text(2)?.map(PathBuf::from),
+        project_id: row.text(3)?,
     })
 }

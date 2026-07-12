@@ -146,8 +146,12 @@ pub async fn reconcile_managed_branch_advance(
         .await
         .map_err(|error| error.to_string())?;
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    let store_lock = orch.jj_store_lock(&store);
-    let _store_guard = store_lock.lock().await;
+    let _store_guard = orch
+        .acquire_jj_store_lock(
+            &store,
+            format!("managed branch {advanced_branch} advanced to {new_tip}"),
+        )
+        .await;
 
     advance_on_branch_workspaces(orch, &db, project_id, advanced_branch, repo_path).await;
     let siblings = load_sibling_jobs(
@@ -202,8 +206,12 @@ async fn reconcile_jj_downstream(
     // conflicted copies of the integration tip. The inner helpers take no lock
     // (`TokioMutex` is not reentrant).
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    let store_lock = orch.jj_store_lock(&store);
-    let _store_guard = store_lock.lock().await;
+    let _store_guard = orch
+        .acquire_jj_store_lock(
+            &store,
+            format!("jj downstream reconcile for {merged_job_id}"),
+        )
+        .await;
 
     // Advance the workspace that sits ON the merged branch (a Coordinator on its
     // integration bookmark) onto the freshly-folded tip. This is asymmetric to
@@ -256,6 +264,17 @@ fn remote_default_revset(default_branch: &str) -> String {
     format!("{default_branch}@origin")
 }
 
+async fn fetch_origin_outside_store_lock(
+    orch: &Orchestrator,
+    repo_path: &Path,
+) -> Result<(), String> {
+    let git = orch.services.git.clone();
+    let repo_path = repo_path.to_path_buf();
+    tokio::task::spawn_blocking(move || git.fetch_origin(&repo_path))
+        .await
+        .map_err(|error| format!("git fetch origin task failed: {error}"))?
+}
+
 /// Reconcile in-flight siblings after the project's default branch advanced
 /// **outside Cairn** (a non-Cairn PR merged in the GitHub UI, or a direct push to
 /// the default branch), detected via the GitHub `push` webhook. Thin wrapper over
@@ -306,23 +325,23 @@ async fn reconcile_default_advance(
     // `jj git import`, which imports the backing git's refs — including the local
     // `<default>` ref a local-only advance or a manual `git pull` moved — so the
     // rebase dest resolves regardless of which branch the main checkout sits on.
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-    // Serialize the store import/fetch + sibling reconcile behind the per-store
-    // mutex, held across the rest of the body. The live webhook, startup catch-up,
-    // and Cairn-merge reconcile paths can overlap for the same advance; without
-    // this they race jj ops on the shared store and mint divergent conflicted
-    // copies. The inner helpers take no lock.
-    let store_lock = orch.jj_store_lock(&store);
-    let _store_guard = store_lock.lock().await;
-    if let Err(error) = crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path)) {
-        log::warn!("external advance on {default_branch}: ensure store failed: {error}");
+    let repo_path_path = Path::new(&repo_path);
+    // Transfer objects and update the ordinary Git repository's origin-tracking
+    // refs before entering the jj critical section. Git object writes are
+    // content-addressed and additive; jj observes the fetched refs only when the
+    // locked import below runs, preserving the store's single-writer discipline.
+    if let Err(error) = fetch_origin_outside_store_lock(orch, repo_path_path).await {
+        log::warn!("external advance on {default_branch}: git fetch origin failed: {error}");
         return Ok(());
     }
-    // The webhook advance lives on origin, not in the local checkout, so fetch
-    // origin to advance the `<default>@origin` tracking bookmark before rebasing.
-    if let Err(error) = crate::jj::fetch_remote(&jj, &store, "origin") {
-        log::warn!("external advance on {default_branch}: jj git fetch failed: {error}");
+
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo_path_path);
+    let _store_guard = orch
+        .acquire_jj_store_lock(&store, format!("external advance on {default_branch}"))
+        .await;
+    if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path_path) {
+        log::warn!("external advance on {default_branch}: ensure store failed: {error}");
         return Ok(());
     }
 
@@ -388,24 +407,50 @@ async fn reconcile_startup_remote_default_advance(
         return Ok(());
     }
 
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let repo_path = Path::new(&project.repo_path);
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
-    let store_lock = orch.jj_store_lock(&store);
-    let _store_guard = store_lock.lock().await;
-    if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path) {
+    let remote_default = remote_default_revset(&project.default_branch);
+    let before = {
+        let _store_guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                format!(
+                    "startup remote advance snapshot on {}",
+                    project.default_branch
+                ),
+            )
+            .await;
+        if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path) {
+            log::warn!(
+                "startup remote advance on {}: ensure store failed: {error}",
+                project.default_branch
+            );
+            return Ok(());
+        }
+        crate::jj::revset_commit(&jj, &store, &remote_default)
+    };
+
+    if let Err(error) = fetch_origin_outside_store_lock(orch, repo_path).await {
         log::warn!(
-            "startup remote advance on {}: ensure store failed: {error}",
+            "startup remote advance on {}: git fetch origin failed: {error}",
             project.default_branch
         );
         return Ok(());
     }
 
-    let remote_default = remote_default_revset(&project.default_branch);
-    let before = crate::jj::revset_commit(&jj, &store, &remote_default);
-    if let Err(error) = crate::jj::fetch_remote(&jj, &store, "origin") {
+    let _store_guard = orch
+        .acquire_jj_store_lock(
+            &store,
+            format!(
+                "startup remote advance import on {}",
+                project.default_branch
+            ),
+        )
+        .await;
+    if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path) {
         log::warn!(
-            "startup remote advance on {}: jj git fetch failed: {error}",
+            "startup remote advance on {}: ensure store failed after fetch: {error}",
             project.default_branch
         );
         return Ok(());
@@ -576,6 +621,7 @@ async fn reconcile_base_advance(
         .rebased_clean
         .iter()
         .chain(report.conflicted.iter())
+        .chain(report.preserved_dirty.iter())
         .cloned()
         .collect();
     for branch in touched {
@@ -593,8 +639,17 @@ async fn reconcile_base_advance(
                 .rebased_clean
                 .retain(|candidate| candidate != &branch);
             report.conflicted.retain(|candidate| candidate != &branch);
-            if !report.failed.contains(&branch) {
-                report.failed.push(branch);
+            report
+                .preserved_dirty
+                .retain(|candidate| candidate != &branch);
+            report.silent.retain(|candidate| candidate != &branch);
+            let workspace_path = std::path::PathBuf::from(&sibling.worktree_path);
+            if !report.failed.iter().any(|failure| failure.branch == branch) {
+                report.failed.push(crate::jj::ReconcileFailure {
+                    branch,
+                    workspace_path,
+                    error: format!("durable base advancement failed: {error}"),
+                });
             }
         }
     }
@@ -607,10 +662,7 @@ async fn reconcile_base_advance(
     );
 
     if !report.failed.is_empty() {
-        let note = format!(
-            "⛔ BLOCKING [Base branch update] The base advanced, but Cairn could not reconcile your workspace automatically. Your work was preserved. Retry a normal `run` tool call; its pre-flight reconcile will refresh a stale workspace. If that still fails, inspect the jj error and escalate rather than force-pushing. ({label})"
-        );
-        notify_failed_siblings(orch, db, &siblings, &report.failed, &note)?;
+        notify_failed_siblings(orch, db, &siblings, &report.failed, label)?;
     }
 
     // Re-read each touched sibling's commit id AFTER the rebase — conflicted and
@@ -658,7 +710,8 @@ async fn reconcile_base_advance(
 
     // Cleanly-rebased siblings: nothing to resolve, but their branch moved — a
     // passive (non-waking) note rides along into their next natural run.
-    let clean_rewritten = siblings_rewritten(&report.rebased_clean, &before, &after);
+    let mut clean_rewritten = siblings_rewritten(&report.rebased_clean, &before, &after);
+    clean_rewritten.retain(|branch| !report.silent.contains(branch));
     if clean_rewritten.is_empty() {
         log::debug!("jj reconcile ({label}): clean rebases unchanged since a prior reconcile; no redundant note");
     } else {
@@ -1148,16 +1201,16 @@ fn notify_failed_siblings(
     orch: &Orchestrator,
     db: &LocalDb,
     siblings: &[SiblingJob],
-    failed: &[String],
-    note: &str,
+    failed: &[crate::jj::ReconcileFailure],
+    label: &str,
 ) -> Result<(), String> {
-    for sibling in siblings {
-        let Some(branch) = sibling_branch(sibling) else {
+    for failure in failed {
+        let Some(sibling) = siblings
+            .iter()
+            .find(|sibling| sibling_branch(sibling).as_deref() == Some(failure.branch.as_str()))
+        else {
             continue;
         };
-        if !failed.contains(&branch) {
-            continue;
-        }
         let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
             log::debug!(
                 "jj reconcile: no run for failed sibling {} to steer",
@@ -1165,7 +1218,12 @@ fn notify_failed_siblings(
             );
             continue;
         };
-        queue_system_direct(orch, &run_id, note, DeliveryUrgency::Steer)?;
+        let note = format!(
+            "⛔ BLOCKING [Base branch update] Cairn failed to reconcile the agent's managed jj workspace after the base advanced ({label}).\nManaged workspace: `{}`\nExact jj operation error:\n{}\nYour work was preserved. Escalate this reconciliation failure directly to a human operator.",
+            failure.workspace_path.display(),
+            failure.error
+        );
+        queue_system_direct(orch, &run_id, &note, DeliveryUrgency::Steer)?;
         log::info!(
             "Steered jj sibling job {} after automatic reconcile failed",
             sibling.id
@@ -1780,7 +1838,130 @@ mod tests {
     use crate::db::DbState;
     use crate::services::testing::{MockGitClient, TestServicesBuilder};
     use crate::storage::{LocalDb, SearchIndex};
+    use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn run_test_git(repo: &Path, args: &[&str]) -> bool {
+        crate::env::git()
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn jj_test_env() -> Option<(TempDir, TempDir, TempDir, crate::jj::JjEnv, PathBuf)> {
+        let bin = std::env::var("CAIRN_JJ_BIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                Command::new("which")
+                    .arg("jj")
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            })?;
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let workspaces = TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "base-advance@cairn.test"],
+            vec!["config", "user.name", "Base Advance Test"],
+        ] {
+            assert!(run_test_git(project.path(), &args));
+        }
+        std::fs::write(project.path().join("base.txt"), "base\n").unwrap();
+        assert!(run_test_git(project.path(), &["add", "."]));
+        assert!(run_test_git(
+            project.path(),
+            &["commit", "-q", "-m", "base"]
+        ));
+        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("store");
+        crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
+        Some((home, project, workspaces, jj, store))
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn managed_workspace_reconcile_fresh_workspace_is_unchanged() {
+        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
+            return;
+        };
+        let branch = "agent/PROJ-2817-builder-0";
+        let workspace = workspaces.path().join("fresh");
+        crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+        let outcome =
+            crate::jj::reconcile_managed_workspace(&jj, &store, &workspace, branch, None).unwrap();
+        assert_eq!(
+            outcome,
+            crate::jj::ManagedWorkspaceReconcileOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn managed_workspace_reconcile_preserves_dirty_local_work() {
+        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
+            return;
+        };
+        let branch = "agent/PROJ-2817-builder-1";
+        let workspace = workspaces.path().join("dirty");
+        crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+        std::fs::write(workspace.join("wip.txt"), "local work\n").unwrap();
+        let outcome =
+            crate::jj::reconcile_managed_workspace(&jj, &store, &workspace, branch, None).unwrap();
+        assert_eq!(
+            outcome,
+            crate::jj::ManagedWorkspaceReconcileOutcome::PreservedDirty
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("wip.txt")).unwrap(),
+            "local work\n"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn managed_workspace_reconcile_advances_clean_behind_workspace() {
+        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
+            return;
+        };
+        let branch = "agent/PROJ-2817-builder-2";
+        let workspace = workspaces.path().join("behind");
+        crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+        jj.run(&store, &["new", branch], "advance test branch")
+            .unwrap();
+        std::fs::write(store.join("advanced.txt"), "advanced\n").unwrap();
+        jj.run(&store, &["describe", "-m", "advance"], "describe advance")
+            .unwrap();
+        jj.run(
+            &store,
+            &[
+                "bookmark",
+                "set",
+                branch,
+                "-r",
+                "@",
+                "--ignore-working-copy",
+            ],
+            "advance bookmark",
+        )
+        .unwrap();
+        let tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+        let outcome =
+            crate::jj::reconcile_managed_workspace(&jj, &store, &workspace, branch, Some(&tip))
+                .unwrap();
+        assert_eq!(
+            outcome,
+            crate::jj::ManagedWorkspaceReconcileOutcome::AdvancedClean
+        );
+        assert!(workspace.join("advanced.txt").exists());
+    }
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("base-advance-test.db").await
@@ -2251,14 +2432,18 @@ mod tests {
             branch: Some("agent/PROJ-2-builder-0".to_string()),
             base_commit: None,
         }];
-        let failed = vec!["agent/PROJ-2-builder-0".to_string()];
+        let failed = vec![crate::jj::ReconcileFailure {
+            branch: "agent/PROJ-2-builder-0".to_string(),
+            workspace_path: "/wt/overlap".into(),
+            error: "jj workspace update-stale failed: exact stderr".to_string(),
+        }];
 
         notify_failed_siblings(
             &orch,
             &orch.db.local,
             &siblings,
             &failed,
-            "base advanced; retry a normal run",
+            "external advance on main",
         )
         .unwrap();
 
@@ -2280,7 +2465,12 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(content.contains("retry a normal run"));
+        assert!(content.contains("agent's managed jj workspace"));
+        assert!(content.contains("/wt/overlap"));
+        assert!(content.contains("jj workspace update-stale failed: exact stderr"));
+        assert!(content.contains("Your work was preserved"));
+        assert!(!content.to_lowercase().contains("retry"));
+        assert!(!content.to_lowercase().contains("force-push"));
         assert_eq!(wake, "wake");
     }
 
@@ -2619,6 +2809,43 @@ mod tests {
     #[test]
     fn remote_default_revset_targets_origin() {
         assert_eq!(remote_default_revset("main"), "main@origin");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_fetch_does_not_block_publication_lock_during_external_reconcile() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let mut git = MockGitClient::new();
+        git.expect_fetch_origin()
+            .with(mockall::predicate::eq(PathBuf::from("/repo")))
+            .return_once(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok(())
+            });
+        let orch = Arc::new(test_orchestrator(db, git));
+        let reconcile_orch = orch.clone();
+        let reconcile = tokio::spawn(async move {
+            reconcile_external_default_advance(&reconcile_orch, "proj-1", "integration").await
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("production reconcile reached the injected fetch stall");
+
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new("/repo"));
+        orch.acquire_jj_store_lock_with_timeout(
+            &store,
+            "test run commit barrier publication",
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("publication acquires the canonical store lock while reconcile fetch is stalled");
+
+        release_tx.send(()).unwrap();
+        reconcile.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -489,7 +489,11 @@ fn build_orientation_block(
     // function only adjusts per-run coordinates.
     ambient: bool,
 ) -> String {
-    let mut out = String::from("## Orientation\n\nYour coordinates for this run:\n\n");
+    let clock = crate::clock::HostClock::local();
+    let mut out = format!(
+        "## Orientation\n\nYour coordinates for this run:\n\n- {}\n",
+        clock.orientation_line(chrono::Utc::now())
+    );
     if ambient {
         out.push_str(&format!(
             "- Working directory (cwd): `{}` \u{2014} the project's live checkout (shared with the user)\n",
@@ -729,12 +733,21 @@ fn build_messaging_context(
     }
 
     if !recent.is_empty() {
-        out.push_str("### Recent Messages\n\n");
+        let clock = crate::clock::HostClock::local();
+        out.push_str(&format!(
+            "### Recent Messages ({})\n\n",
+            clock.timezone_name()
+        ));
+        let mut previous_local_date = None;
         for msg in &recent {
-            let ts = chrono::DateTime::from_timestamp(msg.created_at, 0)
-                .map(|dt| dt.format("%H:%M:%S").to_string())
-                .unwrap_or_else(|| "??:??:??".to_string());
-            out.push_str(&format!("[{}] {}: {}\n", ts, msg.sender_name, msg.content));
+            let (stamp, local_date) = clock
+                .message_stamp(msg.created_at, previous_local_date)
+                .unwrap_or_else(|| ("??:??:??".to_string(), chrono::NaiveDate::MIN));
+            previous_local_date = Some(local_date);
+            out.push_str(&format!(
+                "[{}] {}: {}\n",
+                stamp, msg.sender_name, msg.content
+            ));
         }
     }
 
@@ -2022,6 +2035,7 @@ mod tests {
                     when: crate::config::project_settings::CheckWhen::Review,
                     resource_class: crate::config::project_settings::CheckResourceClass::Shared,
                     timeout: None,
+                    constraints: None,
                 },
             ),
             (
@@ -2033,6 +2047,7 @@ mod tests {
                     when: crate::config::project_settings::CheckWhen::Write,
                     resource_class: crate::config::project_settings::CheckResourceClass::Shared,
                     timeout: None,
+                    constraints: None,
                 },
             ),
         ]);
@@ -2060,6 +2075,13 @@ mod tests {
             false,
         );
         assert!(block.contains("## Orientation"));
+        let clock_line = block
+            .lines()
+            .find(|line| line.starts_with("- Clock: "))
+            .expect("orientation clock line");
+        assert!(clock_line.contains("("));
+        assert!(clock_line.contains("UTC"));
+        assert_eq!(clock_line.split_whitespace().nth(2).unwrap().len(), 3);
         // The resolved model is surfaced as part of the per-run dynamic tail.
         assert!(block.contains("Model: `claude-opus-4`"));
         assert!(block.contains("/work/CAIRN-1288-builder-0"));

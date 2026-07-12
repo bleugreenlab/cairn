@@ -923,10 +923,12 @@ async fn sweep_gate_and_publish_create_pr_branch(
     let store = project_root
         .as_ref()
         .map(|root| crate::jj::project_store_dir(&orch.config_dir, root));
-    let store_lock = store.as_ref().map(|store| orch.jj_store_lock(store));
     let (before_tip, after_tip) = {
-        let _guard = match store_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
+        let _guard = match store.as_deref() {
+            Some(store) => Some(
+                orch.acquire_jj_store_lock(store, "create-pr branch publication")
+                    .await,
+            ),
             None => None,
         };
         let before_tip = store

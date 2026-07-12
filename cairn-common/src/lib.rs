@@ -1,6 +1,8 @@
 pub mod auth;
+pub mod build_identity;
 pub mod change_validation;
 pub mod contract;
+pub mod executor_protocol;
 pub mod ids;
 pub mod logging;
 pub mod paths;

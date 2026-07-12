@@ -6,8 +6,13 @@ pub mod sync_server;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use cairn_common::executor_protocol::{
+    ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, ExecutorMessage,
+    ObjectChannelCredential,
+};
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::jj::{self, JjEnv};
 use cairn_core::internal::mcp::handlers::issue_resources::handle_read_issue_resource;
@@ -19,8 +24,10 @@ use cairn_core::internal::storage::{
     DbError, DbResult, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
 };
 use cairn_db::turso::params;
+use cairn_executor::{BuildSlotPool as ExecutorPool, ExecutorRuntime};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
+use tokio::sync::mpsc;
 
 pub async fn migrated_db() -> (TempDir, LocalDb) {
     let temp = tempdir().unwrap();
@@ -39,6 +46,218 @@ pub fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
     let db_state = Arc::new(DbState::new(db, search_index));
     let services = Arc::new(TestServicesBuilder::new().build());
     Orchestrator::builder(db_state, services, temp.path().join("config")).build()
+}
+
+/// Attach the production executor runtime through the same advertised-message
+/// facade used by enrolled WebSocket executors.
+pub fn attached_executor_home(orch: &Orchestrator) -> PathBuf {
+    orch.config_dir.clone()
+}
+
+pub fn attach_test_executor(orch: &Orchestrator) {
+    attach_executor(
+        orch,
+        attached_executor_home(orch),
+        None,
+        true,
+        "test-executor",
+        Vec::new(),
+    );
+}
+
+/// Attach a production executor whose object cache and workspaces live under a
+/// CAIRN_HOME that is physically separate from the runner. Managed-object tests
+/// use this instead of sharing the runner's jj store, so an execution can only
+/// obtain Git objects through the configured HTTP object channel.
+pub fn attach_isolated_test_executor(
+    orch: &Orchestrator,
+    executor_home: PathBuf,
+    object_base_url: String,
+    project_id: String,
+) {
+    const EXECUTOR_ID: &str = "isolated-test-executor";
+    let (bearer_token, expires_at_unix_ms) = orch.object_plane.issue_credential(
+        EXECUTOR_ID,
+        "isolated-test-device",
+        "test-runner-device",
+        1,
+        unix_time_ms(),
+    );
+    attach_executor(
+        orch,
+        executor_home,
+        Some(ObjectChannelCredential {
+            base_url: object_base_url,
+            bearer_token,
+            expires_at_unix_ms,
+        }),
+        false,
+        EXECUTOR_ID,
+        vec![project_id],
+    );
+}
+
+fn attach_executor(
+    orch: &Orchestrator,
+    executor_home: PathBuf,
+    object_channel: Option<ObjectChannelCredential>,
+    colocated: bool,
+    executor_id: &'static str,
+    projects_served: Vec<String>,
+) {
+    let projects_served = Arc::new(projects_served);
+    let core_pool = orch.build_slots.clone();
+    let snapshot_pool = core_pool.clone();
+    let generation = Arc::new(AtomicU64::new(0));
+    let snapshot_generation = generation.clone();
+    let callback_pool = core_pool.clone();
+    let callback_orch = orch.clone();
+    let runtime = ExecutorRuntime::new(executor_home, jj_bin().unwrap_or_else(|| "jj".to_string()))
+        .with_snapshot_callback(move |snapshot| {
+            snapshot_pool.handle_executor_message(
+                executor_id,
+                snapshot_generation.load(Ordering::Acquire),
+                ExecutorMessage::SnapshotUpdated { snapshot },
+            );
+        })
+        .with_runner_callback(move |callback| {
+            let pool = callback_pool.clone();
+            let orch = callback_orch.clone();
+            Box::pin(async move { pool.handle_runner_callback(&orch, callback).await })
+        });
+    let executor_pool = ExecutorPool::new(runtime);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let attached_generation = core_pool.attach_advertised_executor(
+        ExecutorAdvertisement {
+            identity: ExecutorIdentity {
+                device_id: if colocated {
+                    "test-device"
+                } else {
+                    "isolated-test-device"
+                }
+                .into(),
+                executor_id: executor_id.into(),
+                display_name: if colocated {
+                    "Test executor"
+                } else {
+                    "Isolated test executor"
+                }
+                .into(),
+            },
+            capabilities: ExecutorCapabilities {
+                os: std::env::consts::OS.into(),
+                arch: std::env::consts::ARCH.into(),
+                logical_cores: 1,
+                toolchains: Vec::new(),
+                projects_served: projects_served.as_ref().clone(),
+                slot_capacity: usize::MAX,
+                disk_budget_bytes: None,
+                memory_budget_bytes: None,
+            },
+            current_load: 0,
+            warm_roots: Vec::new(),
+            observed_at_unix_ms: 0,
+        },
+        tx,
+        colocated,
+    );
+    generation.store(attached_generation, Ordering::Release);
+    executor_pool.configure_object_channel(
+        object_channel,
+        executor_id.to_owned(),
+        attached_generation,
+    );
+
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            match message {
+                ExecutorMessage::Configure { config } => executor_pool.configure(config),
+                ExecutorMessage::Submit { request, batch } => {
+                    let executor_pool = executor_pool.clone();
+                    let core_pool = core_pool.clone();
+                    let projects_served = projects_served.clone();
+                    tokio::spawn(async move {
+                        let request_id = request.request_id.clone();
+                        let attempt_id = request.attempt_id.clone();
+                        let outcome = match batch {
+                            Some(batch) => executor_pool.submit_run_batch(request, batch).await,
+                            None => executor_pool.submit(request).await,
+                        };
+                        core_pool.handle_executor_message(
+                            executor_id,
+                            attached_generation,
+                            ExecutorMessage::Result {
+                                request_id,
+                                attempt_id,
+                                outcome,
+                            },
+                        );
+                        core_pool.handle_executor_message(
+                            executor_id,
+                            attached_generation,
+                            ExecutorMessage::AdvertisementUpdated {
+                                advertisement: ExecutorAdvertisement {
+                                    identity: ExecutorIdentity {
+                                        device_id: if colocated {
+                                            "test-device"
+                                        } else {
+                                            "isolated-test-device"
+                                        }
+                                        .into(),
+                                        executor_id: executor_id.into(),
+                                        display_name: if colocated {
+                                            "Test executor"
+                                        } else {
+                                            "Isolated test executor"
+                                        }
+                                        .into(),
+                                    },
+                                    capabilities: ExecutorCapabilities {
+                                        os: std::env::consts::OS.into(),
+                                        arch: std::env::consts::ARCH.into(),
+                                        logical_cores: 1,
+                                        toolchains: Vec::new(),
+                                        projects_served: projects_served.as_ref().clone(),
+                                        slot_capacity: usize::MAX,
+                                        disk_budget_bytes: None,
+                                        memory_budget_bytes: None,
+                                    },
+                                    current_load: 0,
+                                    warm_roots: executor_pool.warm_roots(),
+                                    observed_at_unix_ms: unix_time_ms(),
+                                },
+                            },
+                        );
+                    });
+                }
+                ExecutorMessage::Cancel { request_id, .. } => {
+                    executor_pool.cancel_request(&request_id);
+                }
+                ExecutorMessage::CancelJob { job_id } => {
+                    executor_pool.cancel_job_requests(&job_id);
+                }
+                ExecutorMessage::SnapshotRequest { correlation_id } => {
+                    core_pool.handle_executor_message(
+                        executor_id,
+                        attached_generation,
+                        ExecutorMessage::SnapshotResponse {
+                            correlation_id,
+                            snapshot: executor_pool.snapshot(),
+                        },
+                    );
+                }
+                ExecutorMessage::Shutdown => break,
+                _ => {}
+            }
+        }
+    });
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub fn config_dir(temp: &TempDir) -> PathBuf {
@@ -257,13 +476,42 @@ pub fn head_sha(repo: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[derive(Debug, Clone)]
+pub struct ProvisionedJjWorkspace {
+    pub project_repository: PathBuf,
+    pub git_common_dir: PathBuf,
+    pub store_dir: PathBuf,
+    pub workspace: PathBuf,
+}
+
+fn canonical_git_common_dir(repository: &Path) -> PathBuf {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repository)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let common = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    std::fs::canonicalize(if common.is_absolute() {
+        common
+    } else {
+        repository.join(common)
+    })
+    .unwrap()
+}
+
 /// Provision a NON-COLOCATED `.jj` workspace at `ws` over a shared store backed
-/// by `project_repo`, mirroring production worktree provisioning. The workspace
-/// is created with `jj workspace add` and carries no `.git`, so tests exercise
-/// the real jj/git-shelling seams rather than a colocated checkout that would
-/// mask them. `config_dir` is the orchestrator's config dir, so a handler's
-/// `JjEnv` resolves the same store and config.
-pub fn provision_jj_workspace(config_dir: &Path, project_repo: &Path, ws: &Path, branch: &str) {
+/// by `project_repo`, mirroring production worktree provisioning. The returned
+/// identity makes the one runner Git backend/shared-store pair explicit to tests.
+pub fn provision_jj_workspace(
+    config_dir: &Path,
+    project_repo: &Path,
+    ws: &Path,
+    branch: &str,
+) -> ProvisionedJjWorkspace {
+    assert!(project_repo.join(".git").exists());
+    assert!(!project_repo.join(".jj").exists());
+
     let jj = JjEnv::resolve("jj", config_dir);
     let store = jj::project_store_dir(config_dir, project_repo);
     jj::ensure_project_store(&jj, &store, project_repo).unwrap();
@@ -271,6 +519,23 @@ pub fn provision_jj_workspace(config_dir: &Path, project_repo: &Path, ws: &Path,
     jj::add_workspace(&jj, &store, ws, branch, &base, None).unwrap();
     jj::write_base_marker(ws, "main", &base).unwrap();
     jj::write_project_root_marker(ws, project_repo).unwrap();
+
+    assert!(ws.join(".jj").exists());
+    assert!(!ws.join(".git").exists());
+    assert_eq!(store, jj::project_store_dir(config_dir, project_repo));
+    let git_common_dir = canonical_git_common_dir(project_repo);
+    let git_target = std::fs::read_to_string(store.join(".jj/repo/store/git_target")).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(git_target.trim()).unwrap(),
+        git_common_dir
+    );
+
+    ProvisionedJjWorkspace {
+        project_repository: std::fs::canonicalize(project_repo).unwrap(),
+        git_common_dir,
+        store_dir: std::fs::canonicalize(store).unwrap(),
+        workspace: std::fs::canonicalize(ws).unwrap(),
+    }
 }
 
 /// Drive `primary_ws` into the OP-LOG stale state that reproduces the commit

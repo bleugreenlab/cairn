@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-// ---- rollback_merge refreshes BOTH source and target worktrees ----
+// ---- rollback_merge refreshes both source and target worktrees ----
 
 fn jj_bin() -> Option<String> {
     let bin = std::env::var("CAIRN_JJ_BIN")
@@ -266,6 +266,14 @@ struct MergeFixture {
 }
 
 async fn setup_wedged_merge(bin: &str) -> MergeFixture {
+    setup_merge(bin, true).await
+}
+
+async fn setup_clean_merge(bin: &str) -> MergeFixture {
+    setup_merge(bin, false).await
+}
+
+async fn setup_merge(bin: &str, wedge_target: bool) -> MergeFixture {
     let home_root = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
     let wts = tempfile::tempdir().unwrap();
@@ -317,33 +325,35 @@ async fn setup_wedged_merge(bin: &str) -> MergeFixture {
     std::fs::write(ws_child.join("shared.rs"), "child-edit\n").unwrap();
     crate::jj::seal(&jj, &ws_child, "child edits shared", None).unwrap();
 
-    // Wedge the hub: hub edits shared, main advances conflictingly, the hub
-    // rebases (baking the conflict into its intermediate) and resolves at its
-    // tip — a clean tip over a conflicted intermediate.
-    std::fs::write(ws_coord.join("shared.rs"), "hub-edit\n").unwrap();
-    crate::jj::seal(&jj, &ws_coord, "hub edits shared", None).unwrap();
-    jj_raw(bin, &cfg, &store, &["new", "main"]);
-    std::fs::write(store.join("shared.rs"), "main-advanced\n").unwrap();
-    jj_raw(bin, &cfg, &store, &["describe", "-m", "main advances"]);
-    jj_raw(
-        bin,
-        &cfg,
-        &store,
-        &[
-            "bookmark",
-            "set",
-            "main",
-            "-r",
-            "@",
-            "--ignore-working-copy",
-        ],
-    );
-    crate::jj::rebase_branch_onto(&jj, &store, int, "main").unwrap();
-    assert!(crate::jj::branch_has_conflict(&jj, &store, int).unwrap());
-    crate::jj::update_stale(&jj, &ws_coord).unwrap();
-    std::fs::write(ws_coord.join("shared.rs"), "hub-resolved\n").unwrap();
-    crate::jj::seal(&jj, &ws_coord, "resolve hub", None).unwrap();
-    assert!(!crate::jj::branch_has_conflict(&jj, &store, int).unwrap());
+    if wedge_target {
+        // Wedge the hub: hub edits shared, main advances conflictingly, the hub
+        // rebases (baking the conflict into its intermediate) and resolves at its
+        // tip — a clean tip over a conflicted intermediate.
+        std::fs::write(ws_coord.join("shared.rs"), "hub-edit\n").unwrap();
+        crate::jj::seal(&jj, &ws_coord, "hub edits shared", None).unwrap();
+        jj_raw(bin, &cfg, &store, &["new", "main"]);
+        std::fs::write(store.join("shared.rs"), "main-advanced\n").unwrap();
+        jj_raw(bin, &cfg, &store, &["describe", "-m", "main advances"]);
+        jj_raw(
+            bin,
+            &cfg,
+            &store,
+            &[
+                "bookmark",
+                "set",
+                "main",
+                "-r",
+                "@",
+                "--ignore-working-copy",
+            ],
+        );
+        crate::jj::rebase_branch_onto(&jj, &store, int, "main").unwrap();
+        assert!(crate::jj::branch_has_conflict(&jj, &store, int).unwrap());
+        crate::jj::update_stale(&jj, &ws_coord).unwrap();
+        std::fs::write(ws_coord.join("shared.rs"), "hub-resolved\n").unwrap();
+        crate::jj::seal(&jj, &ws_coord, "resolve hub", None).unwrap();
+        assert!(!crate::jj::branch_has_conflict(&jj, &store, int).unwrap());
+    }
 
     seed_branch_jobs(
         &orch.db.local,
@@ -477,5 +487,91 @@ async fn target_repair_push_failure_rolls_the_whole_merge_back() {
         crate::jj::flatten_state(&fx.jj, &fx.store, &main_tip, fx.int).unwrap(),
         crate::jj::FlattenState::IntermediateOnly,
         "the local integration branch is still wedged after the rollback (matches origin)"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prospective_conflict_restores_store_and_publishes_nothing() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping prospective_conflict_restores_store_and_publishes_nothing: jj not resolvable"
+        );
+        return;
+    };
+    let fx = setup_wedged_merge(&bin).await;
+    let source_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch);
+    let target_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.target_branch);
+    let origin_before = git_stdout(&fx.origin_path, &["rev-parse", fx.int]);
+
+    let error = prospective_store_merge_child(&fx.orch, &fx.ctx, "squash")
+        .await
+        .expect_err("the prospective source conflict must refuse the plan");
+    assert!(error.contains("recorded a conflict"), "{error}");
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch),
+        source_before
+    );
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.target_branch),
+        target_before
+    );
+    assert_eq!(
+        git_stdout(&fx.origin_path, &["rev-parse", fx.int]),
+        origin_before
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn verified_landing_publishes_the_exact_prospective_tree() {
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let plan = prospective_store_merge_child(&fx.orch, &fx.ctx, "squash")
+        .await
+        .expect("clean prospective merge");
+    let target_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, fx.int).unwrap();
+
+    let result = land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan)
+        .await
+        .expect("verified landing");
+    let VerifiedLanding::Landed(commit) = result else {
+        panic!("unchanged tips must land the verified plan");
+    };
+    assert_ne!(commit, target_before);
+    assert_eq!(
+        crate::jj::sealed_tree_hash_via_git(&fx.jj, &fx.store, &commit).unwrap(),
+        plan.tree_hash
+    );
+    assert!(crate::jj::bookmark_landed_in(
+        &fx.jj,
+        &fx.store,
+        &fx.ctx.source_branch,
+        &fx.ctx.target_branch
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_verified_landing_refuses_without_moving_target() {
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let mut plan = prospective_store_merge_child(&fx.orch, &fx.ctx, "squash")
+        .await
+        .expect("clean prospective merge");
+    let target_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, fx.int).unwrap();
+    let origin_before = git_stdout(&fx.origin_path, &["rev-parse", fx.int]);
+    plan.source_tip = "0".repeat(64);
+
+    assert_eq!(
+        land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan)
+            .await
+            .expect("stale plan is a retry result"),
+        VerifiedLanding::Stale
+    );
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, fx.int).unwrap(),
+        target_before
+    );
+    assert_eq!(
+        git_stdout(&fx.origin_path, &["rev-parse", fx.int]),
+        origin_before
     );
 }

@@ -13,20 +13,32 @@ use std::path::Path;
 /// markers and re-seals. The reconcile also never hands a conflicted base down to
 /// clean siblings — when the rebase dest itself carries a conflict, every sibling
 /// is `held` on its prior clean commit rather than rebased onto the conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileFailure {
+    pub branch: String,
+    pub workspace_path: std::path::PathBuf,
+    pub error: String,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// Sibling bookmarks that rebased with no conflict.
     pub rebased_clean: Vec<String>,
     /// Sibling bookmarks whose rebase recorded a conflict.
     pub conflicted: Vec<String>,
+    /// Successful reconciliations that preserve loose local work and therefore
+    /// should not produce a clean-rebase notification.
+    pub preserved_dirty: Vec<String>,
+    /// Trivial bookmark/workspace advances that are current but intentionally
+    /// silent because the sibling had no branch work to announce.
+    pub silent: Vec<String>,
     /// Sibling bookmarks held UNrebased because the rebase dest itself carries
     /// a recorded conflict — never handed a conflicted base. Cleared on the next
     /// reconcile once the base re-seals conflict-free.
     pub held: Vec<String>,
-    /// Sibling bookmarks whose local rebase, flatten recovery, live-workspace
-    /// refresh, or publication to a configured origin failed. A local-only project
-    /// with no origin does not require publication and remains clean.
-    pub failed: Vec<String>,
+    /// Exact per-workspace failures from graph movement, workspace reconciliation,
+    /// flatten recovery, or publication.
+    pub failed: Vec<ReconcileFailure>,
 }
 
 /// Fold a child's real commit into the integration bookmark over the shared

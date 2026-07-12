@@ -259,9 +259,15 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
         let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+        let lock_orch = orch.clone();
+        let lock_store = store.clone();
+        let lock_operation = format!("workspace provisioning for {job_id}");
+        let _store_guard = run_db(async move {
+            Ok(lock_orch
+                .acquire_jj_store_lock(&lock_store, lock_operation)
+                .await)
+        })?;
         crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path))?;
-        let store_lock = orch.jj_store_lock(&store);
-        let _store_guard = run_db(async move { Ok(store_lock.lock_owned().await) })?;
 
         let short_job: String = job_id
             .chars()
@@ -1251,12 +1257,20 @@ pub fn continue_job_impl(
         side_channel_block,
         push_prompt.as_deref(),
     );
-    // Reseed: the seed (header + prior-session digest) leads the delivered
-    // prompt so the fresh session opens with reconstructed context; the normal
-    // trigger tail follows. The seed is also stored as a collapsible `user:seed`
-    // event below, while the trigger keeps its own verbatim user event
-    // (CAIRN-2534).
+    // Reseed: the seed (header + prior-session digest) leads the reconstructed
+    // context; the normal trigger tail follows. The seed is also stored as a
+    // collapsible `user:seed` event below, while the trigger keeps its own
+    // verbatim user event (CAIRN-2534).
     let prompt = apply_reseed_seed(prompt, reseed_outcome.as_ref());
+    // This is the single outer turn-boundary stamp. Apply it after every producer,
+    // including cold-resume reseeding, so all resumed input opens with the clock.
+    let previous_turn_end = previous_turn_end_for_resume(owning_db.clone(), &turn_id)?;
+    let prompt = prepend_resume_stamp(
+        prompt,
+        &crate::clock::HostClock::local(),
+        chrono::Utc::now(),
+        previous_turn_end,
+    );
 
     let job_model = job.model.as_ref().map(Model::new);
 
@@ -1463,6 +1477,45 @@ fn artifact_handoff_resume_note(
 /// like a glitch. Naming it as an intentional suspend up front removes that
 /// tension (CAIRN-2173).
 const RESUME_AFTER_SELF_SUSPEND_NOTE: &str = "Resuming after an intentional self-suspend. Your run paused itself to wait on delegated work (a sub-agent task or a user question) and resumed now that the work finished — the earlier tool call was suspended on purpose, not interrupted or errored, and its result follows.";
+
+fn prepend_resume_stamp(
+    prompt: String,
+    clock: &crate::clock::HostClock,
+    now: chrono::DateTime<chrono::Utc>,
+    previous_turn_end: Option<i64>,
+) -> String {
+    format!(
+        "{}\n\n{}",
+        clock.resume_prefix(now, previous_turn_end),
+        prompt
+    )
+}
+
+fn previous_turn_end_for_resume(db: Arc<LocalDb>, turn_id: &str) -> Result<Option<i64>, String> {
+    let turn_id = turn_id.to_string();
+    run_db(async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT predecessor.ended_at
+                           FROM turns current
+                           LEFT JOIN turns predecessor ON predecessor.id = current.predecessor_id
+                          WHERE current.id = ?1
+                          LIMIT 1",
+                        (turn_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => row.opt_i64(0),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+    })
+}
 
 /// Assemble a resume prompt so notes that accumulated before this wake lead and
 /// the immediate resume message follows them.
@@ -1939,11 +1992,57 @@ mod tests {
     use super::{
         apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content,
         decide_continue_action, ensure_reused_process_model, is_session_stale,
-        session_prefers_native_resume, staleness_threshold_secs, ContinueSessionAction,
-        ReseedOutcome, ReuseDecision, RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
+        prepend_resume_stamp, previous_turn_end_for_resume, session_prefers_native_resume,
+        staleness_threshold_secs, ContinueSessionAction, ReseedOutcome, ReuseDecision,
+        RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
     };
     use crate::agent_process::process::{wrap_plain_stdin, AgentProcessState, RunHandle};
+    use crate::storage::migrated_test_db;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_elapsed_uses_stored_predecessor_turn_end() {
+        let db = Arc::new(migrated_test_db("resume-clock-predecessor").await);
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','P','P','/tmp/p',1,1);
+             INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+               VALUES('j','p','running','s',1,1);
+             INSERT INTO sessions(id, job_id, backend, status, created_at, updated_at)
+               VALUES('s','j','codex','open',1,1);
+             INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at)
+               VALUES('previous','s','j',1,'completed','initial',1,1000,1000);
+             INSERT INTO turns(id, session_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at)
+               VALUES('current','s','j',2,'previous','running','follow_up',1100,1100);",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            previous_turn_end_for_resume(db, "current").unwrap(),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn resumed_input_stamp_is_outermost_even_for_reseeded_context() {
+        let clock = crate::clock::HostClock::fixed("America/Los_Angeles");
+        let now = chrono::DateTime::from_timestamp(1_752_381_600, 0).unwrap();
+        let reconstructed = apply_reseed_seed(
+            "TRIGGER".to_string(),
+            Some(&ReseedOutcome {
+                new_session_id: "session-new".to_string(),
+                seed_content: "SEED".to_string(),
+            }),
+        );
+        let prompt =
+            prepend_resume_stamp(reconstructed, &clock, now, Some(now.timestamp() - 192 * 60));
+        assert_eq!(
+            prompt,
+            "[Sat 21:40 — resumed after 3h 12m]\n\nSEED\n\nTRIGGER"
+        );
+    }
 
     #[test]
     fn passive_note_precedes_immediate_resume_message() {

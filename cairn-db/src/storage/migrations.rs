@@ -248,6 +248,19 @@ macro_rules! shared_tail_index_hot_gui_status_queries {
         )
     };
 }
+/// CAIRN-2804: retain executor attribution and the runner-local toolchain claim
+/// alongside each cached verdict. The cache is shared project state, so this
+/// additive migration is composed once into both lineages.
+macro_rules! shared_tail_check_result_cache_provenance {
+    () => {
+        Migration::new(
+            "0109",
+            "check_result_cache_provenance",
+            include_str!("../../../../turso_migrations/0109_check_result_cache_provenance.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -268,6 +281,7 @@ macro_rules! team_lineage {
             shared_tail_clear_invalid_job_worktree_paths!(),
             shared_tail_add_turn_end_reason!(),
             shared_tail_index_hot_gui_status_queries!(),
+            shared_tail_check_result_cache_provenance!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -384,6 +398,20 @@ macro_rules! private_lineage {
                 include_str!(
                     "../../../../turso_migrations/0107_normalize_openai_token_usage_components.sql"
                 ),
+            ),
+            // Executor enrollment grants and credentials establish trust with
+            // this runner device. They are host-local identity/credential state,
+            // never collaboration data synced into a team replica.
+            Migration::new(
+                "0108",
+                "executor_enrollment",
+                include_str!("../../../../turso_migrations/0108_executor_enrollment.sql"),
+            ),
+            shared_tail_check_result_cache_provenance!(),
+            Migration::new(
+                "0110",
+                "executor_enrollment_expiry",
+                include_str!("../../../../turso_migrations/0110_executor_enrollment_expiry.sql"),
             ),
         ]
     };
@@ -869,6 +897,13 @@ pub const TEAM_MIGRATIONS: &[Migration] = team_lineage![
         "remote_intents",
         include_str!("../../../../turso_migrations_team/0004_remote_intents.sql"),
     ),
+    // Team-only non-secret executor advertisements. Enrollment credentials and
+    // revocation state remain private; only fleet availability is replicated.
+    Migration::new(
+        "0005",
+        "executor_registry",
+        include_str!("../../../../turso_migrations_team/0005_executor_registry.sql"),
+    ),
 ];
 
 // ── Table scope: the single source of truth (CAIRN-2210) ────────────────────
@@ -1038,6 +1073,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "anon_device",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    // Enrollment binds executor credentials and one-time grants to this local
+    // runner device; neither table is team-replicated collaboration state.
+    (
+        "executor_enrollment_grants",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "executor_enrollments",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
     (
@@ -1522,6 +1567,9 @@ mod tests {
                 "0105_add_turn_end_reason".to_string(),
                 "0106_index_hot_gui_status_queries".to_string(),
                 "0107_normalize_openai_token_usage_components".to_string(),
+                "0108_executor_enrollment".to_string(),
+                "0109_check_result_cache_provenance".to_string(),
+                "0110_executor_enrollment_expiry".to_string(),
             ]
         );
         Ok(db)
@@ -2877,6 +2925,9 @@ mod tests {
                 // CAIRN-2629: team-only device_presence table (head migration).
                 "0003_device_presence".to_string(),
                 "0004_remote_intents".to_string(),
+                // Non-secret fleet advertisements are team-visible; enrollment
+                // credentials and grant consumption remain private.
+                "0005_executor_registry".to_string(),
                 // Shared-tail migrations land in the team lineage after the team
                 // head, preserving one shared SQL source for project-scoped tables.
                 "0084_archival_pack_hash".to_string(),
@@ -2898,6 +2949,7 @@ mod tests {
                 "0104_clear_invalid_job_worktree_paths".to_string(),
                 "0105_add_turn_end_reason".to_string(),
                 "0106_index_hot_gui_status_queries".to_string(),
+                "0109_check_result_cache_provenance".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.
@@ -2992,13 +3044,13 @@ mod tests {
             );
         }
 
-        // `device_presence` is team-only (CAIRN-2629): no private counterpart, so
-        // it is skipped here exactly as `teams` is, and re-added to the expected
-        // team projection below.
+        // These fleet/remote-delivery tables are team-only: they have no private
+        // counterpart, so they are skipped here exactly as `teams` is and added
+        // explicitly to the expected team projection below.
         for (name, sql) in &team_tables {
             if matches!(
                 name.as_str(),
-                "teams" | "device_presence" | "remote_intents"
+                "teams" | "device_presence" | "remote_intents" | "executor_registry"
             ) || rerooted.contains(&name.as_str())
             {
                 continue;
@@ -3096,6 +3148,7 @@ mod tests {
         expected_team.insert("teams"); // present in both; classified specially
         expected_team.insert("device_presence"); // team-only (CAIRN-2629)
         expected_team.insert("remote_intents"); // team-only remote delivery inbox
+        expected_team.insert("executor_registry"); // team-only non-secret fleet advertisements
         let actual_team: std::collections::BTreeSet<&str> = team_tables
             .keys()
             .map(String::as_str)

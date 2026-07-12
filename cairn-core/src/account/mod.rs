@@ -7,6 +7,7 @@
 pub mod anon_device;
 pub mod connection;
 pub mod content_store;
+pub mod executor_enrollment;
 pub mod jwt;
 pub mod manager;
 pub mod org_tokens;

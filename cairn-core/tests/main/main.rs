@@ -39,6 +39,7 @@ mod mcp_node_question_answer;
 mod mcp_openrouter_suspend;
 mod mcp_pr_action_dispatch;
 mod mcp_registry_fence;
+mod mcp_run_cas_acceptance;
 mod mcp_run_commit_hygiene;
 mod mcp_run_execution;
 mod mcp_skill_resources;

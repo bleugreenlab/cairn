@@ -35,7 +35,22 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
             .with_process(RealProcessSpawner)
             .build(),
     );
-    Orchestrator::builder(db_state, services, temp.path().join("config")).build()
+    let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    common::attach_test_executor(&orch);
+    orch
+}
+
+#[tokio::test]
+async fn attached_executor_and_runner_share_project_store_root() {
+    let (temp, db) = common::migrated_db().await;
+    let repository = temp.path().join("project");
+    let config_dir = temp.path().join("config");
+    let orch = orchestrator(&temp, Arc::new(db));
+
+    let runner_store = jj::project_store_dir(&config_dir, &repository);
+    let executor_store = jj::project_store_dir(&common::attached_executor_home(&orch), &repository);
+
+    assert_eq!(executor_store, runner_store);
 }
 
 #[tokio::test]
@@ -44,7 +59,7 @@ async fn run_preflight_completes_rebind_interrupted_after_database_cas() {
         return;
     };
     let run_id = "partial-after-cas";
-    let (temp, db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let (temp, db, orch, cwd, _, _fixture) = setup_rebind_fixture(run_id).await;
     let original = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
     let (new_branch, _) = simulate_partial_rebind(&temp, &db, &cwd, run_id, false).await;
 
@@ -78,7 +93,7 @@ async fn run_preflight_completes_rebind_interrupted_between_marker_writes() {
         return;
     };
     let run_id = "partial-between-markers";
-    let (temp, db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let (temp, db, orch, cwd, _, _fixture) = setup_rebind_fixture(run_id).await;
     let original = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
     let (new_branch, _) = simulate_partial_rebind(&temp, &db, &cwd, run_id, true).await;
     assert_eq!(
@@ -113,7 +128,7 @@ async fn run_preflight_rejects_arbitrary_database_branch_at_current_head() {
         return;
     };
     let run_id = "arbitrary-db-branch";
-    let (temp, db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let (temp, db, orch, cwd, _, _) = setup_rebind_fixture(run_id).await;
     let jj = JjEnv::resolve("jj", &temp.path().join("config"));
     let original = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
     let head = jj::head_commit(&jj, Path::new(&cwd)).unwrap();
@@ -158,7 +173,7 @@ async fn run_preflight_rebinds_unowned_legacy_descendant_bookmark() {
         return;
     };
     let run_id = "legacy-descendant";
-    let (temp, _db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let (temp, _db, orch, cwd, _, _fixture) = setup_rebind_fixture(run_id).await;
     let branch = "agent/RHG-1-builder-0";
     let jj = JjEnv::resolve("jj", &temp.path().join("config"));
     let project_repo = temp.path().join("project");
@@ -204,7 +219,7 @@ async fn sealed_same_job_retry_keeps_recorded_base_and_passes_next_preflight() {
         return;
     };
     let run_id = "sealed-retry";
-    let (temp, _db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let (temp, _db, orch, cwd, _, _fixture) = setup_rebind_fixture(run_id).await;
     let branch = "agent/RHG-1-builder-0";
     let jj = JjEnv::resolve("jj", &temp.path().join("config"));
     let project_repo = temp.path().join("project");
@@ -254,7 +269,7 @@ async fn run_preflight_rebinds_prior_lineage_before_command_execution() {
         return;
     };
     let run_id = "run-lineage-rebind";
-    let (temp, db, orch, cwd, project_id) = setup_rebind_fixture(run_id).await;
+    let (temp, db, orch, cwd, project_id, _fixture) = setup_rebind_fixture(run_id).await;
     let branch = "agent/RHG-1-builder-0";
     let jj = JjEnv::resolve("jj", &temp.path().join("config"));
     let old_tip = jj::bookmark_commit(&jj, Path::new(&cwd), branch).unwrap();
@@ -485,7 +500,12 @@ async fn setup_with_sandbox(
     run_id: &str,
     sandbox: LegacySandbox,
     on_escape: LegacyOnEscape,
-) -> (TempDir, Orchestrator, String) {
+) -> (
+    TempDir,
+    Orchestrator,
+    String,
+    common::ProvisionedJjWorkspace,
+) {
     let (temp, db) = common::migrated_db().await;
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
@@ -506,19 +526,40 @@ async fn setup_with_sandbox(
     )
     .await;
     let orch = orchestrator(&temp, db);
-    common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
+    let fixture =
+        common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
     write_managed_identity(&project_id, &project_repo, &ws, branch, &base, run_id);
     let cwd = ws.display().to_string();
-    (temp, orch, cwd)
+    (temp, orch, cwd, fixture)
 }
 
 async fn setup(run_id: &str) -> (TempDir, Orchestrator, String) {
+    let (temp, orch, cwd, _) =
+        setup_with_sandbox(run_id, LegacySandbox::Worktree, LegacyOnEscape::Allow).await;
+    (temp, orch, cwd)
+}
+
+async fn setup_allow_delta(
+    run_id: &str,
+) -> (
+    TempDir,
+    Orchestrator,
+    String,
+    common::ProvisionedJjWorkspace,
+) {
     setup_with_sandbox(run_id, LegacySandbox::Worktree, LegacyOnEscape::Allow).await
 }
 
 async fn setup_rebind_fixture(
     run_id: &str,
-) -> (TempDir, Arc<LocalDb>, Orchestrator, String, String) {
+) -> (
+    TempDir,
+    Arc<LocalDb>,
+    Orchestrator,
+    String,
+    String,
+    common::ProvisionedJjWorkspace,
+) {
     let (temp, db) = common::migrated_db().await;
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
@@ -539,10 +580,11 @@ async fn setup_rebind_fixture(
     )
     .await;
     let orch = orchestrator(&temp, db.clone());
-    common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
+    let fixture =
+        common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
     write_managed_identity(&project_id, &project_repo, &ws, branch, &base, run_id);
     let cwd = ws.display().to_string();
-    (temp, db, orch, cwd, project_id)
+    (temp, db, orch, cwd, project_id, fixture)
 }
 
 async fn simulate_partial_rebind(
@@ -681,7 +723,9 @@ fn sequential_run_request(cwd: &str, run_id: &str, commands: Vec<&str>) -> McpCa
 
 /// Seed a run whose fence is `deny`, so the commit-hygiene gate is active.
 async fn setup_deny(run_id: &str) -> (TempDir, Orchestrator, String) {
-    setup_with_sandbox(run_id, LegacySandbox::Worktree, LegacyOnEscape::Deny).await
+    let (temp, orch, cwd, _) =
+        setup_with_sandbox(run_id, LegacySandbox::Worktree, LegacyOnEscape::Deny).await;
+    (temp, orch, cwd)
 }
 
 fn run_request(
@@ -734,7 +778,7 @@ async fn full_sandbox_run_without_commit_msg_is_not_gated_or_reverted() {
         eprintln!("skipping full_sandbox_run_without_commit_msg_is_not_gated_or_reverted: jj not resolvable");
         return;
     };
-    let (temp, orch, cwd) = setup_with_sandbox(
+    let (temp, orch, cwd, _) = setup_with_sandbox(
         "run-full-sandbox",
         LegacySandbox::Full,
         LegacyOnEscape::Allow,
@@ -769,7 +813,7 @@ async fn run_with_commit_msg_seals_and_cleans() {
         eprintln!("skipping run_with_commit_msg_seals_and_cleans: jj not resolvable");
         return;
     };
-    let (temp, orch, cwd) = setup("run-commit").await;
+    let (temp, orch, cwd, _fixture) = setup_allow_delta("run-commit").await;
     let result = handle_run(
         &orch,
         &run_request(
@@ -784,6 +828,68 @@ async fn run_with_commit_msg_seals_and_cleans() {
     assert!(result.contains("Committed changes"), "result: {result}");
     assert!(Path::new(&cwd).join("committed.txt").exists());
     assert!(ws_clean(&temp.path().join("config"), Path::new(&cwd)));
+}
+
+#[tokio::test]
+async fn managed_store_seal_bridge_materialize_barrier_uses_workspace_store() {
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!(
+            "skipping managed_store_seal_bridge_materialize_barrier_uses_workspace_store: jj not resolvable"
+        );
+        return;
+    };
+    let run_id = "managed-store-publication";
+    let (temp, orch, cwd, fixture) = setup_allow_delta(run_id).await;
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let base = jj::head_commit(&jj, &fixture.workspace).unwrap();
+
+    assert!(!fixture.project_repository.join(".jj").exists());
+    assert!(!fixture.workspace.join(".git").exists());
+    let store_git_target =
+        std::fs::read_to_string(fixture.store_dir.join(".jj/repo/store/git_target")).unwrap();
+    assert_eq!(
+        fixture.git_common_dir,
+        std::fs::canonicalize(store_git_target.trim()).unwrap()
+    );
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf managed-store > managed-store.txt",
+            Some("publish through managed store"),
+        ),
+    )
+    .await;
+
+    assert!(result.contains("Committed changes"), "result: {result}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("managed-store.txt")).unwrap(),
+        "managed-store"
+    );
+    let materialized = jj::head_commit(&jj, &fixture.workspace).unwrap();
+    assert_ne!(materialized, base);
+    assert!(jj::revset_resolves(&jj, &fixture.store_dir, &materialized));
+    assert!(ws_clean(&temp.path().join("config"), &fixture.workspace));
+
+    let temporary_refs = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/cairn-build-delta-",
+        ])
+        .current_dir(&fixture.project_repository)
+        .output()
+        .unwrap();
+    assert!(temporary_refs.status.success());
+    assert!(
+        String::from_utf8_lossy(&temporary_refs.stdout)
+            .trim()
+            .is_empty(),
+        "temporary publication ref survived cleanup: {}",
+        String::from_utf8_lossy(&temporary_refs.stdout)
+    );
 }
 
 #[tokio::test]
@@ -989,7 +1095,7 @@ async fn code_item_with_commit_msg_seals_and_cleans() {
         eprintln!("skipping code_item_with_commit_msg_seals_and_cleans: jj not resolvable");
         return;
     };
-    let (temp, orch, cwd) = setup("run-code-commit").await;
+    let (temp, orch, cwd, _fixture) = setup_allow_delta("run-code-commit").await;
     let result = handle_run(
         &orch,
         &code_run_request(
@@ -1068,4 +1174,154 @@ async fn dirty_worktree_notice_skips_non_worktree_request() {
             .any(|r| r.contains("The worktree has uncommitted changes")),
         "{result:?}"
     );
+}
+
+fn branch_run_request(
+    cwd: &str,
+    run_id: &str,
+    branch: &str,
+    command: &str,
+    commit_msg: Option<&str>,
+) -> McpCallbackRequest {
+    let mut payload = json!({
+        "commands": [{ "command": command }],
+        "branch": branch,
+    });
+    if let Some(message) = commit_msg {
+        payload["commit_msg"] = json!(message);
+    }
+    McpCallbackRequest {
+        thread_id: None,
+        cwd: cwd.to_string(),
+        run_id: Some(run_id.to_string()),
+        tool: "run".to_string(),
+        payload,
+        tool_use_id: Some(format!("toolu-branch-{run_id}")),
+    }
+}
+
+#[tokio::test]
+async fn branch_run_uses_committed_head_and_ignores_dirty_live_workspace() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "branch-commit-true";
+    let (temp, orch, cwd) = setup(run_id).await;
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let sentinel = Path::new(&cwd).join("sentinel.txt");
+    std::fs::write(&sentinel, "committed-sentinel\n").unwrap();
+    let sealed = jj::seal(&jj, Path::new(&cwd), "branch sentinel", None).unwrap();
+    std::fs::write(&sentinel, "dirty-live-workspace\n").unwrap();
+
+    let result = handle_run(
+        &orch,
+        &branch_run_request(
+            &cwd,
+            run_id,
+            "agent/RHG-1-builder-0",
+            "cat sentinel.txt",
+            None,
+        ),
+    )
+    .await;
+
+    assert!(result.contains("committed-sentinel"), "{result}");
+    assert!(!result.contains("dirty-live-workspace"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "dirty-live-workspace\n"
+    );
+    let bookmark = jj::bookmark_commit(&jj, Path::new(&cwd), "agent/RHG-1-builder-0").unwrap();
+    assert!(
+        bookmark.starts_with(&sealed.sha),
+        "{bookmark} != {}",
+        sealed.sha
+    );
+}
+
+#[tokio::test]
+async fn branch_run_accepts_ref_without_a_live_checkout() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "branch-no-checkout";
+    let (temp, orch, cwd) = setup(run_id).await;
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let head = jj::head_commit(&jj, Path::new(&cwd)).unwrap();
+    jj::create_bookmark_at(&jj, Path::new(&cwd), "detached-verdict-ref", &head).unwrap();
+
+    let result = handle_run(
+        &orch,
+        &branch_run_request(&cwd, run_id, "detached-verdict-ref", "cat README.md", None),
+    )
+    .await;
+
+    assert!(result.contains("initial"), "{result}");
+}
+
+#[tokio::test]
+async fn unresolved_branch_ref_fails_before_command_execution() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "branch-unresolved";
+    let (_temp, orch, cwd) = setup(run_id).await;
+    let side_effect = Path::new(&cwd).join("must-not-run.txt");
+
+    let result = handle_run(
+        &orch,
+        &branch_run_request(
+            &cwd,
+            run_id,
+            "definitely-missing-ref",
+            "printf ran > must-not-run.txt",
+            None,
+        ),
+    )
+    .await;
+
+    assert!(result.contains("definitely-missing-ref"), "{result}");
+    assert!(result.contains("Could not resolve branch ref"), "{result}");
+    assert!(!side_effect.exists());
+}
+
+#[tokio::test]
+async fn branch_run_is_verdict_only_and_rejects_commit_messages() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "branch-verdict-only";
+    let (_temp, orch, cwd) = setup(run_id).await;
+
+    let rejected = handle_run(
+        &orch,
+        &branch_run_request(
+            &cwd,
+            run_id,
+            "agent/RHG-1-builder-0",
+            "printf ran > must-not-run.txt",
+            Some("forbidden"),
+        ),
+    )
+    .await;
+    assert!(rejected.contains("verdict-only"), "{rejected}");
+    assert!(!Path::new(&cwd).join("must-not-run.txt").exists());
+
+    let mutation = handle_run(
+        &orch,
+        &branch_run_request(
+            &cwd,
+            run_id,
+            "agent/RHG-1-builder-0",
+            "printf changed > tracked-output.txt",
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        mutation.to_ascii_lowercase().contains("mutation")
+            || mutation.to_ascii_lowercase().contains("verdict"),
+        "{mutation}"
+    );
+    assert!(!Path::new(&cwd).join("tracked-output.txt").exists());
 }

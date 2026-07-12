@@ -14,8 +14,10 @@ pub mod build_services;
 pub mod config_resource;
 pub mod device_presence;
 pub mod docs;
+pub mod executor_registry; // Synced visibility; live placement remains in build_slots.
 pub mod identity;
 pub mod lifecycle;
+pub mod object_plane;
 pub mod parent_wake;
 pub mod recipes;
 pub mod session;
@@ -316,6 +318,7 @@ impl OrchestratorBuilder {
                 crate::execution::check_admission::CheckAdmissionController::default(),
             ),
             build_slots: Arc::new(crate::build_slots::BuildSlotPool::default()),
+            object_plane: Arc::new(crate::orchestrator::object_plane::ObjectPlaneState::default()),
             permission_responses: self.permission_responses,
             run_completions: self.run_completions,
             prompt_responses: self.prompt_responses,
@@ -357,6 +360,29 @@ impl OrchestratorBuilder {
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
+        }
+    }
+}
+
+const JJ_STORE_LOCK_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub struct JjStoreGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    operation: String,
+    store: String,
+    acquired_at: std::time::Instant,
+}
+
+impl Drop for JjStoreGuard {
+    fn drop(&mut self) {
+        let held = self.acquired_at.elapsed();
+        if held >= JJ_STORE_LOCK_WARN_AFTER {
+            log::warn!(
+                "jj store lock hold exceeded {:.1}s: operation={}, store={}",
+                held.as_secs_f64(),
+                self.operation,
+                self.store
+            );
         }
     }
 }
@@ -575,6 +601,8 @@ pub struct Orchestrator {
     pub check_admission: Arc<crate::execution::check_admission::CheckAdmissionController>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub build_slots: Arc<crate::build_slots::BuildSlotPool>,
+    /// Runtime-only object-channel credentials and staged managed-executor uploads.
+    pub object_plane: Arc<crate::orchestrator::object_plane::ObjectPlaneState>,
     /// Pool of long-lived Codex app-servers for EPHEMERAL CALLS (CAIRN-2549).
     /// Each pooled call is a `thread/start` on a shared process rather than a
     /// process of its own. Deliberately owned HERE and NOT in
@@ -825,12 +853,67 @@ impl Orchestrator {
     /// merge-fold mutations on a shared jj project store. Acquire it once per
     /// logical operation at exactly one level — `TokioMutex` is not reentrant, so
     /// the inner reconcile helpers must never re-acquire it while it is held.
-    pub fn jj_store_lock(&self, store_dir: &Path) -> Arc<TokioMutex<()>> {
+    fn jj_store_lock(&self, store_dir: &Path) -> Arc<TokioMutex<()>> {
         let key = store_dir.to_string_lossy().into_owned();
         let mut map = self.jj_store_locks.lock().unwrap();
         map.entry(key)
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_jj_store_lock_for_test(&self, store_dir: &Path) -> Arc<TokioMutex<()>> {
+        self.jj_store_lock(store_dir)
+    }
+
+    /// Acquire a project store lock while recording slow waits and holds.
+    pub async fn acquire_jj_store_lock(
+        &self,
+        store_dir: &Path,
+        operation: impl Into<String>,
+    ) -> JjStoreGuard {
+        self.acquire_jj_store_lock_with_timeout(store_dir, operation, None)
+            .await
+            .expect("an acquisition without a timeout cannot time out")
+    }
+
+    pub async fn acquire_jj_store_lock_with_timeout(
+        &self,
+        store_dir: &Path,
+        operation: impl Into<String>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<JjStoreGuard, ()> {
+        let operation = operation.into();
+        let store = store_dir.to_string_lossy().into_owned();
+        let wait_started = std::time::Instant::now();
+        let lock = self.jj_store_lock(store_dir);
+        let guard = match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, lock.lock_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let waited = wait_started.elapsed();
+                    log::warn!(
+                        "jj store lock wait timed out after {:.1}s: operation={operation}, store={store}",
+                        waited.as_secs_f64()
+                    );
+                    return Err(());
+                }
+            },
+            None => lock.lock_owned().await,
+        };
+        let waited = wait_started.elapsed();
+        if waited >= JJ_STORE_LOCK_WARN_AFTER {
+            log::warn!(
+                "jj store lock wait exceeded {:.1}s: operation={operation}, store={store}",
+                waited.as_secs_f64()
+            );
+        }
+        Ok(JjStoreGuard {
+            _guard: guard,
+            operation,
+            store,
+            acquired_at: std::time::Instant::now(),
+        })
     }
 
     /// Emit a typed attention event to any in-flight `watch` long-poll.
@@ -1803,6 +1886,40 @@ mod tests {
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         Arc::new(DbState::new(Arc::new(local), search))
+    }
+
+    #[tokio::test]
+    async fn store_lock_timeout_returns_without_acquiring_and_releases_waiter() {
+        let db = test_db().await;
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir.clone(),
+        )
+        .build();
+        let store = config_dir.join("jj-stores").join("timeout-test");
+        let held = orch
+            .acquire_jj_store_lock(&store, "timeout test holder")
+            .await;
+
+        let result = orch
+            .acquire_jj_store_lock_with_timeout(
+                &store,
+                "timeout test waiter",
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await;
+        assert!(result.is_err(), "a bounded waiter must time out");
+
+        drop(held);
+        orch.acquire_jj_store_lock_with_timeout(
+            &store,
+            "timeout test retry",
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("the lock remains usable after a timed-out waiter");
     }
 
     async fn insert_account_jwt(db: &DbState, jwt: &str) {

@@ -714,9 +714,12 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             .iter()
             .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)))
     {
-        let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
-        let _guard = match store_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
+        let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+        let _guard = match store.as_deref() {
+            Some(store) => Some(
+                orch.acquire_jj_store_lock(store, "write pre-flight reconcile")
+                    .await,
+            ),
             None => None,
         };
         let context = match crate::mcp::vcs::prepare_managed_workspace(orch, request).await {
@@ -1056,9 +1059,12 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         // happened earlier (pure FS writes, no shared-store mutation) and stays
         // outside the lock. `None` for a non-worktree cwd. The held guard crosses
         // `.await`s; tokio's MutexGuard is Send, so this is correct.
-        let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
-        let _store_guard = match store_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
+        let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+        let _store_guard = match store.as_deref() {
+            Some(store) => Some(
+                orch.acquire_jj_store_lock(store, "write commit barrier")
+                    .await,
+            ),
             None => None,
         };
         match finalize_file_commit(

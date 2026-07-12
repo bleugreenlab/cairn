@@ -1,5 +1,6 @@
 //! Project types.
 
+use cairn_common::executor_protocol::PlacementConstraints;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -162,6 +163,9 @@ pub struct CheckCommand {
     /// 60-minute hard ceiling. See docs/checks.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
+    /// Hard executor placement requirements for this check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<PlacementConstraints>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -34,7 +34,9 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
             .with_process(RealProcessSpawner)
             .build(),
     );
-    Orchestrator::builder(db_state, services, temp.path().join("config")).build()
+    let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    common::attach_test_executor(&orch);
+    orch
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> std::process::Output {

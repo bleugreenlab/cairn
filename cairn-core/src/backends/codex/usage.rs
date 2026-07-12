@@ -25,6 +25,8 @@ use crate::identity::CodexAuth;
 use crate::models::{ProviderUsageResetResult, ProviderUsageSnapshot};
 use crate::orchestrator::Orchestrator;
 
+type CodexUsageProbeEnv = (HashMap<String, String>, String, Option<PathBuf>, bool);
+
 pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapshot {
     let codex_path = match find_binary("codex") {
         Ok(path) => path,
@@ -132,9 +134,7 @@ pub fn consume_codex_usage_reset(orch: &Orchestrator) -> Result<ProviderUsageRes
     result
 }
 
-fn codex_usage_probe_env(
-    orch: &Orchestrator,
-) -> Result<(HashMap<String, String>, String, Option<PathBuf>, bool), String> {
+fn codex_usage_probe_env(orch: &Orchestrator) -> Result<CodexUsageProbeEnv, String> {
     let mut env = HashMap::new();
     let mut temp_home = None;
     let mut uses_codex_oauth = false;

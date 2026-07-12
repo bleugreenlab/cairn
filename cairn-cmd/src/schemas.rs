@@ -240,9 +240,8 @@ pub(crate) struct RunInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) commit_msg: Option<String>,
-    /// Branch/ref whose live checkout should be used as the batch cwd. Cannot be
-    /// combined with commit_msg; refuses dirty checkouts and warns if tracked
-    /// changes appear during the run.
+    /// Branch/ref resolved to its head commit for verdict-only build-slot execution.
+    /// Cannot be combined with commit_msg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
 }

@@ -164,9 +164,12 @@ pub(crate) async fn dispatch_resource_change(
             ));
         }
         if !dry_run {
-            let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
-            let _guard = match store_lock.as_ref() {
-                Some(lock) => Some(lock.lock().await),
+            let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+            let _guard = match store.as_deref() {
+                Some(store) => Some(
+                    orch.acquire_jj_store_lock(store, "resource mutation seal")
+                        .await,
+                ),
                 None => None,
             };
             crate::mcp::vcs::prepare_managed_workspace(orch, request)

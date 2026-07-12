@@ -25,6 +25,14 @@ fn row_to_check_result(
         job_id: row.opt_text(10)?,
         cached: row.opt_i64(11)?.map(|v| v != 0),
         failure_kind: row.opt_text(12)?,
+        executor_id: row.opt_text(13)?,
+        executor_device_id: row.opt_text(14)?,
+        executor_connection_generation: row.opt_i64(15)?,
+        executor_slot_id: row.opt_text(16)?,
+        executor_lease_epoch: row.opt_i64(17)?,
+        executor_started_at_unix_ms: row.opt_i64(18)?,
+        executor_finished_at_unix_ms: row.opt_i64(19)?,
+        toolchain_fingerprint: row.opt_text(20)?,
     })
 }
 
@@ -64,10 +72,13 @@ pub fn get_check_result(
                         "
                         SELECT project_id, tree_hash, input_hash, check_name, exit_code,
                                passed, output_tail, duration_ms, ran_at, target_results_json,
-                               job_id, cached, failure_kind
+                               job_id, cached, failure_kind, executor_id, executor_device_id,
+                               executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                               executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                               toolchain_fingerprint
                         FROM check_result_cache
                         WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                          AND failure_kind IS NULL
+                          AND passed = 1 AND failure_kind IS NULL
                         ",
                         params![
                             project_id.as_str(),
@@ -88,10 +99,12 @@ pub fn get_check_result(
     })
 }
 
-/// Store or replace a cached project-declared check result. Keyed by
-/// `(project_id, check_name, input_hash)`; a conflicting write re-stamps
-/// `tree_hash` (the whole-tree pointer the `/checks` listing reads) onto the
-/// current tree along with the refreshed verdict.
+/// Store a project-declared check result keyed by `(project_id, check_name,
+/// input_hash)`. The row retains the latest visible verdict until a pass exists;
+/// once a pass exists, later failed attempts cannot demote that reusable evidence.
+/// A pass may refresh another pass, including cache-hit tree/job re-stamping while
+/// preserving the original executor provenance. This is a latest-row store, not
+/// complete attempt history.
 pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Result<(), String> {
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
@@ -103,9 +116,13 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                     INSERT INTO check_result_cache (
                         project_id, tree_hash, input_hash, check_name, exit_code, passed,
                         output_tail, duration_ms, ran_at, target_results_json, job_id, cached,
-                        failure_kind
+                        failure_kind, executor_id, executor_device_id,
+                        executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                        executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                        toolchain_fingerprint
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                     ON CONFLICT(project_id, check_name, input_hash) DO UPDATE SET
                         tree_hash = excluded.tree_hash,
                         exit_code = excluded.exit_code,
@@ -116,7 +133,16 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         target_results_json = excluded.target_results_json,
                         job_id = excluded.job_id,
                         cached = excluded.cached,
-                        failure_kind = excluded.failure_kind
+                        failure_kind = excluded.failure_kind,
+                        executor_id = excluded.executor_id,
+                        executor_device_id = excluded.executor_device_id,
+                        executor_connection_generation = excluded.executor_connection_generation,
+                        executor_slot_id = excluded.executor_slot_id,
+                        executor_lease_epoch = excluded.executor_lease_epoch,
+                        executor_started_at_unix_ms = excluded.executor_started_at_unix_ms,
+                        executor_finished_at_unix_ms = excluded.executor_finished_at_unix_ms,
+                        toolchain_fingerprint = excluded.toolchain_fingerprint
+                    WHERE check_result_cache.passed = 0 OR excluded.passed = 1
                     ",
                     params![
                         result.project_id.as_str(),
@@ -134,6 +160,14 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                             .cached
                             .map(|cached| if cached { 1_i64 } else { 0_i64 }),
                         result.failure_kind.as_deref(),
+                        result.executor_id.as_deref(),
+                        result.executor_device_id.as_deref(),
+                        result.executor_connection_generation,
+                        result.executor_slot_id.as_deref(),
+                        result.executor_lease_epoch,
+                        result.executor_started_at_unix_ms,
+                        result.executor_finished_at_unix_ms,
+                        result.toolchain_fingerprint.as_deref(),
                     ],
                 )
                 .await?;
@@ -165,7 +199,10 @@ pub fn list_check_results(
                         "
                         SELECT project_id, tree_hash, input_hash, check_name, exit_code,
                                passed, output_tail, duration_ms, ran_at, target_results_json,
-                               job_id, cached, failure_kind
+                               job_id, cached, failure_kind, executor_id, executor_device_id,
+                               executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                               executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                               toolchain_fingerprint
                         FROM check_result_cache
                         WHERE project_id = ?1 AND tree_hash = ?2
                         ORDER BY check_name ASC
@@ -210,7 +247,11 @@ pub fn list_latest_check_results_for_project(
                         "
                         SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
                                c.passed, c.output_tail, c.duration_ms, c.ran_at,
-                               c.target_results_json, c.job_id, c.cached, c.failure_kind
+                               c.target_results_json, c.job_id, c.cached, c.failure_kind, c.executor_id,
+                               c.executor_device_id, c.executor_connection_generation,
+                               c.executor_slot_id, c.executor_lease_epoch,
+                               c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
+                               c.toolchain_fingerprint
                         FROM check_result_cache c
                         WHERE c.project_id = ?1
                           AND NOT EXISTS (
@@ -255,7 +296,11 @@ pub fn list_check_results_for_job(
                         "
                         SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
                                c.passed, c.output_tail, c.duration_ms, c.ran_at,
-                               c.target_results_json, c.job_id, c.cached, c.failure_kind
+                               c.target_results_json, c.job_id, c.cached, c.failure_kind, c.executor_id,
+                               c.executor_device_id, c.executor_connection_generation,
+                               c.executor_slot_id, c.executor_lease_epoch,
+                               c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
+                               c.toolchain_fingerprint
                         FROM check_result_cache c
                         WHERE c.job_id = ?1
                           AND NOT EXISTS (
@@ -286,6 +331,49 @@ pub fn list_check_results_for_job(
     })
 }
 
+/// Return rows attributable to one executor connection generation. This is the
+/// bulk invalidation and inspection seam; cache identity itself remains independent
+/// of executor provenance.
+pub fn list_check_results_for_executor_generation(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    executor_id: &str,
+    generation: i64,
+) -> Result<Vec<CheckResultCacheEntry>, String> {
+    let project_id = project_id.to_string();
+    let executor_id = executor_id.to_string();
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let project_id = project_id.clone();
+            let executor_id = executor_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT project_id, tree_hash, input_hash, check_name, exit_code,
+                                passed, output_tail, duration_ms, ran_at, target_results_json,
+                                job_id, cached, failure_kind, executor_id, executor_device_id,
+                                executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                                executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                                toolchain_fingerprint
+                         FROM check_result_cache
+                         WHERE project_id = ?1 AND executor_id = ?2
+                           AND executor_connection_generation = ?3
+                         ORDER BY check_name, input_hash",
+                        params![project_id.as_str(), executor_id.as_str(), generation],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row_to_check_result(&row)?);
+                }
+                Ok::<_, crate::storage::DbError>(out)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to list executor-attributed check results: {e}"))
+    })
+}
+
 /// Cached result for one project-declared check at one sealed tree identity.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -309,6 +397,14 @@ pub struct CheckResultCacheEntry {
     /// abnormal deaths render as themselves. `None` for a pass, an ordinary
     /// non-zero exit, and legacy rows. See [`crate::execution::checks::CheckFailureKind`].
     pub failure_kind: Option<String>,
+    pub executor_id: Option<String>,
+    pub executor_device_id: Option<String>,
+    pub executor_connection_generation: Option<i64>,
+    pub executor_slot_id: Option<String>,
+    pub executor_lease_epoch: Option<i64>,
+    pub executor_started_at_unix_ms: Option<i64>,
+    pub executor_finished_at_unix_ms: Option<i64>,
+    pub toolchain_fingerprint: Option<String>,
 }
 
 /// Write payload for a check-result cache row.
@@ -329,6 +425,14 @@ pub struct CheckResultCacheWrite {
     /// Terminal classification of a FAILING check — see
     /// [`CheckResultCacheEntry::failure_kind`].
     pub failure_kind: Option<String>,
+    pub executor_id: Option<String>,
+    pub executor_device_id: Option<String>,
+    pub executor_connection_generation: Option<i64>,
+    pub executor_slot_id: Option<String>,
+    pub executor_lease_epoch: Option<i64>,
+    pub executor_started_at_unix_ms: Option<i64>,
+    pub executor_finished_at_unix_ms: Option<i64>,
+    pub toolchain_fingerprint: Option<String>,
 }
 
 /// Normalize a shell command string for stable cache key comparison.
@@ -479,6 +583,14 @@ mod tests {
             job_id: None,
             cached: None,
             failure_kind: None,
+            executor_id: None,
+            executor_device_id: None,
+            executor_connection_generation: None,
+            executor_slot_id: None,
+            executor_lease_epoch: None,
+            executor_started_at_unix_ms: None,
+            executor_finished_at_unix_ms: None,
+            toolchain_fingerprint: None,
         }
     }
 
@@ -644,9 +756,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_check_result_replaces_same_key() {
+    async fn store_check_result_replaces_red_with_later_red() {
         let db = cache_db().await;
-        store_check_result(db.clone(), test_result("project-a", "input-a", "rust")).unwrap();
+        let mut initial = test_result("project-a", "input-a", "rust");
+        initial.exit_code = 2;
+        initial.passed = false;
+        initial.output_tail = "first failure".to_string();
+        store_check_result(db.clone(), initial).unwrap();
 
         let mut replacement = test_result("project-a", "input-a", "rust");
         replacement.exit_code = 1;
@@ -656,9 +772,14 @@ mod tests {
         replacement.target_results_json = Some("{\"targets\":[]}".to_string());
         store_check_result(db.clone(), replacement).unwrap();
 
-        let row = get_check_result(db, "project-a", "rust", "input-a")
+        assert!(get_check_result(db.clone(), "project-a", "rust", "input-a")
             .unwrap()
-            .expect("replacement should keep the cache row");
+            .is_none());
+        let row = list_check_results(db, "project-a", "input-a")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("replacement should remain visible");
         assert_eq!(row.exit_code, 1);
         assert!(!row.passed);
         assert_eq!(row.output_tail, "failed");
@@ -779,6 +900,69 @@ mod tests {
         assert!(get_check_result(db, "project-a", "rust", "input-abnormal")
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn ordinary_red_is_visible_but_not_reusable() {
+        let db = cache_db().await;
+        let mut red = test_result("project-a", "input-red", "rust");
+        red.tree_hash = "tree-red".to_string();
+        red.exit_code = 1;
+        red.passed = false;
+        red.output_tail = "assertion failed".to_string();
+        store_check_result(db.clone(), red).unwrap();
+
+        assert!(
+            get_check_result(db.clone(), "project-a", "rust", "input-red")
+                .unwrap()
+                .is_none()
+        );
+        let visible = list_check_results(db, "project-a", "tree-red").unwrap();
+        assert_eq!(visible.len(), 1);
+        assert!(!visible[0].passed);
+    }
+
+    #[tokio::test]
+    async fn pass_is_monotonic_and_preserves_provenance_against_late_red() {
+        let db = cache_db().await;
+        let mut pass = test_result("project-a", "input-monotonic", "rust");
+        pass.executor_id = Some("executor-a".to_string());
+        pass.executor_device_id = Some("device-a".to_string());
+        pass.executor_connection_generation = Some(7);
+        pass.executor_slot_id = Some("slot-a".to_string());
+        pass.executor_lease_epoch = Some(9);
+        pass.executor_started_at_unix_ms = Some(100);
+        pass.executor_finished_at_unix_ms = Some(200);
+        pass.toolchain_fingerprint = Some("rustc=test;bun=test".to_string());
+        store_check_result(db.clone(), pass).unwrap();
+
+        let mut red = test_result("project-a", "input-monotonic", "rust");
+        red.passed = false;
+        red.exit_code = 1;
+        red.output_tail = "late failure".to_string();
+        red.executor_id = Some("executor-b".to_string());
+        store_check_result(db.clone(), red).unwrap();
+
+        let row = get_check_result(db.clone(), "project-a", "rust", "input-monotonic")
+            .unwrap()
+            .expect("pass remains reusable");
+        assert!(row.passed);
+        assert_eq!(row.executor_id.as_deref(), Some("executor-a"));
+        assert_eq!(row.executor_device_id.as_deref(), Some("device-a"));
+        assert_eq!(row.executor_connection_generation, Some(7));
+        assert_eq!(row.executor_slot_id.as_deref(), Some("slot-a"));
+        assert_eq!(row.executor_lease_epoch, Some(9));
+        assert_eq!(row.executor_started_at_unix_ms, Some(100));
+        assert_eq!(row.executor_finished_at_unix_ms, Some(200));
+        assert_eq!(
+            row.toolchain_fingerprint.as_deref(),
+            Some("rustc=test;bun=test")
+        );
+
+        let attributed =
+            list_check_results_for_executor_generation(db, "project-a", "executor-a", 7).unwrap();
+        assert_eq!(attributed.len(), 1);
+        assert_eq!(attributed[0].input_hash, "input-monotonic");
     }
 
     #[tokio::test]

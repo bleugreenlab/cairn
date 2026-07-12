@@ -3,6 +3,7 @@
 use super::process::execute_process;
 use crate::mcp::handlers::RunContext;
 use crate::orchestrator::Orchestrator;
+use cairn_common::executor_protocol::BuildSlotExecutionMeta;
 
 pub(crate) fn run_item_stream_id(tool_use_id: &str, index: usize) -> String {
     format!("{tool_use_id}:{index}")
@@ -12,10 +13,12 @@ pub(crate) fn run_item_stream_id(tool_use_id: &str, index: usize) -> String {
 /// when the process produced no code (a signal kill OR a timeout); `timed_out`
 /// disambiguates the two so the runner can record a budget kill AS a timeout
 /// rather than an opaque crash. Combined stdout+stderr rides in `output`.
+#[derive(Debug)]
 pub(crate) struct CheckExecResult {
     pub exit_code: Option<i32>,
     pub output: String,
     pub timed_out: bool,
+    pub provenance: Option<BuildSlotExecutionMeta>,
 }
 
 /// Stream id for a synchronous when:write check's live output. Namespaced with
@@ -70,7 +73,6 @@ pub(crate) async fn run_check_command(
         Some(command),
         None, // no stdin payload — check commands run through `bash -c`
         sandbox_enabled,
-        false, // branch_scoped_run
         false, // promote_on_timeout: a timed-out check is KILLED, never detached
     )
     .await?;
@@ -84,5 +86,6 @@ pub(crate) async fn run_check_command(
         exit_code: out.exit_code,
         output: combined,
         timed_out: out.timed_out,
+        provenance: None,
     })
 }

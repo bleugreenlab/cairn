@@ -1661,7 +1661,6 @@ async fn spawn_terminal_session(
         target.run_id.as_deref(),
         Some(target.project_id.as_str()),
         Some(&command),
-        false,
     )
     .await;
     let fence_mode = sandbox.as_ref().map(|(_, fence)| *fence);

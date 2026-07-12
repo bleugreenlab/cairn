@@ -111,7 +111,6 @@ pub(crate) async fn build_run_sandbox_policy(
     run_id: Option<&str>,
     project_id: Option<&str>,
     command_for_grant: Option<&str>,
-    branch_scoped_run: bool,
 ) -> Option<(sandbox::SandboxPolicy, Fence)> {
     use crate::mcp::handlers::permission::resolve_fence_policy;
 
@@ -121,7 +120,7 @@ pub(crate) async fn build_run_sandbox_policy(
     // snapshot would otherwise be fully unconfined. A real worktree
     // keeps the fence gate (ask/deny confine; allow runs free).
     let non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
-    let readonly_non_worktree = non_worktree && !branch_scoped_run;
+    let readonly_non_worktree = non_worktree;
     let fence = if readonly_non_worktree {
         // Read-only and non-grantable: `Deny` makes run_one never route a denial
         // through the fence (no prompt, no session grant). Detection of the block
@@ -291,15 +290,6 @@ pub(crate) async fn build_run_sandbox_policy(
 mod tests {
     use super::*;
 
-    #[test]
-    fn branch_scoped_checkout_policy_is_writable_while_plain_live_checkout_is_readonly() {
-        let checkout = std::path::Path::new("/project/live");
-        let readonly = sandbox::SandboxPolicy::for_readonly_checkout(checkout, &[], vec![]);
-        let branch_scoped = sandbox::SandboxPolicy::for_run(checkout, &[], vec![]);
-
-        assert!(!readonly.worktree_writable);
-        assert!(branch_scoped.worktree_writable);
-    }
     #[test]
     fn glob_covers_checkout_drops_checkout_scopes_keeps_external() {
         // A non-worktree run must drop any carveout scope that could write the

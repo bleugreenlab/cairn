@@ -57,12 +57,12 @@ use std::path::{Path, PathBuf};
 
 use cairn_common::uri::build_node_checks_uri;
 
-use crate::build_slots::{BuildSlotOutcome, BuildSlotPriority, BuildSlotRequest, MutationPolicy};
+use crate::build_slots::{BuildSlotPriority, BuildSlotRequest, MutationPolicy};
 use crate::execution::cache::{get_check_result, store_check_result, CheckResultCacheWrite};
 use crate::execution::checks::{
     applicable_turn_end_checks, check_platform_identity, check_result_key,
     check_toolchain_identity, load_live_project_checks, resolve_check_timeout_ms,
-    run_planned_checks, CheckExecMode, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
+    run_planned_checks, submit_review_check, CheckExecMode, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::selection::CheckPlan;
 use crate::jj::{node_changed_files, sealed_tree_entries, sealed_tree_hash, JjEnv};
@@ -328,12 +328,13 @@ async fn run_turn_end_checks_inner(
         };
         let mut to_run: Vec<(CheckPlan, String)> = Vec::new();
         for plan in plans {
-            let check = cache_checks.get(&plan.name);
+            let check = cache_checks
+                .get(&plan.name)
+                .expect("planned check must retain its configured definition");
             let input_hash = check_result_key(
-                check.and_then(|check| check.impact.as_ref()),
+                check,
                 entries.as_deref(),
                 &cache_tree_hash,
-                check.map_or(plan.command.as_str(), |check| check.command.as_str()),
                 &check_platform_identity(),
                 check_toolchain_identity(),
             );
@@ -357,6 +358,14 @@ async fn run_turn_end_checks_inner(
                             job_id: Some(cache_job_id.clone()),
                             cached: Some(true),
                             failure_kind: entry.failure_kind,
+                            executor_id: entry.executor_id,
+                            executor_device_id: entry.executor_device_id,
+                            executor_connection_generation: entry.executor_connection_generation,
+                            executor_slot_id: entry.executor_slot_id,
+                            executor_lease_epoch: entry.executor_lease_epoch,
+                            executor_started_at_unix_ms: entry.executor_started_at_unix_ms,
+                            executor_finished_at_unix_ms: entry.executor_finished_at_unix_ms,
+                            toolchain_fingerprint: entry.toolchain_fingerprint,
                         },
                     );
                 }
@@ -441,7 +450,6 @@ async fn run_turn_end_checks_inner(
     let acquisition_deadline_ms = slot_config
         .acquisition_deadline_seconds
         .saturating_mul(1_000);
-    let slot_pool = orch.build_slots.clone();
     let slot_project_id = coords.project_id.clone();
     let slot_repository = canonical_repo;
     let slot_commit = sealed_commit;
@@ -484,13 +492,13 @@ async fn run_turn_end_checks_inner(
         &orch.check_admission,
         Some(orch),
         move |index, command, _stream_id| {
-            let slot_pool = slot_pool.clone();
             let slot_project_id = slot_project_id.clone();
             let slot_repository = slot_repository.clone();
             let slot_commit = slot_commit.clone();
             let slot_job_id = slot_job_id.clone();
             let slot_cancel = slot_cancel.clone();
             let name = to_run_ref[index].0.name.clone();
+            let constraints = checks.get(&name).and_then(|check| check.constraints.clone());
             let log_path = turn_end_log_path(orch, job_id, &name);
             async move {
                 let _ = std::fs::write(&log_path, b"");
@@ -502,7 +510,11 @@ async fn run_turn_end_checks_inner(
                     request_id: uuid::Uuid::new_v4().to_string(),
                     attempt_id: uuid::Uuid::new_v4().to_string(),
                     project_id: slot_project_id.clone(),
-                    repository: slot_repository.clone(),
+                    repository: cairn_common::executor_protocol::RepositoryLocator::ColocatedPath {
+                        project_id: slot_project_id.clone(),
+                        repository_id: slot_project_id.clone(),
+                        absolute_path: slot_repository,
+                    },
                     base_commit: slot_commit.clone(),
                     command,
                     cwd: String::new(),
@@ -513,26 +525,20 @@ async fn run_turn_end_checks_inner(
                     mutation_policy: MutationPolicy::PureVerdict,
                     requesting_job_id: Some(slot_job_id.clone()),
                     affinity_key: None,
+                    constraints,
                 };
-                match slot_pool.submit(orch, request).await {
-                    BuildSlotOutcome::Completed { exit_code, output, timed_out, mutation_delta: None, .. } => {
-                        let _ = std::fs::write(&log_path, &output);
-                        Ok(crate::mcp::handlers::run::CheckExecResult { exit_code, output, timed_out })
+                match submit_review_check(orch, request).await {
+                    Ok(result) => {
+                        let _ = std::fs::write(&log_path, &result.output);
+                        Ok(result)
                     }
-                    BuildSlotOutcome::Completed { mutation_delta: Some(delta), .. } => Err(format!(
-                        "Cairn check infrastructure failure: build slot produced mutation delta {} based on {}",
-                        delta.delta_commit, delta.base_commit
-                    )),
-                    BuildSlotOutcome::FailedAfterExecution { diagnostic, .. } => Err(format!(
-                        "Cairn check infrastructure failure: slot result publication failed: {diagnostic}"
-                    )),
-                    BuildSlotOutcome::Cancelled { .. } => {
+                    Err(crate::execution::checks::CheckExecutionFailure::Substrate(error))
+                        if error.contains("build slot request was cancelled") =>
+                    {
                         slot_cancel.cancel();
                         std::future::pending().await
                     }
-                    BuildSlotOutcome::Unavailable { reason, diagnostic } => Err(format!(
-                        "Cairn check infrastructure failure: {reason:?}: {diagnostic}"
-                    )),
+                    Err(error) => Err(error),
                 }
             }
         },

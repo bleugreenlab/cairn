@@ -94,8 +94,6 @@ pub(crate) async fn run_one(
     cwd: &str,
     tool_use_id: &str,
     run_context: Option<&RunContext>,
-    _commit_present: bool,
-    branch_scoped_run: bool,
     promote_on_timeout: bool,
     header: String,
     spec: Result<RunSpec, String>,
@@ -180,7 +178,6 @@ pub(crate) async fn run_one(
         shell_command.as_deref(),
         stdin.as_deref(),
         true,
-        branch_scoped_run,
         promote_on_timeout,
     )
     .await
@@ -199,7 +196,7 @@ pub(crate) async fn run_one(
         // no run context to adjudicate and nothing the user can grant — changes
         // can only be made in a worktree. This replaces the raw EPERM project
         // chat would otherwise surface.
-        if !branch_scoped_run && !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
+        if !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
             let _ = denial;
             return ItemOutcome::failed(
                 header,
@@ -229,7 +226,6 @@ pub(crate) async fn run_one(
                         shell_command.as_deref(),
                         stdin.as_deref(),
                         false,
-                        branch_scoped_run,
                         promote_on_timeout,
                     )
                     .await
@@ -777,7 +773,6 @@ pub(super) async fn execute_process(
     shell_command: Option<&str>,
     stdin: Option<&str>,
     sandbox_enabled: bool,
-    branch_scoped_run: bool,
     // When true (agent `run` items), a timed-out process with a run context is
     // DETACHED to a durable terminal instead of killed, so its work continues.
     // Project checks pass false: a check that blows its budget must be KILLED at
@@ -803,7 +798,6 @@ pub(super) async fn execute_process(
             run_context.map(|c| c.run_id.as_str()),
             run_context.map(|c| c.project_id.as_str()),
             shell_command.or(Some(program)),
-            branch_scoped_run,
         )
         .await
     } else {
@@ -817,8 +811,7 @@ pub(super) async fn execute_process(
     // routes such a denial to the hard read-only-checkout message, never a fence
     // prompt — non-worktree is non-grantable, so enabling detection cannot
     // synthesize a grant.
-    let readonly_non_worktree =
-        !branch_scoped_run && !crate::jj::is_jj_dir(std::path::Path::new(cwd));
+    let readonly_non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
     let command_scoped_fallback = readonly_non_worktree
         || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
     let sandbox_policy = sandbox.map(|(policy, _)| policy);
@@ -827,10 +820,8 @@ pub(super) async fn execute_process(
 
     let mut spawn_config =
         build_agent_spawn_config(orch, cwd, run_context, program, args, sandbox_policy).await;
-    if !branch_scoped_run {
-        if let (Some(ctx), Some(command)) = (run_context, shell_command) {
-            spawn_config = apply_warm_search_shim(orch, spawn_config, ctx, command);
-        }
+    if let (Some(ctx), Some(command)) = (run_context, shell_command) {
+        spawn_config = apply_warm_search_shim(orch, spawn_config, ctx, command);
     }
 
     // Capture stdin only when the spec carries a payload to feed (today only
@@ -1242,6 +1233,16 @@ async fn reap_readers_bounded(
 /// Cache a checkpoint command result if the executed command matches the job's checkpoint command.
 /// This enables the checkpoint lookback optimization: when the programmatic checkpoint runs,
 /// it can use this cached result instead of re-running the command.
+pub(crate) async fn cache_checkpoint_callback(
+    orch: &Orchestrator,
+    job_id: &str,
+    command: &str,
+    cwd: &str,
+    exit_code: Option<i32>,
+) {
+    cache_checkpoint_result(orch, job_id, command, cwd, exit_code).await;
+}
+
 async fn cache_checkpoint_result(
     orch: &Orchestrator,
     job_id: &str,

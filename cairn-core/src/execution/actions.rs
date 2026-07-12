@@ -740,8 +740,9 @@ async fn commit_triage_ledger_if_needed(
     }
 
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    let store_lock = orch.jj_store_lock(&store);
-    let _store_guard = store_lock.lock().await;
+    let _store_guard = orch
+        .acquire_jj_store_lock(&store, "memory triage ledger seal")
+        .await;
     if !crate::jj::scoped_dirty(&jj, worktree, &[relative_path.as_str()])? {
         return Ok(());
     }

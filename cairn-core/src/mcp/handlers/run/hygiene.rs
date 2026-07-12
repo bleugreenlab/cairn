@@ -128,22 +128,6 @@ pub(super) fn checkout_has_tracked_changes(
     Ok(!checkout_tracked_status(orch, checkout)?.is_empty())
 }
 
-pub(super) fn verify_branch_checkout_clean_after_run(
-    orch: &Orchestrator,
-    checkout: &std::path::Path,
-) -> Result<bool, String> {
-    let status = checkout_tracked_status(orch, checkout)?;
-    if status.is_empty() {
-        return Ok(false);
-    }
-
-    Err(format!(
-        "branch-scoped run left tracked changes in {} and Cairn did not restore them automatically, because another editor or process may have modified the same checkout while the command was running. Review or discard these tracked changes manually before another branch-scoped run:\n{}",
-        checkout.display(),
-        status
-    ))
-}
-
 pub(super) fn check_cd_commands<'a, I>(headers: I, cwd: &str, repo_root: Option<&str>) -> String
 where
     I: IntoIterator<Item = &'a str>,
@@ -183,81 +167,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::DbState;
-    use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
-    use std::sync::Arc;
-
-    fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(fut)
-    }
-
-    fn test_orchestrator() -> Orchestrator {
-        let root = tempfile::tempdir().unwrap().keep();
-        let db_path = root.join("test.db");
-        let local = block_on(async {
-            let local = LocalDb::open(db_path).await.unwrap();
-            MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-                .run(&local)
-                .await
-                .unwrap();
-            local
-        });
-        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
-        let db = Arc::new(DbState::new(Arc::new(local), search));
-        Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build()
-    }
-
-    fn git(repo: &std::path::Path, args: &[&str]) {
-        let output = crate::env::git()
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    #[test]
-    fn branch_checkout_cleanup_refuses_to_discard_tracked_changes_and_leaves_untracked_cache() {
-        let orch = test_orchestrator();
-        let repo = tempfile::tempdir().unwrap();
-        git(repo.path(), &["init", "-q"]);
-        git(repo.path(), &["config", "user.name", "Test"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        std::fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
-        git(repo.path(), &["add", "tracked.txt"]);
-        git(repo.path(), &["commit", "-q", "-m", "base"]);
-
-        std::fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
-        std::fs::create_dir_all(repo.path().join("target")).unwrap();
-        std::fs::write(repo.path().join("target/cache.txt"), "warm\n").unwrap();
-
-        assert!(checkout_has_tracked_changes(&orch, repo.path()).unwrap());
-        let error = verify_branch_checkout_clean_after_run(&orch, repo.path()).unwrap_err();
-        assert!(
-            error.contains("did not restore them automatically"),
-            "unexpected error: {error}"
-        );
-
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
-            "changed\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("target/cache.txt")).unwrap(),
-            "warm\n"
-        );
-        assert!(checkout_has_tracked_changes(&orch, repo.path()).unwrap());
-    }
     #[test]
     fn extract_cd_target_simple_path() {
         assert_eq!(

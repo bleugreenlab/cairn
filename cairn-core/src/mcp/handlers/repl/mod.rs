@@ -271,7 +271,6 @@ pub async fn spawn_session(
         Some(run_context.run_id.as_str()),
         Some(run_context.project_id.as_str()),
         None,
-        false,
     )
     .await
     .map(|(policy, _fence)| policy);

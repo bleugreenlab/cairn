@@ -65,6 +65,9 @@ pub trait GitClient: Send + Sync {
     /// Get the remote URL for origin.
     fn remote_get_url(&self, repo: &Path) -> Result<String, String>;
 
+    /// Fetch origin into the ordinary Git repository.
+    fn fetch_origin(&self, repo: &Path) -> Result<(), String>;
+
     /// Clone a remote repository into the target directory.
     fn clone(&self, remote_url: &str, target_dir: &Path) -> Result<(), String>;
 
@@ -414,6 +417,24 @@ impl GitClient for RealGitClient {
             Ok(output.stdout)
         } else {
             Err(format!("git remote get-url failed: {}", output.stderr))
+        }
+    }
+
+    fn fetch_origin(&self, repo: &Path) -> Result<(), String> {
+        let output = crate::jj::bounded_command_output(
+            self.git_command()
+                .args(["fetch", "origin"])
+                .current_dir(repo),
+            crate::jj::JJ_NETWORK_TIMEOUT,
+            "git fetch origin",
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git fetch origin failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
         }
     }
 

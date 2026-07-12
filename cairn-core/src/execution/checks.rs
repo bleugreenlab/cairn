@@ -67,6 +67,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+// Isolated checks carry their configured fleet constraints into the immutable request.
+use crate::build_slots::{BuildSlotOutcome, BuildSlotPriority, BuildSlotRequest, MutationPolicy};
 use crate::config::project_settings::{load_checks, CheckCommand, CheckWhen};
 use crate::execution::cache::{
     get_check_result, list_latest_check_results_for_project, store_check_result,
@@ -78,6 +80,18 @@ use crate::execution::check_admission::CheckAdmissionController;
 pub(crate) enum CheckExecMode {
     Isolated,
     Shared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckExecutionFailure {
+    Process(String),
+    Substrate(String),
+}
+
+impl From<String> for CheckExecutionFailure {
+    fn from(error: String) -> Self {
+        Self::Process(error)
+    }
 }
 use crate::execution::check_parsers::{
     extract_running_tests, format_failure_excerpt, format_failure_names, parse_check_output,
@@ -207,18 +221,9 @@ fn classify_check_failure(
         return None;
     }
     if spawn_error {
-        let infrastructure = output.starts_with("Cairn check infrastructure failure:");
         return Some(FailureClassification {
-            kind: if infrastructure {
-                CheckFailureKind::Infrastructure
-            } else {
-                CheckFailureKind::SpawnError
-            },
-            reason: if infrastructure {
-                "Cairn: check execution substrate failed before producing a verdict".to_string()
-            } else {
-                "Cairn: check process failed to spawn".to_string()
-            },
+            kind: CheckFailureKind::SpawnError,
+            reason: "Cairn: check process failed to spawn".to_string(),
             evidence_line: None,
         });
     }
@@ -423,14 +428,13 @@ pub async fn run_write_checks_after_seal(
         let keyed: Vec<(CheckPlan, String)> = plans
             .into_iter()
             .map(|plan| {
-                let check = planning_checks.get(&plan.name);
-                let impact = check.and_then(|check| check.impact.as_ref());
-                let command = check.map_or(plan.command.as_str(), |check| check.command.as_str());
+                let check = planning_checks
+                    .get(&plan.name)
+                    .expect("planned check must retain its configured definition");
                 let input_hash = check_result_key(
-                    impact,
+                    check,
                     entries.as_deref(),
                     &tree_hash,
-                    command,
                     &check_platform_identity(),
                     check_toolchain_identity(),
                 );
@@ -444,21 +448,16 @@ pub async fn run_write_checks_after_seal(
                 .flatten()
                 .is_none();
                 let selected_plan = if should_reselect {
-                    match check {
-                        Some(check) => {
-                            let selected_changed = selected_changed_files_for_miss(
-                                latest_by_check.get(&plan.name),
-                                entries.as_deref(),
-                                impact,
-                                &changed,
-                                &planning_jj,
-                                &planning_repo,
-                            );
-                            replan_one_check(&plan.name, check, &selected_changed, &planning_repo)
-                                .unwrap_or(plan)
-                        }
-                        None => plan,
-                    }
+                    let selected_changed = selected_changed_files_for_miss(
+                        latest_by_check.get(&plan.name),
+                        entries.as_deref(),
+                        check.impact.as_ref(),
+                        &changed,
+                        &planning_jj,
+                        &planning_repo,
+                    );
+                    replan_one_check(&plan.name, check, &selected_changed, &planning_repo)
+                        .unwrap_or(plan)
                 } else {
                     plan
                 };
@@ -521,6 +520,7 @@ pub async fn run_write_checks_after_seal(
                 true,
             )
             .await
+            .map_err(CheckExecutionFailure::Process)
         },
         move |checks| {
             let _ = emitter.emit(
@@ -601,17 +601,21 @@ async fn fold_worktree_after_checks(
         return None;
     }
     let store_lock = store_lock_for_checks(orch, run_context, repo_root).await;
-    let guard = match store_lock {
-        Some(lock) => {
-            match tokio::time::timeout(std::time::Duration::from_secs(600), lock.lock_owned()).await
-            {
-                Ok(guard) => Some(guard),
-                Err(_) => {
-                    log::warn!("when:write checks: skipped folding check changes because the version-control store stayed busy for 600s");
-                    return None;
-                }
+    let guard = match store_lock.as_deref() {
+        Some(store) => match orch
+            .acquire_jj_store_lock_with_timeout(
+                store,
+                "when:write check fold",
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(()) => {
+                log::warn!("when:write checks: skipped folding check changes because the version-control store stayed busy for 600s");
+                return None;
             }
-        }
+        },
         None => None,
     };
     let fold_jj = jj.clone();
@@ -661,7 +665,7 @@ async fn store_lock_for_checks(
     orch: &Orchestrator,
     run_context: &RunContext,
     repo_root: &Path,
-) -> Option<Arc<tokio::sync::Mutex<()>>> {
+) -> Option<std::path::PathBuf> {
     if !crate::jj::is_jj_dir(repo_root) {
         return None;
     }
@@ -669,8 +673,10 @@ async fn store_lock_for_checks(
         crate::mcp::handlers::run_context::project_path(&orch.db.local, &run_context.project_id)
             .await
             .ok()??;
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-    Some(orch.jj_store_lock(&store))
+    Some(crate::jj::project_store_dir(
+        &orch.config_dir,
+        Path::new(&repo_path),
+    ))
 }
 
 /// Resolve the project's LIVE `checks` contract for the runner.
@@ -920,7 +926,7 @@ pub struct CheckOutcome {
 /// Versioned identity of the host tools that can affect project-check outcomes.
 /// Probes run at most once per runner process; cache lookups never shell out.
 static CHECK_TOOLCHAIN_IDENTITY: OnceLock<String> = OnceLock::new();
-const CHECK_RESULT_KEY_VERSION: &str = "check-result-v2";
+const CHECK_RESULT_KEY_VERSION: &str = "check-result-v3";
 
 pub(crate) fn check_platform_identity() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -959,16 +965,37 @@ pub(crate) fn check_toolchain_identity() -> &'static str {
 /// Length-prefixing every component makes the tuple encoding unambiguous, and the
 /// version prefix guarantees existing input-only rows invalidate by miss.
 pub(crate) fn check_result_key(
-    impact: Option<&Vec<String>>,
+    check: &CheckCommand,
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
-    command: &str,
     platform: &str,
     toolchain: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
 
-    let filtered_tree = match impact {
+    fn field(hasher: &mut Sha256, value: &str) {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    fn option(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                field(hasher, "some");
+                field(hasher, value);
+            }
+            None => field(hasher, "none"),
+        }
+    }
+    fn strings(hasher: &mut Sha256, values: Option<&[String]>) {
+        let mut values = values.unwrap_or_default().to_vec();
+        values.sort();
+        field(hasher, &values.len().to_string());
+        for value in values {
+            field(hasher, &value);
+        }
+    }
+
+    let filtered_tree = match check.impact.as_ref() {
         None => tree_hash.to_string(),
         Some(globs) => match entries {
             Some(entries) => crate::execution::selection::check_input_hash(entries, globs),
@@ -976,16 +1003,31 @@ pub(crate) fn check_result_key(
         },
     };
     let mut hasher = Sha256::new();
-    for component in [
-        CHECK_RESULT_KEY_VERSION,
-        filtered_tree.as_str(),
-        command,
-        platform,
-        toolchain,
-    ] {
-        hasher.update(component.len().to_be_bytes());
-        hasher.update(component.as_bytes());
+    field(&mut hasher, CHECK_RESULT_KEY_VERSION);
+    field(&mut hasher, &filtered_tree);
+    field(&mut hasher, &check.command);
+    strings(&mut hasher, check.impact.as_deref());
+    field(&mut hasher, check.policy.as_str());
+    field(&mut hasher, check.when.as_str());
+    field(&mut hasher, check.resource_class.as_str());
+    option(
+        &mut hasher,
+        check.timeout.map(|value| value.to_string()).as_deref(),
+    );
+    if let Some(constraints) = check.constraints.as_ref() {
+        field(&mut hasher, "constraints");
+        option(&mut hasher, constraints.executor_id.as_deref());
+        option(&mut hasher, constraints.device_id.as_deref());
+        option(&mut hasher, constraints.os.as_deref());
+        option(&mut hasher, constraints.arch.as_deref());
+        strings(&mut hasher, Some(&constraints.required_toolchains));
+    } else {
+        field(&mut hasher, "no-constraints");
     }
+    field(&mut hasher, platform);
+    // This fingerprint is runner-local and is sound while executors are colocated.
+    // Executor-resolved keying for heterogeneous fleets remains deliberately deferred.
+    field(&mut hasher, toolchain);
     format!("{:x}", hasher.finalize())
 }
 
@@ -1040,7 +1082,7 @@ pub(crate) fn check_result_key(
 // identity, plan set, spawn closure, live-status notifier); grouping them into a
 // struct would only add indirection here.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_planned_checks<F, Fut, N>(
+pub(crate) async fn run_planned_checks<F, Fut, N, E>(
     db: Arc<LocalDb>,
     project_id: &str,
     tree_hash: &str,
@@ -1055,7 +1097,8 @@ pub(crate) async fn run_planned_checks<F, Fut, N>(
 ) -> Vec<CheckOutcome>
 where
     F: Fn(usize, String, String) -> Fut,
-    Fut: std::future::Future<Output = Result<CheckExecResult, String>>,
+    Fut: std::future::Future<Output = Result<CheckExecResult, E>>,
+    E: Into<CheckExecutionFailure>,
     N: Fn(Vec<CheckStatusEntry>),
 {
     // Checklist snapshot, seeded all-`pending` from the plan list. Each check
@@ -1126,6 +1169,14 @@ where
                 job_id: Some(job_id.to_string()),
                 cached: Some(true),
                 failure_kind: entry.failure_kind.clone(),
+                executor_id: entry.executor_id.clone(),
+                executor_device_id: entry.executor_device_id.clone(),
+                executor_connection_generation: entry.executor_connection_generation,
+                executor_slot_id: entry.executor_slot_id.clone(),
+                executor_lease_epoch: entry.executor_lease_epoch,
+                executor_started_at_unix_ms: entry.executor_started_at_unix_ms,
+                executor_finished_at_unix_ms: entry.executor_finished_at_unix_ms,
+                toolchain_fingerprint: entry.toolchain_fingerprint.clone(),
             },
         );
         // Rehydrate the structured per-test detail persisted at run time.
@@ -1183,16 +1234,22 @@ where
             transition(index, "running", None);
             let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
             let started = Instant::now();
-            let (exit_code, output, timed_out, spawn_error) =
+            let (exit_code, output, timed_out, spawn_error, substrate_failure, provenance) =
                 match execute(index, plan.command.clone(), stream_id).await {
                     Ok(CheckExecResult {
                         exit_code,
                         output,
                         timed_out,
-                    }) => (exit_code, output, timed_out, false),
-                    // A spawn error / sandbox denial is a clear failure, never a
-                    // silent pass — and a legible one: the process never ran.
-                    Err(err) => (None, err, false, true),
+                        provenance,
+                    }) => (exit_code, output, timed_out, false, false, provenance),
+                    Err(error) => match error.into() {
+                        CheckExecutionFailure::Process(err) => {
+                            (None, err, false, true, false, None)
+                        }
+                        CheckExecutionFailure::Substrate(err) => {
+                            (None, err, false, false, true, None)
+                        }
+                    },
                 };
             let duration_ms = started.elapsed().as_millis() as i64;
             let passed = exit_code == Some(0);
@@ -1200,8 +1257,16 @@ where
             // Parse before classifying: positive assertion failures outrank any
             // incidental infrastructure warning in the combined output.
             let parsed = parse_check_output(&plan.command, &output);
-            let classification =
-                classify_check_failure(exit_code, timed_out, spawn_error, parsed.as_ref(), &output);
+            let classification = if substrate_failure {
+                Some(FailureClassification {
+                    kind: CheckFailureKind::Infrastructure,
+                    reason: "Cairn: check execution substrate failed before producing a verdict"
+                        .to_string(),
+                    evidence_line: None,
+                })
+            } else {
+                classify_check_failure(exit_code, timed_out, spawn_error, parsed.as_ref(), &output)
+            };
             let failure_kind = classification.as_ref().map(|c| c.kind);
             let target_results_json = parsed.as_ref().and_then(|p| serde_json::to_string(p).ok());
             let mut output_tail = classified_output_excerpt(&output, classification.as_ref());
@@ -1279,6 +1344,22 @@ where
                     job_id: Some(job_id.to_string()),
                     cached: Some(false),
                     failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
+                    executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
+                    executor_device_id: provenance
+                        .as_ref()
+                        .map(|meta| meta.executor_device_id.clone()),
+                    executor_connection_generation: provenance
+                        .as_ref()
+                        .map(|meta| meta.executor_connection_generation as i64),
+                    executor_slot_id: provenance.as_ref().map(|meta| meta.slot_id.clone()),
+                    executor_lease_epoch: provenance.as_ref().map(|meta| meta.lease_epoch as i64),
+                    executor_started_at_unix_ms: provenance
+                        .as_ref()
+                        .map(|meta| meta.started_at_unix_ms as i64),
+                    executor_finished_at_unix_ms: provenance
+                        .as_ref()
+                        .map(|meta| meta.finished_at_unix_ms as i64),
+                    toolchain_fingerprint: Some(check_toolchain_identity().to_string()),
                 },
             );
 
@@ -1528,6 +1609,220 @@ pub(crate) async fn load_node_vcs_anchors(
     }
 }
 
+pub(crate) async fn submit_review_check(
+    orch: &Orchestrator,
+    request: BuildSlotRequest,
+) -> Result<CheckExecResult, CheckExecutionFailure> {
+    check_result_from_build_slot_outcome(orch.build_slots.submit(orch, request).await)
+}
+
+fn check_result_from_build_slot_outcome(
+    outcome: BuildSlotOutcome,
+) -> Result<CheckExecResult, CheckExecutionFailure> {
+    match outcome {
+        BuildSlotOutcome::Completed {
+            exit_code,
+            output,
+            timed_out,
+            metadata,
+            mutation_delta: None,
+            ..
+        } => Ok(CheckExecResult {
+            exit_code,
+            output,
+            timed_out,
+            provenance: Some(metadata),
+        }),
+        BuildSlotOutcome::Completed {
+            mutation_delta: Some(delta),
+            ..
+        } => Err(CheckExecutionFailure::Substrate(format!(
+            "Cairn check infrastructure failure: build slot produced mutation delta {} based on {}",
+            delta.delta_commit, delta.base_commit
+        ))),
+        BuildSlotOutcome::FailedAfterExecution { diagnostic, .. } => {
+            Err(CheckExecutionFailure::Substrate(format!(
+                "Cairn check infrastructure failure: slot result publication failed: {diagnostic}"
+            )))
+        }
+        BuildSlotOutcome::Unavailable { reason, diagnostic } => {
+            Err(CheckExecutionFailure::Substrate(format!(
+                "Cairn check infrastructure failure: {reason:?}: {diagnostic}"
+            )))
+        }
+        BuildSlotOutcome::Cancelled { .. } => Err(CheckExecutionFailure::Substrate(
+            "Cairn check infrastructure failure: build slot request was cancelled".to_string(),
+        )),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ReviewTreeGateResult {
+    Green,
+    CheckFailed { name: String, detail: String },
+    InfrastructureFailure(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn verify_review_tree(
+    orch: &Orchestrator,
+    project_id: &str,
+    repository: &str,
+    planning_root: &Path,
+    commit_id: &str,
+    tree_hash: &str,
+    tree_entries: &[(String, String)],
+    changed: &[GraphFileChange],
+    requesting_job_id: &str,
+    priority: BuildSlotPriority,
+) -> ReviewTreeGateResult {
+    if changed.is_empty() {
+        return ReviewTreeGateResult::Green;
+    }
+    let Some(checks) = load_live_project_checks(orch, project_id, planning_root).await else {
+        return ReviewTreeGateResult::Green;
+    };
+    let mut plans = applicable_turn_end_checks(&checks, changed, planning_root);
+    if plans.is_empty() {
+        return ReviewTreeGateResult::Green;
+    }
+
+    let platform = check_platform_identity();
+    let toolchain = check_toolchain_identity();
+    let mut keyed = Vec::with_capacity(plans.len());
+    for mut plan in plans.drain(..) {
+        plan.externally_admitted = true;
+        let configured = checks
+            .get(&plan.name)
+            .expect("planned check must retain its configured definition");
+        let key = check_result_key(
+            configured,
+            Some(tree_entries),
+            tree_hash,
+            &platform,
+            toolchain,
+        );
+        keyed.push((plan, key));
+    }
+
+    let changed_path =
+        std::env::temp_dir().join(format!("cairn-merge-checks-{}.txt", uuid::Uuid::new_v4()));
+    let changed_body = changed
+        .iter()
+        .map(|change| change.path.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Err(error) = std::fs::write(&changed_path, changed_body) {
+        return ReviewTreeGateResult::InfrastructureFailure(format!(
+            "failed to prepare changed-file input: {error}"
+        ));
+    }
+    let env = vec![(
+        "CAIRN_CHECK_CHANGED_FILES".to_string(),
+        changed_path.to_string_lossy().into_owned(),
+    )];
+    let timeouts: Vec<u32> = keyed
+        .iter()
+        .map(|(plan, _)| {
+            resolve_check_timeout_ms(checks.get(&plan.name), DEFAULT_REVIEW_CHECK_TIMEOUT_MS)
+        })
+        .collect();
+    let constraints: Vec<_> = keyed
+        .iter()
+        .map(|(plan, _)| {
+            checks
+                .get(&plan.name)
+                .and_then(|check| check.constraints.clone())
+        })
+        .collect();
+    let slot_config = crate::config::settings::load_build_slots(&orch.config_dir);
+    let deadline = slot_config
+        .acquisition_deadline_seconds
+        .saturating_mul(1_000);
+    let project = project_id.to_string();
+    let repository = repository.to_string();
+    let commit = commit_id.to_string();
+    let job = requesting_job_id.to_string();
+    let outcomes = run_planned_checks(
+        orch.db.local.clone(),
+        project_id,
+        tree_hash,
+        requesting_job_id,
+        &keyed,
+        &format!("merge-gate:{requesting_job_id}"),
+        CheckExecMode::Isolated,
+        &orch.check_admission,
+        Some(orch),
+        move |index, command, _| {
+            let project = project.clone();
+            let repository = repository.clone();
+            let commit = commit.clone();
+            let job = job.clone();
+            let env = env.clone();
+            let timeout_ms = timeouts[index];
+            let constraints = constraints[index].clone();
+            async move {
+                let request = BuildSlotRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                    project_id: project.clone(),
+                    repository: cairn_common::executor_protocol::RepositoryLocator::ColocatedPath {
+                        project_id: project.clone(),
+                        repository_id: project.clone(),
+                        absolute_path: repository,
+                    },
+                    base_commit: commit,
+                    command,
+                    cwd: String::new(),
+                    env,
+                    priority,
+                    deadline_unix_ms: unix_time_ms_for_checks() + deadline,
+                    timeout_ms,
+                    mutation_policy: MutationPolicy::PureVerdict,
+                    requesting_job_id: Some(job),
+                    affinity_key: None,
+                    constraints,
+                };
+                submit_review_check(orch, request).await
+            }
+        },
+        |_| {},
+    )
+    .await;
+    let _ = std::fs::remove_file(changed_path);
+
+    review_tree_gate_result(outcomes)
+}
+
+fn review_tree_gate_result(outcomes: Vec<CheckOutcome>) -> ReviewTreeGateResult {
+    for outcome in outcomes {
+        if outcome.passed {
+            continue;
+        }
+        if matches!(
+            outcome.failure_kind,
+            Some(CheckFailureKind::Infrastructure | CheckFailureKind::RunnerError)
+        ) {
+            return ReviewTreeGateResult::InfrastructureFailure(format!(
+                "check '{}': {}",
+                outcome.name, outcome.output_tail
+            ));
+        }
+        return ReviewTreeGateResult::CheckFailed {
+            name: outcome.name,
+            detail: outcome.output_tail,
+        };
+    }
+    ReviewTreeGateResult::Green
+}
+
+fn unix_time_ms_for_checks() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1571,56 +1866,106 @@ mod tests {
     }
 
     #[test]
-    fn result_key_is_impact_filtered_and_includes_command_platform_and_toolchain() {
-        let impact = vec!["src/**".to_string()];
+    fn result_key_is_impact_filtered_and_includes_definition_platform_and_toolchain() {
+        let mut definition = check("cargo test", Some(&["src/**"]), CheckWhen::Review);
         let base = vec![
             ("src/lib.rs".to_string(), "blob-a".to_string()),
             ("docs/readme.md".to_string(), "docs-a".to_string()),
         ];
         let key = check_result_key(
-            Some(&impact),
+            &definition,
             Some(&base),
             "whole-tree-a",
-            "cargo test",
             "macos-aarch64",
             "rustc=1;bun=1",
         );
 
+        let mut changed_definition = definition.clone();
+        changed_definition.command = "cargo test --all".to_string();
         assert_ne!(
             key,
             check_result_key(
-                Some(&impact),
+                &changed_definition,
                 Some(&base),
                 "whole-tree-a",
-                "cargo test --all",
                 "macos-aarch64",
-                "rustc=1;bun=1",
-            ),
-            "changing command text must miss"
+                "rustc=1;bun=1"
+            )
+        );
+        changed_definition = definition.clone();
+        changed_definition.policy = CheckPolicy::Gate;
+        assert_ne!(
+            key,
+            check_result_key(
+                &changed_definition,
+                Some(&base),
+                "whole-tree-a",
+                "macos-aarch64",
+                "rustc=1;bun=1"
+            )
+        );
+        changed_definition = definition.clone();
+        changed_definition.resource_class = CheckResourceClass::Exclusive;
+        assert_ne!(
+            key,
+            check_result_key(
+                &changed_definition,
+                Some(&base),
+                "whole-tree-a",
+                "macos-aarch64",
+                "rustc=1;bun=1"
+            )
+        );
+        changed_definition = definition.clone();
+        changed_definition.timeout = Some(42);
+        assert_ne!(
+            key,
+            check_result_key(
+                &changed_definition,
+                Some(&base),
+                "whole-tree-a",
+                "macos-aarch64",
+                "rustc=1;bun=1"
+            )
+        );
+        changed_definition = definition.clone();
+        changed_definition.constraints =
+            Some(cairn_common::executor_protocol::PlacementConstraints {
+                executor_id: Some("executor-a".to_string()),
+                device_id: Some("device-a".to_string()),
+                os: Some("macos".to_string()),
+                arch: Some("aarch64".to_string()),
+                required_toolchains: vec!["rust".to_string()],
+            });
+        assert_ne!(
+            key,
+            check_result_key(
+                &changed_definition,
+                Some(&base),
+                "whole-tree-a",
+                "macos-aarch64",
+                "rustc=1;bun=1"
+            )
         );
         assert_ne!(
             key,
             check_result_key(
-                Some(&impact),
+                &definition,
                 Some(&base),
                 "whole-tree-a",
-                "cargo test",
                 "linux-x86_64",
-                "rustc=1;bun=1",
-            ),
-            "platform must participate in the key"
+                "rustc=1;bun=1"
+            )
         );
         assert_ne!(
             key,
             check_result_key(
-                Some(&impact),
+                &definition,
                 Some(&base),
                 "whole-tree-a",
-                "cargo test",
                 "macos-aarch64",
-                "rustc=2;bun=1",
-            ),
-            "toolchain must participate in the key"
+                "rustc=2;bun=1"
+            )
         );
 
         let inside_changed = vec![
@@ -1630,16 +1975,13 @@ mod tests {
         assert_ne!(
             key,
             check_result_key(
-                Some(&impact),
+                &definition,
                 Some(&inside_changed),
                 "whole-tree-b",
-                "cargo test",
                 "macos-aarch64",
-                "rustc=1;bun=1",
-            ),
-            "content changes inside impact globs must miss"
+                "rustc=1;bun=1"
+            )
         );
-
         let outside_changed = vec![
             ("src/lib.rs".to_string(), "blob-a".to_string()),
             ("docs/readme.md".to_string(), "docs-b".to_string()),
@@ -1647,15 +1989,56 @@ mod tests {
         assert_eq!(
             key,
             check_result_key(
-                Some(&impact),
+                &definition,
                 Some(&outside_changed),
                 "whole-tree-b",
-                "cargo test",
                 "macos-aarch64",
-                "rustc=1;bun=1",
-            ),
-            "content changes outside impact globs must hit"
+                "rustc=1;bun=1"
+            )
         );
+
+        definition.impact = Some(vec!["docs/**".to_string()]);
+        assert_ne!(
+            key,
+            check_result_key(
+                &definition,
+                Some(&base),
+                "whole-tree-a",
+                "macos-aarch64",
+                "rustc=1;bun=1"
+            )
+        );
+    }
+
+    #[test]
+    fn repository_rust_checks_select_all_cargo_control_inputs() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("cairn-core manifest is nested under the repository root");
+        let checks = load_checks(repo_root).expect("repository check configuration must parse");
+        for name in ["rust-lint", "rust-full"] {
+            let check = checks.get(name).expect("configured Rust review check");
+            assert_eq!(check.when, CheckWhen::Review);
+            let impacts = check.impact.as_ref().expect("Rust check has impacts");
+            for path in [
+                "src-tauri/.cargo/config.toml",
+                "src-tauri/Cargo.toml",
+                "src-tauri/os/cairn-core/Cargo.toml",
+                "src-tauri/Cargo.lock",
+                "src-tauri/os/cairn-core/build.rs",
+            ] {
+                let planned = plan_checks(
+                    &HashMap::from([(name.to_string(), check.clone())]),
+                    &[change(path)],
+                    repo_root,
+                );
+                assert!(
+                    planned.iter().any(|plan| plan.name == name && plan.applies),
+                    "{name} must apply when {path} changes; impacts={impacts:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1698,23 +2081,21 @@ mod tests {
         };
         assert_ne!(first_commit, second_commit);
 
-        let impact = vec!["src/**".to_string()];
+        let definition = check("cargo test", Some(&["src/**"]), CheckWhen::Review);
         let first_entries = git_tree_entries(repo, &first_commit);
         let second_entries = git_tree_entries(repo, &second_commit);
         assert_eq!(
             check_result_key(
-                Some(&impact),
+                &definition,
                 Some(&first_entries),
                 &tree,
-                "cargo test",
                 "test-platform",
                 "test-toolchain",
             ),
             check_result_key(
-                Some(&impact),
+                &definition,
                 Some(&second_entries),
                 &tree,
-                "cargo test",
                 "test-platform",
                 "test-toolchain",
             ),
@@ -1740,6 +2121,7 @@ mod tests {
             when,
             resource_class: CheckResourceClass::Shared,
             timeout: None,
+            constraints: None,
         }
     }
 
@@ -1758,6 +2140,14 @@ mod tests {
             job_id: None,
             cached: None,
             failure_kind: None,
+            executor_id: None,
+            executor_device_id: None,
+            executor_connection_generation: None,
+            executor_slot_id: None,
+            executor_lease_epoch: None,
+            executor_started_at_unix_ms: None,
+            executor_finished_at_unix_ms: None,
+            toolchain_fingerprint: None,
         }
     }
 
@@ -2310,6 +2700,166 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn merge_gate_classifies_all_substrate_failures_as_infrastructure() {
+        use cairn_common::executor_protocol::{
+            BuildSlotUnavailableReason::*, ObjectInfrastructureStage,
+        };
+        let unavailable = vec![
+            NoCapacity,
+            Deadline,
+            Provisioning,
+            Checkout,
+            Spawn,
+            Preparation,
+            ExecutorUnavailable,
+            NoMatchingExecutor,
+            ObjectInfrastructure(ObjectInfrastructureStage::FetchInterrupted),
+            ObjectInfrastructure(ObjectInfrastructureStage::IntegrityFailure),
+            ObjectInfrastructure(ObjectInfrastructureStage::IncompleteClosure),
+            ObjectInfrastructure(ObjectInfrastructureStage::InstallFailure),
+            ObjectInfrastructure(ObjectInfrastructureStage::UploadFailure),
+            ObjectInfrastructure(ObjectInfrastructureStage::ExpiredReceipt),
+            ObjectInfrastructure(ObjectInfrastructureStage::StaleReceipt),
+        ];
+        let mut failures = unavailable
+            .into_iter()
+            .map(|reason| BuildSlotOutcome::Unavailable {
+                reason,
+                diagnostic: "unavailable".to_string(),
+            })
+            .collect::<Vec<_>>();
+        failures.push(BuildSlotOutcome::FailedAfterExecution {
+            request_id: "request".to_string(),
+            attempt_id: "attempt".to_string(),
+            diagnostic: "publication failed".to_string(),
+        });
+        failures.push(BuildSlotOutcome::Cancelled {
+            request_id: "request".to_string(),
+            attempt_id: "attempt".to_string(),
+        });
+        failures.push(BuildSlotOutcome::Completed {
+            request_id: "request".to_string(),
+            attempt_id: "attempt".to_string(),
+            exit_code: Some(0),
+            output: String::new(),
+            timed_out: false,
+            metadata: cairn_common::executor_protocol::BuildSlotExecutionMeta {
+                executor_id: "executor".to_string(),
+                executor_device_id: "device".to_string(),
+                executor_connection_generation: 1,
+                slot_id: "slot".to_string(),
+                lease_epoch: 1,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+            },
+            mutation_delta: Some(Box::new(cairn_common::executor_protocol::MutationDelta {
+                base_commit: "base".to_string(),
+                delta_commit: "delta".to_string(),
+                upload_receipt: None,
+            })),
+        });
+
+        for (index, outcome) in failures.into_iter().enumerate() {
+            let failure = check_result_from_build_slot_outcome(outcome)
+                .expect_err("substrate outcome must not become a command verdict");
+            let db = cache_db().await;
+            let results = run_planned_checks(
+                db,
+                "project-a",
+                &format!("tree-{index}"),
+                "job-a",
+                &[(plan("rust", "cargo test"), format!("input-{index}"))],
+                "tool",
+                CheckExecMode::Shared,
+                &admission(),
+                None,
+                move |_, _, _| {
+                    let failure = failure.clone();
+                    async move { Err::<CheckExecResult, _>(failure) }
+                },
+                |_| {},
+            )
+            .await;
+            assert!(matches!(
+                review_tree_gate_result(results),
+                ReviewTreeGateResult::InfrastructureFailure(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_executor_provenance_is_persisted_with_toolchain_claim() {
+        let db = cache_db().await;
+        let provenance = cairn_common::executor_protocol::BuildSlotExecutionMeta {
+            executor_id: "executor-a".to_string(),
+            executor_device_id: "device-a".to_string(),
+            executor_connection_generation: 3,
+            slot_id: "slot-a".to_string(),
+            lease_epoch: 4,
+            started_at_unix_ms: 100,
+            finished_at_unix_ms: 200,
+        };
+        let results = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-provenance",
+            "job-a",
+            &[(plan("rust", "cargo test"), "input-provenance".to_string())],
+            "tool",
+            CheckExecMode::Shared,
+            &admission(),
+            None,
+            move |_, _, _| {
+                let provenance = provenance.clone();
+                async move {
+                    Ok::<_, String>(CheckExecResult {
+                        exit_code: Some(0),
+                        output: "ok".to_string(),
+                        timed_out: false,
+                        provenance: Some(provenance),
+                    })
+                }
+            },
+            |_| {},
+        )
+        .await;
+        assert!(results[0].passed);
+        let row = get_check_result(db, "project-a", "rust", "input-provenance")
+            .unwrap()
+            .expect("completed verdict is reusable");
+        assert_eq!(row.executor_id.as_deref(), Some("executor-a"));
+        assert_eq!(row.executor_device_id.as_deref(), Some("device-a"));
+        assert_eq!(row.executor_connection_generation, Some(3));
+        assert_eq!(row.executor_slot_id.as_deref(), Some("slot-a"));
+        assert_eq!(row.executor_lease_epoch, Some(4));
+        assert_eq!(row.executor_started_at_unix_ms, Some(100));
+        assert_eq!(row.executor_finished_at_unix_ms, Some(200));
+        assert_eq!(
+            row.toolchain_fingerprint.as_deref(),
+            Some(check_toolchain_identity())
+        );
+    }
+
+    #[test]
+    fn merge_gate_treats_command_timeout_as_named_check_failure() {
+        let result = review_tree_gate_result(vec![CheckOutcome {
+            name: "rust-full".to_string(),
+            passed: false,
+            exit_code: None,
+            failure_kind: Some(CheckFailureKind::TimedOut),
+            parsed: None,
+            output_tail: "timed out after 30m".to_string(),
+            cached: false,
+            duration_ms: 1_800_000,
+        }]);
+        assert!(matches!(
+            result,
+            ReviewTreeGateResult::CheckFailed { ref name, ref detail }
+                if name == "rust-full" && detail.contains("timed out")
+        ));
+    }
+
     #[test]
     fn failure_kind_describe_names_each_death() {
         assert_eq!(
@@ -2392,6 +2942,7 @@ mod tests {
             exit_code,
             output: output.into(),
             timed_out: false,
+            provenance: None,
         })
     }
 
@@ -2413,6 +2964,14 @@ mod tests {
                 job_id: Some("job-a".to_string()),
                 cached: Some(false),
                 failure_kind: None,
+                executor_id: None,
+                executor_device_id: None,
+                executor_connection_generation: None,
+                executor_slot_id: None,
+                executor_lease_epoch: None,
+                executor_started_at_unix_ms: None,
+                executor_finished_at_unix_ms: None,
+                toolchain_fingerprint: None,
             },
         )
         .unwrap();
@@ -2717,6 +3276,7 @@ mod tests {
                         output: "     SLOW [>  60.000s] mycrate mod::hangs\nstill going"
                             .to_string(),
                         timed_out: true,
+                        provenance: None,
                     }),
                     // The process could not be spawned.
                     1 => Err("Failed to spawn command: No such file or directory".to_string()),
@@ -2725,6 +3285,7 @@ mod tests {
                         exit_code: None,
                         output: "segfault".to_string(),
                         timed_out: false,
+                        provenance: None,
                     }),
                 }
             },
@@ -2794,6 +3355,14 @@ mod tests {
                 job_id: Some("job-a".to_string()),
                 cached: Some(false),
                 failure_kind: None,
+                executor_id: None,
+                executor_device_id: None,
+                executor_connection_generation: None,
+                executor_slot_id: None,
+                executor_lease_epoch: None,
+                executor_started_at_unix_ms: None,
+                executor_finished_at_unix_ms: None,
+                toolchain_fingerprint: None,
             },
         )
         .unwrap();
@@ -2968,6 +3537,14 @@ mod tests {
                 job_id: Some("job-a".to_string()),
                 cached: Some(false),
                 failure_kind: None,
+                executor_id: None,
+                executor_device_id: None,
+                executor_connection_generation: None,
+                executor_slot_id: None,
+                executor_lease_epoch: None,
+                executor_started_at_unix_ms: None,
+                executor_finished_at_unix_ms: None,
+                toolchain_fingerprint: None,
             },
         )
         .unwrap();

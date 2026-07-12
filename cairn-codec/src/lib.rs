@@ -19,6 +19,7 @@ pub mod codec;
 pub mod diff;
 pub mod objects;
 pub mod packfile;
+pub mod transfer;
 
 // Test helpers, exposed under `test-utils` (not just `cfg(test)`) so cairn-core's
 // archival tests and its unfenced integration lane build identical fixtures.

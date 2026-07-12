@@ -21,7 +21,7 @@ mod types;
 
 pub(crate) use checks::{check_stream_id, run_check_command, run_item_stream_id, CheckExecResult};
 pub(crate) use process::{
-    apply_non_interactive_pager_env_to_pty, build_agent_spawn_config,
+    apply_non_interactive_pager_env_to_pty, build_agent_spawn_config, cache_checkpoint_callback,
     scrub_dev_instance_routing_pty, MAX_BUFFER_SIZE,
 };
 pub use redact::redact_command;
@@ -33,33 +33,403 @@ pub use types::{
 };
 
 use commit_barrier::{run_commit_barrier, CommitBarrierOutcome};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::Duration;
-use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 
 const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const STORE_BUSY_MESSAGE: &str =
     "The project's version-control store is busy behind a long-running operation; retry this run.";
 
-async fn acquire_store_lock<'a>(
-    lock: Option<&'a Arc<TokioMutex<()>>>,
+async fn acquire_store_lock(
+    orch: &Orchestrator,
+    store: Option<&Path>,
+    operation: &str,
     timeout: Duration,
-) -> Result<Option<MutexGuard<'a, ()>>, ()> {
-    match lock {
-        Some(lock) => tokio::time::timeout(timeout, lock.lock())
+) -> Result<Option<crate::orchestrator::JjStoreGuard>, ()> {
+    match store {
+        Some(store) => orch
+            .acquire_jj_store_lock_with_timeout(store, operation, Some(timeout))
             .await
-            .map(Some)
-            .map_err(|_| ()),
+            .map(Some),
         None => Ok(None),
+    }
+}
+fn make_delta_objects_available(
+    orch: &Orchestrator,
+    repository: &std::path::Path,
+    request: &BuildSlotRequest,
+    delta: &crate::build_slots::MutationDelta,
+) -> Result<bool, String> {
+    let Some(receipt) = delta.upload_receipt.as_ref() else {
+        verify_available_delta(repository, delta)?;
+        return Ok(false);
+    };
+    if receipt.coordinate.repository != request.repository.identity()
+        || receipt.coordinate.request_id != request.request_id
+        || receipt.coordinate.attempt_id != request.attempt_id
+        || receipt.base_commit != request.base_commit
+        || receipt.base_commit != delta.base_commit
+        || receipt.delta_commit != delta.delta_commit
+    {
+        return Err("managed delta receipt does not match the routed execution".into());
+    }
+    let staged = orch
+        .object_plane
+        .staged_delta(receipt)
+        .ok_or_else(|| "managed delta receipt is expired or stale".to_string())?;
+    let pack = std::fs::read(&staged.path)
+        .map_err(|error| format!("read staged managed delta pack: {error}"))?;
+    let validated =
+        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
+            .map_err(|error| format!("validate staged managed delta pack: {error}"))?;
+    if validated.manifest.pack_checksum != receipt.pack_checksum {
+        return Err("managed delta pack checksum changed after upload".into());
+    }
+    let objects_text = git_output(
+        repository,
+        &["rev-parse", "--git-path", "objects"],
+        "resolve canonical repository object database",
+    )?;
+    let objects_dir = {
+        let path = std::path::PathBuf::from(objects_text);
+        if path.is_absolute() {
+            path
+        } else {
+            repository.join(path)
+        }
+    };
+    cairn_codec::transfer::install_pack(&objects_dir, &validated)
+        .map_err(|error| format!("install managed delta pack: {error}"))?;
+    cairn_codec::transfer::verify_commit_closure(&objects_dir, &[], &delta.delta_commit)
+        .map_err(|error| format!("verify imported managed delta closure: {error}"))?;
+    verify_available_delta(repository, delta)?;
+    Ok(true)
+}
+
+fn verify_available_delta(
+    repository: &std::path::Path,
+    delta: &crate::build_slots::MutationDelta,
+) -> Result<(), String> {
+    git_output(
+        repository,
+        &[
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", delta.delta_commit),
+        ],
+        "verify build-slot delta object availability",
+    )?;
+    let relationship = std::process::Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            &delta.base_commit,
+            &delta.delta_commit,
+        ])
+        .current_dir(repository)
+        .status()
+        .map_err(|error| format!("verify build-slot delta base relationship: {error}"))?;
+    if !relationship.success() {
+        return Err("build-slot delta is not descended from its declared base".into());
+    }
+    Ok(())
+}
+
+fn git_output(
+    repository: &std::path::Path,
+    args: &[&str],
+    context: &str,
+) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repository)
+        .output()
+        .map_err(|error| format!("{context}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn temporary_delta_ref(
+    request: &BuildSlotRequest,
+    delta: &crate::build_slots::MutationDelta,
+) -> String {
+    fn safe(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+    let abbreviated = delta.delta_commit.get(..12).unwrap_or(&delta.delta_commit);
+    format!(
+        "refs/heads/cairn-build-delta-{}-{}-{abbreviated}",
+        safe(&request.request_id),
+        safe(&request.attempt_id),
+    )
+}
+
+#[derive(Debug)]
+struct RunnerPublicationTarget {
+    project_id: String,
+    repository_identity: cairn_common::executor_protocol::RepositoryIdentity,
+    repository: std::path::PathBuf,
+    git_common_dir: std::path::PathBuf,
+    store_dir: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+}
+
+fn canonical_path(path: &Path, context: &str) -> Result<std::path::PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|error| format!("{context} {}: {error}", path.display()))
+}
+
+fn resolve_git_common_dir(repository: &Path) -> Result<std::path::PathBuf, String> {
+    let common = std::path::PathBuf::from(git_output(
+        repository,
+        &["rev-parse", "--git-common-dir"],
+        "resolve runner repository Git common directory",
+    )?);
+    canonical_path(
+        &if common.is_absolute() {
+            common
+        } else {
+            repository.join(common)
+        },
+        "canonicalize runner repository Git common directory",
+    )
+}
+
+fn resolve_runner_publication_target(
+    config_dir: &Path,
+    context: &ManagedWorkspaceContext,
+    store_lock: &Path,
+    request: &BuildSlotRequest,
+) -> Result<RunnerPublicationTarget, String> {
+    let repository = canonical_path(
+        &context.identity.project_root,
+        "canonicalize managed project repository",
+    )?;
+    let workspace = canonical_path(
+        &context.identity.worktree_path,
+        "canonicalize managed workspace",
+    )?;
+    let store_dir = canonical_path(store_lock, "canonicalize managed shared store")?;
+    let expected_store = canonical_path(
+        &crate::jj::project_store_dir(config_dir, &context.identity.project_root),
+        "canonicalize expected managed shared store",
+    )?;
+    if store_dir != expected_store {
+        return Err(format!(
+            "build-slot publication lock mismatch: locked shared store resolves to {}, managed project store resolves to {}",
+            store_dir.display(),
+            expected_store.display()
+        ));
+    }
+
+    if request.project_id != context.identity.project_id
+        || request.repository.project_id() != context.identity.project_id
+        || request.repository.repository_id() != context.identity.project_id
+    {
+        return Err(format!(
+            "build-slot publication identity mismatch: request project/repository {}/{} does not match managed project {} at {}",
+            request.repository.project_id(),
+            request.repository.repository_id(),
+            context.identity.project_id,
+            repository.display()
+        ));
+    }
+    let Some(request_repository) = request.repository.colocated_path() else {
+        return Err(format!(
+            "build-slot publication repository mismatch: runner workspace {} requires colocated runner repository {}, but request used managed objects",
+            workspace.display(),
+            repository.display()
+        ));
+    };
+    let request_repository = canonical_path(
+        Path::new(request_repository),
+        "canonicalize build-slot request repository",
+    )?;
+    if request_repository != repository {
+        return Err(format!(
+            "build-slot publication repository mismatch: request resolves to {}, managed workspace resolves to {}",
+            request_repository.display(),
+            repository.display()
+        ));
+    }
+
+    let workspace_repo_pointer = workspace.join(".jj").join("repo");
+    let workspace_repo = std::fs::read_to_string(&workspace_repo_pointer).map_err(|error| {
+        format!(
+            "read managed workspace repository pointer {}: {error}",
+            workspace_repo_pointer.display()
+        )
+    })?;
+    let workspace_repo = std::path::PathBuf::from(workspace_repo.trim());
+    let workspace_repo = canonical_path(
+        &if workspace_repo.is_absolute() {
+            workspace_repo
+        } else {
+            workspace_repo_pointer
+                .parent()
+                .unwrap_or(&workspace)
+                .join(workspace_repo)
+        },
+        "resolve managed workspace .jj/repo",
+    )?;
+    let store_repo = canonical_path(
+        &store_dir.join(".jj").join("repo"),
+        "resolve managed shared-store .jj/repo",
+    )?;
+    if workspace_repo != store_repo {
+        return Err(format!(
+            "build-slot publication store mismatch: workspace .jj/repo resolves to {}, locked shared store resolves to {}",
+            workspace_repo.display(),
+            store_repo.display()
+        ));
+    }
+
+    let git_common_dir = resolve_git_common_dir(&repository)?;
+    let git_target_file = store_repo.join("store").join("git_target");
+    let git_target = std::fs::read_to_string(&git_target_file).map_err(|error| {
+        format!(
+            "read shared-store Git target {}: {error}",
+            git_target_file.display()
+        )
+    })?;
+    let git_target = std::path::PathBuf::from(git_target.trim());
+    let git_target = canonical_path(
+        &if git_target.is_absolute() {
+            git_target
+        } else {
+            git_target_file
+                .parent()
+                .unwrap_or(&store_repo)
+                .join(git_target)
+        },
+        "canonicalize shared-store Git target",
+    )?;
+    if git_target != git_common_dir {
+        return Err(format!(
+            "build-slot publication Git backend mismatch: shared store targets {}, runner repository common directory is {}",
+            git_target.display(),
+            git_common_dir.display()
+        ));
+    }
+
+    Ok(RunnerPublicationTarget {
+        project_id: context.identity.project_id.clone(),
+        repository_identity: request.repository.identity(),
+        repository,
+        git_common_dir,
+        store_dir,
+        workspace,
+    })
+}
+
+// Caller holds the canonical per-store lock for the full visibility window.
+fn publish_visible_slot_delta(
+    orch: &Orchestrator,
+    target: &RunnerPublicationTarget,
+    request: &BuildSlotRequest,
+    delta: &crate::build_slots::MutationDelta,
+) -> Result<(), String> {
+    debug_assert_eq!(target.project_id, request.project_id);
+    debug_assert_eq!(target.repository_identity, request.repository.identity());
+    debug_assert!(target.git_common_dir.is_absolute());
+    let repository = &target.repository;
+    let consume_receipt = make_delta_objects_available(orch, repository, request, delta)?;
+    let reference = temporary_delta_ref(request, delta);
+    let existing = git_output(
+        repository,
+        &["rev-parse", "--verify", "--quiet", &reference],
+        "inspect temporary build-delta reference",
+    )
+    .ok();
+    match existing.as_deref() {
+        Some(commit) if commit == delta.delta_commit => {}
+        Some(commit) => {
+            return Err(format!(
+                "temporary build-delta ref collision: {reference} points to {commit}"
+            ))
+        }
+        None => {
+            let absent = "0".repeat(delta.delta_commit.len());
+            git_output(
+                repository,
+                &["update-ref", &reference, &delta.delta_commit, &absent],
+                "publish temporary build-delta reference",
+            )?;
+        }
+    }
+
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    // Executor slots may seal against a separate backend. Once their objects reach
+    // the runner, however, the temporary ref and materializing workspace store
+    // must address this one validated runner Git backend.
+    let primary = (|| {
+        crate::jj::import_git(&jj, &target.store_dir)
+            .map_err(|error| format!("import build-slot delta reference: {error}"))?;
+        jj.run(
+            &target.store_dir,
+            &[
+                "log",
+                "-r",
+                &delta.delta_commit,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "verify build-slot delta visibility",
+        )?;
+        verify_available_delta(repository, delta)?;
+        materialize_slot_delta(orch, target, delta)
+    })();
+    let cleanup = (|| {
+        git_output(
+            repository,
+            &["update-ref", "-d", &reference, &delta.delta_commit],
+            "delete temporary build-delta reference",
+        )?;
+        crate::jj::import_git(&jj, &target.store_dir)
+            .map_err(|error| format!("import temporary build-delta reference deletion: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "{primary}; temporary-ref cleanup also failed: {cleanup}"
+        )),
+        (Err(primary), _) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(format!(
+            "build-slot delta materialized but temporary-ref cleanup failed: {cleanup}"
+        )),
+        (Ok(()), Ok(())) => {
+            if consume_receipt {
+                let receipt = delta.upload_receipt.as_ref().ok_or_else(|| {
+                    "managed delta receipt disappeared before consumption".to_string()
+                })?;
+                orch.object_plane.consume_staged_delta(receipt)?;
+            }
+            Ok(())
+        }
     }
 }
 
 fn materialize_slot_delta(
     orch: &Orchestrator,
-    worktree: &std::path::Path,
+    target: &RunnerPublicationTarget,
     delta: &crate::build_slots::MutationDelta,
 ) -> Result<(), String> {
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let worktree = &target.workspace;
     let current = crate::jj::head_commit(&jj, worktree)?;
     if current != delta.base_commit {
         return Err(format!(
@@ -84,13 +454,12 @@ fn materialize_slot_delta(
     }
     Ok(())
 }
-use hygiene::{
-    check_cd_commands, checkout_has_tracked_changes, verify_branch_checkout_clean_after_run,
-};
+use hygiene::{check_cd_commands, checkout_has_tracked_changes};
 use output::{collect_run_images, compose_run_output, run_envelope};
 use process::run_one;
 use resolve::resolve_run_item;
-use types::{ItemOutcome, RunSpec};
+use types::ItemOutcome;
+pub(crate) use types::RunSpec;
 
 fn apply_default_process_timeout(
     resolved: &mut [(String, Result<RunSpec, String>)],
@@ -116,81 +485,10 @@ pub(crate) struct ResolvedRunBatch {
     pub tool_use_id: String,
     pub stop_on_error: bool,
     pub originally_sequential: bool,
-    pub commit_present: bool,
-}
-
-/// Execute a routed batch in one leased working directory while preserving the
-/// public scheduling contract: sequential payloads run in order and all other
-/// payloads run concurrently. Outcomes remain ordered for stable presentation.
-pub(crate) async fn execute_resolved_slot_batch(
-    orch: &Orchestrator,
-    cwd: &str,
-    batch: ResolvedRunBatch,
-) -> Vec<ItemOutcome> {
-    if batch.originally_sequential {
-        let mut outcomes = Vec::with_capacity(batch.resolved.len());
-        for (index, (header, spec)) in batch.resolved.into_iter().enumerate() {
-            let outcome = run_one(
-                orch,
-                &batch.request,
-                cwd,
-                &run_item_stream_id(&batch.tool_use_id, index),
-                batch.run_context.as_ref(),
-                batch.commit_present,
-                false,
-                false,
-                header,
-                spec,
-            )
-            .await;
-            let stop = outcome.suspended || (!outcome.succeeded && batch.stop_on_error);
-            outcomes.push(outcome);
-            if stop {
-                break;
-            }
-        }
-        return outcomes;
-    }
-
-    let mut handles = Vec::with_capacity(batch.resolved.len());
-    for (index, (header, spec)) in batch.resolved.into_iter().enumerate() {
-        let orch = orch.clone();
-        let cwd = cwd.to_string();
-        let stream_id = run_item_stream_id(&batch.tool_use_id, index);
-        let run_context = batch.run_context.clone();
-        let request = batch.request.clone();
-        let commit_present = batch.commit_present;
-        handles.push(AbortOnDrop(tokio::spawn(async move {
-            run_one(
-                &orch,
-                &request,
-                &cwd,
-                &stream_id,
-                run_context.as_ref(),
-                commit_present,
-                false,
-                false,
-                header,
-                spec,
-            )
-            .await
-        })));
-    }
-
-    let mut outcomes = Vec::with_capacity(handles.len());
-    for handle in &mut handles {
-        match (&mut handle.0).await {
-            Ok(outcome) => outcomes.push(outcome),
-            Err(error) => outcomes.push(ItemOutcome::failed(
-                "<item>".to_string(),
-                format!("Failed to join run task: {error}"),
-            )),
-        }
-    }
-    outcomes
 }
 
 use crate::build_slots::{BuildSlotOutcome, BuildSlotPriority, BuildSlotRequest, MutationPolicy};
+use crate::execution::jobs::workspace_identity::ManagedWorkspaceContext;
 use crate::mcp::git::GitAuthor;
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
@@ -251,7 +549,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         return run_envelope(result, Vec::new());
     }
 
-    let mut cwd = request.cwd.clone();
+    let cwd = request.cwd.clone();
     let tool_use_id = request
         .tool_use_id
         .clone()
@@ -273,41 +571,21 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         .await
         .ok();
 
-    let branch_checkout = if let Some(branch) = payload.branch.as_deref() {
+    let branch_target = if let Some(branch) = payload.branch.as_deref() {
         if commit_present {
             return run_envelope(
-                "A branch-scoped run cannot commit; it runs against another checkout and refuses dirty tracked state. Remove commit_msg and retry."
+                "A branch-scoped run is verdict-only and cannot commit. Remove commit_msg and retry."
                     .to_string(),
                 Vec::new(),
             );
         }
-        let resolution =
-            match crate::mcp::handlers::branch::resolve_for_run(orch, request, branch).await {
-                Ok(resolution) => resolution,
-                Err(error) => return run_envelope(error, Vec::new()),
-            };
-        let checkout = resolution
-            .checkout
-            .expect("branch run resolution always carries checkout");
-        match checkout_has_tracked_changes(orch, &checkout) {
-            Ok(false) => {}
-            Ok(true) => {
-                return run_envelope(
-                    format!(
-                        "Branch-scoped run refused: target checkout has uncommitted tracked changes: {}",
-                        checkout.display()
-                    ),
-                    Vec::new(),
-                )
-            }
-            Err(error) => return run_envelope(error, Vec::new()),
+        match crate::mcp::handlers::branch::resolve_for_run(orch, request, branch).await {
+            Ok(resolution) => Some(resolution),
+            Err(error) => return run_envelope(error.to_string(), Vec::new()),
         }
-        cwd = checkout.to_string_lossy().into_owned();
-        Some(checkout)
     } else {
         None
     };
-    let branch_scoped_run = branch_checkout.is_some();
 
     // Changes can only happen in a worktree. A non-jj cwd is the project's live
     // checkout behind a long-lived triage / read-only agent or another
@@ -348,9 +626,20 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // rebase (the hazard a hand-run `jj workspace update-stale` hit). Resolved once
     // here and reused by the post-batch commit barrier below. Best-effort: a
     // failure leaves the seal-time stale arm as the mid-batch fallback.
-    let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
-    let managed_context = {
-        let _guard = match acquire_store_lock(store_lock.as_ref(), STORE_LOCK_TIMEOUT).await {
+    let store_lock = if branch_target.is_none() {
+        crate::mcp::vcs::resolve_store_lock(orch, request).await
+    } else {
+        None
+    };
+    let managed_context = if branch_target.is_none() {
+        let _guard = match acquire_store_lock(
+            orch,
+            store_lock.as_deref(),
+            "run managed workspace preparation",
+            STORE_LOCK_TIMEOUT,
+        )
+        .await
+        {
             Ok(guard) => guard,
             Err(()) => return run_envelope(STORE_BUSY_MESSAGE.to_string(), Vec::new()),
         };
@@ -358,26 +647,40 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             Ok(context) => context,
             Err(error) => return run_envelope(error, Vec::new()),
         }
+    } else {
+        None
     };
     let bookmark_observation =
         crate::mcp::vcs::observe_managed_bookmark(orch, managed_context.as_ref());
-    let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
-        orch,
-        std::path::Path::new(&cwd),
-        managed_context.as_ref(),
-    );
-    {
-        let _guard = match acquire_store_lock(store_lock.as_ref(), STORE_LOCK_TIMEOUT).await {
-            Ok(guard) => guard,
-            Err(()) => return run_envelope(STORE_BUSY_MESSAGE.to_string(), Vec::new()),
-        };
-        if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&cwd)) {
-            if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) {
-                return run_envelope(e, Vec::new());
+    let vcs = if branch_target.is_none() {
+        let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
+            orch,
+            std::path::Path::new(&cwd),
+            managed_context.as_ref(),
+        );
+        {
+            let _guard = match acquire_store_lock(
+                orch,
+                store_lock.as_deref(),
+                "run pre-flight workspace reconcile",
+                STORE_LOCK_TIMEOUT,
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(()) => return run_envelope(STORE_BUSY_MESSAGE.to_string(), Vec::new()),
+            };
+            if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&cwd)) {
+                if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) {
+                    return run_envelope(e, Vec::new());
+                }
+                log::warn!("pre-flight workspace reconcile failed: {e}");
             }
-            log::warn!("pre-flight workspace reconcile failed: {e}");
         }
-    }
+        Some(vcs)
+    } else {
+        None
+    };
     // Capture the pre-batch snapshot whenever a no-`commit_msg` run could leave
     // dirt the barrier must reconcile. For a worktree this is gated on the
     // hygiene fence (Ask/Deny). For the project's LIVE checkout we capture
@@ -386,9 +689,12 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // and must be flagged (read-only detection; never reverted). The commit_msg
     // case on a non-worktree cwd already returned early above.
     let non_worktree_cwd = !crate::jj::is_jj_dir(std::path::Path::new(&cwd));
-    let status_before = if payload.commit_msg.is_none() && (run_hygiene_applies || non_worktree_cwd)
+    let status_before = if branch_target.is_none()
+        && payload.commit_msg.is_none()
+        && (run_hygiene_applies || non_worktree_cwd)
     {
-        vcs.snapshot(std::path::Path::new(&cwd)).ok()
+        vcs.as_ref()
+            .and_then(|vcs| vcs.snapshot(std::path::Path::new(&cwd)).ok())
     } else {
         None
     };
@@ -446,23 +752,39 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             Vec::new(),
         );
     }
+    if branch_target.is_some() && !has_process {
+        return run_envelope(
+            "The branch option applies only to tree-bound shell or script batches; MCP gateway and REPL batches run on the host.".to_string(),
+            Vec::new(),
+        );
+    }
 
     let mut routed_delta = None;
+    let mut routed_request = None;
     let mut routed_outcomes = None;
     let mut executed_in_slot = false;
-    if has_process && !branch_scoped_run {
-        if let Some(context) = managed_context.as_ref() {
+    let slot_target = if let Some(target) = branch_target.as_ref() {
+        log::info!(
+            "resolved branch run rev {} to commit {} in project {}",
+            target.rev,
+            target.commit_id,
+            target.project_id
+        );
+        Some((
+            target.project_id.clone(),
+            target.repository_path.clone(),
+            target.commit_id.clone(),
+            String::new(),
+            MutationPolicy::PureVerdict,
+        ))
+    } else if let Some(context) = managed_context.as_ref() {
+        if has_process {
             if checkout_has_tracked_changes(orch, std::path::Path::new(&cwd)).unwrap_or(true) {
                 return run_envelope(
                     "A managed process batch requires a clean workspace before build-slot placement.".to_string(),
                     Vec::new(),
                 );
             }
-            let slot_config = crate::config::settings::load_build_slots(&orch.config_dir);
-            apply_default_process_timeout(
-                &mut resolved,
-                slot_config.default_timeout_seconds.min(u32::MAX as u64) as u32,
-            );
             let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
             let base_commit = match crate::jj::head_commit(&jj, std::path::Path::new(&cwd)) {
                 Ok(commit) => commit,
@@ -478,11 +800,37 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            Some((
+                context.identity.project_id.clone(),
+                context.identity.project_root.clone(),
+                base_commit,
+                relative_cwd,
+                MutationPolicy::AllowDelta,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if has_process {
+        if let Some((project_id, project_root, base_commit, relative_cwd, mutation_policy)) =
+            slot_target
+        {
+            let slot_config = crate::config::settings::load_build_slots(&orch.config_dir);
+            apply_default_process_timeout(
+                &mut resolved,
+                slot_config.default_timeout_seconds.min(u32::MAX as u64) as u32,
+            );
             let slot_request = BuildSlotRequest {
                 request_id: Uuid::new_v4().to_string(),
                 attempt_id: Uuid::new_v4().to_string(),
-                project_id: context.identity.project_id.clone(),
-                repository: context.identity.project_root.to_string_lossy().into_owned(),
+                project_id: project_id.clone(),
+                repository: cairn_common::executor_protocol::RepositoryLocator::ColocatedPath {
+                    project_id: project_id.clone(),
+                    repository_id: project_id,
+                    absolute_path: project_root.to_string_lossy().into_owned(),
+                },
                 base_commit,
                 command: format!("run batch ({} items)", resolved.len()),
                 cwd: relative_cwd,
@@ -496,10 +844,12 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     .default_timeout_seconds
                     .saturating_mul(1_000)
                     .min(u32::MAX as u64) as u32,
-                mutation_policy: MutationPolicy::AllowDelta,
+                mutation_policy,
                 requesting_job_id: run_context.as_ref().map(|ctx| ctx.job_id.clone()),
                 affinity_key: run_context.as_ref().map(|ctx| ctx.run_id.clone()),
+                constraints: payload.constraints.clone(),
             };
+            routed_request = Some(slot_request.clone());
             let batch = ResolvedRunBatch {
                 request: request.clone(),
                 run_context: run_context.clone(),
@@ -507,7 +857,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 tool_use_id: tool_use_id.clone(),
                 stop_on_error,
                 originally_sequential: sequential,
-                commit_present,
             };
             match orch
                 .build_slots
@@ -565,8 +914,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 &cwd,
                 &stream_id,
                 run_context.as_ref(),
-                commit_present,
-                branch_scoped_run,
                 true,
                 header,
                 spec,
@@ -602,8 +949,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     &cwd,
                     &stream_id,
                     run_context.as_ref(),
-                    commit_present,
-                    branch_scoped_run,
                     true,
                     header,
                     spec,
@@ -624,44 +969,19 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         outcomes
     };
 
-    let branch_restore_message = if let Some(checkout) = branch_checkout.as_ref() {
-        match verify_branch_checkout_clean_after_run(orch, checkout) {
-            Ok(true) => Some(format!(
-                "✓ Verified branch checkout {} has no tracked changes after run",
-                checkout.display()
-            )),
-            Ok(false) => None,
-            Err(error) => Some(format!(
-                "⚠️ Branch checkout {} has tracked changes after run: {}",
-                checkout.display(),
-                error
-            )),
-        }
-    } else {
-        None
-    };
-
     // If any item durably suspended on a worktree-fence approval, return the
     // suspend marker for the whole call; the run re-drives the batch on resume.
     if outcomes.iter().any(|o| o.suspended) {
-        let mut text = "Run suspended pending worktree fence approval; resume will continue once it is answered."
-            .to_string();
-        if let Some(message) = branch_restore_message {
-            text.push_str("\n\n");
-            text.push_str(&message);
-        }
-        return run_envelope(text, Vec::new());
+        return run_envelope(
+            "Run suspended pending worktree fence approval; resume will continue once it is answered."
+                .to_string(),
+            Vec::new(),
+        );
     }
 
     let mut result = compose_run_output(&outcomes);
 
-    if branch_scoped_run {
-        if let Some(message) = branch_restore_message {
-            if !result.is_empty() {
-                result.push_str("\n\n");
-            }
-            result.push_str(&message);
-        }
+    if branch_target.is_some() {
         if !cd_advisory.is_empty() {
             if !result.is_empty() {
                 result.push_str("\n\n");
@@ -704,15 +1024,38 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // and per-item command execution above stay outside it (per-workspace reads /
     // FS work, not shared-store rebase/import). `None` for a non-worktree cwd.
     // `store_lock` is the same handle resolved for the pre-flight reconcile above.
-    let barrier = match acquire_store_lock(store_lock.as_ref(), STORE_LOCK_TIMEOUT).await {
+    let barrier = match acquire_store_lock(
+        orch,
+        store_lock.as_deref(),
+        "run commit barrier publication",
+        STORE_LOCK_TIMEOUT,
+    )
+    .await
+    {
         Ok(_store_guard) => {
-            let publication = match (payload.commit_msg.as_deref(), routed_delta.as_ref()) {
-                (Some(_), Some(delta)) => materialize_slot_delta(orch, worktree_path, delta),
+            let publication = match (
+                payload.commit_msg.as_deref(),
+                routed_delta.as_ref(),
+                routed_request.as_ref(),
+                managed_context.as_ref(),
+            ) {
+                (Some(_), Some(delta), Some(request), Some(context)) => match store_lock.as_deref() {
+                    Some(store) => resolve_runner_publication_target(
+                        &orch.config_dir,
+                        context,
+                        store,
+                        request,
+                    )
+                    .and_then(|target| publish_visible_slot_delta(orch, &target, request, delta)),
+                    None => Err(
+                        "build-slot publication has no resolved shared-store lock path".to_string(),
+                    ),
+                },
                 _ => Ok(()),
             };
             match publication {
                 Ok(()) => run_commit_barrier(
-                    vcs.as_ref(),
+                    vcs.as_ref().expect("ambient run always resolves a VCS").as_ref(),
                     worktree_path,
                     payload.commit_msg.as_deref(),
                     all_ok,
@@ -861,18 +1204,4 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     };
     let images = collect_run_images(outcomes);
     run_envelope(text, images)
-}
-
-#[cfg(test)]
-mod store_lock_timeout_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn acquisition_returns_timeout_instead_of_waiting_forever() {
-        let lock = Arc::new(TokioMutex::new(()));
-        let _held = lock.lock().await;
-        let result = acquire_store_lock(Some(&lock), Duration::from_millis(10)).await;
-        assert!(result.is_err());
-        assert!(STORE_BUSY_MESSAGE.contains("retry"));
-    }
 }

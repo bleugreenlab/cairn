@@ -1409,10 +1409,12 @@ fn reconcile_siblings_auto_rebases_with_recorded_conflict() {
 
     let failed_push =
         reconcile_siblings(&jj, &store, int, &[(clean.to_string(), ws_clean.clone())]).unwrap();
-    assert_eq!(
-        failed_push.failed,
-        vec![clean.to_string()],
-        "configured-origin publication failure report: {failed_push:?}"
+    assert_eq!(failed_push.failed.len(), 1);
+    assert_eq!(failed_push.failed[0].branch, clean);
+    assert_eq!(failed_push.failed[0].workspace_path, ws_clean);
+    assert!(
+        failed_push.failed[0].error.contains("jj git push"),
+        "configured-origin publication failure preserves the exact operation error: {failed_push:?}"
     );
     assert!(failed_push.rebased_clean.is_empty());
 }
@@ -1480,8 +1482,10 @@ fn reconcile_external_advance_via_origin_fetch_is_idempotent() {
     );
     git(proj.path(), &["push", "-q", "origin", "main"]);
 
-    // Store-sync: fetch origin so `main@origin` resolves to the new tip.
-    fetch_remote(&jj, &store, "origin").unwrap();
+    // Store-sync follows the production staged shape: network transfer updates
+    // the ordinary Git repository, then the locked/local jj import observes it.
+    git(proj.path(), &["fetch", "-q", "origin"]);
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
     let dest = "main@origin";
     assert!(
         bookmark_commit(&jj, &store, dest).is_some()
@@ -1526,7 +1530,8 @@ fn reconcile_external_advance_via_origin_fetch_is_idempotent() {
     // Second reconcile at the SAME tip (the double-fire): a `jj rebase` no-op,
     // so the conflicted commit id is unchanged. The before/after wake guard
     // reads exactly this equality to suppress a redundant wake.
-    fetch_remote(&jj, &store, "origin").unwrap();
+    git(proj.path(), &["fetch", "-q", "origin"]);
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
     let report2 = reconcile_siblings(
         &jj,
         &store,
@@ -1613,13 +1618,13 @@ fn reconcile_siblings_fast_forwards_no_work_sibling() {
     );
 }
 
-/// The fast-forward path still has to surface an idle sibling's unsealed WIP
-/// when re-parenting that workspace `@` onto the new base records a conflict.
+/// The fast-forward path advances the idle bookmark while preserving unsealed
+/// workspace work instead of destructively re-parenting it onto the new base.
 #[test]
 #[serial_test::serial(jj)]
-fn reconcile_siblings_no_work_sibling_with_conflicting_wip_classified_conflicted() {
+fn reconcile_siblings_no_work_sibling_preserves_conflicting_wip() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping reconcile_siblings_no_work_sibling_with_conflicting_wip_classified_conflicted: jj not resolvable");
+        eprintln!("skipping reconcile_siblings_no_work_sibling_preserves_conflicting_wip: jj not resolvable");
         return;
     };
     let home = TempDir::new().unwrap();
@@ -1654,18 +1659,19 @@ fn reconcile_siblings_no_work_sibling_with_conflicting_wip_classified_conflicted
 
     let specs = vec![(idle.to_string(), ws_idle.clone())];
     let report = reconcile_siblings(&jj, &store, int, &specs).unwrap();
-    assert_eq!(report.conflicted, vec![idle.to_string()]);
-    assert!(report.rebased_clean.is_empty());
+    assert!(report.conflicted.is_empty());
+    assert_eq!(report.rebased_clean, vec![idle.to_string()]);
+    assert_eq!(report.silent, vec![idle.to_string()]);
     assert_eq!(
         bookmark_commit(&jj, &store, idle).unwrap(),
         dest_commit,
         "the idle bookmark still fast-forwards to the new base"
     );
 
-    let conflicted_file = std::fs::read_to_string(ws_idle.join("shared.rs")).unwrap();
-    assert!(
-        conflicted_file.contains("<<<<<<<") && conflicted_file.contains(">>>>>>>"),
-        "the agent sees materialized conflict markers: {conflicted_file}"
+    let preserved_file = std::fs::read_to_string(ws_idle.join("shared.rs")).unwrap();
+    assert_eq!(
+        preserved_file, "idle unsealed change\n",
+        "loose local work is preserved rather than destructively re-parented"
     );
 }
 
@@ -5725,6 +5731,95 @@ fn reconcile_workspace_leaves_dirty_workspace_untouched() {
     assert!(
         !ws_coord.join("child.rs").exists(),
         "a dirty tree is left to seal-time, not advanced onto the tip"
+    );
+}
+
+/// Run/write preflight preserves the conflicted-tip boundary: a clean workspace
+/// behind its conflicted bookmark is not re-parented and no conflict markers are
+/// materialized by ordinary command preparation.
+#[test]
+#[serial_test::serial(jj)]
+fn reconcile_workspace_leaves_conflicted_bookmark_tip_untouched() {
+    use crate::mcp::vcs::WorktreeVcs;
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping reconcile_workspace_leaves_conflicted_bookmark_tip_untouched: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-2817-builder-0";
+    let ws = wts.path().join("conflicted-tip");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    let parent_before = jj
+        .run(
+            &ws,
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+            "parent before",
+        )
+        .unwrap();
+
+    jj.run(&store, &["new", branch], "branch edit").unwrap();
+    std::fs::write(store.join("shared.rs"), "branch\n").unwrap();
+    jj.run(
+        &store,
+        &["describe", "-m", "branch edit"],
+        "describe branch",
+    )
+    .unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            "@",
+            "--ignore-working-copy",
+        ],
+        "set branch",
+    )
+    .unwrap();
+
+    jj.run(&store, &["new", "main"], "main edit").unwrap();
+    std::fs::write(store.join("shared.rs"), "main\n").unwrap();
+    jj.run(&store, &["describe", "-m", "main edit"], "describe main")
+        .unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            "@",
+            "--ignore-working-copy",
+        ],
+        "set main",
+    )
+    .unwrap();
+    rebase_branch_onto(&jj, &store, branch, "main").unwrap();
+    assert!(branch_has_conflict(&jj, &store, branch).unwrap());
+
+    let backend = crate::mcp::vcs::JjBackend::new(JjEnv::resolve(&bin, home.path()));
+    backend.reconcile_workspace(&ws).unwrap();
+
+    let parent_after = jj
+        .run(
+            &ws,
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+            "parent after",
+        )
+        .unwrap();
+    assert_eq!(parent_after, parent_before);
+    assert_eq!(
+        std::fs::read_to_string(ws.join("shared.rs")).unwrap(),
+        "base\n"
     );
 }
 
