@@ -2,6 +2,130 @@ use crate::models::{Check, MergeableState, PrCache, PrDataSummary, PrState, Webh
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
 
+/// Whether a locally sealed managed-workspace commit may wait for the next
+/// explicit publication barrier or must advance an already external PR head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationRequirement {
+    DeferredUntilPublication,
+    RequiredForOpenPr,
+}
+
+/// Resolve publication from both durable owners of a managed branch. A remote,
+/// open PR attached either to the routed job or to the branch makes publication
+/// mandatory. Query failure is intentionally left to callers to classify as
+/// `RequiredForOpenPr`; uncertainty must never make a possibly-public branch local-only.
+pub(crate) async fn publication_requirement_for_managed_branch(
+    db: &LocalDb,
+    job_id: &str,
+    project_id: &str,
+    branch: &str,
+) -> PublicationRequirement {
+    let rows = match db
+        .query_all(
+            "SELECT is_local, status, github_state
+             FROM merge_requests
+             WHERE job_id = ?1 OR (project_id = ?2 AND source_branch = ?3)",
+            params![job_id, project_id, branch],
+            |row| {
+                Ok((
+                    row.opt_i64(0)?.unwrap_or(0) != 0,
+                    row.text(1)?,
+                    row.opt_text(2)?,
+                ))
+            },
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::warn!("publication requirement lookup failed closed: {error}");
+            return PublicationRequirement::RequiredForOpenPr;
+        }
+    };
+
+    classify_publication_rows(rows)
+}
+
+fn classify_publication_rows(rows: Vec<(bool, String, Option<String>)>) -> PublicationRequirement {
+    let has_open_remote = rows.into_iter().any(|(is_local, status, github_state)| {
+        !is_local
+            && status != "merged"
+            && status != "closed"
+            && !github_state.as_deref().is_some_and(|state| {
+                state.eq_ignore_ascii_case("merged") || state.eq_ignore_ascii_case("closed")
+            })
+    });
+    if has_open_remote {
+        PublicationRequirement::RequiredForOpenPr
+    } else {
+        PublicationRequirement::DeferredUntilPublication
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod publication_requirement_tests {
+    use cairn_db::turso::params;
+
+    use super::{
+        classify_publication_rows, publication_requirement_for_managed_branch,
+        PublicationRequirement,
+    };
+
+    #[test]
+    fn publication_matrix_distinguishes_remote_open_prs() {
+        assert_eq!(
+            classify_publication_rows(vec![]),
+            PublicationRequirement::DeferredUntilPublication
+        );
+        assert_eq!(
+            classify_publication_rows(vec![(true, "open".into(), Some("OPEN".into()))]),
+            PublicationRequirement::DeferredUntilPublication
+        );
+        assert_eq!(
+            classify_publication_rows(vec![(false, "open".into(), Some("OPEN".into()))]),
+            PublicationRequirement::RequiredForOpenPr
+        );
+        assert_eq!(
+            classify_publication_rows(vec![(false, "closed".into(), Some("CLOSED".into()))]),
+            PublicationRequirement::DeferredUntilPublication
+        );
+    }
+
+    #[tokio::test]
+    async fn same_named_branch_in_another_project_does_not_require_publication() {
+        let db = crate::storage::migrated_test_db("publication-project-scope.db").await;
+        for (workspace, project, key) in [("w-a", "p-a", "A"), ("w-b", "p-b", "B")] {
+            db.execute(
+                "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
+                params![workspace, format!("Workspace {key}")],
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 1)",
+                params![project, workspace, format!("Project {key}"), key, format!("/repo/{key}")],
+            ).await.unwrap();
+        }
+        db.execute(
+            "INSERT INTO merge_requests
+             (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at)
+             VALUES ('mr-b', 'job-b', 'p-b', 'Other PR', 'agent/shared', 'main', 'open', 0, 1, 1)",
+            (),
+        ).await.unwrap();
+
+        assert_eq!(
+            publication_requirement_for_managed_branch(&db, "job-a", "p-a", "agent/shared").await,
+            PublicationRequirement::DeferredUntilPublication
+        );
+        assert_eq!(
+            publication_requirement_for_managed_branch(&db, "job-b", "p-b", "agent/shared").await,
+            PublicationRequirement::RequiredForOpenPr
+        );
+    }
+}
+
 const PR_COLUMNS: &str = "id, job_id, github_pr_number, github_pr_url, title, body, github_state,
     status, github_review, github_mergeable, additions, deletions, checks_status, checks_json,
     github_fetched_at, updated_at, source_branch, target_branch, is_local";
@@ -44,45 +168,6 @@ fn pr_cache_from_row(row: &cairn_db::turso::Row) -> DbResult<PrCache> {
         source_branch: row.opt_text(16)?,
         target_branch: row.opt_text(17)?,
     })
-}
-
-pub async fn get_by_job_id(db: &LocalDb, job_id: &str) -> Result<Option<PrCache>, String> {
-    let job_id = job_id.to_string();
-    db.query_opt(
-        format!("SELECT {PR_COLUMNS} FROM merge_requests WHERE job_id = ?1 LIMIT 1"),
-        params![job_id.as_str()],
-        pr_cache_from_row,
-    )
-    .await
-    .map_err(|e| format!("Failed to load PR by job: {e}"))
-}
-
-pub async fn get_by_id(db: &LocalDb, id: &str) -> Result<Option<PrCache>, String> {
-    let id = id.to_string();
-    db.query_opt(
-        format!("SELECT {PR_COLUMNS} FROM merge_requests WHERE id = ?1 LIMIT 1"),
-        params![id.as_str()],
-        pr_cache_from_row,
-    )
-    .await
-    .map_err(|e| format!("Failed to load PR by id: {e}"))
-}
-
-pub async fn get_summaries_for_jobs(
-    db: &LocalDb,
-    job_ids: &[String],
-) -> Result<Vec<PrDataSummary>, String> {
-    if job_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let mut summaries = Vec::new();
-    for job_id in job_ids {
-        if let Some(summary) = pr_summary_for_job(db, job_id, job_id).await? {
-            summaries.push(summary);
-        }
-    }
-    Ok(summaries)
 }
 
 pub async fn get_summaries_for_action_runs(

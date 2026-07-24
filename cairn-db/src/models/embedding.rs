@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventEmbedding {
-    pub event_id: String,
-    pub embedding: Vec<f32>,
-    pub model_name: String,
-    pub dimensions: i32,
-    pub created_at: i64,
+    event_id: String,
+    embedding: Vec<f32>,
+    model_name: String,
+    dimensions: i32,
+    created_at: i64,
 }

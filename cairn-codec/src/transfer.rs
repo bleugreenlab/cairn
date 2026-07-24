@@ -13,13 +13,86 @@ use std::process::{Command, Stdio};
 
 use crate::packfile::ExecutionPack;
 
+const PACK_FRAME_MAGIC: &[u8; 8] = b"CAIRNPK1";
+const PACK_FRAME_VERSION: u16 = 1;
+
+/// One stable object-store envelope for pack and generated index bytes.
+pub fn frame_pack(pack: &[u8], index: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(26 + pack.len() + index.len());
+    framed.extend_from_slice(PACK_FRAME_MAGIC);
+    framed.extend_from_slice(&PACK_FRAME_VERSION.to_be_bytes());
+    framed.extend_from_slice(&(pack.len() as u64).to_be_bytes());
+    framed.extend_from_slice(&(index.len() as u64).to_be_bytes());
+    framed.extend_from_slice(pack);
+    framed.extend_from_slice(index);
+    framed
+}
+
+/// Decode the canonical frame. The legacy two-length envelope remains readable
+/// so existing execution_history.pack_hash pointers can be cataloged lazily.
+pub fn unframe_pack(bytes: &[u8]) -> Result<ExecutionPack, String> {
+    if bytes.starts_with(PACK_FRAME_MAGIC) {
+        if bytes.len() < 26 {
+            return Err("truncated pack frame header".into());
+        }
+        let version = u16::from_be_bytes(bytes[8..10].try_into().unwrap());
+        if version != PACK_FRAME_VERSION {
+            return Err(format!("unsupported pack frame version {version}"));
+        }
+        let pack_len = usize::try_from(u64::from_be_bytes(bytes[10..18].try_into().unwrap()))
+            .map_err(|_| "pack length exceeds platform size")?;
+        let index_len = usize::try_from(u64::from_be_bytes(bytes[18..26].try_into().unwrap()))
+            .map_err(|_| "index length exceeds platform size")?;
+        let pack_end = 26usize
+            .checked_add(pack_len)
+            .ok_or("pack frame length overflow")?;
+        let end = pack_end
+            .checked_add(index_len)
+            .ok_or("pack frame length overflow")?;
+        if end != bytes.len() {
+            return Err("pack frame length mismatch".into());
+        }
+        return Ok((bytes[26..pack_end].to_vec(), bytes[pack_end..end].to_vec()));
+    }
+
+    unframe_legacy_pack(bytes)
+}
+
+fn unframe_legacy_pack(bytes: &[u8]) -> Result<ExecutionPack, String> {
+    let take = |offset: usize| -> Result<usize, String> {
+        let raw: [u8; 8] = bytes
+            .get(offset..offset + 8)
+            .ok_or("truncated legacy pack frame")?
+            .try_into()
+            .unwrap();
+        usize::try_from(u64::from_le_bytes(raw))
+            .map_err(|_| "legacy length exceeds platform size".into())
+    };
+    let pack_len = take(0)?;
+    let pack_end = 8usize
+        .checked_add(pack_len)
+        .ok_or("legacy pack length overflow")?;
+    let index_len = take(pack_end)?;
+    let index_start = pack_end + 8;
+    let end = index_start
+        .checked_add(index_len)
+        .ok_or("legacy index length overflow")?;
+    if end != bytes.len() {
+        return Err("legacy pack frame length mismatch".into());
+    }
+    Ok((
+        bytes[8..pack_end].to_vec(),
+        bytes[index_start..end].to_vec(),
+    ))
+}
+
 const SHA1_HEX_LEN: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackLimits {
-    pub max_pack_bytes: u64,
-    pub max_object_count: u64,
-    pub max_inflated_bytes: u64,
+    max_pack_bytes: u64,
+    max_object_count: u64,
+    max_inflated_bytes: u64,
 }
 
 impl Default for PackLimits {
@@ -35,9 +108,9 @@ impl Default for PackLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectSize {
     pub oid: String,
-    pub kind: String,
+    kind: String,
     /// Canonical, decompressed and undeltified Git object bytes.
-    pub canonical_bytes: u64,
+    canonical_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,7 +119,7 @@ pub struct PackManifest {
     pub pack_bytes: u64,
     pub index_bytes: u64,
     pub object_count: u64,
-    pub canonical_bytes: u64,
+    canonical_bytes: u64,
     pub objects: Vec<ObjectSize>,
 }
 
@@ -60,16 +133,16 @@ pub struct ValidatedPack {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledPack {
     pub pack_path: PathBuf,
-    pub index_path: PathBuf,
+    index_path: PathBuf,
     pub manifest: PackManifest,
-    pub already_present: bool,
+    already_present: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClosureManifest {
-    pub commit: String,
-    pub object_count: u64,
-    pub canonical_bytes: u64,
+    commit: String,
+    object_count: u64,
+    canonical_bytes: u64,
     pub objects: Vec<ObjectSize>,
 }
 
@@ -250,6 +323,10 @@ pub fn install_pack(
         let _ = fs::remove_file(&pack_path);
         return Err(format!("publishing pack index: {error}"));
     }
+    // Windows does not expose directory handles through File::open. The pack
+    // and index contents are already durable through write_synced; directory
+    // fsync is the additional rename-durability seam on platforms that support it.
+    #[cfg(not(windows))]
     File::open(&pack_dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|e| format!("syncing pack directory: {e}"))?;
@@ -305,7 +382,7 @@ pub fn verify_commit_closure(
 }
 
 /// Return canonical sizes for object IDs resolved through primary plus alternates.
-pub fn canonical_object_sizes(
+fn canonical_object_sizes(
     primary_objects_dir: &Path,
     alternate_objects_dirs: &[PathBuf],
     object_ids: &[String],
@@ -481,15 +558,21 @@ fn git(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawning git {}: {e}", args.join(" ")))?;
-    if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input)
-            .map_err(|e| e.to_string())?;
-    }
+    // Batch plumbing commands write one response per input line. Writing all
+    // input before draining piped output deadlocks once both OS pipe buffers
+    // fill, which is routine for a clone-sized object closure.
+    let writer = stdin.map(|input| {
+        let input = input.to_vec();
+        let mut pipe = child.stdin.take().unwrap();
+        std::thread::spawn(move || pipe.write_all(&input))
+    });
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| format!("git {} input writer panicked", args.join(" ")))?
+            .map_err(|e| format!("writing git {} input: {e}", args.join(" ")))?;
+    }
     if !output.status.success() {
         return Err(format!(
             "git {} failed: {}",
@@ -525,6 +608,50 @@ mod tests {
 
     fn objects_dir(repo: &Path) -> PathBuf {
         repo.join(".git/objects")
+    }
+
+    #[test]
+    fn pack_frame_is_deterministic_versioned_and_strict() {
+        let first = frame_pack(b"pack", b"index");
+        assert_eq!(first, frame_pack(b"pack", b"index"));
+        assert_eq!(
+            unframe_pack(&first).unwrap(),
+            (b"pack".to_vec(), b"index".to_vec())
+        );
+        let mut wrong_version = first.clone();
+        wrong_version[9] = 2;
+        assert!(unframe_pack(&wrong_version).is_err());
+        assert!(unframe_pack(&first[..first.len() - 1]).is_err());
+        let mut trailing = first;
+        trailing.push(0);
+        assert!(unframe_pack(&trailing).is_err());
+    }
+
+    #[test]
+    fn legacy_pack_frame_remains_readable_for_catalog_backfill() {
+        let mut legacy = (4u64).to_le_bytes().to_vec();
+        legacy.extend_from_slice(b"pack");
+        legacy.extend_from_slice(&(3u64).to_le_bytes());
+        legacy.extend_from_slice(b"idx");
+        assert_eq!(
+            unframe_pack(&legacy).unwrap(),
+            (b"pack".to_vec(), b"idx".to_vec())
+        );
+    }
+
+    #[test]
+    fn canonical_size_exchange_drains_output_while_feeding_clone_sized_input() {
+        let source = tempfile::tempdir().unwrap();
+        init_repo(source.path());
+        write_file(source.path(), "base.txt", b"base");
+        let oid = commit_all(source.path(), "base");
+        let count = 100_000;
+        let object_ids = vec![oid.clone(); count];
+
+        let sizes = canonical_object_sizes(&objects_dir(source.path()), &[], &object_ids).unwrap();
+
+        assert_eq!(sizes.len(), count);
+        assert!(sizes.iter().all(|size| size.oid == oid));
     }
 
     #[test]

@@ -18,7 +18,7 @@ fn fmt_runtime(secs: i64) -> String {
 
 /// The rich resume message an agent sees when a subscribed terminal exits:
 /// slug, exit code, runtime, the canonical URI to read, and a short output tail.
-pub fn format_terminal_exit_message(
+pub(crate) fn format_terminal_exit_message(
     slug: &str,
     detail_uri: &str,
     exit_code: Option<i32>,
@@ -65,7 +65,7 @@ fn terminal_exit_event(
 }
 
 /// Route a terminal-exit wake (sync, from the PTY/promoted exit threads).
-pub fn route_terminal_exit(
+pub(crate) fn route_terminal_exit(
     orch: &Orchestrator,
     slug: &str,
     detail_uri: &str,
@@ -99,7 +99,7 @@ pub async fn route_terminal_exit_async(
 /// The resume message an agent sees when a watched phrase appears in a live
 /// terminal's output: slug, the matched phrase, the canonical URI to read, and a
 /// short one-line excerpt (ANSI-stripped, capped) of the matching line.
-pub fn format_terminal_output_message(
+pub(crate) fn format_terminal_output_message(
     slug: &str,
     detail_uri: &str,
     phrase: &str,
@@ -139,7 +139,7 @@ fn terminal_output_event(
 }
 
 /// Route a terminal-output phrase wake (sync, from the agent PTY read loop).
-pub fn route_terminal_output(
+fn route_terminal_output(
     orch: &Orchestrator,
     subscriber_job_id: &str,
     slug: &str,
@@ -155,7 +155,7 @@ pub fn route_terminal_output(
 
 /// Route a terminal-output phrase wake from an async context (the immediate-fire
 /// path when the phrase is already in the buffer at subscribe time).
-pub async fn route_terminal_output_async(
+pub(crate) async fn route_terminal_output_async(
     orch: &Orchestrator,
     subscriber_job_id: &str,
     slug: &str,

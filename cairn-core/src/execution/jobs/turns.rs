@@ -512,7 +512,7 @@ async fn claim_retry_successor_if_head_matches_conn(
     Ok(Some(retry_turn_id))
 }
 
-pub(crate) async fn consecutive_retry_turn_count_conn(
+async fn consecutive_retry_turn_count_conn(
     conn: &cairn_db::turso::Connection,
     head_turn_id: &str,
 ) -> DbResult<u32> {
@@ -685,7 +685,7 @@ pub(crate) fn abandon_pending_retry_if_head_matches(
     })
 }
 
-pub(super) async fn next_turn_sequence_conn(
+async fn next_turn_sequence_conn(
     conn: &cairn_db::turso::Connection,
     session_id: &str,
 ) -> DbResult<i32> {
@@ -704,7 +704,7 @@ pub(super) async fn next_turn_sequence_conn(
     Ok(max_seq.map(|seq| seq as i32).unwrap_or(0) + 1)
 }
 
-pub(super) async fn get_head_turn_conn(
+async fn get_head_turn_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<TurnHead>> {
@@ -738,7 +738,7 @@ pub(super) async fn get_head_turn_conn(
         .transpose()
 }
 
-pub(super) async fn create_turn_conn(
+async fn create_turn_conn(
     conn: &cairn_db::turso::Connection,
     turn_id: &str,
     session_id: &str,
@@ -926,7 +926,7 @@ async fn followup_start_reason_conn(
     Ok(TurnStartReason::MemoryReview)
 }
 
-pub(super) async fn create_successor_turn_conn(
+async fn create_successor_turn_conn(
     conn: &cairn_db::turso::Connection,
     turn_id: &str,
     session_id: &str,
@@ -1119,7 +1119,7 @@ pub fn start_turn(orch: &Orchestrator, turn_id: &str, run_id: &str) -> Result<()
     Ok(())
 }
 
-pub(super) fn valid_running_transition(from: &JobStatus) -> bool {
+fn valid_running_transition(from: &JobStatus) -> bool {
     matches!(
         from,
         JobStatus::Pending

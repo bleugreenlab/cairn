@@ -7,7 +7,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
@@ -95,6 +98,13 @@ pub struct DbState {
     /// Live push+pull task handles, keyed by team id. Dropping a handle aborts
     /// its tasks, so this map IS the loop's lifecycle.
     sync_tasks: RwLock<HashMap<TeamId, TeamSyncHandle>>,
+    /// Whether device authentication is currently available. Team registrations
+    /// and replicas outlive an account session, but their network loops must not:
+    /// a missing device JWT is a stable signed-out state, not a retryable outage.
+    team_sync_authorized: AtomicBool,
+    /// Serializes the flag change with the corresponding task-map mutation so a
+    /// reconnect cannot be lost behind a delayed sign-out clear.
+    team_sync_lifecycle: Mutex<()>,
     /// Single-flight gate serializing team opens. `open_team` keeps a lock-free
     /// `teams.read` fast path and only acquires this on a miss, re-checking the
     /// map under it, so two concurrent opens of the same team converge on one
@@ -128,6 +138,8 @@ impl DbState {
             search_index,
             sync_runtime: RwLock::new(None),
             sync_tasks: RwLock::new(HashMap::new()),
+            team_sync_authorized: AtomicBool::new(true),
+            team_sync_lifecycle: Mutex::new(()),
             open_gate: Mutex::new(()),
             team_token_minter: RwLock::new(None),
             content_store_factory: RwLock::new(None),
@@ -164,6 +176,27 @@ impl DbState {
     /// case), so `cairn` and `CAIRN` route identically.
     fn normalize_key(key: &str) -> String {
         key.to_uppercase()
+    }
+
+    /// Resolve the owning open team for a project id. Object-plane grants fail
+    /// closed when the project is local or its team replica is not connected.
+    pub async fn team_id_for_project(&self, project_id: &str) -> Result<Option<TeamId>, String> {
+        let teams = self.teams.read().await;
+        for (team_id, db) in teams.iter() {
+            let exists = db
+                .query_opt(
+                    "SELECT id FROM projects WHERE id = ?1 LIMIT 1",
+                    (project_id.to_owned(),),
+                    |row| row.text(0),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some();
+            if exists {
+                return Ok(Some(team_id.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// Resolves the database a project's reads and writes should target.
@@ -225,7 +258,7 @@ impl DbState {
     }
 
     #[cfg(test)]
-    pub async fn register_team_db_for_test(&self, team_id: TeamId, db: Arc<LocalDb>) {
+    pub(crate) async fn register_team_db_for_test(&self, team_id: TeamId, db: Arc<LocalDb>) {
         self.teams.write().await.insert(team_id, db);
     }
 
@@ -337,6 +370,11 @@ impl DbState {
                 store: factory.store_for(&cfg.team_id),
                 private_db: Some(self.local.clone()),
             });
+            if let Err(error) =
+                crate::storage::pack_catalog::backfill_execution_pack_catalog(&db, 32).await
+            {
+                log::warn!("incremental pack catalog backfill failed: {error}");
+            }
         }
         let db = Arc::new(db);
         self.teams
@@ -346,9 +384,11 @@ impl DbState {
         // Once the host has enabled the loop, a newly opened replica (startup or
         // runtime-created) gets its push+pull tasks immediately; a team opened
         // before enablement is picked up by `enable_team_sync`.
-        if let Some(runtime) = self.sync_runtime.read().await.clone() {
-            self.spawn_team_sync(&cfg.team_id, db.clone(), &runtime)
-                .await;
+        if self.team_sync_authorized.load(Ordering::Acquire) {
+            if let Some(runtime) = self.sync_runtime.read().await.clone() {
+                self.spawn_team_sync(&cfg.team_id, db.clone(), &runtime)
+                    .await;
+            }
         }
         // Reconcile routes from the just-opened replica so a teammate's projects
         // (which carry no `project_routes` row on THIS host — only their creator
@@ -370,7 +410,9 @@ impl DbState {
     /// already running. Holds only the `sync_tasks` lock.
     async fn spawn_team_sync(&self, team_id: &TeamId, db: Arc<LocalDb>, runtime: &SyncRuntime) {
         let mut tasks = self.sync_tasks.write().await;
-        if tasks.contains_key(team_id) {
+        // Recheck under the task-map lock so a concurrent sign-out cannot clear
+        // the map and then lose a racing spawn.
+        if !self.team_sync_authorized.load(Ordering::Acquire) || tasks.contains_key(team_id) {
             return;
         }
         // A reconciler holding only the private DB, the team replica, the shared
@@ -399,6 +441,13 @@ impl DbState {
     /// dormancy guarantee for local-only installs.
     pub async fn enable_team_sync(&self, runtime: SyncRuntime) {
         *self.sync_runtime.write().await = Some(runtime.clone());
+        if !self.team_sync_authorized.load(Ordering::Acquire) {
+            return;
+        }
+        self.spawn_all_team_sync(&runtime).await;
+    }
+
+    async fn spawn_all_team_sync(&self, runtime: &SyncRuntime) {
         let open: Vec<(TeamId, Arc<LocalDb>)> = self
             .teams
             .read()
@@ -407,14 +456,36 @@ impl DbState {
             .map(|(id, db)| (id.clone(), db.clone()))
             .collect();
         for (team_id, db) in open {
-            self.spawn_team_sync(&team_id, db, &runtime).await;
+            self.spawn_team_sync(&team_id, db, runtime).await;
+        }
+    }
+
+    /// Match the team sync task lifecycle to device-auth availability. Signing
+    /// out aborts every network loop but deliberately keeps replicas and routes
+    /// open for local access. Signing back in reuses the retained runtime and
+    /// starts exactly one push/pull pair per open team.
+    pub(crate) async fn set_team_sync_authorized(&self, authorized: bool) {
+        let _lifecycle = self.team_sync_lifecycle.lock().await;
+        let was_authorized = self.team_sync_authorized.swap(authorized, Ordering::AcqRel);
+        if authorized {
+            if !was_authorized {
+                log::info!("team sync resumed after device authentication became available");
+            }
+            if let Some(runtime) = self.sync_runtime.read().await.clone() {
+                self.spawn_all_team_sync(&runtime).await;
+            }
+        } else {
+            self.sync_tasks.write().await.clear();
+            if was_authorized {
+                log::info!("team sync paused because no device authentication is available");
+            }
         }
     }
 
     /// Stop a team's sync loop and forget its replica. Dropping the handle aborts
     /// the push+pull tasks; integrity holds because an aborted op marks nothing
     /// done and unpushed frames simply retry on a future open.
-    pub async fn close_team(&self, team_id: &str) {
+    async fn close_team(&self, team_id: &str) {
         self.sync_tasks.write().await.remove(team_id);
         self.teams.write().await.remove(team_id);
     }
@@ -469,7 +540,7 @@ impl DbState {
     /// "which teams to reopen at startup" set. The account-teams reconcile
     /// diffs this against the account's current org memberships to find teams
     /// the user no longer belongs to and forget them.
-    pub async fn registered_team_ids(&self) -> DbResult<Vec<String>> {
+    pub(crate) async fn registered_team_ids(&self) -> DbResult<Vec<String>> {
         self.local
             .query_all("SELECT id FROM teams", (), |row| row.text(0))
             .await
@@ -497,7 +568,7 @@ impl DbState {
     /// on-disk replica file is left in place (inert once closed and
     /// deregistered); a rejoin re-bootstraps it. Idempotent: a team never
     /// registered or opened is a no-op. Returns whether a registry row existed.
-    pub async fn forget_team(&self, team_id: &str) -> DbResult<bool> {
+    pub(crate) async fn forget_team(&self, team_id: &str) -> DbResult<bool> {
         // In-memory teardown: abort the sync tasks and drop the replica handle.
         self.close_team(team_id).await;
         // Drop route-cache entries that pointed at this team so a stale read
@@ -569,7 +640,7 @@ impl DbState {
     /// that team outboxes DRAIN (locally-originated writes index) rather than
     /// accumulate; indexing pull-arrived rows on a receiving replica, whose
     /// triggers never fired, is a deferred follow-up.
-    pub async fn apply_pending_search(&self) -> DbResult<usize> {
+    pub(crate) async fn apply_pending_search(&self) -> DbResult<usize> {
         let mut total = 0;
         for db in self.all_dbs().await {
             total += self.search_index.apply_pending(&db).await?;
@@ -734,7 +805,7 @@ async fn ensure_executor_registry_table(team_db: &LocalDb) {
             device_id TEXT NOT NULL, executor_id TEXT NOT NULL, display_name TEXT NOT NULL, \
             os TEXT NOT NULL, arch TEXT NOT NULL, logical_cores INTEGER NOT NULL, \
             toolchains TEXT NOT NULL DEFAULT '[]', projects_served TEXT NOT NULL DEFAULT '[]', \
-            slot_capacity INTEGER NOT NULL, current_load INTEGER NOT NULL, \
+            current_load INTEGER NOT NULL, \
             warm_commits TEXT NOT NULL DEFAULT '[]', connection_generation INTEGER NOT NULL, \
             status TEXT NOT NULL, last_seen INTEGER NOT NULL, expires_at INTEGER NOT NULL, \
             updated_at INTEGER NOT NULL, PRIMARY KEY (device_id, executor_id))",
@@ -903,44 +974,44 @@ impl RouteReconcile for TeamRouteReconciler {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationStatus {
-    pub needed: bool,
-    pub pending_migrations: Vec<String>,
-    pub current_db_path: String,
-    pub error_message: Option<String>,
+    needed: bool,
+    pending_migrations: Vec<String>,
+    current_db_path: String,
+    error_message: Option<String>,
 }
 
 /// Schema change detected during migration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchemaChange {
-    pub table: String,
-    pub change_type: String,
-    pub old_name: Option<String>,
-    pub new_name: Option<String>,
-    pub auto_mapped: bool,
+    table: String,
+    change_type: String,
+    old_name: Option<String>,
+    new_name: Option<String>,
+    auto_mapped: bool,
 }
 
 /// Per-table result for frontend display
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableMigrationResult {
-    pub name: String,
-    pub old_count: usize,
-    pub new_count: usize,
-    pub status: String,
-    pub error: Option<String>,
+    name: String,
+    old_count: usize,
+    new_count: usize,
+    status: String,
+    error: Option<String>,
 }
 
 /// Final migration result for frontend display
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationResult {
-    pub success: bool,
-    pub tables: Vec<TableMigrationResult>,
-    pub schema_changes: Vec<SchemaChange>,
-    pub total_rows_restored: usize,
-    pub total_rows_attempted: usize,
-    pub warnings: Vec<String>,
+    success: bool,
+    tables: Vec<TableMigrationResult>,
+    schema_changes: Vec<SchemaChange>,
+    total_rows_restored: usize,
+    total_rows_attempted: usize,
+    warnings: Vec<String>,
 }
 
 const STANDALONE_IMPORT_MESSAGE: &str =
@@ -1443,5 +1514,65 @@ mod tests {
             Some("Acme".to_string())
         );
         assert_eq!(dbs.registered_team_name("missing").await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn device_auth_transition_pauses_and_rearms_open_team_sync_tasks() {
+        let dbs = db_state("db-bridge-sync-auth-lifecycle.db").await;
+        let team_id = "teamABC123".to_string();
+        dbs.teams.write().await.insert(
+            team_id.clone(),
+            Arc::new(migrated_team_db("db-bridge-sync-auth-team.db").await),
+        );
+        dbs.enable_team_sync(SyncRuntime {
+            emitter: Arc::new(crate::services::testing::CapturingEmitter::new()),
+            cadence: SyncCadence::default(),
+        })
+        .await;
+
+        assert!(dbs.sync_tasks.read().await.contains_key(&team_id));
+        dbs.set_team_sync_authorized(false).await;
+        assert!(dbs.sync_tasks.read().await.is_empty());
+
+        // Repeating the stable signed-out state stays inert. A genuine auth
+        // transition is what re-arms the retained runtime.
+        dbs.set_team_sync_authorized(false).await;
+        assert!(dbs.sync_tasks.read().await.is_empty());
+        dbs.set_team_sync_authorized(true).await;
+        assert!(dbs.sync_tasks.read().await.contains_key(&team_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_waiting_behind_sign_out_cannot_lose_its_rearm() {
+        let dbs = Arc::new(db_state("db-bridge-sync-auth-race.db").await);
+        let team_id = "teamABC123".to_string();
+        dbs.teams.write().await.insert(
+            team_id.clone(),
+            Arc::new(migrated_team_db("db-bridge-sync-auth-race-team.db").await),
+        );
+        dbs.enable_team_sync(SyncRuntime {
+            emitter: Arc::new(crate::services::testing::CapturingEmitter::new()),
+            cadence: SyncCadence::default(),
+        })
+        .await;
+
+        // Hold the lifecycle gate while both transitions queue. Tokio's mutex is
+        // FIFO, so sign-out runs first and reconnect must re-arm after its clear.
+        let gate = dbs.team_sync_lifecycle.lock().await;
+        let sign_out = {
+            let dbs = dbs.clone();
+            tokio::spawn(async move { dbs.set_team_sync_authorized(false).await })
+        };
+        tokio::task::yield_now().await;
+        let reconnect = {
+            let dbs = dbs.clone();
+            tokio::spawn(async move { dbs.set_team_sync_authorized(true).await })
+        };
+        drop(gate);
+        sign_out.await.unwrap();
+        reconnect.await.unwrap();
+
+        assert!(dbs.team_sync_authorized.load(Ordering::Acquire));
+        assert!(dbs.sync_tasks.read().await.contains_key(&team_id));
     }
 }

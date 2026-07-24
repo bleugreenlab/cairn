@@ -10,6 +10,143 @@ pub(crate) struct ManagedWorkspaceContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedWorkspaceGitTarget {
+    pub repository: PathBuf,
+    pub git_common_dir: PathBuf,
+    pub store_dir: PathBuf,
+    pub workspace: PathBuf,
+}
+
+fn canonical_path(path: &Path, context: &str) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|error| format!("{context} {}: {error}", path.display()))
+}
+
+fn resolve_git_common_dir(repository: &Path, purpose: &str) -> Result<PathBuf, String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| format!("resolve {purpose} repository Git common directory: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "resolve {purpose} repository Git common directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    canonical_path(
+        &if common.is_absolute() {
+            common
+        } else {
+            repository.join(common)
+        },
+        &format!("canonicalize {purpose} repository Git common directory"),
+    )
+}
+
+/// Prove that a managed workspace, its configured shared store, and the Git
+/// repository used for materialization all name one production topology.
+/// Callers provide the store path they are actually acting under (the held lock
+/// for publication, the canonical project store for check dispatch), so neither
+/// path can accidentally address a sibling jj operation store or Git checkout.
+pub(crate) fn resolve_managed_workspace_git_target(
+    config_dir: &Path,
+    context: &ManagedWorkspaceContext,
+    store_path: &Path,
+    purpose: &str,
+) -> Result<ManagedWorkspaceGitTarget, String> {
+    let repository = canonical_path(
+        &context.identity.project_root,
+        &format!("canonicalize {purpose} managed project repository"),
+    )?;
+    let workspace = canonical_path(
+        &context.identity.worktree_path,
+        &format!("canonicalize {purpose} managed workspace"),
+    )?;
+    let store_dir = canonical_path(
+        store_path,
+        &format!("canonicalize {purpose} managed shared store"),
+    )?;
+    let expected_store = canonical_path(
+        &crate::jj::project_store_dir(config_dir, &context.identity.project_root),
+        &format!("canonicalize {purpose} expected managed shared store"),
+    )?;
+    if store_dir != expected_store {
+        return Err(format!(
+            "{purpose} store mismatch: selected shared store resolves to {}, managed project store resolves to {}",
+            store_dir.display(),
+            expected_store.display()
+        ));
+    }
+
+    let workspace_repo_pointer = workspace.join(".jj").join("repo");
+    let workspace_repo = std::fs::read_to_string(&workspace_repo_pointer).map_err(|error| {
+        format!(
+            "read {purpose} managed workspace repository pointer {}: {error}",
+            workspace_repo_pointer.display()
+        )
+    })?;
+    let workspace_repo = PathBuf::from(workspace_repo.trim());
+    let workspace_repo = canonical_path(
+        &if workspace_repo.is_absolute() {
+            workspace_repo
+        } else {
+            workspace_repo_pointer
+                .parent()
+                .unwrap_or(&workspace)
+                .join(workspace_repo)
+        },
+        &format!("resolve {purpose} managed workspace .jj/repo"),
+    )?;
+    let store_repo = canonical_path(
+        &store_dir.join(".jj").join("repo"),
+        &format!("resolve {purpose} managed shared-store .jj/repo"),
+    )?;
+    if workspace_repo != store_repo {
+        return Err(format!(
+            "{purpose} store mismatch: workspace .jj/repo resolves to {}, selected shared store resolves to {}",
+            workspace_repo.display(),
+            store_repo.display()
+        ));
+    }
+
+    let git_common_dir = resolve_git_common_dir(&repository, purpose)?;
+    let git_target_file = store_repo.join("store").join("git_target");
+    let git_target = std::fs::read_to_string(&git_target_file).map_err(|error| {
+        format!(
+            "read {purpose} shared-store Git target {}: {error}",
+            git_target_file.display()
+        )
+    })?;
+    let git_target = PathBuf::from(git_target.trim());
+    let git_target = canonical_path(
+        &if git_target.is_absolute() {
+            git_target
+        } else {
+            git_target_file
+                .parent()
+                .unwrap_or(&store_repo)
+                .join(git_target)
+        },
+        &format!("canonicalize {purpose} shared-store Git target"),
+    )?;
+    if git_target != git_common_dir {
+        return Err(format!(
+            "{purpose} Git backend mismatch: shared store targets {}, managed project repository common directory is {}",
+            git_target.display(),
+            git_common_dir.display()
+        ));
+    }
+
+    Ok(ManagedWorkspaceGitTarget {
+        repository,
+        git_common_dir,
+        store_dir,
+        workspace,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchOwnershipEvidence {
     pub prior_same_lineage: bool,
     pub conflicting_owner: Option<String>,
@@ -88,7 +225,7 @@ async fn project_root_conn(
 /// Resolve the stable owner by walking parent links only while the parent shares
 /// the exact physical worktree. This is the durable lineage relation used by
 /// inherited tasks/calls/workflows; commit ancestry is deliberately irrelevant.
-pub(crate) async fn resolve_managed_workspace_context_conn(
+async fn resolve_managed_workspace_context_conn(
     conn: &cairn_db::turso::Connection,
     current_job_id: &str,
 ) -> DbResult<Option<ManagedWorkspaceContext>> {
@@ -234,12 +371,57 @@ pub(crate) async fn assign_workspace_if_unset_or_same(
     .map_err(|e| db_error("Failed to assign managed workspace", e))
 }
 
+/// Restore the coordinates that preceded a failed provisioning attempt. The
+/// compare-and-swap prevents cleanup from erasing a concurrent reassignment.
+pub(crate) async fn restore_workspace_assignment(
+    db: Arc<LocalDb>,
+    job_id: String,
+    current_path: String,
+    current_branch: String,
+    restore_path: Option<String>,
+    restore_branch: Option<String>,
+    now: i32,
+) -> Result<(), String> {
+    db.write(|conn| {
+        let job_id = job_id.clone();
+        let current_path = current_path.clone();
+        let current_branch = current_branch.clone();
+        let restore_path = restore_path.clone();
+        let restore_branch = restore_branch.clone();
+        Box::pin(async move {
+            let changed = conn
+                .execute(
+                    "UPDATE jobs
+                     SET worktree_path = ?1, branch = ?2, updated_at = ?3
+                     WHERE id = ?4 AND worktree_path = ?5 AND branch = ?6",
+                    cairn_db::turso::params![
+                        restore_path.as_deref(),
+                        restore_branch.as_deref(),
+                        now,
+                        job_id.as_str(),
+                        current_path.as_str(),
+                        current_branch.as_str()
+                    ],
+                )
+                .await?;
+            if changed != 1 {
+                return Err(db_internal(format!(
+                    "workspace assignment changed concurrently while restoring job {job_id}"
+                )));
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| db_error("Failed to restore managed workspace assignment", e))
+}
+
 /// Compare-and-swap a rewritten base commit on the stable owner, then update
 /// every non-terminal job intentionally sharing the exact physical workspace and
 /// old base coordinate. The pack anchor remains historical; only the live lineage
 /// proof coordinate follows jj's stable change through its rewritten commit id.
 pub(crate) async fn compare_and_swap_owner_base(
-    db: Arc<LocalDb>,
+    db: &LocalDb,
     owner_job_id: String,
     worktree_path: String,
     old_base: String,
@@ -268,10 +450,16 @@ pub(crate) async fn compare_and_swap_owner_base(
                     ),
                 )
                 .await?;
-            if changed != 1 {
-                return Err(db_internal(format!(
-                    "workspace base assignment changed concurrently for owner {owner_job_id}"
-                )));
+            if changed == 0 {
+                let current = load_job_conn(conn, &owner_job_id)
+                    .await?
+                    .and_then(|job| job.base_commit);
+                if current.as_deref() != Some(new_base.as_str()) {
+                    return Err(db_internal(format!(
+                        "workspace base assignment changed concurrently for owner {owner_job_id}; expected {old_base} or completed {new_base}, found {}",
+                        current.as_deref().unwrap_or("missing")
+                    )));
+                }
             }
             conn.execute(
                 "UPDATE jobs SET base_commit = ?1, updated_at = ?2
@@ -291,6 +479,68 @@ pub(crate) async fn compare_and_swap_owner_base(
     })
     .await
     .map_err(|e| db_error("Failed to refresh managed workspace base", e))
+}
+
+/// Execute one forward durable-base transition using the physical marker as the
+/// write-ahead record. Retrying after any marker/database boundary is idempotent.
+pub(crate) async fn apply_base_transition(
+    db: &LocalDb,
+    worktree: &Path,
+    marker: &mut crate::jj::WorkspaceIdentity,
+    old_base: &str,
+    new_base: &str,
+) -> Result<(), String> {
+    if old_base == new_base {
+        marker.base_commit = new_base.to_string();
+        marker.pending_base_transition = None;
+        return crate::jj::write_workspace_identity(worktree, marker);
+    }
+
+    match marker.pending_base_transition.as_ref() {
+        Some(pending) if pending.old_base == old_base && pending.new_base == new_base => {}
+        Some(pending) => {
+            return Err(format!(
+                "workspace already has a different pending base transition {} -> {}; refused {old_base} -> {new_base}",
+                pending.old_base, pending.new_base
+            ));
+        }
+        None => {
+            marker.pending_base_transition = Some(crate::jj::WorkspaceBaseTransition {
+                old_base: old_base.to_string(),
+                new_base: new_base.to_string(),
+            });
+            crate::jj::write_workspace_identity(worktree, marker).map_err(|error| {
+                format!(
+                    "could not record pending base transition {old_base} -> {new_base} at {} before database update: {error}",
+                    worktree.display()
+                )
+            })?;
+        }
+    }
+
+    compare_and_swap_owner_base(
+        db,
+        marker.owner_job_id.clone(),
+        worktree.to_string_lossy().to_string(),
+        old_base.to_string(),
+        new_base.to_string(),
+        chrono::Utc::now().timestamp() as i32,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "pending base transition {old_base} -> {new_base} remains recorded for retry after database update failed: {error}"
+        )
+    })?;
+
+    marker.base_commit = new_base.to_string();
+    marker.pending_base_transition = None;
+    crate::jj::write_workspace_identity(worktree, marker).map_err(|error| {
+        format!(
+            "database base reached {new_base}; pending marker transition {old_base} -> {new_base} remains recoverable at {} because finalization failed: {error}",
+            worktree.display()
+        )
+    })
 }
 
 /// Compare-and-swap the stable owner, then update every non-terminal job that
@@ -416,7 +666,7 @@ mod tests {
         .await
         .unwrap();
         compare_and_swap_owner_base(
-            db.clone(),
+            db.as_ref(),
             "owner".into(),
             "/worktree".into(),
             "old-base".into(),
@@ -448,12 +698,57 @@ mod tests {
             "the archival anchor remains the historical coordinate"
         );
         assert!(compare_and_swap_owner_base(
-            db,
+            db.as_ref(),
             "owner".into(),
             "/worktree".into(),
             "old-base".into(),
             "other-base".into(),
             4,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_provisioning_restores_only_its_own_reservation() {
+        let db = Arc::new(migrated_test_db("workspace-restore-cas.db").await);
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO jobs (id, project_id, status, worktree_path, branch, created_at, updated_at)
+             VALUES ('job', 'project', 'running', '/reserved', 'agent/reserved', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        restore_workspace_assignment(
+            db.clone(),
+            "job".into(),
+            "/reserved".into(),
+            "agent/reserved".into(),
+            None,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM jobs WHERE id = 'job' AND worktree_path IS NULL AND branch IS NULL",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        assert!(restore_workspace_assignment(
+            db,
+            "job".into(),
+            "/reserved".into(),
+            "agent/reserved".into(),
+            None,
+            None,
+            3,
         )
         .await
         .is_err());

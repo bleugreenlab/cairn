@@ -13,20 +13,20 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Rendered {
     pub body: String,
-    pub suffix: Option<String>,
+    pub(crate) suffix: Option<String>,
 }
 
 /// One location row: file-relative path, 1-based line, single-line snippet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocationHit {
-    pub path: String,
-    pub line: u32,
-    pub snippet: String,
+    pub(crate) path: String,
+    pub(crate) line: u32,
+    pub(crate) snippet: String,
 }
 
 impl Rendered {
     /// A plain message with no header suffix.
-    pub fn message(body: impl Into<String>) -> Self {
+    pub(crate) fn message(body: impl Into<String>) -> Self {
         Self {
             body: body.into(),
             suffix: None,
@@ -35,7 +35,7 @@ impl Rendered {
 }
 
 /// Render location hits as grep-style rows with a match-count suffix.
-pub fn render_locations(hits: &[LocationHit]) -> Rendered {
+pub(crate) fn render_locations(hits: &[LocationHit]) -> Rendered {
     if hits.is_empty() {
         return Rendered {
             body: "no results".to_string(),
@@ -66,7 +66,7 @@ pub fn render_locations(hits: &[LocationHit]) -> Rendered {
 /// `root` resolves each hit's relative path back to its file for source lines.
 /// Context lines are shown untrimmed (like grep) so indentation is visible;
 /// the no-context path keeps the existing trimmed `path:N:snippet` rows.
-pub fn render_locations_with_context(
+pub(crate) fn render_locations_with_context(
     root: &Path,
     hits: &[LocationHit],
     before: usize,

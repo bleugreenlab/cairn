@@ -43,6 +43,164 @@ pub(super) struct FileChangePayload {
     pub replace_all: Option<bool>,
 }
 
+pub(super) fn logical_paths_for_changes(
+    worktree: &std::path::Path,
+    changes: &[IndexedChange<'_>],
+    allow_escape: bool,
+) -> Result<Vec<String>, String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for change in changes {
+        let item = change.item;
+        if item.mode == ChangeMode::UnifiedPatch {
+            let payload: FileChangePayload = item
+                .payload
+                .clone()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            let patch = payload
+                .patch
+                .as_deref()
+                .ok_or_else(|| "mode=unified_patch requires payload.patch".to_string())?;
+            for section in crate::mcp::diff::parse_patch_envelope(patch)? {
+                let path = match section {
+                    PatchEnvelopeFileChange::Add { path, .. }
+                    | PatchEnvelopeFileChange::Update { path, .. }
+                    | PatchEnvelopeFileChange::Delete { path } => path,
+                };
+                paths.insert(path.trim_start_matches('/').to_string());
+            }
+            continue;
+        }
+        let target = normalize_change_target(&item.target, allow_escape)?;
+        let full = resolve_change_target(worktree, &target, allow_escape)?;
+        if !path_escapes_worktree(worktree, &full) {
+            paths.insert(target.strip_prefix("file:").unwrap_or_default().to_string());
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+pub(super) fn apply_logical_file_batch(
+    request: &McpCallbackRequest,
+    changes: &[IndexedChange<'_>],
+    allow_escape: bool,
+    snapshot: &std::collections::HashMap<String, Option<String>>,
+) -> IndexedResult<FileBatchSuccess> {
+    let worktree = std::path::Path::new(&request.cwd);
+    let (prepared, summaries) =
+        prepare_file_changes_with_snapshot(worktree, changes, allow_escape, snapshot.clone())?;
+    apply_prepared_logical(changes, &prepared, &summaries, snapshot)
+}
+
+pub(super) fn apply_prepared_logical(
+    changes: &[IndexedChange<'_>],
+    prepared: &[PreparedChange],
+    summaries: &[String],
+    snapshot: &std::collections::HashMap<String, Option<String>>,
+) -> IndexedResult<FileBatchSuccess> {
+    let mut affected_paths = Vec::new();
+    let mut recorded_changes = Vec::new();
+    let mut logical_mutations = Vec::new();
+    for prepared_change in prepared {
+        match prepared_change {
+            PreparedChange::Write {
+                change_pos,
+                target_uri,
+                repo_path,
+                full_path,
+                content,
+                is_new,
+                outside_worktree,
+            } => {
+                let indexed = &changes[*change_pos];
+                if *outside_worktree {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|error| build_failure(indexed.index, indexed.item, format!("Failed to create parent directories for '{target_uri}': {error}")))?;
+                    }
+                    std::fs::write(full_path, content).map_err(|error| {
+                        build_failure(
+                            indexed.index,
+                            indexed.item,
+                            format!("Failed to write '{target_uri}': {error}"),
+                        )
+                    })?;
+                } else {
+                    let before = snapshot.get(target_uri).and_then(|value| value.as_deref());
+                    let (additions, deletions) = changed_line_counts(before, Some(content));
+                    affected_paths.push(repo_path.clone());
+                    recorded_changes.push(RecordFileChange {
+                        path: repo_path.clone(),
+                        status: if *is_new { "added" } else { "modified" },
+                        additions,
+                        deletions,
+                    });
+                    logical_mutations.push(cairn_vcs::LogicalTreeMutation {
+                        path: repo_path.clone(),
+                        content: Some(content.as_bytes().to_vec()),
+                    });
+                }
+            }
+            PreparedChange::Delete {
+                change_pos,
+                target_uri,
+                repo_path,
+                full_path,
+                outside_worktree,
+            } => {
+                let indexed = &changes[*change_pos];
+                if *outside_worktree {
+                    if full_path.exists() {
+                        std::fs::remove_file(full_path).map_err(|error| {
+                            build_failure(
+                                indexed.index,
+                                indexed.item,
+                                format!("Failed to delete '{target_uri}': {error}"),
+                            )
+                        })?;
+                    }
+                } else {
+                    let before = snapshot.get(target_uri).and_then(|value| value.as_deref());
+                    let (additions, deletions) = changed_line_counts(before, None);
+                    affected_paths.push(repo_path.clone());
+                    recorded_changes.push(RecordFileChange {
+                        path: repo_path.clone(),
+                        status: "deleted",
+                        additions,
+                        deletions,
+                    });
+                    logical_mutations.push(cairn_vcs::LogicalTreeMutation {
+                        path: repo_path.clone(),
+                        content: None,
+                    });
+                }
+            }
+        }
+    }
+    let applied = prepared
+        .iter()
+        .zip(summaries)
+        .map(|(prepared_change, summary)| {
+            let change = &changes[prepared_change.change_pos()];
+            AppliedChange {
+                index: change.index,
+                target: prepared_change.target_uri().to_string(),
+                mode: mode_name(change.item.mode).to_string(),
+                kind: "file".to_string(),
+                summary: summary.clone(),
+                data: None,
+            }
+        })
+        .collect();
+    Ok(FileBatchSuccess {
+        applied,
+        affected_paths,
+        recorded_changes,
+        logical_mutations,
+    })
+}
+
 pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -281,38 +439,30 @@ pub(super) struct FileBatchSuccess {
     pub(super) applied: Vec<AppliedChange>,
     pub(super) affected_paths: Vec<String>,
     pub(super) recorded_changes: Vec<RecordFileChange>,
+    pub(super) logical_mutations: Vec<cairn_vcs::LogicalTreeMutation>,
 }
 
-/// Outcome of [`finalize_file_commit`]'s seal attempt.
-///
-/// `Done` is the normal terminal state (sealed, or nothing to seal). `StaleRetry`
-/// means the seal hit a STALE working copy: a sibling rewrote `@` over the shared
-/// store between apply and seal. The edits are deliberately left ON DISK (not
-/// discarded), so `handle_write` can update-stale, re-apply against the advanced
-/// base, and re-seal — recovering the batch instead of losing it. It carries the
-/// seal error string so the giveup path can report what went wrong. Only the
-/// write+commit_msg path can recover (the handler can re-derive its intended
-/// content); the run path can't, so it reverts via the stale-resilient discard.
-///
-/// `ConflictedBranch` is the divergent-seal refusal: the branch bookmark tip
-/// carries a recorded CONFLICT and `@` has diverged from it (a deliberate
-/// resolve-at-base flatten). It is NEITHER `Done` nor `StaleRetry` — the edits
-/// must be PRESERVED on disk (discarding destroys the resolved flatten) and the
-/// update-stale → re-apply → re-seal loop can never converge (the workspace is
-/// not stale). `handle_write` surfaces a typed error pointing at the flatten
-/// procedure instead of discarding or retrying.
+pub(super) struct PostSealPublication {
+    pub(super) db: std::sync::Arc<crate::storage::LocalDb>,
+    pub(super) project_id: String,
+    pub(super) repository: std::path::PathBuf,
+}
+
+pub(super) struct CompletedCommit {
+    pub(super) report: Option<CommitReport>,
+    pub(super) publication_requirement: crate::merge_requests::queries::PublicationRequirement,
+    pub(super) publication: Option<PostSealPublication>,
+}
+
 pub(super) enum CommitOutcome {
-    Done(Option<CommitReport>),
-    StaleRetry { seal_error: String },
-    ConflictedBranch { seal_error: String },
-    LineageMismatch { seal_error: String },
+    Done(CompletedCommit),
 }
 
 pub(super) struct RecordFileChange {
-    path: String,
-    status: &'static str,
-    additions: i32,
-    deletions: i32,
+    pub(super) path: String,
+    pub(super) status: &'static str,
+    pub(super) additions: i32,
+    pub(super) deletions: i32,
 }
 
 /// Build a helpful message when a literal (non-wildcard) `old_string` is not
@@ -348,7 +498,7 @@ const MAX_DIAGNOSTIC_LINE_CHARS: usize = 180;
 /// would let the caller believe they edited the unique site they meant, so this
 /// remains an explicit refusal. The matching excerpts make the safe follow-up
 /// edit possible without a separate discovery read.
-pub(crate) fn non_unique_match_diagnostic(
+fn non_unique_match_diagnostic(
     target: &str,
     content: &str,
     old_string: &str,
@@ -836,10 +986,22 @@ pub(super) fn prepare_file_changes(
     changes: &[IndexedChange<'_>],
     allow_escape: bool,
 ) -> IndexedResult<PreparedFileChanges> {
+    prepare_file_changes_with_snapshot(
+        worktree,
+        changes,
+        allow_escape,
+        std::collections::HashMap::new(),
+    )
+}
+
+pub(super) fn prepare_file_changes_with_snapshot(
+    worktree: &std::path::Path,
+    changes: &[IndexedChange<'_>],
+    allow_escape: bool,
+    mut in_flight: std::collections::HashMap<String, Option<String>>,
+) -> IndexedResult<PreparedFileChanges> {
     let mut prepared: Vec<PreparedChange> = Vec::with_capacity(changes.len());
     let mut summaries: Vec<String> = Vec::with_capacity(changes.len());
-    let mut in_flight: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
 
     for (change_pos, change) in changes.iter().enumerate() {
         let item = change.item;
@@ -1094,165 +1256,6 @@ pub(super) fn prepare_file_changes(
     Ok((prepared, summaries))
 }
 
-pub(super) fn apply_file_batch(
-    request: &McpCallbackRequest,
-    changes: &[IndexedChange<'_>],
-    allow_escape: bool,
-) -> IndexedResult<FileBatchSuccess> {
-    let worktree = std::path::Path::new(&request.cwd);
-    let (prepared, summaries) = prepare_file_changes(worktree, changes, allow_escape)?;
-    apply_prepared(changes, &prepared, &summaries)
-}
-
-/// Apply already-prepared file changes to disk: write or delete each path,
-/// record the in-worktree changes for the `changed` resource, and build the
-/// per-change `applied` report. Factored out of [`apply_file_batch`] so the
-/// rename mode reuses the exact disk-application + recording step with synthetic
-/// prepared changes computed from the ast-grep rename plan.
-pub(super) fn apply_prepared(
-    changes: &[IndexedChange<'_>],
-    prepared: &[PreparedChange],
-    summaries: &[String],
-) -> IndexedResult<FileBatchSuccess> {
-    let mut affected_paths: Vec<String> = Vec::with_capacity(prepared.len());
-    let mut recorded_changes: Vec<RecordFileChange> = Vec::with_capacity(prepared.len());
-
-    for change in prepared.iter() {
-        match change {
-            PreparedChange::Write {
-                change_pos,
-                target_uri,
-                repo_path,
-                full_path,
-                content,
-                is_new,
-                outside_worktree,
-            } => {
-                let indexed_change = &changes[*change_pos];
-                let previous_content = if !*outside_worktree && full_path.exists() {
-                    Some(
-                        std::fs::read(full_path)
-                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                            .map_err(|e| {
-                                build_failure(
-                                    indexed_change.index,
-                                    indexed_change.item,
-                                    format!("Failed to read '{target_uri}': {e}"),
-                                )
-                            })?,
-                    )
-                } else {
-                    None
-                };
-
-                if let Some(parent) = full_path.parent() {
-                    if !parent.exists() {
-                        std::fs::create_dir_all(parent).map_err(|e| {
-                            build_failure(
-                                indexed_change.index,
-                                indexed_change.item,
-                                format!(
-                                    "Failed to create parent directories for '{target_uri}': {e}"
-                                ),
-                            )
-                        })?;
-                    }
-                }
-                std::fs::write(full_path, content).map_err(|e| {
-                    build_failure(
-                        indexed_change.index,
-                        indexed_change.item,
-                        format!("Failed to write '{target_uri}': {e}"),
-                    )
-                })?;
-                // Outside-worktree writes are applied to disk but never staged
-                // or recorded: they are not part of the worktree's branch.
-                if !*outside_worktree {
-                    let (additions, deletions) =
-                        changed_line_counts(previous_content.as_deref(), Some(content));
-                    affected_paths.push(repo_path.clone());
-                    recorded_changes.push(RecordFileChange {
-                        path: repo_path.clone(),
-                        status: if *is_new { "added" } else { "modified" },
-                        additions,
-                        deletions,
-                    });
-                }
-            }
-            PreparedChange::Delete {
-                change_pos,
-                target_uri,
-                repo_path,
-                full_path,
-                outside_worktree,
-            } => {
-                let indexed_change = &changes[*change_pos];
-                let previous_content = if !*outside_worktree && full_path.exists() {
-                    Some(
-                        std::fs::read(full_path)
-                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                            .map_err(|e| {
-                                build_failure(
-                                    indexed_change.index,
-                                    indexed_change.item,
-                                    format!("Failed to read '{target_uri}': {e}"),
-                                )
-                            })?,
-                    )
-                } else {
-                    None
-                };
-
-                if full_path.exists() {
-                    std::fs::remove_file(full_path).map_err(|e| {
-                        build_failure(
-                            indexed_change.index,
-                            indexed_change.item,
-                            format!("Failed to delete '{target_uri}': {e}"),
-                        )
-                    })?;
-                }
-                if !*outside_worktree {
-                    let (additions, deletions) =
-                        changed_line_counts(previous_content.as_deref(), None);
-                    affected_paths.push(repo_path.clone());
-                    recorded_changes.push(RecordFileChange {
-                        path: repo_path.clone(),
-                        status: "deleted",
-                        additions,
-                        deletions,
-                    });
-                }
-            }
-        }
-    }
-
-    let applied = prepared
-        .iter()
-        .zip(summaries.iter())
-        .map(|(prepared_change, summary)| {
-            let change = &changes[prepared_change.change_pos()];
-            AppliedChange {
-                index: change.index,
-                target: match prepared_change {
-                    PreparedChange::Write { target_uri, .. }
-                    | PreparedChange::Delete { target_uri, .. } => target_uri.clone(),
-                },
-                mode: mode_name(change.item.mode).to_string(),
-                kind: "file".to_string(),
-                summary: summary.clone(),
-                data: None,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    Ok(FileBatchSuccess {
-        applied,
-        affected_paths,
-        recorded_changes,
-    })
-}
-
 pub(crate) fn emit_worktree_changed(orch: &Orchestrator, cwd: &str) {
     let _ = orch.services.emitter.emit(
         "worktree-changed",
@@ -1433,76 +1436,47 @@ pub(super) fn prepare_rename_changes(
     (prepared, applied, summaries)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn finalize_file_commit(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     commit_msg: Option<&str>,
     affected_paths: &[String],
-    recorded_changes: &[RecordFileChange],
+    _recorded_changes: &[RecordFileChange],
     first_change: &IndexedChange<'_>,
     promoted_memory_uris: &[String],
+    logical_resolution: &super::super::branch::BranchResolution,
+    logical_mutations: &[cairn_vcs::LogicalTreeMutation],
 ) -> IndexedResult<CommitOutcome> {
     if affected_paths.is_empty() {
-        return Ok(CommitOutcome::Done(None));
-    }
-
-    // Record the file changes for this job as soon as they're applied — NOT only
-    // when committed. The `changed` resource (`cairn://.../changed`) reads the
-    // `file_changes` table, and a gated artifact is reviewed *before* its node
-    // commits/PRs, so uncommitted worktree edits must already be recorded or the
-    // review loop has no diff to show.
-    for change in recorded_changes {
-        if let Err(e) = record_file_change_async(
-            orch,
-            &request.cwd,
-            &change.path,
-            change.status,
-            change.additions,
-            change.deletions,
-            None,
-        )
-        .await
-        {
-            log::warn!("Failed to record file change: {}", e);
-        }
+        return Ok(CommitOutcome::Done(CompletedCommit {
+            report: None,
+            publication_requirement:
+                crate::merge_requests::queries::PublicationRequirement::DeferredUntilPublication,
+            publication: None,
+        }));
     }
 
     // Route worktree mutations through the VCS seam (jj for a worktree). A
     // non-worktree cwd is rejected up front in `handle_write`, so this path
     // always sees a jj workspace.
-    let managed_context =
+    let (managed_context, routed_db) =
         match super::super::run_context::lookup_run_routed(&orch.db, request).await {
             Ok((run, db)) => {
-                crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
-                    db, run.job_id,
-                )
-                .await
-                .ok()
-                .flatten()
+                let context =
+                    crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
+                        db.clone(),
+                        run.job_id,
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                (context, Some(db))
             }
-            Err(_) => None,
+            Err(_) => (None, None),
         };
-    let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
-        orch,
-        std::path::Path::new(&request.cwd),
-        managed_context.as_ref(),
-    );
-
     let Some(commit_msg) = commit_msg else {
-        // The file edits are already on disk. With no commit_msg, restore the
-        // worktree to HEAD (preserving the worktree==HEAD invariant the
-        // session-archival scheme depends on) and tell the agent to pass one.
-        let restore = vcs.discard(std::path::Path::new(&request.cwd));
-        emit_worktree_changed(orch, &request.cwd);
-        let error = match restore {
-            Ok(()) => "File edits require a descriptive commit_msg; the worktree was \
-                       restored to HEAD. Pass commit_msg so the edits are committed."
-                .to_string(),
-            Err(re) => format!(
-                "File edits require a descriptive commit_msg, and restoring the \
-                 worktree to HEAD failed: {re}"
-            ),
-        };
+        let error = "File edits require a descriptive commit_msg; no project tree changes were published. Pass commit_msg so the proposed tree can be committed.".to_string();
         return Err(Box::new(IndexedFailure {
             failure: ChangeFailure {
                 index: first_change.index,
@@ -1567,68 +1541,90 @@ pub(super) async fn finalize_file_commit(
         }
     }
 
-    match vcs.seal_files(
-        std::path::Path::new(&request.cwd),
-        &unique_paths,
-        &final_commit_msg,
-        author.as_ref(),
-    ) {
+    let publication_mode = if commit_msg == "^" {
+        cairn_vcs::PublicationMode::Amend
+    } else {
+        cairn_vcs::PublicationMode::Child {
+            description: final_commit_msg,
+            author: author.map(|author| cairn_vcs::PublicationAuthor {
+                name: author.name,
+                email: author.email,
+            }),
+        }
+    };
+    let repository_path = logical_resolution.repository_path.clone();
+    let branch = logical_resolution.rev.clone();
+    let expected_head = logical_resolution.commit_id.clone();
+    let mutations = logical_mutations.to_vec();
+    let publication = tokio::task::spawn_blocking(move || {
+        cairn_vcs::publish_logical_mutations(
+            &repository_path,
+            &branch,
+            &expected_head,
+            mutations,
+            publication_mode,
+        )
+    })
+    .await
+    .map_err(|error| {
+        Box::new(IndexedFailure {
+            failure: ChangeFailure {
+                index: first_change.index,
+                target: first_change.item.target.clone(),
+                mode: mode_name(first_change.item.mode).to_string(),
+                kind: "file".to_string(),
+                error: format!("Logical-head publication worker failed: {error}"),
+            },
+            commit: None,
+        })
+    })?;
+    match publication {
         Ok(result) => {
             // File changes were already recorded above (on apply); committing
             // does not re-record them.
             emit_worktree_changed(orch, &request.cwd);
-            Ok(CommitOutcome::Done(Some(CommitReport {
-                status: if commit_msg == "^" {
-                    "amended"
-                } else {
-                    "committed"
+            let publication = match (&managed_context, &routed_db) {
+                (Some(context), Some(db)) => Some(PostSealPublication {
+                    db: db.clone(),
+                    project_id: context.identity.project_id.clone(),
+                    repository: context.identity.project_root.clone(),
+                }),
+                _ => None,
+            };
+            let publication_requirement = match (&managed_context, &routed_db) {
+                (Some(context), Some(db)) => {
+                    crate::merge_requests::queries::publication_requirement_for_managed_branch(
+                        db,
+                        &context.current_job_id,
+                        &context.identity.project_id,
+                        &context.identity.branch,
+                    )
+                    .await
                 }
-                .to_string(),
-                sha: Some(result.sha),
-                pr_number: result.pr_number,
-                // Surface an amend that was converted to a child commit because
-                // the target commit is shared with a sibling bookmark.
-                message: result.amend_note,
-            })))
-        }
-        Err(e) if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) => {
-            Ok(CommitOutcome::LineageMismatch { seal_error: e })
-        }
-        Err(e) if crate::jj::is_conflicted_branch_seal_error(&e) => {
-            // The branch bookmark tip carries a recorded conflict and `@` has
-            // diverged from it (a deliberate resolve-at-base flatten). Do NOT
-            // discard — `@` holds the agent's resolved work the discard would
-            // destroy — and do NOT StaleRetry: the update-stale → re-apply →
-            // re-seal loop can never converge because the workspace is not stale.
-            // Hand the typed outcome up so `handle_write` preserves the on-disk
-            // edits and surfaces the flatten guidance.
-            Ok(CommitOutcome::ConflictedBranch { seal_error: e })
-        }
-        Err(e) if crate::jj::is_stale_error(&e) || crate::jj::is_lost_seal_error(&e) => {
-            // A sibling advanced `@` over the shared store between apply and seal,
-            // either going stale (refused) or letting the seal capture an
-            // empty/divergent commit (the lost-seal case, already backed out in
-            // `seal_paths`). Both recover the same way: do NOT discard here — the
-            // recorded edits drive a re-apply, so `handle_write` can update-stale
-            // (a no-op when not stale), re-apply against the current base, and
-            // re-seal, recovering the batch rather than losing it. The fallback (if
-            // that recovery can't land) is the stale-resilient discard, which keeps
-            // the worktree==HEAD invariant regardless.
-            Ok(CommitOutcome::StaleRetry { seal_error: e })
+                // An unmanaged or ambiguously routed sealed workspace cannot be
+                // proven to have no open PR, so preserve the fail-closed behavior.
+                _ => crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr,
+            };
+            Ok(CommitOutcome::Done(CompletedCommit {
+                report: Some(CommitReport {
+                    status: if commit_msg == "^" {
+                        "amended"
+                    } else {
+                        "committed"
+                    }
+                    .to_string(),
+                    sha: Some(result.head),
+                    pr_number: None,
+                    message: result.amend_note,
+                }),
+                publication_requirement,
+                publication,
+            }))
         }
         Err(e) => {
-            // The edits were applied but the commit failed. Restore the worktree
-            // to HEAD so a failed write does not strand uncommitted dirt.
-            let restore = vcs.discard(std::path::Path::new(&request.cwd));
-            emit_worktree_changed(orch, &request.cwd);
-            let error = match restore {
-                Ok(()) => format!(
-                    "Applied file changes but commit failed: {e}; the worktree was restored to HEAD."
-                ),
-                Err(re) => format!(
-                    "Applied file changes but commit failed: {e}; additionally failed to restore the worktree to HEAD: {re}"
-                ),
-            };
+            let error = format!(
+                "Logical-head publication failed: {e}; no project tree changes were published."
+            );
             Err(Box::new(IndexedFailure {
                 failure: ChangeFailure {
                     index: first_change.index,

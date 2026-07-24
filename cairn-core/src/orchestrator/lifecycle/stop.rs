@@ -189,7 +189,36 @@ fn fail_pending_run_tool_results(
     Ok(inserted)
 }
 
-pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str) {
+pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_waits: bool) {
+    // A durable self-suspend parks warm on its OWN pending `agent_waits` row and
+    // must leave it intact so the eventual resolver can resume the run; only an
+    // external stop cancels the wait. Unconditionally cancelling here — including on
+    // a self-suspend — was the latent defect behind never-resumed durable waits
+    // (CAIRN-2970).
+    if cancel_owned_waits {
+        let cancel_result = run_db_blocking({
+            let dbs = orch.db.clone();
+            let run_id = run_id.to_string();
+            move || async move {
+                let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                db.write(|conn| {
+                    let run_id = run_id.clone();
+                    Box::pin(async move {
+                        conn.execute(
+                            "UPDATE agent_waits SET state='cancelled', resolved_at=?2 WHERE run_id=?1 AND state IN ('pending','resolving')",
+                            cairn_db::turso::params![run_id, chrono::Utc::now().timestamp_millis()],
+                        ).await?;
+                        Ok(())
+                    })
+                }).await.map_err(|e| e.to_string())
+            }
+        });
+        if let Err(error) = cancel_result {
+            log::warn!("Failed to cancel owned wait for run {run_id}: {error}");
+        }
+    }
     let Some(turn_id) = active_turn_id_for_run(orch, run_id) else {
         return;
     };
@@ -400,7 +429,7 @@ pub fn live_run_id_for_job(orch: &Orchestrator, job_id: &str) -> Option<String> 
 /// later Restart works — while the terminal status keeps the startup sweep from
 /// resurrecting it (the trap this issue turns on). A no-op when the node has no
 /// live run.
-pub fn stop_workflow(orch: &Orchestrator, workflow_job_id: &str) -> Result<(), String> {
+pub async fn stop_workflow(orch: &Orchestrator, workflow_job_id: &str) -> Result<(), String> {
     let Some(run_id) = live_run_id_for_job(orch, workflow_job_id) else {
         log::info!("stop_workflow: no live run for job {workflow_job_id}; nothing to stop");
         return Ok(());
@@ -410,7 +439,14 @@ pub fn stop_workflow(orch: &Orchestrator, workflow_job_id: &str) -> Result<(), S
     // non-re-dispatched outcome regardless of which finalizer wins the status
     // race.
     orch.process_state.mark_workflow_stop_requested(&run_id);
-    stop_session(orch, &run_id)
+    // Preserve the existing child-call cascade; the workflow itself no longer
+    // has a runner-local child handle, so its expected final error is ignored.
+    let _ = stop_session(orch, &run_id);
+    let fence = orch
+        .process_state
+        .workflow_lease(&run_id)
+        .ok_or_else(|| format!("workflow {run_id} has no live executor binding"))?;
+    crate::fleet::lifetime::stop(orch, &fence, &run_id).await
 }
 
 /// Stop an in-flight workflow child call (CAIRN-2516).
@@ -665,7 +701,10 @@ pub(crate) fn stop_session_internal(
 ) -> Result<(), String> {
     // Interrupt/cancel the current turn. Fall back to the DB current_turn_id so
     // stop repairs stale UI-visible state even when the process map lost the run.
-    stop_active_turn_for_run(orch, run_id);
+    // A WarmAnyway stop is a durable self-suspend, which must PRESERVE its own
+    // pending wait row; every other (HardKill) stop is an external cancel.
+    let cancel_owned_waits = interrupt_failure_policy != InterruptFailurePolicy::WarmAnyway;
+    stop_active_turn_for_run(orch, run_id, cancel_owned_waits);
 
     // Send interrupt via backend-aware stdin handler. A successful Codex
     // `turn/interrupt` response is deferred until the turn is actually aborted.

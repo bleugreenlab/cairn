@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 /// Default fallback count cap on warm processes (used only when memory is
 /// unmeasurable).
-pub const DEFAULT_MAX_WARM_PROCESSES: usize = 6;
+const DEFAULT_MAX_WARM_PROCESSES: usize = 6;
 
 /// Duration after which a view is considered "stale" for relevance scoring
 const VIEW_RELEVANCE_DURATION: Duration = Duration::from_secs(10 * 60); // 10 minutes
@@ -81,7 +81,7 @@ impl WarmProcessGC {
     }
 
     /// Create a GC with an injected memory probe (for tests).
-    pub fn with_probe(max_warm: usize, probe: Arc<dyn MemoryProbe>) -> Self {
+    fn with_probe(max_warm: usize, probe: Arc<dyn MemoryProbe>) -> Self {
         Self {
             max_warm,
             last_viewed: Mutex::new(HashMap::new()),
@@ -101,7 +101,7 @@ impl WarmProcessGC {
     }
 
     /// Check if a session was viewed recently (within VIEW_RELEVANCE_DURATION)
-    pub fn was_viewed_recently(&self, session_id: &str) -> bool {
+    fn was_viewed_recently(&self, session_id: &str) -> bool {
         if let Ok(views) = self.last_viewed.lock() {
             if let Some(view_time) = views.get(session_id) {
                 return view_time.elapsed() < VIEW_RELEVANCE_DURATION;
@@ -226,7 +226,7 @@ impl WarmProcessGC {
     /// processes are never in the returned set, regardless of pressure.
     ///
     /// The caller is responsible for actually killing the returned runs.
-    pub async fn find_eviction_set(
+    pub(crate) async fn find_eviction_set(
         &self,
         process_state: &AgentProcessState,
         dbs: &DbState,
@@ -439,7 +439,7 @@ impl WarmProcessGC {
 
     /// Clean up stale view records (older than VIEW_RELEVANCE_DURATION).
     /// Called by the periodic warm sweep alongside `find_eviction_set`.
-    pub fn cleanup_stale_views(&self) {
+    pub(crate) fn cleanup_stale_views(&self) {
         if let Ok(mut views) = self.last_viewed.lock() {
             let before = views.len();
             views.retain(|_, view_time| view_time.elapsed() < VIEW_RELEVANCE_DURATION);

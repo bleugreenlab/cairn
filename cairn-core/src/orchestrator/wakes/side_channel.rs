@@ -13,7 +13,7 @@ pub async fn record_live_comment_side_channel_message(
     record_live_comment_side_channel_message_with_key(db, job_id, issue_uri, rendered, None).await
 }
 
-pub async fn record_live_comment_side_channel_message_with_key(
+pub(crate) async fn record_live_comment_side_channel_message_with_key(
     db: &LocalDb,
     job_id: &str,
     issue_uri: &str,
@@ -34,7 +34,7 @@ pub async fn record_live_comment_side_channel_message_with_key(
     .await
 }
 
-pub async fn record_live_issue_message_side_channel_message(
+pub(crate) async fn record_live_issue_message_side_channel_message(
     db: &LocalDb,
     job_id: &str,
     issue_uri: &str,
@@ -54,7 +54,7 @@ pub async fn record_live_issue_message_side_channel_message(
     .await
 }
 
-pub async fn peek_pending_live_side_channel_for_job(
+pub(crate) async fn peek_pending_live_side_channel_for_job(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<SuppressedWake>, String> {
@@ -67,7 +67,7 @@ pub async fn peek_pending_live_side_channel_for_job(
     .map_err(|error| format!("Failed to peek pending side-channel wake messages: {error}"))
 }
 
-pub async fn claim_pending_live_side_channel_for_job_async(
+pub(crate) async fn claim_pending_live_side_channel_for_job_async(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<SuppressedWake>, String> {

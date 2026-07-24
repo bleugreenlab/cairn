@@ -34,7 +34,7 @@ use crate::storage::{run_db_blocking, LocalDb, RowExt};
 /// collapses repeat undelivered emits, while a status/update fingerprint prevents
 /// the same terminal resolution from re-firing after delivery. The resolved child
 /// issue's own jobs are excluded so a child never receives its own notification.
-pub fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) {
+pub(crate) fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) {
     let final_status = match &event.fact {
         AttentionFact::Resolved { final_status } => final_status.clone(),
         _ => return,
@@ -207,7 +207,7 @@ pub(crate) async fn subscriber_jobs_for_issue(
 /// lead-in. Because the cursor only advances on delivery, a second message before
 /// delivery reuses the same start. Passive: it never wakes the idle parent; it
 /// rides along on the parent's next run.
-pub async fn create_catchup_push(
+pub(crate) async fn create_catchup_push(
     db: &LocalDb,
     parent_job_id: &str,
     child_uri: &str,
@@ -407,7 +407,7 @@ async fn resolved_issue_confirmation(orch: &Orchestrator, issue_uri: &str) -> Op
 /// Terminal `resolved:` pushes are intentionally concise confirmations instead
 /// of a full issue read. Falls back to the bare header line when resolution
 /// yields nothing, so the agent still has the URI to follow.
-pub async fn render_push_resolved(
+pub(crate) async fn render_push_resolved(
     orch: &Orchestrator,
     push: &crate::orchestrator::attention_push::Push,
 ) -> String {
@@ -449,7 +449,7 @@ pub async fn render_push_resolved(
 
 /// Resolve and render several pushes into one block (CAIRN-1891), or `None` when
 /// the slice is empty so callers can fold it into an optional prompt section.
-pub async fn render_pushes_resolved(
+pub(crate) async fn render_pushes_resolved(
     orch: &Orchestrator,
     pushes: &[crate::orchestrator::attention_push::Push],
 ) -> Option<String> {

@@ -40,7 +40,7 @@ pub struct JobBrowser {
 }
 
 pub const STATUS_OPEN: &str = "open";
-pub const STATUS_CLOSED: &str = "closed";
+pub(crate) const STATUS_CLOSED: &str = "closed";
 
 fn fresh_webview_label(browser_id: &str) -> String {
     format!("browser:{browser_id}:{}", uuid::Uuid::new_v4())
@@ -58,7 +58,7 @@ impl JobBrowser {
     /// Build a fresh open browser row for a scope. The browser id remains durable,
     /// while the webview label includes an opaque generation that rotates on
     /// reopen so late events from a destroyed page can be rejected.
-    pub fn new(scope: &BrowserScope, slug: &str, url: Option<String>, now: i64) -> Self {
+    pub(crate) fn new(scope: &BrowserScope, slug: &str, url: Option<String>, now: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         let webview_label = fresh_webview_label(&id);
         let (job_id, project_id) = match scope {
@@ -202,7 +202,7 @@ pub async fn get_browser(db: &LocalDb, id: &str) -> Result<Option<JobBrowser>, S
     .map_err(|error| error.to_string())
 }
 
-pub async fn find_browser_by_scope_and_slug(
+pub(crate) async fn find_browser_by_scope_and_slug(
     db: &LocalDb,
     scope: BrowserScope,
     slug: &str,
@@ -245,7 +245,7 @@ pub async fn find_browser_by_scope_and_slug(
 /// can't outrank the user's active tab. When no user-activated row exists the
 /// caller falls back to the literal `default` slug — no worse than the prior
 /// always-default behavior, and self-healing the moment the user activates a tab.
-pub async fn find_most_recently_active_open_browser(
+pub(crate) async fn find_most_recently_active_open_browser(
     db: &LocalDb,
     scope: BrowserScope,
 ) -> Result<Option<JobBrowser>, String> {
@@ -478,7 +478,7 @@ pub async fn delete_browser(db: &LocalDb, id: &str) -> Result<(), String> {
 
 /// All open node-scoped browsers for the given jobs (used by execution teardown
 /// to close their live webviews and delete the rows).
-pub async fn list_running_browsers_for_jobs(
+pub(crate) async fn list_running_browsers_for_jobs(
     db: &LocalDb,
     job_ids: &[String],
 ) -> Result<Vec<JobBrowser>, String> {
@@ -513,7 +513,7 @@ pub async fn list_running_browsers_for_jobs(
 }
 
 /// Delete every browser row owned by the given jobs.
-pub async fn delete_all_browser_rows_for_jobs(
+pub(crate) async fn delete_all_browser_rows_for_jobs(
     db: &LocalDb,
     job_ids: &[String],
 ) -> Result<(), String> {
@@ -681,25 +681,25 @@ pub enum BridgeFormat {
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
+    pub(crate) tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub classes: Vec<String>,
+    classes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
+    role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aria_label: Option<String>,
+    pub(crate) aria_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub href: Option<String>,
+    pub(crate) href: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_type: Option<String>,
+    input_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_name: Option<String>,
+    pub(crate) input_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub has_value: Option<bool>,
+    has_value: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_hint: Option<String>,
+    pub(crate) context_hint: Option<String>,
 }
 
 /// One annotation pushed host->page for rendering (and accepted as a Tauri
@@ -709,13 +709,13 @@ pub struct AnnotationMeta {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnotationWire {
-    pub id: String,
-    pub selector: String,
-    pub snippet: String,
-    pub comment: String,
-    pub number: i64,
+    id: String,
+    selector: String,
+    snippet: String,
+    comment: String,
+    number: i64,
     #[serde(default)]
-    pub meta: AnnotationMeta,
+    meta: AnnotationMeta,
 }
 
 /// A typed bridge request. Serializes to the JSON the injected content script
@@ -808,11 +808,11 @@ pub enum BridgeRequest {
 #[serde(rename_all = "camelCase")]
 pub struct InteractiveElement {
     #[serde(rename = "ref")]
-    pub ref_: String,
-    pub selector: String,
-    pub snippet: String,
+    pub(crate) ref_: String,
+    pub(crate) selector: String,
+    pub(crate) snippet: String,
     #[serde(default)]
-    pub meta: AnnotationMeta,
+    pub(crate) meta: AnnotationMeta,
 }
 
 /// One captured console entry from the page's ring buffer. `ts` is the
@@ -821,11 +821,11 @@ pub struct InteractiveElement {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleEntry {
-    pub ts: i64,
-    pub level: String,
-    pub message: String,
+    pub(crate) ts: i64,
+    pub(crate) level: String,
+    pub(crate) message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stack: Option<String>,
+    pub(crate) stack: Option<String>,
 }
 
 /// The result the content script posts back over IPC, parsed from the

@@ -31,21 +31,22 @@ where
     Ok(Some(value))
 }
 
-/// Load the runner-owned build-slot capability. An absent block is the disabled
+/// Load the runner-owned fleet capability. An absent block is the disabled
 /// default, including the canonical acquisition and execution timeouts.
-pub fn load_build_slots(config_dir: &std::path::Path) -> crate::build_slots::BuildSlotsConfig {
+pub fn load_fleet(config_dir: &std::path::Path) -> crate::fleet::FleetConfig {
     load_settings_file(config_dir)
         .ok()
-        .and_then(|file| file.build_slots)
+        .and_then(|file| file.fleet)
         .unwrap_or_default()
 }
 
-/// Replace the runner-owned build-slot capability in `settings.yaml` without
+/// Replace the runner-owned fleet capability in `settings.yaml` without
 /// routing it through the general Settings DTO. Only `buildSlots` is touched.
-pub fn set_build_slots(
+pub fn set_fleet(
     config_dir: &std::path::Path,
-    config: &crate::build_slots::BuildSlotsConfig,
+    config: &crate::fleet::FleetConfig,
 ) -> Result<(), String> {
+    config.validate()?;
     mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
         root.insert(
             serde_yaml::Value::String("buildSlots".to_string()),
@@ -63,128 +64,135 @@ pub fn set_build_slots(
 pub struct SettingsFile {
     // === Preset fields (new) ===
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_backend: Option<String>,
+    active_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tiers: Option<Vec<String>>,
+    tiers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    backends: Option<HashMap<String, HashMap<String, Preset>>>,
 
     /// External MCP servers reachable through the `cairn://mcp/...` gateway.
     /// Keyed by server name. Project config overlays this set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
+    pub(crate) mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
 
     // === Legacy model fields (kept for deserialization, skipped on serialize) ===
     #[serde(default, skip_serializing)]
-    pub default_model: Option<Model>,
+    default_model: Option<Model>,
     #[serde(default, skip_serializing)]
-    pub preferred_models: Option<Vec<Model>>,
+    preferred_models: Option<Vec<Model>>,
 
     #[serde(default)]
-    pub branch_prefix: Option<String>,
+    branch_prefix: Option<String>,
     /// Double Option to distinguish:
     /// - None = field missing → default to Some(31999)
     /// - Some(None) = field set to null → disabled
     /// - Some(Some(n)) = field set to number → enabled with n tokens
     #[serde(default, deserialize_with = "deserialize_max_thinking_tokens")]
-    pub max_thinking_tokens: Option<Option<i32>>,
+    max_thinking_tokens: Option<Option<i32>>,
     #[serde(default)]
-    pub merge_type: Option<MergeType>,
+    merge_type: Option<MergeType>,
     #[serde(default)]
-    pub pull_on_merge: Option<bool>,
+    pull_on_merge: Option<bool>,
     /// Deprecated — always true. Kept for deserialization compat (silently ignored).
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
     auto_start_jobs: Option<bool>,
     #[serde(default)]
-    pub orphan_cleanup_days: Option<i32>,
+    orphan_cleanup_days: Option<i32>,
     #[serde(default)]
-    pub repo_target_sweep_days: Option<i32>,
+    repo_target_sweep_days: Option<i32>,
     /// Whether agent bug reports are enabled (default: true)
     #[serde(default)]
-    pub bug_reports: Option<bool>,
+    bug_reports: Option<bool>,
     /// Thinking block display mode in chat transcripts
     #[serde(default)]
-    pub thinking_display_mode: Option<ThinkingDisplayMode>,
+    thinking_display_mode: Option<ThinkingDisplayMode>,
     /// Base text scale for transcript markdown.
     #[serde(default)]
-    pub transcript_text_size: Option<TranscriptTextSize>,
+    transcript_text_size: Option<TranscriptTextSize>,
     /// Vertical rhythm preset for transcript markdown.
     #[serde(default)]
-    pub transcript_density: Option<TranscriptDensity>,
+    transcript_density: Option<TranscriptDensity>,
     /// File-log verbosity level. Absent = the light `Standard` default; `verbose`
     /// is the opt-in full-debug + profiler level (today's behavior).
     #[serde(default)]
-    pub log_level: Option<LogLevel>,
-    /// Whether memory review prompts and automatic memory-triage issue creation are enabled.
+    log_level: Option<LogLevel>,
+    /// Whether end-of-job memory review prompts are enabled.
     #[serde(default)]
-    pub memory_review_enabled: Option<bool>,
+    memory_review_enabled: Option<bool>,
+    /// Whether automatic memory-triage issue creation is enabled.
+    #[serde(default)]
+    memory_triage_enabled: Option<bool>,
+    /// Maximum open memory-triage issues for an exact scope.
+    #[serde(default)]
+    max_open_triage_issues_per_scope: Option<i32>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     #[serde(default)]
-    pub pending_memory_threshold: Option<i32>,
+    pending_memory_threshold: Option<i32>,
     /// How replies to the special `to: "external"` target are handled.
     #[serde(default)]
-    pub external_replies: Option<ExternalReplyMode>,
+    external_replies: Option<ExternalReplyMode>,
     /// Sensitive paths the OS sandbox hard-denies reads of for worktree agents.
     /// `~` is expanded to the user's home. Absent = the conservative built-in
     /// default (cloud cred stores, ssh/gpg keys, `~/.cairn[-dev]`). See
     /// `docs/worktree-fence.md`.
     #[serde(default)]
-    pub sandbox_deny_read: Option<Vec<String>>,
+    sandbox_deny_read: Option<Vec<String>>,
     /// Extra case-insensitive names redacted from browser network headers,
     /// query parameters, JSON fields, and form fields. The built-in sensitive
     /// names always apply; this config-only list can only add to them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub browser_network_sensitive_names: Option<Vec<String>>,
+    browser_network_sensitive_names: Option<Vec<String>>,
     /// Managed Build Services: Cairn-supervised shared daemons (e.g. an sccache
     /// server) that run under a service sandbox and inject client env into fenced
     /// agent spawns. Config-only (YAML, not in the Settings DTO). Absent = the
     /// built-in default (a disabled-unless-`sccache`-on-PATH sccache entry). See
     /// `docs/worktree-fence.md` — Managed Build Services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_services: Option<HashMap<String, crate::config::build_services::BuildServiceConfig>>,
-    /// Runner-owned persistent build-slot capability. Project configuration may
+    build_services: Option<HashMap<String, crate::config::build_services::BuildServiceConfig>>,
+    /// Runner-owned persistent fleet capability. Project configuration may
     /// request slot routing, but only this workspace-owned section grants it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_slots: Option<crate::build_slots::BuildSlotsConfig>,
+    #[serde(rename = "buildSlots")]
+    pub(crate) fleet: Option<crate::fleet::FleetConfig>,
     /// Typed web-fetch provider options, keyed by provider id
     /// (`bmd`/`jina`/`firecrawl`) then option key. Config-only (YAML, not in the
     /// Settings DTO). Validated against the per-provider descriptor in
     /// `crate::config::web_fetch`. See `docs/settings.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_fetch: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
+    pub(crate) web_fetch: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
     /// Which web-fetch provider backs fetch. Config-only (YAML, not in the
     /// Settings DTO). Absent / `regular` = the built-in plain-HTTP fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_web_fetch: Option<String>,
+    pub(crate) active_web_fetch: Option<String>,
     /// Typed web-search provider options, keyed by provider id
     /// (`tavily`/`exa`/`brave`/`jina`) then option key. Config-only (YAML, not
     /// in the Settings DTO). Validated against the per-provider descriptor in
     /// `crate::config::web_search`. See `docs/settings.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_search: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
+    pub(crate) web_search: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
     /// Which typed web-search provider backs `cairn://websearch`. Config-only
     /// (YAML, not in the Settings DTO). Absent = web search is unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_web_search: Option<String>,
+    pub(crate) active_web_search: Option<String>,
     /// Typed PDF-extraction provider options, keyed by provider id
     /// (`local`/`bmd`) then option key. Config-only (YAML, not in the Settings
     /// DTO). Validated against `crate::config::pdf`. See `docs/settings.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pdf: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
+    pub(crate) pdf: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
     /// Which PDF-extraction provider backs `.pdf` reads. Config-only (YAML, not
     /// in the Settings DTO). Absent / `local` = the built-in local extractor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_pdf: Option<String>,
+    pub(crate) active_pdf: Option<String>,
     /// Flat monthly subscription fee per backend, in USD. A backend absent from
     /// this map is treated as metered (pay-as-you-go, no normalization). e.g.
     /// `{"claude": 200.0, "codex": 200.0}`. Drives effective-cost analytics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscription_fees: Option<HashMap<String, f64>>,
+    subscription_fees: Option<HashMap<String, f64>>,
     /// OpenRouter provider-routing controls (ZDR + sort). Absent = OpenRouter's
     /// normal routing; omitted from YAML when all-default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openrouter_routing: Option<OpenRouterRouting>,
+    openrouter_routing: Option<OpenRouterRouting>,
     /// Opt-in: route tier-based ephemeral calls through OpenRouter's in-process
     /// HTTP loop instead of the native backend. Absent/false = native routing;
     /// omitted from YAML when unset.
@@ -193,7 +201,7 @@ pub struct SettingsFile {
         rename = "routeCallsViaOpenRouter",
         skip_serializing_if = "Option::is_none"
     )]
-    pub route_calls_via_openrouter: Option<bool>,
+    route_calls_via_openrouter: Option<bool>,
     /// Per-project commands the user has accepted as worktree-fence crossers
     /// (`projectId -> [command, ...]`). A project terminal command's `write`
     /// carveout (or coarse fence crossing) is honored only when its command is
@@ -201,7 +209,7 @@ pub struct SettingsFile {
     /// itself the crossing — acceptance is user-owned. Config-only (YAML, not in
     /// the Settings DTO); preserved across saves. See `crate::config::dev_commands`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepted_fence_commands: Option<HashMap<String, Vec<String>>>,
+    accepted_fence_commands: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Map legacy preferredModels to tier presets.
@@ -336,6 +344,13 @@ impl SettingsFile {
             transcript_text_size: self.transcript_text_size.unwrap_or_default(),
             transcript_density: self.transcript_density.unwrap_or_default(),
             memory_review_enabled: self.memory_review_enabled.unwrap_or(true),
+            memory_triage_enabled: self
+                .memory_triage_enabled
+                .unwrap_or(self.memory_review_enabled.unwrap_or(true)),
+            max_open_triage_issues_per_scope: self
+                .max_open_triage_issues_per_scope
+                .unwrap_or(1)
+                .max(1),
             pending_memory_threshold: self.pending_memory_threshold.unwrap_or(5).max(1),
             external_replies: self
                 .external_replies
@@ -370,6 +385,10 @@ impl SettingsFile {
             transcript_density: Some(settings.transcript_density),
             log_level: Some(settings.log_level),
             memory_review_enabled: Some(settings.memory_review_enabled),
+            memory_triage_enabled: Some(settings.memory_triage_enabled),
+            max_open_triage_issues_per_scope: Some(
+                settings.max_open_triage_issues_per_scope.max(1),
+            ),
             pending_memory_threshold: Some(settings.pending_memory_threshold.max(1)),
             external_replies: Some(settings.external_replies.clone()),
             subscription_fees: if settings.subscription_fees.is_empty() {
@@ -388,7 +407,7 @@ impl SettingsFile {
             sandbox_deny_read: None,
             browser_network_sensitive_names: None,
             build_services: None,
-            build_slots: None,
+            fleet: None,
             accepted_fence_commands: None,
             web_fetch: None,
             active_web_fetch: None,
@@ -401,7 +420,7 @@ impl SettingsFile {
 }
 
 /// Get the path to the settings file
-pub fn get_settings_path(config_dir: &std::path::Path) -> PathBuf {
+pub(crate) fn get_settings_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join("settings.yaml")
 }
 
@@ -503,7 +522,7 @@ pub fn load_browser_network_sensitive_names(config_dir: &std::path::Path) -> Vec
         .unwrap_or_default()
 }
 
-pub fn load_sandbox_deny_read(config_dir: &std::path::Path) -> Vec<PathBuf> {
+pub(crate) fn load_sandbox_deny_read(config_dir: &std::path::Path) -> Vec<PathBuf> {
     let configured = load_settings_file(config_dir)
         .ok()
         .and_then(|f| f.sandbox_deny_read);
@@ -516,7 +535,7 @@ pub fn load_sandbox_deny_read(config_dir: &std::path::Path) -> Vec<PathBuf> {
 /// Load the configured Managed Build Services, or the built-in default set when
 /// none are configured. The supervisor decides which to actually launch (e.g.
 /// the default sccache entry only runs when `sccache` is on `PATH`).
-pub fn load_build_services(
+pub(crate) fn load_build_services(
     config_dir: &std::path::Path,
 ) -> HashMap<String, crate::config::build_services::BuildServiceConfig> {
     let configured = load_settings_file(config_dir)
@@ -660,7 +679,7 @@ fn mutate_build_services<T>(
 /// `{worktrees}` is always `~/.cairn/worktrees` (the canonical worktree root),
 /// independent of the dev/prod `config_dir`, because worktrees live there in
 /// both modes.
-pub fn build_service_templates(
+pub(crate) fn build_service_templates(
     config_dir: &std::path::Path,
     worktree: Option<std::path::PathBuf>,
 ) -> crate::config::build_services::Templates {
@@ -717,6 +736,8 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "thinkingDisplayMode",
     "logLevel",
     "memoryReviewEnabled",
+    "memoryTriageEnabled",
+    "maxOpenTriageIssuesPerScope",
     "pendingMemoryThreshold",
     "externalReplies",
     "subscriptionFees",
@@ -817,6 +838,12 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.memory_review_enabled {
         current.memory_review_enabled = value;
+    }
+    if let Some(value) = input.memory_triage_enabled {
+        current.memory_triage_enabled = value;
+    }
+    if let Some(value) = input.max_open_triage_issues_per_scope {
+        current.max_open_triage_issues_per_scope = value.max(1);
     }
     if let Some(value) = input.pending_memory_threshold {
         current.pending_memory_threshold = value.max(1);
@@ -1028,6 +1055,28 @@ mod tests {
         assert_eq!(settings.transcript_text_size, TranscriptTextSize::Default);
         assert_eq!(settings.transcript_density, TranscriptDensity::Comfortable);
         assert_eq!(settings.external_replies, ExternalReplyMode::Watchers);
+    }
+
+    #[test]
+    fn memory_triage_defaults_inherit_review_and_clamp_cap() {
+        let disabled: SettingsFile =
+            serde_yaml::from_str("memoryReviewEnabled: false\nmaxOpenTriageIssuesPerScope: 0\n")
+                .unwrap();
+        let settings = disabled.to_settings();
+        assert!(!settings.memory_triage_enabled);
+        assert_eq!(settings.max_open_triage_issues_per_scope, 1);
+
+        let overridden: SettingsFile = serde_yaml::from_str(
+            "memoryReviewEnabled: false\nmemoryTriageEnabled: true\nmaxOpenTriageIssuesPerScope: 3\n",
+        )
+        .unwrap();
+        let settings = overridden.to_settings();
+        assert!(settings.memory_triage_enabled);
+        assert_eq!(settings.max_open_triage_issues_per_scope, 3);
+
+        let serialized = serde_yaml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
+        assert!(serialized.contains("memoryTriageEnabled: true"));
+        assert!(serialized.contains("maxOpenTriageIssuesPerScope: 3"));
     }
 
     #[test]
@@ -1902,34 +1951,66 @@ thinkingDisplayMode: full
 }
 
 #[cfg(test)]
-mod build_slot_settings_tests {
+mod fleet_settings_tests {
     use super::SettingsFile;
 
     #[test]
-    fn build_slots_are_config_only_and_round_trip() {
+    fn fleet_config_is_config_only_and_round_trips() {
         let yaml = r#"
 buildSlots:
-  projects:
-    CAIRN: 3
   acquisitionDeadlineSeconds: 15
   defaultTimeoutSeconds: 1800
-  globalCapacity: 2
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let slots = file.build_slots.as_ref().unwrap();
-        assert_eq!(slots.slots_for("CAIRN"), 2);
-        assert_eq!(slots.slots_for("OTHER"), 2);
-        assert_eq!(slots.acquisition_deadline_seconds, 15);
-        assert_eq!(slots.default_timeout_seconds, 1800);
+        let fleet = file.fleet.as_ref().unwrap();
+        assert_eq!(fleet.acquisition_deadline_seconds, 15);
+        assert_eq!(fleet.default_timeout_seconds, 1800);
         let serialized = serde_yaml::to_string(&file).unwrap();
         let reparsed: SettingsFile = serde_yaml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.build_slots, file.build_slots);
+        assert_eq!(reparsed.fleet, file.fleet);
+        assert!(serialized.contains("buildSlots:"));
+        assert!(fleet.remote_executors.is_empty());
     }
 
     #[test]
-    fn set_build_slots_preserves_unrelated_settings_and_reopens() {
-        use crate::build_slots::BuildSlotsConfig;
-        use std::collections::HashMap;
+    fn remote_executor_inventory_round_trips_without_secret_fields() {
+        let yaml = r#"
+buildSlots:
+  remoteExecutors:
+    linux-builder:
+      host: bglab-ub.local
+      sshUser: dev
+      binaryPath: /opt/cairn/cairn-executor
+      cairnHome: /home/dev/.cairn
+      executorId: linux-builder
+      deviceId: linux-builder-device
+      displayName: Linux builder
+      projectIds: [0f25d369-6e5b-4f5d-b590-b7652d895b4e]
+      tunnelPort: 43849
+      extraSshArgs: [-4]
+"#;
+        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let fleet = file.fleet.as_ref().unwrap();
+        fleet.validate().unwrap();
+        let remote = &fleet.remote_executors["linux-builder"];
+        assert_eq!(remote.ssh_user, "dev");
+        assert_eq!(remote.extra_ssh_args, ["-4"]);
+
+        let serialized = serde_yaml::to_string(&file).unwrap();
+        let reparsed: SettingsFile = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.fleet, file.fleet);
+        let serialized_lower = serialized.to_ascii_lowercase();
+        for forbidden in ["token:", "credential:", "grant:", "secret:"] {
+            assert!(
+                !serialized_lower.contains(forbidden),
+                "settings serialized forbidden secret field {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_fleet_preserves_unrelated_settings_and_reopens() {
+        use crate::fleet::FleetConfig;
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();
@@ -1939,25 +2020,20 @@ buildSlots:
             "branchPrefix: custom\nlogLevel: standard\n",
         )
         .unwrap();
-        let config = BuildSlotsConfig {
-            projects: HashMap::from([("CAIRN".to_string(), 3)]),
+        let config = FleetConfig {
             acquisition_deadline_seconds: 12,
             default_timeout_seconds: 900,
-            global_capacity: Some(4),
+            executor_policies: Default::default(),
+            remote_executors: Default::default(),
         };
 
-        super::set_build_slots(dir, &config).unwrap();
+        super::set_fleet(dir, &config).unwrap();
 
-        assert_eq!(super::load_build_slots(dir), config);
+        assert_eq!(super::load_fleet(dir), config);
         let reopened = super::load_settings_file(dir).unwrap();
         assert_eq!(reopened.branch_prefix.as_deref(), Some("custom"));
         let yaml = std::fs::read_to_string(super::get_settings_path(dir)).unwrap();
         assert!(yaml.contains("logLevel: standard"));
-        assert!(yaml.contains("projects:"));
-
-        let defaults = super::load_build_slots(tempfile::TempDir::new().unwrap().path());
-        assert_eq!(defaults.slots_for("arbitrary-project"), 2);
-        let default_yaml = serde_yaml::to_string(&defaults).unwrap();
-        assert!(default_yaml.contains("projects: {}"));
+        assert!(!yaml.contains("projects:"));
     }
 }

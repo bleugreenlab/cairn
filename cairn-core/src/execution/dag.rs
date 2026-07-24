@@ -9,7 +9,7 @@ use crate::db_records::{DbRecipeEdge, DbRecipeNode};
 use crate::models::{RecipeEdge, RecipeNode};
 
 /// Convert RecipeNode (from snapshot) to DbRecipeNode (for job creation).
-pub fn recipe_node_to_db(node: &RecipeNode, recipe_id: &str) -> DbRecipeNode {
+pub(crate) fn recipe_node_to_db(node: &RecipeNode, recipe_id: &str) -> DbRecipeNode {
     // Serialize the config parts back to JSON
     let config = {
         let mut config_map = serde_json::Map::new();
@@ -60,7 +60,7 @@ pub fn recipe_node_to_db(node: &RecipeNode, recipe_id: &str) -> DbRecipeNode {
 }
 
 /// Convert RecipeEdge (from snapshot) to DbRecipeEdge (for job creation).
-pub fn recipe_edge_to_db(edge: &RecipeEdge, recipe_id: &str) -> DbRecipeEdge {
+pub(crate) fn recipe_edge_to_db(edge: &RecipeEdge, recipe_id: &str) -> DbRecipeEdge {
     DbRecipeEdge {
         id: edge.id.clone(),
         recipe_id: recipe_id.to_string(),

@@ -7,7 +7,7 @@ use crate::models::{Memory, MemoryTriageDecision};
 /// The memory table stores the full content and Integrator reasoning. This file
 /// exists only to give discard-only and mixed triage batches a concrete PR diff
 /// that reviewers can merge to ratify the recorded decisions.
-pub fn render_triage_ledger(
+pub(crate) fn render_triage_ledger(
     issue_title: &str,
     scope: &str,
     scope_value: &str,

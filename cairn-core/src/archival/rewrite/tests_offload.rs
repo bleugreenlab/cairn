@@ -135,6 +135,12 @@ async fn team_run_offloads_pack_and_reconstructs_gitcoord_from_store() {
         false,
     )
     .await;
+    db.execute(
+        "UPDATE projects SET repository_id = 'repo-coordinate' WHERE id = 'proj'",
+        (),
+    )
+    .await
+    .unwrap();
 
     let store = crate::storage::InMemoryContentStore::new();
     db.set_team_context(crate::storage::TeamReplicaContext {
@@ -142,6 +148,46 @@ async fn team_run_offloads_pack_and_reconstructs_gitcoord_from_store() {
         store: std::sync::Arc::new(store.clone()),
         private_db: None,
     });
+
+    crate::mcp::vcs::publish_sealed_commit_pack(&db, "proj", &fx.clone, &fx.w1)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM pack_catalog c
+             JOIN pack_catalog_references r
+               ON r.content_hash = c.content_hash
+              AND r.project_id = c.project_id
+              AND r.repository_id = c.repository_id
+              AND r.object_format = c.object_format
+             WHERE c.repository_id = 'repo-coordinate'
+               AND c.kind = 'reachable' AND c.tip_commit = ?1
+               AND r.owner_kind = 'sealed_commit' AND r.owner_id = ?1",
+            (fx.w1.clone(),),
+        )
+        .await
+        .unwrap(),
+        Some(1),
+        "the first cloud-visible sealed root gets self-contained reachable coverage"
+    );
+    git(&fx.clone, &["reset", "--hard", &fx.w1]);
+    write_file(&fx.clone, "sealed-next.txt", b"next sealed root\n");
+    let sealed_next = commit_all(&fx.clone, "next sealed root");
+    crate::mcp::vcs::publish_sealed_commit_pack(&db, "proj", &fx.clone, &sealed_next)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM pack_catalog
+             WHERE repository_id = 'repo-coordinate'
+               AND kind = 'execution_range' AND base_commit = ?1 AND tip_commit = ?2",
+            (fx.w1.clone(), sealed_next),
+        )
+        .await
+        .unwrap(),
+        Some(1),
+        "a later sealed root chains a complete range from its covered parent"
+    );
 
     let v2: &[u8] = b"ALPHA\nbeta\ngamma\ndelta\nepsilon\n";
     let w1_short = short(&fx.clone, &fx.w1);
@@ -212,6 +258,148 @@ async fn team_run_offloads_pack_and_reconstructs_gitcoord_from_store() {
     assert!(
         store.contains(&pack_hash).await,
         "the framed pack is offloaded to the store under pack_hash"
+    );
+    let catalog_count = db
+        .query_opt_i64(
+            "SELECT COUNT(*) FROM pack_catalog c
+             JOIN pack_catalog_references r ON r.content_hash = c.content_hash
+             WHERE c.content_hash = ?1 AND c.kind = 'execution_range'
+               AND c.publication_state = 'published'
+               AND r.owner_kind = 'execution_history' AND r.owner_id = 'exec'",
+            (pack_hash.clone(),),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        catalog_count, 1,
+        "the pointer and catalog reference publish together"
+    );
+    assert_eq!(
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM pack_catalog
+             WHERE content_hash = ?1 AND repository_id = 'repo-coordinate'",
+            (pack_hash.clone(),),
+        )
+        .await
+        .unwrap(),
+        Some(1),
+        "archival publishes under the durable repository coordinate, not project_id"
+    );
+
+    db.execute(
+        "DELETE FROM pack_catalog WHERE content_hash = ?1",
+        (pack_hash.clone(),),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO executions(id, recipe_id, status, started_at)
+         VALUES ('aaa-missing', 'r', 'complete', 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO jobs(id, execution_id, project_id, status, created_at, updated_at)
+         VALUES ('aaa-missing-job', 'aaa-missing', 'proj', 'complete', 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO execution_history
+         (execution_id, base_sha, tip_sha, pack_hash, repository_id)
+         VALUES ('aaa-missing', ?1, ?2, ?3, 'repo-coordinate')",
+        (
+            fx.anchor.as_str(),
+            fx.w1.as_str(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::storage::pack_catalog::backfill_execution_pack_catalog(&db, 1)
+            .await
+            .unwrap(),
+        0,
+        "the first bounded pass records the early missing pointer"
+    );
+    assert_eq!(
+        crate::storage::pack_catalog::backfill_execution_pack_catalog(&db, 1)
+            .await
+            .unwrap(),
+        1,
+        "a recorded missing pointer cannot starve the later valid pointer"
+    );
+
+    let fake_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let framed = store.get(&pack_hash).await.unwrap().unwrap();
+    let (pack, _) = cairn_codec::transfer::unframe_pack(&framed).unwrap();
+    let validated =
+        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
+            .unwrap();
+    crate::storage::pack_catalog::publish_pack(
+        &db,
+        crate::storage::pack_catalog::PackCatalogPublication {
+            content_hash: fake_hash.into(),
+            project_id: "proj".into(),
+            repository_id: "repo-coordinate".into(),
+            object_format: "sha1".into(),
+            byte_count: framed.len() as u64,
+            pack_checksum: validated.manifest.pack_checksum,
+            object_count: validated.manifest.object_count,
+            kind: crate::storage::pack_catalog::PackKind::ExecutionRange,
+            base_commit: Some(fx.anchor.clone()),
+            tip_commit: fx.w1.clone(),
+            owner_kind: "execution_history".into(),
+            owner_id: "exec".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM pack_catalog_references
+             WHERE owner_kind = 'execution_history' AND owner_id = 'exec'",
+            (),
+        )
+        .await
+        .unwrap(),
+        Some(1),
+        "an owner replacement leaves exactly one reference in the GC mark set"
+    );
+    assert_eq!(
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM pack_catalog_references
+             WHERE owner_kind = 'execution_history' AND owner_id = 'exec'
+               AND content_hash = ?1",
+            (fake_hash,),
+        )
+        .await
+        .unwrap(),
+        Some(1),
+        "the owner now marks only the replacement pack"
+    );
+    assert_eq!(
+        crate::storage::pack_catalog::backfill_execution_pack_catalog(&db, 1)
+            .await
+            .unwrap(),
+        1,
+        "a stale owner reference does not suppress repair of the live pack_hash"
+    );
+    assert_eq!(
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM pack_catalog_references
+             WHERE owner_kind = 'execution_history' AND owner_id = 'exec'
+               AND content_hash = ?1",
+            (pack_hash.clone(),),
+        )
+        .await
+        .unwrap(),
+        Some(1),
+        "repair restores the sole mark to the canonical execution pointer"
     );
 
     let events = load_events(&db).await;

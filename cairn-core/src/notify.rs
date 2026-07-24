@@ -18,7 +18,7 @@ use crate::services::EventEmitter;
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
 
 /// Build a project-scoped `issues` db-change payload.
-pub fn issue_db_change_ids(action: &str, issue_id: &str, project_id: Option<&str>) -> Value {
+pub(crate) fn issue_db_change_ids(action: &str, issue_id: &str, project_id: Option<&str>) -> Value {
     json!({
         "table": "issues",
         "action": action,
@@ -27,7 +27,7 @@ pub fn issue_db_change_ids(action: &str, issue_id: &str, project_id: Option<&str
     })
 }
 
-pub fn issue_db_change(issue: &models::Issue, action: &str) -> Value {
+pub(crate) fn issue_db_change(issue: &models::Issue, action: &str) -> Value {
     issue_db_change_ids(action, &issue.id, Some(&issue.project_id))
 }
 
@@ -43,7 +43,7 @@ pub fn issue_db_change(issue: &models::Issue, action: &str) -> Value {
 /// `reconcile_stale_runs`) may emit `{table:"jobs"}` with no ids at all, which
 /// correctly degrades to a broad `["jobs"]` invalidation.
 #[allow(clippy::too_many_arguments)]
-pub fn job_db_change_ids(
+pub(crate) fn job_db_change_ids(
     action: &str,
     job_id: &str,
     issue_id: Option<&str>,
@@ -80,7 +80,7 @@ pub fn job_db_change(job: &models::Job, action: &str) -> Value {
 }
 
 /// Build a fully-scoped `runs` db-change payload.
-pub fn run_db_change_ids(
+pub(crate) fn run_db_change_ids(
     action: &str,
     run_id: &str,
     job_id: Option<&str>,
@@ -110,7 +110,7 @@ pub fn run_db_change(run: &models::Run, action: &str) -> Value {
 
 /// Load the authoritative run scope after a write and build its payload. A
 /// missing row is reserved for recovery/delete paths and falls back to runId.
-pub async fn run_db_change_for_id(db: &LocalDb, run_id: &str, action: &str) -> Value {
+pub(crate) async fn run_db_change_for_id(db: &LocalDb, run_id: &str, action: &str) -> Value {
     let run_id_owned = run_id.to_string();
     let scope = db
         .read(|conn| {
@@ -145,7 +145,7 @@ pub async fn run_db_change_for_id(db: &LocalDb, run_id: &str, action: &str) -> V
     }
 }
 
-pub fn turn_db_change_ids(
+fn turn_db_change_ids(
     action: &str,
     job_id: Option<&str>,
     run_id: Option<&str>,
@@ -164,7 +164,7 @@ pub fn turn_db_change_ids(
     })
 }
 
-pub async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) -> Value {
+pub(crate) async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) -> Value {
     let turn_id_owned = turn_id.to_string();
     let scope = db
         .read(|conn| {
@@ -208,7 +208,7 @@ pub async fn turn_db_change_for_id(db: &LocalDb, turn_id: &str, action: &str) ->
     }
 }
 
-pub async fn turn_db_change_for_job_id(db: &LocalDb, job_id: &str, action: &str) -> Value {
+pub(crate) async fn turn_db_change_for_job_id(db: &LocalDb, job_id: &str, action: &str) -> Value {
     let job_id_owned = job_id.to_string();
     let scope = db
         .read(|conn| {
@@ -278,7 +278,7 @@ fn event_issue_id_for_run(db: Arc<LocalDb>, run_id: &str) -> Result<Option<Strin
     })
 }
 
-pub fn event_db_change_for_run(
+pub(crate) fn event_db_change_for_run(
     db: Arc<LocalDb>,
     run_id: &str,
     session_id: Option<&str>,
@@ -294,7 +294,7 @@ pub fn event_db_change_for_run(
     event_db_change_scoped(run_id, session_id, issue_id.as_deref(), action)
 }
 
-pub fn event_db_change_scoped(
+pub(crate) fn event_db_change_scoped(
     run_id: &str,
     session_id: Option<&str>,
     issue_id: Option<&str>,
@@ -322,7 +322,7 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub fn new(emitter: Arc<dyn EventEmitter>) -> Self {
+    pub(crate) fn new(emitter: Arc<dyn EventEmitter>) -> Self {
         Self { emitter }
     }
 
@@ -352,7 +352,7 @@ impl Notifier {
         self.emit_change("events");
     }
 
-    pub fn artifact(&self, _a: &models::Artifact) {
+    pub(crate) fn artifact(&self, _a: &models::Artifact) {
         self.emit_change("artifacts");
     }
 
@@ -369,7 +369,7 @@ impl Notifier {
     // --- Generic ---
 
     /// Emit a `db-change` event for an arbitrary table.
-    pub fn emit_change(&self, table: &str) {
+    pub(crate) fn emit_change(&self, table: &str) {
         let _ = self.emitter.emit("db-change", json!({"table": table}));
     }
 

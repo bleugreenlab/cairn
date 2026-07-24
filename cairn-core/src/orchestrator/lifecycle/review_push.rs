@@ -10,7 +10,7 @@ use super::common::*;
 
 /// Synchronously read `(issue_id, IssueAttentionContext)` from a job_id.
 /// Returns None when the job has no issue (project-level jobs).
-pub(crate) fn issue_for_attention_by_job(
+fn issue_for_attention_by_job(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Option<(

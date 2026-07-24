@@ -13,61 +13,70 @@
 //!   - single-file / in-memory greps (the archival byte-parity contract in
 //!     `mcp::handlers::search::render_single_file_grep`), which never touch fff;
 //!   - the universal fallback whenever the index is cold, the root is not a
-//!     known worktree, or the query shape is unsupported (multiline, file-type
-//!     walks, sub-directory roots).
+//!     known worktree, or the query shape is unsupported (including multiline
+//!     and file-type walks);
+//!   - the *residue* of a partially covered query: individual files this index
+//!     cannot search are named in [`WorktreeGrepOutcome::uncovered`] and the
+//!     caller greps just those, merging their lines before rendering.
 //!
 //! A cold index therefore costs nothing: the first eligible grep in a worktree
 //! falls through to ripgrep while the background scan warms, and the second and
 //! later greps hit the resident index.
 //!
-//! ## Not a ripgrep impersonator
+//! ## Output parity
 //!
-//! The fff path is *not* held to byte-identical parity with the ripgrep walk
-//! (that contract is load-bearing only for the single-file/archival path, which
-//! stays on `grep-searcher`). What it preserves is the **output format** —
-//! `path:N:text` for matches, `path:N-text` for context, `--` group separators,
-//! and the `files_with_matches` / `count` shapes — so it slots in behind the
-//! existing surface as a drop-in. What it deliberately keeps from fff are its
-//! niceties: relevance/definition-aware ordering, smart-case (case-insensitive
-//! until the pattern contains an uppercase char) as the default, and the SIMD
-//! literal (`PlainText`) path for non-regex patterns. The one thing it will not
-//! silently shrink is completeness: fff's per-call `page_limit` / per-file cap
-//! are lifted so the index returns every match, exactly as the ripgrep walk
-//! does, and `head_limit` stays the sole place results get capped — on the
-//! agent's terms.
+//! This module does not render output. It drains matches out of fff, expands
+//! each one's context window into the shared
+//! [`crate::search_util::GrepLine`] model, and hands the result to
+//! [`crate::search_util::render_grep_lines`] — the same renderer cairn-core's
+//! ripgrep walk uses. Match/context separators, `--` group breaks, path-then-
+//! line ordering, and the `files_with_matches` / `count` projections are
+//! therefore defined in exactly one place, so warm and cold routing cannot
+//! drift into disagreeing about them.
+//!
+//! What this module keeps from fff are its engine niceties: smart-case
+//! (case-insensitive until the pattern contains an uppercase char) as the
+//! default, and the SIMD literal (`PlainText`) path for non-regex patterns.
+//! What it will not silently shrink is completeness: fff's per-call
+//! `page_limit` / per-file cap are lifted so the index returns every match,
+//! exactly as the ripgrep walk does, and `head_limit` stays the sole place
+//! results get capped — on the agent's terms.
 //!
 //! ## Runtime shape
 //!
 //! Frecency and query-history LMDB stores are disabled (default, uninitialized
 //! `SharedFrecency` — no on-disk state). fff never memory-maps a file on
-//! cairn's behalf, and that is load-bearing for crash-safety. Two distinct
-//! mmap paths exist in fff and both are closed here: the *persistent* mmap
-//! cache is off (`enable_mmap_cache: false`), and the *fresh* per-grep mmap —
-//! which fff otherwise takes for any file at or above `FRESH_MMAP_THRESHOLD`
-//! (256 KiB on Unix, 1 MiB on macOS), independent of that cache flag — is made
-//! unreachable by capping `max_file_size` below the smallest threshold (see
+//! Cairn's behalf, and that is load-bearing for crash-safety. Three distinct
+//! mmap paths exist in fff and all are closed here: persistent-cache *warmup*
+//! is disabled with `enable_mmap_cache: false`; lazy persistent-cache creation
+//! from `get_cached_content` is denied by [`content_cache_budget`]'s zero entry
+//! budget; and the *fresh* per-grep mmap — which fff otherwise takes for any
+//! file at or above `FRESH_MMAP_THRESHOLD` (256 KiB on Unix, 1 MiB on macOS),
+//! independent of the cache flag — is made unreachable by capping
+//! `max_file_size` below the smallest threshold (see
 //! [`MMAP_SAFE_MAX_FILE_SIZE`]). This matters because a file truncated by
 //! another process while it is mapped (jj snapshots, agent writes, worktree
 //! teardown) raises SIGBUS on the next page-in — an uncatchable signal that
-//! kills the whole runner process (CAIRN-2574). `fff`'s process-wide SIGSEGV
-//! handler installs only through `fff::log::init_tracing`, which cairn-core
+//! kills the whole runner process (CAIRN-2574, CAIRN-3074). `fff`'s process-wide
+//! SIGSEGV handler installs only through `fff::log::init_tracing`, which cairn-core
 //! never calls, so embedding the library installs no signal handler. Each
 //! instance runs ~2 background threads (scan + watcher) plus a content index
 //! (~360 B/file); the pool caps how many live at once and teardown drops them
 //! per worktree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fff_search::{
-    has_regex_metacharacters, Constraint, FFFMode, FFFQuery, FilePicker, FilePickerOptions,
-    FuzzyQuery, FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs, SharedFilePicker,
-    SharedFrecency,
+    has_regex_metacharacters, Constraint, ContentCacheBudget, FFFMode, FFFQuery, FilePicker,
+    FilePickerOptions, FuzzyQuery, FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs,
+    SharedFilePicker, SharedFrecency,
 };
 
-use crate::search_util::{build_glob_matcher, format_grep_line, path_within_any};
+use crate::search_util::{build_glob_matcher, path_within_any, GrepLine};
 
 /// Owned grep parameters handed to [`WorktreeSearch::try_grep`]. Mirrors the
 /// fields of `mcp::handlers::search::GrepPayload` that the index path honors,
@@ -118,18 +127,57 @@ const GREP_TIME_BUDGET_MS: u64 = 25_000;
 /// warm or cold. Rare false positives (a genuinely 509–512-byte line) just take
 /// the correct fallback.
 const LINE_TRUNCATION_THRESHOLD: usize = 509;
-/// fff `=0.9.6` memory-maps any grepped file at or above `FRESH_MMAP_THRESHOLD`
-/// (256 KiB on Unix, 1 MiB on macOS — `fff-core/src/constants.rs`). A file
-/// truncated by another process while it is mapped raises SIGBUS on the next
-/// page-in, which no in-process handler can survive and which takes down the
-/// whole runner (CAIRN-2574). Capping `max_file_size` below the smallest
-/// threshold makes the mmap branch unreachable: fff's size prefilter
-/// (`file.size <= max_file_size`) rejects oversized files before
-/// `get_content_for_search` runs, and every file that does reach it is read
-/// into a buffer via `read_exact`, which fails cleanly (→ skip) if the file
-/// shrinks mid-read rather than faulting. Pinned to fff `=0.9.6`'s thresholds
-/// via the exact-version dependency; see the `Cargo.toml` note.
+/// fff `=0.9.6` has two grep-time mmap paths in addition to cache warmup. Its
+/// `get_cached_content` can lazily create a persistent mmap at `MMAP_THRESHOLD`
+/// (16 KiB on aarch64) before considering grep options; [`content_cache_budget`]
+/// closes that path. It can also create a fresh mmap at or above
+/// `FRESH_MMAP_THRESHOLD` (256 KiB on Unix, 1 MiB on macOS —
+/// `fff-core/src/constants.rs`). Capping `max_file_size` below the smallest
+/// fresh threshold makes that branch unreachable: fff's size prefilter rejects
+/// oversized files, and every admitted uncached file is read into a buffer via
+/// `read_exact`, which fails cleanly if the file shrinks mid-read rather than
+/// faulting. A mapped file that is concurrently truncated can instead raise an
+/// uncatchable SIGBUS and kill the runner (CAIRN-2574, CAIRN-3074). These
+/// assumptions are pinned to fff `=0.9.6`; see the `Cargo.toml` note.
 const MMAP_SAFE_MAX_FILE_SIZE: u64 = 256 * 1024 - 1;
+
+const CONTENT_CACHE_MAX_FILES: usize = 0;
+const CONTENT_CACHE_MAX_BYTES: u64 = 0;
+
+/// Deny lazy persistent-cache entries while preserving the buffered-read size
+/// ceiling. This must be a literal budget rather than `from_overrides`: zeros
+/// passed to that constructor inherit fff's generous repository defaults.
+fn content_cache_budget() -> ContentCacheBudget {
+    ContentCacheBudget {
+        // fff checks `cached_count >= max_files` before creating an entry, so
+        // 0/0 makes persistent mmap creation structurally impossible.
+        max_files: CONTENT_CACHE_MAX_FILES,
+        max_bytes: CONTENT_CACHE_MAX_BYTES,
+        // The buffered path also consults this field. Keep it aligned with the
+        // grep cap so a future path that skips the options prefilter still
+        // cannot reach the fresh-mmap threshold.
+        max_file_size: MMAP_SAFE_MAX_FILE_SIZE,
+        cached_count: AtomicUsize::new(0),
+        cached_bytes: AtomicU64::new(0),
+    }
+}
+
+/// What one warm-index grep proved.
+///
+/// Coverage is partial by design. A single file the index cannot search — one
+/// above the mmap-safe size cap, or one whose display lines fff would truncate
+/// — used to discard the entire query; in a repository holding even one such
+/// file that made the index dead weight for every root-scoped search. Naming
+/// the file instead lets the caller re-grep just that file with its own engine
+/// and merge, which is why this carries lines rather than rendered bytes:
+/// merged lines render once, so ordering and group separators come out right
+/// by construction.
+pub struct WorktreeGrepOutcome {
+    /// Every line the index proved, in the shared model.
+    pub lines: Vec<GrepLine>,
+    /// Search-root-relative paths the index could not cover.
+    pub uncovered: Vec<String>,
+}
 
 /// One match, copied out of the borrowed [`fff_search::GrepResult`] so the
 /// picker read-guard can be released before formatting.
@@ -181,6 +229,7 @@ fn plan_query(pattern: &str, case_insensitive: Option<bool>) -> (String, GrepMod
 pub struct WorktreeSearch {
     worktree: PathBuf,
     shared: SharedFilePicker,
+    served_grep_queries: AtomicU64,
     // Held only to keep the (uninitialized) frecency handle alive alongside the
     // picker; never queried. Dropping it with the instance releases nothing on
     // disk because it was never `init`-ed.
@@ -202,7 +251,9 @@ impl WorktreeSearch {
                 enable_mmap_cache: false,
                 enable_content_indexing: true,
                 mode: FFFMode::Ai,
-                cache_budget: None,
+                // An explicit budget prevents fff's post-scan auto-budget from
+                // replacing it and closes lazy `get_cached_content` mmap creation.
+                cache_budget: Some(content_cache_budget()),
                 watch: true,
                 follow_symlinks: false,
                 enable_fs_root_scanning: false,
@@ -213,6 +264,7 @@ impl WorktreeSearch {
         Ok(Self {
             worktree: worktree.to_path_buf(),
             shared,
+            served_grep_queries: AtomicU64::new(0),
             _frecency: frecency,
         })
     }
@@ -226,13 +278,20 @@ impl WorktreeSearch {
 
     /// Run a grep against the warm index.
     ///
-    /// Returns `None` when the background scan has not finished yet — the caller
-    /// then falls through to the ripgrep walk while the index keeps warming.
-    /// `Some(body)` means the index served the query; the body is the joined,
-    /// unwindowed output lines (empty when there were no matches). The caller
-    /// applies the empty-result message and `offset`/`head_limit` windowing via
-    /// the shared `finalize_grep_output`.
-    pub fn try_grep(&self, params: &WorktreeGrepParams, deny_read: &[PathBuf]) -> Option<String> {
+    /// `None` means the index cannot answer this query at all and the caller
+    /// must use its own engine for the whole thing: the background scan has not
+    /// finished (the file set is not yet known), the picker lock failed, the
+    /// pattern or a glob does not compile (the caller emits the canonical
+    /// error), or the result set ran past the drain safety cap.
+    ///
+    /// `Some(outcome)` carries the lines the index proved plus the paths it
+    /// could not cover; see [`WorktreeGrepOutcome`]. Rendering, windowing, and
+    /// the empty-result message all belong to the caller.
+    pub fn try_grep(
+        &self,
+        params: &WorktreeGrepParams,
+        deny_read: &[PathBuf],
+    ) -> Option<WorktreeGrepOutcome> {
         // Non-blocking readiness probe: `wait_for_scan(ZERO)` returns true only
         // when scanning has already finished. A cold index → None → fallback.
         if !self.shared.wait_for_scan(Duration::ZERO) {
@@ -257,6 +316,22 @@ impl WorktreeSearch {
             return None;
         }
 
+        // ripgrep's `-m N` does not simply stop at the Nth match: it keeps
+        // printing that match's after-context window, and a line inside the
+        // window that itself matches renders as a match rather than context.
+        // fff's per-file cap has no way to express either, so decline the
+        // combination whole and let the caller's engine answer it exactly.
+        //
+        // A zero cap means "no matches" by construction. It is declined rather
+        // than answered empty so the PATH shim passes it through to the real
+        // binary, whose behavior for `-m 0` differs between ripgrep (nothing,
+        // exit 1) and BSD grep (every line, as context).
+        if params.max_per_file.is_some_and(|max| max == 0)
+            || (params.max_per_file.is_some() && params.after_context > 0)
+        {
+            return None;
+        }
+
         let (grep_text, mode, smart_case) = plan_query(&params.pattern, params.case_insensitive);
 
         let subdir = params.subdir.as_deref();
@@ -269,21 +344,17 @@ impl WorktreeSearch {
         // fff's mmap threshold so no grepped file is ever memory-mapped (a file
         // truncated while mapped raises SIGBUS and kills the runner). The flip
         // side is that fff then silently skips any in-scope, non-binary file
-        // above that cap — a completeness hole. If such a file exists, bail to
-        // the ripgrep fallback (buffered, uncapped, crash-safe) exactly like the
-        // `LINE_TRUNCATION_THRESHOLD` bail below, so warm and cold routing return
-        // the same matches. The picker read guard is held across the whole query,
-        // so the watcher cannot change indexed sizes between this check and the
-        // search.
-        if has_oversized_in_scope_file(
+        // above that cap — a completeness hole. Name those files as uncovered so
+        // the caller re-greps them with its buffered, uncapped, crash-safe
+        // engine. The picker read guard is held across the whole query, so the
+        // watcher cannot change indexed sizes between this check and the search.
+        let mut uncovered = oversized_in_scope_files(
             picker,
             &self.worktree,
             subdir,
             overrides.as_ref(),
             deny_read,
-        ) {
-            return None;
-        }
+        );
 
         // Constraints reference `grep_text` / `subdir_prefilter`, which outlive
         // the query built below. User glob filters deliberately stay out of fff:
@@ -321,6 +392,11 @@ impl WorktreeSearch {
         // ripgrep walk it replaces has no per-call cap). Bounded by the safety
         // cap against a pathological flood.
         let mut collected: Vec<OwnedMatch> = Vec::new();
+        // Display truncation changes a line's *bytes*, not whether the file
+        // matched or how many matches it holds, so it only makes a file
+        // uncovered for `content`.
+        let checks_truncation = params.output_mode == "content";
+        let mut truncated: HashSet<String> = HashSet::new();
         let mut file_offset = 0usize;
         loop {
             let options = GrepSearchOptions {
@@ -348,19 +424,20 @@ impl WorktreeSearch {
                 }) {
                     continue;
                 }
-                // fff truncates long display lines to 512 bytes; bail the whole
-                // grep to the ripgrep fallback so match (and context) bytes stay
-                // identical between warm and cold routing rather than silently
-                // returning a shortened line.
-                if m.line_content.len() >= LINE_TRUNCATION_THRESHOLD
-                    || m.context_before
-                        .iter()
-                        .any(|l| l.len() >= LINE_TRUNCATION_THRESHOLD)
-                    || m.context_after
-                        .iter()
-                        .any(|l| l.len() >= LINE_TRUNCATION_THRESHOLD)
+                // fff truncates long display lines to 512 bytes. Hand that file
+                // to the caller's engine, which emits full content, so a match's
+                // bytes are identical whether the index is warm or cold.
+                if checks_truncation
+                    && (m.line_content.len() >= LINE_TRUNCATION_THRESHOLD
+                        || m.context_before
+                            .iter()
+                            .any(|l| l.len() >= LINE_TRUNCATION_THRESHOLD)
+                        || m.context_after
+                            .iter()
+                            .any(|l| l.len() >= LINE_TRUNCATION_THRESHOLD))
                 {
-                    return None;
+                    truncated.insert(stripped_rel.to_string());
+                    continue;
                 }
                 collected.push(OwnedMatch {
                     rel: stripped_rel.to_string(),
@@ -370,13 +447,47 @@ impl WorktreeSearch {
                     context_after: m.context_after.clone(),
                 });
             }
-            if result.next_file_offset == 0 || collected.len() >= DRAIN_SAFETY_CAP {
+            if result.next_file_offset == 0 {
                 break;
+            }
+            // Past the safety cap the drain would be truncated, and a truncated
+            // result set is indistinguishable from a complete one downstream.
+            // Decline the whole query rather than pass off a partial answer as
+            // a complete one.
+            if collected.len() >= DRAIN_SAFETY_CAP {
+                log::warn!(
+                    "worktree_search: grep for {} passed the {DRAIN_SAFETY_CAP}-match drain cap; \
+                     declining so the caller's engine answers completely",
+                    self.worktree.display()
+                );
+                return None;
             }
             file_offset = result.next_file_offset;
         }
 
-        Some(format_matches(&collected, params))
+        // Matches already drained from a truncating file would duplicate what
+        // the caller's re-grep produces, so drop them.
+        if !truncated.is_empty() {
+            collected.retain(|m| !truncated.contains(&m.rel));
+            uncovered.extend(truncated);
+            uncovered.sort();
+            uncovered.dedup();
+        }
+
+        self.served_grep_queries.fetch_add(1, Ordering::Relaxed);
+        Some(WorktreeGrepOutcome {
+            lines: grep_lines(&collected),
+            uncovered,
+        })
+    }
+
+    /// Number of grep queries completed by this resident index.
+    ///
+    /// This monotonic diagnostic makes routing observable without coupling callers
+    /// to fff internals and lets integration tests prove a virtual search used the
+    /// warm engine rather than its filesystem fallback.
+    pub fn served_grep_query_count(&self) -> u64 {
+        self.served_grep_queries.load(Ordering::Relaxed)
     }
 
     /// Run a glob against the warm index.
@@ -490,12 +601,11 @@ fn contains_glob_metachar(path: &str) -> bool {
         .any(|b| matches!(b, b'*' | b'?' | b'[' | b']' | b'{' | b'}'))
 }
 
-/// Does the warm index hold a non-binary file that is in scope for this grep
-/// but larger than [`MMAP_SAFE_MAX_FILE_SIZE`]? The `max_file_size` cap keeps
-/// such a file from being memory-mapped (and so from raising SIGBUS on a
-/// concurrent truncation), but that same cap makes fff silently skip it — so
-/// its presence forces [`WorktreeSearch::try_grep`] to bail to the ripgrep
-/// fallback, preserving warm/cold completeness parity.
+/// Search-root-relative paths of the non-binary, in-scope files larger than
+/// [`MMAP_SAFE_MAX_FILE_SIZE`]. The `max_file_size` cap keeps such a file from
+/// being memory-mapped (and so from raising SIGBUS on a concurrent truncation),
+/// but that same cap makes fff silently skip it — so it is reported as
+/// uncovered and the caller greps it with its own engine.
 ///
 /// Scans both the primary file list and the watcher-discovered overflow list (a
 /// file added/removed mid-session lands in overflow). "In scope" mirrors the
@@ -503,105 +613,73 @@ fn contains_glob_metachar(path: &str) -> bool {
 /// stripping, pass the user glob override filter, and not sit under a
 /// `deny_read` fence root. Binaries are excluded because neither engine
 /// content-searches them and fff never mmaps them, so a large committed binary
-/// (a PNG, say) must not poison every grep in the tree.
-fn has_oversized_in_scope_file(
+/// (a PNG, say) costs nothing.
+fn oversized_in_scope_files(
     picker: &FilePicker,
     worktree: &Path,
     subdir: Option<&str>,
     overrides: Option<&ignore::overrides::Override>,
     deny_read: &[PathBuf],
-) -> bool {
-    picker
+) -> Vec<String> {
+    let mut paths: Vec<String> = picker
         .get_files()
         .iter()
         .chain(picker.get_overflow_files())
-        .any(|file| {
+        .filter_map(|file| {
             if file.is_binary() || file.size <= MMAP_SAFE_MAX_FILE_SIZE {
-                return false;
+                return None;
             }
             let rel = file.relative_path(picker);
-            let Some(stripped_rel) = strip_subdir_prefix(&rel, subdir) else {
-                return false;
-            };
+            let stripped_rel = strip_subdir_prefix(&rel, subdir)?;
             if overrides
                 .is_some_and(|filter| filter.matched(Path::new(stripped_rel), false).is_ignore())
             {
-                return false;
+                return None;
             }
             if !deny_read.is_empty() && path_within_any(&worktree.join(&rel), deny_read) {
-                return false;
+                return None;
             }
-            true
+            Some(stripped_rel.to_string())
         })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
-/// Format drained matches into the `path:N:text` output contract for the
-/// requested output mode. fff returns matches file-grouped and line-ordered
-/// (files ranked by relevance), so iterating them preserves coherent per-file
-/// blocks.
-fn format_matches(matches: &[OwnedMatch], params: &WorktreeGrepParams) -> String {
-    match params.output_mode.as_str() {
-        "files_with_matches" => {
-            let mut seen: Vec<&str> = Vec::new();
-            for m in matches {
-                if !seen.iter().any(|s| *s == m.rel) {
-                    seen.push(&m.rel);
-                }
-            }
-            seen.join("\n")
+/// Expand drained matches into the shared [`GrepLine`] model: each match
+/// contributes its before-context window, the matched line, and its
+/// after-context window at their absolute line numbers. Windows of nearby
+/// matches overlap; the renderer's coordinate dedupe is what collapses them,
+/// so this deliberately does no grouping of its own.
+fn grep_lines(matches: &[OwnedMatch]) -> Vec<GrepLine> {
+    let mut lines = Vec::with_capacity(matches.len());
+    for m in matches {
+        let before_start = m.line_number.saturating_sub(m.context_before.len() as u64);
+        for (offset, text) in m.context_before.iter().enumerate() {
+            lines.push(GrepLine {
+                path: m.rel.clone(),
+                line_number: before_start + offset as u64,
+                is_match: false,
+                text: text.clone(),
+            });
         }
-        "count" => {
-            // Per-file counts in first-seen (relevance) order, emitted as
-            // `path:count` — the shape the ripgrep walk produces.
-            let mut order: Vec<&str> = Vec::new();
-            let mut counts: HashMap<&str, usize> = HashMap::new();
-            for m in matches {
-                let entry = counts.entry(m.rel.as_str()).or_insert(0);
-                if *entry == 0 {
-                    order.push(&m.rel);
-                }
-                *entry += 1;
-            }
-            order
-                .into_iter()
-                .map(|rel| format!("{}:{}", rel, counts[rel]))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        // "content" and any already-validated mode fall here.
-        _ => {
-            let ctx_requested = params.before_context > 0 || params.after_context > 0;
-            let mut lines: Vec<String> = Vec::new();
-            let mut previous_context_end: Option<(&str, u64)> = None;
-            for m in matches {
-                let before_start = m.line_number.saturating_sub(m.context_before.len() as u64);
-                // `grep_searcher` emits context breaks inside a file when two
-                // match groups are separated. It does not insert a break between
-                // different files, so mirror that instead of separating every
-                // drained fff match whenever context is requested.
-                if ctx_requested
-                    && previous_context_end
-                        .is_some_and(|(rel, end)| rel == m.rel && before_start > end + 1)
-                {
-                    lines.push("--".to_string());
-                }
-                for (j, text) in m.context_before.iter().enumerate() {
-                    let ln = params.show_line_numbers.then(|| before_start + j as u64);
-                    lines.push(format_grep_line(&m.rel, ln, '-', text));
-                }
-                let ln = params.show_line_numbers.then_some(m.line_number);
-                lines.push(format_grep_line(&m.rel, ln, ':', &m.line_content));
-                for (j, text) in m.context_after.iter().enumerate() {
-                    let ln = params
-                        .show_line_numbers
-                        .then(|| m.line_number + 1 + j as u64);
-                    lines.push(format_grep_line(&m.rel, ln, '-', text));
-                }
-                previous_context_end = Some((&m.rel, m.line_number + m.context_after.len() as u64));
-            }
-            lines.join("\n")
+        lines.push(GrepLine {
+            path: m.rel.clone(),
+            line_number: m.line_number,
+            is_match: true,
+            text: m.line_content.clone(),
+        });
+        for (offset, text) in m.context_after.iter().enumerate() {
+            lines.push(GrepLine {
+                path: m.rel.clone(),
+                line_number: m.line_number + 1 + offset as u64,
+                is_match: false,
+                text: text.clone(),
+            });
         }
     }
+    lines
 }
 
 /// Bounded, LRU-evicting pool of per-worktree indexes, keyed by worktree path.
@@ -630,7 +708,7 @@ impl PoolInner {
 }
 
 impl WorktreeSearchPool {
-    pub fn new(capacity: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             inner: Mutex::new(PoolInner {
@@ -699,6 +777,7 @@ impl Default for WorktreeSearchPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search_util::render_grep_lines;
 
     #[test]
     fn plan_query_literal_default_is_smart_case_plaintext() {
@@ -765,10 +844,21 @@ mod tests {
         }
     }
 
+    /// Drive the same expansion + rendering the live path uses.
+    fn render(matches: &[OwnedMatch], params: &WorktreeGrepParams, native_output: bool) -> String {
+        render_grep_lines(
+            grep_lines(matches),
+            &params.output_mode,
+            params.show_line_numbers,
+            native_output,
+            params.before_context > 0 || params.after_context > 0,
+        )
+    }
+
     #[test]
     fn format_content_emits_path_line_text() {
         let matches = vec![m("src/a.rs", 10, "let x = 1;"), m("src/b.rs", 3, "x()")];
-        let out = format_matches(&matches, &content_params());
+        let out = render(&matches, &content_params(), false);
         assert_eq!(out, "src/a.rs:10:let x = 1;\nsrc/b.rs:3:x()");
     }
 
@@ -776,7 +866,7 @@ mod tests {
     fn format_content_without_line_numbers() {
         let mut params = content_params();
         params.show_line_numbers = false;
-        let out = format_matches(&[m("a.rs", 1, "hit")], &params);
+        let out = render(&[m("a.rs", 1, "hit")], &params, false);
         assert_eq!(out, "a.rs:hit");
     }
 
@@ -790,15 +880,48 @@ mod tests {
         first.context_after = vec!["after6".to_string()];
         let mut second = m("a.rs", 20, "MATCH2");
         second.context_before = vec!["before19".to_string()];
-        let out = format_matches(&[first, second], &params);
+        let out = render(&[first, second], &params, false);
         assert_eq!(
             out,
             "a.rs:4-before4\na.rs:5:MATCH1\na.rs:6-after6\n--\na.rs:19-before19\na.rs:20:MATCH2"
         );
     }
 
+    /// Two matches close enough that their context windows overlap share the
+    /// lines between them. fff reports each window in full, so only the
+    /// renderer's coordinate dedupe keeps them from printing twice.
     #[test]
-    fn format_files_with_matches_dedups_in_order() {
+    fn format_content_collapses_overlapping_context_windows() {
+        let mut params = content_params();
+        params.before_context = 2;
+        params.after_context = 2;
+        let mut first = m("a.rs", 3, "MATCH1");
+        first.context_before = vec!["one".to_string(), "two".to_string()];
+        first.context_after = vec!["four".to_string(), "five".to_string()];
+        let mut second = m("a.rs", 6, "MATCH2");
+        second.context_before = vec!["four".to_string(), "five".to_string()];
+        second.context_after = vec!["seven".to_string(), "eight".to_string()];
+        assert_eq!(
+            render(&[first, second], &params, false),
+            "a.rs:1-one\na.rs:2-two\na.rs:3:MATCH1\na.rs:4-four\na.rs:5-five\n\
+             a.rs:6:MATCH2\na.rs:7-seven\na.rs:8-eight"
+        );
+    }
+
+    #[test]
+    fn format_content_with_context_separates_files() {
+        let mut params = content_params();
+        params.before_context = 1;
+        let out = render(
+            &[m("a.rs", 5, "MATCH1"), m("b.rs", 1, "MATCH2")],
+            &params,
+            true,
+        );
+        assert_eq!(out, "a.rs:5:MATCH1\n--\nb.rs:1:MATCH2");
+    }
+
+    #[test]
+    fn format_files_with_matches_dedups_by_path() {
         let matches = vec![
             m("src/b.rs", 1, "x"),
             m("src/a.rs", 2, "x"),
@@ -806,8 +929,8 @@ mod tests {
         ];
         let mut params = content_params();
         params.output_mode = "files_with_matches".to_string();
-        let out = format_matches(&matches, &params);
-        assert_eq!(out, "src/b.rs\nsrc/a.rs");
+        let out = render(&matches, &params, false);
+        assert_eq!(out, "src/a.rs\nsrc/b.rs");
     }
 
     #[test]
@@ -819,8 +942,29 @@ mod tests {
         ];
         let mut params = content_params();
         params.output_mode = "count".to_string();
-        let out = format_matches(&matches, &params);
-        assert_eq!(out, "src/b.rs:2\nsrc/a.rs:1");
+        let out = render(&matches, &params, false);
+        assert_eq!(out, "src/a.rs:1\nsrc/b.rs:2");
+    }
+
+    /// Render a grep the index covered completely, as the live seam does.
+    fn served(
+        search: &WorktreeSearch,
+        params: &WorktreeGrepParams,
+        deny_read: &[PathBuf],
+    ) -> String {
+        let outcome = search.try_grep(params, deny_read).expect("index served");
+        assert!(
+            outcome.uncovered.is_empty(),
+            "expected full coverage, got uncovered {:?}",
+            outcome.uncovered
+        );
+        render_grep_lines(
+            outcome.lines,
+            &params.output_mode,
+            params.show_line_numbers,
+            false,
+            params.before_context > 0 || params.after_context > 0,
+        )
     }
 
     fn write_file(root: &Path, rel: &str, contents: &str) {
@@ -874,8 +1018,8 @@ mod tests {
             show_line_numbers: true,
         };
 
-        let out = search.try_grep(&params, &[]).expect("index ready → Some");
-        let files: std::collections::HashSet<&str> = out.lines().collect();
+        let out = served(&search, &params, &[]);
+        let files: HashSet<&str> = out.lines().collect();
         assert!(files.contains("alpha.rs"), "root match found: {out:?}");
         assert!(files.contains("sub/beta.rs"), "subdir match found: {out:?}");
         assert!(
@@ -884,23 +1028,22 @@ mod tests {
         );
 
         // content mode carries `path:N:text`.
-        let content = search
-            .try_grep(
-                &WorktreeGrepParams {
-                    output_mode: "content".to_string(),
-                    ..params_clone(&params)
-                },
-                &[],
-            )
-            .unwrap();
+        let content = served(
+            &search,
+            &WorktreeGrepParams {
+                output_mode: "content".to_string(),
+                ..params_clone(&params)
+            },
+            &[],
+        );
         assert!(
             content.contains("alpha.rs:1:fn needle() {}"),
             "content format: {content:?}"
         );
 
         // Fence: denying `sub/` drops sub/beta.rs from results.
-        let fenced = search.try_grep(&params, &[root.join("sub")]).unwrap();
-        let fenced_files: std::collections::HashSet<&str> = fenced.lines().collect();
+        let fenced = served(&search, &params, &[root.join("sub")]);
+        let fenced_files: HashSet<&str> = fenced.lines().collect();
         assert!(fenced_files.contains("alpha.rs"));
         assert!(
             !fenced_files.contains("sub/beta.rs"),
@@ -908,53 +1051,83 @@ mod tests {
         );
     }
 
-    /// The two review fixes for cold-vs-warm divergence: an invalid regex bails
-    /// to the ripgrep fallback (`None`) instead of silently literal-matching,
-    /// and a match on a line past fff's 512-byte display cap bails too so match
-    /// content is never silently truncated.
+    /// An invalid regex is the one pattern-level whole-query decline: fff would
+    /// silently fall back to literal matching, so the index steps aside and the
+    /// caller produces the canonical "Invalid regex pattern" error instead.
     #[test]
-    fn index_bails_on_invalid_regex_and_long_lines() {
+    fn index_declines_the_whole_query_for_an_invalid_regex() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git_init(root);
         write_file(root, "short.rs", "let needle = 1;\n");
-        // A single line well past fff's 512-byte display cap containing the
-        // needle: the warm index would truncate its content, so the grep must
-        // bail to the ripgrep fallback rather than return a shortened line.
-        let long_line = format!("let needle = \"{}\";\n", "a".repeat(700));
-        write_file(root, "long.rs", &long_line);
 
         let search = WorktreeSearch::new(root).unwrap();
         assert!(search.shared.wait_for_scan(Duration::from_secs(15)));
 
-        // Invalid regex → None so the caller falls through to ripgrep for the
-        // canonical "Invalid regex pattern" error.
         let bad = WorktreeGrepParams {
             pattern: "[".to_string(),
             ..content_params()
         };
-        assert!(
-            search.try_grep(&bad, &[]).is_none(),
-            "invalid regex bails to fallback"
+        assert!(search.try_grep(&bad, &[]).is_none());
+    }
+
+    /// A line past fff's 512-byte display cap would come back shortened, so the
+    /// file naming itself uncovered is how match bytes stay identical between
+    /// warm and cold routing. Only that file is affected, and only in `content`
+    /// mode — truncated display changes neither whether a file matched nor how
+    /// many matches it holds.
+    #[test]
+    fn a_truncating_line_makes_only_its_file_uncovered_and_only_for_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_init(root);
+        write_file(root, "short.rs", "let needle = 1;\n");
+        write_file(
+            root,
+            "long.rs",
+            &format!("let needle = \"{}\";\n", "a".repeat(700)),
         );
 
-        // A grep whose match set includes an over-cap line bails entirely.
+        let search = WorktreeSearch::new(root).unwrap();
+        assert!(search.shared.wait_for_scan(Duration::from_secs(15)));
+
         let needle = WorktreeGrepParams {
             pattern: "needle".to_string(),
             ..content_params()
         };
-        assert!(
-            search.try_grep(&needle, &[]).is_none(),
-            "a match on an over-cap line bails to the fallback"
+        let outcome = search.try_grep(&needle, &[]).expect("partially served");
+        assert_eq!(outcome.uncovered, vec!["long.rs".to_string()]);
+        assert_eq!(
+            render_grep_lines(outcome.lines, "content", true, false, false),
+            "short.rs:1:let needle = 1;",
+            "the truncating file's drained matches are dropped so the re-grep is not doubled"
         );
+
+        for output_mode in ["files_with_matches", "count"] {
+            let params = WorktreeGrepParams {
+                pattern: "needle".to_string(),
+                output_mode: output_mode.to_string(),
+                ..content_params()
+            };
+            let outcome = search.try_grep(&params, &[]).expect("served");
+            assert!(
+                outcome.uncovered.is_empty(),
+                "{output_mode} must not be poisoned by a long line: {:?}",
+                outcome.uncovered
+            );
+            assert!(
+                render_grep_lines(outcome.lines, output_mode, true, false, false)
+                    .contains("long.rs")
+            );
+        }
     }
 
-    /// A non-binary file larger than the mmap-safe cap forces the whole grep to
-    /// bail to the ripgrep fallback (`None`) so fff never memory-maps it — the
-    /// SIGBUS crash-proofing (CAIRN-2574). Narrowing scope past the big file
-    /// with a glob restores warm service.
+    /// fff never searches a non-binary file above the mmap-safe cap (the SIGBUS
+    /// crash-proofing, CAIRN-2574), so it is named uncovered and the rest of
+    /// the tree is still served. Narrowing scope past it with a glob restores
+    /// full coverage.
     #[test]
-    fn index_bails_when_oversized_in_scope_file_present() {
+    fn an_oversized_in_scope_file_is_uncovered_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git_init(root);
@@ -971,29 +1144,59 @@ mod tests {
             pattern: "needle".to_string(),
             ..content_params()
         };
-        // Scope includes big.rs → bail to the fallback.
-        assert!(
-            search.try_grep(&needle, &[]).is_none(),
-            "a large in-scope non-binary file bails to the ripgrep fallback"
+        let outcome = search.try_grep(&needle, &[]).expect("partially served");
+        assert_eq!(outcome.uncovered, vec!["big.rs".to_string()]);
+        assert_eq!(
+            render_grep_lines(outcome.lines, "content", true, false, false),
+            "small.rs:1:let needle = 1;"
         );
 
-        // A glob that excludes big.rs takes it out of scope → warm service.
+        // A glob that excludes big.rs takes it out of scope entirely.
         let narrowed = WorktreeGrepParams {
             pattern: "needle".to_string(),
             globs: vec!["small.rs".to_string()],
             ..content_params()
         };
-        let out = search
-            .try_grep(&narrowed, &[])
-            .expect("grep scoped past the big file is served warm");
+        let out = served(&search, &narrowed, &[]);
         assert!(out.contains("small.rs:1:let needle = 1;"), "{out:?}");
     }
 
-    /// A large *binary* file must not trigger the oversized bail: neither engine
-    /// content-searches binaries and fff never mmaps them, so an ordinary grep
-    /// alongside a big binary blob is still served warm.
+    /// A file in fff's lazy-cache window must still use the buffered grep path.
+    /// Observing the counters avoids a truncate-mid-grep test that could SIGBUS
+    /// and terminate the test process instead of producing an assertion failure.
     #[test]
-    fn index_oversized_binary_file_does_not_bail() {
+    fn grep_does_not_create_a_lazy_persistent_mmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_init(root);
+        let body = format!("needle\n{}", "a".repeat(64 * 1024));
+        assert!(body.len() as u64 > 16 * 1024);
+        assert!((body.len() as u64) < MMAP_SAFE_MAX_FILE_SIZE);
+        write_file(root, "cache-window.txt", &body);
+
+        let search = WorktreeSearch::new(root).unwrap();
+        assert!(search.shared.wait_for_scan(Duration::from_secs(15)));
+        let needle = WorktreeGrepParams {
+            pattern: "needle".to_string(),
+            ..content_params()
+        };
+        let outcome = search.try_grep(&needle, &[]).expect("index served");
+        assert!(outcome.uncovered.is_empty());
+
+        let guard = search.shared.read().unwrap();
+        let budget = guard.as_ref().unwrap().cache_budget();
+        assert_eq!(budget.max_files, 0);
+        assert_eq!(budget.max_bytes, 0);
+        assert_eq!(budget.max_file_size, MMAP_SAFE_MAX_FILE_SIZE);
+        assert_eq!(budget.cached_count.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.cached_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    /// A large *binary* file must not count as uncovered: neither engine
+    /// content-searches binaries and fff never mmaps them, so re-grepping it
+    /// would be pure waste.
+    #[test]
+    fn index_oversized_binary_file_stays_fully_covered() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git_init(root);
@@ -1008,10 +1211,44 @@ mod tests {
             pattern: "needle".to_string(),
             ..content_params()
         };
-        let out = search
-            .try_grep(&needle, &[])
-            .expect("a big binary blob does not poison the warm grep");
+        let out = served(&search, &needle, &[]);
         assert!(out.contains("small.rs:1:let needle = 1;"), "{out:?}");
+    }
+
+    /// Past the drain safety cap the result set would be silently cut short,
+    /// and a cut-short set is indistinguishable downstream from a complete one.
+    /// Decline the whole query so the caller's uncapped engine answers it.
+    #[test]
+    fn a_result_set_past_the_drain_cap_declines_rather_than_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_init(root);
+        // Each file stays under the mmap-safe cap so none is "uncovered".
+        // fff fills a page at PAGE_LIMIT matches, so a page covers about four
+        // of these files, and the drain cap is only consulted when a page ends
+        // with files still unsearched — hence enough files for a third page to
+        // begin after the cap has been passed.
+        let per_file = 30_000;
+        let body = "needle\n".repeat(per_file);
+        assert!((body.len() as u64) < MMAP_SAFE_MAX_FILE_SIZE);
+        let files = 12;
+        for index in 0..files {
+            write_file(root, &format!("flood-{index}.txt"), &body);
+        }
+
+        let search = WorktreeSearch::new(root).unwrap();
+        assert!(search.shared.wait_for_scan(Duration::from_secs(30)));
+
+        let needle = WorktreeGrepParams {
+            pattern: "needle".to_string(),
+            ..content_params()
+        };
+        assert!(
+            search.try_grep(&needle, &[]).is_none(),
+            "a drain past the safety cap must decline, not return a partial body \
+             (if fff's paging changed so this fixture arrives in fewer pages, \
+             the cap is never consulted — grow `files`)"
+        );
     }
 
     /// The cap must stay below fff `=0.9.6`'s smallest `FRESH_MMAP_THRESHOLD`
@@ -1022,6 +1259,9 @@ mod tests {
     fn mmap_safe_cap_is_below_fff_threshold() {
         // Compile-time guard: the cap must stay below fff's smallest threshold.
         const { assert!(MMAP_SAFE_MAX_FILE_SIZE < 256 * 1024) };
+        // Lazy persistent mmap creation stays impossible only while both entry
+        // budgets are zero; keep this invariant visible beside the size guard.
+        const { assert!(CONTENT_CACHE_MAX_FILES == 0 && CONTENT_CACHE_MAX_BYTES == 0) };
     }
 
     fn params_clone(p: &WorktreeGrepParams) -> WorktreeGrepParams {
@@ -1076,6 +1316,7 @@ mod tests {
         let cold = WorktreeSearch {
             worktree: PathBuf::from("/tmp/cold-worktree"),
             shared: SharedFilePicker::default(),
+            served_grep_queries: AtomicU64::new(0),
             _frecency: SharedFrecency::default(),
         };
         assert!(cold.try_glob("*.rs", None, &[]).is_none());

@@ -41,13 +41,13 @@ pub enum PositionKind {
 /// precomputed substance weight (see [`PositionConfig::weight_for`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionMeta {
-    pub session_id: String,
-    pub kind: PositionKind,
-    pub weight: f32,
+    pub(crate) session_id: String,
+    pub(crate) kind: PositionKind,
+    pub(crate) weight: f32,
 }
 
 impl PositionMeta {
-    pub fn new(session_id: impl Into<String>, kind: PositionKind, weight: f32) -> Self {
+    pub(crate) fn new(session_id: impl Into<String>, kind: PositionKind, weight: f32) -> Self {
         Self {
             session_id: session_id.into(),
             kind,
@@ -62,20 +62,20 @@ impl PositionMeta {
 #[derive(Debug, Clone)]
 pub struct PositionConfig {
     /// EMA rate for the fast (recent) timescale.
-    pub alpha_fast: f32,
+    alpha_fast: f32,
     /// EMA rate for the slow (anchor) timescale.
-    pub alpha_slow: f32,
+    alpha_slow: f32,
     /// Below this cosine(slow, event) the slow anchor is treated as stale and
     /// re-anchors faster (a topic pivot).
-    pub pivot_threshold: f32,
+    pivot_threshold: f32,
     /// Multiplier applied to `alpha_slow` when a pivot is detected.
-    pub pivot_boost: f32,
+    pivot_boost: f32,
     /// Role multiplier for user-turn substance weight.
-    pub role_user: f32,
+    role_user: f32,
     /// Role multiplier for agent-content substance weight.
-    pub role_agent: f32,
+    role_agent: f32,
     /// Role multiplier for change-signal substance weight.
-    pub role_change: f32,
+    role_change: f32,
 }
 
 impl Default for PositionConfig {
@@ -96,7 +96,7 @@ impl Default for PositionConfig {
 }
 
 impl PositionConfig {
-    pub fn role_multiplier(&self, kind: PositionKind) -> f32 {
+    fn role_multiplier(&self, kind: PositionKind) -> f32 {
         match kind {
             PositionKind::User => self.role_user,
             PositionKind::Agent => self.role_agent,
@@ -106,14 +106,14 @@ impl PositionConfig {
 
     /// Substance weight = substance units (token count, or a length estimate
     /// when token counts are absent) times the role multiplier.
-    pub fn weight_for(&self, kind: PositionKind, tokens: Option<i32>, text: &str) -> f32 {
+    pub(crate) fn weight_for(&self, kind: PositionKind, tokens: Option<i32>, text: &str) -> f32 {
         substance_units(tokens, text) * self.role_multiplier(kind)
     }
 }
 
 /// Estimate an event's substance in token-ish units: prefer a real token count,
 /// else ~4 characters per token. Floored at 1.0 so every event contributes.
-pub fn substance_units(tokens: Option<i32>, text: &str) -> f32 {
+fn substance_units(tokens: Option<i32>, text: &str) -> f32 {
     let raw = match tokens {
         Some(t) if t > 0 => t as f32,
         _ => text.chars().count() as f32 / 4.0,
@@ -122,7 +122,7 @@ pub fn substance_units(tokens: Option<i32>, text: &str) -> f32 {
 }
 
 /// L2-normalize, returning the input unchanged when it is all-zeros or empty.
-pub fn normalize(v: &[f32]) -> Vec<f32> {
+fn normalize(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm == 0.0 {
         v.to_vec()
@@ -138,13 +138,13 @@ fn lerp(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
 /// One session's live position: dual-timescale EMA over event vectors.
 #[derive(Debug, Clone)]
 pub struct SessionLive {
-    pub fast: Vec<f32>,
-    pub slow: Vec<f32>,
+    fast: Vec<f32>,
+    slow: Vec<f32>,
     /// Resolved node/chat URI this session rolls up into, if known. `None`
     /// means the summary centroid can't be routed (live position still works).
-    pub owner_uri: Option<String>,
-    pub last_seen: Instant,
-    pub dirty: bool,
+    owner_uri: Option<String>,
+    last_seen: Instant,
+    dirty: bool,
 }
 
 impl SessionLive {
@@ -184,7 +184,7 @@ impl SessionLive {
 
     /// `current_pos = norm(fast + slow)`. Falls back to whichever timescale is
     /// populated when only one is (shouldn't happen after the first fold).
-    pub fn current_pos(&self) -> Vec<f32> {
+    fn current_pos(&self) -> Vec<f32> {
         match (self.fast.is_empty(), self.slow.is_empty()) {
             (true, true) => Vec::new(),
             (true, false) => self.slow.clone(),
@@ -212,10 +212,10 @@ impl SessionLive {
 /// One node/chat's summary: substance-weighted vector sum (`centroid = norm(sum)`).
 #[derive(Debug, Clone)]
 pub struct OwnerAccum {
-    pub sum: Vec<f32>,
-    pub weight: f32,
-    pub last_seen: Instant,
-    pub dirty: bool,
+    sum: Vec<f32>,
+    weight: f32,
+    last_seen: Instant,
+    dirty: bool,
 }
 
 impl OwnerAccum {
@@ -246,7 +246,7 @@ impl OwnerAccum {
     /// scale-invariant, so storing the unnormalized sum is equivalent to the
     /// centroid for recall while preserving accumulated weight across eviction
     /// and restart.
-    pub fn summary_vector(&self) -> Vec<f32> {
+    fn summary_vector(&self) -> Vec<f32> {
         self.sum.clone()
     }
 }
@@ -255,20 +255,20 @@ impl OwnerAccum {
 #[derive(Debug, Default, PartialEq)]
 pub struct EvictionFlush {
     /// `(session_id, current_pos)` to persist to `sessions.current_pos`.
-    pub sessions: Vec<(String, Vec<f32>)>,
+    pub(crate) sessions: Vec<(String, Vec<f32>)>,
     /// `(owner_uri, centroid)` to upsert into `resource_embeddings`.
-    pub owners: Vec<(String, Vec<f32>)>,
+    pub(crate) owners: Vec<(String, Vec<f32>)>,
 }
 
 /// In-memory position state across all live sessions and their owning nodes/chats.
-pub struct PositionEngine {
-    pub sessions: HashMap<String, SessionLive>,
-    pub owners: HashMap<String, OwnerAccum>,
-    pub cfg: PositionConfig,
+pub(crate) struct PositionEngine {
+    sessions: HashMap<String, SessionLive>,
+    owners: HashMap<String, OwnerAccum>,
+    cfg: PositionConfig,
 }
 
 impl PositionEngine {
-    pub fn new(cfg: PositionConfig) -> Self {
+    pub(crate) fn new(cfg: PositionConfig) -> Self {
         Self {
             sessions: HashMap::new(),
             owners: HashMap::new(),
@@ -276,7 +276,7 @@ impl PositionEngine {
         }
     }
 
-    pub fn has_session(&self, session_id: &str) -> bool {
+    pub(crate) fn has_session(&self, session_id: &str) -> bool {
         self.sessions.contains_key(session_id)
     }
 
@@ -285,7 +285,7 @@ impl PositionEngine {
     /// (resume) sets `fast = slow = norm(seed)`. The owner summary is NOT seeded
     /// here — it reloads from its own persisted vector via [`PositionEngine::seed_owner`],
     /// so idle gaps and restarts resume the running mean rather than resetting it.
-    pub fn register_session(
+    pub(crate) fn register_session(
         &mut self,
         session_id: &str,
         owner_uri: Option<String>,
@@ -299,7 +299,7 @@ impl PositionEngine {
         self.sessions.insert(session_id.to_string(), live);
     }
 
-    pub fn has_owner(&self, uri: &str) -> bool {
+    pub(crate) fn has_owner(&self, uri: &str) -> bool {
         self.owners.contains_key(uri)
     }
 
@@ -307,7 +307,7 @@ impl PositionEngine {
     /// idle eviction and app restarts resume the substance-weighted running
     /// mean instead of resetting it to post-gap activity. The reloaded state is
     /// not marked dirty (it already equals what's persisted).
-    pub fn seed_owner(&mut self, uri: &str, sum: Vec<f32>, now: Instant) {
+    pub(crate) fn seed_owner(&mut self, uri: &str, sum: Vec<f32>, now: Instant) {
         if sum.is_empty() {
             return;
         }
@@ -326,7 +326,7 @@ impl PositionEngine {
     /// Fold an event vector into a registered session's live position and its
     /// owner's summary centroid. Returns the new current_pos for persisting, or
     /// `None` if the session was never registered.
-    pub fn fold(
+    pub(crate) fn fold(
         &mut self,
         session_id: &str,
         v: &[f32],
@@ -345,7 +345,7 @@ impl PositionEngine {
     }
 
     /// Drain dirty live positions for per-batch persistence, clearing the flag.
-    pub fn take_dirty_sessions(&mut self) -> Vec<(String, Vec<f32>)> {
+    pub(crate) fn take_dirty_sessions(&mut self) -> Vec<(String, Vec<f32>)> {
         let mut out = Vec::new();
         for (id, live) in self.sessions.iter_mut() {
             if live.dirty {
@@ -357,7 +357,7 @@ impl PositionEngine {
     }
 
     /// Drain dirty summary centroids for the coarser upsert timer, clearing the flag.
-    pub fn take_dirty_owners(&mut self) -> Vec<(String, Vec<f32>)> {
+    pub(crate) fn take_dirty_owners(&mut self) -> Vec<(String, Vec<f32>)> {
         let mut out = Vec::new();
         for (uri, accum) in self.owners.iter_mut() {
             if accum.dirty {
@@ -370,7 +370,7 @@ impl PositionEngine {
 
     /// Evict sessions and owners idle for at least `ttl`, returning their final
     /// vectors for one last persist.
-    pub fn evict_idle(&mut self, now: Instant, ttl: Duration) -> EvictionFlush {
+    pub(crate) fn evict_idle(&mut self, now: Instant, ttl: Duration) -> EvictionFlush {
         let stale_sessions: Vec<String> = self
             .sessions
             .iter()
@@ -401,7 +401,7 @@ impl PositionEngine {
     }
 
     /// Drain everything for a final flush (channel close / shutdown).
-    pub fn drain_all(&mut self) -> EvictionFlush {
+    pub(crate) fn drain_all(&mut self) -> EvictionFlush {
         let sessions = self
             .sessions
             .drain()

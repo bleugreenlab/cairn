@@ -23,19 +23,19 @@ use std::collections::{HashMap, VecDeque};
 /// A job whose derived status differs from its cached status.
 #[derive(Debug, Clone)]
 pub struct JobStatusChange {
-    pub job_id: String,
+    job_id: String,
     pub from: JobStatus,
-    pub to: JobStatus,
-    pub issue_id: Option<String>,
-    pub project_id: String,
-    pub parent_job_id: Option<String>,
+    to: JobStatus,
+    issue_id: Option<String>,
+    project_id: String,
+    parent_job_id: Option<String>,
     /// Carried so the scoped `jobs` db-change can invalidate the parent batch's
     /// child-job query (`["child-jobs", parentToolUseId]`) without a cache scan.
-    pub parent_tool_use_id: Option<String>,
+    parent_tool_use_id: Option<String>,
     /// When `to == Blocked` because the node ended its turn without its declared
     /// output, a human-readable reason naming the missing artifact. None for
     /// other Blocked causes (approval gate) and for non-Blocked changes.
-    pub blocked_reason: Option<String>,
+    blocked_reason: Option<String>,
 }
 
 impl JobStatusChange {
@@ -854,7 +854,7 @@ pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
 /// sweep's responsibility), a top-level job, an already-terminal child, or a
 /// non-terminal outcome (a live turn, or a crash whose interrupted turn must
 /// stay resumable so re-dispatch can replay).
-pub(crate) async fn reduce_delegated_child_job_conn(
+async fn reduce_delegated_child_job_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<JobStatus>> {

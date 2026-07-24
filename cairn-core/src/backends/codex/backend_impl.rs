@@ -1,12 +1,121 @@
 use super::app_server::AppServerClient;
 use super::auth::{find_codex_oauth_account_id, CodexAuthState};
 use super::config::{write_codex_config, write_codex_config_for_provider};
-use super::models::discover_codex_models;
+use super::models::{discover_codex_models, refresh_codex_model_cache};
 use super::protocol::CodexStdin;
 use super::thread_params::{
     build_resume_fallback_prompt, build_thread_fork_params, build_thread_resume_params,
     build_thread_start_params, codex_sandbox_mode, is_missing_rollout_error,
 };
+
+const REQUIRED_CAIRN_MCP_TOOLS: [&str; 3] = ["read", "run", "write"];
+
+fn cairn_mcp_status(client: &AppServerClient, thread_id: &str) -> Result<(), String> {
+    let response = client.send_request(
+        "mcpServerStatus/list",
+        serde_json::json!({
+            "threadId": thread_id,
+            "detail": "toolsAndAuthOnly",
+        }),
+    )?;
+    let servers = response
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "malformed mcpServerStatus/list response: missing data array".to_string())?;
+    let cairn = servers
+        .iter()
+        .find(|server| server.get("name").and_then(serde_json::Value::as_str) == Some("cairn"))
+        .ok_or_else(|| "cairn server is absent from the thread MCP registry".to_string())?;
+    let tools = cairn
+        .get("tools")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "cairn server status is missing its tool inventory".to_string())?;
+    let mut advertised = tools.keys().map(String::as_str).collect::<Vec<_>>();
+    advertised.sort_unstable();
+    if advertised != REQUIRED_CAIRN_MCP_TOOLS {
+        return Err(format!(
+            "cairn server advertised tools [{}], required exactly [{}]",
+            advertised.join(", "),
+            REQUIRED_CAIRN_MCP_TOOLS.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+fn verify_resumed_thread_with_fallback<StartReplacement, Persist, ReportError>(
+    client: &AppServerClient,
+    resumed_thread_id: &str,
+    start_replacement: StartReplacement,
+    mut persist: Persist,
+    mut report_error: ReportError,
+) -> Result<String, String>
+where
+    StartReplacement: FnOnce() -> Result<String, String>,
+    Persist: FnMut(&str) -> Result<(), String>,
+    ReportError: FnMut(&str),
+{
+    let result: Result<String, String> = (|| {
+        if ensure_cairn_mcp_attached(client, resumed_thread_id, "resume").is_ok() {
+            persist(resumed_thread_id)?;
+            return Ok(resumed_thread_id.to_string());
+        }
+
+        let replacement_thread_id = start_replacement()?;
+        ensure_cairn_mcp_attached(
+            client,
+            &replacement_thread_id,
+            "resume-transcript-fallback",
+        )
+        .map_err(|reason| {
+            format!(
+                "replacement thread {replacement_thread_id} for resumed thread {resumed_thread_id} failed attachment: {reason}"
+            )
+        })?;
+        persist(&replacement_thread_id)?;
+        Ok(replacement_thread_id)
+    })();
+    if let Err(error) = &result {
+        report_error(error);
+    }
+    result
+}
+
+fn ensure_cairn_mcp_attached(
+    client: &AppServerClient,
+    thread_id: &str,
+    resume_mode: &str,
+) -> Result<(), String> {
+    match cairn_mcp_status(client, thread_id) {
+        Ok(()) => {
+            log::info!(
+                "Codex MCP attachment verified: thread_id={} resume_mode={} server=cairn startup_state=ready",
+                thread_id,
+                resume_mode
+            );
+            return Ok(());
+        }
+        Err(first_reason) => log::warn!(
+            "Codex MCP attachment unavailable; refreshing once: thread_id={} resume_mode={} server=cairn startup_state=unavailable reason={}",
+            thread_id,
+            resume_mode,
+            first_reason
+        ),
+    }
+
+    client
+        .send_request("config/mcpServer/reload", serde_json::Value::Null)
+        .map_err(|reason| format!("cairn MCP refresh failed for thread {thread_id}: {reason}"))?;
+    cairn_mcp_status(client, thread_id).map_err(|reason| {
+        format!("cairn MCP attachment failed after refresh for thread {thread_id}: {reason}")
+    })?;
+    log::info!(
+        "Codex MCP attachment recovered: thread_id={} resume_mode={} server=cairn startup_state=ready",
+        thread_id,
+        resume_mode
+    );
+    Ok(())
+}
 use super::version::check_codex_version;
 use super::{CodexAppServerProfile, CodexBackend, CODEX_BACKEND_NAME};
 use crate::agent_process::process::{ActiveProcess, BackendStdin};
@@ -20,7 +129,9 @@ use crate::orchestrator::session::{
 };
 use crate::orchestrator::Orchestrator;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+
+static CODEX_START_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 use std::thread;
 
 use super::super::{
@@ -225,7 +336,10 @@ impl AgentBackend for CodexBackend {
     }
 
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
-        discover_codex_models()
+        let _guard = CODEX_START_LOCK
+            .lock()
+            .map_err(|_| "Codex start lock poisoned".to_string())?;
+        discover_codex_models(None, &HashMap::new())
     }
 
     fn option_descriptors(&self) -> Vec<ProviderOptionDescriptor> {
@@ -327,12 +441,6 @@ impl AgentBackend for CodexBackend {
             .get_secret_for_mcp()
             .map_err(|e| format!("Failed to get MCP auth secret: {}", e))?;
 
-        let codex_home = write_codex_config(
-            &orch.mcp_binary_path,
-            orch.mcp_callback_port,
-            &config.mcp_config_json,
-        )?;
-
         let identity = config
             .identity
             .as_ref()
@@ -366,6 +474,36 @@ impl AgentBackend for CodexBackend {
             }
             _ => None,
         };
+
+        let catalog_login_params = match (codex_auth.as_ref(), oauth_state.as_ref()) {
+            (Some(CodexAuth::OAuthToken(_)), Some(state)) => {
+                let guard = state
+                    .lock()
+                    .map_err(|_| "Codex auth state lock poisoned".to_string())?;
+                Some(serde_json::json!({
+                    "type": "chatgptAuthTokens",
+                    "idToken": guard.id_access_pair().0,
+                    "accessToken": guard.id_access_pair().1,
+                    "chatgptAccountId": guard
+                        .chatgpt_account_id()
+                        .ok_or_else(|| "Missing ChatGPT account id in Codex auth tokens".to_string())?,
+                }))
+            }
+            (Some(CodexAuth::ApiKey(key)), _) => Some(serde_json::json!({
+                "type": "apiKey",
+                "apiKey": key,
+            })),
+            _ => None,
+        };
+        let start_guard = CODEX_START_LOCK
+            .lock()
+            .map_err(|_| "Codex start lock poisoned".to_string())?;
+        refresh_codex_model_cache(catalog_login_params, &HashMap::new())?;
+        let codex_home = write_codex_config(
+            &orch.mcp_binary_path,
+            orch.mcp_callback_port,
+            &config.mcp_config_json,
+        )?;
 
         let mut env = HashMap::new();
         env.insert("CODEX_HOME".to_string(), codex_home.clone());
@@ -407,6 +545,7 @@ impl AgentBackend for CodexBackend {
             }),
         )?;
         client.send_notification("initialized", serde_json::json!({}))?;
+        drop(start_guard);
 
         let approval_policy = match config.permissions.fence {
             crate::models::Fence::Allow => "never",
@@ -463,6 +602,11 @@ impl AgentBackend for CodexBackend {
         }
 
         let mut prompt_text = config.prompt.clone();
+        let resume_mode = match &config.session_start {
+            crate::backends::SessionStart::Resume { .. } => "resume",
+            crate::backends::SessionStart::Fork { .. } => "fork",
+            crate::backends::SessionStart::New { .. } => "new",
+        };
         let thread_resp = match &config.session_start {
             crate::backends::SessionStart::Resume {
                 backend_id,
@@ -583,7 +727,7 @@ impl AgentBackend for CodexBackend {
             }
         };
 
-        let thread_id = thread_resp
+        let mut thread_id = thread_resp
             .get("thread")
             .and_then(|t| t.get("id"))
             .and_then(|v| v.as_str())
@@ -595,7 +739,62 @@ impl AgentBackend for CodexBackend {
             session_id.as_deref().unwrap_or("<none>")
         );
 
-        // Store the Codex thread_id as the session's backend resume handle
+        if let Err(attachment_error) = ensure_cairn_mcp_attached(&client, &thread_id, resume_mode) {
+            if let crate::backends::SessionStart::Resume {
+                backend_id,
+                session_id: cairn_session_id,
+            } = &config.session_start
+            {
+                log::warn!(
+                    "Codex resumed thread MCP attachment failed; replacing thread with transcript preload: thread_id={} resume_mode=resume server=cairn startup_state=unavailable reason={}",
+                    thread_id,
+                    attachment_error
+                );
+                if let Some(preloaded_prompt) =
+                    build_resume_fallback_prompt(&run_db, cairn_session_id, &config.prompt)
+                {
+                    prompt_text = preloaded_prompt;
+                }
+                let replacement = client.send_request(
+                    "thread/start",
+                    build_thread_start_params(
+                        &config.working_dir,
+                        approval_policy,
+                        sandbox_mode,
+                        model_str.as_deref(),
+                        config.reasoning_effort.as_deref(),
+                        config.service_tier.as_deref(),
+                        &base_instructions,
+                        developer_instructions.as_deref(),
+                    ),
+                )?;
+                thread_id = replacement
+                    .get("thread")
+                    .and_then(|thread| thread.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        "Codex replacement thread response missing thread id".to_string()
+                    })?
+                    .to_string();
+                if let Err(reason) =
+                    ensure_cairn_mcp_attached(&client, &thread_id, "resume-transcript-fallback")
+                {
+                    let error = format!(
+                        "Codex Cairn MCP infrastructure unavailable: replacement thread {thread_id} for resumed thread {backend_id} failed attachment: {reason}"
+                    );
+                    insert_error_event(orch, &config.run_id, session_id.as_deref(), &error);
+                    return Err(error);
+                }
+            } else {
+                let error = format!(
+                    "Codex Cairn MCP infrastructure unavailable: thread {thread_id} mode={resume_mode}: {attachment_error}"
+                );
+                insert_error_event(orch, &config.run_id, session_id.as_deref(), &error);
+                return Err(error);
+            }
+        }
+
+        // Store only a verified Codex thread_id as the session's backend resume handle.
         if let Some(ref sid) = session_id {
             let _ = set_session_backend_id(CODEX_BACKEND_NAME, &run_db, sid, &thread_id);
         }
@@ -795,13 +994,6 @@ pub(crate) fn start_app_server_session(
         .get_secret_for_mcp()
         .map_err(|e| format!("Failed to get MCP auth secret: {}", e))?;
 
-    let codex_home = write_codex_config_for_provider(
-        &orch.mcp_binary_path,
-        orch.mcp_callback_port,
-        &config.mcp_config_json,
-        profile.model_provider.as_ref(),
-    )?;
-
     let identity = config
         .identity
         .as_ref()
@@ -835,6 +1027,41 @@ pub(crate) fn start_app_server_session(
         }
         _ => None,
     };
+
+    let catalog_login_params = match (codex_auth.as_ref(), oauth_state.as_ref()) {
+        (Some(CodexAuth::OAuthToken(_)), Some(state)) => {
+            let guard = state
+                .lock()
+                .map_err(|_| "Codex auth state lock poisoned".to_string())?;
+            Some(serde_json::json!({
+                "type": "chatgptAuthTokens",
+                "idToken": guard.id_access_pair().0,
+                "accessToken": guard.id_access_pair().1,
+                "chatgptAccountId": guard
+                    .chatgpt_account_id()
+                    .ok_or_else(|| "Missing ChatGPT account id in Codex auth tokens".to_string())?,
+            }))
+        }
+        (Some(CodexAuth::ApiKey(key)), _) => Some(serde_json::json!({
+            "type": "apiKey",
+            "apiKey": key,
+        })),
+        _ => None,
+    };
+    let mut discovery_env = HashMap::new();
+    if let Some((key, value)) = profile.api_key_env.as_ref() {
+        discovery_env.insert((*key).to_string(), value.clone());
+    }
+    let start_guard = CODEX_START_LOCK
+        .lock()
+        .map_err(|_| "Codex start lock poisoned".to_string())?;
+    refresh_codex_model_cache(catalog_login_params, &discovery_env)?;
+    let codex_home = write_codex_config_for_provider(
+        &orch.mcp_binary_path,
+        orch.mcp_callback_port,
+        &config.mcp_config_json,
+        profile.model_provider.as_ref(),
+    )?;
 
     let mut env = HashMap::new();
     env.insert("CODEX_HOME".to_string(), codex_home.clone());
@@ -879,6 +1106,7 @@ pub(crate) fn start_app_server_session(
         }),
     )?;
     client.send_notification("initialized", serde_json::json!({}))?;
+    drop(start_guard);
 
     let approval_policy = match config.permissions.fence {
         crate::models::Fence::Allow => "never",
@@ -1057,22 +1285,89 @@ pub(crate) fn start_app_server_session(
         }
     };
 
-    let thread_id = thread_resp
+    let resume_mode = match &config.session_start {
+        crate::backends::SessionStart::Resume { .. } => "resume",
+        crate::backends::SessionStart::Fork { .. } => "fork",
+        crate::backends::SessionStart::New { .. } => "new",
+    };
+    let mut thread_id = thread_resp
         .get("thread")
         .and_then(|t| t.get("id"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Codex thread response missing thread id".to_string())?
         .to_string();
+
+    if let crate::backends::SessionStart::Resume {
+        session_id: cairn_session_id,
+        ..
+    } = &config.session_start
+    {
+        let run_id = config.run_id.clone();
+        thread_id = verify_resumed_thread_with_fallback(
+            &client,
+            &thread_id,
+            || {
+                if let Some(preloaded_prompt) =
+                    build_resume_fallback_prompt(&run_db, cairn_session_id, &config.prompt)
+                {
+                    prompt_text = preloaded_prompt;
+                }
+                let replacement = client.send_request(
+                    "thread/start",
+                    build_thread_start_params(
+                        &config.working_dir,
+                        approval_policy,
+                        sandbox_mode,
+                        model_str.as_deref(),
+                        config.reasoning_effort.as_deref(),
+                        config.service_tier.as_deref(),
+                        &base_instructions,
+                        developer_instructions.as_deref(),
+                    ),
+                )?;
+                replacement
+                    .get("thread")
+                    .and_then(|thread| thread.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        "Codex replacement thread response missing thread id".to_string()
+                    })
+            },
+            |verified_thread_id| {
+                set_session_backend_id(
+                    profile.backend_name,
+                    &run_db,
+                    cairn_session_id,
+                    verified_thread_id,
+                )
+            },
+            |reason| {
+                insert_error_event(
+                    orch,
+                    &run_id,
+                    session_id.as_deref(),
+                    &format!("Codex Cairn MCP infrastructure unavailable: {reason}"),
+                );
+            },
+        )?;
+    } else {
+        if let Err(attachment_error) = ensure_cairn_mcp_attached(&client, &thread_id, resume_mode) {
+            let error = format!(
+                "Codex Cairn MCP infrastructure unavailable: thread {thread_id} mode={resume_mode}: {attachment_error}"
+            );
+            insert_error_event(orch, &config.run_id, session_id.as_deref(), &error);
+            return Err(error);
+        }
+        if let Some(ref sid) = session_id {
+            set_session_backend_id(profile.backend_name, &run_db, sid, &thread_id)?;
+        }
+    }
     log::info!(
         "Codex session start received thread_id={} for cairn_session_id={}",
         thread_id,
         session_id.as_deref().unwrap_or("<none>")
     );
-
-    // Store the Codex thread_id as the session's backend resume handle
-    if let Some(ref sid) = session_id {
-        let _ = set_session_backend_id(profile.backend_name, &run_db, sid, &thread_id);
-    }
 
     let initial_sequence = persist_system_prompt_event(
         orch,
@@ -1241,7 +1536,7 @@ fn codex_login(
 /// (CAIRN-2549). One process hosts N call threads; each call finalizes its
 /// one-shot turn and abandons its thread. Isolation: the per-call `RunHandle`
 /// carries a NULL child so kill/stop/finalize never signal the shared process.
-pub(crate) fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
     let start_time = std::time::Instant::now();
     let session_id = Some(config.session_start.session_id().to_string());
     let run_db = resolve_run_db(CODEX_BACKEND_NAME, orch, &config.run_id)?;
@@ -1512,6 +1807,213 @@ pub(crate) fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> R
 mod tests {
     use super::*;
     use crate::agent_process::process::wrap_plain_stdin;
+    use serde_json::json;
+
+    fn ready_mcp_status() -> serde_json::Value {
+        json!({
+            "result": {
+                "data": [{
+                    "name": "cairn",
+                    "tools": {
+                        "read": {"name": "read"},
+                        "write": {"name": "write"},
+                        "run": {"name": "run"}
+                    }
+                }]
+            }
+        })
+    }
+
+    fn request_methods(requests: &Arc<Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request["method"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn healthy_thread_verifies_without_refresh() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client =
+            AppServerClient::for_test_scripted(vec![Ok(ready_mcp_status())], Arc::clone(&requests));
+
+        ensure_cairn_mcp_attached(&client, "thread-new", "new").unwrap();
+
+        assert_eq!(request_methods(&requests), vec!["mcpServerStatus/list"]);
+        assert_eq!(
+            requests.lock().unwrap()[0]["params"]["threadId"],
+            "thread-new"
+        );
+    }
+
+    #[test]
+    fn empty_resume_status_refreshes_then_recovers() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = AppServerClient::for_test_scripted(
+            vec![
+                Ok(json!({"result": {"data": []}})),
+                Ok(json!({"result": {}})),
+                Ok(ready_mcp_status()),
+            ],
+            Arc::clone(&requests),
+        );
+
+        ensure_cairn_mcp_attached(&client, "thread-resume", "resume").unwrap();
+
+        assert_eq!(
+            request_methods(&requests),
+            vec![
+                "mcpServerStatus/list",
+                "config/mcpServer/reload",
+                "mcpServerStatus/list"
+            ]
+        );
+    }
+
+    #[test]
+    fn healthy_resume_checks_the_existing_thread_without_replacement() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client =
+            AppServerClient::for_test_scripted(vec![Ok(ready_mcp_status())], Arc::clone(&requests));
+
+        ensure_cairn_mcp_attached(&client, "existing-thread", "resume").unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["params"]["threadId"], "existing-thread");
+    }
+
+    #[test]
+    fn persistent_callback_failure_never_sends_turn_start() {
+        let callback_error =
+            json!({"error": {"code": -32000, "message": "callback connection refused"}});
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = AppServerClient::for_test_scripted(
+            vec![
+                Ok(callback_error.clone()),
+                Ok(json!({"result": {}})),
+                Ok(callback_error),
+            ],
+            Arc::clone(&requests),
+        );
+
+        let reported = Arc::new(Mutex::new(Vec::<String>::new()));
+        let error = verify_resumed_thread_with_fallback(
+            &client,
+            "thread-offline",
+            || Err("replacement app-server unavailable".to_string()),
+            |_| Ok(()),
+            {
+                let reported = Arc::clone(&reported);
+                move |error| reported.lock().unwrap().push(error.to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("replacement app-server unavailable"));
+        assert_eq!(reported.lock().unwrap().as_slice(), [error.as_str()]);
+        assert!(!request_methods(&requests).contains(&"turn/start".to_string()));
+    }
+
+    #[test]
+    fn resumed_thread_fallback_persists_replacement_before_turn_start() {
+        let empty_status = json!({"result": {"data": []}});
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let persisted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let client = AppServerClient::for_test_scripted(
+            vec![
+                Ok(empty_status.clone()),
+                Ok(json!({"result": {}})),
+                Ok(empty_status),
+                Ok(json!({"result": {"thread": {"id": "replacement-thread"}}})),
+                Ok(ready_mcp_status()),
+                Ok(json!({"result": {"turn": {"id": "turn-1"}}})),
+            ],
+            Arc::clone(&requests),
+        );
+
+        let verified_thread = verify_resumed_thread_with_fallback(
+            &client,
+            "stale-thread",
+            || {
+                let replacement =
+                    client.send_request("thread/start", json!({"cwd": "/tmp/worktree"}))?;
+                replacement["thread"]["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "replacement missing id".to_string())
+            },
+            {
+                let persisted = Arc::clone(&persisted);
+                move |thread_id| {
+                    persisted.lock().unwrap().push(thread_id.to_string());
+                    Ok(())
+                }
+            },
+            {
+                let errors = Arc::clone(&errors);
+                move |error| errors.lock().unwrap().push(error.to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(verified_thread, "replacement-thread");
+        assert_eq!(persisted.lock().unwrap().as_slice(), ["replacement-thread"]);
+        assert!(errors.lock().unwrap().is_empty());
+
+        client
+            .send_request(
+                "turn/start",
+                json!({"threadId": verified_thread, "input": []}),
+            )
+            .unwrap();
+
+        assert_eq!(
+            request_methods(&requests),
+            vec![
+                "mcpServerStatus/list",
+                "config/mcpServer/reload",
+                "mcpServerStatus/list",
+                "thread/start",
+                "mcpServerStatus/list",
+                "turn/start",
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_core_mcp_verb_is_rejected_after_one_refresh() {
+        let status = json!({
+            "result": {
+                "data": [{
+                    "name": "cairn",
+                    "tools": {
+                        "read": {"name": "read"},
+                        "write": {"name": "write"}
+                    }
+                }]
+            }
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = AppServerClient::for_test_scripted(
+            vec![Ok(status.clone()), Ok(json!({"result": {}})), Ok(status)],
+            Arc::clone(&requests),
+        );
+
+        let error = ensure_cairn_mcp_attached(&client, "thread-broken", "resume").unwrap_err();
+
+        assert!(error.contains("required exactly [read, run, write]"));
+        assert_eq!(
+            request_methods(&requests),
+            vec![
+                "mcpServerStatus/list",
+                "config/mcpServer/reload",
+                "mcpServerStatus/list"
+            ]
+        );
+    }
 
     /// Codex cannot switch models on a live process. The warm-reuse path relies
     /// on this error to fall back to a restart, so it must stay explicit.

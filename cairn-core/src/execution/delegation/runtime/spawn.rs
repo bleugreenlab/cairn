@@ -64,6 +64,31 @@ async fn resolve_task_agent_config(
             Err(e) => return Err(format!("Failed to load agent config: {}", e)),
         };
 
+    let policy = crate::config::contextual_packages::load_contextual_packages(project_path);
+    let selection = policy.selection(
+        crate::config::contextual_packages::ContextualPackageKind::Agent,
+        &file_agent.id,
+        &file_agent.bundles,
+    );
+    if !policy.is_selected(
+        crate::config::contextual_packages::ContextualPackageKind::Agent,
+        &file_agent.id,
+        &file_agent.bundles,
+    ) {
+        let reason = if matches!(
+            selection,
+            crate::config::contextual_packages::ContextualPackageSelection::ExplicitlyDisabled
+        ) {
+            "disabled"
+        } else {
+            "not enabled"
+        };
+        return Err(format!(
+            "Agent '{}' is {reason} for project {}",
+            file_agent.name, parent_ctx.project_key
+        ));
+    }
+
     let parent_backend = select_optional_text(
         &db,
         "SELECT model FROM jobs WHERE id = ?1",
@@ -827,7 +852,7 @@ pub async fn spawn_workflow_packets(
     };
 
     // 3. Spawn the supervised bun process now that the packet exists.
-    if let Err(e) = start_workflow_run(orch, &prepared) {
+    if let Err(e) = start_workflow_run(orch, &prepared).await {
         reclaim_ephemeral_workflow_worktree(orch, &prepared).await;
         err!(e);
     }

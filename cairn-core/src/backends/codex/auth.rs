@@ -36,15 +36,15 @@ impl CodexAuthState {
         })
     }
 
-    pub(super) fn account_id(&self) -> Option<String> {
+    fn account_id(&self) -> Option<String> {
         self.account_id.clone()
     }
 
-    pub(super) fn raw_json(&self) -> String {
+    fn raw_json(&self) -> String {
         self.raw_json.clone()
     }
 
-    pub(super) fn tokens(&self) -> CodexOAuthTokens {
+    fn tokens(&self) -> CodexOAuthTokens {
         self.tokens.clone()
     }
 
@@ -59,11 +59,11 @@ impl CodexAuthState {
         self.tokens.chatgpt_account_id.clone()
     }
 
-    pub(super) fn refresh_token(&self) -> Option<String> {
+    fn refresh_token(&self) -> Option<String> {
         self.tokens.refresh_token.clone()
     }
 
-    pub(super) fn apply_refresh(&mut self, new_tokens: CodexOAuthTokens) -> Result<String, String> {
+    fn apply_refresh(&mut self, new_tokens: CodexOAuthTokens) -> Result<String, String> {
         let mut value: Value = serde_json::from_str(&self.raw_json)
             .map_err(|e| format!("Failed to parse Codex auth JSON: {}", e))?;
         let tokens_obj = value
@@ -110,9 +110,7 @@ impl CodexAuthState {
     }
 }
 
-pub(super) fn refresh_codex_tokens_via_http(
-    refresh_token: &str,
-) -> Result<CodexOAuthTokens, String> {
+fn refresh_codex_tokens_via_http(refresh_token: &str) -> Result<CodexOAuthTokens, String> {
     let client = Client::new();
     let response = client
         .post(CODEX_OAUTH_TOKEN_URL)
@@ -171,7 +169,7 @@ pub fn refresh_codex_oauth_tokens_for_current_account(
     refresh_codex_tokens_for_session(orch, &state)
 }
 
-pub(super) fn refresh_codex_tokens_for_session_with<F>(
+fn refresh_codex_tokens_for_session_with<F>(
     orch: &Orchestrator,
     state_arc: &Arc<Mutex<CodexAuthState>>,
     refresh_fn: F,
@@ -232,7 +230,7 @@ where
     }
 }
 
-pub(super) fn apply_and_persist_codex_refresh(
+fn apply_and_persist_codex_refresh(
     orch: &Orchestrator,
     state_arc: &Arc<Mutex<CodexAuthState>>,
     new_tokens: CodexOAuthTokens,
@@ -257,7 +255,7 @@ pub(super) fn apply_and_persist_codex_refresh(
     Ok(())
 }
 
-pub(super) fn sync_codex_auth_state_from_store(
+fn sync_codex_auth_state_from_store(
     orch: &Orchestrator,
     state_arc: &Arc<Mutex<CodexAuthState>>,
 ) -> Result<bool, String> {
@@ -283,7 +281,7 @@ pub(super) fn sync_codex_auth_state_from_store(
     Ok(true)
 }
 
-pub(super) fn is_refresh_token_reused_error(err: &str) -> bool {
+fn is_refresh_token_reused_error(err: &str) -> bool {
     err.contains("refresh_token_reused")
 }
 
@@ -302,10 +300,7 @@ pub(super) fn find_codex_oauth_account_id(orch: &Orchestrator, auth_json: &str) 
         .map(|account| account.id.clone())
 }
 
-pub(super) fn codex_oauth_json_from_store(
-    orch: &Orchestrator,
-    account_id: Option<&str>,
-) -> Option<String> {
+fn codex_oauth_json_from_store(orch: &Orchestrator, account_id: Option<&str>) -> Option<String> {
     let store = orch.get_identity_store()?;
 
     if let Some(account_id) = account_id {
@@ -336,7 +331,7 @@ pub(super) fn codex_oauth_json_from_store(
         .map(|(_, value)| value)
 }
 
-pub(super) fn persist_codex_oauth_tokens(
+fn persist_codex_oauth_tokens(
     orch: &Orchestrator,
     account_id: Option<&str>,
     previous_json: &str,
@@ -392,7 +387,7 @@ pub(super) fn persist_codex_oauth_tokens(
     Ok(true)
 }
 
-pub(super) fn parse_codex_oauth_tokens(auth_json: &str) -> Result<CodexOAuthTokens, String> {
+fn parse_codex_oauth_tokens(auth_json: &str) -> Result<CodexOAuthTokens, String> {
     let value: Value =
         serde_json::from_str(auth_json).map_err(|e| format!("Invalid Codex OAuth JSON: {}", e))?;
     let tokens = value
@@ -417,7 +412,7 @@ pub(super) fn parse_codex_oauth_tokens(auth_json: &str) -> Result<CodexOAuthToke
 }
 
 /// Extract `chatgpt_account_id` from a Codex access token JWT without signature verification.
-pub(super) fn extract_chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
+fn extract_chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
@@ -427,7 +422,7 @@ pub(super) fn extract_chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
     json_string(payload.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id"))
 }
 
-pub(super) fn token_chatgpt_account_id(
+fn token_chatgpt_account_id(
     tokens: &serde_json::Map<String, Value>,
     access_token: &str,
 ) -> Option<String> {

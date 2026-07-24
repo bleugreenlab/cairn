@@ -44,7 +44,7 @@ fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
 /// from the durable `messages` row (the push key carries the message id), which
 /// is why migrating directs onto the push queue needs no schema change
 /// (CAIRN-1900).
-pub async fn get_message_by_id_async(db: &LocalDb, id: &str) -> DbResult<Option<Message>> {
+pub(crate) async fn get_message_by_id_async(db: &LocalDb, id: &str) -> DbResult<Option<Message>> {
     let id = id.to_string();
     db.read(|conn| {
         let id = id.clone();
@@ -110,7 +110,7 @@ pub fn insert_message(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn insert_message_with_urgency(
+pub(crate) fn insert_message_with_urgency(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
@@ -134,7 +134,7 @@ pub fn insert_message_with_urgency(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn insert_message_with_urgency_and_id(
+pub(crate) fn insert_message_with_urgency_and_id(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
@@ -228,7 +228,7 @@ async fn insert_message_async_with_id(
 /// the issue's strictly-monotonic `updated_at` so the row's own timestamp is the
 /// `cairn watch` catch-up cursor.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn insert_message_at_async(
+async fn insert_message_at_async(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
@@ -365,7 +365,7 @@ pub async fn insert_external_reply(
 /// - `limit`: max results (default 50)
 ///
 /// Returns messages in chronological order (oldest first).
-pub fn query_channel(
+pub(crate) fn query_channel(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
@@ -393,7 +393,7 @@ pub fn query_channel(
     })
 }
 
-pub(super) async fn query_channel_async(
+async fn query_channel_async(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
@@ -457,81 +457,6 @@ pub(super) async fn query_channel_async(
     .map_err(|error| db_error("Failed to query messages", error))
 }
 
-/// Query new channel messages since a timestamp for hook delivery.
-/// Returns project + issue channel messages newer than `since`, excluding
-/// messages sent by `exclude_run_id` (the caller) and direct messages.
-/// `project_key` is the project key (e.g. "CAIRN"), used as channel_id for project channels.
-/// `issue_key` is the issue key in KEY/NUMBER format (e.g. "CRN/40"), used as channel_id for issue channels.
-pub fn query_new_for_hook(
-    db: &LocalDb,
-    project_key: &str,
-    issue_key: Option<&str>,
-    since: i64,
-    exclude_run_id: &str,
-) -> Result<Vec<Message>, String> {
-    let project_key = project_key.to_string();
-    let issue_key = issue_key.map(str::to_string);
-    let exclude_run_id = exclude_run_id.to_string();
-
-    run_db_blocking(move || async move {
-        query_new_for_hook_async(
-            db,
-            &project_key,
-            issue_key.as_deref(),
-            since,
-            &exclude_run_id,
-        )
-        .await
-    })
-}
-
-pub(super) async fn query_new_for_hook_async(
-    db: &LocalDb,
-    project_key: &str,
-    issue_key: Option<&str>,
-    since: i64,
-    exclude_run_id: &str,
-) -> Result<Vec<Message>, String> {
-    let project_key = project_key.to_string();
-    let issue_key = issue_key.map(str::to_string);
-    let exclude_run_id = exclude_run_id.to_string();
-
-    db.read(|conn| {
-        let project_key = project_key.clone();
-        let issue_key = issue_key.clone();
-        let exclude_run_id = exclude_run_id.clone();
-        Box::pin(async move {
-            let sql = format!(
-                "SELECT {} FROM messages
-                     WHERE created_at > ?1
-                       AND (sender_run_id IS NULL OR sender_run_id != ?2)
-                       AND (
-                            (channel_type = 'project' AND channel_id = ?3)
-                         OR (?4 IS NOT NULL AND channel_type = 'issue' AND channel_id = ?4)
-                       )
-                     ORDER BY created_at ASC
-                     LIMIT 50",
-                MESSAGE_COLUMNS
-            );
-            let rows = conn
-                .query(
-                    &sql,
-                    params![
-                        since,
-                        exclude_run_id.as_str(),
-                        project_key.as_str(),
-                        issue_key.as_deref()
-                    ],
-                )
-                .await?;
-
-            collect_messages(rows).await
-        })
-    })
-    .await
-    .map_err(|error| db_error("Failed to query new messages", error))
-}
-
 /// Query messages for an issue (both issue channel and direct to agents on that issue).
 /// Used for the ExecutionPanel frontend view.
 /// `issue_key` is in KEY/NUMBER format (e.g. "CRN/40").
@@ -545,7 +470,7 @@ pub fn query_for_issue(
     run_db_blocking(move || async move { query_for_issue_async(db, &issue_key, since).await })
 }
 
-pub(super) async fn query_for_issue_async(
+async fn query_for_issue_async(
     db: &LocalDb,
     issue_key: &str,
     since: Option<i64>,
@@ -579,7 +504,7 @@ pub(super) async fn query_for_issue_async(
 /// Direct messages are keyed by `recipient_run_id` (and `sender_run_id`), so a
 /// job's full DM history is the union of directs touching any run owned by the
 /// job. Returned in chronological order, oldest first.
-pub fn query_directs_for_job(
+pub(crate) fn query_directs_for_job(
     db: &LocalDb,
     job_id: &str,
     since: Option<i64>,
@@ -591,7 +516,7 @@ pub fn query_directs_for_job(
     )
 }
 
-pub(super) async fn query_directs_for_job_async(
+async fn query_directs_for_job_async(
     db: &LocalDb,
     job_id: &str,
     since: Option<i64>,
@@ -830,43 +755,5 @@ mod tests {
 
         assert!(matches!(msg.channel_type, ChannelType::Direct));
         assert_eq!(msg.recipient_run_id.as_deref(), Some("run-2"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_query_new_for_hook_excludes_directs() {
-        let db = migrated_db().await;
-
-        // A DM to recipient should NOT come back from the channel hook query,
-        // which is what makes the queued-direct claim path necessary.
-        insert_message_async(
-            &db,
-            &ChannelType::Direct,
-            None,
-            Some("sender"),
-            "planner",
-            Some("recipient"),
-            "private",
-            None,
-        )
-        .await
-        .unwrap();
-        insert_message_async(
-            &db,
-            &ChannelType::Issue,
-            Some("PROJ/1"),
-            Some("sender"),
-            "planner",
-            None,
-            "public",
-            None,
-        )
-        .await
-        .unwrap();
-
-        let results = query_new_for_hook_async(&db, "proj-1", Some("PROJ/1"), 0, "recipient")
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "public");
     }
 }

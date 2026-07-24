@@ -79,7 +79,7 @@ async fn exact_subscription(
     .map_err(|error| format!("Failed to read wake subscription: {error}"))
 }
 
-pub async fn peek_pending_suppressed_for_job(
+pub(crate) async fn peek_pending_suppressed_for_job(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<SuppressedWake>, String> {
@@ -114,7 +114,7 @@ async fn select_pending_suppressed(
     Ok(notices)
 }
 
-pub async fn subscribe_scope(
+async fn subscribe_scope(
     db: &LocalDb,
     job_id: &str,
     scope: &WakeScope,
@@ -166,7 +166,7 @@ pub(super) async fn seed_scope(
     subscribe_scope(db, job_id, scope, created_by).await
 }
 
-pub async fn subscribe(
+pub(crate) async fn subscribe(
     db: &LocalDb,
     job_id: &str,
     source_kind: &str,
@@ -182,7 +182,7 @@ pub async fn subscribe(
 /// Subscribe a one-shot wake: the subscription is consumed (deleted) the first
 /// time a matching wake routes to it. Used for terminal-exit subscriptions,
 /// which fire exactly once.
-pub async fn subscribe_one_shot(
+pub(crate) async fn subscribe_one_shot(
     db: &LocalDb,
     job_id: &str,
     source_kind: &str,
@@ -237,7 +237,7 @@ pub async fn subscribe_terminal_output_one_shot(
 /// original session) and a subscribe made while no session was live is honored
 /// by the next session. The `wake_subscriptions` row is the source of truth;
 /// the in-memory watcher list is only a per-session cache.
-pub async fn list_terminal_output_watchers(
+pub(crate) async fn list_terminal_output_watchers(
     db: &LocalDb,
     terminal_uri: &str,
 ) -> Result<Vec<(String, String, String, String)>, String> {
@@ -310,7 +310,10 @@ pub async fn list_terminal_output_watchers_for_job_terminal(
     .map_err(|error| format!("Failed to list terminal output watchers: {error}"))
 }
 
-pub async fn seed_default_job_subscriptions(db: &LocalDb, job_id: &str) -> Result<(), String> {
+pub(crate) async fn seed_default_job_subscriptions(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<(), String> {
     seed_scope(
         db,
         job_id,
@@ -328,7 +331,7 @@ pub async fn seed_default_job_subscriptions(db: &LocalDb, job_id: &str) -> Resul
     Ok(())
 }
 
-pub async fn mute_scope(
+async fn mute_scope(
     db: &LocalDb,
     job_id: &str,
     scope: &WakeScope,
@@ -352,7 +355,7 @@ pub async fn mute_scope(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn mute(
+pub(crate) async fn mute(
     db: &LocalDb,
     job_id: &str,
     source_kind: &str,
@@ -371,7 +374,7 @@ pub async fn mute(
     mute_scope(db, job_id, &scope, until.as_ref(), created_by).await
 }
 
-pub async fn unmute_matching(
+pub(crate) async fn unmute_matching(
     db: &LocalDb,
     job_id: &str,
     source_kind: &str,
@@ -388,7 +391,7 @@ pub async fn unmute_matching(
     .await
 }
 
-pub async fn unsubscribe_matching(
+pub(crate) async fn unsubscribe_matching(
     db: &LocalDb,
     job_id: &str,
     source_kind: &str,

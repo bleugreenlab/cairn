@@ -5,12 +5,12 @@ use std::process::Output;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitAuthor {
-    pub name: String,
-    pub email: String,
+    pub(crate) name: String,
+    pub(crate) email: String,
 }
 
 impl GitAuthor {
-    pub fn new(name: impl Into<String>, email: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>, email: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             email: email.into(),
@@ -50,13 +50,13 @@ fn git_stdout(
 #[derive(Debug, Clone)]
 pub struct CommitResult {
     pub sha: String,
-    pub pr_number: Option<i32>,
+    pub(crate) pr_number: Option<i32>,
     /// Set when a `^` amend was CONVERTED into a regular child commit because the
     /// commit it would have rewritten is shared with a sibling bookmark. Carries a
     /// human-readable note the barrier/commit report surfaces so the agent's `^`
     /// intent visibly landed as a child commit instead of silently rewriting
     /// shared history. `None` for every ordinary seal/amend.
-    pub amend_note: Option<String>,
+    pub(crate) amend_note: Option<String>,
 }
 
 pub fn current_commit(worktree_path: &Path) -> Result<String, String> {
@@ -78,7 +78,7 @@ pub fn current_branch(worktree_path: &Path) -> Result<String, String> {
 }
 
 /// Return true when the worktree has a configured, non-empty `origin` remote.
-pub fn has_remote(worktree_path: &Path) -> bool {
+pub(crate) fn has_remote(worktree_path: &Path) -> bool {
     crate::env::git()
         .args(["remote", "get-url", "origin"])
         .current_dir(worktree_path)

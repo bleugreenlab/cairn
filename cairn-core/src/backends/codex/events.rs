@@ -124,10 +124,7 @@ pub(super) fn emit_streaming_delta(
 
 /// Flush the accumulator's buffered chunks to the DB and advance the stream
 /// version. Caller ensures there is something to flush.
-pub(super) fn flush_codex_pending(
-    state: &mut StreamingState,
-    run_db: &Arc<LocalDb>,
-) -> Result<(), String> {
+fn flush_codex_pending(state: &mut StreamingState, run_db: &Arc<LocalDb>) -> Result<(), String> {
     let pending = state.acc.take_pending();
     let result = append_chunks(run_db.clone(), &state.stream_id, state.version, &pending)?;
     state.version = result.version;
@@ -135,7 +132,7 @@ pub(super) fn flush_codex_pending(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn ensure_stream_open(
+fn ensure_stream_open(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
@@ -526,14 +523,14 @@ pub(super) fn terminal_tool_called_for_run(orch: &Orchestrator, run_id: &str) ->
         .unwrap_or(false)
 }
 
-pub(super) fn should_finalize_task_run_on_interrupted_turn(
+fn should_finalize_task_run_on_interrupted_turn(
     terminal_tool_called: bool,
     is_task_spawned: bool,
 ) -> bool {
     terminal_tool_called && is_task_spawned
 }
 
-pub(super) fn handle_codex_interrupted_turn(
+fn handle_codex_interrupted_turn(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
@@ -718,7 +715,7 @@ fn codex_reset_credit_from_value(value: &Value) -> Option<ProviderUsageResetCred
     })
 }
 
-pub(super) fn codex_rate_limit_scope(window_duration_mins: Option<i32>) -> ProviderUsageScope {
+fn codex_rate_limit_scope(window_duration_mins: Option<i32>) -> ProviderUsageScope {
     if window_duration_mins == Some(10_080) {
         ProviderUsageScope::Weekly
     } else {
@@ -740,7 +737,7 @@ pub(super) fn codex_rate_limit_window_label(id: &str, window_duration_mins: Opti
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn store_event_with_id(
+fn store_event_with_id(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
@@ -825,7 +822,7 @@ pub(super) fn store_event_with_id(
     }
 }
 
-pub(super) fn finalize_streaming_with_event(
+fn finalize_streaming_with_event(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,

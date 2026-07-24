@@ -55,26 +55,28 @@ fn is_false(b: &bool) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct RecipeFile {
     /// Format version for future compatibility
-    pub cairn_version: u32,
+    cairn_version: u32,
     /// Recipe name
     pub name: String,
     /// Optional description
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<String>,
     /// When the recipe can be triggered
-    pub trigger: RecipeTrigger,
+    trigger: RecipeTrigger,
     /// Marks a backend/system recipe: hidden from the issue-create picker but
     /// still listed in Settings. Only written to YAML when true.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub system: bool,
+    system: bool,
     /// Legacy context field — read during deserialization for migration, never written.
     /// Value is migrated into the trigger node's scope during into_recipe().
     #[serde(default, skip_serializing)]
     context: Option<String>,
     /// Node definitions
-    pub nodes: Vec<RecipeFileNode>,
+    nodes: Vec<RecipeFileNode>,
     /// Edge definitions
-    pub edges: Vec<RecipeFileEdge>,
+    edges: Vec<RecipeFileEdge>,
 }
 
 /// Compact node representation for file format
@@ -189,13 +191,13 @@ pub struct RecipeFileValidation {
     /// Whether the file is valid for import
     pub valid: bool,
     /// Non-fatal warnings (e.g., unknown agent config references)
-    pub warnings: Vec<String>,
+    warnings: Vec<String>,
     /// Fatal errors that prevent import
     pub errors: Vec<String>,
     /// Number of nodes in the file
-    pub node_count: usize,
+    node_count: usize,
     /// Number of edges in the file
-    pub edge_count: usize,
+    edge_count: usize,
 }
 
 // ============================================================================
@@ -264,6 +266,7 @@ impl From<Recipe> for RecipeFile {
             cairn_version: CURRENT_CAIRN_VERSION,
             name: recipe.name,
             description: recipe.description,
+            bundles: Vec::new(),
             trigger: recipe.trigger,
             system: recipe.is_system,
             context: None,
@@ -1065,6 +1068,7 @@ mod tests {
             cairn_version: 1,
             name: "No Trigger".to_string(),
             description: None,
+            bundles: Vec::new(),
             trigger: RecipeTrigger::Manual,
             context: None,
             system: false,
@@ -1090,6 +1094,7 @@ mod tests {
             cairn_version: 1,
             name: "Bad Edge".to_string(),
             description: None,
+            bundles: Vec::new(),
             trigger: RecipeTrigger::Manual,
             context: None,
             system: false,
@@ -1446,6 +1451,7 @@ edges: []
             cairn_version: 1,
             name: "Test".to_string(),
             description: None,
+            bundles: Vec::new(),
             trigger: RecipeTrigger::SkillCalled,
             context: None,
             system: false,

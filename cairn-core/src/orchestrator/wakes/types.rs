@@ -12,8 +12,8 @@ const SOURCE_KIND_CONDITION: &str = "condition";
 pub(super) const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 pub(super) const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
 pub(super) const FACT_KIND_MESSAGE: &str = "message";
-pub const FACT_KIND_TERMINAL_EXIT: &str = "terminal_exit";
-pub const FACT_KIND_TERMINAL_OUTPUT: &str = "terminal_output";
+pub(crate) const FACT_KIND_TERMINAL_EXIT: &str = "terminal_exit";
+pub(crate) const FACT_KIND_TERMINAL_OUTPUT: &str = "terminal_output";
 
 // CAIRN-1647: the attention ledger collapses the old `agent_idle_with_work` +
 // `pr_state_change` fan-out into a single `review` item kind. Default child
@@ -44,7 +44,7 @@ pub enum WakeSource {
 }
 
 impl WakeSource {
-    pub fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Issue { .. } => SOURCE_KIND_ISSUE,
             Self::Peer { .. } => SOURCE_KIND_PEER,
@@ -55,7 +55,7 @@ impl WakeSource {
         }
     }
 
-    pub fn reference(&self) -> Option<&str> {
+    pub(crate) fn reference(&self) -> Option<&str> {
         match self {
             Self::Issue { reference }
             | Self::Process { reference }
@@ -66,7 +66,7 @@ impl WakeSource {
         }
     }
 
-    pub fn from_parts(kind: &str, reference: Option<&str>) -> Result<Self, String> {
+    pub(crate) fn from_parts(kind: &str, reference: Option<&str>) -> Result<Self, String> {
         match kind {
             SOURCE_KIND_ISSUE => Ok(Self::Issue { reference: required_ref(kind, reference)? }),
             SOURCE_KIND_PEER => Ok(Self::Peer { reference: reference.filter(|value| !value.is_empty()).map(ToString::to_string) }),
@@ -96,12 +96,12 @@ fn required_ref(kind: &str, reference: Option<&str>) -> Result<String, String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WakeScope {
-    pub source: WakeSource,
-    pub fact_kinds: Option<Vec<String>>,
+    pub(crate) source: WakeSource,
+    pub(crate) fact_kinds: Option<Vec<String>>,
 }
 
 impl WakeScope {
-    pub fn new(source: WakeSource, fact_kinds: Option<Vec<String>>) -> Self {
+    pub(crate) fn new(source: WakeSource, fact_kinds: Option<Vec<String>>) -> Self {
         Self { source, fact_kinds }
     }
 }
@@ -109,11 +109,11 @@ impl WakeScope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WakeEvent {
-    pub source: WakeSource,
-    pub fact_kind: String,
-    pub detail_uri: Option<String>,
-    pub delivery: WakeDelivery,
-    pub urgency: DeliveryUrgency,
+    pub(crate) source: WakeSource,
+    pub(crate) fact_kind: String,
+    pub(crate) detail_uri: Option<String>,
+    pub(crate) delivery: WakeDelivery,
+    pub(crate) urgency: DeliveryUrgency,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,7 +150,7 @@ pub enum WakeSubscriptionState {
 }
 
 impl WakeSubscriptionState {
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Muted => "muted",
@@ -171,16 +171,16 @@ impl WakeSubscriptionState {
 #[serde(rename_all = "camelCase")]
 pub struct WakeSubscription {
     pub id: String,
-    pub job_id: String,
+    pub(crate) job_id: String,
     pub source_kind: String,
     pub source_ref: Option<String>,
     pub fact_kinds: Option<Vec<String>>,
-    pub state: WakeSubscriptionState,
-    pub mute_until_kind: Option<String>,
-    pub mute_until_ref: Option<String>,
-    pub created_by: String,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub(crate) state: WakeSubscriptionState,
+    mute_until_kind: Option<String>,
+    mute_until_ref: Option<String>,
+    pub(crate) created_by: String,
+    created_at: i64,
+    pub(crate) updated_at: i64,
     /// Consumed (row deleted) the first time a matching wake routes to it, so a
     /// one-time fact like a terminal exit can never wake the subscriber twice.
     pub one_shot: bool,
@@ -192,26 +192,26 @@ pub struct WakeSubscription {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuppressedWake {
-    pub id: String,
-    pub subscription_id: Option<String>,
-    pub job_id: String,
-    pub source_kind: String,
-    pub source_ref: Option<String>,
-    pub fact_kind: Option<String>,
-    pub occurrences: i64,
-    pub latest_detail_uri: Option<String>,
-    pub content: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub delivered_at: Option<i64>,
+    pub(crate) id: String,
+    pub(crate) subscription_id: Option<String>,
+    pub(crate) job_id: String,
+    pub(crate) source_kind: String,
+    pub(crate) source_ref: Option<String>,
+    pub(crate) fact_kind: Option<String>,
+    pub(crate) occurrences: i64,
+    pub(crate) latest_detail_uri: Option<String>,
+    pub(crate) content: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) delivered_at: Option<i64>,
 }
 
 impl SuppressedWake {
-    pub fn render_digest(notices: &[SuppressedWake]) -> String {
+    pub(crate) fn render_digest(notices: &[SuppressedWake]) -> String {
         Self::render_digest_with_context(notices, None)
     }
 
-    pub fn render_digest_with_context(
+    pub(crate) fn render_digest_with_context(
         notices: &[SuppressedWake],
         woken_by: Option<&WakeSource>,
     ) -> String {

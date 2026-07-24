@@ -23,9 +23,9 @@
 //! The runner family is detected from the COMMAND STRING, not a config field, so
 //! the `checks` schema stays unextended and no new field can drift across its
 //! four consumers (`config/project_settings.rs`, the TS `CheckCommand`, the
-//! editor, and docs). `nextest` (the repo's `test:rust:nextest` script) routes to
-//! the rust parser, `vitest` to the vitest parser, and `tsc` to the tsc parser.
-//! These tokens are pairwise disjoint, so detection order does not matter.
+//! editor, and docs). The repo's Rust entry points (`test:rust`, `nextest`, and
+//! `cargo test`) route to the rust parser, `vitest` to the vitest parser, and
+//! `tsc` to the tsc parser.
 //!
 //! ## The persisted shape (`target_results_json`)
 //!
@@ -43,10 +43,10 @@ use regex::Regex;
 /// write-cadence inline summary and the turn-end `### Systematic checks`
 /// section). One constant for both surfaces, sized at the turn-end section's
 /// historical 1500-char cap.
-pub const FAILURE_EXCERPT_CHARS: usize = 1_500;
+const FAILURE_EXCERPT_CHARS: usize = 1_500;
 
 /// Failing test names listed inline before collapsing the rest into `+N more`.
-pub const MAX_FAILURE_NAMES: usize = 5;
+pub(crate) const MAX_FAILURE_NAMES: usize = 5;
 
 /// Cap on a single per-failure message excerpt, keeping the stored JSON and the
 /// rendered lines bounded regardless of a runner's stack-trace verbosity.
@@ -59,17 +59,17 @@ const MESSAGE_CHARS: usize = 240;
 #[serde(rename_all = "camelCase")]
 pub struct ParsedCheckResult {
     /// Which runner produced this: `"nextest"`, `"vitest"`, or `"tsc"`.
-    pub parser: String,
+    pub(crate) parser: String,
     /// Passing test count. `0` for tsc, which has no test concept.
-    pub passed: usize,
+    pub(crate) passed: usize,
     /// Failing test / error count (the runner's own tally when available).
-    pub failed: usize,
+    pub(crate) failed: usize,
     /// Skipped / ignored / todo test count.
-    pub skipped: usize,
+    pub(crate) skipped: usize,
     /// The failing tests, in report order. This is the substrate future
     /// baseline/delta work compares across trees, so `name` is a stable
     /// identifier.
-    pub failures: Vec<CheckFailure>,
+    pub(crate) failures: Vec<CheckFailure>,
 }
 
 impl ParsedCheckResult {
@@ -78,14 +78,14 @@ impl ParsedCheckResult {
     /// type-error tally with no "test count" meaning. Verdict surfaces gate the
     /// `N tests` / `no tests matched` rendering on this so a passing typecheck is
     /// never labelled with a bogus test count.
-    pub fn is_test_runner(&self) -> bool {
+    pub(crate) fn is_test_runner(&self) -> bool {
         self.parser == "nextest" || self.parser == "vitest"
     }
 
     /// Tests the runner actually executed: passed + failed. Skipped/ignored tests
     /// did not run, so they are excluded from the "was anything validated?" tally
     /// that distinguishes a real green from a zero-selection green.
-    pub fn tests_run(&self) -> usize {
+    pub(crate) fn tests_run(&self) -> usize {
         self.passed + self.failed
     }
 }
@@ -97,13 +97,13 @@ pub struct CheckFailure {
     /// Stable identifier for the failing test / error site: a nextest
     /// `<crate> <test::path>`, a vitest full test title, or a tsc
     /// `file(line,col)`.
-    pub name: String,
+    pub(crate) name: String,
     /// A short, single-line excerpt of the failure message when the runner
     /// exposes one cleanly (vitest assertion text, tsc error text). `None` for
     /// nextest, whose per-test panic text is not reliably attributable from its
     /// human output; callers fall back to the raw output tail there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub(crate) message: Option<String>,
 }
 
 /// Runner family a check's output should be parsed as.
@@ -119,7 +119,10 @@ enum ParserKind {
 /// command with no recognized runner, so the check degrades to exit-code +
 /// raw-tail behavior.
 fn detect_parser(command: &str) -> Option<ParserKind> {
-    if command.contains("nextest") {
+    if command.contains("nextest")
+        || command.contains("cargo test")
+        || command.contains("test:rust")
+    {
         return Some(ParserKind::Rust);
     }
     if command.contains("vitest") {
@@ -137,7 +140,7 @@ fn detect_parser(command: &str) -> Option<ParserKind> {
 /// the raw output tail. A recognized runner that simply found no failures still
 /// returns `Some` (a zero-failure result), which is a valid "green at this tree"
 /// record for future baseline work.
-pub fn parse_check_output(command: &str, output: &str) -> Option<ParsedCheckResult> {
+pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCheckResult> {
     let kind = detect_parser(command)?;
     let clean = strip_ansi(output);
     match kind {
@@ -272,7 +275,7 @@ static NEXTEST_SLOW: LazyLock<Regex> = LazyLock::new(|| {
 /// Empty for any other runner or output with no SLOW lines. Enrichment only:
 /// surfaced beside a `timed_out` verdict so the first agent question ("what was
 /// it doing when it died?") is answerable without re-running the suite.
-pub fn extract_running_tests(output: &str) -> Vec<String> {
+pub(crate) fn extract_running_tests(output: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for cap in NEXTEST_SLOW.captures_iter(output) {
@@ -362,7 +365,51 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         }
     }
 
+    // Libtest repeats the authoritative failing names in a `failures:` summary
+    // immediately before each binary's `test result:` line. Collect those too:
+    // inline `... FAILED` status lines can be absent or interleaved in captured
+    // output, while `--no-fail-fast` emits one stable summary per binary.
+    // Candidates are committed only when the block reaches `test result:` so the
+    // earlier `failures:` detail section and its indented panic output are ignored.
+    let mut in_failure_summary = false;
+    let mut summary_names: Vec<String> = Vec::new();
+    for line in clean.lines() {
+        if line.trim() == "failures:" {
+            in_failure_summary = true;
+            summary_names.clear();
+            continue;
+        }
+        if !in_failure_summary {
+            continue;
+        }
+        if line.trim_start().starts_with("test result:") {
+            for name in summary_names.drain(..) {
+                if seen.insert(name.clone()) {
+                    failures.push(CheckFailure {
+                        name,
+                        message: None,
+                    });
+                }
+            }
+            in_failure_summary = false;
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("    ").map(str::trim) {
+            if !name.is_empty() {
+                summary_names.push(name.to_string());
+                continue;
+            }
+        }
+        in_failure_summary = false;
+        summary_names.clear();
+    }
+
     Some(ParsedCheckResult {
+        // `nextest` is the persisted label for the whole Rust test-runner family,
+        // including the wrapper's cargo-test fallback.
         parser: "nextest".to_string(),
         passed,
         failed,
@@ -378,7 +425,7 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
 /// Render the one-line "what failed" fragment for a failing check:
 /// `3 failed: a, b, c +N more`. `None` when the parse carries no failing names
 /// (a degraded parse), so callers fall back to the exit code alone.
-pub fn format_failure_names(parsed: &ParsedCheckResult) -> Option<String> {
+pub(crate) fn format_failure_names(parsed: &ParsedCheckResult) -> Option<String> {
     if parsed.failures.is_empty() {
         return None;
     }
@@ -402,7 +449,7 @@ pub fn format_failure_names(parsed: &ParsedCheckResult) -> Option<String> {
 /// carries per-failure messages (vitest / tsc), compose `name: message` lines
 /// from them; otherwise fall back to the raw output tail (nextest, or a degraded
 /// parse). Always bounded to [`FAILURE_EXCERPT_CHARS`].
-pub fn format_failure_excerpt(parsed: Option<&ParsedCheckResult>, raw_tail: &str) -> String {
+pub(crate) fn format_failure_excerpt(parsed: Option<&ParsedCheckResult>, raw_tail: &str) -> String {
     if let Some(p) = parsed {
         let composed: Vec<String> = p
             .failures
@@ -536,10 +583,14 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
 
     #[test]
     fn detects_each_runner_from_the_command() {
-        assert_eq!(
-            detect_parser("bun run test:rust:nextest -p cairn-core"),
-            Some(ParserKind::Rust)
-        );
+        for command in [
+            "bun run test:rust",
+            "bun run test:rust:nextest",
+            "cargo nextest run",
+            "cargo test --workspace",
+        ] {
+            assert_eq!(detect_parser(command), Some(ParserKind::Rust), "{command}");
+        }
         assert_eq!(
             detect_parser("bunx vitest related --reporter=json a.ts"),
             Some(ParserKind::Vitest)
@@ -616,6 +667,50 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
         assert_eq!(r.skipped, 1);
         let names: Vec<&str> = r.failures.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["tests::fails_panic", "tests::fails_math"]);
+    }
+
+    #[test]
+    fn cargo_test_collects_failure_summaries_across_binaries_and_dedupes() {
+        let output = "\
+running 1 test
+
+failures:
+
+---- alpha::breaks stdout ----
+    panic output that is not a test name
+
+failures:
+    alpha::breaks
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+
+running 2 tests
+test alpha::breaks ... FAILED
+test beta::also_breaks ... FAILED
+
+failures:
+    alpha::breaks
+    beta::also_breaks
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+
+running 1 test
+
+failures:
+    src/lib.rs - module::item (line 42)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
+        let parsed = parse_check_output("cargo test --workspace", output).unwrap();
+        let names: Vec<&str> = parsed.failures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha::breaks",
+                "beta::also_breaks",
+                "src/lib.rs - module::item (line 42)",
+            ]
+        );
+        assert_eq!(parsed.failed, 4);
     }
 
     #[test]

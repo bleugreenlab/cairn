@@ -20,37 +20,10 @@ impl Orchestrator {
             .and_then(|guard| guard.as_ref().map(|store| store.resolve(None, None)))
     }
 
-    /// Save identity to the local store and update the in-memory state.
-    /// Backward-compatible: maps `UserIdentity` fields into the store.
-    pub fn save_identity(&self, identity: UserIdentity) -> Result<(), String> {
-        local::save_local_identity(&self.config_dir, &identity)?;
-        // Reload the store from disk (save_local_identity writes v2 format)
-        let store = local::load_identity_store(&self.config_dir)?;
-        if let Ok(mut guard) = self.identity_store.lock() {
-            *guard = store;
-        }
-        self.refresh_model_catalog();
-        Ok(())
-    }
-
-    /// Clear the stored identity (remove from disk and memory).
-    pub fn clear_identity(&self) -> Result<(), String> {
-        let path = self.config_dir.join("identity.yaml");
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("Failed to remove identity file: {}", e))?;
-        }
-        if let Ok(mut guard) = self.identity_store.lock() {
-            *guard = None;
-        }
-        self.refresh_model_catalog();
-        Ok(())
-    }
-
     // === New multi-account API ===
 
     /// Get the full identity store.
-    pub fn get_identity_store(&self) -> Option<IdentityStore> {
+    pub(crate) fn get_identity_store(&self) -> Option<IdentityStore> {
         self.identity_store
             .lock()
             .ok()
@@ -58,7 +31,7 @@ impl Orchestrator {
     }
 
     /// Save the full identity store to disk and update in-memory state.
-    pub fn save_identity_store(&self, store: IdentityStore) -> Result<(), String> {
+    pub(crate) fn save_identity_store(&self, store: IdentityStore) -> Result<(), String> {
         local::save_identity_store(&self.config_dir, &store)?;
         if let Ok(mut guard) = self.identity_store.lock() {
             *guard = Some(store);
@@ -68,7 +41,7 @@ impl Orchestrator {
     }
 
     /// Resolve identity for a specific project (with overrides).
-    pub fn resolve_identity_for_project(
+    pub(crate) fn resolve_identity_for_project(
         &self,
         project_id: Option<&str>,
         overrides: Option<&AccountOverrides>,
@@ -81,7 +54,7 @@ impl Orchestrator {
     }
 
     /// Resolve only the git author/committer identity for a project.
-    pub fn resolve_git_identity_for_project(
+    pub(crate) fn resolve_git_identity_for_project(
         &self,
         project_id: Option<&str>,
     ) -> Option<(String, String)> {

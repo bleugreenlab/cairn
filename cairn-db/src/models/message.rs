@@ -39,13 +39,6 @@ impl DeliveryUrgency {
     pub fn wakes_idle(self) -> bool {
         self >= DeliveryUrgency::Queue
     }
-
-    pub fn delivered_at_tool_boundary(self) -> bool {
-        matches!(
-            self,
-            DeliveryUrgency::Passive | DeliveryUrgency::Steer | DeliveryUrgency::Interrupt
-        )
-    }
 }
 
 /// Channel type determines delivery behavior.

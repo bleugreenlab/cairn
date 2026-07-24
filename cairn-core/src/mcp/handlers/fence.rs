@@ -35,7 +35,7 @@ use super::permission::{await_permission_decision, resolve_fence_policy, Permiss
 /// Resolve the canonical run and its fence policy for a verb request, looking
 /// the run up by id or, failing that, by cwd. Returns `None` when there is no
 /// active run or the cwd is unknown — no fence applies.
-pub async fn resolve_run_fence(
+pub(crate) async fn resolve_run_fence(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
 ) -> Option<(String, Fence)> {
@@ -63,7 +63,7 @@ pub enum CrossingKind {
 impl CrossingKind {
     /// Stable tag stored in the request `tool_input` (so a legacy tool prompt's
     /// `tool_input` never parses as a crossing by accident).
-    pub(crate) fn tag(self) -> &'static str {
+    fn tag(self) -> &'static str {
         match self {
             CrossingKind::ReadOutsideWorktree => "read_outside_worktree",
             CrossingKind::WriteOutsideWorktree => "write_outside_worktree",
@@ -75,13 +75,13 @@ impl CrossingKind {
 /// A detected boundary crossing awaiting a fence decision.
 #[derive(Debug, Clone)]
 pub struct Crossing {
-    pub kind: CrossingKind,
+    kind: CrossingKind,
     /// The verb that produced it: "read" | "write" | "run".
-    pub verb: &'static str,
+    verb: &'static str,
     /// Canonical key for session-grant matching (path or normalized command).
     pub descriptor: String,
     /// Human-readable summary for the UI and the deny message.
-    pub summary: String,
+    summary: String,
 }
 
 impl Crossing {
@@ -98,7 +98,7 @@ impl Crossing {
         }
     }
 
-    pub fn write_outside(path: &Path) -> Self {
+    pub(crate) fn write_outside(path: &Path) -> Self {
         let descriptor = path.display().to_string();
         Crossing {
             kind: CrossingKind::WriteOutsideWorktree,
@@ -123,7 +123,7 @@ impl Crossing {
 
     /// Shell crossing with no path (privilege escalation). The descriptor is the
     /// normalized command.
-    pub fn shell_command(summary: String, command: &str) -> Self {
+    pub(crate) fn shell_command(summary: String, command: &str) -> Self {
         Crossing {
             kind: CrossingKind::ShellEscape,
             verb: "run",

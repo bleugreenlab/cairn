@@ -23,9 +23,9 @@ use crate::models::{
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresetsConfig {
-    pub active_backend: String,
-    pub tiers: Vec<String>,
-    pub backends: HashMap<String, HashMap<String, Preset>>,
+    pub(crate) active_backend: String,
+    pub(crate) tiers: Vec<String>,
+    pub(crate) backends: HashMap<String, HashMap<String, Preset>>,
 }
 
 /// Result of resolving a tier reference.
@@ -39,8 +39,8 @@ pub struct ResolvedPreset {
 /// Authored tier/backend pair stored on agents and snapshot agents.
 #[derive(Debug, Clone)]
 pub struct AuthoredSelection {
-    pub tier: Model,
-    pub backend: Option<String>,
+    tier: Model,
+    backend: Option<String>,
 }
 
 /// Which level decided the resolved backend. Display/audit only.
@@ -63,9 +63,9 @@ pub enum ResolutionSource {
 /// runtime [`RuntimeExtras`], and the provenance of the backend decision.
 #[derive(Debug, Clone)]
 pub struct ResolvedSelection {
-    pub selection: ModelSelection,
-    pub extras: RuntimeExtras,
-    pub source: ResolutionSource,
+    pub(crate) selection: ModelSelection,
+    pub(crate) extras: RuntimeExtras,
+    pub(crate) source: ResolutionSource,
 }
 
 /// A launch-time override for one agent node: a tier reference that resolves to
@@ -97,8 +97,8 @@ impl From<&SnapshotPresets> for PresetsConfig {
 }
 
 /// Default tier names.
-pub const DEFAULT_TIERS: &[&str] = &["sm", "md", "lg"];
-pub const DEFAULT_TIER: &str = "md";
+pub(crate) const DEFAULT_TIERS: &[&str] = &["sm", "md", "lg"];
+const DEFAULT_TIER: &str = "md";
 
 /// Build default Claude backend presets.
 ///
@@ -121,7 +121,9 @@ fn reasoning_options(effort: Option<&str>) -> HashMap<String, PresetOptionValue>
 /// `legacy_thinking_enabled` reflects the deprecated workspace `max_thinking_tokens`
 /// setting: when present (the historical default), reasoning models default to
 /// "high" effort; otherwise effort is left to the CLI default.
-pub fn default_claude_presets(legacy_thinking_enabled: Option<i32>) -> HashMap<String, Preset> {
+pub(crate) fn default_claude_presets(
+    legacy_thinking_enabled: Option<i32>,
+) -> HashMap<String, Preset> {
     let reasoning_default = legacy_thinking_enabled.map(|_| "high".to_string());
     let mut map = HashMap::new();
     map.insert(
@@ -149,7 +151,7 @@ pub fn default_claude_presets(legacy_thinking_enabled: Option<i32>) -> HashMap<S
 }
 
 /// Build default Codex backend presets.
-pub fn default_codex_presets() -> HashMap<String, Preset> {
+fn default_codex_presets() -> HashMap<String, Preset> {
     let mut map = HashMap::new();
     map.insert(
         "sm".to_string(),
@@ -176,7 +178,7 @@ pub fn default_codex_presets() -> HashMap<String, Preset> {
 }
 
 /// Build default OpenRouter backend presets.
-pub fn default_openrouter_presets() -> HashMap<String, Preset> {
+fn default_openrouter_presets() -> HashMap<String, Preset> {
     let mut map = HashMap::new();
     map.insert(
         "sm".to_string(),
@@ -203,7 +205,7 @@ pub fn default_openrouter_presets() -> HashMap<String, Preset> {
 }
 
 /// Build a default PresetsConfig.
-pub fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig {
+pub(crate) fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig {
     let mut backends = HashMap::new();
     backends.insert("claude".to_string(), default_claude_presets(max_thinking));
     backends.insert("codex".to_string(), default_codex_presets());
@@ -217,7 +219,7 @@ pub fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig {
 }
 
 /// Parse a tier reference like `"md"` or `"codex/lg"`.
-pub fn parse_tier_ref(tier_ref: &str) -> (Option<&str>, &str) {
+pub(crate) fn parse_tier_ref(tier_ref: &str) -> (Option<&str>, &str) {
     if let Some(idx) = tier_ref.find('/') {
         (Some(&tier_ref[..idx]), &tier_ref[idx + 1..])
     } else {
@@ -226,7 +228,7 @@ pub fn parse_tier_ref(tier_ref: &str) -> (Option<&str>, &str) {
 }
 
 /// Check if a string looks like a tier reference (matches a known tier or contains `/`).
-pub fn is_tier_ref(s: &str, config: &PresetsConfig) -> bool {
+pub(crate) fn is_tier_ref(s: &str, config: &PresetsConfig) -> bool {
     if s.contains('/') {
         return true;
     }
@@ -353,17 +355,8 @@ pub fn resolve_preset(tier_ref: &str, config: &PresetsConfig) -> Result<Resolved
     })
 }
 
-/// Resolve a specific tier against an explicit backend.
-pub fn resolve_preset_for_backend(
-    backend: &str,
-    tier: &str,
-    config: &PresetsConfig,
-) -> Result<ResolvedPreset, String> {
-    resolve_preset(&format!("{}/{}", backend, tier), config)
-}
-
 /// Normalize a legacy concrete model selection to a tier ref when possible.
-pub fn normalize_tier_selection(selection: &str, config: &PresetsConfig) -> String {
+pub(crate) fn normalize_tier_selection(selection: &str, config: &PresetsConfig) -> String {
     let (backend, tier) = parse_tier_ref(selection);
     if backend.is_some() || config.tiers.contains(&tier.to_string()) {
         return selection.to_string();
@@ -397,7 +390,7 @@ pub fn normalize_tier_selection(selection: &str, config: &PresetsConfig) -> Stri
 }
 
 /// Normalize authored tier/backend inputs.
-pub fn normalize_authored_selection(
+fn normalize_authored_selection(
     tier_selection: Option<&str>,
     backend: Option<&str>,
     config: &PresetsConfig,
@@ -427,7 +420,7 @@ pub fn normalize_authored_selection(
 ///
 /// Loud by design: an unresolvable tier or an unrecognized model returns a
 /// descriptive `Err` instead of silently degrading to a bare model name.
-pub fn resolve_runtime_selection(
+pub(crate) fn resolve_runtime_selection(
     tier_selection: Option<&str>,
     backend: Option<&str>,
     config: &PresetsConfig,
@@ -448,7 +441,7 @@ pub fn resolve_runtime_selection(
 /// Loud: a token that is neither a known tier ref nor a recognizable concrete
 /// model (no `backend_for_model` match and no explicit backend) is an `Err`,
 /// never a fabricated `Model::new(token)` against the active backend.
-pub fn resolve_selection_with_provenance(
+pub(crate) fn resolve_selection_with_provenance(
     tier_selection: Option<&str>,
     override_backend: Option<&str>,
     preferred_backend: Option<&str>,
@@ -550,7 +543,7 @@ pub fn load_effective_presets(config_dir: &Path, project_path: Option<&Path>) ->
 /// This is the MVP option set: there is no canonical concrete-model registry beyond
 /// tiers, so the launch composer offers exactly the tier-resolved selections (the
 /// caller unions in a row's own concrete custom selection when needed).
-pub fn available_selections(config: &PresetsConfig) -> Vec<ModelSelection> {
+pub(crate) fn available_selections(config: &PresetsConfig) -> Vec<ModelSelection> {
     let mut out: Vec<ModelSelection> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for tier in &config.tiers {
@@ -1310,6 +1303,7 @@ mod tests {
             hooks: None,
             backend_preference: None,
             icon: None,
+            bundles: Vec::new(),
             is_project_scoped: false,
             file_path: std::path::PathBuf::new(),
         }

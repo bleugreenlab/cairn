@@ -9,7 +9,7 @@
 ///
 /// Shared across backends as the first system-prompt segment, so every backend
 /// receives the same global harness contract.
-pub const CAIRN_SYSTEM_PROMPT: &str = include_str!("agent_process/system_prompt.md");
+const CAIRN_SYSTEM_PROMPT: &str = include_str!("agent_process/system_prompt.md");
 
 /// Sentinel line in `system_prompt.md` marking where the capability-tier Version
 /// Control section is substituted in. The trailing newline is part of the marker
@@ -35,7 +35,7 @@ const VERSION_CONTROL_AMBIENT: &str = include_str!("agent_process/version_contro
 /// it is assembled as the `workspace` segment for every backend, carrying the
 /// motivating doctrine the old per-backend base prompts used to hold. It is
 /// never assembled directly — only used as the seed bytes.
-pub const DEFAULT_WORKSPACE_PROMPT: &str =
+pub(crate) const DEFAULT_WORKSPACE_PROMPT: &str =
     include_str!("agent_process/default_workspace_prompt.md");
 
 use cairn_common::contract::{KeySpec, KeyType, RESOURCE_CONTRACTS};
@@ -53,7 +53,7 @@ fn format_keys(specs: &[KeySpec]) -> String {
 /// drifts from the dispatcher's gate. Each mutable resource lists its modes,
 /// required (typed) and optional payload keys, and — where the payload nests
 /// (arrays/objects) — a copy-paste example.
-pub fn resource_mutation_reference() -> String {
+fn resource_mutation_reference() -> String {
     let mut out = String::from(
         "## Resource Mutations\n\n\
          `write` mutates a resource by URI. Keys are typed; [optional]. \
@@ -160,7 +160,7 @@ spans resources rather than belonging to any single one:
 /// Render the read-side catalog from the contract table: every resource's URI
 /// template, name, description, and its read-query projections (`?key=values`).
 /// This is the read surface the mutation reference never showed.
-pub fn resource_read_catalog() -> String {
+fn resource_read_catalog() -> String {
     let mut out = String::from(
         "## Read catalog\n\n\
          Every readable resource and its read-query projections (`?key=values`), \
@@ -181,7 +181,7 @@ pub fn resource_read_catalog() -> String {
 /// The full self-describing help page: grammar + mechanics, the read catalog,
 /// and the mutation matrix. Served by `cairn://help` as the complete on-demand
 /// resource reference.
-pub fn cairn_help() -> String {
+pub(crate) fn cairn_help() -> String {
     format!(
         "{}\n{}\n{}",
         HELP_GRAMMAR,
@@ -201,7 +201,7 @@ pub fn cairn_help() -> String {
 /// so the authoring variant stays byte-identical for provider prompt-cache
 /// reuse; the ambient variant is a second content-addressable variant that
 /// dedups cleanly within its tier.
-pub fn cairn_system_prompt(ambient: bool) -> String {
+pub(crate) fn cairn_system_prompt(ambient: bool) -> String {
     let version_control = if ambient {
         VERSION_CONTROL_AMBIENT
     } else {
@@ -246,6 +246,9 @@ mod tests {
         for ambient in [false, true] {
             let prompt = cairn_system_prompt(ambient);
             assert!(prompt.contains("`mermaid` and `vega-lite` fenced code blocks"));
+            assert!(prompt.contains("`$…$` as inline math"));
+            assert!(prompt.contains("`$$…$$` as display math"));
+            assert!(prompt.contains("literal dollar signs in code spans"));
             assert!(prompt.contains("inline data with `data.values`"));
             assert!(prompt.contains("not remote `data.url` sources"));
             assert!(prompt.contains("`inlinehtml` fences render as live sandboxed HTML previews"));

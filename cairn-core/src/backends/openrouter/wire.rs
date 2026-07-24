@@ -98,15 +98,15 @@ pub(super) fn default_function_type() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ChatStreamChunk {
     #[serde(default)]
-    pub(super) id: Option<String>,
+    id: Option<String>,
     #[serde(default)]
-    pub(super) model: Option<String>,
+    model: Option<String>,
     #[serde(default)]
     pub(super) choices: Vec<ChatStreamChoice>,
     #[serde(default)]
-    pub(super) usage: Option<TurnUsage>,
+    usage: Option<TurnUsage>,
     #[serde(default)]
-    pub(super) error: Option<StreamError>,
+    error: Option<StreamError>,
 }
 
 impl ChatStreamChunk {
@@ -133,7 +133,7 @@ pub(super) struct StreamError {
     #[serde(default)]
     #[allow(dead_code)]
     pub(super) code: Option<Value>,
-    pub(super) message: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,7 +141,7 @@ pub(super) struct ChatStreamChoice {
     #[serde(default)]
     pub(super) delta: ChatStreamDelta,
     #[serde(default)]
-    pub(super) finish_reason: Option<String>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -149,7 +149,7 @@ pub(super) struct ChatStreamDelta {
     #[serde(default)]
     pub(super) content: Option<String>,
     #[serde(default)]
-    pub(super) tool_calls: Option<Vec<StreamingToolCallDelta>>,
+    tool_calls: Option<Vec<StreamingToolCallDelta>>,
     #[serde(default)]
     pub(super) reasoning: Option<String>,
     // Kept verbatim as raw JSON (not reshaped into typed structs) so order and
@@ -160,21 +160,21 @@ pub(super) struct ChatStreamDelta {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(super) struct StreamingToolCallDelta {
-    pub(super) index: usize,
+    index: usize,
     #[serde(default)]
-    pub(super) id: Option<String>,
+    id: Option<String>,
     #[serde(default)]
-    pub(super) r#type: Option<String>,
+    r#type: Option<String>,
     #[serde(default)]
-    pub(super) function: Option<StreamingToolFunctionDelta>,
+    function: Option<StreamingToolFunctionDelta>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(super) struct StreamingToolFunctionDelta {
     #[serde(default)]
-    pub(super) name: Option<String>,
+    name: Option<String>,
     #[serde(default)]
-    pub(super) arguments: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -183,18 +183,18 @@ pub(super) struct StreamingAggregate {
     pub(super) model: Option<String>,
     pub(super) text: String,
     pub(super) reasoning: String,
-    pub(super) reasoning_details: Vec<ReasoningDetailBuilder>,
-    pub(super) tool_calls: Vec<StreamingToolCallBuilder>,
+    reasoning_details: Vec<ReasoningDetailBuilder>,
+    tool_calls: Vec<StreamingToolCallBuilder>,
     pub(super) usage: Option<TurnUsage>,
-    pub(super) finish_reason: Option<String>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct StreamingToolCallBuilder {
-    pub(super) id: Option<String>,
-    pub(super) r#type: Option<String>,
-    pub(super) name: String,
-    pub(super) arguments: String,
+    id: Option<String>,
+    r#type: Option<String>,
+    name: String,
+    arguments: String,
 }
 
 /// Accumulates one streaming `reasoning_details` block. OpenRouter streams these
@@ -206,15 +206,15 @@ pub(super) struct StreamingToolCallBuilder {
 #[derive(Debug, Default)]
 pub(super) struct ReasoningDetailBuilder {
     /// Set-once metadata (type, id, format, index, and any unrecognized key).
-    pub(super) meta: serde_json::Map<String, Value>,
-    pub(super) text: Option<String>,
-    pub(super) summary: Option<String>,
-    pub(super) signature: Option<String>,
-    pub(super) data: Option<String>,
+    meta: serde_json::Map<String, Value>,
+    text: Option<String>,
+    summary: Option<String>,
+    signature: Option<String>,
+    data: Option<String>,
 }
 
 impl ReasoningDetailBuilder {
-    pub(super) fn apply(&mut self, delta: &Value) {
+    fn apply(&mut self, delta: &Value) {
         let Some(obj) = delta.as_object() else {
             return;
         };
@@ -231,7 +231,7 @@ impl ReasoningDetailBuilder {
         }
     }
 
-    pub(super) fn to_value(&self) -> Value {
+    fn to_value(&self) -> Value {
         let mut obj = self.meta.clone();
         if let Some(text) = &self.text {
             obj.insert("text".to_string(), Value::String(text.clone()));
@@ -249,7 +249,7 @@ impl ReasoningDetailBuilder {
     }
 }
 
-pub(super) fn append_reasoning_field(slot: &mut Option<String>, value: &Value) {
+fn append_reasoning_field(slot: &mut Option<String>, value: &Value) {
     if let Some(text) = value.as_str() {
         slot.get_or_insert_with(String::new).push_str(text);
     }
@@ -313,7 +313,7 @@ impl StreamingAggregate {
         }
     }
 
-    pub(super) fn tool_calls(&self) -> Vec<ToolCall> {
+    fn tool_calls(&self) -> Vec<ToolCall> {
         self.tool_calls
             .iter()
             .enumerate()

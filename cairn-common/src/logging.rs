@@ -26,6 +26,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 pub enum ProcessTag {
     App,
     Cmd,
+    Executor,
     Server,
     Runner,
 }
@@ -35,6 +36,7 @@ impl ProcessTag {
         match self {
             ProcessTag::App => "cairn-app",
             ProcessTag::Cmd => "cairn-cmd",
+            ProcessTag::Executor => "cairn-executor",
             ProcessTag::Server => "cairn-server",
             ProcessTag::Runner => "cairn-runner",
         }
@@ -82,7 +84,7 @@ pub enum LogLevel {
 
 impl LogLevel {
     /// The `EnvFilter` directive string this level resolves to.
-    pub fn directives(self) -> &'static str {
+    fn directives(self) -> &'static str {
         match self {
             LogLevel::Quiet => "warn,profiler=off",
             LogLevel::Standard => "info,profiler=off",

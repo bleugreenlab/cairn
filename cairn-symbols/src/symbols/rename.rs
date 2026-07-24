@@ -29,6 +29,79 @@ pub enum RenameSpec {
     At(PathBuf, (u32, u32)),
 }
 
+/// Compute the same rename plan from an immutable logical-head snapshot rather
+/// than a materialized worktree. Paths must be absolute so returned edits retain
+/// the existing `RenamePlan` contract.
+pub fn compute_plan_from_files(
+    files: &[(PathBuf, String)],
+    spec: RenameSpec,
+    new_name: &str,
+) -> Result<RenamePlan, String> {
+    let (name, scope) = match spec {
+        RenameSpec::Name(name) => (name, Scope::Worktree),
+        RenameSpec::At(path, position) => {
+            let lang = lang_for_path(&path)
+                .ok_or_else(|| format!("no bundled grammar for {}", path.display()))?;
+            let src = files
+                .iter()
+                .find(|(candidate, _)| candidate == &path)
+                .map(|(_, content)| content.as_str())
+                .ok_or_else(|| format!("failed to read {} from logical head", path.display()))?;
+            let offset = byte_offset(src, position.0 as usize, position.1 as usize);
+            let ast = parse(src, lang);
+            let node = identifier_at(&ast.root(), offset).ok_or_else(|| {
+                format!(
+                    "no identifier at {}:{}:{}",
+                    path.display(),
+                    position.0 + 1,
+                    position.1 + 1
+                )
+            })?;
+            let name = node.text().into_owned();
+            let scope = if let Some(func) = enclosing_function(&node) {
+                if function_binds_local(&func, &name) {
+                    Scope::Function {
+                        path,
+                        lang,
+                        range: func.range(),
+                    }
+                } else {
+                    Scope::Worktree
+                }
+            } else {
+                Scope::Worktree
+            };
+            (name, scope)
+        }
+    };
+    if name.is_empty() {
+        return Err("could not resolve a symbol to rename".to_string());
+    }
+    let mut file_edits = Vec::new();
+    for (path, src) in files {
+        let Some(lang) = lang_for_path(path) else {
+            continue;
+        };
+        let within = match &scope {
+            Scope::Worktree => None,
+            Scope::Function {
+                path: scoped_path,
+                range,
+                ..
+            } if scoped_path == path => Some(range.clone()),
+            Scope::Function { .. } => continue,
+        };
+        if let Some(edit) = rename_in_content(path, src, lang, &name, new_name, within) {
+            file_edits.push(edit);
+        }
+    }
+    if file_edits.is_empty() {
+        return Err(format!("no symbol named `{name}` found to rename"));
+    }
+    file_edits.sort_by(|a, b| a.worktree_path.cmp(&b.worktree_path));
+    Ok(RenamePlan { file_edits })
+}
+
 /// One file's resulting state after applying a rename's edits. Mirrors the shape
 /// the change machinery (`prepare_rename_changes`) consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +216,18 @@ fn rename_in_file(
     within: Option<Range<usize>>,
 ) -> Option<FileEdit> {
     let src = std::fs::read_to_string(path).ok()?;
-    let ast = parse(&src, lang);
+    rename_in_content(path, &src, lang, name, new_name, within)
+}
+
+fn rename_in_content(
+    path: &Path,
+    src: &str,
+    lang: SupportLang,
+    name: &str,
+    new_name: &str,
+    within: Option<Range<usize>>,
+) -> Option<FileEdit> {
+    let ast = parse(src, lang);
     let mut sites: Vec<Range<usize>> = Vec::new();
     for node in ast.root().dfs() {
         if node.kind().ends_with("identifier") && node.text().as_ref() == name {
@@ -161,7 +245,7 @@ fn rename_in_file(
     }
     // Apply right-to-left so earlier byte ranges stay valid as the string shifts.
     sites.sort_by(|a, b| b.start.cmp(&a.start));
-    let mut content = src.clone();
+    let mut content = src.to_string();
     for site in &sites {
         content.replace_range(site.clone(), new_name);
     }

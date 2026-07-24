@@ -136,7 +136,7 @@ async fn get_installation_token(
 }
 
 /// Create authenticated headers for GitHub API requests.
-pub async fn auth_headers(
+async fn auth_headers(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
 ) -> Result<HeaderMap, String> {
@@ -223,85 +223,85 @@ async fn github_get_json<T: DeserializeOwned>(
 
 #[derive(Debug, Deserialize)]
 pub struct PullRequest {
-    pub title: String,
-    pub body: Option<String>,
-    pub state: String,
-    pub draft: bool,
-    pub mergeable: Option<bool>,
-    pub mergeable_state: Option<String>,
-    pub additions: i32,
-    pub deletions: i32,
-    pub merged: bool,
-    pub head: PrHead,
+    pub(crate) title: String,
+    pub(crate) body: Option<String>,
+    pub(crate) state: String,
+    pub(crate) draft: bool,
+    pub(crate) mergeable: Option<bool>,
+    pub(crate) mergeable_state: Option<String>,
+    pub(crate) additions: i32,
+    pub(crate) deletions: i32,
+    pub(crate) merged: bool,
+    pub(crate) head: PrHead,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PrHead {
-    pub sha: String,
+    pub(crate) sha: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CheckRunsResponse {
-    pub check_runs: Vec<CheckRun>,
+    pub(crate) check_runs: Vec<CheckRun>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CheckRun {
-    pub name: String,
-    pub status: String,
-    pub conclusion: Option<String>,
-    pub html_url: String,
-    pub output: CheckRunOutput,
+    pub(crate) name: String,
+    pub(crate) status: String,
+    pub(crate) conclusion: Option<String>,
+    pub(crate) html_url: String,
+    pub(crate) output: CheckRunOutput,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CheckRunOutput {
-    pub summary: Option<String>,
+    pub(crate) summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Review {
-    pub state: String,
-    pub user: User,
+    pub(crate) state: String,
+    pub(crate) user: User,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct User {
-    pub login: String,
+    pub(crate) login: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct JobsResponse {
-    pub jobs: Vec<Job>,
+    pub(crate) jobs: Vec<Job>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Job {
-    pub name: String,
-    pub steps: Option<Vec<Step>>,
+    pub(crate) name: String,
+    pub(crate) steps: Option<Vec<Step>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Step {
-    pub name: String,
-    pub conclusion: Option<String>,
+    pub(crate) name: String,
+    pub(crate) conclusion: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PrFile {
-    pub filename: String,
-    pub status: String,
-    pub additions: i32,
-    pub deletions: i32,
-    pub changes: i32,
-    pub patch: Option<String>,
-    pub previous_filename: Option<String>,
+    pub(crate) filename: String,
+    pub(crate) status: String,
+    pub(crate) additions: i32,
+    pub(crate) deletions: i32,
+    pub(crate) changes: i32,
+    pub(crate) patch: Option<String>,
+    pub(crate) previous_filename: Option<String>,
 }
 
 // ── URL Parsing ─────────────────────────────────────────────────
 
 /// Extract owner and repo from a GitHub URL or repo path.
-pub fn parse_repo_from_url(url: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_repo_from_url(url: &str) -> Result<(String, String), String> {
     let url = url.trim_end_matches(".git");
 
     if url.contains("github.com") {
@@ -325,7 +325,7 @@ pub fn parse_repo_from_url(url: &str) -> Result<(String, String), String> {
 }
 
 /// Get repo remote URL from git directory.
-pub fn get_repo_remote(repo_path: &str) -> Result<String, String> {
+pub(crate) fn get_repo_remote(repo_path: &str) -> Result<String, String> {
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(repo_path)
@@ -342,7 +342,7 @@ pub fn get_repo_remote(repo_path: &str) -> Result<String, String> {
 // ── API Operations ──────────────────────────────────────────────
 
 /// Merge a PR via REST API.
-pub async fn merge_pr(
+pub(crate) async fn merge_pr(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -373,7 +373,7 @@ pub async fn merge_pr(
 }
 
 /// Delete a branch via REST API.
-pub async fn delete_branch(
+pub(crate) async fn delete_branch(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -403,7 +403,7 @@ pub async fn delete_branch(
 }
 
 /// Delete remote branches via GitHub API (non-fatal, logs warnings).
-pub async fn delete_remote_branches(
+pub(crate) async fn delete_remote_branches(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -421,7 +421,7 @@ pub async fn delete_remote_branches(
 // ── PR API Operations ──────────────────────────────────────────
 
 /// Fetch PR details via REST API.
-pub async fn fetch_pr(
+pub(crate) async fn fetch_pr(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -436,7 +436,7 @@ pub async fn fetch_pr(
 }
 
 /// Fetch check runs for a commit via REST API.
-pub async fn fetch_check_runs(
+pub(crate) async fn fetch_check_runs(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -451,7 +451,7 @@ pub async fn fetch_check_runs(
 }
 
 /// Fetch PR reviews via REST API.
-pub async fn fetch_reviews(
+pub(crate) async fn fetch_reviews(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -490,36 +490,8 @@ pub struct PrCommitDetails {
     pub message: String,
 }
 
-/// Fetch PR commits via REST API.
-pub async fn fetch_pr_commits(
-    http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
-    owner: &str,
-    repo: &str,
-    pr_number: i32,
-) -> Result<Vec<PrCommit>, String> {
-    let headers = auth_headers(http, creds).await?;
-    let url = format!(
-        "{}/repos/{}/{}/pulls/{}/commits",
-        GITHUB_API_BASE, owner, repo, pr_number
-    );
-
-    let resp = http.get(&url, headers).await?;
-    check_rate_limit(&resp)?;
-
-    if !resp.is_success() {
-        return Err(format!(
-            "GitHub API error: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    resp.json()
-}
-
 /// Close a PR via REST API.
-pub async fn close_pr(
+pub(crate) async fn close_pr(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -548,7 +520,7 @@ pub async fn close_pr(
 }
 
 /// Fetch workflow run jobs via REST API.
-pub async fn fetch_run_jobs(
+pub(crate) async fn fetch_run_jobs(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -563,7 +535,7 @@ pub async fn fetch_run_jobs(
 }
 
 /// Fetch workflow run logs via REST API. Returns the raw log content as bytes.
-pub async fn fetch_run_logs(
+pub(crate) async fn fetch_run_logs(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,

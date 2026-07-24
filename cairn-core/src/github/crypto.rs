@@ -85,13 +85,13 @@ pub fn decrypt_payload(encrypted_b64: &str, secret_key_b64: &str) -> Result<Stri
 const VERSION: u8 = 0x01;
 
 /// Domain separator for the relay E2E private key (`relay_private_key_encrypted`).
-pub const RELAY_KEY_DOMAIN: &[u8] = b"cairn-relay-key-v1";
+const RELAY_KEY_DOMAIN: &[u8] = b"cairn-relay-key-v1";
 /// Domain separator for the webhook secret (`webhook_secret`).
-pub const WEBHOOK_SECRET_DOMAIN: &[u8] = b"cairn-webhook-secret-v1";
+pub(crate) const WEBHOOK_SECRET_DOMAIN: &[u8] = b"cairn-webhook-secret-v1";
 /// Domain separator for the GitHub App private key (`private_key`).
-pub const APP_PRIVATE_KEY_DOMAIN: &[u8] = b"cairn-github-app-key-v1";
+pub(crate) const APP_PRIVATE_KEY_DOMAIN: &[u8] = b"cairn-github-app-key-v1";
 /// Domain separator for the relay channel shared secret (`relay_secret`).
-pub const RELAY_SECRET_DOMAIN: &[u8] = b"cairn-relay-secret-v1";
+pub(crate) const RELAY_SECRET_DOMAIN: &[u8] = b"cairn-relay-secret-v1";
 
 /// Derive a 32-byte key from the machine ID and a domain separator.
 fn derive_storage_key(machine_id: &str, domain: &[u8]) -> [u8; 32] {
@@ -105,7 +105,11 @@ fn derive_storage_key(machine_id: &str, domain: &[u8]) -> [u8; 32] {
 ///
 /// Format: `[version: 1 byte][nonce: 12 bytes][ciphertext + 16-byte auth tag]`,
 /// base64-encoded.
-pub fn encrypt_at_rest(plaintext: &str, machine_id: &str, domain: &[u8]) -> Result<String, String> {
+pub(crate) fn encrypt_at_rest(
+    plaintext: &str,
+    machine_id: &str,
+    domain: &[u8],
+) -> Result<String, String> {
     let key = derive_storage_key(machine_id, domain);
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
         .map_err(|e| format!("Failed to create cipher: {e}"))?;
@@ -131,7 +135,11 @@ pub fn encrypt_at_rest(plaintext: &str, machine_id: &str, domain: &[u8]) -> Resu
 /// ciphertext) pass through unchanged so existing installs migrate on the next
 /// write. A value that *is* in our ciphertext format but fails to decrypt (wrong
 /// machine or tampering) returns an error rather than leaking ciphertext.
-pub fn decrypt_at_rest(value: &str, machine_id: &str, domain: &[u8]) -> Result<String, String> {
+pub(crate) fn decrypt_at_rest(
+    value: &str,
+    machine_id: &str,
+    domain: &[u8],
+) -> Result<String, String> {
     // PEM private keys are unambiguously plaintext.
     if value.contains("-----BEGIN") {
         return Ok(value.to_string());

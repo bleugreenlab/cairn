@@ -29,11 +29,11 @@ impl HostClock {
         &self.timezone_name
     }
 
-    pub(crate) fn orientation_line(&self, now: DateTime<Utc>) -> String {
+    pub(crate) fn initial_turn_prefix(&self, now: DateTime<Utc>) -> String {
         let local = now.with_timezone(&self.timezone);
         let offset_seconds = local.offset().fix().local_minus_utc();
         format!(
-            "Clock: {} {} ({})",
+            "[{} {} ({})]",
             local.format("%a %Y-%m-%d %H:%M"),
             self.timezone_name,
             format_utc_offset(offset_seconds),
@@ -112,12 +112,12 @@ mod tests {
     }
 
     #[test]
-    fn pins_orientation_and_resume_formats() {
+    fn pins_initial_turn_and_resume_formats() {
         let clock = HostClock::fixed("America/Los_Angeles");
         let now = utc(1_752_381_600); // 2025-07-12 21:40 PDT
         assert_eq!(
-            clock.orientation_line(now),
-            "Clock: Sat 2025-07-12 21:40 America/Los_Angeles (UTC-7)"
+            clock.initial_turn_prefix(now),
+            "[Sat 2025-07-12 21:40 America/Los_Angeles (UTC-7)]"
         );
         assert_eq!(
             clock.resume_prefix(now, Some(now.timestamp() - (3 * 3600 + 12 * 60))),

@@ -71,6 +71,14 @@ impl ConfigResource for RecipeResource {
         file.is_project_scoped
     }
 
+    fn file_bundles(file: &Self::File) -> &[String] {
+        &file.bundles
+    }
+
+    fn package_kind() -> crate::config::contextual_packages::ContextualPackageKind {
+        crate::config::contextual_packages::ContextualPackageKind::Recipe
+    }
+
     fn to_config(
         file: Self::File,
         workspace_id: Option<String>,
@@ -120,6 +128,7 @@ impl ConfigResource for RecipeResource {
         };
         config_recipes::FileRecipe {
             recipe,
+            bundles: Vec::new(),
             is_project_scoped,
             file_path: PathBuf::new(),
         }
@@ -174,6 +183,7 @@ impl ConfigResource for RecipeResource {
 
         config_recipes::FileRecipe {
             recipe,
+            bundles: existing.bundles.clone(),
             is_project_scoped: new_is_project_scoped,
             file_path: if scope_changing {
                 PathBuf::new()
@@ -222,6 +232,7 @@ impl ConfigResource for RecipeResource {
 
         config_recipes::FileRecipe {
             recipe,
+            bundles: source.bundles.clone(),
             is_project_scoped,
             file_path: PathBuf::new(),
         }
@@ -254,6 +265,7 @@ impl Orchestrator {
     ) -> Result<Recipe, String> {
         let file_recipe = config_recipes::FileRecipe {
             recipe: recipe.clone(),
+            bundles: Vec::new(),
             is_project_scoped,
             file_path,
         };
@@ -339,7 +351,7 @@ impl Orchestrator {
     /// Returns every recipe in scope, including system recipes — trigger
     /// evaluation depends on seeing them. The issue-create picker uses
     /// [`Self::list_picker_recipes`] instead, which drops system recipes.
-    pub fn list_recipes_for_context(&self, project_id: &str) -> Result<Vec<Recipe>, String> {
+    pub(crate) fn list_recipes_for_context(&self, project_id: &str) -> Result<Vec<Recipe>, String> {
         config_resource::list_for_context::<RecipeResource>(self, project_id)
     }
 
@@ -604,6 +616,7 @@ mod tests {
                 created_at: 1,
                 updated_at: 1,
             },
+            bundles: Vec::new(),
             is_project_scoped: false,
             file_path: PathBuf::from("recipe.yaml"),
         }

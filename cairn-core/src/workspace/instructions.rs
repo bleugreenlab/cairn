@@ -1,7 +1,7 @@
 /// Best-effort read of the workspace-level instruction file (`~/.cairn/AGENTS.md`).
 ///
 /// Returns `None` when the file is absent, empty, or unreadable — never errors.
-pub fn read_workspace_instructions() -> Option<String> {
+pub(crate) fn read_workspace_instructions() -> Option<String> {
     let path = cairn_common::paths::cairn_home().join("AGENTS.md");
     let content = std::fs::read_to_string(&path).ok()?;
     let trimmed = content.trim();
@@ -17,7 +17,7 @@ pub fn read_workspace_instructions() -> Option<String> {
 /// exact checkout the agent operates in — so this reflects branch-specific
 /// `AGENTS.md` edits. Returns `None` when the file is absent, empty, or
 /// unreadable — never errors.
-pub fn read_project_instructions(repo_root: &std::path::Path) -> Option<String> {
+pub(crate) fn read_project_instructions(repo_root: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(repo_root.join("AGENTS.md")).ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {

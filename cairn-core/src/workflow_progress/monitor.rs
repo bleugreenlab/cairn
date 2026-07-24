@@ -19,16 +19,16 @@ use crate::storage::{LocalDb, RowExt};
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowCall {
-    pub run_id: String,
+    run_id: String,
     /// The call's job id — the target for drilling into the call's own detail.
-    pub job_id: String,
-    pub label: Option<String>,
-    pub phase: Option<String>,
-    pub model: Option<String>,
+    job_id: String,
+    label: Option<String>,
+    phase: Option<String>,
+    model: Option<String>,
     /// Raw run status text (starting | live | exited | crashed, plus legacy).
-    pub status: Option<String>,
-    pub started_at: Option<i64>,
-    pub exited_at: Option<i64>,
+    status: Option<String>,
+    started_at: Option<i64>,
+    exited_at: Option<i64>,
     /// Summed billable tokens across the run's rollup rows (0 if none folded).
     ///
     /// This is CUMULATIVE billed tokens across every request the call made, not
@@ -38,23 +38,23 @@ pub struct WorkflowCall {
     /// `cache_read` dominates). The panel shows this compactly (e.g. `393k`) with
     /// the composition + a "cumulative across every request" note in a tooltip,
     /// so it reads as billed throughput rather than an impossible context size.
-    pub tokens: i64,
+    tokens: i64,
     /// Token components summed across the run's rollup rows, backing the display
     /// tooltip's composition breakdown (which shows where the cumulative billed
     /// total went — the re-sent `cache_read` dominates).
-    pub input_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_create_tokens: i64,
-    pub output_tokens: i64,
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_create_tokens: i64,
+    output_tokens: i64,
     /// Tool-invocation count for the run (0 if none extracted).
-    pub tools: i64,
+    tools: i64,
     /// The run's `exit_reason`, e.g. `"user_stop"` for a deliberately stopped
     /// call. Lets the panel render a stop distinctly from a clean completion.
-    pub exit_reason: Option<String>,
+    exit_reason: Option<String>,
     /// True while this call's `workflow_call` journal link still exists — the
     /// call is in-flight/undelivered and thus restartable. A delivered call
     /// (link deleted at finalize) reads false, so restart is refused.
-    pub undelivered: bool,
+    undelivered: bool,
 }
 
 /// One phase in the spine: a `phase()` boundary or a phase tag seen only on
@@ -63,19 +63,19 @@ pub struct WorkflowCall {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowPhase {
-    pub name: String,
+    name: String,
     /// The `phase()` boundary timestamp, else the earliest start among its calls.
-    pub started_at: Option<i64>,
-    pub total: i64,
-    pub done: i64,
+    started_at: Option<i64>,
+    total: i64,
+    done: i64,
 }
 
 /// One `log()` line from the progress timeline.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowLog {
-    pub text: String,
-    pub created_at: i64,
+    text: String,
+    created_at: i64,
 }
 
 /// The workflow node's OWN latest run status — the authoritative source for the
@@ -86,10 +86,10 @@ pub struct WorkflowLog {
 pub struct WorkflowNodeStatus {
     /// Latest run status text (starting | live | exited | crashed | failed), or
     /// `None` when the node has no run yet.
-    pub status: Option<String>,
+    status: Option<String>,
     /// The latest run's `exit_reason`; `"user_stop"` marks a deliberate stop,
     /// which the header renders as Stopped rather than a crash or a clean exit.
-    pub exit_reason: Option<String>,
+    exit_reason: Option<String>,
 }
 
 /// The workflow node's identity: which workflow package it is and the args it
@@ -101,9 +101,9 @@ pub struct WorkflowNodeStatus {
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowIdentity {
-    pub workflow_id: Option<String>,
+    workflow_id: Option<String>,
     /// Raw invocation args JSON (verbatim as validated at spawn), or `None`.
-    pub args: Option<String>,
+    args: Option<String>,
 }
 
 /// The full monitoring picture for a workflow node.
@@ -112,13 +112,13 @@ pub struct WorkflowIdentity {
 pub struct WorkflowMonitor {
     /// The workflow node's own run status — drives the header's stop/restart
     /// affordances (Running -> Stop, Stopped/Failed -> Restart).
-    pub workflow: WorkflowNodeStatus,
+    workflow: WorkflowNodeStatus,
     /// What the workflow IS: its package id and invocation args, for the panel's
     /// identity line (CAIRN-2636).
-    pub identity: WorkflowIdentity,
-    pub phases: Vec<WorkflowPhase>,
-    pub calls: Vec<WorkflowCall>,
-    pub logs: Vec<WorkflowLog>,
+    identity: WorkflowIdentity,
+    phases: Vec<WorkflowPhase>,
+    calls: Vec<WorkflowCall>,
+    logs: Vec<WorkflowLog>,
 }
 
 /// A run counts as "done" once its process has terminated. Mirrors

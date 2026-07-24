@@ -89,7 +89,7 @@ fn send(client: &reqwest::Client, prepared: &PreparedRequest) -> reqwest::Reques
 
 /// Build the provider-specific request (endpoint, method, auth header, body).
 /// Pure: no network, no keychain — the api key is passed in.
-pub(crate) fn build_request(
+fn build_request(
     id: SearchProviderId,
     query: &str,
     options: &Options,
@@ -104,7 +104,7 @@ pub(crate) fn build_request(
 }
 
 /// Parse a provider's raw JSON body into the common result shape.
-pub(crate) fn parse(id: SearchProviderId, body: &str) -> Result<Vec<SearchResult>, String> {
+fn parse(id: SearchProviderId, body: &str) -> Result<Vec<SearchResult>, String> {
     match id {
         SearchProviderId::Tavily => parse_tavily(body),
         SearchProviderId::Exa => parse_exa(body),
@@ -393,7 +393,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Render results as a ranked `title · url · snippet` markdown list.
-pub(crate) fn render(id: SearchProviderId, query: &str, results: &[SearchResult]) -> String {
+fn render(id: SearchProviderId, query: &str, results: &[SearchResult]) -> String {
     if results.is_empty() {
         return format!(
             "Web search for \"{query}\" via {} returned no results.",
@@ -417,7 +417,7 @@ pub(crate) fn render(id: SearchProviderId, query: &str, results: &[SearchResult]
 }
 
 /// Guidance returned when no web-search provider is configured.
-pub(crate) fn no_provider_message() -> String {
+fn no_provider_message() -> String {
     "No web-search provider is configured. Set one up in Settings → Web Services — choose a search provider (Tavily, Exa, Brave, or Jina) and paste its API key — then read `cairn://websearch?q=<your query>`.".to_string()
 }
 

@@ -33,7 +33,7 @@ impl Orchestrator {
     }
 }
 
-pub async fn upsert_executor(
+async fn upsert_executor(
     db: &LocalDb,
     advertisement: &ExecutorAdvertisement,
     generation: u64,
@@ -63,8 +63,8 @@ pub async fn upsert_executor(
         let status = status.clone();
         Box::pin(async move {
             conn.execute(
-                "INSERT INTO executor_registry (device_id, executor_id, display_name, os, arch, logical_cores, toolchains, projects_served, slot_capacity, current_load, warm_commits, connection_generation, status, last_seen, expires_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?14) ON CONFLICT(device_id,executor_id) DO UPDATE SET display_name=excluded.display_name, os=excluded.os, arch=excluded.arch, logical_cores=excluded.logical_cores, toolchains=excluded.toolchains, projects_served=excluded.projects_served, slot_capacity=excluded.slot_capacity, current_load=excluded.current_load, warm_commits=excluded.warm_commits, connection_generation=excluded.connection_generation, status=excluded.status, last_seen=excluded.last_seen, expires_at=excluded.expires_at, updated_at=excluded.updated_at",
-                params![identity.device_id, identity.executor_id, identity.display_name, capabilities.os, capabilities.arch, capabilities.logical_cores as i64, toolchains, projects, capabilities.slot_capacity as i64, current_load, warm, generation as i64, status, now, expires_at]
+                "INSERT INTO executor_registry (device_id, executor_id, display_name, os, arch, logical_cores, toolchains, projects_served, current_load, warm_commits, connection_generation, status, last_seen, expires_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14) ON CONFLICT(device_id,executor_id) DO UPDATE SET display_name=excluded.display_name, os=excluded.os, arch=excluded.arch, logical_cores=excluded.logical_cores, toolchains=excluded.toolchains, projects_served=excluded.projects_served, current_load=excluded.current_load, warm_commits=excluded.warm_commits, connection_generation=excluded.connection_generation, status=excluded.status, last_seen=excluded.last_seen, expires_at=excluded.expires_at, updated_at=excluded.updated_at",
+                params![identity.device_id, identity.executor_id, identity.display_name, capabilities.os, capabilities.arch, capabilities.logical_cores as i64, toolchains, projects, current_load, warm, generation as i64, status, now, expires_at]
             ).await?;
             Ok(())
         })
@@ -100,7 +100,6 @@ mod tests {
                 logical_cores: 4,
                 toolchains: vec!["rust".into()],
                 projects_served: vec!["p".into()],
-                slot_capacity: 2,
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
             },

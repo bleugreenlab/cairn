@@ -142,7 +142,7 @@ pub async fn seed_team_chain(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn make_event(
+pub(crate) fn make_event(
     id: &str,
     event_type: &str,
     data: &str,

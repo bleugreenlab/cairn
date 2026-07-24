@@ -125,7 +125,7 @@ impl McpServerConfig {
     /// each `${VAR}` resolves from the OS keychain first, then the process environment, then an empty string. A
     /// missing secret surfaces as a connect/auth failure from the server, not a
     /// panic here.
-    pub fn expanded(&self, server_name: &str) -> McpServerConfig {
+    pub(crate) fn expanded(&self, server_name: &str) -> McpServerConfig {
         self.expand_vars(&|var| {
             super::secrets::get_secret(server_name, var)
                 .or_else(|| std::env::var(var).ok())
@@ -175,7 +175,7 @@ fn collect_vars(input: &str, out: &mut BTreeSet<String>) {
 
 /// Expand `${VAR}` occurrences in `input`, resolving each name via `resolve`.
 /// A literal `${` with no closing brace is left untouched.
-pub fn expand_with(input: &str, resolve: &dyn Fn(&str) -> String) -> String {
+fn expand_with(input: &str, resolve: &dyn Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -204,7 +204,7 @@ pub fn expand_env_vars(input: &str) -> String {
 /// `~/.cairn/settings.yaml` overlaid by the project's `.cairn/config.yaml`
 /// (project wins on key collision). `project_path` is `None` for project-less
 /// (workspace-only) contexts.
-pub fn resolve_mcp_servers(
+pub(crate) fn resolve_mcp_servers(
     config_dir: &Path,
     project_path: Option<&Path>,
 ) -> HashMap<String, McpServerConfig> {

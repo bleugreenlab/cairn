@@ -53,7 +53,7 @@ fn is_dropped(tool: &str) -> bool {
 ///   `create_pr` and the memory tools) pass through unchanged.
 ///
 /// The result is deduplicated, preserving first-seen order.
-pub fn resolve_tools(tools: &[String]) -> Vec<String> {
+pub(crate) fn resolve_tools(tools: &[String]) -> Vec<String> {
     let mut allowed: Vec<String> = Vec::new();
 
     let push = |name: &str, allowed: &mut Vec<String>| {
@@ -76,7 +76,7 @@ pub fn resolve_tools(tools: &[String]) -> Vec<String> {
 }
 
 /// The three core verbs — the entire working Cairn surface.
-pub const CORE_VERBS: [&str; 3] = ["mcp__cairn__read", "mcp__cairn__write", "mcp__cairn__run"];
+const CORE_VERBS: [&str; 3] = ["mcp__cairn__read", "mcp__cairn__write", "mcp__cairn__run"];
 
 /// Ensure the three core verbs are present in an allow-list, appending any that
 /// are missing (order preserved, deduped).
@@ -87,7 +87,7 @@ pub const CORE_VERBS: [&str; 3] = ["mcp__cairn__read", "mcp__cairn__write", "mcp
 /// just `read`, so its `write cairn:~/return` — how a sub-agent task returns —
 /// trips the permission prompt and wedges the run. Both backends call this after
 /// [`resolve_tools`].
-pub fn ensure_core_verbs(allowed: &mut Vec<String>) {
+pub(crate) fn ensure_core_verbs(allowed: &mut Vec<String>) {
     for verb in CORE_VERBS {
         if !allowed.iter().any(|t| t == verb) {
             allowed.push(verb.to_string());

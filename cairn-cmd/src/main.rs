@@ -14,6 +14,7 @@ use rmcp::ServiceExt;
 use cairn_common::uri::parse_uri as parse_cairn_uri;
 
 mod cli;
+mod executor;
 mod output;
 mod resolve;
 mod schemas;
@@ -38,6 +39,42 @@ struct Args {
     /// JSON-encoded list of available agents [{name, description}, ...]
     #[arg(long)]
     agents: Option<String>,
+}
+
+#[cfg(test)]
+mod cli_parse_tests {
+    use super::*;
+
+    #[test]
+    fn executor_add_accepts_one_liner_and_repeatable_overrides() {
+        let args = Args::try_parse_from([
+            "cairn",
+            "executor",
+            "add",
+            "dev@builder.local",
+            "--project",
+            "CAIRN",
+            "--project",
+            "WEB",
+            "--ssh-arg=-4",
+        ])
+        .unwrap();
+        let Some(Command::Executor {
+            command:
+                executor::ExecutorCommand::Add {
+                    target,
+                    projects,
+                    extra_ssh_args,
+                    ..
+                },
+        }) = args.command
+        else {
+            panic!("expected executor add")
+        };
+        assert_eq!(target, "dev@builder.local");
+        assert_eq!(projects, ["CAIRN", "WEB"]);
+        assert_eq!(extra_ssh_args, ["-4"]);
+    }
 }
 
 /// Top-level CLI subcommands.
@@ -66,6 +103,11 @@ enum Command {
         /// Read at most this many lines. Single-target convenience (see --offset).
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Manage runner-supervised SSH remote executors.
+    Executor {
+        #[command(subcommand)]
+        command: executor::ExecutorCommand,
     },
     /// Apply ordered file/resource mutations (ChangeInput JSON via --json or stdin).
     #[command(alias = "change")]
@@ -113,7 +155,10 @@ async fn async_main() -> Result<()> {
     // the file only. The MCP server path also logs to stderr.
     let is_cli = matches!(
         args.command,
-        Some(Command::Read { .. }) | Some(Command::Write { .. }) | Some(Command::Watch { .. })
+        Some(Command::Read { .. })
+            | Some(Command::Write { .. })
+            | Some(Command::Watch { .. })
+            | Some(Command::Executor { .. })
     );
     // `None` level: the spawning app injects `CAIRN_LOG_LEVEL`, which the filter
     // resolution picks up; a directly-launched cairn-cmd falls back to Standard.
@@ -135,6 +180,10 @@ async fn async_main() -> Result<()> {
             limit,
         }) => {
             let ok = run_cli_read(targets, *offset, *limit).await;
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        Some(Command::Executor { command }) => {
+            let ok = executor::run(command.clone()).await;
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Write { json, commit_msg }) => {

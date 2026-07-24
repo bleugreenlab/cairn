@@ -8,19 +8,19 @@ use cairn_db::turso::params;
 
 #[derive(Debug, Clone)]
 pub struct NewTurn<'a> {
-    pub id: &'a str,
-    pub session_id: &'a str,
-    pub run_id: Option<&'a str>,
-    pub job_id: Option<&'a str>,
-    pub sequence: i32,
-    pub predecessor_id: Option<&'a str>,
-    pub state: &'a str,
-    pub yield_reason: Option<&'a str>,
-    pub start_reason: &'a str,
-    pub created_at: i32,
-    pub started_at: Option<i32>,
-    pub ended_at: Option<i32>,
-    pub updated_at: i32,
+    id: &'a str,
+    session_id: &'a str,
+    run_id: Option<&'a str>,
+    job_id: Option<&'a str>,
+    sequence: i32,
+    predecessor_id: Option<&'a str>,
+    state: &'a str,
+    yield_reason: Option<&'a str>,
+    start_reason: &'a str,
+    created_at: i32,
+    started_at: Option<i32>,
+    ended_at: Option<i32>,
+    updated_at: i32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,22 +90,6 @@ pub async fn create_turn(
     Ok(turn)
 }
 
-pub async fn get_turn(db: &LocalDb, turn_id: &str) -> Result<Turn, String> {
-    let turn_id = turn_id.to_string();
-    db.query_opt(
-        "SELECT id, session_id, run_id, job_id, sequence,
-                predecessor_id, state, yield_reason, end_reason, start_reason, created_at,
-                started_at, ended_at, updated_at
-         FROM turns
-         WHERE id = ?1",
-        params![turn_id.as_str()],
-        turn_from_row,
-    )
-    .await
-    .and_then(|turn| turn.ok_or_else(|| DbError::Row(format!("Turn not found: {turn_id}"))))
-    .map_err(|e| format!("Turn not found: {e}"))
-}
-
 pub async fn get_head_turn(db: &LocalDb, job_id: &str) -> Result<Option<Turn>, String> {
     load_one_turn_by_query(
         db,
@@ -145,14 +129,6 @@ pub async fn get_successor_turn(
         predecessor_id,
     )
     .await
-}
-
-pub async fn list_by_session(db: &LocalDb, session_id: &str) -> Result<Vec<Turn>, String> {
-    list_by_column(db, "session_id", session_id).await
-}
-
-pub async fn list_by_job(db: &LocalDb, job_id: &str) -> Result<Vec<Turn>, String> {
-    list_by_column(db, "job_id", job_id).await
 }
 
 pub async fn update_turn(
@@ -541,21 +517,6 @@ async fn load_one_turn_by_query(
 ) -> Result<Option<Turn>, String> {
     let value = value.to_string();
     db.query_opt(sql, params![value.as_str()], turn_from_row)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-async fn list_by_column(db: &LocalDb, column: &str, value: &str) -> Result<Vec<Turn>, String> {
-    let value = value.to_string();
-    let sql = format!(
-        "SELECT id, session_id, run_id, job_id, sequence,
-                predecessor_id, state, yield_reason, end_reason, start_reason, created_at,
-                started_at, ended_at, updated_at
-         FROM turns
-         WHERE {column} = ?1
-         ORDER BY sequence ASC"
-    );
-    db.query_all(sql, params![value.as_str()], turn_from_row)
         .await
         .map_err(|e| e.to_string())
 }

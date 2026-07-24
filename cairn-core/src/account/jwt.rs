@@ -12,16 +12,16 @@ const JWT_KEY_DOMAIN: &[u8] = b"cairn-team-v1";
 /// Claims extracted from a JWT payload (no signature verification — API already verified).
 #[derive(Debug, Clone)]
 pub struct JwtClaims {
-    pub sub: String,
+    pub(crate) sub: String,
     pub org_id: String,
     pub org_role: String,
-    pub exp: i64,
+    pub(crate) exp: i64,
     pub name: Option<String>,
     pub email: Option<String>,
 }
 
 /// Decode JWT claims from the payload segment without verifying signature.
-pub fn decode_jwt_claims(jwt: &str) -> Result<JwtClaims, String> {
+pub(crate) fn decode_jwt_claims(jwt: &str) -> Result<JwtClaims, String> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
         return Err("Invalid JWT format".to_string());
@@ -126,13 +126,13 @@ fn decrypt_jwt(encrypted_b64: &str, machine_id: &str) -> Result<String, String> 
 }
 
 /// Encrypt a JWT for storage using the current machine's identity.
-pub fn encrypt_jwt_for_storage(jwt: &str) -> Result<String, String> {
+pub(crate) fn encrypt_jwt_for_storage(jwt: &str) -> Result<String, String> {
     let machine_id = crypto::get_machine_id();
     encrypt_jwt(jwt, &machine_id)
 }
 
 /// Decrypt a stored JWT using the current machine's identity.
-pub fn decrypt_jwt_from_storage(encrypted: &str) -> Result<String, String> {
+pub(crate) fn decrypt_jwt_from_storage(encrypted: &str) -> Result<String, String> {
     let machine_id = crypto::get_machine_id();
     decrypt_jwt(encrypted, &machine_id)
 }

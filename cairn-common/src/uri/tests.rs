@@ -753,6 +753,24 @@ fn single_execution_does_not_shadow_node() {
 }
 
 #[test]
+fn task_checks_uri_parses_and_round_trips() {
+    let uri = "cairn://p/CAIRN/42/2/builder/task/review-rust/checks";
+    let resource = CairnResource::TaskChecks {
+        project: "CAIRN".to_string(),
+        number: 42,
+        exec_seq: 2,
+        node_id: "builder".to_string(),
+        task_name: "review-rust".to_string(),
+    };
+    assert_eq!(parse_uri(uri), Some(resource.clone()));
+    assert_eq!(resource.to_uri(), uri);
+    assert!(matches!(
+        parse_uri("cairn://p/CAIRN/42/2/review-rust/checks"),
+        Some(CairnResource::NodeChecks { .. })
+    ));
+}
+
+#[test]
 fn round_trips_every_resource_family() {
     let resources = vec![
         CairnResource::Project {

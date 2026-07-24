@@ -41,26 +41,42 @@ pub enum CheckScope {
     Partial,
 }
 
+/// Whether any path intersects a check's impact set. Invalid globs are treated
+/// conservatively as a match so callers never reuse evidence on uncertainty.
+pub(crate) fn paths_match_impact(globs: &[String], paths: &[String]) -> bool {
+    let changes: Vec<GraphFileChange> = paths
+        .iter()
+        .map(|path| GraphFileChange {
+            path: path.clone(),
+            previous_path: None,
+            status: "modified".to_string(),
+            additions: 0,
+            deletions: 0,
+        })
+        .collect();
+    !matches!(matched_paths(globs, &changes), MatchOutcome::Matched(paths) if paths.is_empty())
+}
+
 /// The decision for a single check: whether it applies to this change set and,
 /// if so, the concrete command to run and whether that run is full or partial.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckPlan {
     /// The check's name (its key in the `checks` map).
-    pub name: String,
+    pub(crate) name: String,
     /// Whether this check applies to the change set. A check that does not apply
     /// is skipped by the runner; its `command`/`scope` are populated with the
     /// full-run defaults but unused.
-    pub applies: bool,
+    pub(crate) applies: bool,
     /// The concrete command to run, with any `{changedFiles}`/`{targets}`
     /// placeholder already substituted.
-    pub command: String,
+    pub(crate) command: String,
     /// Whether `command` runs the whole check or a selected subset.
-    pub scope: CheckScope,
+    pub(crate) scope: CheckScope,
     /// Process-wide admission class used immediately before process spawn.
-    pub resource_class: crate::config::project_settings::CheckResourceClass,
-    /// Whether an execution substrate owns admission instead of the host controller.
-    pub externally_admitted: bool,
+    pub(crate) resource_class: crate::config::project_settings::CheckResourceClass,
+    /// Whether the command executes locally and therefore needs the runner-local semaphore.
+    pub(crate) requires_runner_local_admission: bool,
 }
 
 /// Plan every check against a change set.
@@ -68,7 +84,7 @@ pub struct CheckPlan {
 /// Returns one [`CheckPlan`] per check, ordered by check name for determinism
 /// (the input is an unordered map). `repo_root` is the worktree root the
 /// `changed_files` paths are relative to; it anchors crate-graph resolution.
-pub fn plan_checks(
+pub(crate) fn plan_checks(
     checks: &HashMap<String, CheckCommand>,
     changed_files: &[GraphFileChange],
     repo_root: &Path,
@@ -94,7 +110,7 @@ fn plan_one(
         command: check.command.clone(),
         scope,
         resource_class: check.resource_class,
-        externally_admitted: false,
+        requires_runner_local_admission: true,
     };
 
     // Coarse gate: does this check apply at all? With no `impact`, any change
@@ -127,7 +143,7 @@ fn plan_one(
             command,
             scope: CheckScope::Partial,
             resource_class: check.resource_class,
-            externally_admitted: false,
+            requires_runner_local_admission: true,
         }
     } else if check.command.contains(TARGETS_PLACEHOLDER) {
         // `{targets}` → crate-graph targets resolved from the matched files. On
@@ -147,7 +163,7 @@ fn plan_one(
                     command,
                     scope: CheckScope::Partial,
                     resource_class: check.resource_class,
-                    externally_admitted: false,
+                    requires_runner_local_admission: true,
                 }
             }
             _ => {
@@ -160,7 +176,7 @@ fn plan_one(
                     command,
                     scope: CheckScope::Full,
                     resource_class: check.resource_class,
-                    externally_admitted: false,
+                    requires_runner_local_admission: true,
                 }
             }
         }
@@ -436,6 +452,20 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn manual_cache_dirt_only_invalidates_matching_impact() {
+        let globs = vec!["src-tauri/**/*.rs".to_string(), "package.json".to_string()];
+        assert!(paths_match_impact(
+            &globs,
+            &["src-tauri/os/cairn-core/src/lib.rs".to_string()]
+        ));
+        assert!(!paths_match_impact(&globs, &["docs/checks.md".to_string()]));
+        assert!(paths_match_impact(
+            &["[invalid".to_string()],
+            &["docs/checks.md".to_string()]
+        ));
     }
 
     // --- coarse gate: applies / does-not-apply -----------------------------

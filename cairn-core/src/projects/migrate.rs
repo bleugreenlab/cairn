@@ -22,10 +22,10 @@ pub enum MoveProjectGateFailure {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockingJob {
-    pub id: String,
-    pub status: String,
-    pub issue_number: Option<i64>,
-    pub node_name: Option<String>,
+    id: String,
+    status: String,
+    issue_number: Option<i64>,
+    node_name: Option<String>,
 }
 
 impl BlockingJob {

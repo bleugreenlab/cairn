@@ -5,6 +5,7 @@
 
 use super::process::ChildProcess;
 use super::pty_osc::Osc133Event;
+use cairn_common::executor_protocol::{LifetimeLeaseFence, LifetimeProcessEvent};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -31,6 +32,30 @@ pub struct CommandState {
     pub last_duration_ms: Option<u64>,
     /// When the in-flight command started, used to compute `last_duration_ms`.
     started_at: Option<std::time::Instant>,
+}
+
+pub struct RemoteTerminalChild;
+
+impl TerminalChild for RemoteTerminalChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn wait(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn try_wait_exit(&mut self) -> Option<i32> {
+        None
+    }
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+}
+
+#[derive(Clone)]
+pub struct LeaseTerminalBinding {
+    pub fence: LifetimeLeaseFence,
+    pub process_key: String,
+    pub process_generation: u64,
 }
 
 impl CommandState {
@@ -108,59 +133,11 @@ impl TerminalChild for PortableTerminalChild {
     }
 }
 
-/// `TerminalChild` over an inline `ChildProcess` promoted from a `run` command.
-///
-/// `ChildProcess` exposes no blocking wait, so `wait` polls `try_wait`. `kill`
-/// already SIGKILLs the whole process group (see `RealChildProcess::kill`).
-pub struct InlineTerminalChild {
-    inner: SharedInlineChild,
-}
-
-impl InlineTerminalChild {
-    pub fn new(inner: SharedInlineChild) -> Self {
-        Self { inner }
-    }
-}
-
-impl TerminalChild for InlineTerminalChild {
-    fn kill(&mut self) -> std::io::Result<()> {
-        match self.inner.lock() {
-            Ok(mut c) => c.kill(),
-            Err(_) => Ok(()),
-        }
-    }
-    fn wait(&mut self) -> std::io::Result<()> {
-        loop {
-            let exited = match self.inner.lock() {
-                Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
-                Err(_) => return Ok(()),
-            };
-            if exited {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-    fn try_wait_exit(&mut self) -> Option<i32> {
-        match self.inner.lock() {
-            Ok(mut c) => match c.try_wait() {
-                Ok(Some(status)) => Some(status.code().unwrap_or(0)),
-                _ => None,
-            },
-            Err(_) => None,
-        }
-    }
-    fn process_id(&self) -> Option<u32> {
-        self.inner.lock().ok().map(|c| c.id())
-    }
-}
-
 /// A single terminal session.
 ///
-/// Two attachment modes share this type: a PTY-backed interactive terminal
-/// (`master`/`writer` present) and a promoted pipe-backed run command
-/// (`master`/`writer` `None`). Buffer reads and exit tracking work identically
-/// for both; input and resize are unavailable-but-harmless for promoted ones.
+/// Interactive terminals have a local PTY master/writer; executor-backed
+/// terminals, including promoted runs, bind through `lease` and keep those local
+/// handles absent.
 pub struct PtySession {
     /// PTY master for resize/foreground queries. `None` for promoted runs.
     pub master: Option<Box<dyn MasterPty + Send>>,
@@ -168,6 +145,9 @@ pub struct PtySession {
     pub writer: Option<Box<dyn Write + Send>>,
     /// Process handle for cleanup and exit tracking.
     pub child: Box<dyn TerminalChild>,
+    /// Executor-hosted terminal authority. When present, input, resize, and stop
+    /// route through the lifetime lease instead of local process handles.
+    pub lease: Option<LeaseTerminalBinding>,
     /// Output buffer for late attachment (agent terminals only)
     pub output_buffer: Option<Arc<Mutex<VecDeque<u8>>>>,
     /// Whether this session was spawned by an agent (vs user)
@@ -191,9 +171,13 @@ pub struct PtySession {
 }
 
 /// Manages all active PTY sessions
+pub type LifetimeProcessHandler = Arc<dyn Fn(LifetimeProcessEvent) + Send + Sync>;
+
 pub struct PtyState {
     pub sessions: Mutex<HashMap<String, Arc<Mutex<PtySession>>>>,
     pub inline_commands: Mutex<HashMap<String, HashMap<String, SharedInlineChild>>>,
+    pub lifetime_handlers: Mutex<HashMap<(String, String), LifetimeProcessHandler>>,
+    pub lifetime_subscription_installed: std::sync::atomic::AtomicBool,
 }
 
 impl Default for PtyState {
@@ -201,6 +185,8 @@ impl Default for PtyState {
         Self {
             sessions: Mutex::new(HashMap::new()),
             inline_commands: Mutex::new(HashMap::new()),
+            lifetime_handlers: Mutex::new(HashMap::new()),
+            lifetime_subscription_installed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -360,19 +346,6 @@ pub fn ensure_submitted_line(content: &str) -> Cow<'_, str> {
     } else {
         Cow::Owned(format!("{content}\n"))
     }
-}
-
-/// Submit `command` so the shell exits with the command's status: EOF then
-/// coincides with command completion and the shell's own exit code equals the
-/// command's. The trailing newline separates the command from `exit $?` so a
-/// multiline command completes first; nothing between them resets `$?`, and
-/// `exit $?` preserves an interrupt's `128+signal` code through the shell.
-///
-/// Used only for agent-monitored terminals, whose shell is a one-shot host for
-/// the command — not a post-command scratch shell. User scratch terminals keep
-/// `ensure_submitted_line` so their shell stays interactive.
-pub fn submit_command_exiting_shell(command: &str) -> String {
-    format!("{}\nexit $?\n", command.trim_end_matches('\n'))
 }
 
 // ============================================================================
@@ -634,63 +607,8 @@ mod tests {
     }
 
     // =========================================================================
-    // submit_command_exiting_shell tests
-    // =========================================================================
-
-    #[test]
-    fn submit_command_exiting_shell_appends_exit() {
-        assert_eq!(
-            submit_command_exiting_shell("echo hi"),
-            "echo hi\nexit $?\n"
-        );
-    }
-
-    #[test]
-    fn submit_command_exiting_shell_empty_command() {
-        // An empty command runs nothing; the shell exits 0.
-        assert_eq!(submit_command_exiting_shell(""), "\nexit $?\n");
-    }
-
-    #[test]
-    fn submit_command_exiting_shell_trims_trailing_newlines() {
-        // A single `exit $?` is appended regardless of trailing newlines on the
-        // command, so `$?` reflects the command (not a blank line).
-        assert_eq!(
-            submit_command_exiting_shell("make build\n"),
-            "make build\nexit $?\n"
-        );
-        assert_eq!(
-            submit_command_exiting_shell("make build\n\n"),
-            "make build\nexit $?\n"
-        );
-    }
-
-    #[test]
-    fn submit_command_exiting_shell_multiline_command() {
-        // The command's own newlines are preserved; `exit $?` follows the last
-        // line so it carries that line's status.
-        assert_eq!(
-            submit_command_exiting_shell("a=1\necho $a"),
-            "a=1\necho $a\nexit $?\n"
-        );
-    }
-
-    // =========================================================================
     // TerminalChild tests
     // =========================================================================
-
-    #[cfg(unix)]
-    #[test]
-    fn inline_terminal_child_normalizes_exit_code() {
-        use crate::services::{ProcessSpawner, RealProcessSpawner, SpawnConfig};
-        let child = RealProcessSpawner
-            .spawn(SpawnConfig::new("/bin/sh").args(["-c".to_string(), "exit 3".to_string()]))
-            .unwrap();
-        let shared = Arc::new(Mutex::new(child));
-        let mut tc = InlineTerminalChild::new(shared);
-        tc.wait().unwrap();
-        assert_eq!(tc.try_wait_exit(), Some(3));
-    }
 
     #[cfg(unix)]
     #[test]

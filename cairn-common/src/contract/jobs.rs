@@ -52,6 +52,17 @@ pub(crate) const NODE_CHECKS_CONTRACT: ResourceContract =
         mutations: NO_MUTATIONS,
     };
 
+pub(crate) const TASK_CHECKS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::TaskChecks,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/checks",
+    name: "Task checks",
+    description: "Turn-end project check results for a sub-agent task job (read-only)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const NODE_WAKES_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::NodeWakes,

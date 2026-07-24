@@ -21,7 +21,7 @@ use std::path::Path;
 /// staleness probe (`jj debug workingcopy` is gone; `--ignore-working-copy`
 /// skips the check entirely). Centralized here with the jj phrasing cited so a
 /// future jj rewording is a one-line change.
-pub fn is_stale_error(msg: &str) -> bool {
+pub(crate) fn is_stale_error(msg: &str) -> bool {
     msg.contains("working copy is stale") || msg.contains("behind its branch tip")
 }
 
@@ -44,7 +44,7 @@ pub(crate) const LOST_SEAL_MSG: &str =
 /// [`is_stale_error`] — the cause and jj phrasing differ — and OR'd with it at the
 /// routing sites, because both are recoverable the same way: re-apply the batch
 /// against the current base and re-seal.
-pub fn is_lost_seal_error(msg: &str) -> bool {
+pub(crate) fn is_lost_seal_error(msg: &str) -> bool {
     msg.contains(LOST_SEAL_MSG)
 }
 
@@ -70,14 +70,14 @@ pub(crate) const CONFLICTED_BRANCH_SEAL_MSG: &str =
 /// copy, because discarding destroys the resolved flatten and advancing lands
 /// back on the conflict. The routing sites give it its own non-destructive arm
 /// that preserves `@` and points at the git-workflow resolve-at-base flatten.
-pub fn is_conflicted_branch_seal_error(msg: &str) -> bool {
+pub(crate) fn is_conflicted_branch_seal_error(msg: &str) -> bool {
     msg.contains(CONFLICTED_BRANCH_SEAL_MSG)
 }
 
 /// Refresh a workspace whose `@` was rebased out from under it. A rebased live
 /// workspace goes stale; `update-stale` updates the on-disk files and
 /// materializes any conflict markers for the agent to resolve.
-pub fn update_stale(jj: &JjEnv, ws: &Path) -> Result<(), String> {
+pub(crate) fn update_stale(jj: &JjEnv, ws: &Path) -> Result<(), String> {
     jj.run(
         ws,
         &["workspace", "update-stale"],

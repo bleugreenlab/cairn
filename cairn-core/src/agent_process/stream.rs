@@ -83,15 +83,15 @@ pub enum ClaudeEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitInfo {
     #[serde(default)]
-    pub status: String,
+    pub(crate) status: String,
     #[serde(default, rename = "rateLimitType")]
-    pub rate_limit_type: Option<String>,
+    pub(crate) rate_limit_type: Option<String>,
     #[serde(default, rename = "resetsAt")]
-    pub resets_at: Option<i64>,
+    pub(crate) resets_at: Option<i64>,
     #[serde(default, rename = "overageResetsAt")]
-    pub overage_resets_at: Option<i64>,
+    pub(crate) overage_resets_at: Option<i64>,
     #[serde(flatten, default)]
-    pub extra: Value,
+    extra: Value,
 }
 
 impl RateLimitInfo {
@@ -99,7 +99,7 @@ impl RateLimitInfo {
     /// limit, as opposed to allowed or a soft warning. Conservative on purpose:
     /// only an explicit reject counts, because a blocking-status EOF is finalized
     /// as recoverable (warm/resumable) rather than a hard crash.
-    pub fn is_blocking(&self) -> bool {
+    pub(crate) fn is_blocking(&self) -> bool {
         let status = self.status.to_ascii_lowercase();
         matches!(status.as_str(), "rejected" | "blocked" | "exhausted")
     }
@@ -171,8 +171,8 @@ pub enum DeltaContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageContent {
-    pub role: String,
-    pub content: MessageContentInner,
+    role: String,
+    content: MessageContentInner,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,34 +209,34 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     #[serde(default)]
-    pub input_tokens: u32,
+    pub(crate) input_tokens: u32,
     #[serde(default)]
-    pub output_tokens: u32,
+    pub(crate) output_tokens: u32,
     #[serde(default)]
-    pub cache_creation_input_tokens: Option<u32>,
+    pub(crate) cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
-    pub cache_read_input_tokens: Option<u32>,
+    pub(crate) cache_read_input_tokens: Option<u32>,
     #[serde(default)]
-    pub output_tokens_details: Option<OutputTokensDetails>,
+    pub(crate) output_tokens_details: Option<OutputTokensDetails>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutputTokensDetails {
     #[serde(default)]
-    pub thinking_tokens: Option<u32>,
+    pub(crate) thinking_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TokenCounts {
-    pub input: Option<i32>,
-    pub output: Option<i32>,
-    pub cache_read: Option<i32>,
-    pub cache_create: Option<i32>,
-    pub thinking: Option<i32>,
+    pub(crate) input: Option<i32>,
+    pub(crate) output: Option<i32>,
+    pub(crate) cache_read: Option<i32>,
+    pub(crate) cache_create: Option<i32>,
+    pub(crate) thinking: Option<i32>,
 }
 
 impl TokenCounts {
-    pub fn from_usage(usage: &Usage) -> Self {
+    fn from_usage(usage: &Usage) -> Self {
         Self {
             input: Some(usage.input_tokens as i32),
             output: Some(usage.output_tokens as i32),
@@ -252,7 +252,7 @@ impl TokenCounts {
         }
     }
 
-    pub fn from_optional_usage(usage: Option<&Usage>) -> Self {
+    pub(crate) fn from_optional_usage(usage: Option<&Usage>) -> Self {
         usage.map(Self::from_usage).unwrap_or_default()
     }
 }
@@ -285,7 +285,7 @@ pub struct TranscriptEvent {
     /// count, in milliseconds. Set only on finalized assistant events that
     /// carried reasoning; `None` (and omitted from JSON) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_ms: Option<i64>,
+    pub(crate) thinking_ms: Option<i64>,
     /// Remainder of raw JSON after stripping extracted fields.
     /// None if only boilerplate fields remain.
     pub raw: Option<Value>,
@@ -329,7 +329,7 @@ fn strip_extracted_fields(mut raw: Value, event_type: &str) -> Option<Value> {
 }
 
 impl TranscriptEvent {
-    pub fn from_claude_event(event: &ClaudeEvent, raw: Value) -> Self {
+    pub(crate) fn from_claude_event(event: &ClaudeEvent, raw: Value) -> Self {
         match event {
             ClaudeEvent::System {
                 subtype,
@@ -624,7 +624,7 @@ fn extract_assistant_content(
 }
 
 /// Parse a line of stream-json output
-pub fn parse_event(line: &str) -> Result<(ClaudeEvent, Value), String> {
+pub(crate) fn parse_event(line: &str) -> Result<(ClaudeEvent, Value), String> {
     let raw: Value =
         serde_json::from_str(line).map_err(|e| format!("Failed to parse JSON: {}", e))?;
     let normalized = normalize_control_response(raw.clone());

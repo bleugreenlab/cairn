@@ -3,187 +3,115 @@
 //! Handles: search, glob, grep
 
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{SearchContentType, SearchFilters};
+use crate::models::SearchContentType;
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::query::QueryParam;
-use cairn_symbols::search_util::{build_glob_matcher, format_grep_line};
+use cairn_symbols::search_util::{build_glob_matcher, render_grep_lines, GrepLine};
+use grep_searcher::SinkError;
 use serde::{Deserialize, Serialize};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Payload for search tool
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchPayload {
-    pub query: String,
-    pub content_types: Option<Vec<String>>,
+    query: String,
+    content_types: Option<Vec<String>>,
     /// Author-role facet: `assistant`/`user`/`tool` for events, `user`/`agent`
     /// for comments.
-    pub role: Option<String>,
+    role: Option<String>,
     /// Match the query against the title field only (the `in=title` axis).
     #[serde(default)]
-    pub title_only: bool,
-    pub project_id: Option<String>,
-    pub issue_id: Option<String>,
-    pub since: Option<i64>,
-    pub limit: Option<usize>,
+    title_only: bool,
+    project_id: Option<String>,
+    issue_id: Option<String>,
+    since: Option<i64>,
+    limit: Option<usize>,
 }
 
-/// Handle search tool call - searches across issues, comments, artifacts, and events.
-pub async fn handle_search(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: SearchPayload = match super::parse_payload(request) {
-        Ok(payload) => payload,
+pub(crate) fn render_tree_grep(files: &[(String, Vec<u8>)], payload: &GrepPayload) -> String {
+    let output_mode = payload
+        .output_mode
+        .as_deref()
+        .unwrap_or("files_with_matches");
+    if !matches!(output_mode, "files_with_matches" | "count" | "content") {
+        return format!(
+            "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
+            output_mode
+        );
+    }
+    let matcher = match build_grep_matcher(payload) {
+        Ok(matcher) => matcher,
         Err(error) => return error,
     };
-
-    let SearchPayload {
-        query,
-        content_types,
-        role,
-        title_only,
-        project_id,
-        issue_id,
-        since,
-        limit,
-    } = payload;
-
-    log::info!("search called: query={}", query);
-
-    // Get project context via run chain (internal agents), or none (external callers)
-    let ctx = lookup_search_project_context(&orch.db.local, request).await;
-
-    // Build filters - use provided project_id or default to current project from run chain
-    let project_id = project_id.or_else(|| ctx.as_ref().map(|c| c.project_id.clone()));
-
-    let filters = SearchFilters {
-        project_id,
-        issue_id,
-        content_types,
-        role,
-        title_only,
-        since,
-        limit,
+    let glob = match payload.glob.as_deref() {
+        Some(pattern) => match cairn_symbols::search_util::build_glob_matcher(pattern) {
+            Ok(matcher) => Some(matcher),
+            Err(error) => return error,
+        },
+        None => None,
     };
-
-    // Drain every open database's outbox so team-replica writes are indexed
-    // before the query, not only at startup.
-    if let Err(error) = orch.db.apply_pending_search().await {
-        return format!("Search failed: {error}");
+    let file_types = match payload.file_type.as_deref() {
+        Some(file_type) => {
+            let mut builder = ignore::types::TypesBuilder::new();
+            builder.add_defaults();
+            builder.select(file_type);
+            match builder.build() {
+                Ok(types) => Some(types),
+                Err(error) => return format!("Invalid file type '{}': {}", file_type, error),
+            }
+        }
+        None => None,
+    };
+    let show_line_numbers = payload.line_numbers.unwrap_or(true);
+    let mut collected: Vec<GrepLine> = Vec::new();
+    for (path, bytes) in files {
+        let path_ref = Path::new(path);
+        if glob.as_ref().is_some_and(|matcher| {
+            !matcher.is_match(path_ref)
+                && !path_ref
+                    .file_name()
+                    .is_some_and(|name| matcher.is_match(name))
+        }) {
+            continue;
+        }
+        if file_types
+            .as_ref()
+            .is_some_and(|types| !types.matched(path_ref, false).is_whitelist())
+        {
+            continue;
+        }
+        let mut searcher = build_grep_searcher(payload);
+        if let Err(error) = grep_collect_into(
+            &mut searcher,
+            &matcher,
+            path,
+            GrepSource::Bytes(bytes),
+            output_mode,
+            None,
+            &mut collected,
+        ) {
+            return error;
+        }
     }
-    match crate::search::search_content(
-        &orch.db.local,
-        &orch.db.search_index,
-        &query,
-        Some(filters),
+    let (before, after) = grep_context_window(payload);
+
+    finalize_grep_output(
+        render_grep_lines(
+            collected,
+            output_mode,
+            show_line_numbers,
+            false,
+            before > 0 || after > 0,
+        ),
+        &payload.pattern,
+        payload.offset.unwrap_or(0) as usize,
+        payload.head_limit,
     )
-    .await
-    {
-        Ok(results) => {
-            format_search_results(&results, ctx.as_ref().map(|c| c.project_key.as_str()))
-        }
-        Err(e) => format!("Search failed: {}", e),
-    }
-}
-
-#[derive(Debug, Clone)]
-struct SearchProjectContext {
-    project_id: String,
-    project_key: String,
-}
-
-async fn lookup_search_project_context(
-    db: &LocalDb,
-    request: &McpCallbackRequest,
-) -> Option<SearchProjectContext> {
-    let result = if let Some(ref run_id) = request.run_id {
-        lookup_search_project_context_by_run_id(db, run_id).await
-    } else {
-        lookup_search_project_context_by_cwd(db, &request.cwd).await
-    };
-
-    match result {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            log::debug!("search project context lookup failed: {}", error);
-            None
-        }
-    }
-}
-
-async fn lookup_search_project_context_by_run_id(
-    db: &LocalDb,
-    run_id: &str,
-) -> DbResult<Option<SearchProjectContext>> {
-    let run_id = run_id.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "
-                    SELECT p.id, p.key
-                    FROM runs r
-                    LEFT JOIN jobs j ON r.job_id = j.id
-                    JOIN projects p ON p.id = COALESCE(j.project_id, r.project_id)
-                    WHERE r.id = ?1
-                    LIMIT 1
-                    ",
-                    (run_id.as_str(),),
-                )
-                .await?;
-
-            rows.next()
-                .await?
-                .map(|row| search_project_context_from_row(&row))
-                .transpose()
-        })
-    })
-    .await
-}
-
-async fn lookup_search_project_context_by_cwd(
-    db: &LocalDb,
-    cwd: &str,
-) -> DbResult<Option<SearchProjectContext>> {
-    let cwd = cwd.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "
-                    SELECT p.id, p.key
-                    FROM runs r
-                    JOIN jobs j ON r.job_id = j.id
-                    JOIN projects p ON j.project_id = p.id
-                    WHERE r.status IN ('starting', 'live')
-                      AND (
-                        j.worktree_path = ?1
-                        OR (p.repo_path = ?1 AND j.issue_id IS NULL)
-                      )
-                    ORDER BY
-                        CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
-                        r.created_at DESC
-                    LIMIT 1
-                    ",
-                    (cwd.as_str(),),
-                )
-                .await?;
-
-            rows.next()
-                .await?
-                .map(|row| search_project_context_from_row(&row))
-                .transpose()
-        })
-    })
-    .await
-}
-
-fn search_project_context_from_row(row: &cairn_db::turso::Row) -> DbResult<SearchProjectContext> {
-    Ok(SearchProjectContext {
-        project_id: row.text(0)?,
-        project_key: row.text(1)?,
-    })
 }
 
 fn should_walk_entry(entry_path: &Path, walk_root: &Path, deny_read: &[PathBuf]) -> bool {
@@ -243,8 +171,8 @@ const GREP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Payload for glob tool (matches cairn-cmd GlobInput)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GlobPayload {
-    pub pattern: String,
-    pub path: Option<String>,
+    pattern: String,
+    path: Option<String>,
 }
 
 /// Payload for grep tool (matches cairn-cmd GrepInput)
@@ -305,7 +233,7 @@ fn default_grep_output_mode(search_path: &Path) -> &'static str {
 /// directory grep with `-C=N` would otherwise silently drop both the context
 /// and the matched lines. With no override and no context request, fall back to
 /// the target-aware default (see `default_grep_output_mode`).
-pub fn resolve_grep_output_mode<'a>(
+pub(crate) fn resolve_grep_output_mode<'a>(
     explicit: Option<&'a str>,
     requested_context: bool,
     search_path: &Path,
@@ -444,7 +372,7 @@ pub(crate) fn glob_timeout_warning() -> String {
 }
 
 /// Handle glob tool call — pattern-match files with path scoping.
-pub async fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+pub(crate) async fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     let GlobMatches {
         search_dir,
         pattern,
@@ -477,7 +405,7 @@ pub async fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> S
 }
 
 /// Handle grep tool call — in-process ripgrep search.
-pub async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+pub(crate) async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     let payload: GrepPayload = match super::parse_payload(request) {
         Ok(payload) => payload,
         Err(error) => return error,
@@ -628,37 +556,190 @@ async fn try_worktree_index_grep(
     // Key the pool on the raw DB `worktree_path` so teardown's `drop_worktree`
     // (which reads the same column) matches the entry created here.
     let worktree_raw = PathBuf::from(ctx.worktree_path?);
-    let scope = resolve_worktree_scope(orch, search_path, &worktree_raw)?;
+    try_worktree_index_grep_for_worktree(
+        orch,
+        IndexGrepRequest {
+            worktree_raw: &worktree_raw,
+            search_path,
+            payload,
+            output_mode,
+            show_line_numbers,
+            deny_read,
+            native_output: false,
+            globs: None,
+            max_per_file: None,
+            uncovered_timeout: GREP_TIMEOUT,
+        },
+    )
+    .await
+}
 
-    let combined_context = payload.context_alias.or(payload.context);
+/// One warm-index grep attempt, as issued by `read ?grep=` or a translated
+/// `run` search.
+pub(crate) struct IndexGrepRequest<'a> {
+    /// Raw DB `worktree_path`, which is also the index pool's key.
+    pub worktree_raw: &'a Path,
+    pub search_path: &'a Path,
+    pub payload: &'a GrepPayload,
+    pub output_mode: &'a str,
+    pub show_line_numbers: bool,
+    pub deny_read: &'a [PathBuf],
+    /// Render context lines in ripgrep's `path-N-text` form rather than
+    /// Cairn's `path:N-text`.
+    pub native_output: bool,
+    /// A translated run search's full glob list; `None` uses `payload.glob`.
+    pub globs: Option<&'a [String]>,
+    pub max_per_file: Option<usize>,
+    /// Budget for re-grepping whatever the index could not cover. Overrunning
+    /// it declines the query so the caller's own walk answers it in one pass.
+    pub uncovered_timeout: Duration,
+}
+
+/// Shared fff-first grep seam for `read ?grep=` and translated `run` searches.
+///
+/// The index answers what it can prove and names the files it could not cover;
+/// this greps those few files with the ripgrep walk, merges their lines into
+/// the index's, and renders once. `None` tells the caller the index could not
+/// contribute at all, so its own cancellation-aware walk should answer.
+pub(crate) async fn try_worktree_index_grep_for_worktree(
+    orch: &Orchestrator,
+    request: IndexGrepRequest<'_>,
+) -> Option<String> {
+    let IndexGrepRequest {
+        worktree_raw,
+        search_path,
+        payload,
+        output_mode,
+        show_line_numbers,
+        deny_read,
+        native_output,
+        globs,
+        max_per_file,
+        uncovered_timeout,
+    } = request;
+    if payload.multiline == Some(true) || payload.file_type.is_some() {
+        return None;
+    }
+    let scope = resolve_worktree_scope(orch, search_path, worktree_raw)?;
+    let worktree_canon = scope.worktree_canon.clone();
+    let subdir_label = scope
+        .subdir
+        .as_deref()
+        .map(|rel| format!(" subdir={rel}"))
+        .unwrap_or_default();
+
+    let (before_context, after_context) = grep_context_window(payload);
     let params = crate::worktree_search::WorktreeGrepParams {
         pattern: payload.pattern.clone(),
         subdir: scope.subdir.clone(),
-        globs: payload.glob.clone().into_iter().collect(),
-        max_per_file: None,
+        globs: globs
+            .map(<[String]>::to_vec)
+            .unwrap_or_else(|| payload.glob.clone().into_iter().collect()),
+        max_per_file,
         output_mode: output_mode.to_string(),
         case_insensitive: payload.case_insensitive,
-        before_context: payload.before_context.or(combined_context).unwrap_or(0) as usize,
-        after_context: payload.after_context.or(combined_context).unwrap_or(0) as usize,
+        before_context,
+        after_context,
         show_line_numbers,
     };
     let deny = deny_read.to_vec();
+    let search = scope.search.clone();
 
     // fff grep is CPU-bound (up to its time budget), so run it off the async
     // runtime exactly like the ripgrep walk it replaces.
-    let body = tokio::task::spawn_blocking(move || scope.search.try_grep(&params, &deny))
+    let outcome = tokio::task::spawn_blocking(move || search.try_grep(&params, &deny))
         .await
         .ok()??;
+
+    let mut lines = outcome.lines;
+    if !outcome.uncovered.is_empty() {
+        let uncovered = outcome.uncovered.clone();
+        let walk_payload = payload.clone();
+        let root = search_path.to_path_buf();
+        let mode = output_mode.to_string();
+        let covered = tokio::task::spawn_blocking(move || {
+            grep_uncovered_files(
+                &walk_payload,
+                &root,
+                &uncovered,
+                &mode,
+                max_per_file,
+                uncovered_timeout,
+            )
+        })
+        .await
+        .ok()?;
+        match covered {
+            Ok(extra) => lines.extend(extra),
+            Err(error) => {
+                log::debug!(
+                    "worktree_search: could not cover {} residual file(s) for {} ({error}); \
+                     falling through to the full walk",
+                    outcome.uncovered.len(),
+                    worktree_canon.display()
+                );
+                return None;
+            }
+        }
+    }
+
     log::debug!(
-        "worktree_search: served grep for {} from warm index{}",
-        scope.worktree_canon.display(),
-        scope
-            .subdir
-            .as_deref()
-            .map(|rel| format!(" subdir={rel}"))
-            .unwrap_or_default()
+        "worktree_search: served grep for {}{subdir_label} from warm index ({} file(s) re-grepped)",
+        worktree_canon.display(),
+        outcome.uncovered.len()
     );
-    Some(body)
+    Some(render_grep_lines(
+        lines,
+        output_mode,
+        show_line_numbers,
+        native_output,
+        before_context > 0 || after_context > 0,
+    ))
+}
+
+/// Grep the files the warm index could not cover, each as an explicit
+/// single-file target so no directory is traversed twice. An error means the
+/// budget ran out, and the caller answers the whole query with its own walk
+/// rather than returning a knowingly incomplete result.
+pub(crate) fn grep_uncovered_files(
+    payload: &GrepPayload,
+    search_root: &Path,
+    uncovered: &[String],
+    output_mode: &str,
+    max_per_file: Option<usize>,
+    timeout: Duration,
+) -> Result<Vec<GrepLine>, String> {
+    let matcher = build_grep_matcher(payload)?;
+    let mut searcher = build_grep_searcher(payload);
+    let (_, after) = grep_context_window(payload);
+    let cap = GrepCap::new(max_per_file, after);
+    let deadline = Instant::now() + timeout;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut lines = Vec::new();
+    for relative in uncovered {
+        if Instant::now() >= deadline {
+            return Err(format!("covering the residual files exceeded {timeout:?}"));
+        }
+        let path = search_root.join(relative);
+        // The watcher may have removed the file since the index listed it.
+        if !path.is_file() {
+            continue;
+        }
+        let control = SearchControl {
+            deadline,
+            cancelled: cancelled.clone(),
+        };
+        grep_collect_into(
+            &mut searcher,
+            &matcher,
+            relative,
+            GrepSource::Path(&path, control),
+            output_mode,
+            cap,
+            &mut lines,
+        )?;
+    }
+    Ok(lines)
 }
 
 pub(crate) struct WorktreeIndexScope {
@@ -710,16 +791,44 @@ fn worktree_index_search_subdir(
     (!rel.is_empty()).then_some(Some(rel))
 }
 
+struct SearchControl {
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SearchControl {
+    fn timed_out(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed) || Instant::now() >= self.deadline
+    }
+}
+
+struct ControlledReader {
+    file: std::fs::File,
+    control: SearchControl,
+}
+
+impl Read for ControlledReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.control.timed_out() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "grep deadline elapsed",
+            ));
+        }
+        self.file.read(buffer)
+    }
+}
+
 /// A content source for a single-file grep: a filesystem path (live directory
 /// walk) or an in-memory byte slice (single-file read / archival reconstruction).
-#[derive(Clone, Copy)]
 enum GrepSource<'a> {
-    Path(&'a Path),
+    Path(&'a Path, SearchControl),
     Bytes(&'a [u8]),
 }
 
-/// Run a configured searcher over one source, dispatching to `search_path` for
-/// the filesystem walk and `search_slice` for in-memory bytes.
+/// Run a configured searcher over one source. Files use a deadline-aware reader
+/// rather than `search_path`, so an outer timeout can cooperatively stop a scan
+/// that is already inside one large file instead of detaching hidden work.
 fn run_search<S: grep_searcher::Sink>(
     searcher: &mut grep_searcher::Searcher,
     matcher: &grep_regex::RegexMatcher,
@@ -727,7 +836,10 @@ fn run_search<S: grep_searcher::Sink>(
     sink: S,
 ) -> Result<(), S::Error> {
     match source {
-        GrepSource::Path(path) => searcher.search_path(matcher, path, sink),
+        GrepSource::Path(path, control) => {
+            let file = std::fs::File::open(path).map_err(S::Error::error_io)?;
+            searcher.search_reader(matcher, ControlledReader { file, control }, sink)
+        }
         GrepSource::Bytes(bytes) => searcher.search_slice(matcher, bytes, sink),
     }
 }
@@ -748,24 +860,49 @@ fn build_grep_matcher(payload: &GrepPayload) -> Result<grep_regex::RegexMatcher,
         .map_err(|e| format!("Invalid regex pattern '{}': {}", payload.pattern, e))
 }
 
+/// ripgrep's `-m N` for one file. The cap is not "stop at the Nth match":
+/// ripgrep keeps printing that match's after-context window, and a line inside
+/// the window that itself matches renders as a *match* (`:` separator) while
+/// neither counting toward the cap nor extending the window. Carrying the
+/// after-context alongside the count is what lets the sink reproduce that.
+#[derive(Clone, Copy)]
+struct GrepCap {
+    max_per_file: usize,
+    after_context: u64,
+}
+
+impl GrepCap {
+    fn new(max_per_file: Option<usize>, after_context: usize) -> Option<Self> {
+        max_per_file.map(|max_per_file| Self {
+            max_per_file,
+            after_context: after_context as u64,
+        })
+    }
+}
+
+/// The context window a payload asks for: the `-C`/`context` alias supplies
+/// both sides, and `-A`/`-B` override their own side. The single resolution
+/// used by the searcher, the warm index params, and the renderer's group
+/// separators.
+pub(crate) fn grep_context_window(payload: &GrepPayload) -> (usize, usize) {
+    let combined = payload.context_alias.or(payload.context);
+    (
+        payload.before_context.or(combined).unwrap_or(0) as usize,
+        payload.after_context.or(combined).unwrap_or(0) as usize,
+    )
+}
+
 /// Build the searcher (binary detection, line numbers, context window) for a
 /// grep. Shared by the directory walker and the single-file bytes renderer.
 fn build_grep_searcher(payload: &GrepPayload) -> grep_searcher::Searcher {
     let mut builder = grep_searcher::SearcherBuilder::new();
+    let (before, after) = grep_context_window(payload);
     builder
         .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
-        .line_number(true);
+        .line_number(true)
+        .before_context(before)
+        .after_context(after);
 
-    let context = payload.context_alias.or(payload.context);
-    if let Some(c) = context {
-        builder.before_context(c as usize).after_context(c as usize);
-    }
-    if let Some(a) = payload.after_context {
-        builder.after_context(a as usize);
-    }
-    if let Some(b) = payload.before_context {
-        builder.before_context(b as usize);
-    }
     if payload.multiline.unwrap_or(false) {
         builder.multi_line(true);
     }
@@ -773,53 +910,94 @@ fn build_grep_searcher(payload: &GrepPayload) -> grep_searcher::Searcher {
     builder.build()
 }
 
-/// Collect grep output lines for one source under the requested output mode,
-/// appending to `output_lines`. This is the single per-file formatter shared by
-/// the directory walker (`grep_search`) and the single-file bytes renderer
-/// (`render_single_file_grep`), so both emit identical match/context/count lines.
+/// Collect one source's grep hits as [`GrepLine`]s, appending to `lines`. This
+/// is the single per-file collector shared by the directory walker
+/// (`grep_search`), the tree renderer, and the single-file bytes renderer, and
+/// it produces the same model the warm index produces — so
+/// [`render_grep_lines`] is the only place output bytes are decided.
+///
+/// `files_with_matches` and `count` need only match coordinates, so their lines
+/// carry no text; the renderer projects them to paths and per-path counts.
 fn grep_collect_into(
     searcher: &mut grep_searcher::Searcher,
     matcher: &grep_regex::RegexMatcher,
     relative: &str,
     source: GrepSource<'_>,
     output_mode: &str,
-    show_line_numbers: bool,
-    output_lines: &mut Vec<String>,
-) {
+    cap: Option<GrepCap>,
+    lines: &mut Vec<GrepLine>,
+) -> Result<(), String> {
     use grep_searcher::Searcher;
+
+    let max_per_file = cap.map(|cap| cap.max_per_file);
+    // `-m 0` asks for no matches at all — ripgrep prints nothing and exits 1.
+    // Short-circuit before searching so no output mode can record a first hit
+    // and only then discover the cap.
+    if max_per_file == Some(0) {
+        return Ok(());
+    }
+
+    fn coordinate(relative: &str, line_number: u64) -> GrepLine {
+        GrepLine {
+            path: relative.to_string(),
+            line_number,
+            is_match: true,
+            text: String::new(),
+        }
+    }
 
     match output_mode {
         "files_with_matches" => {
-            let mut found = false;
-            let sink = grep_searcher::sinks::UTF8(|_, _| {
-                found = true;
+            let mut first: Option<u64> = None;
+            let sink = grep_searcher::sinks::UTF8(|line_number, _| {
+                first = Some(line_number);
                 Ok(false)
             });
-            let _ = run_search(searcher, matcher, source, sink);
-            if found {
-                output_lines.push(relative.to_string());
+            run_search(searcher, matcher, source, sink).map_err(|error| error.to_string())?;
+            if let Some(line_number) = first {
+                lines.push(coordinate(relative, line_number));
             }
         }
         "count" => {
-            let mut count: u64 = 0;
-            let sink = grep_searcher::sinks::UTF8(|_, _| {
-                count += 1;
-                Ok(true)
+            let mut matched: Vec<u64> = Vec::new();
+            let sink = grep_searcher::sinks::UTF8(|line_number, _| {
+                matched.push(line_number);
+                Ok(max_per_file.is_none_or(|max| matched.len() < max))
             });
-            let _ = run_search(searcher, matcher, source, sink);
-            if count > 0 {
-                output_lines.push(format!("{}:{}", relative, count));
-            }
+            run_search(searcher, matcher, source, sink).map_err(|error| error.to_string())?;
+            lines.extend(
+                matched
+                    .into_iter()
+                    .map(|line_number| coordinate(relative, line_number)),
+            );
         }
         "content" => {
-            struct ContentSink {
-                relative: String,
-                show_line_numbers: bool,
-                lines: Vec<String>,
-                needs_separator: bool,
+            struct ContentSink<'a> {
+                relative: &'a str,
+                cap: Option<GrepCap>,
+                matched: usize,
+                /// Last line the capped match's after-context window reaches,
+                /// set once the cap is hit. See [`GrepCap`].
+                window_end: Option<u64>,
+                lines: Vec<GrepLine>,
             }
 
-            impl grep_searcher::Sink for ContentSink {
+            impl ContentSink<'_> {
+                fn push(&mut self, line_number: u64, is_match: bool, bytes: &[u8]) {
+                    self.lines.push(GrepLine {
+                        path: self.relative.to_string(),
+                        line_number,
+                        is_match,
+                        text: std::str::from_utf8(bytes)
+                            .unwrap_or("")
+                            .trim_end_matches('\n')
+                            .trim_end_matches('\r')
+                            .to_string(),
+                    });
+                }
+            }
+
+            impl grep_searcher::Sink for ContentSink<'_> {
                 type Error = std::io::Error;
 
                 fn matched(
@@ -827,15 +1005,25 @@ fn grep_collect_into(
                     _searcher: &Searcher,
                     mat: &grep_searcher::SinkMatch<'_>,
                 ) -> Result<bool, Self::Error> {
-                    self.needs_separator = true;
-                    let text = std::str::from_utf8(mat.bytes())
-                        .unwrap_or("")
-                        .trim_end_matches('\n')
-                        .trim_end_matches('\r');
-                    let line_number = self.show_line_numbers.then(|| mat.line_number()).flatten();
-                    self.lines
-                        .push(format_grep_line(&self.relative, line_number, ':', text));
-                    Ok(true)
+                    let line_number = mat.line_number().unwrap_or(0);
+                    // Inside the capped match's window this line still renders
+                    // as a match, but it neither counts toward the cap nor
+                    // extends the window.
+                    if let Some(end) = self.window_end {
+                        if line_number > end {
+                            return Ok(false);
+                        }
+                        self.push(line_number, true, mat.bytes());
+                        return Ok(true);
+                    }
+                    self.push(line_number, true, mat.bytes());
+                    self.matched += 1;
+                    let Some(cap) = self.cap.filter(|cap| self.matched >= cap.max_per_file) else {
+                        return Ok(true);
+                    };
+                    self.window_end = Some(line_number + cap.after_context);
+                    // With no after-context there is nothing left to drain.
+                    Ok(cap.after_context > 0)
                 }
 
                 fn context(
@@ -843,45 +1031,34 @@ fn grep_collect_into(
                     _searcher: &Searcher,
                     ctx: &grep_searcher::SinkContext<'_>,
                 ) -> Result<bool, Self::Error> {
-                    let text = std::str::from_utf8(ctx.bytes())
-                        .unwrap_or("")
-                        .trim_end_matches('\n')
-                        .trim_end_matches('\r');
-                    let line_number = self.show_line_numbers.then(|| ctx.line_number()).flatten();
-                    self.lines
-                        .push(format_grep_line(&self.relative, line_number, '-', text));
-                    Ok(true)
-                }
-
-                fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
-                    if self.needs_separator {
-                        self.lines.push("--".to_string());
-                        self.needs_separator = false;
+                    let line_number = ctx.line_number().unwrap_or(0);
+                    if self.window_end.is_some_and(|end| line_number > end) {
+                        return Ok(false);
                     }
+                    self.push(line_number, false, ctx.bytes());
                     Ok(true)
                 }
             }
 
             let mut sink = ContentSink {
-                relative: relative.to_string(),
-                show_line_numbers,
+                relative,
+                cap,
+                matched: 0,
+                window_end: None,
                 lines: Vec::new(),
-                needs_separator: false,
             };
-            let _ = run_search(searcher, matcher, source, &mut sink);
-            if sink.lines.last().is_some_and(|l| l == "--") {
-                sink.lines.pop();
-            }
-            output_lines.extend(sink.lines);
+            run_search(searcher, matcher, source, &mut sink).map_err(|error| error.to_string())?;
+            lines.append(&mut sink.lines);
         }
         _ => unreachable!(),
     }
+    Ok(())
 }
 
 /// Apply the post-search finalization shared by the directory grep and the
 /// single-file bytes renderer: the empty-result message, then the
 /// `offset`/`head_limit` match-window slice.
-pub(crate) fn finalize_grep_output(
+fn finalize_grep_output(
     output: String,
     pattern: &str,
     offset: usize,
@@ -934,19 +1111,28 @@ pub(crate) fn render_single_file_grep(bytes: &[u8], label: &str, payload: &GrepP
     };
     let mut searcher = build_grep_searcher(payload);
 
-    let mut output_lines: Vec<String> = Vec::new();
-    grep_collect_into(
+    let mut collected: Vec<GrepLine> = Vec::new();
+    if let Err(error) = grep_collect_into(
         &mut searcher,
         &matcher,
         label,
         GrepSource::Bytes(bytes),
         output_mode,
-        show_line_numbers,
-        &mut output_lines,
-    );
+        None,
+        &mut collected,
+    ) {
+        return error;
+    }
 
+    let (before, after) = grep_context_window(payload);
     finalize_grep_output(
-        output_lines.join("\n"),
+        render_grep_lines(
+            collected,
+            output_mode,
+            show_line_numbers,
+            false,
+            before > 0 || after > 0,
+        ),
         &payload.pattern,
         offset,
         head_limit,
@@ -1097,6 +1283,32 @@ pub(crate) fn grep_materialized_body(body: &str, payload: &GrepPayload) -> (Stri
     (rendered, matches)
 }
 
+/// Engine-level bounds for one filesystem grep walk that the agent-facing
+/// [`GrepPayload`] cannot express: the ripgrep-style glob list (repeated
+/// `--glob`, `!` negations, the synthetic filename glob an explicit file target
+/// produces), rg's `-m N` per-file match cap, and the deadline plus shared
+/// cancel flag an outer timeout uses to stop a walk that is already inside one
+/// large file.
+pub(crate) struct GrepWalkLimits {
+    pub globs: Vec<String>,
+    pub max_per_file: Option<usize>,
+    pub timeout: Duration,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+impl GrepWalkLimits {
+    /// The `read ?grep=` walk: the payload's single glob, no per-file cap, the
+    /// module timeout, and no external cancellation.
+    fn for_payload(payload: &GrepPayload) -> Self {
+        Self {
+            globs: payload.glob.clone().into_iter().collect(),
+            max_per_file: None,
+            timeout: GREP_TIMEOUT,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 /// Perform the actual in-process grep search over a filesystem tree.
 pub fn grep_search(
     payload: GrepPayload,
@@ -1104,6 +1316,50 @@ pub fn grep_search(
     output_mode: &str,
     show_line_numbers: bool,
     deny_read: Vec<PathBuf>,
+) -> Result<String, String> {
+    let limits = GrepWalkLimits::for_payload(&payload);
+    grep_search_with_format(
+        payload,
+        search_path,
+        output_mode,
+        show_line_numbers,
+        deny_read,
+        false,
+        limits,
+    )
+}
+
+/// The same walk rendered the way ripgrep renders it (`path-N-text` context
+/// separators). This is the fallback engine behind a translated `run` search:
+/// whenever the warm index declines, the walk answers instead, so an index
+/// decline is a routing choice rather than a user-visible failure.
+pub(crate) fn grep_search_native(
+    payload: GrepPayload,
+    search_path: &Path,
+    output_mode: &str,
+    show_line_numbers: bool,
+    deny_read: Vec<PathBuf>,
+    limits: GrepWalkLimits,
+) -> Result<String, String> {
+    grep_search_with_format(
+        payload,
+        search_path,
+        output_mode,
+        show_line_numbers,
+        deny_read,
+        true,
+        limits,
+    )
+}
+
+fn grep_search_with_format(
+    payload: GrepPayload,
+    search_path: &Path,
+    output_mode: &str,
+    show_line_numbers: bool,
+    deny_read: Vec<PathBuf>,
+    native_output: bool,
+    limits: GrepWalkLimits,
 ) -> Result<String, String> {
     use ignore::overrides::OverrideBuilder;
     use ignore::types::TypesBuilder;
@@ -1139,11 +1395,13 @@ pub fn grep_search(
             })?;
     }
 
-    if let Some(ref g) = payload.glob {
+    if !limits.globs.is_empty() {
         let mut overrides = OverrideBuilder::new(walk_root);
-        overrides
-            .add(g)
-            .map_err(|e| format!("Invalid glob '{}': {}", g, e))?;
+        for glob in &limits.globs {
+            overrides
+                .add(glob)
+                .map_err(|e| format!("Invalid glob '{}': {}", glob, e))?;
+        }
         walker_builder.overrides(
             overrides
                 .build()
@@ -1152,6 +1410,8 @@ pub fn grep_search(
     }
 
     let mut searcher = build_grep_searcher(&payload);
+    let (before, after) = grep_context_window(&payload);
+    let cap = GrepCap::new(limits.max_per_file, after);
 
     let base_path = if is_file {
         search_path.parent().unwrap_or(search_path)
@@ -1159,13 +1419,14 @@ pub fn grep_search(
         search_path
     };
 
-    let mut output_lines: Vec<String> = Vec::new();
-    let deadline = std::time::Instant::now() + GREP_TIMEOUT;
+    let mut collected: Vec<GrepLine> = Vec::new();
+    let timeout = limits.timeout;
+    let deadline = Instant::now() + timeout;
 
     for entry in walker_builder.build() {
-        if std::time::Instant::now() > deadline {
-            log::warn!("grep walk timed out");
-            break;
+        if limits.cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            log::warn!("grep walk timed out after {timeout:?}");
+            return Err(format!("grep timed out after {timeout:?}"));
         }
 
         let entry = match entry {
@@ -1173,7 +1434,11 @@ pub fn grep_search(
             Err(_) => continue,
         };
 
-        if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+        // Virtual search reads regular files only. Special entries such as
+        // FIFOs can block in `File::open` before cooperative cancellation is
+        // observable, while symlink/device semantics belong to native CLI
+        // execution rather than the node-tree read contract.
+        if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }
 
@@ -1184,23 +1449,180 @@ pub fn grep_search(
             .to_string_lossy()
             .to_string();
 
-        grep_collect_into(
+        let control = SearchControl {
+            deadline,
+            cancelled: limits.cancelled.clone(),
+        };
+        if let Err(error) = grep_collect_into(
             &mut searcher,
             &matcher,
             &relative,
-            GrepSource::Path(&path),
+            GrepSource::Path(&path, control),
             output_mode,
-            show_line_numbers,
-            &mut output_lines,
-        );
+            cap,
+            &mut collected,
+        ) {
+            if limits.cancelled.load(Ordering::Relaxed)
+                || Instant::now() >= deadline
+                || error.contains("deadline elapsed")
+            {
+                return Err(format!("grep timed out after {timeout:?}"));
+            }
+            return Err(error);
+        }
     }
 
-    Ok(output_lines.join("\n"))
+    Ok(render_grep_lines(
+        collected,
+        output_mode,
+        show_line_numbers,
+        native_output,
+        before > 0 || after > 0,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_grep_deadline_is_failure_not_partial_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("match.txt"), "needle\n").unwrap();
+        let payload = GrepPayload {
+            pattern: "needle".to_string(),
+            path: None,
+            glob: None,
+            file_type: None,
+            output_mode: Some("content".to_string()),
+            context: None,
+            after_context: None,
+            before_context: None,
+            context_alias: None,
+            case_insensitive: Some(false),
+            line_numbers: Some(true),
+            head_limit: None,
+            offset: None,
+            multiline: Some(false),
+        };
+
+        let result = grep_search_native(
+            payload,
+            dir.path(),
+            "content",
+            true,
+            Vec::new(),
+            GrepWalkLimits {
+                globs: Vec::new(),
+                max_per_file: None,
+                timeout: Duration::ZERO,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        assert!(matches!(result, Err(error) if error.starts_with("grep timed out after")));
+    }
+
+    #[test]
+    fn controlled_reader_stops_after_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        std::fs::write(&path, vec![b'x'; 128 * 1024]).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut reader = ControlledReader {
+            file: std::fs::File::open(path).unwrap(),
+            control: SearchControl {
+                deadline: Instant::now() + Duration::from_secs(60),
+                cancelled: cancelled.clone(),
+            },
+        };
+        let mut buffer = [0_u8; 4096];
+        assert!(reader.read(&mut buffer).unwrap() > 0);
+        cancelled.store(true, Ordering::Relaxed);
+        let error = reader.read(&mut buffer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_grep_skips_fifo_and_worker_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("match.txt"), "needle\n").unwrap();
+        let fifo = dir.path().join("blocked.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let root = dir.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let payload = GrepPayload {
+                pattern: "needle".to_string(),
+                path: None,
+                glob: None,
+                file_type: None,
+                output_mode: Some("content".to_string()),
+                context: None,
+                after_context: None,
+                before_context: None,
+                context_alias: None,
+                case_insensitive: Some(false),
+                line_numbers: Some(true),
+                head_limit: None,
+                offset: None,
+                multiline: Some(false),
+            };
+            let result = grep_search_native(
+                payload,
+                &root,
+                "content",
+                true,
+                Vec::new(),
+                GrepWalkLimits {
+                    globs: Vec::new(),
+                    max_per_file: None,
+                    timeout: Duration::from_secs(1),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            let _ = send.send(result);
+        });
+
+        let result = receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("virtual search worker must not block opening a FIFO")
+            .unwrap();
+        assert!(result.contains("match.txt:1:needle"), "{result}");
+    }
+
+    #[test]
+    fn native_grep_context_uses_ripgrep_separators() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\nmatch\nafter\n").unwrap();
+        let mut payload = grep_payload("match");
+        payload.context_alias = Some(1);
+        payload.output_mode = Some("content".to_string());
+
+        let native = grep_search_native(
+            payload.clone(),
+            dir.path(),
+            "content",
+            true,
+            Vec::new(),
+            GrepWalkLimits {
+                globs: Vec::new(),
+                max_per_file: None,
+                timeout: GREP_TIMEOUT,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .unwrap();
+        assert_eq!(native, "a.txt-1-before\na.txt:2:match\na.txt-3-after");
+
+        let cairn = grep_search(payload, dir.path(), "content", true, Vec::new()).unwrap();
+        assert_eq!(cairn, "a.txt:1-before\na.txt:2:match\na.txt:3-after");
+    }
 
     #[test]
     fn worktree_index_search_subdir_accepts_root_and_subdir_but_not_files() {
@@ -1489,6 +1911,29 @@ mod tests {
         let expected = fs_single_file_grep(content, label, payload);
         let actual = render_single_file_grep(content.as_bytes(), label, payload);
         assert_eq!(actual, expected, "payload: {payload:?}");
+    }
+
+    #[test]
+    fn render_tree_grep_preserves_context_glob_binary_and_slicing() {
+        let files = vec![
+            (
+                "src/a.rs".to_string(),
+                b"alpha\ncontext\nNEEDLE\nafter\nNEEDLE again\n".to_vec(),
+            ),
+            ("src/skip.txt".to_string(), b"NEEDLE\n".to_vec()),
+            ("src/binary.rs".to_string(), b"NEEDLE\0ignored\n".to_vec()),
+        ];
+        let mut payload = grep_payload("NEEDLE");
+        payload.output_mode = Some("content".to_string());
+        payload.context_alias = Some(1);
+        payload.glob = Some("*.rs".to_string());
+        payload.head_limit = Some(3);
+        let output = render_tree_grep(&files, &payload);
+        assert!(output.contains("src/a.rs:3:NEEDLE"), "{output}");
+        assert!(output.contains("src/a.rs:2-context"), "{output}");
+        assert!(output.contains("src/a.rs:4-after"), "{output}");
+        assert!(!output.contains("skip.txt"), "{output}");
+        assert!(!output.contains("binary.rs"), "{output}");
     }
 
     #[test]

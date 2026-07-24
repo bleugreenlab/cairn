@@ -2,14 +2,14 @@ pub mod stream_store;
 
 use serde_json::Value;
 
-pub type TranscriptRow = (String, i32, String, String);
+pub(crate) type TranscriptRow = (String, i32, String, String);
 
 /// Format transcript rows into markdown without truncation.
 ///
 /// Intended for reuse in places where we need a faithful text rendering of the
 /// visible conversation, such as `cairn://.../chat` reads and resume fallback
 /// prompt construction.
-pub fn format_transcript_full(events: &[TranscriptRow]) -> String {
+pub(crate) fn format_transcript_full(events: &[TranscriptRow]) -> String {
     let mut transcript = String::new();
 
     for (_run_id, _seq, event_type, data) in events {

@@ -13,6 +13,10 @@ pub struct SetupProgress {
     pub phase: Option<String>,
     pub command: Option<String>,
     pub line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_id: Option<String>,
 }
 
 impl SetupProgress {
@@ -31,6 +35,8 @@ impl SetupProgress {
             phase: phase.map(str::to_string),
             command,
             line,
+            elapsed_ms: None,
+            store_id: None,
         }
     }
 }
@@ -74,4 +80,47 @@ pub fn emit(
         command,
         line,
     ));
+}
+
+/// Emit a machine-readable phase duration correlated by the canonical store path.
+pub fn emit_timing(
+    sink: &SetupSink,
+    job_id: &str,
+    issue_id: Option<String>,
+    phase: &str,
+    elapsed_ms: u64,
+    store_id: String,
+) {
+    let mut progress = SetupProgress::new(job_id, issue_id, "timing", Some(phase), None, None);
+    progress.elapsed_ms = Some(elapsed_ms);
+    progress.store_id = Some(store_id);
+    sink(progress);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timing_progress_is_machine_readable_and_store_correlated() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let sink: SetupSink = Arc::new(move |event| captured.lock().unwrap().push(event));
+        emit_timing(
+            &sink,
+            "job-1",
+            Some("issue-1".into()),
+            "populate-discovery-copy",
+            12_345,
+            "/stores/project".into(),
+        );
+        let event = events.lock().unwrap().pop().unwrap();
+        assert_eq!(event.kind, "timing");
+        assert_eq!(event.phase.as_deref(), Some("populate-discovery-copy"));
+        assert_eq!(event.elapsed_ms, Some(12_345));
+        assert_eq!(event.store_id.as_deref(), Some("/stores/project"));
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["elapsedMs"], 12_345);
+        assert_eq!(json["storeId"], "/stores/project");
+    }
 }

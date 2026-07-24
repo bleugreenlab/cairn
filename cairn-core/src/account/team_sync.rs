@@ -14,6 +14,9 @@
 //! [`super::AccountManager`] refresh loop — the ordering the host wiring relies
 //! on (the minter is constructed at `db/init` time, before `AccountManager`).
 
+use cairn_common::executor_protocol::{
+    CloudObjectGrant, CloudObjectOperation, CLOUD_OBJECT_GRANT_VERSION,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::api::ApiConfig;
@@ -25,8 +28,8 @@ use crate::storage::{LocalDb, RowExt};
 pub struct SyncConfig {
     pub team_id: String,
     /// The BROKER url to hand the Turso Sync client as its remote url.
-    pub sync_url: String,
-    pub db_name: String,
+    pub(crate) sync_url: String,
+    pub(crate) db_name: String,
     pub status: String,
 }
 
@@ -79,8 +82,8 @@ pub enum TeamConnectStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamSyncStatus {
-    pub team_id: String,
-    pub status: TeamSyncReadiness,
+    pub(crate) team_id: String,
+    pub(crate) status: TeamSyncReadiness,
 }
 
 /// Outcome of [`crate::orchestrator::Orchestrator::connect_account_teams`]: a
@@ -92,18 +95,18 @@ pub struct TeamSyncStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ConnectAccountTeamsSummary {
     /// Teams whose replica opened (or was already open).
-    pub connected: usize,
+    pub(crate) connected: usize,
     /// Teams the api reports as still provisioning (503).
-    pub provisioning: usize,
+    pub(crate) provisioning: usize,
     /// Teams with no sync config (404) — team sync not enabled.
-    pub not_configured: usize,
+    pub(crate) not_configured: usize,
     /// Teams skipped because no device JWT is stored (not authenticated).
-    pub not_authenticated: usize,
+    pub(crate) not_authenticated: usize,
     /// Teams whose connect attempt errored (logged and swallowed).
-    pub failed: usize,
+    pub(crate) failed: usize,
     /// Teams the account no longer belongs to that were forgotten (replica
     /// closed, registry + routes deleted) so they stop being visible locally.
-    pub forgotten: usize,
+    pub(crate) forgotten: usize,
 }
 
 /// The readiness states the create-into-team selector distinguishes, mapped
@@ -199,23 +202,77 @@ pub async fn mint_team_sync_token(
         .send()
         .await
         .map_err(|e| format!("Failed to request team sync token: {e}"))?;
-
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Team sync token request failed ({status}): {body}"));
     }
-
     let body: SyncTokenResponse = resp
         .json()
         .await
         .map_err(|e| format!("Failed to parse team sync token response: {e}"))?;
-
     let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
         .map(|dt| dt.timestamp())
         .unwrap_or_else(|_| chrono::Utc::now().timestamp() + 3600);
-
     Ok((body.token, expires_at))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObjectGrantBody<'a> {
+    hash: &'a str,
+    operation: CloudObjectOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byte_count: Option<u64>,
+}
+
+/// Request a transient exact-object grant with the runner's device JWT. The URL
+/// is returned to the live control path only and must never enter stored state.
+pub async fn mint_cloud_object_grant(
+    client: &reqwest::Client,
+    device_jwt: &str,
+    team_id: &str,
+    content_hash: &str,
+    operation: CloudObjectOperation,
+    byte_count: Option<u64>,
+    api: &ApiConfig,
+) -> Result<CloudObjectGrant, String> {
+    let response = client
+        .post(api.team_object_grants_url(team_id))
+        .bearer_auth(device_jwt)
+        .json(&ObjectGrantBody {
+            hash: content_hash,
+            operation,
+            byte_count,
+        })
+        .send()
+        .await
+        .map_err(|error| format!("Failed to request object grant: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(format!("Object grant request failed ({status})"));
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ResponseBody {
+        url: String,
+        method: String,
+        expires_at: String,
+        headers: std::collections::BTreeMap<String, String>,
+    }
+    let body: ResponseBody = response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to parse object grant response: {error}"))?;
+    Ok(CloudObjectGrant {
+        version: CLOUD_OBJECT_GRANT_VERSION,
+        content_hash: content_hash.to_owned(),
+        operation,
+        url: body.url,
+        method: body.method,
+        expires_at: body.expires_at,
+        headers: body.headers,
+    })
 }
 
 /// Read and decrypt the stored device JWT directly from the private database,

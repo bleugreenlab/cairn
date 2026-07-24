@@ -39,9 +39,7 @@ const CONFIG_FIELDS: &str =
 
 /// Parse the optional `scope` field. Absent/null -> workspace (the default,
 /// matching the Settings UI's scope).
-pub(crate) fn parse_mcp_scope(
-    payload: Option<&serde_json::Value>,
-) -> Result<McpWriteScope, String> {
+fn parse_mcp_scope(payload: Option<&serde_json::Value>) -> Result<McpWriteScope, String> {
     match payload.and_then(|p| p.get("scope")) {
         None | Some(serde_json::Value::Null) => Ok(McpWriteScope::Workspace),
         Some(serde_json::Value::String(s)) => match s.as_str() {

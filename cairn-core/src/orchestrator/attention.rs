@@ -75,8 +75,8 @@ pub enum AttentionFact {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExternalMessageReplyContent {
-    pub sender: String,
-    pub body: String,
+    pub(crate) sender: String,
+    pub(crate) body: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,9 +86,9 @@ pub struct QuestionContent {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PermissionContent {
-    pub tool_name: String,
-    pub tool_use_id: String,
-    pub input: serde_json::Value,
+    pub(crate) tool_name: String,
+    pub(crate) tool_use_id: String,
+    pub(crate) input: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,12 +103,12 @@ pub struct ArtifactSummary {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrStateContent {
-    pub number: i64,
-    pub state: String,
-    pub mergeable: Option<String>,
-    pub additions: Option<i64>,
-    pub deletions: Option<i64>,
-    pub title: Option<String>,
+    number: i64,
+    state: String,
+    mergeable: Option<String>,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    title: Option<String>,
 }
 
 /// One attention event delivered to a watcher.
@@ -131,22 +131,22 @@ pub struct AttentionEvent {
 /// the window collapses into a single wake. Distinct facts always pass through.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionFactKey {
-    pub kind: &'static str,
-    pub detail_uri: Option<String>,
+    pub(crate) kind: &'static str,
+    pub(crate) detail_uri: Option<String>,
 }
 
 impl AttentionFact {
     /// Canonical delivery urgency for this fact kind. The external-reply fact
     /// steers an external `cairn watch` driver; every other fact is queue
     /// urgency.
-    pub fn urgency(&self) -> DeliveryUrgency {
+    pub(crate) fn urgency(&self) -> DeliveryUrgency {
         match self {
             AttentionFact::ExternalMessageReply { .. } => DeliveryUrgency::Steer,
             _ => DeliveryUrgency::Queue,
         }
     }
 
-    pub fn key(&self) -> AttentionFactKey {
+    pub(crate) fn key(&self) -> AttentionFactKey {
         match self {
             AttentionFact::Question { detail_uri, .. } => AttentionFactKey {
                 kind: "question",
@@ -185,7 +185,7 @@ impl AttentionFact {
 /// Compatible with the prior shape (`actionable`/`resolved`/`pending`) and
 /// additively carries the typed `fact` block. Existing consumers that ignore
 /// unknown fields keep working.
-pub fn event_to_watch_json(event: &AttentionEvent) -> serde_json::Value {
+pub(crate) fn event_to_watch_json(event: &AttentionEvent) -> serde_json::Value {
     if let AttentionFact::Resolved { final_status, .. } = &event.fact {
         return serde_json::json!({
             "status": "resolved",
@@ -216,6 +216,14 @@ pub fn event_to_watch_json(event: &AttentionEvent) -> serde_json::Value {
 
 type PendingNodeDetailBuilder = fn(&str, i32, i32, &str, &str) -> String;
 
+struct PendingNodeDetail {
+    exec_seq: i64,
+    node_segment: String,
+    parent_segment: Option<String>,
+    detail_segment: String,
+    agent_config_id: Option<String>,
+}
+
 async fn pending_node_detail_uri(
     db: &LocalDb,
     project_key: &str,
@@ -226,13 +234,19 @@ async fn pending_node_detail_uri(
 ) -> Option<String> {
     let issue_id = issue_id.to_string();
     let project_key = project_key.to_string();
-    let resolved: Option<(i64, String, String)> = db
+    let resolved: Option<PendingNodeDetail> = db
         .read(|conn| {
             let issue_id = issue_id.clone();
             Box::pin(async move {
                 let mut rows = conn.query(query, (issue_id.as_str(),)).await?;
                 match rows.next().await? {
-                    Some(row) => Ok::<_, DbError>(Some((row.i64(0)?, row.text(1)?, row.text(2)?))),
+                    Some(row) => Ok::<_, DbError>(Some(PendingNodeDetail {
+                        exec_seq: row.i64(0)?,
+                        node_segment: row.text(1)?,
+                        parent_segment: row.opt_text(2)?,
+                        detail_segment: row.text(3)?,
+                        agent_config_id: row.opt_text(4)?,
+                    })),
                     None => Ok(None),
                 }
             })
@@ -241,8 +255,26 @@ async fn pending_node_detail_uri(
         .ok()
         .flatten();
 
-    resolved.map(|(seq, node, segment)| {
-        build_detail_uri(&project_key, number, seq as i32, &node, &segment)
+    resolved.map(|detail| {
+        match (
+            detail.agent_config_id.as_deref() == Some("workflow"),
+            detail.parent_segment,
+        ) {
+            (false, Some(parent)) => cairn_common::uri::build_job_base_uri(
+                &project_key,
+                number,
+                detail.exec_seq as i32,
+                &detail.node_segment,
+                Some(&parent),
+            ),
+            _ => build_detail_uri(
+                &project_key,
+                number,
+                detail.exec_seq as i32,
+                &detail.node_segment,
+                &detail.detail_segment,
+            ),
+        }
     })
 }
 
@@ -251,7 +283,7 @@ async fn pending_node_detail_uri(
 /// Shared with `mcp::handlers::watch` so the watch handler can fall back to a
 /// synthetic event when waking up from a `Lagged` recovery — the same shape it
 /// uses in the catch-up path.
-pub async fn pending_question_uri(
+async fn pending_question_uri(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -262,11 +294,12 @@ pub async fn pending_question_uri(
         project_key,
         number,
         issue_id,
-        "SELECT e.seq, j.uri_segment, p.uri_segment
+        "SELECT e.seq, j.uri_segment, parent.uri_segment, p.uri_segment, j.agent_config_id
                          FROM prompts p
                          JOIN runs r ON p.run_id = r.id
                          JOIN jobs j ON r.job_id = j.id
                          JOIN executions e ON j.execution_id = e.id
+                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                          WHERE r.issue_id = ?1 AND p.response IS NULL
                          ORDER BY p.created_at DESC LIMIT 1",
         cairn_common::uri::build_node_question_uri,
@@ -281,7 +314,7 @@ pub async fn pending_question_uri(
 /// the answerable permission segment (e.g. `.../builder/permissions/perm-5`)
 /// instead of the bare issue URI, so a handler can go straight to the decision
 /// patch with no enumeration read of the collection.
-pub async fn pending_permission_uri(
+async fn pending_permission_uri(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -355,7 +388,7 @@ pub async fn pending_permission_uri(
 /// blocked owner across both tables, addressing by `(executions.seq,
 /// uri_segment)` — the same key the node-tree emits and the read resolver
 /// accepts (CAIRN-1222).
-pub async fn blocked_node_artifact_uri(
+async fn blocked_node_artifact_uri(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -471,8 +504,8 @@ pub async fn blocked_node_artifact_uri(
 /// whether the PR work is newer than what the driver has already seen.
 #[derive(Debug, Clone)]
 pub struct OpenPrWork {
-    pub detail_uri: String,
-    pub updated_at: i64,
+    detail_uri: String,
+    updated_at: i64,
 }
 
 /// Best-effort: resolve the open PR work product for an issue.
@@ -485,7 +518,7 @@ pub struct OpenPrWork {
 /// the producing node's `/pr` node-artifact URI from the producing job's latest
 /// artifact, falling back to the generic `/artifact` alias when that job has no
 /// artifact row yet.
-pub async fn open_pr_work_for_issue(
+async fn open_pr_work_for_issue(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -574,8 +607,8 @@ pub async fn open_pr_work_for_issue(
 /// case the cursor is the issue projection's `updated_at`.
 #[derive(Debug, Clone)]
 pub struct IdleFact {
-    pub fact: AttentionFact,
-    pub updated_at: i64,
+    pub(crate) fact: AttentionFact,
+    pub(crate) updated_at: i64,
 }
 
 /// Build the typed idle fact (and its cursor) for an issue whose agent just went
@@ -592,7 +625,7 @@ pub struct IdleFact {
 ///
 /// `job_hint` biases the open-PR lookup toward a specific producing job (the
 /// builder whose turn just terminalized) so the detail URI points at its `/pr`.
-pub async fn idle_fact_for_issue(
+pub(crate) async fn idle_fact_for_issue(
     db: &LocalDb,
     issue_id: &str,
     ctx: &IssueAttentionContext,
@@ -657,7 +690,7 @@ pub async fn idle_fact_for_issue(
 
 /// Read an issue's `(project_key, number, attention, status, updated_at)` in
 /// one query, used by emit sites that hold only an `issue_id`.
-pub async fn read_issue_for_attention(
+pub(crate) async fn read_issue_for_attention(
     db: &LocalDb,
     issue_id: &str,
 ) -> Result<IssueAttentionContext, String> {
@@ -704,22 +737,22 @@ pub async fn read_issue_for_attention(
 /// Snapshot of the bits of an issue's projection an emit site needs.
 #[derive(Debug, Clone)]
 pub struct IssueAttentionContext {
-    pub project_key: String,
-    pub number: i32,
-    pub attention: IssueAttention,
-    pub status: IssueStatus,
-    pub updated_at: i64,
+    pub(crate) project_key: String,
+    pub(crate) number: i32,
+    pub(crate) attention: IssueAttention,
+    pub(crate) status: IssueStatus,
+    pub(crate) updated_at: i64,
 }
 
 impl IssueAttentionContext {
-    pub fn issue_uri(&self) -> String {
+    pub(crate) fn issue_uri(&self) -> String {
         cairn_common::uri::build_issue_uri(&self.project_key, self.number)
     }
 }
 
 /// Resolve a `(issue_id, IssueAttentionContext)` from `(project_key, number)`.
 /// Used by emit sites that hold URI coordinates but not the internal id.
-pub async fn lookup_issue_for_attention_by_key(
+pub(crate) async fn lookup_issue_for_attention_by_key(
     db: &LocalDb,
     project_key: &str,
     number: i32,

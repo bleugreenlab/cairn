@@ -5,11 +5,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const MAX_RECORDS_PER_BROWSER: usize = 500;
-pub const MAX_BYTES_PER_BROWSER: usize = 8 * 1024 * 1024;
-pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
-pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
-pub const MAX_CAPTURE_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_RECORDS_PER_BROWSER: usize = 500;
+const MAX_BYTES_PER_BROWSER: usize = 8 * 1024 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+const MAX_CAPTURE_PAYLOAD_BYTES: usize = 256 * 1024;
 const REDACTED: &str = "[REDACTED]";
 
 const BUILTIN_SENSITIVE_NAMES: &[&str] = &[
@@ -80,22 +80,22 @@ fn normalize_name(name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserNetworkEntry {
-    pub id: String,
-    pub ts: i64,
-    pub method: String,
-    pub url: String,
+    pub(crate) id: String,
+    pub(crate) ts: i64,
+    pub(crate) method: String,
+    pub(crate) url: String,
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    pub(crate) kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
+    pub(crate) status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<f64>,
+    pub(crate) duration_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
+    pub(crate) size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub has_details: bool,
-    pub truncated: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) has_details: bool,
+    pub(crate) truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,106 +148,106 @@ impl Default for CapturedBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FormField {
-    pub name: String,
+    name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<FileMetadata>,
+    file: Option<FileMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadata {
-    pub name: String,
+    name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    pub size: u64,
+    mime_type: Option<String>,
+    size: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redirect_ms: Option<f64>,
+    pub(crate) redirect_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_ms: Option<f64>,
+    pub(crate) worker_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_ms: Option<f64>,
+    pub(crate) dns_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connect_ms: Option<f64>,
+    pub(crate) connect_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_ms: Option<f64>,
+    pub(crate) tls_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_ms: Option<f64>,
+    pub(crate) request_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_ms: Option<f64>,
+    pub(crate) response_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_ms: Option<f64>,
+    pub(crate) total_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    pub(crate) protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transfer_size: Option<u64>,
+    pub(crate) transfer_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoded_body_size: Option<u64>,
+    pub(crate) encoded_body_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decoded_body_size: Option<u64>,
+    pub(crate) decoded_body_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedirectMetadata {
     #[serde(default)]
-    pub redirected: bool,
+    pub(crate) redirected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_url: Option<String>,
+    pub(crate) final_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aggregate_ms: Option<f64>,
+    aggregate_ms: Option<f64>,
     #[serde(default)]
-    pub hop_chain_available: bool,
+    hop_chain_available: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitiatorMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initiator_type: Option<String>,
+    pub(crate) initiator_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub document_url: Option<String>,
+    pub(crate) document_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stack: Option<String>,
+    pub(crate) stack: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserNetworkRecord {
-    pub id: String,
-    pub ts: i64,
-    pub method: String,
-    pub url: String,
+    pub(crate) id: String,
+    pub(crate) ts: i64,
+    pub(crate) method: String,
+    pub(crate) url: String,
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    pub(crate) kind: Option<String>,
     #[serde(default)]
-    pub request_headers: Vec<(String, String)>,
+    pub(crate) request_headers: Vec<(String, String)>,
     #[serde(default)]
-    pub request_body: CapturedBody,
+    pub(crate) request_body: CapturedBody,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
+    pub(crate) status: Option<u16>,
     #[serde(default)]
-    pub response_headers: Vec<(String, String)>,
+    pub(crate) response_headers: Vec<(String, String)>,
     #[serde(default)]
-    pub response_body: CapturedBody,
+    pub(crate) response_body: CapturedBody,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub(crate) error: Option<String>,
     #[serde(default)]
-    pub timing: NetworkTiming,
+    pub(crate) timing: NetworkTiming,
     #[serde(default)]
-    pub redirect: RedirectMetadata,
+    pub(crate) redirect: RedirectMetadata,
     #[serde(default)]
-    pub initiator: InitiatorMetadata,
+    pub(crate) initiator: InitiatorMetadata,
 }
 
 impl BrowserNetworkRecord {
-    pub fn summary(&self) -> BrowserNetworkEntry {
+    fn summary(&self) -> BrowserNetworkEntry {
         let truncated =
             body_is_truncated(&self.request_body) || body_is_truncated(&self.response_body);
         BrowserNetworkEntry {
@@ -350,19 +350,6 @@ impl BrowserNetworkArchive {
         self.insert_inner(browser_id, Some(generation), record, policy)
     }
 
-    pub fn insert_json(
-        &self,
-        browser_id: &str,
-        payload: &str,
-        policy: &RedactionPolicy,
-    ) -> Result<BrowserNetworkEntry, ArchiveError> {
-        if payload.len() > MAX_CAPTURE_PAYLOAD_BYTES {
-            return Err(ArchiveError::PayloadTooLarge);
-        }
-        let record = serde_json::from_str(payload).map_err(|_| ArchiveError::PayloadTooLarge)?;
-        self.insert(browser_id, record, policy)
-    }
-
     pub fn insert(
         &self,
         browser_id: &str,
@@ -429,7 +416,7 @@ impl BrowserNetworkArchive {
         Ok(summary)
     }
 
-    pub fn list(&self, browser_id: &str, limit: Option<usize>) -> Vec<BrowserNetworkEntry> {
+    pub(crate) fn list(&self, browser_id: &str, limit: Option<usize>) -> Vec<BrowserNetworkEntry> {
         let all = self
             .browsers
             .lock()
@@ -481,7 +468,7 @@ pub async fn restore_open_generations(
     Ok(browsers.len())
 }
 
-pub fn is_valid_request_id(id: &str) -> bool {
+fn is_valid_request_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 160
         && id
@@ -517,7 +504,7 @@ fn sanitize_record(record: &mut BrowserNetworkRecord, policy: &RedactionPolicy) 
     }
 }
 
-pub fn sanitize_url(raw: &str, policy: &RedactionPolicy) -> String {
+fn sanitize_url(raw: &str, policy: &RedactionPolicy) -> String {
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return redact_unstructured(raw);
     };

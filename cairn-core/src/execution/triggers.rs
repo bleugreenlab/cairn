@@ -65,7 +65,7 @@ fn matches_job_ended(recipe: &Recipe, event: &JobEndedEvent) -> bool {
 }
 
 /// Find all recipes that match a JobEnded event.
-pub fn find_recipes_for_job_ended(
+pub(crate) fn find_recipes_for_job_ended(
     orch: &Orchestrator,
     project_id: &str,
     event: &JobEndedEvent,
@@ -124,7 +124,7 @@ fn matches_skill_called(recipe: &Recipe, event: &SkillCalledEvent) -> bool {
 }
 
 /// Find all recipes that match a SkillCalled event.
-pub fn find_recipes_for_skill_called(
+pub(crate) fn find_recipes_for_skill_called(
     orch: &Orchestrator,
     project_id: &str,
     event: &SkillCalledEvent,
@@ -140,7 +140,7 @@ pub fn find_recipes_for_skill_called(
 ///
 /// Event-triggered executions never emit further events. Only `Manual` and
 /// `Schedule` executions are allowed to trigger event-based recipes.
-pub fn is_event_triggered(snapshot: &ExecutionSnapshot) -> bool {
+pub(crate) fn is_event_triggered(snapshot: &ExecutionSnapshot) -> bool {
     matches!(
         snapshot.trigger_context.trigger_type,
         TriggerType::JobEnded | TriggerType::SkillCalled
@@ -151,7 +151,7 @@ pub fn is_event_triggered(snapshot: &ExecutionSnapshot) -> bool {
 ///
 /// For each recipe, starts an execution, creates jobs, and enqueues
 /// `AdvanceDag` so the host effect drainer picks up newly ready jobs.
-pub fn dispatch_event_recipes(
+pub(crate) fn dispatch_event_recipes(
     orch: &Orchestrator,
     recipes: Vec<Recipe>,
     trigger_type: TriggerType,

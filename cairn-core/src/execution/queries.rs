@@ -14,7 +14,6 @@ use crate::models::{
     ActionRun, Execution, ExecutionDetail, ExecutionFilters, ExecutionListItem,
     ExecutionListResult, ExecutionSnapshot, ExecutionStatus, Job, RecipeNode, TriggerType,
 };
-use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 const EXECUTION_COLUMNS: &str = "id, recipe_id, issue_id, project_id, status, started_at,
@@ -204,7 +203,7 @@ pub fn list_triggered_executions_for_execution(
     })
 }
 
-async fn get_execution_snapshot_async(
+pub async fn get_execution_snapshot_async(
     db: &LocalDb,
     execution_id: &str,
 ) -> Result<Option<ExecutionSnapshot>, String> {
@@ -400,72 +399,6 @@ pub fn compute_tabs_for_jobs(
     run_query_db(async move { compute_tabs_for_jobs_async(&db, &job_ids).await })
 }
 
-pub fn list_jobs_for_issue_impl(orch: &Orchestrator, issue_id: &str) -> Result<Vec<Job>, String> {
-    let db = run_query_db({
-        let dbs = orch.db.clone();
-        let issue_id = issue_id.to_string();
-        async move {
-            crate::issues::crud::owning_db_for_issue(&dbs, &issue_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    run_query_db(list_jobs_for_issue(db, issue_id.to_string()))
-}
-
-pub fn get_job_impl(orch: &Orchestrator, job_id: &str) -> Result<Job, String> {
-    let db = run_query_db({
-        let dbs = orch.db.clone();
-        let job_id = job_id.to_string();
-        async move {
-            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    run_query_db(get_job(db, job_id.to_string()))
-}
-
-pub fn list_child_jobs_impl(
-    orch: &Orchestrator,
-    parent_tool_use_id: &str,
-) -> Result<Vec<Job>, String> {
-    let db = run_query_db({
-        let dbs = orch.db.clone();
-        let parent_tool_use_id = parent_tool_use_id.to_string();
-        async move {
-            crate::execution::routing::owning_db_for_parent_tool_use(&dbs, &parent_tool_use_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    run_query_db(list_jobs_by_column(
-        db,
-        "parent_tool_use_id",
-        parent_tool_use_id.to_string(),
-    ))
-}
-
-pub fn list_child_jobs_by_parent_impl(
-    orch: &Orchestrator,
-    parent_job_id: &str,
-) -> Result<Vec<Job>, String> {
-    let db = run_query_db({
-        let dbs = orch.db.clone();
-        let parent_job_id = parent_job_id.to_string();
-        async move {
-            crate::execution::routing::owning_db_for_job(&dbs, &parent_job_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    run_query_db(list_jobs_by_column(
-        db,
-        "parent_job_id",
-        parent_job_id.to_string(),
-    ))
-}
-
 fn run_query_db<T, Fut>(future: Fut) -> Result<T, String>
 where
     T: Send + 'static,
@@ -480,26 +413,6 @@ where
     })
     .join()
     .map_err(|_| "Query database task panicked".to_string())?
-}
-
-async fn list_jobs_for_issue(db: Arc<LocalDb>, issue_id: String) -> Result<Vec<Job>, String> {
-    let db_jobs = load_jobs(&db, "issue_id", &issue_id).await?;
-    jobs_from_db(&db, db_jobs).await
-}
-
-async fn get_job(db: Arc<LocalDb>, job_id: String) -> Result<Job, String> {
-    let db_jobs = load_jobs(&db, "id", &job_id).await?;
-    let mut jobs = jobs_from_db(&db, db_jobs).await?;
-    jobs.pop().ok_or_else(|| "Job not found".to_string())
-}
-
-async fn list_jobs_by_column(
-    db: Arc<LocalDb>,
-    column: &'static str,
-    value: String,
-) -> Result<Vec<Job>, String> {
-    let db_jobs = load_jobs(&db, column, &value).await?;
-    jobs_from_db(&db, db_jobs).await
 }
 
 async fn load_jobs(db: &LocalDb, column: &'static str, value: &str) -> Result<Vec<DbJob>, String> {
@@ -528,21 +441,6 @@ async fn load_jobs(db: &LocalDb, column: &'static str, value: &str) -> Result<Ve
         .map_err(|e| e.to_string())
 }
 
-async fn jobs_from_db(db: &LocalDb, db_jobs: Vec<DbJob>) -> Result<Vec<Job>, String> {
-    let mut jobs = Vec::new();
-    for db_job in db_jobs {
-        let mut job = Job::try_from(db_job)?;
-        if let Some(execution_id) = job.execution_id.as_deref() {
-            job.exec_seq = execution_seq(db, execution_id).await?;
-        }
-        let tabs = tabs_for_job(db, &job).await?;
-        job.available_tabs = tabs.available_tabs;
-        job.initial_tab = tabs.initial_tab;
-        jobs.push(job);
-    }
-    Ok(jobs)
-}
-
 async fn compute_tabs_for_jobs_async(
     db: &LocalDb,
     job_ids: &[String],
@@ -561,18 +459,6 @@ async fn compute_tabs_for_jobs_async(
         result.insert(job_id.clone(), tabs_for_job(db, &job).await?);
     }
     Ok(result)
-}
-
-async fn execution_seq(db: &LocalDb, execution_id: &str) -> Result<Option<i32>, String> {
-    let execution_id = execution_id.to_string();
-    db.query_opt(
-        "SELECT seq FROM executions WHERE id = ?1",
-        params![execution_id.as_str()],
-        |row| row.opt_i64(0).map(|seq| seq.map(|value| value as i32)),
-    )
-    .await
-    .map(Option::flatten)
-    .map_err(|e| e.to_string())
 }
 
 async fn tabs_for_job(db: &LocalDb, job: &Job) -> Result<JobTabs, String> {

@@ -32,6 +32,8 @@
 //!    Cargo `target/` artifacts in live worktrees after
 //!    `TARGET_SWEEP_MAX_IDLE_SECS`; these are regenerable build products, so the
 //!    worst case is one slower rebuild.
+//!    Executor-owned build slots are outside this GC: their continuously hot
+//!    check variants are instead bounded by the executor's per-slot target budget.
 //! 3. **Repository target sweep** — opt-in cleanup of each project's main
 //!    checkout `target/` dirs, controlled by `repo_target_sweep_days`. This uses
 //!    the same marker-based discovery and freshness policy as the worktree target
@@ -134,7 +136,7 @@ pub(crate) async fn run_worktree_gc(orch: &Orchestrator) {
 /// protected set is loaded from `local_db` and candidates are filtered against it
 /// here. Once the record is dropped (clean completion or the redispatch sweep),
 /// GC reclaims the job as the intended stray backstop.
-pub(crate) async fn plan_gc_targets(
+async fn plan_gc_targets(
     db: &LocalDb,
     local_db: &LocalDb,
     cutoff: i64,

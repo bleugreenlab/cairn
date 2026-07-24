@@ -3,29 +3,29 @@ use serde::{Deserialize, Serialize};
 /// GitHub App manifest for the manifest flow.
 #[derive(Debug, Serialize)]
 pub struct AppManifest {
-    pub name: String,
-    pub url: String,
-    pub hook_attributes: HookAttributes,
-    pub redirect_url: String,
-    pub callback_urls: Vec<String>,
-    pub public: bool,
-    pub default_permissions: Permissions,
-    pub default_events: Vec<String>,
+    name: String,
+    url: String,
+    hook_attributes: HookAttributes,
+    redirect_url: String,
+    callback_urls: Vec<String>,
+    public: bool,
+    default_permissions: Permissions,
+    default_events: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct HookAttributes {
-    pub url: String,
-    pub active: bool,
+    url: String,
+    active: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Permissions {
-    pub pull_requests: String,
-    pub checks: String,
-    pub contents: String,
-    pub metadata: String,
-    pub actions: String,
+    pull_requests: String,
+    checks: String,
+    contents: String,
+    metadata: String,
+    actions: String,
 }
 
 /// Response from GitHub's manifest flow completion endpoint.

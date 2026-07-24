@@ -33,7 +33,7 @@ const OAUTH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 
 /// Refresh an access token this many seconds before its actual expiry, so a
 /// token never expires mid-call.
-pub const EXPIRY_SKEW_SECS: i64 = 60;
+pub(crate) const EXPIRY_SKEW_SECS: i64 = 60;
 
 // ---------------------------------------------------------------------------
 // WWW-Authenticate (RFC9728 §5.1, RFC6750 §3)
@@ -48,7 +48,7 @@ pub struct WwwAuthenticate {
     /// `scope` — space-delimited scopes the resource is asking for.
     pub scope: Option<String>,
     /// `error` — e.g. `insufficient_scope` on a `403` step-up.
-    pub error: Option<String>,
+    error: Option<String>,
 }
 
 impl WwwAuthenticate {
@@ -61,7 +61,7 @@ impl WwwAuthenticate {
 /// Parse the auth-params out of a `WWW-Authenticate` header value. Tolerant of
 /// the `Bearer ` scheme prefix, quoted or bare values, and surrounding
 /// whitespace. Unknown params are ignored.
-pub fn parse_www_authenticate(header: &str) -> WwwAuthenticate {
+fn parse_www_authenticate(header: &str) -> WwwAuthenticate {
     let mut out = WwwAuthenticate::default();
     // Drop the leading scheme token (`Bearer`, `DPoP`, …) if present.
     let rest = match header.split_once(char::is_whitespace) {
@@ -136,13 +136,13 @@ pub struct ProtectedResourceMetadata {
     #[serde(default)]
     pub resource: Option<String>,
     #[serde(default)]
-    pub authorization_servers: Vec<String>,
+    authorization_servers: Vec<String>,
     #[serde(default)]
     pub scopes_supported: Vec<String>,
 }
 
 /// Parse a PRM JSON document.
-pub fn parse_protected_resource_metadata(json: &str) -> Result<ProtectedResourceMetadata, String> {
+fn parse_protected_resource_metadata(json: &str) -> Result<ProtectedResourceMetadata, String> {
     serde_json::from_str(json).map_err(|e| format!("Invalid protected resource metadata: {e}"))
 }
 
@@ -190,19 +190,19 @@ pub struct AuthServerMetadata {
     #[serde(default)]
     pub scopes_supported: Vec<String>,
     #[serde(default)]
-    pub code_challenge_methods_supported: Vec<String>,
+    code_challenge_methods_supported: Vec<String>,
     #[serde(default)]
     pub grant_types_supported: Vec<String>,
 }
 
 /// Parse an authorization-server metadata JSON document.
-pub fn parse_auth_server_metadata(json: &str) -> Result<AuthServerMetadata, String> {
+fn parse_auth_server_metadata(json: &str) -> Result<AuthServerMetadata, String> {
     serde_json::from_str(json).map_err(|e| format!("Invalid authorization server metadata: {e}"))
 }
 
 /// Whether the server advertises PKCE `S256` support — mandatory; the flow
 /// refuses to proceed without it.
-pub fn supports_s256(meta: &AuthServerMetadata) -> bool {
+fn supports_s256(meta: &AuthServerMetadata) -> bool {
     meta.code_challenge_methods_supported
         .iter()
         .any(|m| m == "S256")
@@ -212,7 +212,7 @@ pub fn supports_s256(meta: &AuthServerMetadata) -> bool {
 /// order (MCP Authorization § "Authorization Server Metadata Discovery"):
 /// RFC8414 path-aware, OIDC path-aware, then OIDC path-insertion; for an
 /// issuer with no path, the root well-knowns.
-pub fn as_metadata_urls(issuer: &str) -> Vec<String> {
+fn as_metadata_urls(issuer: &str) -> Vec<String> {
     let Ok(url) = reqwest::Url::parse(issuer) else {
         return Vec::new();
     };
@@ -263,7 +263,7 @@ fn origin_string(url: &reqwest::Url) -> String {
 
 /// Whether a URL uses HTTPS (or is a loopback http URL, allowed for local test
 /// servers). Authorization/token endpoints must be HTTPS per the spec.
-pub fn is_secure_endpoint(url: &str) -> bool {
+fn is_secure_endpoint(url: &str) -> bool {
     match reqwest::Url::parse(url) {
         Ok(u) if u.scheme() == "https" => true,
         Ok(u) if u.scheme() == "http" => is_loopback_host(u.host_str()),
@@ -459,7 +459,7 @@ pub async fn exchange_code(
 }
 
 /// Refresh an access token via the refresh-token grant, re-binding `resource`.
-pub async fn refresh_access_token(
+pub(crate) async fn refresh_access_token(
     token_endpoint: &str,
     client_id: &str,
     client_secret: Option<&str>,
@@ -743,7 +743,7 @@ pub struct ClientCredentials {
 /// Scope the DCR `grant_types` to what the authorization server advertises:
 /// `authorization_code` (always) plus `refresh_token` only when supported. An
 /// empty `supported` list (server didn't advertise) requests both, best-effort.
-pub fn scoped_grant_types(supported: &[String]) -> Vec<&'static str> {
+fn scoped_grant_types(supported: &[String]) -> Vec<&'static str> {
     if supported.is_empty() {
         return vec!["authorization_code", "refresh_token"];
     }

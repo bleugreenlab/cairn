@@ -92,6 +92,7 @@ pub enum TurnYieldReason {
     UserInput,
     Permission,
     DependencyWait,
+    Wait,
 }
 
 impl std::fmt::Display for TurnYieldReason {
@@ -100,6 +101,7 @@ impl std::fmt::Display for TurnYieldReason {
             TurnYieldReason::UserInput => write!(f, "user_input"),
             TurnYieldReason::Permission => write!(f, "permission"),
             TurnYieldReason::DependencyWait => write!(f, "dependency_wait"),
+            TurnYieldReason::Wait => write!(f, "wait"),
         }
     }
 }
@@ -112,6 +114,7 @@ impl std::str::FromStr for TurnYieldReason {
             "user_input" => Ok(TurnYieldReason::UserInput),
             "permission" => Ok(TurnYieldReason::Permission),
             "dependency_wait" => Ok(TurnYieldReason::DependencyWait),
+            "wait" => Ok(TurnYieldReason::Wait),
             _ => Err(format!("Unknown yield reason: {}", s)),
         }
     }
@@ -160,6 +163,7 @@ pub enum TurnStartReason {
     Retry,
     ManagerWake,
     DependencyUnblock,
+    WaitResolved,
     /// The post-completion memory review/reflection turn. It runs after the
     /// job's real work turn has already completed, so the job-status projection
     /// excludes it when gathering facts (the work turn stays the latest fact),
@@ -177,6 +181,7 @@ impl std::fmt::Display for TurnStartReason {
             TurnStartReason::Retry => write!(f, "retry"),
             TurnStartReason::ManagerWake => write!(f, "manager_wake"),
             TurnStartReason::DependencyUnblock => write!(f, "dependency_unblock"),
+            TurnStartReason::WaitResolved => write!(f, "wait_resolved"),
             TurnStartReason::MemoryReview => write!(f, "memory_review"),
         }
     }
@@ -194,6 +199,7 @@ impl std::str::FromStr for TurnStartReason {
             "retry" => Ok(TurnStartReason::Retry),
             "manager_wake" => Ok(TurnStartReason::ManagerWake),
             "dependency_unblock" => Ok(TurnStartReason::DependencyUnblock),
+            "wait_resolved" => Ok(TurnStartReason::WaitResolved),
             "memory_review" => Ok(TurnStartReason::MemoryReview),
             _ => Err(format!("Unknown start reason: {}", s)),
         }

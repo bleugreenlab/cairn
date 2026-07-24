@@ -16,7 +16,7 @@ mod worker;
 
 pub use client::{EmbeddingClient, InputType, TokenProvider, COHERE_DIMS, COHERE_MODEL};
 pub use position::{PositionConfig, PositionKind, PositionMeta};
-pub use resource_text::artifact_embed_text;
+pub(crate) use resource_text::artifact_embed_text;
 pub use vibes::VibeState;
 pub use worker::{spawn_embed_worker, EmbedJob};
 
@@ -39,7 +39,7 @@ pub fn extract_embeddable_text(data_json: &str) -> Option<String> {
 /// the `commit_msg` plus each touched `target` (paths/URIs only — never file
 /// contents) across every `write` tool-use in the event. Returns `None` when
 /// the event has no `write` tool-use or yields no signal text.
-pub fn extract_change_signal_text(data_json: &str) -> Option<String> {
+pub(crate) fn extract_change_signal_text(data_json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(data_json).ok()?;
     let tool_uses = value.get("toolUses").and_then(|t| t.as_array())?;
 

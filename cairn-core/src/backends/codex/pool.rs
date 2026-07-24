@@ -51,8 +51,8 @@ pub type PoolKey = String;
 /// key; per-thread filesystem isolation rides here instead.
 #[derive(Clone, Debug)]
 pub struct CallBinding {
-    pub run_id: String,
-    pub cwd: String,
+    pub(crate) run_id: String,
+    pub(crate) cwd: String,
 }
 
 /// One long-lived app-server hosting N ephemeral call threads.
@@ -105,7 +105,7 @@ impl PooledAppServer {
 
     /// Drop a call thread's routing entries. Idempotent: the reader calls it on
     /// exit and a crash-teardown may have already removed it.
-    pub(super) fn deregister_call(&self, thread_id: &str) {
+    fn deregister_call(&self, thread_id: &str) {
         self.thread_runs.lock().unwrap().remove(thread_id);
         self.senders.lock().unwrap().remove(thread_id);
     }
@@ -175,12 +175,12 @@ impl PooledAppServer {
     }
 
     #[cfg(test)]
-    pub(crate) fn close_all_calls_for_test(&self) {
+    fn close_all_calls_for_test(&self) {
         self.close_all_calls();
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(client: Arc<AppServerClient>) -> Arc<Self> {
+    fn for_test(client: Arc<AppServerClient>) -> Arc<Self> {
         Arc::new(Self {
             client,
             thread_runs: Arc::new(Mutex::new(HashMap::new())),
@@ -192,7 +192,7 @@ impl PooledAppServer {
 
 /// A pooled call's cleanup handle, held by its reader thread. Dropping the
 /// call's routing entries on reader exit is idempotent with crash teardown.
-pub struct PooledCall {
+pub(crate) struct PooledCall {
     server: Arc<PooledAppServer>,
     thread_id: String,
 }
@@ -219,14 +219,14 @@ pub struct CodexAppServerPool {
 
 impl CodexAppServerPool {
     #[cfg(test)]
-    pub(crate) fn insert_test_server(&self, key: PoolKey, server: Arc<PooledAppServer>) {
+    fn insert_test_server(&self, key: PoolKey, server: Arc<PooledAppServer>) {
         self.pools.lock().unwrap().insert(key, server);
     }
 
     /// Map a pooled call's `threadId` (from `_meta.threadId`) to its owning run
     /// AND working directory. A `threadId` is a globally-unique Codex uuid, so a
     /// linear scan across the (few) live pools is correct and cheap.
-    pub fn binding_for_thread(&self, thread_id: &str) -> Option<CallBinding> {
+    pub(crate) fn binding_for_thread(&self, thread_id: &str) -> Option<CallBinding> {
         let pools = self.pools.lock().ok()?;
         for server in pools.values() {
             if let Some(binding) = server.thread_runs.lock().ok()?.get(thread_id) {

@@ -7,8 +7,44 @@ use std::path::Path;
 /// archival before it packs the worktree history: an out-of-workspace auto-rebase
 /// (an orchestration merge) may not have exported to this workspace's git yet, so
 /// without the refresh the pack could be built from stale refs. Best-effort.
-pub fn export_git(jj: &JjEnv, ws: &Path) -> Result<(), String> {
-    jj.run(ws, &["git", "export"], "jj git export").map(|_| ())
+pub(crate) fn export_git(jj: &JjEnv, ws: &Path) -> Result<(), String> {
+    export_git_preserving_checkout(jj, ws, false, "jj git export")
+}
+
+/// Query only candidate bookmark names in one structured jj invocation. An
+/// empty candidate set is resolved without spawning jj.
+pub(crate) fn query_local_bookmarks(
+    jj: &JjEnv,
+    store: &Path,
+    candidates: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let revset = candidates
+        .iter()
+        .map(|name| format!("bookmarks(exact:{name:?})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let out = jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+            "--ignore-working-copy",
+        ],
+        "jj log (candidate local bookmarks)",
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// Create a new local bookmark at an exact revision without snapshotting any
@@ -66,7 +102,7 @@ pub fn set_bookmark_at(
 /// Returns `None` when `ws` is not a jj workspace or jj cannot resolve the commit.
 /// Both yield identity/skip semantics at the call site: plain-git worktrees and
 /// unresolvable ids keep today's behavior.
-pub fn forward_resolve_commit(
+pub(crate) fn forward_resolve_commit(
     jj: &JjEnv,
     ws: &Path,
     commit: &str,
@@ -131,6 +167,7 @@ pub fn forward_resolve_commit(
 /// ancestor of `descendant`. Unlike the archival resolver above, this proof is
 /// store-scoped and anchored to an explicit physical head, so it cannot select a
 /// divergent incarnation from another workspace lineage.
+#[cfg(test)]
 fn exactly_one_commit_id(output: &str) -> Option<String> {
     let mut commits = output
         .lines()
@@ -140,45 +177,214 @@ fn exactly_one_commit_id(output: &str) -> Option<String> {
     commits.next().is_none().then_some(commit)
 }
 
-pub fn forward_resolve_ancestor(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardResolveAncestor {
+    Resolved(String),
+    Unresolved,
+    Ambiguous(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableBaseRelationship {
+    Equal,
+    MarkerBehindDatabase,
+    DatabaseBehindMarker,
+    Divergent,
+    AmbiguousRewrite,
+    Unresolved,
+    OffTarget,
+}
+
+impl DurableBaseRelationship {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Equal => "equal",
+            Self::MarkerBehindDatabase => "marker behind database",
+            Self::DatabaseBehindMarker => "database behind marker",
+            Self::Divergent => "divergent/incomparable",
+            Self::AmbiguousRewrite => "ambiguous rewrite",
+            Self::Unresolved => "unresolved",
+            Self::OffTarget => "off-target",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableBaseLineage {
+    marker: ForwardResolveAncestor,
+    database: ForwardResolveAncestor,
+    pub(crate) marker_on_target: bool,
+    pub(crate) database_on_target: bool,
+    pub(crate) relationship: DurableBaseRelationship,
+    pub(crate) newer_base: Option<String>,
+}
+
+impl DurableBaseLineage {
+    pub(crate) fn marker_resolved(&self) -> Option<&str> {
+        match &self.marker {
+            ForwardResolveAncestor::Resolved(commit) => Some(commit),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn database_resolved(&self) -> Option<&str> {
+        match &self.database {
+            ForwardResolveAncestor::Resolved(commit) => Some(commit),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn repairable(&self) -> bool {
+        matches!(
+            self.relationship,
+            DurableBaseRelationship::Equal
+                | DurableBaseRelationship::MarkerBehindDatabase
+                | DurableBaseRelationship::DatabaseBehindMarker
+        )
+    }
+}
+
+/// Resolve a recorded commit to its unique current incarnation beneath an
+/// explicit descendant. The descendant anchor prevents a rewritten change from
+/// resolving onto a divergent workspace lineage.
+fn classify_forward_resolve_ancestor(
+    jj: &JjEnv,
+    store: &Path,
+    commit: &str,
+    descendant: &str,
+) -> ForwardResolveAncestor {
+    let Ok(change_id) = jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            commit,
+            "--no-graph",
+            "-T",
+            "change_id",
+            "--ignore-working-copy",
+        ],
+        "jj forward-resolve ancestor change_id",
+    ) else {
+        return ForwardResolveAncestor::Unresolved;
+    };
+    if change_id.trim().is_empty() {
+        return ForwardResolveAncestor::Unresolved;
+    }
+    let revset = format!("latest(change_id({change_id}) & ::{descendant})");
+    let Ok(output) = jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            r#"commit_id ++ "\n""#,
+            "--ignore-working-copy",
+        ],
+        "jj forward-resolve ancestor commit_id",
+    ) else {
+        return ForwardResolveAncestor::Unresolved;
+    };
+    let commits: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    match commits.as_slice() {
+        [commit] => ForwardResolveAncestor::Resolved(commit.clone()),
+        [] => ForwardResolveAncestor::Unresolved,
+        _ => ForwardResolveAncestor::Ambiguous(commits),
+    }
+}
+
+pub(crate) fn forward_resolve_ancestor(
     jj: &JjEnv,
     store: &Path,
     commit: &str,
     descendant: &str,
 ) -> Option<String> {
-    let change_id = jj
-        .run(
-            store,
-            &[
-                "log",
-                "-r",
-                commit,
-                "--no-graph",
-                "-T",
-                "change_id",
-                "--ignore-working-copy",
-            ],
-            "jj forward-resolve ancestor change_id",
-        )
-        .ok()
-        .filter(|value| !value.is_empty())?;
-    let revset = format!("latest(change_id({change_id}) & ::{descendant})");
-    let output = jj
-        .run(
-            store,
-            &[
-                "log",
-                "-r",
-                &revset,
-                "--no-graph",
-                "-T",
-                r#"commit_id ++ "\n""#,
-                "--ignore-working-copy",
-            ],
-            "jj forward-resolve ancestor commit_id",
-        )
-        .ok()?;
-    exactly_one_commit_id(&output)
+    match classify_forward_resolve_ancestor(jj, store, commit, descendant) {
+        ForwardResolveAncestor::Resolved(commit) => Some(commit),
+        ForwardResolveAncestor::Unresolved | ForwardResolveAncestor::Ambiguous(_) => None,
+    }
+}
+
+/// Classify two durable base coordinates against one explicit target.
+///
+/// Marker and database bases are equal, or their difference is explained by one
+/// pending forward transition. A finalized mismatch may be normalized only when
+/// both coordinates uniquely resolve onto one comparable lineage beneath the
+/// explicit target.
+pub(crate) fn classify_durable_base_lineage(
+    jj: &JjEnv,
+    store: &Path,
+    marker_base: &str,
+    database_base: &str,
+    target: &str,
+) -> DurableBaseLineage {
+    let marker = classify_forward_resolve_ancestor(jj, store, marker_base, target);
+    let database = classify_forward_resolve_ancestor(jj, store, database_base, target);
+    let marker_resolved = match &marker {
+        ForwardResolveAncestor::Resolved(commit) => Some(commit.as_str()),
+        _ => None,
+    };
+    let database_resolved = match &database {
+        ForwardResolveAncestor::Resolved(commit) => Some(commit.as_str()),
+        _ => None,
+    };
+    let marker_on_target =
+        marker_resolved.is_some_and(|commit| revision_descends_from(jj, store, target, commit));
+    let database_on_target =
+        database_resolved.is_some_and(|commit| revision_descends_from(jj, store, target, commit));
+
+    let (relationship, newer_base) =
+        match (&marker, &database) {
+            (ForwardResolveAncestor::Ambiguous(_), _)
+            | (_, ForwardResolveAncestor::Ambiguous(_)) => {
+                (DurableBaseRelationship::AmbiguousRewrite, None)
+            }
+            (ForwardResolveAncestor::Unresolved, _) | (_, ForwardResolveAncestor::Unresolved) => {
+                (DurableBaseRelationship::Unresolved, None)
+            }
+            (ForwardResolveAncestor::Resolved(_), ForwardResolveAncestor::Resolved(_))
+                if !marker_on_target || !database_on_target =>
+            {
+                (DurableBaseRelationship::OffTarget, None)
+            }
+            (
+                ForwardResolveAncestor::Resolved(marker),
+                ForwardResolveAncestor::Resolved(database),
+            ) if marker == database => (DurableBaseRelationship::Equal, Some(marker.clone())),
+            (
+                ForwardResolveAncestor::Resolved(marker),
+                ForwardResolveAncestor::Resolved(database),
+            ) if revision_descends_from(jj, store, database, marker) => (
+                DurableBaseRelationship::MarkerBehindDatabase,
+                Some(database.clone()),
+            ),
+            (
+                ForwardResolveAncestor::Resolved(marker),
+                ForwardResolveAncestor::Resolved(database),
+            ) if revision_descends_from(jj, store, marker, database) => (
+                DurableBaseRelationship::DatabaseBehindMarker,
+                Some(marker.clone()),
+            ),
+            (ForwardResolveAncestor::Resolved(_), ForwardResolveAncestor::Resolved(_)) => {
+                (DurableBaseRelationship::Divergent, None)
+            }
+        };
+
+    DurableBaseLineage {
+        marker,
+        database,
+        marker_on_target,
+        database_on_target,
+        relationship,
+        newer_base,
+    }
 }
 
 /// Push the workspace's bookmark to origin. Callers choose whether publication
@@ -195,7 +401,7 @@ pub fn forward_resolve_ancestor(
 /// the workspace) into the working-copy commit, exactly the kind of working-copy
 /// mutation a concurrent store op can then wedge a later seal on. Matches
 /// `advance_workspace_onto` / `node_changed_files`, which pass it deliberately.
-pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) -> Result<(), String> {
+pub(crate) fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) -> Result<(), String> {
     if branch.is_empty() || branch == "main" || branch == "master" {
         log::debug!("Skipping jj push for branch: {branch}");
         return Ok(());
@@ -226,39 +432,6 @@ pub fn bookmark_commit(jj: &JjEnv, store: &Path, branch: &str) -> Option<String>
     revset_commit(jj, store, &revset)
 }
 
-/// Every local bookmark name in the shared store, as one set, resolved with a
-/// SINGLE `jj` invocation. The sibling reconcile uses it to precheck which
-/// siblings still have a bookmark before spawning any `jj rebase`: a base advance
-/// that still lists long-dead `agent/…` siblings (worktrees reclaimed, bookmarks
-/// gone) would otherwise spawn one doomed rebase — and log one WARN — per branch.
-/// Templated via `local_bookmarks` (the proven [`local_bookmarks_at`] shape) over
-/// the `bookmarks()` revset, so remote-tracking refs never leak in; a divergent
-/// bookmark's repeated name is folded by the set.
-pub fn list_local_bookmarks(
-    jj: &JjEnv,
-    store: &Path,
-) -> Result<std::collections::HashSet<String>, String> {
-    let out = jj.run(
-        store,
-        &[
-            "log",
-            "-r",
-            "bookmarks()",
-            "--no-graph",
-            "-T",
-            "local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
-            "--ignore-working-copy",
-        ],
-        "jj log (all local bookmarks)",
-    )?;
-    Ok(out
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
 /// Whether the `src` bookmark's tip has already landed in `dst` — its commit is
 /// an ancestor of (or equal to) the `dst` bookmark's tip in the shared store.
 ///
@@ -274,7 +447,7 @@ pub fn list_local_bookmarks(
 /// but an out-of-band squash that discards SRC's commits (e.g. GitHub's own
 /// squash-merge) leaves SRC off DST's history and returns `false`. Use it only
 /// where the store owns the fold (the local jj merge path and its teardown).
-pub fn bookmark_landed_in(jj: &JjEnv, store: &Path, src: &str, dst: &str) -> bool {
+pub(crate) fn bookmark_landed_in(jj: &JjEnv, store: &Path, src: &str, dst: &str) -> bool {
     if src.is_empty() || dst.is_empty() {
         return false;
     }
@@ -289,7 +462,7 @@ pub fn bookmark_landed_in(jj: &JjEnv, store: &Path, src: &str, dst: &str) -> boo
 /// converted to a child commit rather than rewriting shared history.
 /// `--ignore-working-copy` keeps the read from snapshotting `@` before the seal
 /// deliberately does so.
-pub fn local_bookmarks_at(jj: &JjEnv, ws: &Path, rev: &str) -> Result<Vec<String>, String> {
+pub(crate) fn local_bookmarks_at(jj: &JjEnv, ws: &Path, rev: &str) -> Result<Vec<String>, String> {
     let out = jj.run(
         ws,
         &[
@@ -314,7 +487,7 @@ pub fn local_bookmarks_at(jj: &JjEnv, ws: &Path, rev: &str) -> Result<Vec<String
 /// Resolve a single revset to a commit id over the shared store, or `None` when
 /// it does not resolve. Used for both exact local bookmarks and remote-tracking
 /// bookmarks such as `main@origin`.
-pub fn revset_commit(jj: &JjEnv, store: &Path, revset: &str) -> Option<String> {
+pub(crate) fn revset_commit(jj: &JjEnv, store: &Path, revset: &str) -> Option<String> {
     let resolve = |ignore_working_copy: bool| {
         let mut args = vec!["log", "-r", revset, "--no-graph", "-T", "commit_id"];
         if ignore_working_copy {
@@ -336,7 +509,7 @@ pub fn revset_commit(jj: &JjEnv, store: &Path, revset: &str) -> Option<String> {
 /// resolved over the shared store. Used to detect whether
 /// [`advance_workspace_onto`] actually moved the `@` (a real advance) versus an
 /// idempotent no-op, so the on-branch advance only notifies on a genuine move.
-pub fn workspace_head_commit(jj: &JjEnv, store: &Path, ws_branch: &str) -> Option<String> {
+pub(crate) fn workspace_head_commit(jj: &JjEnv, store: &Path, ws_branch: &str) -> Option<String> {
     let source = format!("{}@", workspace_name_for_branch(ws_branch));
     jj.run(
         store,
@@ -355,7 +528,11 @@ pub fn workspace_head_commit(jj: &JjEnv, store: &Path, ws_branch: &str) -> Optio
 /// No-op when the bookmark does not resolve in the store (base not sealed yet)
 /// or already matches origin (`jj git push` reports "Nothing changed"). jj 0.42
 /// auto-tracks a new bookmark on push, so no `--allow-new` is passed.
-pub fn ensure_bookmark_on_origin(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
+pub(crate) fn ensure_bookmark_on_origin(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+) -> Result<(), String> {
     if branch.is_empty() {
         return Ok(());
     }

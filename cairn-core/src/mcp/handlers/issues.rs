@@ -21,8 +21,8 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// the recipe/agent default.
 #[derive(Debug, Default, Clone)]
 pub struct CreateExecutionSpec {
-    pub recipe: Option<String>,
-    pub backend: Option<String>,
+    pub(crate) recipe: Option<String>,
+    pub(crate) backend: Option<String>,
 }
 
 /// Persist a new issue and emit the standard side effects (embed, sync,
@@ -105,60 +105,16 @@ fn created_issue_summary(ctx: &ProjectContext, issue: &Issue) -> String {
     )
 }
 
-async fn create_issue_with_context(
-    orch: &Orchestrator,
-    owning_db: &LocalDb,
-    ctx: ProjectContext,
-    title: String,
-    description: Option<String>,
-) -> Result<String, String> {
-    let issue =
-        insert_issue_with_context(orch, owning_db, &ctx, title, description, None, None, None)
-            .await?;
-    Ok(created_issue_summary(&ctx, &issue))
-}
-
-pub async fn create_issue_from_request(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    project_key: Option<&str>,
-    title: String,
-    description: Option<String>,
-) -> Result<String, String> {
-    let (owning_db, ctx) = if let Some(key) = project_key {
-        // The project lookup must run against the owning DB: a team project's
-        // `projects` row lives only in its team replica (CAIRN-2181).
-        let db = orch.db.for_project(key).await;
-        let ctx = lookup_project_by_key(&db, key).await?;
-        (db, ctx)
-    } else {
-        // No explicit key: resolve the run/cwd context from the OWNING DB. A team
-        // run's `runs`/`jobs` rows live in its replica (CAIRN-2182), so a run-id
-        // lookup against the private DB errors `No run found`; route by run id
-        // when present, falling back to the private DB for the cwd path.
-        let lookup_db = match request.run_id.as_deref() {
-            Some(run_id) => crate::execution::routing::routing_db_for_id(&orch.db, run_id)
-                .await
-                .map_err(|e| e.to_string())?,
-            None => orch.db.local.clone(),
-        };
-        let ctx = lookup_project_context(&lookup_db, request).await?;
-        let db = orch.db.for_project(&ctx.project_key).await;
-        (db, ctx)
-    };
-    create_issue_with_context(orch, &owning_db, ctx, title, description).await
-}
-
 /// Outcome of creating an issue through the resource-mutation path: the
 /// human-readable summary plus the structured identifiers UI renderers need to
 /// resolve the created issue (drag target, live-node lookup) without parsing
 /// the summary string.
 pub struct CreatedIssueOutcome {
-    pub summary: String,
+    pub(crate) summary: String,
     pub issue_id: String,
-    pub project_key: String,
+    pub(crate) project_key: String,
     pub number: i32,
-    pub uri: String,
+    pub(crate) uri: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,17 +182,6 @@ pub async fn create_issue_in_project(
         number,
         uri,
     })
-}
-
-pub async fn create_issue_external_in_project(
-    orch: &Orchestrator,
-    project_key: &str,
-    title: String,
-    description: Option<String>,
-) -> Result<String, String> {
-    let owning_db = orch.db.for_project(project_key).await;
-    let ctx = lookup_project_by_key(&owning_db, project_key).await?;
-    create_issue_with_context(orch, &owning_db, ctx, title, description).await
 }
 
 async fn lookup_project_by_key(db: &LocalDb, key: &str) -> Result<ProjectContext, String> {
@@ -524,20 +469,20 @@ async fn create_issue_row(
     .await
 }
 
-pub struct IssuePatchFields {
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub depends_on: Option<Vec<String>>,
-    pub labels: Option<Vec<String>>,
+pub(crate) struct IssuePatchFields {
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) depends_on: Option<Vec<String>>,
+    pub(crate) labels: Option<Vec<String>>,
     /// Resolution to apply via [`crate::issues::status::update_status`]. Only
     /// `merged`/`closed` are accepted at the URI layer; callers validate before
     /// setting this. `None` leaves the resolution untouched.
-    pub status: Option<String>,
+    pub(crate) status: Option<String>,
     /// Re-parenting. `None` leaves parent untouched; `Some(None)` orphans the
     /// issue (clears parent); `Some(Some(uri))` adopts under the given canonical
     /// issue URI. The URI is resolved to an issue id, validated same-project, and
     /// checked for parent-chain cycles inside the update transaction.
-    pub parent: Option<Option<String>>,
+    pub(crate) parent: Option<Option<String>>,
 }
 
 async fn update_issue_row(
@@ -668,7 +613,7 @@ async fn update_issue_row(
     .await
 }
 
-pub async fn update_issue_by_project_number(
+pub(crate) async fn update_issue_by_project_number(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     project_key: &str,

@@ -15,8 +15,8 @@ use cairn_db::turso::params;
 /// GitHub App credentials needed for API auth.
 #[derive(Debug, Clone)]
 pub struct GitHubAppCredentials {
-    pub app_id: i64,
-    pub private_key: String,
+    pub(crate) app_id: i64,
+    pub(crate) private_key: String,
     pub installation_id: i64,
 }
 

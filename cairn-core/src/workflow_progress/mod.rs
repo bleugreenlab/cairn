@@ -30,17 +30,17 @@ pub mod monitor;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressEntry {
     /// Monotonic per-job append order.
-    pub seq: i64,
+    pub(crate) seq: i64,
     /// `"phase"` or `"log"` (guarded by the table CHECK constraint).
-    pub kind: String,
+    pub(crate) kind: String,
     /// The phase name (kind=`phase`) or the log message (kind=`log`).
-    pub text: String,
-    pub created_at: i64,
+    pub(crate) text: String,
+    pub(crate) created_at: i64,
 }
 
 /// Append a progress entry for a workflow node's job, allocating the next
 /// monotonic `seq`. Returns the inserted row.
-pub async fn append_entry(
+pub(crate) async fn append_entry(
     db: &LocalDb,
     job_id: &str,
     kind: &str,
@@ -96,7 +96,7 @@ pub async fn append_entry(
 }
 
 /// List a workflow node job's progress entries in append order (oldest first).
-pub async fn list_entries(db: &LocalDb, job_id: &str) -> Result<Vec<ProgressEntry>, String> {
+pub(crate) async fn list_entries(db: &LocalDb, job_id: &str) -> Result<Vec<ProgressEntry>, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();

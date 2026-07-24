@@ -83,6 +83,15 @@ pub(crate) async fn read_recipes_collection(
             by_id.entry(recipe.recipe.id.clone()).or_insert(recipe);
         }
     }
+    let policy =
+        crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
+    by_id.retain(|id, recipe| {
+        policy.is_selected(
+            crate::config::contextual_packages::ContextualPackageKind::Recipe,
+            id,
+            &recipe.bundles,
+        )
+    });
 
     let header = match project_key.as_deref() {
         Some(key) => format!("# Recipes — {key} context\n\n"),
@@ -135,6 +144,15 @@ pub(crate) async fn read_recipe(
     // Explicit project scope is project-only: never silently resolve a shared
     // workspace recipe behind an explicit project URI.
     if explicit_project.is_some() && !recipe.is_project_scoped {
+        return not_found(recipe_id, explicit_project);
+    }
+    let policy =
+        crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
+    if !policy.is_selected(
+        crate::config::contextual_packages::ContextualPackageKind::Recipe,
+        recipe_id,
+        &recipe.bundles,
+    ) {
         return not_found(recipe_id, explicit_project);
     }
 

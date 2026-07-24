@@ -13,22 +13,22 @@ use std::time::Duration;
 // ── Parsed PR Details ──────────────────────────────────────────
 
 /// Intermediate struct returned by `fetch_pr_via_api`.
-pub struct ParsedPrDetails {
-    pub title: Option<String>,
-    pub body: Option<String>,
-    pub state: PrState,
-    pub is_draft: bool,
-    pub review_decision: Option<ReviewDecision>,
-    pub mergeable: MergeableState,
-    pub additions: Option<i32>,
-    pub deletions: Option<i32>,
-    pub head_sha: String,
+pub(crate) struct ParsedPrDetails {
+    pub(crate) title: Option<String>,
+    pub(crate) body: Option<String>,
+    pub(crate) state: PrState,
+    pub(crate) is_draft: bool,
+    pub(crate) review_decision: Option<ReviewDecision>,
+    pub(crate) mergeable: MergeableState,
+    pub(crate) additions: Option<i32>,
+    pub(crate) deletions: Option<i32>,
+    pub(crate) head_sha: String,
 }
 
 // ── Pure Computation ───────────────────────────────────────────
 
 /// Compute PR state from API response fields.
-pub fn compute_pr_state(merged: bool, state_str: &str) -> PrState {
+fn compute_pr_state(merged: bool, state_str: &str) -> PrState {
     if merged {
         PrState::Merged
     } else if state_str == "closed" {
@@ -39,7 +39,7 @@ pub fn compute_pr_state(merged: bool, state_str: &str) -> PrState {
 }
 
 /// Compute mergeable state from API response fields.
-pub fn compute_mergeable_state(
+fn compute_mergeable_state(
     mergeable: Option<bool>,
     mergeable_state_str: Option<&str>,
 ) -> MergeableState {
@@ -53,7 +53,7 @@ pub fn compute_mergeable_state(
 }
 
 /// Compute review decision from reviews.
-pub fn compute_review_decision(reviews: &[api::Review]) -> Option<ReviewDecision> {
+fn compute_review_decision(reviews: &[api::Review]) -> Option<ReviewDecision> {
     if reviews.is_empty() {
         return None;
     }
@@ -78,7 +78,7 @@ pub fn compute_review_decision(reviews: &[api::Review]) -> Option<ReviewDecision
 }
 
 /// Compute overall checks status from a list of checks.
-pub fn compute_checks_status(checks: &[Check]) -> Option<ChecksStatus> {
+pub(crate) fn compute_checks_status(checks: &[Check]) -> Option<ChecksStatus> {
     if checks.is_empty() {
         return None;
     }
@@ -135,7 +135,7 @@ const MERGEABILITY_POLL_BACKOFF: Duration = Duration::from_millis(600);
 /// Polls past GitHub's asynchronous mergeability-compute window (see
 /// [`MERGEABILITY_POLL_ATTEMPTS`]) so an open PR never resolves to a
 /// null-window `UNKNOWN` that would otherwise stick in the cache.
-pub async fn fetch_pr_via_api(
+pub(crate) async fn fetch_pr_via_api(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -198,7 +198,7 @@ async fn fetch_pr_via_api_with_backoff(
 }
 
 /// Fetch check runs for a commit and convert to domain Check model.
-pub async fn fetch_checks_via_api(
+pub(crate) async fn fetch_checks_via_api(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
     owner: &str,
@@ -331,7 +331,7 @@ pub async fn fetch_failure_logs_via_api(
 // hard-reset it.
 const REGENERABLE_DIRTY_CHECKOUT_PATHS: &[&str] = &["src-tauri/Cargo.lock"];
 
-pub fn dirty_tracked_paths_from_porcelain(status: &str) -> Vec<String> {
+pub(crate) fn dirty_tracked_paths_from_porcelain(status: &str) -> Vec<String> {
     status
         .lines()
         .filter_map(|line| {
@@ -348,7 +348,7 @@ pub fn dirty_tracked_paths_from_porcelain(status: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn assert_main_checkout_clean_for_default_merge(
+pub(crate) fn assert_main_checkout_clean_for_default_merge(
     git: &dyn GitClient,
     repo_path: &str,
 ) -> Result<(), String> {
@@ -407,7 +407,7 @@ fn run_git_checked(
 /// pass through a pre-merge dirty-checkout gate, so any remaining tracked dirt is
 /// the allowlisted, regenerable lockfile churn from the two-lockfile dev-build
 /// workflow and can be discarded by the hard reset.
-pub fn reconcile_main_checkout_after_merge(
+pub(crate) fn reconcile_main_checkout_after_merge(
     git: &dyn GitClient,
     repo_path: &str,
     default_branch: &str,
@@ -435,54 +435,124 @@ pub fn reconcile_main_checkout_after_merge(
         return Ok(());
     }
 
-    reconcile_checkout_inner(git, repo, default_branch, detached, pull)?;
-    log::info!(
-        "Reconciled main repo at {} onto {}",
-        repo_path,
-        default_branch
-    );
+    let reconciled = reconcile_checkout_inner(git, repo, default_branch, detached, pull)?;
+    if reconciled {
+        log::info!(
+            "Reconciled main repo at {} onto {}",
+            repo_path,
+            default_branch
+        );
+    } else {
+        // The dirty guard declined the repair (it already warned with the manual
+        // re-attach commands); the checkout is intentionally left detached, so do
+        // not claim a reconcile that did not happen, and do not pull into it.
+        log::warn!(
+            "Left main repo at {} detached to preserve uncommitted changes; see the re-attach warning above",
+            repo_path
+        );
+    }
     Ok(())
 }
 
-/// The HEAD-mutating core. Re-attaches a detached HEAD to the default branch and
-/// hard-resets the working tree to its tip, then optionally pulls. The re-attach
+/// The HEAD-mutating core. Re-attaches a detached HEAD to the default branch
+/// (delegating to the canonical [`reattach_checkout_head`] repair) and then
+/// optionally pulls, returning whether the checkout ended ATTACHED. The re-attach
 /// runs before the pull so the invariant is restored even if the pull (network)
-/// fails.
+/// fails; and the pull is skipped entirely when the dirty guard DECLINED the
+/// repair, so it never merges into a still-detached, dirty checkout.
 fn reconcile_checkout_inner(
     git: &dyn GitClient,
     repo: &Path,
     default_branch: &str,
     detached: bool,
     pull: bool,
-) -> Result<(), String> {
-    if detached {
-        run_git_checked(
-            git,
-            repo,
-            &[
-                "symbolic-ref",
-                "HEAD",
-                &format!("refs/heads/{default_branch}"),
-            ],
-            "re-attach HEAD to default branch",
-        )?;
-        run_git_checked(
-            git,
-            repo,
-            &["reset", "--hard", default_branch],
-            "fast-forward checkout to merged tip",
-        )?;
-        log::info!(
-            "Re-attached main checkout HEAD to '{}' and fast-forwarded to merged tip",
-            default_branch
-        );
-    }
+) -> Result<bool, String> {
+    // `attached` = the checkout ends attached to the default branch. A detached
+    // checkout whose dirty guard declined the repair stays detached, and we must
+    // NOT pull into it: pulling into a detached, dirty checkout fights the edits
+    // the guard deliberately preserved (and can fast-forward or fail against a
+    // detached HEAD). Only pull once the checkout is genuinely on the branch.
+    let attached = if detached {
+        matches!(
+            reattach_checkout_head(git, repo, default_branch)?,
+            ReattachOutcome::Reattached
+        )
+    } else {
+        true
+    };
 
-    if pull {
+    if pull && attached {
         git.pull(repo, "origin", default_branch)?;
     }
 
-    Ok(())
+    Ok(attached)
+}
+
+/// Outcome of a [`reattach_checkout_head`] attempt, made explicit so callers can
+/// distinguish a completed repair from a guard that declined it (leaving HEAD
+/// detached). The two must not be conflated: a declined repair must NOT be
+/// followed by a `git pull` into the still-detached, dirty checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReattachOutcome {
+    /// HEAD was re-attached to the branch and the tree fast-forwarded to its tip.
+    Reattached,
+    /// The dirty-tree guard declined the repair; HEAD is LEFT detached and the
+    /// user's uncommitted edits preserved (a warning named the manual repair).
+    DeclinedDirty,
+}
+
+/// Re-attach a detached checkout HEAD to `branch` and fast-forward the working
+/// tree to that branch's tip — the ONE canonical repair for the detach a
+/// `jj git export` inflicts when it moves the branch HEAD was a symref to. Used
+/// both by the export wrapper (`crate::jj::export_git_preserving_checkout`,
+/// synchronously at the export choke point) and by
+/// [`reconcile_main_checkout_after_merge`] (for detaches caused by an export from
+/// a different machine/process, e.g. the push-webhook path).
+///
+/// Clean-tree guard: if the working tree carries uncommitted tracked changes
+/// beyond the regenerable-lockfile allowlist, a hard reset would destroy user
+/// work, so HEAD is LEFT detached and a warning names the exact two commands to
+/// self-repair. Callers that pre-gate the checkout clean (the default-branch
+/// merge, via `assert_main_checkout_clean_for_default_merge`) never hit the
+/// guard; callers on paths with no such gate (non-merge exports) are protected by
+/// it. A failing `symbolic-ref`/`reset` on the clean path surfaces as an error
+/// (the export wrapper downgrades it to a warning; the merge reconcile
+/// propagates it).
+pub(crate) fn reattach_checkout_head(
+    git: &dyn GitClient,
+    repo: &Path,
+    branch: &str,
+) -> Result<ReattachOutcome, String> {
+    let blocking: Vec<String> = dirty_tracked_paths_from_porcelain(&git.status(repo)?)
+        .into_iter()
+        .filter(|path| !REGENERABLE_DIRTY_CHECKOUT_PATHS.contains(&path.as_str()))
+        .collect();
+    if !blocking.is_empty() {
+        log::warn!(
+            "Export detached HEAD in checkout {repo} but the working tree has uncommitted changes \
+             to {files}; leaving HEAD detached to preserve them. Re-attach manually with \
+             `git -C {repo} symbolic-ref HEAD refs/heads/{branch}` then \
+             `git -C {repo} reset --hard {branch}`.",
+            repo = repo.display(),
+            files = blocking.join(", "),
+        );
+        return Ok(ReattachOutcome::DeclinedDirty);
+    }
+
+    run_git_checked(
+        git,
+        repo,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        "re-attach HEAD to branch",
+    )?;
+    run_git_checked(
+        git,
+        repo,
+        &["reset", "--hard", branch],
+        "fast-forward checkout to branch tip",
+    )?;
+    log::info!("Re-attached checkout HEAD to '{branch}' and fast-forwarded to its tip");
+    Ok(ReattachOutcome::Reattached)
 }
 
 fn run_git(
@@ -494,7 +564,7 @@ fn run_git(
 }
 
 /// Compute local mergeability without touching the working tree.
-pub fn compute_local_mergeable(
+pub(crate) fn compute_local_mergeable(
     git: &dyn GitClient,
     repo_path: &Path,
     target_branch: &str,
@@ -512,7 +582,7 @@ pub fn compute_local_mergeable(
 }
 
 /// Capture local changed files for a PR-equivalent using git diff --numstat.
-pub fn local_pr_files(
+pub(crate) fn local_pr_files(
     git: &dyn GitClient,
     repo_path: &Path,
     target_branch: &str,
@@ -1073,7 +1143,8 @@ mod tests {
         // with NO network pull. Before the fix this path was never reached.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status().never();
+        // The canonical repair probes the tree; a clean tree proceeds to reset.
+        git.expect_status().returning(|_| Ok(String::new()));
         expect_git_verb(&mut git, "symbolic-ref");
         expect_git_verb(&mut git, "reset");
         git.expect_pull().never();
@@ -1090,7 +1161,7 @@ mod tests {
         // not gated on the pull preference.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status().never();
+        git.expect_status().returning(|_| Ok(String::new()));
         expect_git_verb(&mut git, "symbolic-ref");
         expect_git_verb(&mut git, "reset");
         git.expect_pull().times(1).returning(|_, _, _| Ok(()));
@@ -1103,12 +1174,13 @@ mod tests {
     fn reconcile_detached_dirty_reset_does_not_stash() {
         use crate::services::testing::MockGitClient;
 
-        // The dirty-checkout gate runs before default-branch merges. Reconcile is
-        // therefore free to reset away any remaining allowlisted lockfile churn
-        // without touching the stash stack.
+        // The dirty-checkout gate runs before default-branch merges, so only the
+        // allowlisted lockfile churn can remain. The canonical repair treats it as
+        // clean and resets away, without touching the stash stack.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status().never();
+        git.expect_status()
+            .returning(|_| Ok(" M src-tauri/Cargo.lock\n".to_string()));
         expect_git_verb(&mut git, "symbolic-ref");
         expect_git_verb(&mut git, "reset");
         git.expect_pull().never();
@@ -1125,7 +1197,7 @@ mod tests {
         // not be silently swallowed.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status().never();
+        git.expect_status().returning(|_| Ok(String::new()));
         git.expect_run()
             .withf(|_, args| args.first().map(String::as_str) == Some("symbolic-ref"))
             .returning(|_, _| {
@@ -1139,5 +1211,64 @@ mod tests {
         let result = reconcile_main_checkout_after_merge(&git, "/repo", "main", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("re-attach HEAD"));
+    }
+
+    // ── reattach_checkout_head clean-tree guard ─────────────────
+
+    #[test]
+    fn reattach_leaves_detached_and_skips_reset_when_tree_dirty() {
+        use crate::services::testing::MockGitClient;
+
+        // A tracked edit outside the regenerable-lockfile allowlist must block the
+        // hard reset: HEAD stays detached (no symbolic-ref / reset) and the user's
+        // work is preserved. This is the guard the non-merge export paths rely on,
+        // where no pre-merge clean gate runs.
+        let mut git = MockGitClient::new();
+        git.expect_status()
+            .returning(|_| Ok(" M src/main.rs\n".to_string()));
+        git.expect_run().never();
+
+        let result = reattach_checkout_head(&git, Path::new("/repo"), "main");
+        assert_eq!(
+            result,
+            Ok(ReattachOutcome::DeclinedDirty),
+            "the guard declines the repair, leaving HEAD detached"
+        );
+    }
+
+    #[test]
+    fn reattach_resets_when_only_allowlisted_lockfile_dirty() {
+        use crate::services::testing::MockGitClient;
+
+        // Allowlisted lockfile churn is treated as clean, so the repair proceeds.
+        let mut git = MockGitClient::new();
+        git.expect_status()
+            .returning(|_| Ok(" M src-tauri/Cargo.lock\n".to_string()));
+        expect_git_verb(&mut git, "symbolic-ref");
+        expect_git_verb(&mut git, "reset");
+
+        let result = reattach_checkout_head(&git, Path::new("/repo"), "main");
+        assert_eq!(result, Ok(ReattachOutcome::Reattached));
+    }
+
+    #[test]
+    fn reconcile_detached_dirty_with_pull_skips_pull_and_leaves_detached() {
+        use crate::services::testing::MockGitClient;
+
+        // Reachable when the checkout is dirtied AFTER the pre-merge clean gate but
+        // BEFORE the reconcile (the merge path includes store + network work in
+        // that window). The export wrapper leaves HEAD detached to preserve the
+        // edits; the dirty guard then declines the re-attach here too, so the
+        // reconcile must NOT pull into the still-detached, dirty checkout even
+        // though `pull = true`.
+        let mut git = MockGitClient::new();
+        git.expect_current_branch().returning(|_| Ok(String::new()));
+        git.expect_status()
+            .returning(|_| Ok(" M src/main.rs\n".to_string()));
+        git.expect_run().never(); // no symbolic-ref / reset
+        git.expect_pull().never(); // and crucially, no pull into a detached dirty checkout
+
+        let result = reconcile_main_checkout_after_merge(&git, "/repo", "main", true);
+        assert!(result.is_ok());
     }
 }

@@ -28,15 +28,8 @@ struct IssueTokenResponse {
     expires_at: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct RefreshTokenResponse {
-    token: String,
-    #[serde(alias = "expiresAt", alias = "expires_at")]
-    expires_at: String,
-}
-
 impl OrgTokenCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tokens: HashMap::new(),
         }
@@ -60,7 +53,7 @@ impl OrgTokenCache {
     }
 
     /// Clear all cached tokens (e.g. on logout).
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.tokens.clear();
     }
 
@@ -102,39 +95,6 @@ pub async fn fetch_org_token(
         .json()
         .await
         .map_err(|e| format!("Failed to parse org token response: {e}"))?;
-
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
-        .map(|dt| dt.timestamp())
-        .unwrap_or_else(|_| chrono::Utc::now().timestamp() + 3600);
-
-    Ok((body.token, expires_at))
-}
-
-/// Refresh an existing org-scoped JWT.
-pub async fn refresh_org_token(
-    client: &reqwest::Client,
-    org_jwt: &str,
-    api_url: &str,
-) -> Result<(String, i64), String> {
-    let url = format!("{}/tokens/refresh", api_url.trim_end_matches('/'));
-
-    let resp = client
-        .post(&url)
-        .bearer_auth(org_jwt)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to refresh org token: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Org token refresh failed ({status}): {body}"));
-    }
-
-    let body: RefreshTokenResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse org token refresh response: {e}"))?;
 
     let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
         .map(|dt| dt.timestamp())

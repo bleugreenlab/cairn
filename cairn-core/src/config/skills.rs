@@ -26,27 +26,29 @@ use super::ConfigResult;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
+    pub(crate) created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_by: Option<String>,
+    pub(crate) created_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_by: Option<String>,
+    pub(crate) updated_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_issue: Option<String>,
+    pub(crate) source_issue: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_run_id: Option<String>,
+    pub(crate) source_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_url: Option<String>,
+    pub(crate) source_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_file: Option<String>,
 }
 
 /// Update parameters for `.meta.json` provenance.
 #[derive(Debug, Clone, Default)]
 pub struct SkillMetaUpdate {
-    pub updated_by: Option<String>,
-    pub source_issue: Option<String>,
-    pub source_run_id: Option<String>,
+    pub(crate) updated_by: Option<String>,
+    pub(crate) source_issue: Option<String>,
+    pub(crate) source_run_id: Option<String>,
 }
 
 /// Skill loaded from a directory.
@@ -58,6 +60,8 @@ pub struct FileSkill {
     pub description: String,
     pub prompt: String,
     pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub bundles: Vec<String>,
     pub is_project_scoped: bool,
     /// Path to SKILL.md
     pub file_path: PathBuf,
@@ -236,6 +240,7 @@ pub fn save_skill(
         display_name: &skill.name,
         description: &skill.description,
         allowed_tools: skill.allowed_tools.as_deref(),
+        bundles: &skill.bundles,
         prompt: &skill.prompt,
     });
 
@@ -293,7 +298,7 @@ fn write_meta(skill_dir: &Path, update: SkillMetaUpdate) -> Result<(), String> {
 
 /// Copy package subdirectories (scripts/, references/, assets/) from source to dest skill dir.
 /// Skips directories that don't exist in source. Overwrites files in dest.
-pub fn copy_skill_package(source_dir: &Path, dest_dir: &Path) -> Result<(), String> {
+pub(crate) fn copy_skill_package(source_dir: &Path, dest_dir: &Path) -> Result<(), String> {
     for subdir in &["scripts", "references", "assets"] {
         let src = source_dir.join(subdir);
         if src.is_dir() {
@@ -343,7 +348,7 @@ pub fn delete_skill(
 }
 
 /// Migrate a single legacy skill file to directory format.
-pub fn migrate_legacy_skill(skills_dir: &Path, id: &str) -> Result<(), String> {
+fn migrate_legacy_skill(skills_dir: &Path, id: &str) -> Result<(), String> {
     let legacy_path = skills_dir.join(format!("{}.md", id));
     if !legacy_path.exists() {
         return Err(format!("Legacy skill file not found: {}", id));
@@ -363,6 +368,7 @@ pub fn migrate_legacy_skill(skills_dir: &Path, id: &str) -> Result<(), String> {
         display_name: &parsed.name,
         description: &parsed.description,
         allowed_tools: parsed.allowed_tools.as_deref(),
+        bundles: &parsed.bundles,
         prompt: &parsed.prompt,
     });
     std::fs::write(skill_dir.join("SKILL.md"), &markdown)
@@ -448,6 +454,7 @@ fn load_skill_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<File
             description: parsed.description,
             prompt: parsed.prompt,
             allowed_tools: parsed.allowed_tools,
+            bundles: parsed.bundles,
             is_project_scoped,
             file_path: skill_md_path,
             dir_path: dir_path.to_path_buf(),
@@ -597,6 +604,7 @@ mod tests {
             description: "A test skill".into(),
             prompt: "Do things.".into(),
             allowed_tools: Some(vec!["Read".into(), "Grep".into()]),
+            bundles: vec!["coding".into()],
             is_project_scoped: false,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),
@@ -646,6 +654,7 @@ mod tests {
             description: "Updated".into(),
             prompt: "Updated.".into(),
             allowed_tools: None,
+            bundles: Vec::new(),
             is_project_scoped: false,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),

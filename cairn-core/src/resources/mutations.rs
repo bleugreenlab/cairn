@@ -122,7 +122,7 @@ pub(super) fn payload_trimmed_non_empty_str<'a>(
         .filter(|value| !value.is_empty())
 }
 
-pub(super) async fn scope_project_path(
+async fn scope_project_path(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     explicit_project: Option<&str>,

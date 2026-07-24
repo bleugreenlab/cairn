@@ -95,6 +95,7 @@ pub enum ResourceKind {
     NodeCalls,
     NodeWakes,
     NodeChecks,
+    TaskChecks,
     NodeQuestions,
     NodeQuestion,
     NodePermissions,
@@ -145,7 +146,7 @@ pub enum ResourceKind {
 
 impl ResourceKind {
     /// Every kind, for exhaustive enumeration (parity test + advertising).
-    pub const ALL: &'static [ResourceKind] = &[
+    pub(crate) const ALL: &'static [ResourceKind] = &[
         ResourceKind::Project,
         ResourceKind::ProjectIssues,
         ResourceKind::ProjectMessages,
@@ -187,6 +188,7 @@ impl ResourceKind {
         ResourceKind::NodeCalls,
         ResourceKind::NodeWakes,
         ResourceKind::NodeChecks,
+        ResourceKind::TaskChecks,
         ResourceKind::NodeQuestions,
         ResourceKind::NodeQuestion,
         ResourceKind::NodePermissions,
@@ -302,7 +304,7 @@ pub struct KeySpec {
     /// individually (see `agent_frontmatter_honors_model_alias_for_tier`).
     pub aliases: &'static [&'static str],
     pub ty: KeyType,
-    pub note: &'static str,
+    note: &'static str,
 }
 
 impl KeySpec {

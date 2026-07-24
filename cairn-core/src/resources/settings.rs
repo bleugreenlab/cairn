@@ -52,6 +52,14 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         yes_no(settings.memory_review_enabled)
     ));
     out.push_str(&format!(
+        "- memoryTriageEnabled: {}\n",
+        yes_no(settings.memory_triage_enabled)
+    ));
+    out.push_str(&format!(
+        "- maxOpenTriageIssuesPerScope: {}\n",
+        settings.max_open_triage_issues_per_scope
+    ));
+    out.push_str(&format!(
         "- pendingMemoryThreshold: {}\n",
         settings.pending_memory_threshold
     ));

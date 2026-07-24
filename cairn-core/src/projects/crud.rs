@@ -278,6 +278,9 @@ pub async fn create_db(
     let name = input.name.clone();
     let key = input.key.clone();
     let repo_path = input.repo_path.clone();
+    // Repository identity is its own durable column even though Cairn's current
+    // one-repository-per-project creation flow initially assigns the project UUID.
+    let repository_id = id.clone();
     let team_id = input.team_id.clone();
 
     db.write(|conn| {
@@ -286,6 +289,7 @@ pub async fn create_db(
         let key = key.clone();
         let repo_path = repo_path.clone();
         let team_id = team_id.clone();
+        let repository_id = repository_id.clone();
         Box::pin(async move {
             match team_id {
                 // Team replica: `projects` re-roots at `team_id` (NOT NULL FK to
@@ -293,17 +297,18 @@ pub async fn create_db(
                 Some(team_id) => {
                     conn.execute(
                         "INSERT INTO projects(
-                            id, team_id, name, key, repo_path, context, docs_enabled,
+                            id, team_id, name, key, repo_path, repository_id, context, docs_enabled,
                             default_branch, next_issue_number, created_at, updated_at,
                             is_workspace
                          )
-                         VALUES (?1, ?2, ?3, ?4, ?5, '', 1, 'main', 1, ?6, ?7, 0)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 1, 'main', 1, ?7, ?8, 0)",
                         (
                             id.as_str(),
                             team_id.as_str(),
                             name.as_str(),
                             key.as_str(),
                             repo_path.as_str(),
+                            repository_id.as_str(),
                             now,
                             now,
                         ),
@@ -314,16 +319,17 @@ pub async fn create_db(
                 None => {
                     conn.execute(
                         "INSERT INTO projects(
-                            id, workspace_id, name, key, repo_path, context, docs_enabled,
+                            id, workspace_id, name, key, repo_path, repository_id, context, docs_enabled,
                             default_branch, next_issue_number, created_at, updated_at,
                             is_workspace
                          )
-                         VALUES (?1, 'default', ?2, ?3, ?4, '', 1, 'main', 1, ?5, ?6, 0)",
+                         VALUES (?1, 'default', ?2, ?3, ?4, ?5, '', 1, 'main', 1, ?6, ?7, 0)",
                         (
                             id.as_str(),
                             name.as_str(),
                             key.as_str(),
                             repo_path.as_str(),
+                            repository_id.as_str(),
                             now,
                             now,
                         ),
@@ -435,7 +441,7 @@ pub async fn resolve_local_repo_path_and_key(
     Ok((local_path, project.key))
 }
 
-pub async fn local_repo_path(
+async fn local_repo_path(
     private_db: &LocalDb,
     project_key: &str,
 ) -> Result<Option<String>, CairnError> {
@@ -487,7 +493,7 @@ pub async fn set_remote_url_db(db: &LocalDb, id: &str, remote_url: &str) -> Resu
 /// catalog (CAIRN-2132). `team_id` is `None` for a local project — the row
 /// stores NULL and `DbState::for_project` resolves it to the private database.
 /// The key is normalized upper-case to match every other route lookup.
-pub async fn insert_project_route(
+pub(crate) async fn insert_project_route(
     db: &LocalDb,
     clock: &dyn Clock,
     project_key: &str,
@@ -577,11 +583,11 @@ pub async fn seed_workspace_project_db(
         Box::pin(async move {
             conn.execute(
                 "INSERT OR IGNORE INTO projects(
-                    id, workspace_id, name, key, repo_path, context, docs_enabled,
+                    id, workspace_id, name, key, repo_path, repository_id, context, docs_enabled,
                     default_branch, next_issue_number, created_at, updated_at,
                     hidden, is_workspace
                  )
-                 VALUES ('workspace', 'default', 'Workspace', 'WS', ?1, '', 1,
+                 VALUES ('workspace', 'default', 'Workspace', 'WS', ?1, 'workspace', '', 1,
                          'main', 1, ?2, ?3, 0, 1)",
                 (repo_path.as_str(), now, now),
             )
@@ -606,7 +612,7 @@ pub async fn seed_workspace_project_db(
 /// A's clone path. Embedding the team id keeps every team's workspace route and
 /// clone path distinct while staying constant within one team replica (so the
 /// first-writer-wins UNIQUE-key guard still holds there).
-pub fn team_workspace_key(team_id: &str) -> String {
+pub(crate) fn team_workspace_key(team_id: &str) -> String {
     format!("WORKSPACE-{team_id}")
 }
 
@@ -624,7 +630,7 @@ pub fn team_workspace_key(team_id: &str) -> String {
 /// recorded separately in the private `project_routes` catalog during
 /// services-aware provisioning (like any team project, CAIRN-2223), so a member
 /// who has not yet materialized the repo simply contributes no config layer.
-pub async fn seed_team_workspace_project_db(
+pub(crate) async fn seed_team_workspace_project_db(
     team_db: &LocalDb,
     now: i64,
     team_id: &str,
@@ -635,11 +641,11 @@ pub async fn seed_team_workspace_project_db(
     let affected = team_db
         .execute(
             "INSERT OR IGNORE INTO projects(
-                id, team_id, name, key, repo_path, context, docs_enabled,
+                id, team_id, name, key, repo_path, repository_id, context, docs_enabled,
                 default_branch, next_issue_number, created_at, updated_at,
                 hidden, is_workspace
              )
-             VALUES (?1, ?2, 'Team Workspace', ?3, ?4, '', 1,
+             VALUES (?1, ?2, 'Team Workspace', ?3, ?4, ?1, '', 1,
                      'main', 1, ?5, ?5, 0, 1)",
             (
                 id.to_string(),
@@ -741,7 +747,7 @@ pub async fn set_default_branch_db(db: &LocalDb, id: &str, branch: &str) -> Resu
 /// detected one, and a per-project detection or persist failure is logged and
 /// never aborts the sweep (the same discipline as the local default-advance
 /// sweep).
-pub async fn reconcile_default_branches(db: &LocalDb) {
+pub(crate) async fn reconcile_default_branches(db: &LocalDb) {
     let projects = match list_db(db).await {
         Ok(projects) => projects,
         Err(e) => {

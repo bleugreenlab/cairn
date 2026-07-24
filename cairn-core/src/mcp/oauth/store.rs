@@ -48,7 +48,7 @@ pub struct StoredAuth {
 
 impl StoredAuth {
     /// Whether the access token is expired (or within the refresh skew window).
-    pub fn is_expired(&self) -> bool {
+    fn is_expired(&self) -> bool {
         match self.expires_at {
             Some(expires_at) => chrono::Utc::now().timestamp() + EXPIRY_SKEW_SECS >= expires_at,
             None => false,
@@ -57,7 +57,7 @@ impl StoredAuth {
 
     /// Fold a freshly obtained/refreshed token set into the stored record,
     /// preserving endpoints and client identity.
-    pub fn apply_tokens(&mut self, tokens: TokenSet) {
+    fn apply_tokens(&mut self, tokens: TokenSet) {
         self.access_token = tokens.access_token;
         if tokens.refresh_token.is_some() {
             self.refresh_token = tokens.refresh_token;
@@ -79,12 +79,12 @@ pub struct OAuthStatus {
     /// `authorized`, `needs_auth`, or `error`.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+    detail: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scopes: Vec<String>,
+    scopes: Vec<String>,
     /// Scopes a step-up (`403 insufficient_scope`) is waiting on, if any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub needs_scopes: Vec<String>,
+    needs_scopes: Vec<String>,
 }
 
 impl OAuthStatus {
@@ -103,7 +103,7 @@ impl OAuthStatus {
     }
 
     /// The server requires OAuth but has no stored token yet.
-    pub fn needs_auth() -> Self {
+    pub(crate) fn needs_auth() -> Self {
         Self {
             state: "needs_auth".to_string(),
             detail: None,

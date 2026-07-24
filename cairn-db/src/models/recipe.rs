@@ -350,71 +350,71 @@ pub struct NodePosition {
 pub struct NodeConfig {
     // Trigger config
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger_type: Option<RecipeTrigger>,
+    trigger_type: Option<RecipeTrigger>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<TriggerScope>,
+    scope: Option<TriggerScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule_config: Option<ScheduleConfig>,
+    schedule_config: Option<ScheduleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_filter: Option<EventFilter>,
+    event_filter: Option<EventFilter>,
 
     // Agent config
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_config_id: Option<String>,
+    agent_config_id: Option<String>,
     /// Nested output schema for agent nodes
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<SchemaConfig>,
+    output_schema: Option<SchemaConfig>,
     /// Git/worktree configuration for agent nodes
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_config: Option<AgentGitConfig>,
+    git_config: Option<AgentGitConfig>,
 
     // Action config
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_config_id: Option<String>,
+    action_config_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
+    action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_params: Option<serde_json::Value>,
+    action_params: Option<serde_json::Value>,
     /// Nested input schema for action nodes
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_schema: Option<SchemaConfig>,
+    input_schema: Option<SchemaConfig>,
     /// Nested output schema for action nodes (uses output_schema field above)
 
     // Standalone checkpoint node config (command gate). A `checkpoint`-type node
     // runs this command: exit 0 passes (continue), non-zero blocks (resumable).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
+    command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
+    prompt: Option<String>,
 
     // Artifact-node config (the typed schema node on a context edge)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_type: Option<String>,
+    artifact_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema: Option<serde_json::Value>,
+    schema: Option<serde_json::Value>,
     /// Confirm policy for an ArtifactNode used as a producer's terminal target.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub confirm_policy: Option<ConfirmPolicy>,
+    confirm_policy: Option<ConfirmPolicy>,
 
     // Condition config
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub condition_type: Option<ConditionType>,
+    condition_type: Option<ConditionType>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<String>,
+    expression: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub question: Option<String>,
+    question: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ports: Option<Vec<String>>,
+    ports: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<ConditionErrorBehavior>,
+    on_error: Option<ConditionErrorBehavior>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_port: Option<String>,
+    default_port: Option<String>,
 
     // Context config
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    content: Option<String>,
 }
 
 /// Recipe node - a single node in the workflow DAG

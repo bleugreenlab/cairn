@@ -18,7 +18,7 @@ mod thread_params;
 pub mod usage;
 mod version;
 
-pub use auth::refresh_codex_oauth_tokens_for_current_account;
+pub(crate) use auth::refresh_codex_oauth_tokens_for_current_account;
 pub use usage::{collect_codex_usage_snapshot, consume_codex_usage_reset};
 
 pub(super) const CODEX_BACKEND_NAME: &str = "Codex";

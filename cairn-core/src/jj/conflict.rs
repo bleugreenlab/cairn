@@ -7,7 +7,7 @@ use std::path::Path;
 /// (`main@origin`), or a `bookmarks(exact:...)` expression. Used to vet a rebase
 /// DEST before handing it to clean siblings: a conflicted dest must never
 /// propagate down to children.
-pub fn revset_has_conflict(jj: &JjEnv, store: &Path, revset: &str) -> Result<bool, String> {
+pub(crate) fn revset_has_conflict(jj: &JjEnv, store: &Path, revset: &str) -> Result<bool, String> {
     let out = jj.run(
         store,
         &["log", "-r", revset, "--no-graph", "-T", "self.conflict()"],
@@ -31,7 +31,7 @@ pub fn branch_has_conflict(jj: &JjEnv, store: &Path, branch: &str) -> Result<boo
 /// on no conflicts (jj exits non-zero with "No conflicts found", mapped to an Err
 /// and swallowed) or any other error — the file list is advisory detail on a note,
 /// never load-bearing.
-pub fn conflicted_files(jj: &JjEnv, ws_path: &Path) -> Vec<String> {
+pub(crate) fn conflicted_files(jj: &JjEnv, ws_path: &Path) -> Vec<String> {
     let Ok(out) = jj.run(ws_path, &["resolve", "--list"], "jj resolve --list") else {
         return Vec::new();
     };
@@ -48,13 +48,13 @@ pub fn conflicted_files(jj: &JjEnv, ws_path: &Path) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictedCommit {
     /// Short commit id.
-    pub commit_id: String,
+    pub(crate) commit_id: String,
     /// Short change id.
-    pub change_id: String,
+    pub(crate) change_id: String,
     /// First line of the commit description.
-    pub description: String,
+    pub(crate) description: String,
     /// Conflicted file paths recorded in this commit.
-    pub files: Vec<String>,
+    pub(crate) files: Vec<String>,
 }
 
 /// Enumerate the conflicted commits in `range_revset` (e.g. `"a..b"`, or a bare
@@ -68,7 +68,11 @@ pub struct ConflictedCommit {
 /// commits. Fields are emitted unit-separated (`\x1f`) and the file list
 /// record-separated (`\x1e`) so the parse stays robust against arbitrary
 /// descriptions and paths.
-pub fn conflicted_commits(jj: &JjEnv, store: &Path, range_revset: &str) -> Vec<ConflictedCommit> {
+pub(crate) fn conflicted_commits(
+    jj: &JjEnv,
+    store: &Path,
+    range_revset: &str,
+) -> Vec<ConflictedCommit> {
     // jj template, verified against jj 0.42: `\x1f`/`\x1e` are jj string escapes
     // that emit the literal control bytes we split on; `conflicts()` is the
     // revset and `self.conflicted_files()` yields store-side paths (no workspace).
@@ -138,7 +142,7 @@ pub enum FlattenState {
 /// commit id). The tip is checked FIRST so a conflicted tip is never misread as a
 /// recoverable intermediate: `conflicted_commits(dest..branch)` would include the
 /// tip too, but a conflicted tip needs manual resolution, not a flatten.
-pub fn flatten_state(
+pub(crate) fn flatten_state(
     jj: &JjEnv,
     store: &Path,
     dest_revset: &str,
@@ -186,7 +190,12 @@ pub(crate) fn revset_descends_from(
 /// serialization, stops new divergent conflicted copies from accumulating and
 /// keeps a resolved clean bookmark from being dragged back onto a conflicted
 /// twin.
-pub fn branch_descends_from(jj: &JjEnv, store: &Path, branch: &str, dest_commit: &str) -> bool {
+pub(crate) fn branch_descends_from(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest_commit: &str,
+) -> bool {
     revset_descends_from(
         jj,
         store,
@@ -199,7 +208,12 @@ pub fn branch_descends_from(jj: &JjEnv, store: &Path, branch: &str, dest_commit:
 /// A resolve failure falls to `false`, matching [`revset_descends_from`]: callers
 /// should proceed with the normal rebase rather than wrongly classifying a branch
 /// as safely fast-forwardable.
-pub fn branch_is_ancestor_of(jj: &JjEnv, store: &Path, branch: &str, dest_commit: &str) -> bool {
+pub(crate) fn branch_is_ancestor_of(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest_commit: &str,
+) -> bool {
     let branch_revset = format!("bookmarks(exact:{branch:?})");
     let revset = format!("({branch_revset})::{dest_commit}");
     jj.run(
@@ -216,7 +230,7 @@ pub fn branch_is_ancestor_of(jj: &JjEnv, store: &Path, branch: &str, dest_commit
 /// does not resolve. A jj *divergent* change's twins all share ONE change-id,
 /// and the bookmark points at exactly one of them, so this returns that shared
 /// id even mid-divergence. `--ignore-working-copy` keeps it store-driven.
-pub fn change_id_of(jj: &JjEnv, store: &Path, branch: &str) -> String {
+pub(crate) fn change_id_of(jj: &JjEnv, store: &Path, branch: &str) -> String {
     jj.run(
         store,
         &[
@@ -238,7 +252,11 @@ pub fn change_id_of(jj: &JjEnv, store: &Path, branch: &str) -> String {
 /// resolves to exactly one commit; a jj *divergent* change (the `<id>/0 /1 ...`
 /// accumulation) resolves to several. The `change_id(...)` revset function is
 /// used (not the bare id) because jj refuses a bare divergent change-id symbol.
-pub fn visible_commit_ids_for_change(jj: &JjEnv, store: &Path, change_id: &str) -> Vec<String> {
+pub(crate) fn visible_commit_ids_for_change(
+    jj: &JjEnv,
+    store: &Path,
+    change_id: &str,
+) -> Vec<String> {
     jj.run(
         store,
         &[
@@ -315,7 +333,7 @@ pub enum CollapseOutcome {
 ///
 /// Mutations use `--ignore-working-copy` (store-driven, like `reconcile_siblings`).
 /// The caller MUST hold the per-store lock so the collapse cannot itself fork.
-pub fn collapse_divergent_bookmark(
+pub(crate) fn collapse_divergent_bookmark(
     jj: &JjEnv,
     store: &Path,
     branch: &str,

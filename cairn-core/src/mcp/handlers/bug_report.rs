@@ -14,10 +14,10 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BugReportPayload {
-    pub category: String,
-    pub title: String,
-    pub description: String,
-    pub tool_name: Option<String>,
+    category: String,
+    title: String,
+    description: String,
+    tool_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,7 +43,7 @@ struct BugReportRequest {
 ///
 /// `payload_value` must contain `category` (String), `title` (String), `description` (String),
 /// and optionally `toolName` (String).
-pub async fn submit_bug_report(
+pub(crate) async fn submit_bug_report(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     payload_value: &serde_json::Value,

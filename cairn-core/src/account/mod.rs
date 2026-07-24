@@ -21,8 +21,8 @@ pub use content_store::{BrokeredContentStore, BrokeredContentStoreFactory};
 pub use manager::AccountManager;
 pub use org_tokens::OrgTokenCache;
 pub use team_sync::{
-    fetch_team_sync_config, mint_team_sync_token, probe_team_sync_status, read_device_jwt,
-    ConnectAccountTeamsSummary, SyncConfig, SyncConfigStatus, TeamConnectStatus, TeamSyncReadiness,
-    TeamSyncStatus,
+    fetch_team_sync_config, mint_cloud_object_grant, mint_team_sync_token, probe_team_sync_status,
+    read_device_jwt, ConnectAccountTeamsSummary, SyncConfig, SyncConfigStatus, TeamConnectStatus,
+    TeamSyncReadiness, TeamSyncStatus,
 };
 pub use team_token_minter::{DefaultTeamTokenMinter, TeamTokenMinter};

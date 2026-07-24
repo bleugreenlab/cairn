@@ -16,7 +16,7 @@ use crate::orchestrator::Orchestrator;
 use std::collections::HashMap;
 
 /// Handle `read cairn://mcp...`.
-pub async fn handle_mcp_read(
+pub(crate) async fn handle_mcp_read(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     server: Option<String>,
@@ -337,7 +337,7 @@ fn property_desc(spec: &serde_json::Value) -> String {
 /// so awareness never blocks on spawning a server inline. Full argument schemas
 /// stay a `read cairn://mcp/<server>` away. Returns `None` when no servers are
 /// configured.
-pub fn render_mcp_affordance_block(
+pub(crate) fn render_mcp_affordance_block(
     servers: &HashMap<String, McpServerConfig>,
     tools_by_server: &HashMap<String, Vec<McpToolDef>>,
 ) -> Option<String> {

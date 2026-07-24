@@ -510,15 +510,7 @@ async fn terminal_wake_active(
 /// `cairn:~/terminal/<slug>` form so the suggested calls paste directly.
 fn build_terminal_poll_nudge(slug: &str, count: u32) -> String {
     format!(
-        "You've read `cairn:~/terminal/{slug}` {count} times this turn and it hasn't finished. \
-         Polling a terminal spends your turn waiting on it. Instead, set a wake and end your turn \
-         — you'll resume the moment it's ready, with the exit code and final output:\n\n  \
-         • a command that should finish — wake on exit:\n    \
-         write cairn:~/wakes {{subscribe:{{kind:\"terminal\", ref:\"cairn:~/terminal/{slug}\", \
-         on:\"exit\"}}}}\n  • a long-running process that never exits (a dev server) — wake on a \
-         readiness line:\n    write cairn:~/wakes {{subscribe:{{kind:\"terminal\", \
-         ref:\"cairn:~/terminal/{slug}\", on:\"output\", phrase:\"<line it prints when ready>\"}}}}\
-         \n\nSubscribe, then end your turn. Do not keep reading the terminal."
+        "You've read `cairn:~/terminal/{slug}` {count} times this turn and it hasn't finished. Polling spends the current turn waiting.\n\nWait for exit:\n  run({{commands:[{{waitFor:{{kind:\"terminal\",ref:\"cairn:~/terminal/{slug}\",on:\"exit\"}}}}]}})\n\nWait for readiness output:\n  run({{commands:[{{waitFor:{{kind:\"terminal\",ref:\"cairn:~/terminal/{slug}\",on:\"output\",phrase:\"<ready line>\"}}}}]}})\n\nUse `cairn:~/wakes` only if your turn is otherwise complete and you want a later notification. Do not keep reading the terminal."
     )
 }
 
@@ -901,7 +893,7 @@ mod tests {
         let fired = nudge_for(&orch, &req).await;
         assert_eq!(fired.len(), 1, "read 3 should nudge");
         let body = &fired[0];
-        assert!(body.contains("subscribe"));
+        assert!(body.contains("waitFor"));
         assert!(body.contains("on:\"exit\""));
         assert!(body.contains("cairn:~/terminal/run-1"));
     }

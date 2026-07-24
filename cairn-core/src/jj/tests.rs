@@ -17,6 +17,123 @@ fn jj_bin() -> Option<String> {
 }
 
 #[test]
+#[serial_test::serial(jj)]
+fn origin_presence_is_workspace_safe() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping origin_presence_is_workspace_safe: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    init_project(project.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("project");
+    ensure_project_store(&jj, &store, project.path()).unwrap();
+    let workspace = workspaces.path().join("builder");
+    add_workspace(&jj, &store, &workspace, "agent/origin-probe", "main", None).unwrap();
+    std::fs::write(workspace.join("unsealed.rs"), "unsealed\n").unwrap();
+    let commit_before = jj
+        .run(
+            &workspace,
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+                "--ignore-working-copy",
+            ],
+            "capture working-copy commit before origin probe",
+        )
+        .unwrap();
+
+    assert_eq!(
+        discover_origin_presence(&jj, &workspace),
+        OriginPresence::Absent
+    );
+    let commit_after = jj
+        .run(
+            &workspace,
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+                "--ignore-working-copy",
+            ],
+            "capture working-copy commit after origin probe",
+        )
+        .unwrap();
+    assert_eq!(commit_before, commit_after);
+    assert!(is_working_copy_dirty(&jj, &workspace).unwrap());
+
+    let origin = TempDir::new().unwrap();
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    git(
+        project.path(),
+        &["remote", "add", "origin", &origin.path().to_string_lossy()],
+    );
+    assert_eq!(
+        discover_origin_presence(&jj, &workspace),
+        OriginPresence::Present
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+#[cfg(unix)]
+fn malformed_post_commit_probe_restores_the_pre_seal_graph_and_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(bin) = jj_bin() else {
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let real_jj = JjEnv::with_binary(bin.clone(), home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&real_jj, &store, proj.path()).unwrap();
+    let ws = wts.path().join("w");
+    let branch = "agent/CAIRN-2968-builder-0";
+    add_workspace(&real_jj, &store, &ws, branch, "main", None).unwrap();
+    let parent_before = head_commit(&real_jj, &ws).unwrap();
+    let bookmark_before = bookmark_commit(&real_jj, &store, branch).unwrap();
+    let bytes = b"probe failure must preserve these bytes\n\0binary\n";
+    std::fs::write(ws.join("preserved.bin"), bytes).unwrap();
+
+    let shim = home.path().join("malformed-probe-jj");
+    let escaped_bin = bin.replace('\'', "'\\''");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *'commit_id.short() ++ \"|\" ++ if(empty'*) printf 'malformed-probe-output'; exit 0;;\nesac\nexec '{escaped_bin}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let injected = JjEnv::with_binary(shim.to_string_lossy(), home.path());
+
+    let error = seal(&injected, &ws, "must roll back", None).unwrap_err();
+    assert!(error.contains("pre-seal operation was restored"), "{error}");
+    assert_eq!(std::fs::read(ws.join("preserved.bin")).unwrap(), bytes);
+    assert_eq!(head_commit(&real_jj, &ws).unwrap(), parent_before);
+    assert_eq!(
+        bookmark_commit(&real_jj, &store, branch).unwrap(),
+        bookmark_before
+    );
+    assert!(is_working_copy_dirty(&real_jj, &ws).unwrap());
+}
+
+/// A validated executor commit is deliberately not published as a Git ref.
+/// The runner must still be able to read its tree through jj's Git backend and
+/// fold it into the working-copy change with exactly one jj operation.
+#[test]
 fn base_marker_round_trips() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
@@ -407,6 +524,71 @@ fn child_workspace_bases_off_unsealed_coordinator_branch() {
     assert!(
         is_jj_dir(&wts.path().join("child")),
         "child workspace based on the unsealed coordinator branch must provision"
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn marker_failure_rolls_back_new_workspace_registration_bookmark_and_path() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/CAIRN-2924-marker-failure";
+    let name = workspace_name_for_branch(branch);
+    let ws = wts.path().join("job");
+
+    let error = add_workspace_with_marker_writer(
+        &jj,
+        &store,
+        &ws,
+        branch,
+        "main",
+        None,
+        |_path, _branch| Err("injected branch marker failure".into()),
+    )
+    .unwrap_err();
+    assert!(error.contains("injected branch marker failure"));
+    assert!(!ws.exists(), "partial workspace directory is removed");
+    assert!(!workspace_registered(&jj, &store, &name));
+    assert!(bookmark_commit(&jj, &store, branch).is_none());
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn marker_failure_preserves_preexisting_branch_bookmark() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/CAIRN-2924-existing-bookmark";
+    jj.run(
+        &store,
+        &["bookmark", "create", branch, "-r", "main"],
+        "seed existing bookmark",
+    )
+    .unwrap();
+    let tip = bookmark_commit(&jj, &store, branch).unwrap();
+    let ws = wts.path().join("job");
+
+    add_workspace_with_marker_writer(&jj, &store, &ws, branch, "main", None, |_path, _branch| {
+        Err("injected branch marker failure".into())
+    })
+    .unwrap_err();
+
+    assert!(!ws.exists(), "new workspace path is rolled back");
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(tip.as_str()),
+        "rollback preserves the bookmark that predated this add"
     );
 }
 
@@ -4061,6 +4243,219 @@ fn rebase_branch_exports_git_ref_to_rebased_tip() {
     assert!(
         !bookmarks.contains("@git"),
         "the branch must not remain conflicted against a stale @git ref: {bookmarks}"
+    );
+}
+
+/// Advance the shared store's `main` bookmark by one commit WITHOUT touching the
+/// project checkout's git ref, mirroring a fetch/import that lands in the store
+/// before the checkout pulls. Returns the new store `main` tip. The advance is an
+/// empty commit: its commit-id differs from the pre-advance tip (so a re-attach's
+/// fast-forward is observable) while its tree is unchanged (so a `reset --hard`
+/// never needs real content in the store working copy).
+#[cfg(test)]
+fn advance_store_main(jj: &JjEnv, store: &Path) -> String {
+    jj.run(
+        store,
+        &["new", "main", "-m", "store advance"],
+        "test: new child of main",
+    )
+    .unwrap();
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            "@",
+            "--ignore-working-copy",
+        ],
+        "test: move store main bookmark forward",
+    )
+    .unwrap();
+    bookmark_commit(jj, store, "main").unwrap()
+}
+
+/// The core repair: an export that moves the checkout's attached branch (`main`)
+/// detaches HEAD, and the wrapper must re-attach it and fast-forward the clean
+/// tree to the exported tip.
+#[test]
+#[serial_test::serial(jj)]
+fn export_reattaches_detached_main_checkout() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping export_reattaches_detached_main_checkout: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    // Precondition: the checkout is attached to main.
+    assert_eq!(
+        git_stdout(proj.path(), &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+    let main_before = git_stdout(proj.path(), &["rev-parse", "main"]);
+
+    let store_main = advance_store_main(&jj, &store);
+    assert_ne!(
+        store_main, main_before,
+        "the store's main must have advanced"
+    );
+
+    // The export moves refs/heads/main and would leave HEAD detached; the wrapper
+    // must repair it synchronously.
+    export_git_preserving_checkout(&jj, &store, true, "test export").unwrap();
+
+    assert_eq!(
+        git_stdout(proj.path(), &["symbolic-ref", "HEAD"]),
+        "refs/heads/main",
+        "HEAD must be re-attached to main after the export detached it"
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", "HEAD"]),
+        store_main,
+        "the checkout must be fast-forwarded to the exported main tip"
+    );
+}
+
+/// An export that moves a branch OTHER than the one HEAD is attached to must
+/// leave the checkout untouched — jj only detaches HEAD when it moves the branch
+/// HEAD is a symref to.
+#[test]
+#[serial_test::serial(jj)]
+fn export_moving_a_non_checkout_branch_leaves_head_attached() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping export_moving_a_non_checkout_branch_leaves_head_attached: jj missing");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let main_before = git_stdout(proj.path(), &["rev-parse", "main"]);
+
+    // Advance an agent branch (not main) in the store, then export.
+    jj.run(
+        &store,
+        &["new", "main", "-m", "agent work"],
+        "test: agent commit",
+    )
+    .unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "create",
+            "agent/foo",
+            "-r",
+            "@",
+            "--ignore-working-copy",
+        ],
+        "test: create agent bookmark",
+    )
+    .unwrap();
+
+    export_git_preserving_checkout(&jj, &store, true, "test export").unwrap();
+
+    assert_eq!(
+        git_stdout(proj.path(), &["symbolic-ref", "HEAD"]),
+        "refs/heads/main",
+        "HEAD must stay attached to main when the export did not move main"
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", "main"]),
+        main_before,
+        "main must be unchanged"
+    );
+}
+
+/// A checkout the user deliberately detached must be left detached: the wrapper
+/// only repairs a detach the export itself caused, never a pre-existing one.
+#[test]
+#[serial_test::serial(jj)]
+fn export_leaves_preexisting_detached_head_alone() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping export_leaves_preexisting_detached_head_alone: jj missing");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    // The user detaches HEAD themselves before any export.
+    git(proj.path(), &["checkout", "--detach", "HEAD"]);
+    assert!(
+        !crate::env::git()
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(proj.path())
+            .status()
+            .unwrap()
+            .success(),
+        "precondition: HEAD is detached"
+    );
+
+    advance_store_main(&jj, &store);
+    export_git_preserving_checkout(&jj, &store, true, "test export").unwrap();
+
+    assert!(
+        !crate::env::git()
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(proj.path())
+            .status()
+            .unwrap()
+            .success(),
+        "a user-deliberate detached HEAD must be left detached"
+    );
+}
+
+/// When the export detaches HEAD but the working tree has real uncommitted
+/// changes, the repair must NOT `reset --hard` (that would destroy the edits):
+/// HEAD is left detached and the user's work is preserved.
+#[test]
+#[serial_test::serial(jj)]
+fn export_with_dirty_tree_leaves_head_detached_and_preserves_edits() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping export_with_dirty_tree_leaves_head_detached_and_preserves_edits: jj missing"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    // Uncommitted edit to a tracked file (not the regenerable-lockfile allowlist).
+    std::fs::write(proj.path().join("shared.rs"), "UNCOMMITTED USER WORK\n").unwrap();
+
+    advance_store_main(&jj, &store);
+    export_git_preserving_checkout(&jj, &store, true, "test export").unwrap();
+
+    assert!(
+        !crate::env::git()
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(proj.path())
+            .status()
+            .unwrap()
+            .success(),
+        "HEAD must stay detached rather than reset away a dirty tree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.path().join("shared.rs")).unwrap(),
+        "UNCOMMITTED USER WORK\n",
+        "the uncommitted user edit must be preserved"
     );
 }
 

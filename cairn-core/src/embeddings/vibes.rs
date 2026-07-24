@@ -39,12 +39,12 @@ const L_HOT: f32 = 0.62; // lightness at friction01 = 1 (slightly darker/alarmin
 #[derive(Debug, Clone)]
 pub struct VibeAxis {
     /// Axis name (`"phase"` | `"friction"`).
-    pub name: String,
+    name: String,
     /// 1536-d unit contrast vector (`norm(mean(pos) - mean(neg))`).
-    pub vector: Vec<f32>,
+    vector: Vec<f32>,
     /// 101 sorted breakpoints `p0..=p100` of the empirical projection
     /// distribution, used to percentile-rank a new projection into `[0,1]`.
-    pub percentiles: Vec<f32>,
+    percentiles: Vec<f32>,
 }
 
 /// The result of assigning a vibe to an event: a CSS color plus the two
@@ -53,18 +53,18 @@ pub struct VibeAxis {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VibeAssignment {
-    pub event_id: String,
-    pub css_color: String,
+    event_id: String,
+    pub(crate) css_color: String,
     /// PHASE coordinate in `[0,1]` (0 = explore, 1 = ship).
-    pub phase: f32,
+    pub(crate) phase: f32,
     /// FRICTION coordinate in `[0,1]` (0 = smooth, 1 = post-error friction).
-    pub friction: f32,
+    pub(crate) friction: f32,
 }
 
 /// Holds the loaded contrast axes, ready for assignment. Expects a `phase` and a
 /// `friction` axis; an empty set assigns no color (callers fall back to neutral).
 pub struct VibeState {
-    pub axes: Vec<VibeAxis>,
+    axes: Vec<VibeAxis>,
 }
 
 #[derive(Deserialize)]
@@ -120,7 +120,7 @@ impl VibeState {
 
     /// Assign a vibe color to a single embedding. Returns `None` when the `phase`
     /// or `friction` axis is missing (color falls back to neutral upstream).
-    pub fn assign_one(&self, event_id: &str, embedding: &[f32]) -> Option<VibeAssignment> {
+    pub(crate) fn assign_one(&self, event_id: &str, embedding: &[f32]) -> Option<VibeAssignment> {
         let phase_axis = self.axis("phase")?;
         let friction_axis = self.axis("friction")?;
 

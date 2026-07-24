@@ -8,7 +8,7 @@ use crate::orchestrator::Orchestrator;
 /// Payload for read_issue_resource request
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReadIssueResourcePayload {
-    pub uri: String,
+    uri: String,
 }
 
 /// Handle read_issue_resource request.

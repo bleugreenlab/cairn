@@ -11,7 +11,7 @@ use super::types::{EffectResult, WorkflowEffect};
 /// This is the feedback path: host executor completes an effect and returns
 /// an `EffectResult`, which this function maps to zero or more new effects
 /// that re-enter the effect loop.
-pub fn reduce_effect_result(result: EffectResult) -> Vec<WorkflowEffect> {
+pub(crate) fn reduce_effect_result(result: EffectResult) -> Vec<WorkflowEffect> {
     match result {
         EffectResult::CheckpointComplete { job_id, passed, .. } => {
             if passed {

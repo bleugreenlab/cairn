@@ -14,11 +14,11 @@ use cairn_db::turso::params;
 
 #[derive(Debug, Clone)]
 pub(super) struct ChangePreviewEvent {
-    pub(super) run_id: String,
+    run_id: String,
     pub(super) sequence: i32,
     pub(super) tool_use_id: String,
-    pub(super) data: serde_json::Value,
-    pub(super) status: Option<String>,
+    data: serde_json::Value,
+    status: Option<String>,
 }
 
 pub(super) fn is_change_tool_name(name: &str) -> bool {

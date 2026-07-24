@@ -55,7 +55,7 @@ use graph::*;
 ///
 /// This is the synchronous replacement for `advance_execution_with_actions`.
 /// All DB mutations happen here; host-crossing operations are returned as effects.
-pub fn reduce_dag(
+pub(crate) fn reduce_dag(
     orch: &Orchestrator,
     execution_id: &str,
 ) -> Result<(Vec<Job>, Vec<WorkflowEffect>), String> {

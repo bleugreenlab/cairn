@@ -72,7 +72,7 @@ fn extract_image_paths(text: &str) -> Vec<String> {
 /// If `resolve_base64` is provided, it will be called for each image path
 /// before falling back to reading from disk. This allows hosts to provide
 /// pre-computed base64 data (e.g. from a cache).
-pub fn build_message_content(
+pub(crate) fn build_message_content(
     text: &str,
     working_dir: Option<&str>,
     resolve_base64: Base64Resolver<'_>,
@@ -155,7 +155,7 @@ pub fn build_message_content(
 /// The working_dir is only needed for relative paths; absolute paths work without it.
 /// If `resolve_base64` is provided, it will be called for each image path before
 /// falling back to reading from disk.
-pub fn send_user_message_with_images(
+pub(crate) fn send_user_message_with_images(
     stdin: &mut dyn Write,
     session_id: &str,
     content: &str,
@@ -255,7 +255,7 @@ pub fn send_control_response(
 ///   "request": { "subtype": "interrupt" | "set_model" | "set_permission_mode", ... }
 /// }
 /// ```
-pub fn send_control_request(
+fn send_control_request(
     stdin: &mut dyn Write,
     request_id: &str,
     request: serde_json::Value,
@@ -286,12 +286,15 @@ pub fn send_control_request(
 
 /// Send an interrupt control request to gracefully stop the current turn.
 /// The process stays alive and can receive new messages for follow-up.
-pub fn send_interrupt_request(stdin: &mut dyn Write, request_id: &str) -> Result<(), String> {
+pub(crate) fn send_interrupt_request(
+    stdin: &mut dyn Write,
+    request_id: &str,
+) -> Result<(), String> {
     send_control_request(stdin, request_id, json!({ "subtype": "interrupt" }))
 }
 
 /// Send a set_model control request to change the model for subsequent turns.
-pub fn send_set_model_request(
+pub(crate) fn send_set_model_request(
     stdin: &mut dyn Write,
     request_id: &str,
     model: &str,
@@ -304,7 +307,7 @@ pub fn send_set_model_request(
 }
 
 /// Send a set_permission_mode control request to change permission handling.
-pub fn send_set_permission_mode_request(
+pub(crate) fn send_set_permission_mode_request(
     stdin: &mut dyn Write,
     request_id: &str,
     mode: &str,

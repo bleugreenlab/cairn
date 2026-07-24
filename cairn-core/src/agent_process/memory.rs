@@ -9,13 +9,7 @@
 //! which makes the GC fall back to its count cap.
 
 /// A snapshot of system-wide memory in bytes.
-#[derive(Debug, Clone, Copy)]
-pub struct SystemMemory {
-    /// Total physical memory (or the cgroup memory limit under a container).
-    pub total: u64,
-    /// Memory the OS reports as available for allocation without swapping.
-    pub available: u64,
-}
+pub use cairn_common::memory::SystemMemory;
 
 /// A source of memory measurements. Abstracted behind a trait so the GC's
 /// budget policy is unit-testable with a stub, without spawning real processes.
@@ -50,18 +44,7 @@ impl MemoryProbe for OsMemoryProbe {
     }
 
     fn system_memory(&self) -> Option<SystemMemory> {
-        #[cfg(target_os = "macos")]
-        {
-            system_memory_macos()
-        }
-        #[cfg(target_os = "linux")]
-        {
-            system_memory_linux()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            None
-        }
+        cairn_common::memory::system_memory()
     }
 }
 
@@ -90,68 +73,6 @@ fn process_rss_macos(pid: u32) -> Option<u64> {
         return None;
     }
     Some(info.pti_resident_size)
-}
-
-#[cfg(target_os = "macos")]
-fn system_memory_macos() -> Option<SystemMemory> {
-    let total = sysctl_memsize()?;
-    let available = available_macos()?;
-    Some(SystemMemory { total, available })
-}
-
-/// Total physical memory via `sysctl(HW_MEMSIZE)`.
-#[cfg(target_os = "macos")]
-fn sysctl_memsize() -> Option<u64> {
-    let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_MEMSIZE];
-    let mut value: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    let ret = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            &mut value as *mut _ as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if ret != 0 {
-        return None;
-    }
-    Some(value)
-}
-
-/// Available memory: (free + inactive) pages via `host_statistics64`. Inactive
-/// pages are reclaimable on demand, so counting them mirrors what the OS treats
-/// as available headroom.
-// `mach_host_self` is deprecated in `libc` in favor of the `mach2` crate, but
-// the reaper precedent keeps us on `libc` for FFI; the call is stable.
-#[allow(deprecated)]
-#[cfg(target_os = "macos")]
-fn available_macos() -> Option<u64> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page_size <= 0 {
-        return None;
-    }
-    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
-    let mut count = (std::mem::size_of::<libc::vm_statistics64>()
-        / std::mem::size_of::<libc::integer_t>())
-        as libc::mach_msg_type_number_t;
-    let ret = unsafe {
-        libc::host_statistics64(
-            libc::mach_host_self(),
-            libc::HOST_VM_INFO64,
-            &mut stats as *mut _ as *mut libc::integer_t,
-            &mut count,
-        )
-    };
-    // KERN_SUCCESS == 0.
-    if ret != 0 {
-        return None;
-    }
-    let free = stats.free_count as u64;
-    let inactive = stats.inactive_count as u64;
-    Some((free + inactive) * page_size as u64)
 }
 
 // ============================================================================
@@ -232,8 +153,8 @@ fn cgroup_v2_memory() -> Option<SystemMemory> {
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Clone, Default)]
 pub struct StubMemoryProbe {
-    pub system: Option<SystemMemory>,
-    pub rss: std::collections::HashMap<u32, u64>,
+    pub(crate) system: Option<SystemMemory>,
+    pub(crate) rss: std::collections::HashMap<u32, u64>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]

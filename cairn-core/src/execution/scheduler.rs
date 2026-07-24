@@ -395,7 +395,7 @@ fn due_at(
 /// Restart-safe and double-fire-safe via the executions-table dedupe in
 /// [`last_scheduled_fire`]: a fired schedule writes an execution row whose
 /// `started_at` moves the next computed fire into the future.
-pub async fn run_scheduler_loop(orch: Orchestrator) {
+async fn run_scheduler_loop(orch: Orchestrator) {
     log::info!("Recipe scheduler started");
 
     loop {
@@ -547,7 +547,7 @@ fn describe_schedule(config: &ScheduleConfig) -> String {
 
 /// Spawn the scheduler as a detached background loop. Called by the always-on
 /// hosts (runner and non-inert server), never the thin desktop app.
-pub fn spawn_recipe_scheduler(orch: Orchestrator) {
+pub(crate) fn spawn_recipe_scheduler(orch: Orchestrator) {
     tokio::spawn(run_scheduler_loop(orch));
 }
 

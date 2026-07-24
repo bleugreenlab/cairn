@@ -79,25 +79,25 @@ pub(in crate::backends) struct TurnToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::backends) struct TurnUsage {
     #[serde(default)]
-    pub(in crate::backends) prompt_tokens: Option<i32>,
+    prompt_tokens: Option<i32>,
     #[serde(default)]
-    pub(in crate::backends) completion_tokens: Option<i32>,
+    completion_tokens: Option<i32>,
     #[serde(default)]
-    pub(in crate::backends) total_tokens: Option<i32>,
+    total_tokens: Option<i32>,
     #[serde(default)]
-    pub(in crate::backends) reasoning_tokens: Option<i32>,
+    reasoning_tokens: Option<i32>,
     #[serde(default)]
-    pub(in crate::backends) prompt_tokens_details: Option<Value>,
+    prompt_tokens_details: Option<Value>,
     #[serde(default)]
-    pub(in crate::backends) completion_tokens_details: Option<Value>,
+    completion_tokens_details: Option<Value>,
     #[serde(default)]
-    pub(in crate::backends) cost: Option<f64>,
+    cost: Option<f64>,
     #[serde(default)]
-    pub(in crate::backends) cost_details: Option<Value>,
+    cost_details: Option<Value>,
 }
 
 impl TurnUsage {
-    pub(in crate::backends) fn token_counts(&self) -> TokenCounts {
+    fn token_counts(&self) -> TokenCounts {
         let cache_read = self.prompt_tokens_details.as_ref().and_then(|v| {
             v.get("cached_tokens")
                 .and_then(Value::as_i64)

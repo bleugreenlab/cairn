@@ -20,8 +20,8 @@ use super::node::{
     read_node_chat_event, read_node_chat_raw, read_node_chat_turn, read_node_checks,
     read_node_permission, read_node_permissions, read_node_question, read_node_questions,
     read_node_tasks, read_node_wakes, read_task, read_task_artifact, read_task_chat,
-    read_task_chat_event, read_task_chat_raw, read_task_chat_turn, read_task_permission,
-    read_task_permissions,
+    read_task_chat_event, read_task_chat_raw, read_task_chat_turn, read_task_checks,
+    read_task_permission, read_task_permissions,
 };
 use super::progress::read_node_progress;
 use super::symbols::{read_node_symbols, read_project_symbols};
@@ -1628,6 +1628,19 @@ async fn render_resource_body(
                 error
             } else {
                 read_node_checks(orch, &project, number, exec_seq, &node_id).await
+            }
+        }
+        CairnResource::TaskChecks {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => {
+            if let Some(error) = reject_query_params("task checks", &params) {
+                error
+            } else {
+                read_task_checks(orch, &project, number, exec_seq, &node_id, &task_name).await
             }
         }
         CairnResource::NodeQuestions {

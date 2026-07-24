@@ -15,30 +15,30 @@ use std::path::Path;
 /// is `held` on its prior clean commit rather than rebased onto the conflict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileFailure {
-    pub branch: String,
-    pub workspace_path: std::path::PathBuf,
-    pub error: String,
+    pub(crate) branch: String,
+    pub(crate) workspace_path: std::path::PathBuf,
+    pub(crate) error: String,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// Sibling bookmarks that rebased with no conflict.
-    pub rebased_clean: Vec<String>,
+    pub(crate) rebased_clean: Vec<String>,
     /// Sibling bookmarks whose rebase recorded a conflict.
-    pub conflicted: Vec<String>,
+    pub(crate) conflicted: Vec<String>,
     /// Successful reconciliations that preserve loose local work and therefore
     /// should not produce a clean-rebase notification.
-    pub preserved_dirty: Vec<String>,
+    pub(crate) preserved_dirty: Vec<String>,
     /// Trivial bookmark/workspace advances that are current but intentionally
     /// silent because the sibling had no branch work to announce.
-    pub silent: Vec<String>,
+    pub(crate) silent: Vec<String>,
     /// Sibling bookmarks held UNrebased because the rebase dest itself carries
     /// a recorded conflict — never handed a conflicted base. Cleared on the next
     /// reconcile once the base re-seals conflict-free.
-    pub held: Vec<String>,
+    pub(crate) held: Vec<String>,
     /// Exact per-workspace failures from graph movement, workspace reconciliation,
     /// flatten recovery, or publication.
-    pub failed: Vec<ReconcileFailure>,
+    pub(crate) failed: Vec<ReconcileFailure>,
 }
 
 /// Fold a child's real commit into the integration bookmark over the shared
@@ -58,7 +58,7 @@ pub struct ReconcileReport {
 /// agent, so it is never echoed. For a fold whose target advances out of band
 /// (the project default branch), callers use `rebase_then_fold_into`, which
 /// rebases first so this path is never reached.
-pub fn merge_into_bookmark(
+pub(crate) fn merge_into_bookmark(
     jj: &JjEnv,
     store: &Path,
     integration_branch: &str,
@@ -98,12 +98,7 @@ pub fn merge_into_bookmark(
     // would start from the pre-merge tip — breaking the store-owns-merge
     // invariant. Load-bearing, so it fails the fold rather than silently leaving
     // a stale ref.
-    jj.run(
-        store,
-        &["git", "export", "--ignore-working-copy"],
-        "jj git export (merge fold)",
-    )
-    .map(|_| ())
+    export_git_preserving_checkout(jj, store, true, "jj git export (merge fold)")
 }
 
 /// Merge a source bookmark into a target whose tip may have advanced out of band
@@ -163,7 +158,7 @@ pub fn rebase_then_fold_into(
 /// that hint is legitimate here (we are replacing the branch's own history with
 /// an equivalent-tree single commit), unlike `merge_into_bookmark`, where the
 /// same hint would clobber commits that advanced a shared target.
-pub fn squash_branch_onto(
+pub(crate) fn squash_branch_onto(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
@@ -235,12 +230,7 @@ pub fn squash_branch_onto(
     )?;
     // Export the rewritten bookmark to the backing git, as the fold path does,
     // so the project's `refs/heads/<branch>` tracks the squashed commit.
-    jj.run(
-        store,
-        &["git", "export", "--ignore-working-copy"],
-        "jj git export (squash)",
-    )
-    .map(|_| ())
+    export_git_preserving_checkout(jj, store, true, "jj git export (squash)")
 }
 
 /// Commit ids of the direct children of `rev` in the shared store. Used to
@@ -278,7 +268,7 @@ fn base_children(
 /// origin's ref was created outside this store's jj. A no-op when already
 /// tracked; errors (best-effort for the caller) when there is no such remote
 /// bookmark, e.g. a no-remote project.
-pub fn track_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
+pub(crate) fn track_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
     let remote_ref = format!("{branch}@origin");
     jj.run(
         store,
@@ -293,7 +283,7 @@ pub fn track_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), Stri
 /// advance both the integration tip after a fold and a cleanly-rebased sibling's
 /// PR head; jj's remote-tracking model accepts a rewritten bookmark without a
 /// force-push.
-pub fn push_store_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
+pub(crate) fn push_store_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
     jj.run_with_timeout(
         store,
         &[
@@ -332,12 +322,7 @@ pub fn rebase_branch_onto(
         &["rebase", "-b", branch, "-o", dest, "--ignore-working-copy"],
         "jj rebase",
     )?;
-    jj.run(
-        store,
-        &["git", "export", "--ignore-working-copy"],
-        "jj git export (rebase)",
-    )
-    .map(|_| ())
+    export_git_preserving_checkout(jj, store, true, "jj git export (rebase)")
 }
 
 /// Fast-forward a branch bookmark to a concrete destination commit over the shared
@@ -345,7 +330,7 @@ pub fn rebase_branch_onto(
 /// ref stay in lockstep. This is the no-work sibling analogue of
 /// [`rebase_branch_onto`]: there is no branch commit to rebase, only an idle
 /// bookmark to move onto the advanced base.
-pub fn fast_forward_bookmark(
+pub(crate) fn fast_forward_bookmark(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
@@ -363,10 +348,5 @@ pub fn fast_forward_bookmark(
         ],
         "jj bookmark fast-forward",
     )?;
-    jj.run(
-        store,
-        &["git", "export", "--ignore-working-copy"],
-        "jj git export (bookmark fast-forward)",
-    )
-    .map(|_| ())
+    export_git_preserving_checkout(jj, store, true, "jj git export (bookmark fast-forward)")
 }

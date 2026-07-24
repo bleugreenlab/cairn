@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
@@ -107,6 +109,8 @@ pub struct LocalDb {
     /// private DB carries `None`, so archival/reconstruct branch on
     /// `content_store()` and the local-run inline path is byte-for-byte unchanged.
     team: Option<Arc<TeamReplicaContext>>,
+    #[cfg(test)]
+    read_transaction_count: AtomicUsize,
 }
 
 impl LocalDb {
@@ -124,6 +128,8 @@ impl LocalDb {
             retry,
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            #[cfg(test)]
+            read_transaction_count: AtomicUsize::new(0),
         };
         db.configure().await?;
         Ok(db)
@@ -169,6 +175,8 @@ impl LocalDb {
             retry,
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            #[cfg(test)]
+            read_transaction_count: AtomicUsize::new(0),
         };
         db.configure().await?;
         Ok(db)
@@ -208,6 +216,8 @@ impl LocalDb {
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            #[cfg(test)]
+            read_transaction_count: AtomicUsize::new(0),
         };
         db.configure().await?;
         Ok(db)
@@ -313,6 +323,8 @@ impl LocalDb {
         &self,
         f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
+        #[cfg(test)]
+        self.read_transaction_count.fetch_add(1, Ordering::Relaxed);
         let conn = self.connect().await?;
         run_read_tx(&conn, self.concurrent_begin(), f).await
     }
@@ -332,13 +344,16 @@ impl LocalDb {
         self.transaction_with_begin("BEGIN", &mut f).await
     }
 
-    /// Runs a SELECT in a read transaction and collects every mapped row.
+    /// Runs one SELECT and collects every mapped row.
+    ///
+    /// A single SQL statement already observes one database snapshot. Avoiding an
+    /// explicit BEGIN/COMMIT here removes two engine round-trips from the hottest
+    /// read path. Call Self::read when several statements must share a snapshot.
     ///
     /// # Errors
     ///
-    /// Returns database errors from opening the read transaction, running the
-    /// query, fetching rows, or mapping each row. Read transactions are not
-    /// retried.
+    /// Returns database errors from opening the connection, running the query,
+    /// fetching rows, or mapping each row.
     pub async fn query_all<T, F>(
         &self,
         sql: impl Into<String>,
@@ -350,26 +365,21 @@ impl LocalDb {
         T: Send + 'static,
     {
         let sql = sql.into();
-        self.read(move |conn| {
-            Box::pin(async move {
-                let mut rows = conn.query(&sql, params).await?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    out.push(map(&row)?);
-                }
-                Ok(out)
-            })
-        })
-        .await
+        let conn = self.connect().await?;
+        let mut rows = conn.query(&sql, params).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(map(&row)?);
+        }
+        Ok(out)
     }
 
-    /// Runs a SELECT in a read transaction and maps the first row, if present.
+    /// Runs one SELECT and maps the first row, if present.
     ///
     /// # Errors
     ///
-    /// Returns database errors from opening the read transaction, running the
-    /// query, fetching the row, or mapping the row. Read transactions are not
-    /// retried.
+    /// Returns database errors from opening the connection, running the query,
+    /// fetching the row, or mapping the row.
     pub async fn query_opt<T, F>(
         &self,
         sql: impl Into<String>,
@@ -381,23 +391,18 @@ impl LocalDb {
         T: Send + 'static,
     {
         let sql = sql.into();
-        self.read(move |conn| {
-            Box::pin(async move {
-                let mut rows = conn.query(&sql, params).await?;
-                rows.next().await?.map(|row| map(&row)).transpose()
-            })
-        })
-        .await
+        let conn = self.connect().await?;
+        let mut rows = conn.query(&sql, params).await?;
+        rows.next().await?.map(|row| map(&row)).transpose()
     }
 
-    /// Runs a SELECT in a read transaction and returns the first column of the
+    /// Runs one SELECT and returns the first column of the
     /// first row as optional text.
     ///
     /// # Errors
     ///
-    /// Returns database errors from opening the read transaction, running the
-    /// query, fetching the row, or reading column 0. Read transactions are not
-    /// retried.
+    /// Returns database errors from opening the connection, running the query,
+    /// fetching the row, or reading column 0.
     pub async fn query_opt_text(
         &self,
         sql: impl Into<String>,
@@ -408,14 +413,13 @@ impl LocalDb {
             .map(Option::flatten)
     }
 
-    /// Runs a SELECT in a read transaction and returns the first column of the
+    /// Runs one SELECT and returns the first column of the
     /// first row as optional integer.
     ///
     /// # Errors
     ///
-    /// Returns database errors from opening the read transaction, running the
-    /// query, fetching the row, or reading column 0. Read transactions are not
-    /// retried.
+    /// Returns database errors from opening the connection, running the query,
+    /// fetching the row, or reading column 0.
     pub async fn query_opt_i64(
         &self,
         sql: impl Into<String>,
@@ -426,14 +430,13 @@ impl LocalDb {
             .map(Option::flatten)
     }
 
-    /// Runs a SELECT in a read transaction and returns the first column of the
+    /// Runs one SELECT and returns the first column of the
     /// first row as text, or `None` when the query returns no row.
     ///
     /// # Errors
     ///
-    /// Returns database errors from opening the read transaction, running the
-    /// query, fetching the row, or reading column 0. Read transactions are not
-    /// retried.
+    /// Returns database errors from opening the connection, running the query,
+    /// fetching the row, or reading column 0.
     pub async fn query_text(
         &self,
         sql: impl Into<String>,
@@ -442,13 +445,13 @@ impl LocalDb {
         self.query_opt(sql, params, |row| row.text(0)).await
     }
 
-    /// Runs a SELECT in a read transaction and requires one row.
+    /// Runs one SELECT and requires one row.
     ///
     /// # Errors
     ///
-    /// Returns database errors from opening the read transaction, running the
-    /// query, fetching the row, or mapping the row. Returns `DbError::Row` when
-    /// the query returns no rows. Read transactions are not retried.
+    /// Returns database errors from opening the connection, running the query,
+    /// fetching the row, or mapping the row. Returns `DbError::Row` when the
+    /// query returns no rows.
     pub async fn query_one<T, F>(
         &self,
         sql: impl Into<String>,
@@ -714,6 +717,36 @@ mod tests {
 
     use super::*;
     use crate::storage::{Migration, MigrationRunner, RowExt};
+
+    #[tokio::test]
+    async fn single_select_helpers_avoid_transaction_round_trip() {
+        let db = test_db().await.unwrap();
+        let before = db.read_transaction_count.load(Ordering::Relaxed);
+        let value = db
+            .query_one("SELECT 1", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        assert_eq!(value, 1);
+        assert_eq!(
+            db.read_transaction_count.load(Ordering::Relaxed),
+            before,
+            "single-statement helpers must not open an explicit read transaction"
+        );
+
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query("SELECT 1", ()).await?;
+                Ok(rows.next().await?.unwrap().i64(0)?)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.read_transaction_count.load(Ordering::Relaxed),
+            before + 1,
+            "multi-statement read API must retain explicit snapshot transactions"
+        );
+    }
 
     const TEST_SCHEMA: &[Migration] = &[Migration::new(
         "0001",
@@ -1010,6 +1043,8 @@ mod tests {
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            #[cfg(test)]
+            read_transaction_count: AtomicUsize::new(0),
         };
         db.configure().await?;
         MigrationRunner::new(TEST_SCHEMA.to_vec()).run(&db).await?;

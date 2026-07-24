@@ -62,7 +62,7 @@ use sha2::{Digest, Sha256};
 use crate::jj::JjEnv;
 use crate::models::Event;
 use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
-use crate::storage::content_store::{content_hash, frame_pack, ContentStore};
+use crate::storage::content_store::{content_hash, ContentStore};
 use crate::storage::events::encoding::{
     init_placeholder, ArchivedShape, ARCHIVED_SYSTEM_INIT, ARCHIVED_SYSTEM_PROMPT, INIT_TOOLS_TAG,
 };
@@ -158,20 +158,20 @@ where
 /// render-and-compare (replay drift, a dirty worktree, the composition seam).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArchiveSummary {
-    pub gitcoord_read: usize,
-    pub gitcoord_write: usize,
+    pub(crate) gitcoord_read: usize,
+    pub(crate) gitcoord_write: usize,
     /// Mixed-target reads archived per-section: the reproducible `file:` sections
     /// git-addressed, the rest stored verbatim in a placeholder skeleton.
-    pub hybrid_read: usize,
-    pub zstd: usize,
+    pub(crate) hybrid_read: usize,
+    pub(crate) zstd: usize,
     /// Assembled `system:prompt` events rewritten to content-addressed segments.
     pub system_prompt: usize,
     /// Near-constant `system:init` events rewritten to a content-addressed
     /// skeleton plus a deduped tool-set and the inlined varying fields.
-    pub system_init: usize,
-    pub mismatch_fallback: usize,
-    pub bytes_before: usize,
-    pub bytes_after: usize,
+    pub(crate) system_init: usize,
+    pub(crate) mismatch_fallback: usize,
+    pub(crate) bytes_before: usize,
+    pub(crate) bytes_after: usize,
 }
 
 /// Archive one teardown target's execution: pack its at-risk commits and rewrite
@@ -238,6 +238,8 @@ pub async fn archive_target(
 
 struct Loaded {
     execution_id: String,
+    project_id: String,
+    repository_id: String,
     /// Replay anchor: the worktree HEAD when the root job was created. `None`
     /// makes the whole execution zstd-only.
     base_commit: Option<String>,
@@ -301,19 +303,25 @@ async fn load(db: &LocalDb, worktree_path: &str, job_ids: &[String]) -> DbResult
                 }
             };
 
-            let default_branch = {
+            let (project_id, repository_id, default_branch) = {
                 let mut rows = conn
                     .query(
-                        "SELECT p.default_branch FROM jobs j
-                         JOIN projects p ON j.project_id = p.id
+                        "SELECT p.id, COALESCE(p.repository_id, p.id), p.default_branch
+                         FROM jobs j JOIN projects p ON j.project_id = p.id
                          WHERE j.execution_id = ?1 LIMIT 1",
                         (execution_id.as_str(),),
                     )
                     .await?;
-                rows.next()
-                    .await?
-                    .and_then(|row| row.opt_text(0).ok().flatten())
-                    .unwrap_or_else(|| "main".to_string())
+                let row = rows.next().await?.ok_or_else(|| {
+                    crate::storage::DbError::Internal(
+                        "archival execution has no durable repository coordinate".into(),
+                    )
+                })?;
+                (
+                    row.text(0)?,
+                    row.text(1)?,
+                    row.opt_text(2)?.unwrap_or_else(|| "main".to_string()),
+                )
             };
 
             // Filter by a run subquery rather than joining, so the unqualified
@@ -334,6 +342,8 @@ async fn load(db: &LocalDb, worktree_path: &str, job_ids: &[String]) -> DbResult
 
             Ok(Some(Loaded {
                 execution_id,
+                project_id,
+                repository_id,
                 base_commit,
                 pack_anchor,
                 default_branch,
@@ -370,6 +380,8 @@ struct EventUpdate {
 #[derive(Clone)]
 struct ExecHistory {
     execution_id: String,
+    project_id: String,
+    repository_id: String,
     base_sha: String,
     tip_sha: String,
     pack: Option<(Vec<u8>, Vec<u8>)>,
@@ -469,6 +481,8 @@ fn classify(
             .map(|base| forward_map(worktree, jj, base));
         history = Some(ExecHistory {
             execution_id: loaded.execution_id.clone(),
+            project_id: loaded.project_id.clone(),
+            repository_id: loaded.repository_id.clone(),
             base_sha: history_base,
             tip_sha,
             pack: pack_pair,

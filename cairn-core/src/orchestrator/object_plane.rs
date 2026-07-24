@@ -3,12 +3,171 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cairn_common::executor_protocol::{
-    BuildSlotRequest, DeltaUploadReceipt, ObjectTransferCoordinate,
+    CellRequest, CloudObjectGrantRequest, CloudObjectOperation, DeltaUploadReceipt,
+    ObjectTransferCoordinate,
 };
 use sha2::{Digest, Sha256};
 
+use crate::storage::content_store::ContentStore;
+use crate::storage::pack_catalog::PackCatalogPublication;
+use crate::storage::{DbResult, LocalDb, RowExt};
+
 const CREDENTIAL_TTL_MS: u64 = 15 * 60 * 1000;
 const STAGED_UPLOAD_TTL_MS: u64 = 60 * 60 * 1000;
+
+#[derive(Clone)]
+pub struct ValidatedObjectPack {
+    pub pack: Vec<u8>,
+    pub(crate) index: Vec<u8>,
+    pub(crate) framed: Vec<u8>,
+    pub(crate) content_hash: String,
+    pub pack_checksum: String,
+    pub(crate) object_count: u64,
+}
+
+pub fn validate_pack_bytes(pack: Vec<u8>) -> Result<ValidatedObjectPack, String> {
+    let validated =
+        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
+            .map_err(|error| format!("validate object pack: {error}"))?;
+    let index = validated.index.clone();
+    let framed = cairn_codec::transfer::frame_pack(&pack, &index);
+    Ok(ValidatedObjectPack {
+        content_hash: content_sha256(&framed),
+        pack_checksum: validated.manifest.pack_checksum,
+        object_count: validated.manifest.object_count,
+        pack,
+        index,
+        framed,
+    })
+}
+
+pub fn validate_framed_pack(framed: Vec<u8>) -> Result<ValidatedObjectPack, String> {
+    let expected_hash = content_sha256(&framed);
+    let (pack, supplied_index) = cairn_codec::transfer::unframe_pack(&framed)
+        .map_err(|error| format!("unframe object pack: {error}"))?;
+    let validated = validate_pack_bytes(pack)?;
+    if validated.index != supplied_index {
+        return Err("object pack index disagrees with independent validation".into());
+    }
+
+    if validated.content_hash != expected_hash {
+        return Err("object pack framing changed during validation".into());
+    }
+    Ok(validated)
+}
+
+/// Put validated bytes before publishing their catalog owner reference. An
+/// absent content store is a complete local-only mode, not an error.
+pub(crate) async fn publish_validated_pack(
+    db: &LocalDb,
+    store: Option<&dyn ContentStore>,
+    pack: &ValidatedObjectPack,
+    mut publication: PackCatalogPublication,
+) -> Result<(), String> {
+    publication.content_hash = pack.content_hash.clone();
+    publication.byte_count = pack.framed.len() as u64;
+    publication.pack_checksum = pack.pack_checksum.clone();
+    publication.object_count = pack.object_count;
+    if let Some(store) = store {
+        store
+            .put(&pack.content_hash, &pack.framed)
+            .await
+            .map_err(|error| format!("put object pack {}: {error}", pack.content_hash))?;
+        publish_validated_reference(db, pack, publication).await?;
+    }
+    Ok(())
+}
+
+/// Publish a reference for bytes already durably present in the content store.
+/// This is the completion seam for direct executor uploads: callers must first
+/// fetch and validate the addressed bytes.
+pub(crate) async fn publish_validated_reference(
+    db: &LocalDb,
+    pack: &ValidatedObjectPack,
+    mut publication: PackCatalogPublication,
+) -> Result<(), String> {
+    publication.content_hash = pack.content_hash.clone();
+    publication.byte_count = pack.framed.len() as u64;
+    publication.pack_checksum = pack.pack_checksum.clone();
+    publication.object_count = pack.object_count;
+    crate::storage::pack_catalog::publish_pack(db, publication)
+        .await
+        .map_err(|error| format!("publish object pack catalog: {error}"))
+}
+
+/// Resolve durable catalog truth. Local object presence is deliberately
+/// irrelevant; only referenced, published entries participate.
+pub async fn resolve_catalog_chain(
+    db: &LocalDb,
+    project_id: &str,
+    repository_id: &str,
+    want_commit: &str,
+    have_commits: &[String],
+) -> DbResult<Vec<(String, u64, String, Option<String>, String)>> {
+    let mut tip = want_commit.to_owned();
+    let mut chain = Vec::new();
+    for _ in 0..128 {
+        if have_commits.iter().any(|have| have == &tip) {
+            break;
+        }
+        let Some(row) = db
+            .query_opt(
+                "SELECT content_hash, byte_count, pack_checksum, base_commit, tip_commit
+                 FROM pack_catalog c WHERE c.project_id = ?1 AND c.repository_id = ?2
+                   AND c.object_format = 'sha1' AND c.tip_commit = ?3
+                   AND c.publication_state = 'published'
+                   AND EXISTS (SELECT 1 FROM pack_catalog_references r
+                     WHERE r.content_hash = c.content_hash AND r.project_id = c.project_id
+                       AND r.repository_id = c.repository_id
+                       AND r.object_format = c.object_format)
+                 ORDER BY CASE kind WHEN 'reachable' THEN 0 ELSE 1 END,
+                          created_at DESC LIMIT 1",
+                (project_id.to_owned(), repository_id.to_owned(), tip.clone()),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.i64(1)? as u64,
+                        row.text(2)?,
+                        row.opt_text(3)?,
+                        row.text(4)?,
+                    ))
+                },
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        tip = match &row.3 {
+            Some(base) => base.clone(),
+            None => {
+                chain.push(row);
+                break;
+            }
+        };
+        chain.push(row);
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Read-only runner-local pack construction. Call without the project-store lock.
+pub fn build_local_reachable_pack(
+    repository: &Path,
+    want_commit: &str,
+    have_commits: &[String],
+) -> Result<Option<ValidatedObjectPack>, String> {
+    let wants = [want_commit.to_owned()];
+    let Some((pack, builder_index)) =
+        cairn_codec::transfer::build_reachable_pack(repository, &wants, have_commits)?
+    else {
+        return Ok(None);
+    };
+    let validated = validate_pack_bytes(pack)?;
+    if validated.index != builder_index {
+        return Err("reachable pack builder index disagrees with independent validation".into());
+    }
+    Ok(Some(validated))
+}
 
 #[derive(Clone, Debug)]
 struct ObjectCredentialSession {
@@ -36,7 +195,7 @@ pub struct AuthenticatedObjectSession {
 
 #[derive(Clone, Debug)]
 pub struct StagedDeltaUpload {
-    pub receipt: DeltaUploadReceipt,
+    receipt: DeltaUploadReceipt,
     pub path: PathBuf,
     staged_at_unix_ms: u64,
 }
@@ -122,12 +281,7 @@ impl ObjectPlaneState {
         }
     }
 
-    pub fn authorize_request(
-        &self,
-        request: &BuildSlotRequest,
-        executor_id: &str,
-        generation: u64,
-    ) {
+    pub fn authorize_request(&self, request: &CellRequest, executor_id: &str, generation: u64) {
         let coordinate = ObjectTransferCoordinate {
             repository: request.repository.identity(),
             request_id: request.request_id.clone(),
@@ -169,6 +323,26 @@ impl ObjectPlaneState {
             .is_some_and(|transfer| {
                 transfer.coordinate == *coordinate && transfer.base_commit == base_commit
             })
+    }
+
+    /// Validate the execution/generation fence before the runner asks the API to
+    /// mint bearer material. Hash and length checks happen here as well as at the
+    /// API boundary so malformed executor input never reaches the grant minter.
+    pub(crate) fn authorizes_cloud_grant(
+        &self,
+        request: &CloudObjectGrantRequest,
+        base_commit: &str,
+    ) -> bool {
+        let valid_hash = request.content_hash.len() == 64
+            && request
+                .content_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let valid_size = match request.operation {
+            CloudObjectOperation::Get => request.byte_count.is_none(),
+            CloudObjectOperation::Put => request.byte_count.is_some_and(|bytes| bytes > 0),
+        };
+        valid_hash && valid_size && self.authorizes(&request.coordinate, base_commit)
     }
 
     pub fn authenticate(
@@ -254,7 +428,7 @@ impl ObjectPlaneState {
             .cloned()
     }
 
-    pub fn consume_staged_delta(&self, receipt: &DeltaUploadReceipt) -> Result<(), String> {
+    pub(crate) fn consume_staged_delta(&self, receipt: &DeltaUploadReceipt) -> Result<(), String> {
         let upload = {
             let mut staged = self.staged.lock().unwrap();
             match staged.get(&receipt.receipt_id) {
@@ -273,7 +447,7 @@ impl ObjectPlaneState {
         Ok(())
     }
 
-    pub fn cleanup_expired_staged(&self, now_unix_ms: u64) {
+    fn cleanup_expired_staged(&self, now_unix_ms: u64) {
         let expired = {
             let mut staged = self.staged.lock().unwrap();
             let ids = staged
@@ -327,6 +501,12 @@ mod tests {
     use super::*;
     use cairn_common::executor_protocol::{GitObjectFormat, RepositoryIdentity};
 
+    #[test]
+    fn canonical_validator_rejects_unframed_and_corrupt_pack_bytes() {
+        assert!(validate_pack_bytes(b"not a git pack".to_vec()).is_err());
+        assert!(validate_framed_pack(b"not framed".to_vec()).is_err());
+    }
+
     fn coordinate(generation: u64) -> ObjectTransferCoordinate {
         ObjectTransferCoordinate {
             repository: RepositoryIdentity {
@@ -356,11 +536,9 @@ mod tests {
 
     #[test]
     fn request_authorization_binds_every_coordinate_dimension() {
-        use cairn_common::executor_protocol::{
-            BuildSlotPriority, MutationPolicy, RepositoryLocator,
-        };
+        use cairn_common::executor_protocol::{CellPriority, MutationPolicy, RepositoryLocator};
         let state = ObjectPlaneState::default();
-        let request = BuildSlotRequest {
+        let request = CellRequest {
             request_id: "request".into(),
             attempt_id: "attempt".into(),
             project_id: "project".into(),
@@ -371,20 +549,39 @@ mod tests {
             },
             base_commit: "a".repeat(40),
             command: "check".into(),
+            command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            owner: None,
             cwd: String::new(),
             env: Vec::new(),
-            priority: BuildSlotPriority::ReviewCheck,
+            priority: CellPriority::ReviewCheck,
             deadline_unix_ms: 1,
             timeout_ms: 1,
             mutation_policy: MutationPolicy::PureVerdict,
             requesting_job_id: None,
             affinity_key: None,
             constraints: None,
+            command_resource_identity: None,
+            resource_reservation: Default::default(),
+            learned_estimate: None,
         };
         state.authorize_request(&request, "executor", 1);
         assert!(state.authorizes(&coordinate(1), &request.base_commit));
         assert!(!state.authorizes(&coordinate(2), &request.base_commit));
         assert!(!state.authorizes(&coordinate(1), &"b".repeat(40)));
+        let get = CloudObjectGrantRequest {
+            coordinate: coordinate(1),
+            content_hash: "a".repeat(64),
+            operation: CloudObjectOperation::Get,
+            byte_count: None,
+        };
+        assert!(state.authorizes_cloud_grant(&get, &request.base_commit));
+        let mut wrong_generation = get.clone();
+        wrong_generation.coordinate.connection_generation = 2;
+        assert!(!state.authorizes_cloud_grant(&wrong_generation, &request.base_commit));
+        let mut malformed_put = get;
+        malformed_put.operation = CloudObjectOperation::Put;
+        assert!(!state.authorizes_cloud_grant(&malformed_put, &request.base_commit));
+
         state.revoke_request("request", "attempt", "executor", 1);
         assert!(!state.authorizes(&coordinate(1), &request.base_commit));
     }

@@ -19,7 +19,7 @@ pub enum PatchEnvelopeFileChange {
 /// Apply a unified diff to file content.
 /// The diff must be for a single file. Multi-file diffs are rejected.
 /// Returns the patched content on success.
-pub fn apply_unified_diff(content: &str, diff: &str) -> Result<String, String> {
+pub(crate) fn apply_unified_diff(content: &str, diff: &str) -> Result<String, String> {
     let hunks = parse_hunks(diff)?;
 
     if hunks.is_empty() {
@@ -53,7 +53,10 @@ pub fn apply_unified_diff(content: &str, diff: &str) -> Result<String, String> {
 }
 
 /// Normalize supported patch payloads into a canonical single-file unified diff body.
-pub fn normalize_single_file_patch(diff: &str, expected_path: &str) -> Result<String, String> {
+pub(crate) fn normalize_single_file_patch(
+    diff: &str,
+    expected_path: &str,
+) -> Result<String, String> {
     if diff.trim().is_empty() {
         return Err(ACCEPTED_PATCH_FORMATS_ERROR.to_string());
     }
@@ -68,7 +71,7 @@ pub fn normalize_single_file_patch(diff: &str, expected_path: &str) -> Result<St
 
 /// Validate that a diff is for a single file and matches the expected path.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn validate_single_file_diff(diff: &str, expected_path: &str) -> Result<(), String> {
+fn validate_single_file_diff(diff: &str, expected_path: &str) -> Result<(), String> {
     normalize_single_file_patch(diff, expected_path).map(|_| ())
 }
 
@@ -118,7 +121,7 @@ fn validate_unified_diff(diff: &str, expected_path: &str) -> Result<(), String> 
     Ok(())
 }
 
-pub fn parse_patch_envelope(diff: &str) -> Result<Vec<PatchEnvelopeFileChange>, String> {
+pub(crate) fn parse_patch_envelope(diff: &str) -> Result<Vec<PatchEnvelopeFileChange>, String> {
     if diff.trim().is_empty() {
         return Err(ACCEPTED_PATCH_FORMATS_ERROR.to_string());
     }

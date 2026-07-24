@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// `None`.
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
-    pub project_id: Option<String>,
+    pub(crate) project_id: Option<String>,
 }
 
 impl Scope {
@@ -22,8 +22,8 @@ impl Scope {
 /// Half-open time window in epoch seconds. A `None` bound is unbounded.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TimeRange {
-    pub start: Option<i64>,
-    pub end: Option<i64>,
+    pub(crate) start: Option<i64>,
+    pub(crate) end: Option<i64>,
 }
 
 impl TimeRange {
@@ -77,26 +77,26 @@ impl Bucket {
 #[serde(rename_all = "camelCase")]
 pub struct TokensPerSessionPoint {
     /// Epoch seconds at the start of the bucket.
-    pub bucket_start: i64,
-    pub avg_tokens: f64,
-    pub session_count: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) avg_tokens: f64,
+    pub(crate) session_count: i64,
 }
 
 /// One PR-producing job's token-to-line efficiency.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TokensPerLocPoint {
-    pub job_id: String,
+    pub(crate) job_id: String,
     /// Epoch seconds the merge request opened.
-    pub ts: i64,
-    pub billable_tokens: i64,
-    pub lines_changed: i64,
-    pub tokens_per_line: f64,
+    pub(crate) ts: i64,
+    pub(crate) billable_tokens: i64,
+    pub(crate) lines_changed: i64,
+    pub(crate) tokens_per_line: f64,
     /// Real metered cost for this PR's job (exact `events.cost_usd` when
     /// reported, else the price-table estimate). Drives the cost-per-line chart.
-    pub cost_usd: f64,
-    pub model: Option<String>,
-    pub role: String,
+    pub(crate) cost_usd: f64,
+    pub(crate) model: Option<String>,
+    pub(crate) role: String,
 }
 
 /// Priced cost for one (time bucket, backend) group; the stacked provider-split
@@ -104,10 +104,10 @@ pub struct TokensPerLocPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendCostPoint {
-    pub bucket_start: i64,
-    pub backend: String,
-    pub cost_usd: f64,
-    pub billable_tokens: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) backend: String,
+    pub(crate) cost_usd: f64,
+    pub(crate) billable_tokens: i64,
 }
 
 /// Token components (by type) for one time bucket; the stacked token-composition
@@ -116,12 +116,12 @@ pub struct BackendCostPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenCompositionPoint {
-    pub bucket_start: i64,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
-    pub thinking: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) input: i64,
+    pub(crate) cache_read: i64,
+    pub(crate) cache_create: i64,
+    pub(crate) output: i64,
+    pub(crate) thinking: i64,
 }
 
 /// Total real cost for one project across the range; the cost-by-project chart
@@ -129,21 +129,21 @@ pub struct TokenCompositionPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectCost {
-    pub project_id: String,
-    pub project_name: String,
-    pub cost_usd: f64,
-    pub billable_tokens: i64,
+    pub(crate) project_id: String,
+    pub(crate) project_name: String,
+    pub(crate) cost_usd: f64,
+    pub(crate) billable_tokens: i64,
 }
 
 /// Tool-call error rate for one time bucket; the tool-error-rate trend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolErrorRatePoint {
-    pub bucket_start: i64,
-    pub total: i64,
-    pub errors: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) total: i64,
+    pub(crate) errors: i64,
     /// `errors / total`; 0 when no calls in the bucket.
-    pub error_rate: f64,
+    pub(crate) error_rate: f64,
 }
 
 /// Total billable tokens for one (day-of-week, hour) cell, in the user's local
@@ -151,18 +151,18 @@ pub struct ToolErrorRatePoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HeatmapCell {
-    pub day_of_week: i64,
-    pub hour: i64,
-    pub tokens: i64,
+    pub(crate) day_of_week: i64,
+    pub(crate) hour: i64,
+    pub(crate) tokens: i64,
 }
 
 /// One trend point of priced cost.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CostPoint {
-    pub bucket_start: i64,
-    pub cost_usd: f64,
-    pub billable_tokens: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) billable_tokens: i64,
 }
 
 /// One (fine-bucket, backend) effective-cost point. `effective_cost` allocates a
@@ -176,68 +176,68 @@ pub struct CostPoint {
 pub struct EffectiveCostPoint {
     /// First-of-month epoch seconds (UTC) of the month this point belongs to;
     /// the ratio/fee allocation is keyed on this.
-    pub month_start: i64,
+    pub(crate) month_start: i64,
     /// Start epoch seconds of the fine bucket (day/week/hour/month) this point
     /// covers. Equals `month_start` when the page bucket is Month.
-    pub bucket_start: i64,
-    pub backend: String,
+    pub(crate) bucket_start: i64,
+    pub(crate) backend: String,
     /// True only when this backend reports a real per-generation cost
     /// (genuinely pay-as-you-go, e.g. OpenRouter). Subscription backends
     /// (Claude/Codex) are never metered, even before a fee is configured.
-    pub metered: bool,
+    pub(crate) metered: bool,
     /// True when the month contains "now" (running estimate, not yet settled).
-    pub provisional: bool,
+    pub(crate) provisional: bool,
     /// The flat monthly fee for a subscription backend; 0 for metered.
-    pub subscription_fee: f64,
+    pub(crate) subscription_fee: f64,
     /// Workspace-wide list-price cost for (month, backend); drives the ratio.
-    pub list_cost: f64,
+    pub(crate) list_cost: f64,
     /// List/real-price cost of the displayed (scoped) usage.
-    pub scoped_cost: f64,
+    pub(crate) scoped_cost: f64,
     /// `fee / workspace_list_cost` for subscriptions; `1.0` for metered;
     /// `None` when undefined (a fee is paid but there is no priced usage).
-    pub ratio: Option<f64>,
+    pub(crate) ratio: Option<f64>,
     /// Effective cost of the scoped usage: `scoped_cost * ratio` for a
     /// subscription, or real metered cost. 0 when the fee is unrecovered.
-    pub effective_cost: f64,
+    pub(crate) effective_cost: f64,
     /// Billable tokens in the scoped usage for this (bucket, backend).
-    pub billable_tokens: i64,
+    pub(crate) billable_tokens: i64,
     /// Input-side token denominator (`input + cache_read + cache_create`).
-    pub input_tokens: i64,
+    pub(crate) input_tokens: i64,
     /// Output-side token denominator.
-    pub output_tokens: i64,
+    pub(crate) output_tokens: i64,
     /// Effective cost attributed to input tokens; sums with
     /// `effective_output_cost` to `effective_cost`.
-    pub effective_input_cost: f64,
+    pub(crate) effective_input_cost: f64,
     /// Effective cost attributed to output tokens.
-    pub effective_output_cost: f64,
+    pub(crate) effective_output_cost: f64,
 }
 
 /// Economics for one grouping key (a model alias or a normalized role).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EconomicsRow {
-    pub key: String,
-    pub billable_tokens: i64,
-    pub cost_usd: f64,
-    pub runs: i64,
-    pub input_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_create_tokens: i64,
-    pub output_tokens: i64,
-    pub thinking_tokens: i64,
+    pub(crate) key: String,
+    pub(crate) billable_tokens: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) runs: i64,
+    pub(crate) input_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_create_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) thinking_tokens: i64,
     /// `cache_read / total_input` (Claude cache efficiency); 0 when no input.
-    pub cache_hit_ratio: f64,
+    pub(crate) cache_hit_ratio: f64,
     /// `thinking / output`; 0 when no output.
-    pub thinking_share: f64,
+    pub(crate) thinking_share: f64,
 }
 
 /// Model and role economics plus the price-table source date.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRoleEconomics {
-    pub by_model: Vec<EconomicsRow>,
-    pub by_role: Vec<EconomicsRow>,
-    pub price_source_date: String,
+    pub(crate) by_model: Vec<EconomicsRow>,
+    pub(crate) by_role: Vec<EconomicsRow>,
+    pub(crate) price_source_date: String,
 }
 
 // --- Tier B: tool-invocation (target/error) analytics ---
@@ -246,49 +246,49 @@ pub struct ModelRoleEconomics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolBackfillSummary {
-    pub runs_processed: i64,
-    pub rows_written: i64,
-    pub total_indexed: i64,
+    pub(crate) runs_processed: i64,
+    pub(crate) rows_written: i64,
+    pub(crate) total_indexed: i64,
 }
 
 /// Activity and error rate for one target shape (verb × scheme × kind).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetShapeRow {
-    pub verb: String,
-    pub scheme: String,
-    pub kind: String,
-    pub count: i64,
-    pub error_count: i64,
-    pub error_rate: f64,
+    pub(crate) verb: String,
+    pub(crate) scheme: String,
+    pub(crate) kind: String,
+    pub(crate) count: i64,
+    pub(crate) error_count: i64,
+    pub(crate) error_rate: f64,
 }
 
 /// One frequently-targeted resource or file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TopTargetRow {
-    pub target: String,
-    pub scheme: String,
-    pub count: i64,
-    pub error_count: i64,
+    pub(crate) target: String,
+    pub(crate) scheme: String,
+    pub(crate) count: i64,
+    pub(crate) error_count: i64,
 }
 
 /// One trend point of average tool calls per session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallsPerSessionPoint {
-    pub bucket_start: i64,
-    pub avg_calls: f64,
-    pub session_count: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) avg_calls: f64,
+    pub(crate) session_count: i64,
 }
 
 /// Tool/verb frequency for one time bucket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolMixPoint {
-    pub bucket_start: i64,
-    pub verb: String,
-    pub count: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) verb: String,
+    pub(crate) count: i64,
 }
 
 /// Run wall-time composition for one time bucket. `model_overhead_s` is the
@@ -297,36 +297,36 @@ pub struct ToolMixPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeCompositionPoint {
-    pub bucket_start: i64,
-    pub wall_s: i64,
-    pub tool_s: i64,
-    pub model_overhead_s: i64,
-    pub run_count: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) wall_s: i64,
+    pub(crate) tool_s: i64,
+    pub(crate) model_overhead_s: i64,
+    pub(crate) run_count: i64,
 }
 
 /// Tool execution seconds by verb for one time bucket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolTimeMixPoint {
-    pub bucket_start: i64,
-    pub verb: String,
-    pub seconds: i64,
-    pub count: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) verb: String,
+    pub(crate) seconds: i64,
+    pub(crate) count: i64,
 }
 
 /// Aggregated duration for one target shape, ordered by total seconds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandDurationRow {
-    pub verb: String,
-    pub scheme: String,
-    pub kind: String,
-    pub target: Option<String>,
-    pub count: i64,
-    pub total_s: i64,
-    pub avg_s: f64,
-    pub max_s: i64,
-    pub error_count: i64,
+    pub(crate) verb: String,
+    pub(crate) scheme: String,
+    pub(crate) kind: String,
+    pub(crate) target: Option<String>,
+    pub(crate) count: i64,
+    pub(crate) total_s: i64,
+    pub(crate) avg_s: f64,
+    pub(crate) max_s: i64,
+    pub(crate) error_count: i64,
 }
 
 /// Average completed run wall time per session for one time bucket. A session's
@@ -335,18 +335,18 @@ pub struct CommandDurationRow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDurationPoint {
-    pub bucket_start: i64,
-    pub session_count: i64,
-    pub avg_s: f64,
+    pub(crate) bucket_start: i64,
+    pub(crate) session_count: i64,
+    pub(crate) avg_s: f64,
 }
 
 /// Target-shape breakdown plus the most-targeted resources.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetBreakdown {
-    pub shapes: Vec<TargetShapeRow>,
-    pub top_targets: Vec<TopTargetRow>,
-    pub total: i64,
+    pub(crate) shapes: Vec<TargetShapeRow>,
+    pub(crate) top_targets: Vec<TopTargetRow>,
+    pub(crate) total: i64,
 }
 
 // --- Delivery economics: normalized per merged PR shipped ---
@@ -359,19 +359,19 @@ pub struct TargetBreakdown {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PrEconomicsRow {
-    pub key: String,
+    pub(crate) key: String,
     /// Merged PRs attributed to this key's jobs.
-    pub pr_count: i64,
+    pub(crate) pr_count: i64,
     /// Total delivery cost (real metered where reported, else priced estimate).
-    pub cost_usd: f64,
-    pub billable_tokens: i64,
-    pub lines_changed: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) billable_tokens: i64,
+    pub(crate) lines_changed: i64,
     /// `cost_usd / pr_count`; 0 when no PRs.
-    pub cost_per_pr: f64,
+    pub(crate) cost_per_pr: f64,
     /// `billable_tokens / pr_count`; 0 when no PRs.
-    pub tokens_per_pr: f64,
+    pub(crate) tokens_per_pr: f64,
     /// `billable_tokens / lines_changed`; 0 when no lines.
-    pub tokens_per_line: f64,
+    pub(crate) tokens_per_line: f64,
 }
 
 /// Per-model and per-role delivery economics normalized per merged PR, plus the
@@ -379,9 +379,9 @@ pub struct PrEconomicsRow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MergedPrEconomics {
-    pub by_model: Vec<PrEconomicsRow>,
-    pub by_role: Vec<PrEconomicsRow>,
-    pub price_source_date: String,
+    pub(crate) by_model: Vec<PrEconomicsRow>,
+    pub(crate) by_role: Vec<PrEconomicsRow>,
+    pub(crate) price_source_date: String,
 }
 
 /// One time-bucket point of delivery efficiency: the cost and tokens the
@@ -390,11 +390,11 @@ pub struct MergedPrEconomics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PrCostTrendPoint {
-    pub bucket_start: i64,
-    pub pr_count: i64,
-    pub cost_usd: f64,
-    pub billable_tokens: i64,
-    pub lines_changed: i64,
+    pub(crate) bucket_start: i64,
+    pub(crate) pr_count: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) billable_tokens: i64,
+    pub(crate) lines_changed: i64,
 }
 
 /// One merged issue's lead time: the seconds from issue creation to its first
@@ -402,7 +402,7 @@ pub struct PrCostTrendPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueLeadTimePoint {
-    pub lead_seconds: i64,
+    pub(crate) lead_seconds: i64,
     /// `merged_at` of the first merged PR, so the client can slice by time.
-    pub merged_at: i64,
+    pub(crate) merged_at: i64,
 }

@@ -536,7 +536,7 @@ struct PromptAnswerItem {
     text: Option<String>,
 }
 
-pub fn normalize_prompt_answer_payload(
+fn normalize_prompt_answer_payload(
     questions_json: &str,
     payload: &Value,
 ) -> Result<String, String> {
@@ -694,28 +694,7 @@ pub async fn answer_node_question(
     answer_prompt_id(orch, &prompt_id, response).await
 }
 
-pub async fn validate_node_question_answer(
-    orch: &Orchestrator,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    node_segment: &str,
-    prompt_segment: &str,
-    payload: &Value,
-) -> Result<String, String> {
-    let (_, questions_json) = lookup_prompt_for_node_question(
-        orch,
-        project_key,
-        issue_number,
-        exec_seq,
-        node_segment,
-        prompt_segment,
-    )
-    .await?;
-    normalize_prompt_answer_payload(&questions_json, payload)
-}
-
-pub async fn answer_prompt_id(
+async fn answer_prompt_id(
     orch: &Orchestrator,
     prompt_id: &str,
     response: String,
@@ -802,7 +781,7 @@ pub async fn answer_prompt_id(
             (resume.tool_use_id.as_deref(), resume.session_id.as_deref())
         {
             let now = chrono::Utc::now().timestamp() as i32;
-            if let Err(e) = crate::execution::jobs::store_tool_result_event_with_turn(
+            if let Err(error) = crate::execution::jobs::store_tool_result_event_with_turn(
                 orch,
                 &resume.run_id,
                 session_id,
@@ -812,7 +791,15 @@ pub async fn answer_prompt_id(
                 now,
                 resume.predecessor_turn_id.as_deref(),
             ) {
-                log::warn!("Failed to store synthetic prompt tool_result: {}", e);
+                // The prompt answer and successor are already durable. Dispatching
+                // with a visible user event keeps retry semantics intact, while
+                // OpenRouter history normalization supplies the missing result.
+                log::warn!(
+                    "Failed to persist synthetic prompt tool_result for run {} and call {}: {}. Resuming with a user event",
+                    resume.run_id,
+                    tool_use_id,
+                    error
+                );
                 false
             } else {
                 true

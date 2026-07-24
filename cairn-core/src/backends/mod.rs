@@ -51,7 +51,7 @@ pub enum SessionStart {
 }
 
 impl SessionStart {
-    pub fn session_id(&self) -> &str {
+    fn session_id(&self) -> &str {
         match self {
             SessionStart::New { session_id }
             | SessionStart::Resume { session_id, .. }
@@ -82,16 +82,16 @@ impl SessionStart {
 /// protocol fields. Actual enforcement lives in Cairn's verb handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPermissions {
-    pub fence: Fence,
+    fence: Fence,
 }
 
 impl AgentPermissions {
-    pub fn new(fence: Fence) -> Self {
+    pub(crate) fn new(fence: Fence) -> Self {
         Self { fence }
     }
 
     /// Convert to a legacy permission mode string for the runtime stdin protocol.
-    pub fn to_legacy_str(&self) -> &'static str {
+    pub(crate) fn to_legacy_str(&self) -> &'static str {
         self.fence.to_legacy_permission_mode()
     }
 }
@@ -104,57 +104,57 @@ impl AgentPermissions {
 #[derive(Debug, Clone)]
 pub struct ResolvedTools {
     /// Tools the backend's native runtime should allow.
-    pub allowed: Vec<String>,
+    pub(crate) allowed: Vec<String>,
     /// Tools the backend's native runtime should disallow.
-    pub disallowed: Vec<String>,
+    pub(crate) disallowed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredReasoningEffort {
-    pub reasoning_effort: String,
-    pub description: Option<String>,
+    reasoning_effort: String,
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredModel {
-    pub id: String,
-    pub model: String,
-    pub display_name: String,
-    pub description: Option<String>,
+    pub(crate) id: String,
+    pub(crate) model: String,
+    pub(crate) display_name: String,
+    pub(crate) description: Option<String>,
     #[serde(default)]
-    pub hidden: bool,
+    pub(crate) hidden: bool,
     #[serde(default)]
-    pub is_default: bool,
-    pub default_reasoning_effort: Option<String>,
+    pub(crate) is_default: bool,
+    pub(crate) default_reasoning_effort: Option<String>,
     #[serde(default)]
-    pub supported_reasoning_efforts: Vec<DiscoveredReasoningEffort>,
+    pub(crate) supported_reasoning_efforts: Vec<DiscoveredReasoningEffort>,
     #[serde(default)]
-    pub context_window: Option<i64>,
+    pub(crate) context_window: Option<i64>,
     #[serde(default)]
-    pub canonical_slug: Option<String>,
+    pub(crate) canonical_slug: Option<String>,
     #[serde(default)]
-    pub pricing: Option<DiscoveredModelPricing>,
+    pub(crate) pricing: Option<DiscoveredModelPricing>,
     #[serde(default)]
-    pub supported_parameters: Vec<String>,
+    pub(crate) supported_parameters: Vec<String>,
     #[serde(default)]
-    pub router: bool,
+    pub(crate) router: bool,
     #[serde(default)]
-    pub architecture_modality: Option<String>,
+    pub(crate) architecture_modality: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredModelPricing {
-    pub prompt: Option<String>,
-    pub completion: Option<String>,
-    pub request: Option<String>,
-    pub image: Option<String>,
-    pub web_search: Option<String>,
-    pub internal_reasoning: Option<String>,
-    pub input_cache_read: Option<String>,
-    pub input_cache_write: Option<String>,
+    prompt: Option<String>,
+    completion: Option<String>,
+    request: Option<String>,
+    image: Option<String>,
+    web_search: Option<String>,
+    internal_reasoning: Option<String>,
+    input_cache_read: Option<String>,
+    input_cache_write: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,19 +162,19 @@ pub struct DiscoveredModelPricing {
 pub struct ProviderOptionDescriptor {
     /// Runtime-supported option key. Add variants here only when preset
     /// resolution and backend launch paths also carry the option end-to-end.
-    pub key: ProviderOptionKey,
-    pub label: String,
-    pub kind: OptionKind,
+    key: ProviderOptionKey,
+    label: String,
+    kind: OptionKind,
     #[serde(default)]
-    pub choices: Vec<OptionChoice>,
-    pub default: Option<String>,
+    choices: Vec<OptionChoice>,
+    default: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OptionChoice {
-    pub value: String,
-    pub label: String,
+    value: String,
+    label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,12 +195,12 @@ pub enum OptionKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelCatalog {
-    pub backend: String,
-    pub models: Vec<DiscoveredModel>,
+    pub(crate) backend: String,
+    pub(crate) models: Vec<DiscoveredModel>,
     #[serde(default)]
-    pub options: Vec<ProviderOptionDescriptor>,
-    pub refreshed_at: Option<i64>,
-    pub error: Option<String>,
+    pub(crate) options: Vec<ProviderOptionDescriptor>,
+    pub(crate) refreshed_at: Option<i64>,
+    pub(crate) error: Option<String>,
 }
 
 // ============================================================================
@@ -215,57 +215,57 @@ pub struct ProviderModelCatalog {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Run ID for this session
-    pub run_id: String,
+    pub(crate) run_id: String,
     /// Working directory for the agent process
-    pub working_dir: String,
+    pub(crate) working_dir: String,
     /// The user prompt to send
-    pub prompt: String,
+    pub(crate) prompt: String,
     /// Agent role instructions (injected as system prompt content)
-    pub system_prompt_content: Option<String>,
+    pub(crate) system_prompt_content: Option<String>,
     /// The trailing per-run dynamic suffix of `system_prompt_content` (the
     /// orientation block + `</agent_role>` close). A suffix of
     /// `system_prompt_content`; used only to split the agent content into a static
     /// head and the inlined dynamic tail when recording the segment boundary map.
-    pub system_prompt_dynamic_tail: Option<String>,
+    pub(crate) system_prompt_dynamic_tail: Option<String>,
     /// Resolved model (job > agent > workspace default)
-    pub model: Option<Model>,
+    pub(crate) model: Option<Model>,
     /// Explicit session start semantics for this backend invocation.
-    pub session_start: SessionStart,
+    pub(crate) session_start: SessionStart,
     /// Resolved allowed tools list
-    pub allowed_tools: Vec<String>,
+    pub(crate) allowed_tools: Vec<String>,
     /// Resolved disallowed tools list
-    pub disallowed_tools: Vec<String>,
+    pub(crate) disallowed_tools: Vec<String>,
     /// The MCP config as a self-contained JSON string (built per run, never
     /// shared on disk). Claude passes it inline via `--mcp-config <json>`; Codex
     /// parses it to extract the cairn-cmd args.
-    pub mcp_config_json: String,
+    pub(crate) mcp_config_json: String,
     /// Stable home URI for this run (full node URI). Forwarded to the MCP child
     /// as `CAIRN_HOME_URI` so `cairn:~/...` shorthand resolves. Claude bakes this
     /// into its inline MCP config JSON env; Codex inherits it via the process env.
-    pub home_uri: String,
+    pub(crate) home_uri: String,
     /// Max thinking tokens (None = disabled)
-    pub max_thinking_tokens: Option<i32>,
+    pub(crate) max_thinking_tokens: Option<i32>,
     /// Codex: reasoning effort level ("low", "medium", "high", "xhigh")
-    pub reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     /// Service tier request id, if the backend supports one.
-    pub service_tier: Option<String>,
+    pub(crate) service_tier: Option<String>,
     /// Canonical agent permissions (replaces opaque permission_mode string).
-    pub permissions: AgentPermissions,
+    pub(crate) permissions: AgentPermissions,
     /// Enable stdin streaming (bidirectional mode)
-    pub bidirectional: bool,
+    pub(crate) bidirectional: bool,
     /// Pre-resolved identity for this session (includes project overrides).
     /// If set, backends use this instead of calling `orch.get_identity()`.
-    pub identity: Option<crate::identity::UserIdentity>,
+    pub(crate) identity: Option<crate::identity::UserIdentity>,
     /// Resolved JSON Schema to constrain the model's output natively (CAIRN-2505).
     /// Set only for node-less ephemeral calls that carry an output contract, so
     /// each backend passes the provider's native output constraint (Claude
     /// `--json-schema`, OpenRouter `response_format`, Codex per-turn
     /// `outputSchema`). `None` for ordinary agent sessions, which are unchanged.
-    pub output_schema: Option<serde_json::Value>,
+    pub(crate) output_schema: Option<serde_json::Value>,
     /// Ambient (no-worktree) run: selects the ambient tier variant of the shared
     /// CAIRN system-prompt segment (`cairn_system_prompt(ambient)`) rather than
     /// the authoring one. Set from `is_ambient_run` at session assembly.
-    pub ambient: bool,
+    pub(crate) ambient: bool,
     /// True only for a node-less EPHEMERAL CALL (CAIRN-2549). The calls path is
     /// the single source of truth: `start_agent_session` derives this from
     /// `constrain_output_natively`, which ONLY the calls path passes `true`.
@@ -274,7 +274,7 @@ pub struct SessionConfig {
     /// sessions leave it `false` and keep the process-per-session shape. A future
     /// non-call constrained session must NOT set this without owning the pooled
     /// lifecycle.
-    pub is_ephemeral_call: bool,
+    pub(crate) is_ephemeral_call: bool,
 }
 
 impl SessionConfig {}
@@ -305,8 +305,8 @@ pub enum CallBatchShape {
 /// unbounded (pure passthrough — no admission bookkeeping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallBatchCapability {
-    pub shape: CallBatchShape,
-    pub max_concurrency: Option<usize>,
+    pub(crate) shape: CallBatchShape,
+    pub(crate) max_concurrency: Option<usize>,
 }
 
 pub trait AgentBackend: Send + Sync {
@@ -374,7 +374,7 @@ pub trait AgentBackend: Send + Sync {
 
 /// Create an AgentBackend for the given backend name.
 /// Returns ClaudeBackend for None or "claude", CodexBackend for "codex".
-pub fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
+pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
     match name {
         Some("codex") => Box::new(codex::CodexBackend),
         Some("openrouter") => Box::new(openrouter::OpenRouterBackend),
@@ -392,7 +392,7 @@ const CODEX_MODEL_PREFIXES: &[&str] = &["codex-mini", "gpt-5"];
 /// **Deprecated path:** The primary path now is preset resolution via
 /// `config::presets::resolve_preset()`. This function remains as a fallback
 /// for legacy data (snapshots, concrete model strings not yet migrated to tiers).
-pub fn backend_for_model(model: &str) -> Option<&'static str> {
+pub(crate) fn backend_for_model(model: &str) -> Option<&'static str> {
     let lower = model.to_lowercase();
     if lower == "openrouter/auto" || lower.starts_with('~') || lower.contains('/') {
         return Some("openrouter");

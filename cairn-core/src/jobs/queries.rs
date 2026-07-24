@@ -18,69 +18,7 @@ pub struct ImplementationInfo {
     pub project_id: String,
 }
 
-pub async fn get_implementation_for_pr_by_cwd(
-    db: &LocalDb,
-    cwd: &str,
-) -> Result<ImplementationInfo, CairnError> {
-    let cwd = cwd.to_string();
-    db.read(|conn| {
-        let cwd = cwd.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT j.id, j.worktree_path, j.branch, p.id, j.recipe_node_id, e.snapshot
-                     FROM runs r
-                     JOIN jobs j ON r.job_id = j.id
-                     JOIN issues i ON j.issue_id = i.id
-                     JOIN projects p ON i.project_id = p.id
-                     LEFT JOIN executions e ON j.execution_id = e.id
-                     WHERE j.worktree_path = ?1
-                       AND r.status IN ('starting', 'live')
-                     ORDER BY r.created_at DESC",
-                    params![cwd.as_str()],
-                )
-                .await?;
-
-            while let Some(row) = rows.next().await? {
-                let node_id = row.opt_text(4)?;
-                let snapshot = row.opt_text(5)?;
-                let node_type = match (snapshot.as_deref(), node_id.as_deref()) {
-                    (Some(snapshot), Some(node_id)) => node_type_from_snapshot(snapshot, node_id),
-                    _ => None,
-                };
-                if node_type.as_deref() != Some("agent") {
-                    continue;
-                }
-
-                let worktree_path = row
-                    .opt_text(1)?
-                    .ok_or_else(|| DbError::internal("Implementation has no worktree path"))?;
-                let branch = row
-                    .opt_text(2)?
-                    .ok_or_else(|| DbError::internal("Implementation has no branch name"))?;
-
-                return Ok(ImplementationInfo {
-                    job_id: row.text(0)?,
-                    worktree_path,
-                    branch,
-                    project_id: row.text(3)?,
-                });
-            }
-
-            Err(DbError::Row(format!("implementation run not found: {cwd}")))
-        })
-    })
-    .await
-    .map_err(|error| match error {
-        DbError::Row(_) => CairnError::NotFound {
-            entity: "implementation run",
-            id: cwd,
-        },
-        other => other.into(),
-    })
-}
-
-pub async fn active_agent_job_ids_for_issue(
+pub(crate) async fn active_agent_job_ids_for_issue(
     db: &LocalDb,
     issue_id: &str,
 ) -> Result<Vec<String>, CairnError> {
@@ -97,52 +35,6 @@ pub async fn active_agent_job_ids_for_issue(
     )
     .await
     .map_err(Into::into)
-}
-
-pub async fn get_implementation_artifact(
-    db: &LocalDb,
-    job_id: &str,
-) -> Result<(String, Option<String>), CairnError> {
-    let job_id = job_id.to_string();
-    let artifact_data = db
-        .read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT data
-                         FROM artifacts
-                         WHERE job_id = ?1
-                         ORDER BY version DESC
-                         LIMIT 1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| row.text(0))
-                    .transpose()?
-                    .ok_or_else(|| {
-                        DbError::internal(
-                            "No implementation artifact found. Agent must call submit_output first.",
-                        )
-                    })
-            })
-        })
-        .await?;
-
-    let data: serde_json::Value = serde_json::from_str(&artifact_data)?;
-    let title = data
-        .get("title")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CairnError::Internal("Artifact missing 'title' field".to_string()))?
-        .to_string();
-    let body = data
-        .get("body")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    Ok((title, body))
 }
 
 pub async fn load_execution_snapshot(
@@ -180,59 +72,11 @@ pub async fn load_execution_snapshot(
     Ok(serde_json::from_str(&snapshot_json)?)
 }
 
-pub fn find_node_in_snapshot<'a>(
+fn find_node_in_snapshot<'a>(
     snapshot: &'a ExecutionSnapshot,
     node_id: &str,
 ) -> Option<&'a RecipeNode> {
     snapshot.recipe.nodes.iter().find(|node| node.id == node_id)
-}
-
-pub async fn load_node_for_job(
-    db: &LocalDb,
-    job_id: &str,
-) -> Result<Option<(RecipeNode, ExecutionSnapshot)>, CairnError> {
-    let job_id = job_id.to_string();
-    let row = db
-        .read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT j.recipe_node_id, e.snapshot
-                         FROM jobs j
-                         LEFT JOIN executions e ON j.execution_id = e.id
-                         WHERE j.id = ?1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| Ok((row.opt_text(0)?, row.opt_text(1)?)))
-                    .transpose()
-            })
-        })
-        .await?;
-
-    let Some((Some(node_id), Some(snapshot_json))) = row else {
-        return Ok(None);
-    };
-    let snapshot: ExecutionSnapshot = serde_json::from_str(&snapshot_json)?;
-    Ok(find_node_in_snapshot(&snapshot, &node_id)
-        .cloned()
-        .map(|node| (node, snapshot)))
-}
-
-pub async fn get_node_type_for_job(
-    db: &LocalDb,
-    execution_id: Option<&str>,
-    node_id: Option<&str>,
-) -> Option<String> {
-    let (execution_id, node_id) = match (execution_id, node_id) {
-        (Some(execution_id), Some(node_id)) => (execution_id, node_id),
-        _ => return None,
-    };
-    let snapshot = load_execution_snapshot(db, execution_id).await.ok()?;
-    find_node_in_snapshot(&snapshot, node_id).map(|node| node.node_type.to_string())
 }
 
 pub async fn get_node_name_from_execution(
@@ -244,36 +88,55 @@ pub async fn get_node_name_from_execution(
     find_node_in_snapshot(&snapshot, node_id).map(|node| node.name.clone())
 }
 
-pub async fn get_node_name_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
+/// The job's canonical node URI (`cairn://p/{KEY}/{number}/{seq}/{segment}`,
+/// nesting a sub-agent task under its parent node). This is the one canonical
+/// job-id → node-URI resolution: message wake links, pending-delivery
+/// recipients, and per-job scratch-dir naming all resolve through here.
+/// `Ok(None)` when the job can't be resolved (unknown id, or no `uri_segment`
+/// assigned yet).
+pub async fn home_uri_for_job(db: &LocalDb, job_id: &str) -> Result<Option<String>, DbError> {
     let job_id = job_id.to_string();
-    let data = db
-        .read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT execution_id, recipe_node_id FROM jobs WHERE id = ?1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| Ok((row.opt_text(0)?, row.opt_text(1)?)))
-                    .transpose()
-            })
-        })
-        .await
-        .ok()??;
-
-    match data {
-        (Some(execution_id), Some(recipe_node_id)) => {
-            get_node_name_from_execution(db, &execution_id, &recipe_node_id).await
-        }
-        _ => None,
-    }
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move { home_uri_for_job_conn(conn, &job_id).await })
+    })
+    .await
 }
 
-pub async fn task_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
+/// Connection-level variant of [`home_uri_for_job`] for callers already inside
+/// a caller-owned transaction.
+pub(crate) async fn home_uri_for_job_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Result<Option<String>, DbError> {
+    let mut rows = conn
+        .query(
+            "SELECT p.key, i.number, COALESCE(e.seq, 1), j.uri_segment, parent.uri_segment, j.agent_config_id
+             FROM jobs j
+             JOIN issues i ON i.id = j.issue_id
+             JOIN projects p ON p.id = i.project_id
+             LEFT JOIN executions e ON e.id = j.execution_id
+             LEFT JOIN jobs parent ON j.parent_job_id = parent.id
+             WHERE j.id = ?1 LIMIT 1",
+            params![job_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let key = row.text(0)?;
+    let number = row.i64(1)? as i32;
+    let seq = row.i64(2)? as i32;
+    let segment = row.opt_text(3)?;
+    let parent_segment = row.opt_text(4)?;
+    let is_workflow = row.opt_text(5)?.as_deref() == Some("workflow");
+    let parent_segment = (!is_workflow).then_some(parent_segment).flatten();
+    Ok(segment.map(|seg| {
+        cairn_common::uri::build_job_base_uri(&key, number, seq, &seg, parent_segment.as_deref())
+    }))
+}
+
+pub(crate) async fn task_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     let job_id = job_id.to_string();
     let (stored_segment, node_name, agent_config_id) = db
         .query_opt(
@@ -314,7 +177,7 @@ pub async fn task_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<Stri
 /// is the parent-segment input the URI builder needs to nest a sub-task as
 /// `.../{seq}/{parent}/task/{segment}` instead of misreporting it as a
 /// top-level node URI.
-pub async fn parent_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
+pub(crate) async fn parent_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     let job_id = job_id.to_string();
     db.query_opt(
         "SELECT parent.uri_segment
@@ -330,7 +193,7 @@ pub async fn parent_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<St
     .flatten()
 }
 
-pub async fn node_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
+pub(crate) async fn node_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     let job_id = job_id.to_string();
     let (stored_segment, recipe_node_id, node_name, agent_config_id, snapshot) = db
         .query_opt(
@@ -382,39 +245,10 @@ pub async fn node_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<Stri
         .filter(|segment| !segment.is_empty())
 }
 
-pub async fn resolve_task_artifact_uri(
-    db: &LocalDb,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    task_job_id: &str,
-) -> Option<String> {
-    let task_job_id = task_job_id.to_string();
-    let parent_job_id = db
-        .query_opt(
-            "SELECT parent_job_id FROM jobs WHERE id = ?1",
-            params![task_job_id.as_str()],
-            |row| row.opt_text(0),
-        )
-        .await
-        .ok()???;
-
-    let parent_segment = node_uri_segment_for_job(db, &parent_job_id).await?;
-    let task_segment = task_uri_segment_for_job(db, &task_job_id).await?;
-
-    Some(cairn_common::uri::build_task_artifact_uri(
-        project_key,
-        issue_number,
-        exec_seq,
-        &parent_segment,
-        &task_segment,
-    ))
-}
-
 #[derive(Serialize)]
 pub struct JobTabs {
-    pub available_tabs: Vec<String>,
-    pub initial_tab: String,
+    available_tabs: Vec<String>,
+    initial_tab: String,
 }
 
 pub async fn compute_tabs_for_jobs(
@@ -669,8 +503,8 @@ pub enum NodeActivity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatusIndicator {
-    pub job_id: String,
-    pub activity: NodeActivity,
+    job_id: String,
+    activity: NodeActivity,
 }
 
 /// Pure mapping from the three raw facts to a `NodeActivity`. Awaiting-input is
@@ -680,7 +514,7 @@ pub struct NodeStatusIndicator {
 /// prompt/permission row is the authoritative signal regardless of turn state.
 /// This mirrors exactly what the per-node chat surface uses
 /// (`get_pending_prompt_for_job` / `get_pending_permission_for_job`).
-pub fn derive_node_activity(
+pub(crate) fn derive_node_activity(
     head_turn_state: Option<&str>,
     has_pending_prompt: bool,
     has_pending_permission: bool,
@@ -770,13 +604,13 @@ pub async fn node_status_indicators(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueAgentRef {
-    pub job_id: String,
-    pub node_name: Option<String>,
-    pub agent_config_id: Option<String>,
-    pub activity: NodeActivity,
+    job_id: String,
+    node_name: Option<String>,
+    agent_config_id: Option<String>,
+    activity: NodeActivity,
     /// Timestamp of the head turn that produced this activity. Consumers use it
     /// to choose the most recently active agent when several jobs are live.
-    pub activity_updated_at: i64,
+    activity_updated_at: i64,
 }
 
 /// The cached pull-request facts for an issue's current execution, mirrored
@@ -787,15 +621,15 @@ pub struct IssueAgentRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssuePrIndicator {
-    pub pr_number: Option<i64>,
-    pub pr_url: Option<String>,
+    pr_number: Option<i64>,
+    pr_url: Option<String>,
     /// Cairn-owned lifecycle: `open` | `merged` | `closed`.
-    pub status: String,
-    pub github_state: Option<String>,
-    pub review_decision: Option<String>,
-    pub mergeable: Option<String>,
-    pub checks_status: Option<String>,
-    pub is_local: bool,
+    status: String,
+    github_state: Option<String>,
+    review_decision: Option<String>,
+    mergeable: Option<String>,
+    checks_status: Option<String>,
+    is_local: bool,
 }
 
 /// Live status rollup for one in-progress (active/waiting) issue — the unit the
@@ -803,16 +637,16 @@ pub struct IssuePrIndicator {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueStatusIndicator {
-    pub issue_id: String,
+    issue_id: String,
     /// Rolled up across the issue's current-execution jobs with
     /// `AwaitingInput > Running > Idle` precedence: awaiting-input is the
     /// actionable state, so it wins over a merely-running sibling job.
-    pub activity: NodeActivity,
+    activity: NodeActivity,
     /// The live (non-idle) jobs' agents, so the sidebar can show which agent is
     /// working. Empty when the issue is idle.
-    pub agents: Vec<IssueAgentRef>,
+    agents: Vec<IssueAgentRef>,
     /// The issue's current pull request, if any.
-    pub pr: Option<IssuePrIndicator>,
+    pr: Option<IssuePrIndicator>,
     /// Current-execution job ids. Not itself a rendered field: the transport
     /// command tests these against the orchestrator's in-memory turn-end-checks
     /// set to fill `checks_running`, which no SQL column records.
@@ -827,7 +661,7 @@ pub struct IssueStatusIndicator {
     /// Whether a latest non-PR artifact version is awaiting human confirmation.
     /// This deliberately excludes `create-pr`: open PR attention is represented
     /// by `pr`, not by the generic artifact-review glyph.
-    pub artifact_waiting: bool,
+    artifact_waiting: bool,
 }
 
 /// Roll several jobs' activities into one issue-level signal with
@@ -1132,11 +966,6 @@ pub async fn issue_status_indicators(
     })
     .await
     .map_err(CairnError::from)
-}
-
-fn node_type_from_snapshot(snapshot_json: &str, node_id: &str) -> Option<String> {
-    let snapshot: ExecutionSnapshot = serde_json::from_str(snapshot_json).ok()?;
-    find_node_in_snapshot(&snapshot, node_id).map(|node| node.node_type.to_string())
 }
 
 fn node_name_from_snapshot(snapshot_json: &str, node_id: &str) -> Option<String> {

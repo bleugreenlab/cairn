@@ -38,7 +38,7 @@ pub struct RestartNodeOutcome {
 
 /// Connection-level restart: validate, archive the prior attempt, create a fresh
 /// job — all in one transaction so a partial restart is never observable.
-pub(crate) async fn restart_node_conn(
+async fn restart_node_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
     recipe_node_id: &str,

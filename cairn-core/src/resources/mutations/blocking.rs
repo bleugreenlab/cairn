@@ -3,12 +3,15 @@ use crate::execution::delegation::{
     SpawnTaskPacketsInput,
 };
 use crate::execution::jobs::{CallWorktree, CreateChildTaskInput};
+#[cfg(test)]
+use crate::mcp::handlers::tool_use_correlation::find_tool_use_id;
+use crate::mcp::handlers::tool_use_correlation::resolve_tool_use_id;
 use crate::mcp::types::{
     AskUserPayload, CallPayload, CallWorktreeMode, ChangeItem, ChangeMode, McpCallbackRequest,
     TaskPayload, TaskSessionMode,
 };
 use crate::orchestrator::Orchestrator;
-use crate::storage::{LocalDb, RowExt};
+use crate::storage::LocalDb;
 use cairn_common::uri::{build_node_uri, parse_uri, CairnResource};
 
 /// A blocking append routed to a node's tasks/questions collection.
@@ -534,53 +537,31 @@ async fn job_uri_segment(orch: &Orchestrator, job_id: &str) -> Option<String> {
 /// Pure: given recent assistant-event `data` blobs (newest first), return the id
 /// of the `write` (or legacy `change`) tool-use whose input appends to a matching
 /// collection.
+fn change_matches_collection(
+    name: &str,
+    input: &serde_json::Value,
+    collection_suffix: &str,
+) -> bool {
+    (name == "write" || name.ends_with("__write") || name == "change" || name.ends_with("__change"))
+        && input
+            .get("changes")
+            .and_then(|c| c.as_array())
+            .map(|changes| {
+                changes.iter().any(|item| {
+                    let target = item.get("target").and_then(|t| t.as_str()).unwrap_or("");
+                    let mode = item.get("mode").and_then(|m| m.as_str()).unwrap_or("");
+                    let path = target.split('?').next().unwrap_or(target);
+                    mode == "append" && path.ends_with(collection_suffix)
+                })
+            })
+            .unwrap_or(false)
+}
+
+#[cfg(test)]
 fn find_change_tool_id(event_data: &[String], collection_suffix: &str) -> Option<String> {
-    for data in event_data {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-            continue;
-        };
-        let Some(tools) = value.get("toolUses").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for tool in tools {
-            let is_change = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|n| {
-                    n == "write"
-                        || n.ends_with("__write")
-                        || n == "change"
-                        || n.ends_with("__change")
-                })
-                .unwrap_or(false);
-            if !is_change {
-                continue;
-            }
-            let appends_collection = tool
-                .get("input")
-                .and_then(|i| i.get("changes"))
-                .and_then(|c| c.as_array())
-                .map(|changes| {
-                    changes.iter().any(|item| {
-                        let target = item.get("target").and_then(|t| t.as_str()).unwrap_or("");
-                        let mode = item.get("mode").and_then(|m| m.as_str()).unwrap_or("");
-                        let path = target.split('?').next().unwrap_or(target);
-                        mode == "append" && path.ends_with(collection_suffix)
-                    })
-                })
-                .unwrap_or(false);
-            if appends_collection {
-                if let Some(id) = tool
-                    .get("id")
-                    .or_else(|| tool.get("toolUseId"))
-                    .and_then(|v| v.as_str())
-                {
-                    return Some(id.to_string());
-                }
-            }
-        }
-    }
-    None
+    find_tool_use_id(event_data, |name, input| {
+        change_matches_collection(name, input, collection_suffix)
+    })
 }
 
 /// Correlate the originating `write` tool-use id from the run's transcript.
@@ -591,37 +572,10 @@ async fn resolve_change_tool_use_id(
     run_id: &str,
     collection_suffix: &str,
 ) -> Option<String> {
-    for _ in 0..20 {
-        let run_id = run_id.to_string();
-        let rows: Vec<String> = orch
-            .db
-            .local
-            .read(|conn| {
-                let run_id = run_id.clone();
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT data FROM events
-                             WHERE run_id = ?1 AND event_type = 'assistant'
-                             ORDER BY sequence DESC LIMIT 8",
-                            (run_id.as_str(),),
-                        )
-                        .await?;
-                    let mut out = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        out.push(row.text(0)?);
-                    }
-                    Ok(out)
-                })
-            })
-            .await
-            .unwrap_or_default();
-        if let Some(id) = find_change_tool_id(&rows, collection_suffix) {
-            return Some(id);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    None
+    resolve_tool_use_id(&orch.db.local, run_id, None, |name, input| {
+        change_matches_collection(name, input, collection_suffix)
+    })
+    .await
 }
 
 fn delegated_task_payload(task: TaskPayload) -> DelegatedTaskPayload {

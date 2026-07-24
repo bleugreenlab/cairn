@@ -7,8 +7,9 @@ use cairn_db::turso::params;
 use super::common::{
     connect_and_find_node_job, connect_and_find_task_job, connect_for_read,
     find_action_run_by_node_name, find_job_by_node_name, find_query_value, get_artifact_for_job,
-    get_direct_artifact_for_job, get_named_artifact_for_job, list_named_artifacts_for_job,
-    reject_query_params, resolve_issue_id, visible_job_node_segment, ResourceActionRun,
+    get_direct_artifact_for_job, get_named_artifact_for_job, has_artifact_for_job,
+    list_named_artifacts_for_job, reject_query_params, resolve_issue_id, visible_job_node_segment,
+    ResourceActionRun,
 };
 use super::transcript::{
     format_raw_transcript, format_transcript_digest_with, get_nth_run_id, get_single_event,
@@ -22,7 +23,7 @@ use cairn_common::uri::{
     build_job_todos_uri, build_node_artifact_uri_named, build_node_chat_uri, build_node_checks_uri,
     build_node_permission_uri, build_node_question_uri, build_node_uri, build_node_wakes_uri,
     build_task_artifact_uri, build_task_artifact_uri_named, build_task_chat_uri,
-    build_task_permission_uri,
+    build_task_checks_uri, build_task_permission_uri,
 };
 
 /// Resolve the job_id that owns the todos addressed by a `JobTodos` URI.
@@ -366,6 +367,42 @@ pub(super) async fn read_node_checks(
     out
 }
 
+/// Read the checks projection for a delegated task job.
+pub(super) async fn read_task_checks(
+    orch: &crate::orchestrator::Orchestrator,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+) -> String {
+    let (_conn, _parent_job, task_job) = match connect_and_find_task_job(
+        &orch.db.local,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => return error,
+    };
+    let uri = build_task_checks_uri(project_key, number, exec_seq, node_name, task_name);
+    let mut out = format!("# Checks — {task_name}\n\n{uri}\n");
+    match crate::execution::checks_turn_end::render_turn_end_checks_section(orch, &task_job.id)
+        .await
+    {
+        Some(section) => {
+            out.push('\n');
+            out.push_str(section.trim_start_matches('\n'));
+        }
+        None => out.push_str("\nNo turn-end check results yet for the current tree.\n"),
+    }
+    out
+}
+
 /// Render a node's ephemeral calls (CAIRN-2481): the caller's child jobs that
 /// carry a persisted output contract. Calls share the `parent_job_id` linkage
 /// with delegated tasks but are distinguished by a non-NULL `output_contract`.
@@ -434,6 +471,14 @@ pub(super) async fn read_node_calls(
     output
 }
 
+struct TaskListItem {
+    job_id: String,
+    segment: String,
+    agent: Option<String>,
+    description: Option<String>,
+    status: String,
+}
+
 pub(super) async fn read_node_tasks(
     db: &LocalDb,
     project_key: &str,
@@ -447,11 +492,11 @@ pub(super) async fn read_node_tasks(
             Err(error) => return error,
         };
 
-    let mut tasks: Vec<(String, Option<String>, Option<String>, String)> = Vec::new();
+    let mut tasks: Vec<TaskListItem> = Vec::new();
     if let Ok(mut rows) = conn
         .query(
             "
-            SELECT uri_segment, agent_config_id, task_description, status
+            SELECT id, uri_segment, agent_config_id, task_description, status
             FROM jobs
             WHERE parent_job_id = ?1
             ORDER BY task_index ASC, created_at ASC
@@ -461,16 +506,23 @@ pub(super) async fn read_node_tasks(
         .await
     {
         while let Ok(Some(row)) = rows.next().await {
-            let (Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
-                row.opt_text(0),
+            let (Ok(task_id), Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
+                row.text(0),
                 row.opt_text(1),
                 row.opt_text(2),
-                row.text(3),
+                row.opt_text(3),
+                row.text(4),
             ) else {
                 continue;
             };
             let segment = segment.unwrap_or_else(|| "task".to_string());
-            tasks.push((segment, agent, description, status));
+            tasks.push(TaskListItem {
+                job_id: task_id,
+                segment,
+                agent,
+                description,
+                status,
+            });
         }
     }
 
@@ -479,7 +531,14 @@ pub(super) async fn read_node_tasks(
         output.push_str("No delegated tasks yet.\n\n");
     } else {
         output.push_str(&format!("{} task(s)\n\n", tasks.len()));
-        for (segment, agent, description, status) in &tasks {
+        for task in &tasks {
+            let TaskListItem {
+                job_id,
+                segment,
+                agent,
+                description,
+                status,
+            } = task;
             let icon = match status.as_str() {
                 "complete" => "✓",
                 "running" => "◐",
@@ -492,19 +551,29 @@ pub(super) async fn read_node_tasks(
                 .filter(|value| !value.is_empty())
                 .or_else(|| agent.clone())
                 .unwrap_or_default();
-            output.push_str(&format!(
-                "- [{}]({}) [{}]{} — chat: {} · artifact: {}\n",
+            let chat_uri = build_task_chat_uri(project_key, number, exec_seq, node_name, segment);
+            let mut detail = format!(
+                "- [{}]({}) [{}]{} — chat: {}",
                 segment,
-                build_task_chat_uri(project_key, number, exec_seq, node_name, segment),
+                chat_uri,
                 icon,
                 if label.is_empty() {
                     String::new()
                 } else {
                     format!(" {}", label)
                 },
-                build_task_chat_uri(project_key, number, exec_seq, node_name, segment),
-                build_task_artifact_uri(project_key, number, exec_seq, node_name, segment),
-            ));
+                chat_uri,
+            );
+            if has_artifact_for_job(&conn, job_id).await {
+                detail.push_str(&format!(
+                    " · artifact: {}",
+                    build_task_artifact_uri(project_key, number, exec_seq, node_name, segment),
+                ));
+            } else if status == "failed" || status == "cancelled" {
+                detail.push_str(&format!(" — {status}, no verdict"));
+            }
+            detail.push('\n');
+            output.push_str(&detail);
         }
         output.push('\n');
     }
@@ -1350,7 +1419,7 @@ pub(super) async fn read_node_chat(
 /// code path rather than re-rendered through a parallel one. `base_uri`/`meta`
 /// are caller-built (the cosmetic header line plus truncation drill-down link
 /// scaffolding).
-pub(crate) async fn render_job_chat_digest(
+async fn render_job_chat_digest(
     db: &LocalDb,
     conn: &cairn_db::turso::Connection,
     job_id: &str,
@@ -2139,7 +2208,7 @@ pub(super) async fn read_task_artifact(
 
 /// Sentinel body a `?wait` read returns when the call is still running past the
 /// long-poll budget. The harness re-issues the read; agents ignore it.
-pub(crate) const CALL_WAIT_PENDING: &str = "__CAIRN_CALL_PENDING__";
+const CALL_WAIT_PENDING: &str = "__CAIRN_CALL_PENDING__";
 /// Sentinel body a `?wait` read returns when the call finished without a usable
 /// artifact (a failed/crashed run, or a terminal run with no artifact). The
 /// harness maps it to a `null` `agent()` result.

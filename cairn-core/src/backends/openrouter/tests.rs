@@ -1,7 +1,7 @@
 use super::context::{
     context_fit_budget, estimate_conversation_tokens, fit_conversation, trim_conversation_to_budget,
 };
-use super::conversation::{reorder_tool_results_by_call_order, transcript_event_to_chat_message};
+use super::conversation::{normalize_tool_call_groups, transcript_event_to_chat_message};
 use super::http::{build_provider_object, tool_schemas};
 use super::wire::{
     default_function_type, ChatMessage, ChatStreamChunk, ChatStreamDelta, StreamingAggregate,
@@ -21,6 +21,49 @@ use std::sync::Arc;
 fn provider_object_default_only_requires_parameters() {
     let provider = build_provider_object(&OpenRouterRouting::default());
     assert_eq!(provider, json!({ "require_parameters": true }));
+}
+
+#[test]
+fn normalize_tool_results_repairs_missing_and_separated_results() {
+    let messages = vec![
+        assistant_with_calls(&["missing", "late"]),
+        ChatMessage::user("answer arrived separately".to_string()),
+        ChatMessage::tool("late".to_string(), "recorded".to_string()),
+    ];
+    let normalized = normalize_tool_call_groups(messages);
+    assert_eq!(normalized[1].tool_call_id.as_deref(), Some("missing"));
+    assert_eq!(
+        normalized[1].content.as_deref(),
+        Some("Interrupted before the tool result was recorded.")
+    );
+    assert_eq!(normalized[2].tool_call_id.as_deref(), Some("late"));
+    assert_eq!(normalized[3].role, "user");
+}
+
+#[test]
+fn normalize_tool_results_drops_orphans_and_duplicates() {
+    let messages = vec![
+        ChatMessage::tool("orphan".to_string(), "unused".to_string()),
+        assistant_with_calls(&["call"]),
+        ChatMessage::tool("call".to_string(), "first".to_string()),
+        ChatMessage::tool("call".to_string(), "last".to_string()),
+    ];
+    let normalized = normalize_tool_call_groups(messages);
+    assert_eq!(normalized.len(), 2);
+    assert_eq!(normalized[1].tool_call_id.as_deref(), Some("call"));
+    assert_eq!(normalized[1].content.as_deref(), Some("last"));
+}
+
+#[test]
+fn normalize_tool_results_handles_more_than_two_hundred_messages() {
+    let mut messages = (0..250)
+        .map(|index| ChatMessage::user(format!("message {index}")))
+        .collect::<Vec<_>>();
+    messages.push(assistant_with_calls(&["call"]));
+    messages.push(ChatMessage::tool("call".to_string(), "result".to_string()));
+    let normalized = normalize_tool_call_groups(messages);
+    assert_eq!(normalized.len(), 252);
+    assert_eq!(normalized[251].tool_call_id.as_deref(), Some("call"));
 }
 
 #[test]
@@ -97,7 +140,7 @@ fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
 }
 
 #[test]
-fn reorder_tool_results_follows_assistant_tool_call_order() {
+fn normalize_tool_results_follows_assistant_tool_call_order() {
     // A suspended first tool call (`w`) persists the later call's placeholder
     // (`r`) at suspend time and its own real result only on resume, so the
     // raw event order is [assistant, tool(r), tool(w)] — the wrong order for
@@ -108,7 +151,7 @@ fn reorder_tool_results_follows_assistant_tool_call_order() {
         ChatMessage::tool("r".to_string(), "placeholder".to_string()),
         ChatMessage::tool("w".to_string(), "real answer".to_string()),
     ];
-    let reordered = reorder_tool_results_by_call_order(messages);
+    let reordered = normalize_tool_call_groups(messages);
     // Tool results now follow the assistant's tool_calls order: w then r.
     assert_eq!(reordered[2].tool_call_id.as_deref(), Some("w"));
     assert_eq!(reordered[2].content.as_deref(), Some("real answer"));
@@ -119,13 +162,13 @@ fn reorder_tool_results_follows_assistant_tool_call_order() {
 }
 
 #[test]
-fn reorder_tool_results_is_noop_when_already_ordered() {
+fn normalize_tool_results_is_noop_when_already_ordered() {
     let messages = vec![
         assistant_with_calls(&["a", "b"]),
         ChatMessage::tool("a".to_string(), "ra".to_string()),
         ChatMessage::tool("b".to_string(), "rb".to_string()),
     ];
-    let reordered = reorder_tool_results_by_call_order(messages);
+    let reordered = normalize_tool_call_groups(messages);
     assert_eq!(reordered[1].tool_call_id.as_deref(), Some("a"));
     assert_eq!(reordered[2].tool_call_id.as_deref(), Some("b"));
 }

@@ -108,9 +108,9 @@ pub async fn repair_index_entry_drift(db: &LocalDb) -> DbResult<Vec<String>> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
-    pub version: &'static str,
-    pub name: &'static str,
-    pub sql: &'static str,
+    pub(crate) version: &'static str,
+    name: &'static str,
+    sql: &'static str,
     /// When true, run this migration with foreign-key enforcement disabled.
     ///
     /// libsql has no usable `ALTER TABLE ... DROP COLUMN` and enforces
@@ -119,13 +119,13 @@ pub struct Migration {
     /// requires a full table rebuild with enforcement off. `PRAGMA foreign_keys`
     /// is a no-op inside an open transaction, so the runner toggles it *before*
     /// `BEGIN` on a dedicated connection.
-    pub fk_off: bool,
+    fk_off: bool,
 }
 
 impl Migration {
     /// A standard migration, applied inside the normal exclusive transaction
     /// with foreign keys enforced.
-    pub const fn new(version: &'static str, name: &'static str, sql: &'static str) -> Self {
+    pub(crate) const fn new(version: &'static str, name: &'static str, sql: &'static str) -> Self {
         Self {
             version,
             name,
@@ -136,7 +136,7 @@ impl Migration {
 
     /// A migration that rebuilds FK-referenced tables and must run with foreign
     /// keys disabled. See the [`Migration::fk_off`] field docs.
-    pub const fn rebuild_fk_off(
+    pub(crate) const fn rebuild_fk_off(
         version: &'static str,
         name: &'static str,
         sql: &'static str,

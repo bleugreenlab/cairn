@@ -31,7 +31,7 @@ struct ReadBatchPayload {
 }
 
 /// Handle a `read_batch` callback: classify, produce, dedup, and assemble.
-pub async fn handle_read_batch(
+pub(crate) async fn handle_read_batch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     read_cursors: &ReadCursorState,
@@ -361,19 +361,39 @@ async fn produce_resource_segment(
     read_cursors: &ReadCursorState,
     target: &str,
 ) -> ReadSegment {
-    let identity = split_target_query(target)
+    // Resolve a home-relative terminal before classifying it. The generic
+    // resource producer resolves all other `cairn:~` targets itself, but terminal
+    // reads must be intercepted first because they use the live-buffer/cursor
+    // adapter rather than the ordinary resource renderer.
+    let unresolved_identity = split_target_query(target)
         .map(|split| split.identity)
         .unwrap_or_else(|_| target.to_string());
+    let resolved_target = if unresolved_identity.starts_with("cairn:~/terminal/") {
+        match crate::resources::resolve_home_relative_resource_uri(&orch.db, request, target).await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return error_segment(target, error),
+        }
+    } else {
+        target.to_string()
+    };
+    let identity = split_target_query(&resolved_target)
+        .map(|split| split.identity)
+        .unwrap_or_else(|_| resolved_target.clone());
     if matches!(
         parse_uri(&identity),
-        Some(CairnResource::NodeTerminal { .. } | CairnResource::ProjectTerminal { .. })
+        Some(
+            CairnResource::NodeTerminal { .. }
+                | CairnResource::TaskTerminal { .. }
+                | CairnResource::ProjectTerminal { .. }
+        )
     ) {
-        return produce_terminal_segment(orch, request, read_cursors, target).await;
+        return produce_terminal_segment(orch, request, read_cursors, target, &resolved_target)
+            .await;
     }
 
-    // A `cairn:~/terminal/<slug>` from a sub-task agent resolves to a
-    // `.../task/{seg}/terminal/{slug}` shape that does not parse as a terminal.
-    // Name the constraint instead of failing with a generic unknown-resource error.
+    // Name a malformed task-terminal shape instead of failing with a generic
+    // unknown-resource error.
     if parse_uri(&identity).is_none() {
         if let Some(hint) = crate::mcp::handlers::resources::task_terminal_hint(&identity) {
             return error_segment(target, hint);
@@ -477,6 +497,7 @@ async fn produce_terminal_segment(
     request: &McpCallbackRequest,
     read_cursors: &ReadCursorState,
     target: &str,
+    resolved_target: &str,
 ) -> ReadSegment {
     // Universal grep over the rendered buffer (a single body has no glob pushdown).
     let grep_payload = match split_target_query(target) {
@@ -487,7 +508,8 @@ async fn produce_terminal_segment(
         Err(_) => None,
     };
 
-    let (clean, offset, limit) = split_line_scope(target, true);
+    let (_, offset, limit) = split_line_scope(target, true);
+    let (clean, _, _) = split_line_scope(resolved_target, true);
     let clean = strip_query_keys(&clean, GREP_STRIP_KEYS);
 
     let resource_request = McpCallbackRequest {
@@ -1786,7 +1808,33 @@ omega-24')",
     }
 
     #[tokio::test]
-    async fn task_terminal_read_via_batch_surfaces_terminal_shape() {
+    async fn home_relative_node_terminal_read_routes_through_terminal_adapter() {
+        let orch = seeded_orch().await;
+        seed_home_run(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, exit_code, created_at, exited_at, slug, output_tail)
+             VALUES ('term-home-rb', 'job-rb', 'proj-rb', 'run-rb', 'sess-home-rb', 'printf ready', 'exited', 0, 1, 2, 'ci', 'ready')",
+        )
+        .await;
+
+        let envelope = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn:~/terminal/ci"]),
+            Some("run-rb"),
+        )
+        .await;
+        let text = &envelope.text;
+
+        assert!(text.contains("=== cairn:~/terminal/ci"), "{text}");
+        assert!(text.contains("[terminal ci:"), "{text}");
+        assert!(text.contains("ready"), "{text}");
+        assert!(!text.contains("read_resource"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn task_terminal_read_via_batch_uses_terminal_adapter() {
         let orch = seeded_orch().await;
         seed_project(&orch).await;
         let text = read_batch_text(
@@ -1794,10 +1842,8 @@ omega-24')",
             serde_json::json!(["cairn://p/RB/1/1/builder/task/Explore/terminal/ci"]),
         )
         .await;
-        // Terminal reads are served by read_resource; the batch path falls back to
-        // the task-terminal affordance (shape + start/send/stop actions) rather than
-        // routing. Task terminals are first-class, so there is no top-level-node gate.
-        assert!(text.contains("## Task terminal"), "{text}");
-        assert!(text.contains("start terminal"), "{text}");
+
+        assert!(text.contains("Terminal 'ci' not found"), "{text}");
+        assert!(!text.contains("read_resource"), "{text}");
     }
 }

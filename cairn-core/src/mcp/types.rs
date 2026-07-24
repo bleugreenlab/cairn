@@ -45,18 +45,18 @@ pub struct AskUserPayload {
 /// Payload for add_comment tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddCommentPayload {
-    pub content: String,
+    content: String,
 }
 
 /// Payload for read tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFilePayload {
-    pub path: String,
-    pub offset: Option<i64>,
-    pub limit: Option<usize>,
+    pub(crate) path: String,
+    pub(crate) offset: Option<i64>,
+    pub(crate) limit: Option<usize>,
     /// Include issue history for this file path
     #[serde(default)]
-    pub issue_history: Option<IssueHistoryMode>,
+    pub(crate) issue_history: Option<IssueHistoryMode>,
 }
 
 /// Mode for issue history output
@@ -84,23 +84,23 @@ pub use cairn_common::contract::ChangeMode;
 /// `payload`, exactly where resource-target keys already do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeItem {
-    pub target: String,
-    pub mode: ChangeMode,
+    pub(crate) target: String,
+    pub(crate) mode: ChangeMode,
     /// Structured payload carrying this item's keys (file and resource targets alike).
     #[serde(default)]
-    pub payload: Option<Value>,
+    pub(crate) payload: Option<Value>,
 }
 
 /// Payload for the canonical change tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangePayload {
-    pub changes: Vec<ChangeItem>,
+    pub(crate) changes: Vec<ChangeItem>,
     #[serde(default)]
-    pub commit_msg: Option<String>,
+    pub(crate) commit_msg: Option<String>,
     #[serde(default)]
-    pub preview: Option<bool>,
+    pub(crate) preview: Option<bool>,
     #[serde(default)]
-    pub atomic: Option<bool>,
+    pub(crate) atomic: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -118,33 +118,27 @@ pub struct TaskPayload {
     /// Required display title for the task: a short "what this task is" string.
     /// The tasks-collection contract lists it as required, so a missing key is
     /// rejected at deserialization (mirroring `subagentType`/`prompt`).
-    pub description: String,
-    pub prompt: String,
-    pub subagent_type: String,
+    pub(crate) description: String,
+    pub(crate) prompt: String,
+    pub(crate) subagent_type: String,
     #[serde(default, alias = "model")]
-    pub tier: Option<String>,
+    pub(crate) tier: Option<String>,
     #[serde(default, rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<String>,
+    pub(crate) backend_preference: Option<String>,
     /// Fire-and-forget when true: spawn and return the task URI without blocking.
     /// Accepts `runInBackground` (verb schema) or `background` (change-append payload).
     #[serde(default, alias = "background")]
-    pub run_in_background: Option<bool>,
+    pub(crate) run_in_background: Option<bool>,
     #[serde(default)]
-    pub session: Option<TaskSessionMode>,
+    pub(crate) session: Option<TaskSessionMode>,
     /// Task index for batch_tasks ordering (0, 1, 2...)
     #[serde(default)]
-    pub task_index: Option<i32>,
+    pub(crate) task_index: Option<i32>,
     /// Optional per-task output schema: a preset name (string) or an inline
     /// custom JSON Schema (object). Absent preserves the default `return`
     /// contract. Untagged, mirroring the recipe/agent `OutputSchema`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<crate::models::OutputSchema>,
-}
-
-impl TaskPayload {
-    pub fn session_mode(&self) -> Result<TaskSessionMode, String> {
-        Ok(self.session.unwrap_or(TaskSessionMode::New))
-    }
+    pub(crate) output_schema: Option<crate::models::OutputSchema>,
 }
 
 /// Worktree binding for an ephemeral call (CAIRN-2481).
@@ -164,39 +158,39 @@ pub enum CallWorktreeMode {
 #[serde(rename_all = "camelCase")]
 pub struct CallPayload {
     /// The call's instruction.
-    pub prompt: String,
+    pub(crate) prompt: String,
     /// Worker agent; defaults to `Explore` when absent.
     #[serde(default)]
-    pub subagent_type: Option<String>,
+    pub(crate) subagent_type: Option<String>,
     /// Display title; defaults to the label or a prompt prefix.
     #[serde(default)]
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     #[serde(default, alias = "model")]
-    pub tier: Option<String>,
+    pub(crate) tier: Option<String>,
     #[serde(default, rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<String>,
+    pub(crate) backend_preference: Option<String>,
     /// Preset name (string) or an inline custom JSON Schema (object). Absent
     /// preserves the default `return` contract.
     #[serde(default)]
-    pub output_schema: Option<crate::models::OutputSchema>,
+    pub(crate) output_schema: Option<crate::models::OutputSchema>,
     #[serde(default)]
-    pub worktree: Option<CallWorktreeMode>,
+    pub(crate) worktree: Option<CallWorktreeMode>,
     /// Durable workflow tags (no UI yet).
     #[serde(default)]
-    pub label: Option<String>,
+    pub(crate) label: Option<String>,
     #[serde(default)]
-    pub phase: Option<String>,
+    pub(crate) phase: Option<String>,
     /// Fire-and-forget when true: spawn and return the call URI without blocking.
     #[serde(default, alias = "background")]
-    pub run_in_background: Option<bool>,
+    pub(crate) run_in_background: Option<bool>,
     #[serde(default)]
-    pub task_index: Option<i32>,
+    pub(crate) task_index: Option<i32>,
     /// The harness's per-run monotonic dispatch ordinal (CAIRN-2498). Present
     /// only for `agent()` calls from a workflow script; it keys the call into
     /// the workflow journal so a host-restart replay short-circuits already-
     /// resolved calls. Absent for ordinary `cairn:~/calls` appends.
     #[serde(default)]
-    pub ordinal: Option<i64>,
+    pub(crate) ordinal: Option<i64>,
 }
 
 // ============================================================================

@@ -46,8 +46,8 @@ use crate::storage::LocalDb;
 /// makes the pull task pure push/pull as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamSyncScope {
-    pub team_id: String,
-    pub project_ids: Vec<String>,
+    pub(crate) team_id: String,
+    pub(crate) project_ids: Vec<String>,
 }
 
 #[async_trait::async_trait]

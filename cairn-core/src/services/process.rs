@@ -19,27 +19,27 @@ use super::sandbox::SandboxPolicy;
 /// Configuration for spawning a process.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: Option<String>,
-    pub env: HashMap<String, String>,
-    pub capture_stdout: bool,
-    pub capture_stderr: bool,
-    pub capture_stdin: bool,
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) env: HashMap<String, String>,
+    pub(crate) capture_stdout: bool,
+    pub(crate) capture_stderr: bool,
+    capture_stdin: bool,
     /// OS-level filesystem confinement to apply to this spawn. `None` = run
     /// unconfined (trusted agent, no run context, or platform without support).
-    pub sandbox: Option<SandboxPolicy>,
+    pub(crate) sandbox: Option<SandboxPolicy>,
     /// Environment variables to explicitly REMOVE from the inherited process env
     /// before spawn. Applied after the `env` overlay in `build_command`, so a
     /// removal is unconditional (it wins over both inheritance and the overlay).
     /// Used to strip a host dev-instance's build-target routing
     /// (`crate::env::DEV_INSTANCE_ROUTING_ENV`) so a worktree command builds into
     /// its own target dir rather than the shared one.
-    pub env_remove: Vec<String>,
+    pub(crate) env_remove: Vec<String>,
 }
 
 impl SpawnConfig {
-    pub fn new(program: &str) -> Self {
+    pub(crate) fn new(program: &str) -> Self {
         Self {
             program: program.to_string(),
             args: Vec::new(),
@@ -54,22 +54,22 @@ impl SpawnConfig {
     }
 
     /// Apply an OS-level filesystem sandbox to this spawn.
-    pub fn sandbox(mut self, policy: Option<SandboxPolicy>) -> Self {
+    pub(crate) fn sandbox(mut self, policy: Option<SandboxPolicy>) -> Self {
         self.sandbox = policy;
         self
     }
 
-    pub fn stdin(mut self, capture: bool) -> Self {
+    pub(crate) fn stdin(mut self, capture: bool) -> Self {
         self.capture_stdin = capture;
         self
     }
 
-    pub fn arg(mut self, arg: &str) -> Self {
+    pub(crate) fn arg(mut self, arg: &str) -> Self {
         self.args.push(arg.to_string());
         self
     }
 
-    pub fn args<I, S>(mut self, args: I) -> Self
+    pub(crate) fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -79,12 +79,12 @@ impl SpawnConfig {
         self
     }
 
-    pub fn cwd(mut self, dir: &str) -> Self {
+    pub(crate) fn cwd(mut self, dir: &str) -> Self {
         self.cwd = Some(dir.to_string());
         self
     }
 
-    pub fn env(mut self, key: &str, value: &str) -> Self {
+    pub(crate) fn env(mut self, key: &str, value: &str) -> Self {
         self.env.insert(key.to_string(), value.to_string());
         self
     }
@@ -92,7 +92,7 @@ impl SpawnConfig {
     /// Mark an environment variable for removal from the inherited env before
     /// spawn. Applied after the `env` overlay in `build_command`, so the removal
     /// is unconditional.
-    pub fn env_remove(mut self, key: &str) -> Self {
+    pub(crate) fn env_remove(mut self, key: &str) -> Self {
         self.env_remove.push(key.to_string());
         self
     }
@@ -135,7 +135,7 @@ pub struct KillOnDrop {
 }
 
 impl KillOnDrop {
-    pub fn new(child: Arc<Mutex<Box<dyn ChildProcess>>>) -> Self {
+    pub(crate) fn new(child: Arc<Mutex<Box<dyn ChildProcess>>>) -> Self {
         Self {
             child,
             armed: AtomicBool::new(true),
@@ -143,7 +143,7 @@ impl KillOnDrop {
     }
 
     /// Transfer ownership away from this guard so `Drop` does not reap.
-    pub fn disarm(&self) {
+    pub(crate) fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
     }
 }
@@ -163,10 +163,10 @@ impl Drop for KillOnDrop {
 /// Result of running a command to completion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOutput {
-    pub success: bool,
-    pub exit_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
+    pub(crate) success: bool,
+    exit_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Trait for spawning processes.

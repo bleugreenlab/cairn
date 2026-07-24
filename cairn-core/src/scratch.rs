@@ -94,7 +94,7 @@ fn friendly_scratch_name(job_id: &str, home_uri: &str) -> String {
 /// it from the canonical node URI; the small temp-root registry lets command,
 /// terminal, and teardown paths recover that same directory from the internal
 /// job id. Legacy or not-yet-started jobs fall back to their UUID-keyed path.
-pub fn job_scratch_dir(job_id: &str) -> PathBuf {
+fn job_scratch_dir(job_id: &str) -> PathBuf {
     mapped_job_scratch_dir(job_id).unwrap_or_else(|| legacy_job_scratch_dir(job_id))
 }
 
@@ -205,7 +205,7 @@ fn sanitize_slug(slug: &str) -> String {
 /// `terminals/` subdir when it actually writes, mirroring the
 /// [`job_scratch_dir`]/[`ensure_job_scratch_dir`] split so a *read* never
 /// provisions directories.
-pub fn terminal_log_path(job_id: &str, slug: &str) -> PathBuf {
+pub(crate) fn terminal_log_path(job_id: &str, slug: &str) -> PathBuf {
     job_scratch_dir(job_id)
         .join("terminals")
         .join(format!("{}.log", sanitize_slug(slug)))
@@ -231,7 +231,7 @@ impl TerminalLog {
     /// re-created same-slug terminal) a session-separator line is written first,
     /// so the two sessions' output stays distinguishable in one file. Returns
     /// `None` on any IO error — teeing is best-effort and never blocks the PTY.
-    pub fn open(job_id: &str, slug: &str) -> Option<Self> {
+    pub(crate) fn open(job_id: &str, slug: &str) -> Option<Self> {
         let path = terminal_log_path(job_id, slug);
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -266,7 +266,7 @@ impl TerminalLog {
     /// Append a raw PTY chunk, compacting when the file exceeds the cap.
     /// Best-effort: an IO error is dropped (the live buffer and `output_tail`
     /// remain), never surfaced to the reader loop.
-    pub fn append(&mut self, bytes: &[u8]) {
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }

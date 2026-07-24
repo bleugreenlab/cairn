@@ -48,10 +48,12 @@ fn build_file_recipe(recipe_file: RecipeFile, id: &str, is_project_scoped: bool)
     } else {
         (Some("default".to_string()), None)
     };
+    let bundles = recipe_file.bundles.clone();
     let mut recipe = recipe_file.into_recipe(ws_id, proj_id);
     recipe.id = id.to_string();
     FileRecipe {
         recipe,
+        bundles,
         is_project_scoped,
         file_path: PathBuf::new(),
     }

@@ -42,26 +42,26 @@ pub struct WorkspaceRebindTransition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceBaseTransition {
-    pub old_base: String,
-    pub new_base: String,
+    pub(crate) old_base: String,
+    pub(crate) new_base: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceIdentity {
-    pub version: u32,
-    pub lineage_root_job_id: String,
-    pub owner_job_id: String,
+    version: u32,
+    pub(crate) lineage_root_job_id: String,
+    pub(crate) owner_job_id: String,
     pub project_id: String,
-    pub project_root: PathBuf,
-    pub worktree_path: PathBuf,
+    pub(crate) project_root: PathBuf,
+    pub(crate) worktree_path: PathBuf,
     pub branch: String,
     pub workspace_name: String,
     pub base_commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_rebind: Option<WorkspaceRebindTransition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_base_transition: Option<WorkspaceBaseTransition>,
+    pub(crate) pending_base_transition: Option<WorkspaceBaseTransition>,
 }
 
 impl WorkspaceIdentity {
@@ -107,6 +107,46 @@ pub fn add_workspace(
     base_rev: &str,
     author: Option<&GitAuthor>,
 ) -> Result<(), String> {
+    add_workspace_with_marker_writer(
+        jj,
+        store_dir,
+        ws_path,
+        branch,
+        base_rev,
+        author,
+        write_branch_marker,
+    )
+}
+
+fn rollback_created_workspace(
+    jj: &JjEnv,
+    store_dir: &Path,
+    ws_path: &Path,
+    name: &str,
+    branch: &str,
+    delete_created_bookmark: bool,
+) {
+    let _ = forget_workspace_name(jj, store_dir, name);
+    if delete_created_bookmark {
+        let _ = jj.run(
+            store_dir,
+            &["bookmark", "delete", branch],
+            "jj bookmark delete",
+        );
+    }
+    let _ = std::fs::remove_dir_all(ws_path);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn add_workspace_with_marker_writer(
+    jj: &JjEnv,
+    store_dir: &Path,
+    ws_path: &Path,
+    branch: &str,
+    base_rev: &str,
+    author: Option<&GitAuthor>,
+    marker_writer: impl FnOnce(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
     let name = workspace_name_for_branch(branch);
 
     // Inspection and destructive retry cleanup are deliberately separate. The
@@ -125,7 +165,20 @@ pub fn add_workspace(
     ]);
     let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     jj.run(store_dir, &argref, "jj workspace add")?;
-    write_branch_marker(ws_path, branch)?;
+    if let Err(error) = marker_writer(ws_path, branch) {
+        // Bookmark creation occurs only after the marker succeeds, so this
+        // failure owns only the new workspace registration and path. A branch
+        // bookmark may have predated this general low-level call.
+        rollback_created_workspace(
+            jj,
+            store_dir,
+            ws_path,
+            &workspace_name_for_branch(branch),
+            branch,
+            false,
+        );
+        return Err(error);
+    }
 
     // Ensure the workspace's branch is a resolvable, pushable bookmark from
     // creation — git parity, where a worktree's branch ref exists immediately.
@@ -137,11 +190,23 @@ pub fn add_workspace(
     // exists and a retried job must not fail on that, while `bookmark set` is
     // wrong here because it refuses backwards/sideways moves.
     if bookmark_commit(jj, store_dir, branch).is_none() {
-        jj.run(
+        if let Err(error) = jj.run(
             store_dir,
             &["bookmark", "create", branch, "-r", base_rev],
             "jj bookmark create",
-        )?;
+        ) {
+            // This branch is reached only after proving the bookmark absent;
+            // a partially-applied create is therefore owned by this invocation.
+            rollback_created_workspace(
+                jj,
+                store_dir,
+                ws_path,
+                &workspace_name_for_branch(branch),
+                branch,
+                true,
+            );
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -179,7 +244,12 @@ pub fn revset_resolves(jj: &JjEnv, store: &Path, rev: &str) -> bool {
 /// `git_rev_parse` returns the trimmed SHA for a ref the project git resolves,
 /// or `None`. Kept as a closure so the orchestration layer owns the git service
 /// and this stays unit-testable with the jj test harness.
-pub fn resolve_base_rev<F>(jj: &JjEnv, store: &Path, base_ref: &str, git_rev_parse: F) -> String
+pub(crate) fn resolve_base_rev<F>(
+    jj: &JjEnv,
+    store: &Path,
+    base_ref: &str,
+    git_rev_parse: F,
+) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -196,7 +266,7 @@ where
 }
 
 /// Whether a workspace registration exists in the shared store.
-pub fn workspace_registered(jj: &JjEnv, store_dir: &Path, workspace_name: &str) -> bool {
+pub(crate) fn workspace_registered(jj: &JjEnv, store_dir: &Path, workspace_name: &str) -> bool {
     jj.run(
         store_dir,
         &["workspace", "list", "--template", "name ++ \"\\n\""],
@@ -224,7 +294,7 @@ pub fn cleanup_workspace_retry(
 
 /// Forget a persisted jj workspace registration name. The directory itself is
 /// removed by the caller.
-pub fn forget_workspace_name(
+pub(crate) fn forget_workspace_name(
     jj: &JjEnv,
     store_dir: &Path,
     workspace_name: &str,
@@ -270,7 +340,7 @@ pub fn write_base_marker(ws_path: &Path, base_branch: &str, base_rev: &str) -> R
 
 /// Read the workspace's base marker as `(branch, rev)`, if present. Returns
 /// `None` when the marker is absent or its branch line is empty.
-pub fn read_base_marker(ws_path: &Path) -> Option<(String, String)> {
+pub(crate) fn read_base_marker(ws_path: &Path) -> Option<(String, String)> {
     let content = std::fs::read_to_string(ws_path.join(".jj").join(BASE_MARKER)).ok()?;
     let mut lines = content.lines();
     let branch = lines.next().map(str::trim).filter(|s| !s.is_empty())?;
@@ -288,7 +358,7 @@ pub fn write_project_root_marker(ws_path: &Path, repo_path: &Path) -> Result<(),
 }
 
 /// Read the workspace's project-root marker, if present and non-empty.
-pub fn read_project_root_marker(ws_path: &Path) -> Option<PathBuf> {
+pub(crate) fn read_project_root_marker(ws_path: &Path) -> Option<PathBuf> {
     std::fs::read_to_string(ws_path.join(".jj").join(PROJECT_ROOT_MARKER))
         .ok()
         .map(|s| s.trim().to_string())
@@ -331,7 +401,7 @@ pub fn read_workspace_identity(ws_path: &Path) -> Option<WorkspaceIdentity> {
 
 /// A half-created same-job retry is safe to clear only when it contains no
 /// workspace files. A valid jj workspace is additionally required to be clean.
-pub fn workspace_retry_is_clean(jj: &JjEnv, ws_path: &Path) -> bool {
+pub(crate) fn workspace_retry_is_clean(jj: &JjEnv, ws_path: &Path) -> bool {
     if !ws_path.exists() {
         return true;
     }

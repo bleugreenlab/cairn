@@ -3,7 +3,7 @@
 //! Handles: add_comment, and artifact writes/patches submitted through the
 //! `write` verb (the replacement for the deleted dynamic `return` tool).
 
-use crate::mcp::types::{AddCommentPayload, McpCallbackRequest};
+use crate::mcp::types::McpCallbackRequest;
 use crate::models::ConfirmPolicy;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, RowExt};
@@ -33,7 +33,7 @@ pub async fn append_issue_comment(
     .await
 }
 
-pub async fn append_issue_comment_for_remote_intent(
+pub(crate) async fn append_issue_comment_for_remote_intent(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     project_key: &str,
@@ -106,37 +106,6 @@ async fn append_issue_comment_canonical(
         "Appended comment to issue {}-{}",
         project_key_upper, issue_number
     ))
-}
-
-/// Handle add_comment tool call - adds a comment to the issue associated with this run
-pub async fn handle_add_comment(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: AddCommentPayload = match super::parse_payload(request) {
-        Ok(payload) => payload,
-        Err(error) => return error,
-    };
-
-    log::info!(
-        "add_comment for cwd={}, {} chars",
-        request.cwd,
-        payload.content.len()
-    );
-
-    let ctx = match super::run_context::lookup_run(&orch.db.local, request).await {
-        Ok(ctx) => ctx,
-        Err(e) => return e,
-    };
-    let issue_number = match ctx.issue_number {
-        Some(number) => number,
-        None => {
-            return "Cannot add comment: project-level jobs don't have an associated issue"
-                .to_string();
-        }
-    };
-    let project_key = ctx.project_key.clone();
-    match append_issue_comment(orch, request, &project_key, issue_number, &payload.content).await {
-        Ok(result) => result,
-        Err(error) => error,
-    }
 }
 
 /// Validate `payload` against a resolved JSON Schema, returning a descriptive
@@ -892,8 +861,9 @@ fn should_arm_output_artifact_interrupt(
 /// 2. **Gate.** Compute the branch's delta versus its base over the store. If it is
 ///    STILL empty after the sweep, refuse the artifact write with a diagnostic
 ///    naming the branch and base, catching a +0/-0 PR at its source.
-/// 3. **Publish.** Unconditionally push the current bookmark to origin and propagate
-///    any failure so artifact storage cannot report success against a stale PR head.
+/// 3. **Publish.** Push the current bookmark when the project has an origin and
+///    propagate any real publication failure so artifact storage cannot report
+///    success against a stale PR head. A local-only project has nothing to publish.
 ///
 /// Skips entirely when the worktree no longer exists on disk (post-merge title
 /// edits and the like): there is nothing to sweep, gate, or publish.
@@ -1029,9 +999,10 @@ fn sweep_gate_and_publish_create_pr_branch_locked(
         }
     }
 
-    // 3. Publish even when the workspace was already clean: a rebase or re-anchor
-    //    can advance the shared-store bookmark without leaving anything to seal.
-    crate::jj::push_to_origin(jj, worktree, branch).map_err(|e| {
+    // 3. Publish when an origin exists, even when the workspace was already clean:
+    //    a rebase or re-anchor can advance the shared-store bookmark without leaving
+    //    anything to seal. Local-only projects have nothing to publish.
+    crate::mcp::vcs::publish_required_origin(backend, worktree).map_err(|e| {
         format!(
             "create-pr artifact was not written because bookmark `{branch}` could not be \
              published to origin: {e}"
@@ -1513,7 +1484,7 @@ mod tests {
 
     struct CreatePrJjFixture {
         _home: TempDir,
-        origin: TempDir,
+        origin: Option<TempDir>,
         project: TempDir,
         _worktrees: TempDir,
         jj: crate::jj::JjEnv,
@@ -1521,28 +1492,38 @@ mod tests {
         store: PathBuf,
         worktree: PathBuf,
         branch: &'static str,
-        remote_head_before_advance: String,
+        remote_head_before_advance: Option<String>,
     }
 
     impl CreatePrJjFixture {
         fn new(bin: &str) -> Self {
+            Self::with_origin(bin, true)
+        }
+
+        fn without_origin(bin: &str) -> Self {
+            Self::with_origin(bin, false)
+        }
+
+        fn with_origin(bin: &str, attach_origin: bool) -> Self {
             let home = TempDir::new().unwrap();
-            let origin = TempDir::new().unwrap();
+            let origin = attach_origin.then(|| TempDir::new().unwrap());
             let project = TempDir::new().unwrap();
             let worktrees = TempDir::new().unwrap();
 
-            git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
             git(project.path(), &["init", "-q", "-b", "main"]);
             git(project.path(), &["config", "user.email", "p@e.com"]);
             git(project.path(), &["config", "user.name", "P"]);
             std::fs::write(project.path().join("shared.rs"), "base\n").unwrap();
             git(project.path(), &["add", "-A"]);
             git(project.path(), &["commit", "-q", "-m", "base"]);
-            git(
-                project.path(),
-                &["remote", "add", "origin", &origin.path().to_string_lossy()],
-            );
-            git(project.path(), &["push", "-q", "origin", "main"]);
+            if let Some(origin) = &origin {
+                git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+                git(
+                    project.path(),
+                    &["remote", "add", "origin", &origin.path().to_string_lossy()],
+                );
+                git(project.path(), &["push", "-q", "origin", "main"]);
+            }
 
             let jj = crate::jj::JjEnv::resolve(bin, home.path());
             let store = home.path().join("jj-stores").join("project");
@@ -1553,8 +1534,10 @@ mod tests {
 
             std::fs::write(worktree.join("feature.rs"), "first\n").unwrap();
             crate::jj::seal(&jj, &worktree, "initial feature", None).unwrap();
-            crate::jj::push_to_origin(&jj, &worktree, branch).unwrap();
-            let remote_head_before_advance = git_stdout(origin.path(), &["rev-parse", branch]);
+            let remote_head_before_advance = origin.as_ref().map(|origin| {
+                crate::jj::push_to_origin(&jj, &worktree, branch).unwrap();
+                git_stdout(origin.path(), &["rev-parse", branch])
+            });
 
             // Advance the bookmark locally without pushing. `seal` leaves a fresh,
             // clean working-copy commit while the bare origin remains stale.
@@ -1562,11 +1545,15 @@ mod tests {
             crate::jj::seal(&jj, &worktree, "rewrite feature", None).unwrap();
             assert!(!crate::jj::is_working_copy_dirty(&jj, &worktree).unwrap());
             let local_head = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
-            assert_ne!(remote_head_before_advance, local_head);
-            assert_eq!(
-                git_stdout(origin.path(), &["rev-parse", branch]),
-                remote_head_before_advance
-            );
+            if let (Some(origin), Some(remote_head_before_advance)) =
+                (&origin, &remote_head_before_advance)
+            {
+                assert_ne!(remote_head_before_advance, &local_head);
+                assert_eq!(
+                    git_stdout(origin.path(), &["rev-parse", branch]),
+                    *remote_head_before_advance
+                );
+            }
 
             let backend =
                 crate::mcp::vcs::JjBackend::new(crate::jj::JjEnv::resolve(bin, home.path()));
@@ -1608,9 +1595,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            git_stdout(fixture.origin.path(), &["rev-parse", fixture.branch]),
+            git_stdout(
+                fixture.origin.as_ref().unwrap().path(),
+                &["rev-parse", fixture.branch]
+            ),
             fixture.local_head()
         );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn create_pr_preparation_succeeds_without_an_origin_remote() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping create_pr_preparation_succeeds_without_an_origin_remote: jj not resolvable");
+            return;
+        };
+        let fixture = CreatePrJjFixture::without_origin(&bin);
+        let bookmark_before_sweep = fixture.local_head();
+        std::fs::write(fixture.worktree.join("feature.rs"), "third\n").unwrap();
+
+        sweep_gate_and_publish_create_pr_branch_locked(
+            &fixture.jj,
+            &fixture.backend,
+            &fixture.worktree,
+            fixture.branch,
+            Some("main"),
+        )
+        .unwrap();
+
+        let swept_tip = fixture.local_head();
+        assert_ne!(bookmark_before_sweep, swept_tip);
+        assert!(!crate::jj::is_working_copy_dirty(&fixture.jj, &fixture.worktree).unwrap());
     }
 
     #[test]
@@ -1651,8 +1666,15 @@ mod tests {
             "{error}"
         );
         assert_eq!(
-            git_stdout(fixture.origin.path(), &["rev-parse", fixture.branch]),
-            fixture.remote_head_before_advance
+            git_stdout(
+                fixture.origin.as_ref().unwrap().path(),
+                &["rev-parse", fixture.branch]
+            ),
+            fixture
+                .remote_head_before_advance
+                .as_ref()
+                .unwrap()
+                .as_str()
         );
     }
 
@@ -1680,8 +1702,15 @@ mod tests {
             "{error}"
         );
         assert_eq!(
-            git_stdout(fixture.origin.path(), &["rev-parse", fixture.branch]),
-            fixture.remote_head_before_advance
+            git_stdout(
+                fixture.origin.as_ref().unwrap().path(),
+                &["rev-parse", fixture.branch]
+            ),
+            fixture
+                .remote_head_before_advance
+                .as_ref()
+                .unwrap()
+                .as_str()
         );
     }
 

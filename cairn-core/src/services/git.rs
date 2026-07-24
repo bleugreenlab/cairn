@@ -170,8 +170,27 @@ impl GitClient for RealGitClient {
     }
 
     fn is_repo(&self, path: &Path) -> Result<bool, String> {
-        let output = self.run_git_strs(path, &["rev-parse", "--is-inside-work-tree"])?;
-        Ok(output.success && output.stdout.trim() == "true")
+        // Ask whether `path` IS a repository root, not whether it sits inside
+        // one. `--is-inside-work-tree` answers the containment question and so
+        // returns true for any directory nested under a repository, however far
+        // up the tree that repository lives. Every caller of this method uses the
+        // answer to decide whether to `git init` here or to operate on "the"
+        // repository at this path, so containment is the wrong question: a
+        // config directory sitting inside an unrelated enclosing repository (a
+        // home directory versioned as a dotfiles repo, say) would be reported as
+        // already initialized, and Cairn would then stage, commit, and re-point
+        // the remote of the user's repository instead of its own.
+        let output = self.run_git_strs(path, &["rev-parse", "--show-toplevel"])?;
+        if !output.success {
+            return Ok(false);
+        }
+        let toplevel = Path::new(output.stdout.trim());
+        // Canonicalize both sides: git reports the resolved path, so on macOS a
+        // caller passing /var/... would otherwise never match /private/var/...
+        Ok(match (toplevel.canonicalize(), path.canonicalize()) {
+            (Ok(reported), Ok(requested)) => reported == requested,
+            _ => false,
+        })
     }
 
     fn init_repo(&self, path: &Path, initial_branch: &str) -> Result<(), String> {

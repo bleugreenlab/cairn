@@ -15,23 +15,7 @@ pub struct OutboxEntry {
     pub id: String,
     pub kind: String,
     pub dedupe_key: String,
-    pub payload_json: String,
-}
-
-/// Claim all pending outbox entries for processing.
-///
-/// Atomically transitions entries from `pending` to `running` and
-/// increments their attempt counter. Returns the claimed entries.
-pub fn drain_pending(db: Arc<LocalDb>) -> Vec<OutboxEntry> {
-    match block_on_outbox_db(
-        async move { drain_pending_async(&db).await.map_err(|e| e.to_string()) },
-    ) {
-        Ok(entries) => entries,
-        Err(error) => {
-            log::warn!("Failed to drain pending outbox entries: {}", error);
-            Vec::new()
-        }
-    }
+    pub(crate) payload_json: String,
 }
 
 pub async fn drain_pending_async(db: &LocalDb) -> DbResult<Vec<OutboxEntry>> {
@@ -81,7 +65,7 @@ pub async fn drain_pending_async(db: &LocalDb) -> DbResult<Vec<OutboxEntry>> {
 }
 
 /// Mark an outbox entry as successfully processed.
-pub fn mark_done(db: Arc<LocalDb>, id: &str) {
+pub(crate) fn mark_done(db: Arc<LocalDb>, id: &str) {
     let id = id.to_string();
     if let Err(error) =
         block_on_outbox_db(
@@ -92,7 +76,7 @@ pub fn mark_done(db: Arc<LocalDb>, id: &str) {
     }
 }
 
-pub async fn mark_done_async(db: &LocalDb, id: &str) -> DbResult<()> {
+async fn mark_done_async(db: &LocalDb, id: &str) -> DbResult<()> {
     db.write(|conn| {
         let id = id.to_string();
         Box::pin(async move { mark_done_conn(conn, &id).await })
@@ -100,7 +84,7 @@ pub async fn mark_done_async(db: &LocalDb, id: &str) -> DbResult<()> {
     .await
 }
 
-pub async fn mark_done_conn(conn: &Connection, id: &str) -> DbResult<()> {
+async fn mark_done_conn(conn: &Connection, id: &str) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp() as i32;
     conn.execute(
         "UPDATE effect_outbox
@@ -114,7 +98,7 @@ pub async fn mark_done_conn(conn: &Connection, id: &str) -> DbResult<()> {
 }
 
 /// Mark an outbox entry as failed with an error message.
-pub fn mark_failed(db: Arc<LocalDb>, id: &str, error: &str) {
+pub(crate) fn mark_failed(db: Arc<LocalDb>, id: &str, error: &str) {
     let id = id.to_string();
     let error = error.to_string();
     if let Err(mark_error) = block_on_outbox_db(async move {
@@ -135,7 +119,7 @@ pub async fn mark_failed_async(db: &LocalDb, id: &str, error: &str) -> DbResult<
     .await
 }
 
-pub async fn mark_failed_conn(conn: &Connection, id: &str, error: &str) -> DbResult<()> {
+async fn mark_failed_conn(conn: &Connection, id: &str, error: &str) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp() as i32;
     conn.execute(
         "UPDATE effect_outbox
@@ -147,22 +131,6 @@ pub async fn mark_failed_conn(conn: &Connection, id: &str, error: &str) -> DbRes
     )
     .await?;
     Ok(())
-}
-
-/// Mark all `running` or `pending` outbox entries for a given kind+dedupe_key as done.
-///
-/// Used after successful effect execution to mark the corresponding
-/// outbox entries without threading individual IDs through the effect flow.
-pub fn mark_done_by_key(db: Arc<LocalDb>, kind: &str, dedupe_key: &str) {
-    let kind = kind.to_string();
-    let dedupe_key = dedupe_key.to_string();
-    if let Err(error) = block_on_outbox_db(async move {
-        mark_done_by_key_async(&db, &kind, &dedupe_key)
-            .await
-            .map_err(|e| e.to_string())
-    }) {
-        log::warn!("Failed to mark outbox entries done by key: {}", error);
-    }
 }
 
 pub async fn mark_done_by_key_async(db: &LocalDb, kind: &str, dedupe_key: &str) -> DbResult<()> {
@@ -187,13 +155,8 @@ pub async fn mark_done_by_key_async(db: &LocalDb, kind: &str, dedupe_key: &str) 
     .await
 }
 
-/// Insert a pending outbox entry. Returns the generated entry ID.
-pub fn insert_pending(db: Arc<LocalDb>, kind: &str, dedupe_key: &str) -> Result<String, String> {
-    insert_pending_with_payload(db, kind, dedupe_key, "{}")
-}
-
 /// Insert a pending outbox entry with a payload.
-pub fn insert_pending_with_payload(
+pub(crate) fn insert_pending_with_payload(
     db: Arc<LocalDb>,
     kind: &str,
     dedupe_key: &str,
@@ -209,7 +172,7 @@ pub fn insert_pending_with_payload(
     })
 }
 
-pub async fn insert_pending_with_payload_async(
+pub(crate) async fn insert_pending_with_payload_async(
     db: &LocalDb,
     kind: &str,
     dedupe_key: &str,
@@ -226,7 +189,7 @@ pub async fn insert_pending_with_payload_async(
     .await
 }
 
-pub async fn insert_pending_with_payload_conn(
+async fn insert_pending_with_payload_conn(
     conn: &Connection,
     kind: &str,
     dedupe_key: &str,
@@ -243,24 +206,6 @@ pub async fn insert_pending_with_payload_conn(
     )
     .await?;
     Ok(id)
-}
-
-/// Reset `running` entries back to `pending` (for crash recovery).
-///
-/// Called on startup to reclaim entries that were mid-flight when the
-/// process crashed.
-pub fn reset_running_to_pending(db: Arc<LocalDb>) -> usize {
-    match block_on_outbox_db(async move {
-        reset_running_to_pending_async(&db)
-            .await
-            .map_err(|e| e.to_string())
-    }) {
-        Ok(count) => count,
-        Err(error) => {
-            log::warn!("Failed to reset running outbox entries: {}", error);
-            0
-        }
-    }
 }
 
 pub async fn reset_running_to_pending_async(db: &LocalDb) -> DbResult<usize> {
@@ -293,7 +238,7 @@ pub fn gc(db: Arc<LocalDb>) -> usize {
     }
 }
 
-pub async fn gc_async(db: &LocalDb) -> DbResult<usize> {
+async fn gc_async(db: &LocalDb) -> DbResult<usize> {
     db.write(|conn| {
         Box::pin(async move {
             let cutoff = chrono::Utc::now().timestamp() as i32 - 86400;

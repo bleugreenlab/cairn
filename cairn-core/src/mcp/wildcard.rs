@@ -30,7 +30,7 @@
 //! literal content, not a marker; the backslash is stripped from the anchor.
 
 /// The wildcard marker used in `old_string` for anchored matching.
-pub const WILDCARD_TOKEN: &str = "~~*~~";
+pub(crate) const WILDCARD_TOKEN: &str = "~~*~~";
 
 /// Scan mode for lightweight tokenization during balanced matching.
 /// Delimiters inside strings and comments are ignored.
@@ -60,7 +60,7 @@ enum ScanMode {
 /// - An empty *trailing* anchor is permitted only when the preceding anchor's
 ///   trimmed right edge ends with an opener (`{`/`[`/`(`) — balance supplies the
 ///   matching closer.
-pub fn parse_wildcard(old_string: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_wildcard(old_string: &str) -> Option<Vec<String>> {
     let mut segments: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut found_separator = false;
@@ -102,7 +102,7 @@ pub fn parse_wildcard(old_string: &str) -> Option<Vec<String>> {
 /// Strip escaping backslashes from `\~~*~~` sequences, yielding the literal text
 /// to match when `old_string` is not a wildcard edit (so an escaped marker still
 /// targets a literal `~~*~~` in the file).
-pub fn unescape_literal(old: &str) -> String {
+pub(crate) fn unescape_literal(old: &str) -> String {
     old.replace("\\~~*~~", WILDCARD_TOKEN)
 }
 
@@ -208,7 +208,7 @@ fn matching_closer(opener: u8) -> Option<u8> {
 /// middle anchors face a marker on both sides. Those marker-facing edges are
 /// whitespace-trimmed before matching. Each gap is resolved as balanced or span
 /// per the module docs.
-pub fn apply_wildcard_edit<S: AsRef<str>>(
+pub(crate) fn apply_wildcard_edit<S: AsRef<str>>(
     content: &str,
     anchors: &[S],
     new_string: &str,

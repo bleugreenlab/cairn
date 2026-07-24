@@ -44,11 +44,10 @@ pub use process::{
     SpawnConfig,
 };
 pub use pty::{
-    ensure_submitted_line, get_default_shell, read_pty_loop, scan_for_phrase,
-    submit_command_exiting_shell, update_output_buffer, CommandState, InlineTerminalChild,
-    PhraseScan, PortableTerminalChild, PtyComponents, PtyFactory, PtyPair, PtyResult, PtySession,
-    PtyState, RealPtyFactory, TerminalChild, TerminalOutputWatcher, MAX_BUFFER_SIZE,
-    PHRASE_EXCERPT_MAX,
+    ensure_submitted_line, get_default_shell, read_pty_loop, scan_for_phrase, update_output_buffer,
+    CommandState, LeaseTerminalBinding, PhraseScan, PortableTerminalChild, PtyComponents,
+    PtyFactory, PtyPair, PtyResult, PtySession, PtyState, RealPtyFactory, RemoteTerminalChild,
+    TerminalChild, TerminalOutputWatcher, MAX_BUFFER_SIZE, PHRASE_EXCERPT_MAX,
 };
 pub use pty_osc::{Osc133Event, Osc133Parser};
 pub use reaper::{OsProcessReaper, ProcessReaper};

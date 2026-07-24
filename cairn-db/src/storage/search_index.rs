@@ -43,7 +43,7 @@ pub struct SearchIndexHit {
     pub issue_id: Option<String>,
     pub job_id: Option<String>,
     /// Author-role facet (see `SearchFilters::role`); empty when not applicable.
-    pub role: String,
+    role: String,
     pub title: String,
     pub snippet: String,
     pub rank: f64,

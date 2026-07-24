@@ -29,25 +29,38 @@ impl PendingDeliverySource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingDelivery {
-    pub id: String,
-    pub source: PendingDeliverySource,
-    pub kind: String,
-    pub headline: String,
-    pub detail: Option<String>,
-    pub uri: Option<String>,
-    pub created_at: i64,
+    id: String,
+    source: PendingDeliverySource,
+    kind: String,
+    headline: String,
+    detail: Option<String>,
+    uri: Option<String>,
+    created_at: i64,
 }
 
 pub async fn list_pending_deliveries(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<PendingDelivery>, String> {
-    let mut items = Vec::new();
-
-    if let Some(recipient) = node_uri_for_job(db, job_id).await {
-        let pushes = attention_push::list_pending_live(db, &recipient)
+    let recipient = node_uri_for_job(db, job_id).await;
+    let pushes = async {
+        match recipient.as_deref() {
+            Some(recipient) => attention_push::list_pending_live(db, recipient)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(Vec::new()),
+        }
+    };
+    let notices = side_channel::peek_pending_side_channel_for_job_async(db, job_id);
+    let channel_messages = async {
+        session::pending_channel_messages_for_job(db, job_id, 20)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+    };
+    let (pushes, notices, channel_messages) = tokio::try_join!(pushes, notices, channel_messages)?;
+
+    let mut items = Vec::new();
+    if recipient.is_some() {
         items.extend(pushes.into_iter().map(|push| {
             let prefix = push
                 .key
@@ -67,7 +80,6 @@ pub async fn list_pending_deliveries(
         }));
     }
 
-    let notices = side_channel::peek_pending_side_channel_for_job_async(db, job_id).await?;
     items.extend(notices.into_iter().map(|notice| {
         let detail = notice.render();
         PendingDelivery {
@@ -81,9 +93,6 @@ pub async fn list_pending_deliveries(
         }
     }));
 
-    let channel_messages = session::pending_channel_messages_for_job(db, job_id, 20)
-        .await
-        .map_err(|error| error.to_string())?;
     items.extend(channel_messages.into_iter().map(|message| PendingDelivery {
         id: message.rowid.to_string(),
         source: PendingDeliverySource::Channel,

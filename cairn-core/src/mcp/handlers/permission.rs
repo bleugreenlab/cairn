@@ -310,120 +310,6 @@ pub(crate) async fn await_permission_decision(
     }
 }
 
-/// Create a permission request for background work (agent terminals) without
-/// yielding or suspending the current turn. The returned request id is answered
-/// through the normal permission response broadcast.
-pub(crate) async fn create_background_permission_request(
-    orch: &Orchestrator,
-    run_id: &str,
-    tool_use_id: &str,
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-) -> Result<String, String> {
-    // Intrinsic prefixing (CAIRN-2210): inherit the owning run's scope so a team
-    // background permission_request routes back to the replica.
-    let request_id = ids::mint_child(run_id);
-    let now = chrono::Utc::now().timestamp() as i32;
-    let tool_input_json = serde_json::to_string(tool_input).unwrap_or_default();
-
-    let perm_segment = orch
-        .db
-        .local
-        .write(|conn| {
-            let request_id = request_id.clone();
-            let run_id = run_id.to_string();
-            let tool_use_id = tool_use_id.to_string();
-            let tool_name = tool_name.to_string();
-            let tool_input_json = tool_input_json.clone();
-            Box::pin(async move {
-                let job_id = {
-                    let mut rows = conn
-                        .query(
-                            "SELECT job_id FROM runs WHERE id = ?1 LIMIT 1",
-                            params![run_id.as_str()],
-                        )
-                        .await?;
-                    match rows.next().await? {
-                        Some(row) => row.opt_text(0)?,
-                        None => None,
-                    }
-                };
-
-                let uri_segment = if job_id.is_some() {
-                    let mut count_rows = conn
-                        .query(
-                            "SELECT COUNT(*) FROM permission_requests pr \
-                             JOIN runs r ON pr.run_id = r.id \
-                             WHERE r.job_id = (SELECT job_id FROM runs WHERE id = ?1)",
-                            params![run_id.as_str()],
-                        )
-                        .await?;
-                    let ordinal = count_rows
-                        .next()
-                        .await?
-                        .and_then(|row| row.i64(0).ok())
-                        .unwrap_or(0)
-                        + 1;
-                    Some(format!("perm-{}", ordinal))
-                } else {
-                    None
-                };
-
-                conn.execute(
-                    "
-                    INSERT INTO permission_requests (
-                        id, run_id, job_id, tool_use_id, tool_name, tool_input,
-                        status, created_at, turn_id, uri_segment
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, ?8)
-                    ",
-                    params![
-                        request_id.as_str(),
-                        run_id.as_str(),
-                        job_id.as_deref(),
-                        tool_use_id.as_str(),
-                        tool_name.as_str(),
-                        tool_input_json.as_str(),
-                        now,
-                        uri_segment.as_deref()
-                    ],
-                )
-                .await?;
-
-                Ok(uri_segment)
-            })
-        })
-        .await
-        .map_err(|e| format!("Failed to store request: {e}"))?;
-
-    let _ = orch.services.emitter.emit(
-        "permission-request",
-        serde_json::json!({
-            "requestId": request_id,
-            "runId": run_id,
-            "toolUseId": tool_use_id,
-            "toolName": tool_name,
-            "input": tool_input,
-        }),
-    );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "permission_requests", "action": "insert"}),
-    );
-
-    emit_permission_attention(
-        orch,
-        run_id,
-        tool_name,
-        tool_use_id,
-        tool_input,
-        perm_segment.as_deref(),
-    )
-    .await;
-
-    Ok(request_id)
-}
-
 /// Emit the attention fact for a pending permission request so the UI toast and
 /// the `watch` long-poll learn it without a follow-up read. Best-effort: a
 /// missing run context simply wakes the issue.
@@ -1751,6 +1637,90 @@ pub async fn ensure_and_start_successor_turn(
             .await?;
             update.started = start_turn_for_run(conn, &update.turn_id, &run_id).await?;
             Ok(Some(update))
+        })
+    })
+    .await
+}
+
+/// Outcome of [`ensure_wait_resolved_successor`].
+pub enum WaitSuccessor {
+    /// The wait's own `WaitResolved` successor — either freshly created (pending,
+    /// unstarted) or an existing one reused on replay.
+    Ready(SuccessorTurnUpdate),
+    /// The predecessor already has a DIFFERENT successor from a racing
+    /// continuation (predecessor -> successor is 1:1). The wait must not hijack a
+    /// foreign turn as its own; the caller decides what to do based on `state` (a
+    /// pending foreign turn means the run has NOT resumed yet).
+    Collision {
+        turn_id: String,
+        start_reason: String,
+        state: TurnState,
+    },
+}
+
+/// Resolve the owned wait's `WaitResolved` successor by explicit identity, WITHOUT
+/// starting it. A yielded predecessor turn has at most one successor, so:
+///
+/// - an existing `wait_resolved` successor is the wait's own — reuse it (idempotent
+///   replay);
+/// - an existing successor with any other `start_reason` is a racing continuation
+///   (e.g. a user steer that resumed the run mid-wait) — report a `Collision` so the
+///   caller does not adopt it;
+/// - no successor yet — create the wait's pending `WaitResolved` turn.
+///
+/// Matching on `start_reason` (not predecessor identity alone) is what keeps the
+/// resolver from hijacking a foreign turn or silently skipping delivery against it
+/// (CAIRN-2970).
+pub async fn ensure_wait_resolved_successor(
+    db: &LocalDb,
+    run_id: &str,
+    predecessor_turn_id: &str,
+) -> DbResult<Option<WaitSuccessor>> {
+    let run_id = run_id.to_string();
+    let predecessor_turn_id = predecessor_turn_id.to_string();
+    db.write(|conn| {
+        let run_id = run_id.clone();
+        let predecessor_turn_id = predecessor_turn_id.clone();
+        Box::pin(async move {
+            let Some((job_id, session_id)) = run_turn_context(conn, &run_id).await? else {
+                return Ok(None);
+            };
+            let existing = {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, start_reason, state FROM turns WHERE predecessor_id = ?1 ORDER BY sequence ASC LIMIT 1",
+                        params![predecessor_turn_id.clone()],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Some((row.text(0)?, row.text(1)?, row.text(2)?)),
+                    None => None,
+                }
+            };
+            if let Some((turn_id, start_reason, state)) = existing {
+                if start_reason == TurnStartReason::WaitResolved.to_string() {
+                    return Ok(Some(WaitSuccessor::Ready(SuccessorTurnUpdate {
+                        turn_id,
+                        inserted: false,
+                        started: false,
+                    })));
+                }
+                let state: TurnState = state.parse().map_err(DbError::Row)?;
+                return Ok(Some(WaitSuccessor::Collision {
+                    turn_id,
+                    start_reason,
+                    state,
+                }));
+            }
+            let update = ensure_successor_turn(
+                conn,
+                &session_id,
+                &job_id,
+                &predecessor_turn_id,
+                TurnStartReason::WaitResolved,
+            )
+            .await?;
+            Ok(Some(WaitSuccessor::Ready(update)))
         })
     })
     .await

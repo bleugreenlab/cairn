@@ -376,14 +376,14 @@ fn condition_db_error(error: DbError) -> String {
 /// upstream agent with the actual failure (not just a pass/fail bit).
 #[derive(Debug, Clone)]
 pub struct CheckpointRunOutput {
-    pub passed: bool,
-    pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub(crate) passed: bool,
+    pub(crate) exit_code: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Execute a programmatic checkpoint command, capturing its output.
-pub async fn execute_programmatic_checkpoint(
+pub(crate) async fn execute_programmatic_checkpoint(
     worktree_path: &str,
     command: &str,
 ) -> Result<CheckpointRunOutput, String> {

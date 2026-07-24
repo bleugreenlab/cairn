@@ -32,12 +32,12 @@ pub type Delivery = DeliveryUrgency;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueuedMessage {
-    pub id: String,
-    pub job_id: String,
-    pub content: String,
-    pub delivery: Delivery,
-    pub created_at: i64,
-    pub delivered_at: Option<i64>,
+    pub(crate) id: String,
+    pub(crate) job_id: String,
+    pub(crate) content: String,
+    pub(crate) delivery: Delivery,
+    pub(crate) created_at: i64,
+    pub(crate) delivered_at: Option<i64>,
 }
 
 fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<QueuedMessage> {
@@ -69,7 +69,7 @@ pub fn enqueue(
     run_db_blocking(move || async move { enqueue_async(db, &job_id, &content, delivery).await })
 }
 
-pub async fn enqueue_async(
+pub(crate) async fn enqueue_async(
     db: &LocalDb,
     job_id: &str,
     content: &str,
@@ -118,7 +118,7 @@ pub fn list_pending_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<QueuedMess
     run_db_blocking(move || async move { list_pending_for_job_async(db, &job_id).await })
 }
 
-pub async fn list_pending_for_job_async(
+async fn list_pending_for_job_async(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<QueuedMessage>, String> {
@@ -233,7 +233,7 @@ pub async fn claim_steer_for_job_async(
 /// Atomically claim pending rows that should be delivered at a tool boundary:
 /// passive rides along, steer lands promptly, and interrupt leftovers degrade to
 /// steer if their backend interrupt raced a natural tool/turn boundary.
-pub async fn claim_tool_boundary_for_job_async(
+pub(crate) async fn claim_tool_boundary_for_job_async(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<QueuedMessage>, String> {
@@ -243,12 +243,12 @@ pub async fn claim_tool_boundary_for_job_async(
 /// Atomically claim ALL pending messages for a job (turn-end / resume path),
 /// regardless of delivery tag. This is what sweeps up a `steer` row that never
 /// reached a tool boundary, plus every `queue` row.
-pub fn claim_all_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<QueuedMessage>, String> {
+pub(crate) fn claim_all_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<QueuedMessage>, String> {
     let job_id = job_id.to_string();
     run_db_blocking(move || async move { claim_all_for_job_async(db, &job_id).await })
 }
 
-pub async fn claim_all_for_job_async(
+pub(crate) async fn claim_all_for_job_async(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<QueuedMessage>, String> {
@@ -316,26 +316,21 @@ async fn claim_for_job_inner(
     .map_err(|error| format!("Failed to claim queued messages: {error}"))
 }
 
-/// Non-stamping count of pending messages for a job. Used by the flush-on-idle
-/// guard to decide whether to resume a job that has gone idle with a stranded
-/// queued message (the resume itself claims and injects them).
-pub fn peek_pending_count_for_job(db: &LocalDb, job_id: &str) -> Result<usize, String> {
-    let job_id = job_id.to_string();
-    run_db_blocking(move || async move { peek_pending_count_for_job_async(db, &job_id).await })
-}
-
 pub async fn peek_pending_count_for_job_async(db: &LocalDb, job_id: &str) -> Result<usize, String> {
     Ok(list_pending_for_job_async(db, job_id).await?.len())
 }
 
-pub fn peek_waking_pending_count_for_job(db: &LocalDb, job_id: &str) -> Result<usize, String> {
+pub(crate) fn peek_waking_pending_count_for_job(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<usize, String> {
     let job_id = job_id.to_string();
     run_db_blocking(
         move || async move { peek_waking_pending_count_for_job_async(db, &job_id).await },
     )
 }
 
-pub async fn peek_waking_pending_count_for_job_async(
+async fn peek_waking_pending_count_for_job_async(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<usize, String> {

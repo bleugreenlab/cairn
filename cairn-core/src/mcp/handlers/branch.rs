@@ -15,9 +15,69 @@ use crate::storage::RowExt;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BranchResolution {
+    pub project_id: String,
+    /// Runner-owned jj operation repository used for coordinate mutation.
+    pub repository_path: PathBuf,
+    /// Git object database used by immutable read overlays.
+    pub object_repository_path: PathBuf,
     pub rev: String,
-    pub checkout: Option<PathBuf>,
-    pub project_path: Option<PathBuf>,
+    pub commit_id: String,
+    pub default_commit_id: String,
+}
+
+/// Resolve the durable logical coordinate owned by the current run. This is the
+/// ordinary project-content authority; `cwd` is used only by `lookup_run` as a
+/// legacy identity fallback and is never inspected for its jj `@` coordinate.
+pub(crate) async fn resolve_current_for_read(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Result<BranchResolution, String> {
+    let run = super::run_context::lookup_run(&orch.db.local, request).await?;
+    let project = project_context_by_id(orch, &run.project_id).await?;
+    let job_id = run.job_id.clone();
+    let rev = orch
+        .db
+        .local
+        .read(move |conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT branch FROM jobs WHERE id = ?1 LIMIT 1",
+                        params![job_id],
+                    )
+                    .await?;
+                rows.next().await?.map(|row| row.opt_text(0)).transpose()
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .unwrap_or_else(|| project.default_branch.clone());
+    let project_path = project
+        .project_path
+        .ok_or_else(|| format!("project '{}' has no local repository", project.project_id))?;
+    let managed_store = crate::jj::project_store_dir(&orch.config_dir, &project_path);
+    let repository_path = if crate::jj::is_jj_dir(&managed_store) {
+        managed_store
+    } else {
+        project_path.clone()
+    };
+    let commit_id = cairn_vcs::resolve_coordinate(&repository_path, &rev)
+        .await
+        .map_err(|error| map_coordinate_error(error, &rev).to_string())?;
+    let default_commit_id =
+        cairn_vcs::resolve_coordinate(&repository_path, &project.default_branch)
+            .await
+            .map_err(|error| map_coordinate_error(error, &project.default_branch).to_string())?;
+    Ok(BranchResolution {
+        project_id: project.project_id,
+        repository_path,
+        object_repository_path: project_path,
+        rev,
+        commit_id,
+        default_commit_id,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -71,9 +131,25 @@ struct ProjectBranchContext {
 #[derive(Debug, Clone)]
 struct JobBranchContext {
     branch: Option<String>,
-    worktree_path: Option<PathBuf>,
-    project_path: Option<PathBuf>,
     project_id: String,
+}
+
+fn map_coordinate_error(
+    error: cairn_vcs::CoordinateResolutionError,
+    requested: &str,
+) -> BranchRefResolutionError {
+    match error {
+        cairn_vcs::CoordinateResolutionError::Invalid(_) => BranchRefResolutionError::Invalid {
+            requested: requested.to_string(),
+        },
+        cairn_vcs::CoordinateResolutionError::Ambiguous(_) => BranchRefResolutionError::Ambiguous {
+            requested: requested.to_string(),
+        },
+        other => BranchRefResolutionError::Unresolvable {
+            requested: requested.to_string(),
+            diagnostic: other.to_string(),
+        },
+    }
 }
 
 pub(crate) async fn resolve_for_read(
@@ -81,24 +157,47 @@ pub(crate) async fn resolve_for_read(
     request: &McpCallbackRequest,
     branch: &str,
 ) -> Result<BranchResolution, String> {
-    if let Some(job) = resolve_node_uri(orch, branch).await? {
-        let rev = job
-            .branch
-            .ok_or_else(|| format!("Node URI '{branch}' has no recorded branch"))?;
-        return Ok(BranchResolution {
-            rev,
-            checkout: job.worktree_path,
-            project_path: job.project_path,
-        });
-    }
-
-    Ok(BranchResolution {
-        rev: branch.to_string(),
-        checkout: None,
-        project_path: project_context_for_request(orch, request)
+    let (project, rev) = match resolve_node_uri(orch, branch).await? {
+        Some(job) => {
+            let rev = job
+                .branch
+                .ok_or_else(|| format!("Node URI '{branch}' has no recorded branch"))?;
+            (project_context_by_id(orch, &job.project_id).await?, rev)
+        }
+        None => {
+            let project = project_context_for_request(orch, request).await?;
+            let rev = if branch.trim() == "main" {
+                project.default_branch.clone()
+            } else {
+                branch.trim().to_string()
+            };
+            (project, rev)
+        }
+    };
+    let project_path = project
+        .project_path
+        .ok_or_else(|| format!("project '{}' has no local repository", project.project_id))?;
+    let managed_store = crate::jj::project_store_dir(&orch.config_dir, &project_path);
+    let repository_path = if crate::jj::is_jj_dir(&managed_store) {
+        managed_store
+    } else {
+        project_path.clone()
+    };
+    let requested = branch.to_string();
+    let commit_id = cairn_vcs::resolve_coordinate(&repository_path, &rev)
+        .await
+        .map_err(|error| map_coordinate_error(error, &requested).to_string())?;
+    let default_commit_id =
+        cairn_vcs::resolve_coordinate(&repository_path, &project.default_branch)
             .await
-            .ok()
-            .and_then(|ctx| ctx.project_path),
+            .map_err(|error| map_coordinate_error(error, &project.default_branch).to_string())?;
+    Ok(BranchResolution {
+        project_id: project.project_id,
+        repository_path,
+        object_repository_path: project_path,
+        rev,
+        commit_id,
+        default_commit_id,
     })
 }
 
@@ -158,46 +257,15 @@ pub(crate) async fn resolve_for_run(
                 requested: requested.clone(),
                 diagnostic: format!("project '{}' has no local repository", project.project_id),
             })?;
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let managed_store = crate::jj::project_store_dir(&orch.config_dir, &repository_path);
     let revision_store = if crate::jj::is_jj_dir(&managed_store) {
         managed_store.as_path()
     } else {
         repository_path.as_path()
     };
-    let output = jj
-        .run(
-            revision_store,
-            &[
-                "log",
-                "-r",
-                &rev,
-                "--no-graph",
-                "--ignore-working-copy",
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-            "resolve branch ref to immutable commit",
-        )
-        .map_err(|diagnostic| BranchRefResolutionError::Unresolvable {
-            requested: requested.clone(),
-            diagnostic,
-        })?;
-    let commits: Vec<_> = output
-        .lines()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect();
-    let commit_id = match commits.as_slice() {
-        [commit] => (*commit).to_string(),
-        [] => {
-            return Err(BranchRefResolutionError::Unresolvable {
-                requested,
-                diagnostic: "the revision selected no commits".into(),
-            })
-        }
-        _ => return Err(BranchRefResolutionError::Ambiguous { requested }),
-    };
+    let commit_id = cairn_vcs::resolve_coordinate(revision_store, &rev)
+        .await
+        .map_err(|error| map_coordinate_error(error, &requested))?;
 
     Ok(RunBranchResolution {
         project_id: project.project_id,
@@ -205,18 +273,6 @@ pub(crate) async fn resolve_for_run(
         rev,
         commit_id,
     })
-}
-
-pub(crate) fn jj_command_dir(resolution: &BranchResolution, fallback_cwd: &str) -> PathBuf {
-    let fallback = PathBuf::from(fallback_cwd);
-    if crate::jj::is_jj_dir(&fallback) {
-        return fallback;
-    }
-    resolution
-        .checkout
-        .clone()
-        .or_else(|| resolution.project_path.clone())
-        .unwrap_or(fallback)
 }
 
 async fn project_context_for_request(
@@ -323,7 +379,7 @@ async fn job_by_node_uri(
             Box::pin(async move {
                 let mut rows = if let Some(task_name) = task_name {
                     conn.query(
-                        "SELECT child.branch, child.worktree_path, p.repo_path, p.id
+                        "SELECT child.branch, p.id
                          FROM jobs parent
                          JOIN jobs child ON child.parent_job_id = parent.id
                          JOIN issues i ON parent.issue_id = i.id
@@ -348,7 +404,7 @@ async fn job_by_node_uri(
                     .await?
                 } else {
                     conn.query(
-                        "SELECT j.branch, j.worktree_path, p.repo_path, p.id
+                        "SELECT j.branch, p.id
                          FROM jobs j
                          JOIN issues i ON j.issue_id = i.id
                          JOIN projects p ON i.project_id = p.id
@@ -382,8 +438,6 @@ async fn job_by_node_uri(
 fn job_context_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<JobBranchContext> {
     Ok(JobBranchContext {
         branch: row.opt_text(0)?,
-        worktree_path: row.opt_text(1)?.map(PathBuf::from),
-        project_path: row.opt_text(2)?.map(PathBuf::from),
-        project_id: row.text(3)?,
+        project_id: row.text(1)?,
     })
 }

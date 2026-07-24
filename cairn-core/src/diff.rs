@@ -44,9 +44,9 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeSummary {
-    pub files_changed: i32,
-    pub additions: Option<i32>,
-    pub deletions: Option<i32>,
+    files_changed: i32,
+    additions: Option<i32>,
+    deletions: Option<i32>,
 }
 
 /// A node's resolved `base..tip` diff: per-file hunks plus rolled-up stats.

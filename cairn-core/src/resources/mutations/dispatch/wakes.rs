@@ -201,7 +201,7 @@ pub(super) async fn dispatch(
 pub(super) struct WakeFilterPayload {
     pub(super) kind: String,
     pub(super) reference: Option<String>,
-    pub(super) fact_kinds: Option<Vec<String>>,
+    fact_kinds: Option<Vec<String>>,
     /// Terminal subscriptions only: `"exit"` (default) or `"output"`.
     pub(super) on: Option<String>,
     /// Terminal `on:"output"` subscriptions only: the literal phrase to watch for.
@@ -391,6 +391,7 @@ async fn subscribe_terminal_exit_wake(
         slug,
         uri,
         Some(row),
+        row.session_id.as_deref(),
         created_by,
     )
     .await
@@ -448,7 +449,7 @@ async fn subscribe_terminal_output_wake(
         uri,
         phrase,
         Some(row),
-        None,
+        row.session_id.as_deref(),
         created_by,
     )
     .await

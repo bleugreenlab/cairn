@@ -125,7 +125,10 @@ pub async fn owning_db_for_run(dbs: &DbState, run_id: &str) -> Result<Arc<LocalD
 }
 
 /// The database that owns this turn. Fail-closed (see module docs).
-pub async fn owning_db_for_turn(dbs: &DbState, turn_id: &str) -> Result<Arc<LocalDb>, CairnError> {
+pub(crate) async fn owning_db_for_turn(
+    dbs: &DbState,
+    turn_id: &str,
+) -> Result<Arc<LocalDb>, CairnError> {
     routing_db_for_id(dbs, turn_id).await
 }
 

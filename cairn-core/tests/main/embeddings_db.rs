@@ -308,6 +308,17 @@ async fn get_event_vibes_for_session_filters_and_orders() {
     )
     .await;
 
+    // Pin the primary ordering key so this test actually exercises the
+    // documented sequence tie-breaker. Millisecond wall-clock timestamps may
+    // differ under the full parallel suite even though isolated inserts often
+    // land in the same tick.
+    db.execute(
+        "UPDATE events SET created_at = 1 WHERE id IN (?1, ?2)",
+        cairn_db::turso::params![e1.as_str(), e2.as_str()],
+    )
+    .await
+    .unwrap();
+
     for id in [&e1, &e2, &eb] {
         queries::upsert_event_vibe_async(&db, id, None, "oklch()", 0.5, 0.6, "m")
             .await

@@ -45,9 +45,9 @@ impl std::str::FromStr for VariableType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TemplateVariable {
-    pub name: String,
-    pub var_type: VariableType,
-    pub required: bool,
+    name: String,
+    var_type: VariableType,
+    required: bool,
 }
 
 /// Action configuration - a reusable action definition

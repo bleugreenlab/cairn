@@ -33,7 +33,7 @@ pub async fn create(db: &LocalDb, input: CreateMemory) -> Result<Memory, String>
     .map_err(|error| error.to_string())
 }
 
-pub async fn update(db: &LocalDb, input: UpdateMemory) -> Result<Memory, String> {
+pub(crate) async fn update(db: &LocalDb, input: UpdateMemory) -> Result<Memory, String> {
     let has_change = input.content.is_some() || input.status.is_some();
 
     if has_change {
@@ -63,7 +63,7 @@ pub async fn delete(db: &LocalDb, id: &str) -> Result<(), String> {
 /// Confirm the surviving draft memories captured by a completed job and enqueue
 /// their content embedding. Confirmation is intentionally tied to job completion:
 /// drafts that never reach this hook remain inert drafts.
-pub fn confirm_drafts_for_completed_job(
+fn confirm_drafts_for_completed_job(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
 ) -> Result<Vec<Memory>, String> {
@@ -82,7 +82,7 @@ pub fn confirm_drafts_for_completed_job(
 /// to `pending` AND spawn a triage issue in the same replica (CAIRN-2587). ROLE
 /// and WORKSPACE pools are cross-project, cross-database aggregates and remain
 /// PRIVATE-DB by explicit contract pending a team-orchestration decision.
-pub async fn confirm_and_spawn_drafts_for_merged_issue(
+pub(crate) async fn confirm_and_spawn_drafts_for_merged_issue(
     orch: crate::orchestrator::Orchestrator,
     issue_id: &str,
 ) -> Result<Vec<String>, String> {
@@ -154,25 +154,25 @@ fn resolve_owning_db_for_job_sync(
 
 #[derive(Debug, Clone)]
 pub struct MemoryReviewCompletion {
-    pub confirmed_count: usize,
-    pub confirmed_scopes: Vec<(String, String)>,
+    pub(crate) confirmed_count: usize,
+    pub(crate) confirmed_scopes: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MemoryReviewIdleState {
-    pub state: Option<String>,
-    pub draft_count: usize,
-    pub has_output_artifact: bool,
+    pub(crate) state: Option<String>,
+    pub(crate) draft_count: usize,
+    pub(crate) has_output_artifact: bool,
     /// True when this job is a sub-agent task (it has a `parent_job_id`), as
     /// opposed to a top-level recipe node. Reflection prompts are skipped for
     /// tasks; review prompts still fire for them when they captured drafts.
-    pub is_task: bool,
+    pub(crate) is_task: bool,
 }
 
 /// Queue the one-shot draft-memory review prompt when a job with draft memories
 /// first goes idle. The pending direct is delivered by the existing
 /// flush-on-idle path immediately after the idle hook returns.
-pub fn send_memory_review_on_idle(
+pub(crate) fn send_memory_review_on_idle(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
     run_id: &str,
@@ -309,7 +309,7 @@ fn latest_memory_review_direct_message_id(
 /// to attention pushes. Conservative gates keep user-authored follow-ups and live
 /// turns in front: this only nudges idle jobs with an open current session, no
 /// queued user message, no active turn, and no existing memory-review turn.
-pub fn reconcile_stranded_memory_reviews(
+pub(crate) fn reconcile_stranded_memory_reviews(
     orch: crate::orchestrator::Orchestrator,
 ) -> Result<usize, String> {
     if !orch.get_settings().memory_review_enabled {
@@ -449,7 +449,7 @@ Keep it to genuinely durable lessons and skip anything specific to just this iss
     )
 }
 
-pub fn memory_review_idle_state_for_job(
+pub(crate) fn memory_review_idle_state_for_job(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
 ) -> Result<MemoryReviewIdleState, String> {
@@ -569,7 +569,7 @@ async fn output_artifact_present_conn(
     Ok(rows.next().await?.is_some())
 }
 
-pub fn complete_sent_memory_review(
+pub(crate) fn complete_sent_memory_review(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
 ) -> Result<MemoryReviewCompletion, String> {
@@ -600,7 +600,7 @@ fn set_memory_review_done(
     })
 }
 
-pub fn confirm_drafts_for_completed_job_without_artifact_review(
+pub(crate) fn confirm_drafts_for_completed_job_without_artifact_review(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
 ) -> Result<MemoryReviewCompletion, String> {
@@ -640,7 +640,9 @@ pub fn confirm_drafts_for_completed_job_without_artifact_review(
 /// whose `memory_review_state = 'sent'` and whose review turn has not yet
 /// ended), enqueueing content embeds for the confirmed drafts. Returns the
 /// total confirmed count.
-pub fn confirm_orphaned_drafts(orch: &crate::orchestrator::Orchestrator) -> Result<usize, String> {
+pub(crate) fn confirm_orphaned_drafts(
+    orch: &crate::orchestrator::Orchestrator,
+) -> Result<usize, String> {
     // Discovery spans EVERY open database: a team run's stranded terminal-job
     // drafts live in that team's synced replica, so scanning only the private DB
     // would never confirm them (the CAIRN-2587 team-triage gap). The per-job

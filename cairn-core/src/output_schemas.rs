@@ -21,7 +21,7 @@ fn embedded_preset_schema(schema_name: &str) -> Option<&'static str> {
 }
 
 /// List of preset schema names
-pub const PRESET_SCHEMAS: &[&str] = &[
+pub(crate) const PRESET_SCHEMAS: &[&str] = &[
     "document",
     "plan",
     "tasklist",
@@ -32,7 +32,7 @@ pub const PRESET_SCHEMAS: &[&str] = &[
 ];
 
 /// Check if a schema name is a preset
-pub fn is_preset_schema(name: &str) -> bool {
+pub(crate) fn is_preset_schema(name: &str) -> bool {
     PRESET_SCHEMAS.contains(&name)
 }
 
@@ -41,10 +41,7 @@ pub fn is_preset_schema(name: &str) -> bool {
 /// `schema_dir` is host-specific:
 /// - Tauri: `resource_dir/resources/schemas`
 /// - cairn-server: a configured path or embedded
-pub fn load_preset_schema(
-    schema_dir: &Path,
-    schema_name: &str,
-) -> Result<serde_json::Value, String> {
+fn load_preset_schema(schema_dir: &Path, schema_name: &str) -> Result<serde_json::Value, String> {
     let schema_path = schema_dir.join(format!("{}.json", schema_name));
 
     if !schema_path.exists() {
@@ -71,7 +68,7 @@ fn load_embedded_preset_schema(schema_name: &str) -> Result<serde_json::Value, S
 /// Resolve an output schema to its JSON Schema value.
 /// - For preset names (e.g., "plan"), loads from the schema directory
 /// - For custom schemas (already a JSON object), returns as-is
-pub fn resolve_output_schema(
+pub(crate) fn resolve_output_schema(
     schema_dir: Option<&Path>,
     output_schema: &crate::models::OutputSchema,
 ) -> Result<serde_json::Value, String> {

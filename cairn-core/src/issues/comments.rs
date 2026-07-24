@@ -41,7 +41,7 @@ pub(crate) async fn next_issue_comment_seq(
 }
 
 /// Resolve a per-issue comment `seq` to its stable comment id, if present.
-pub async fn id_for_issue_seq(
+pub(crate) async fn id_for_issue_seq(
     db: &LocalDb,
     issue_id: &str,
     seq: i64,

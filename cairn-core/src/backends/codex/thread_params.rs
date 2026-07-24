@@ -182,7 +182,7 @@ pub(super) fn build_resume_fallback_prompt(
 /// Wrap a prior-session transcript and the latest reply into the fresh-thread
 /// fallback prompt. Pure so the ordering invariant (prior context precedes the
 /// latest message) is unit-testable without a database.
-pub(super) fn format_resume_fallback_prompt(transcript: &str, latest_user_message: &str) -> String {
+fn format_resume_fallback_prompt(transcript: &str, latest_user_message: &str) -> String {
     format!(
         "The previous Codex thread could not be resumed, so you are continuing from a transcript snapshot instead.\n\n\
 ## Prior Transcript\n\n{}\n\n\
@@ -191,7 +191,7 @@ pub(super) fn format_resume_fallback_prompt(transcript: &str, latest_user_messag
     )
 }
 
-pub(super) fn trim_resume_transcript(transcript: &str, max_chars: usize) -> String {
+fn trim_resume_transcript(transcript: &str, max_chars: usize) -> String {
     if transcript.chars().count() <= max_chars {
         return transcript.to_string();
     }

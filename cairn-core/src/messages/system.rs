@@ -19,7 +19,12 @@ use cairn_db::turso::params;
 /// `run_id` identifies the run this event is about. When set, it becomes
 /// the `sender_run_id` on the message so that delivery filters can exclude
 /// the message from being shown back to the same agent.
-pub fn emit_job_event(orch: &Orchestrator, job_id: &str, run_id: Option<&str>, event: JobEvent) {
+pub(crate) fn emit_job_event(
+    orch: &Orchestrator,
+    job_id: &str,
+    run_id: Option<&str>,
+    event: JobEvent,
+) {
     // Lifecycle messages live in the job's OWNING database (CAIRN-2197): a team
     // job's rows are in the synced replica, so looking up context and inserting
     // the message against the private DB would silently drop the message for
@@ -91,19 +96,6 @@ fn owning_db_for_job(orch: &Orchestrator, job_id: &str) -> Option<Arc<LocalDb>> 
     let job_id = job_id.to_string();
     run_db_blocking(move || async move {
         crate::execution::routing::owning_db_for_job(&dbs, &job_id)
-            .await
-            .map_err(|e| e.to_string())
-    })
-    .ok()
-}
-
-/// Resolve the database that owns a run (CAIRN-2197), same contract as
-/// [`owning_db_for_job`].
-fn owning_db_for_run(orch: &Orchestrator, run_id: &str) -> Option<Arc<LocalDb>> {
-    let dbs = orch.db.clone();
-    let run_id = run_id.to_string();
-    run_db_blocking(move || async move {
-        crate::execution::routing::owning_db_for_run(&dbs, &run_id)
             .await
             .map_err(|e| e.to_string())
     })
@@ -218,71 +210,42 @@ pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, titl
     }
 }
 
-/// Emit a system message for a run being continued (follow-up message sent).
-pub fn emit_run_continued(orch: &Orchestrator, run_id: &str) {
-    let Some(db) = owning_db_for_run(orch, run_id) else {
+/// Emit a system message when a user creates a REPL for a job. Tells the agent
+/// the slug it can send code into (the shared namespace) and the URI to read.
+pub fn emit_repl_created(orch: &Orchestrator, job_id: &str, slug: &str, interpreter: &str) {
+    let Some(db) = owning_db_for_job(orch, job_id) else {
         return;
     };
-    let job_id = lookup_run_job_id(db.clone(), run_id);
+    let ctx = match lookup_job_context(db.clone(), job_id) {
+        Some(ctx) => ctx,
+        None => return, // No issue context — standalone job, skip
+    };
 
-    if let Some(job_id) = job_id {
-        let ctx = match lookup_job_context(db.clone(), &job_id) {
-            Some(ctx) => ctx,
-            None => return,
-        };
+    let repl_uri = match &ctx.uri {
+        Some(node_uri) => format!("{}/repl/{}", node_uri, slug),
+        None => return,
+    };
 
-        let label = match &ctx.uri {
-            Some(uri) => format!("{} ({})", ctx.node_name, uri),
-            None => ctx.node_name.clone(),
-        };
-        let content = format!("{} received a follow-up message", label);
+    let content = format!(
+        "User opened a {interpreter} REPL \"{slug}\" — send code into the shared session with a run item {{code, interpreter:\"{interpreter}\", repl:\"{slug}\"}}. Read it: {repl_uri}"
+    );
 
-        let msg = super::db::insert_message(
-            &db,
-            &ChannelType::Issue,
-            Some(&ctx.issue_key),
-            Some(run_id),
-            "system",
-            None,
-            &content,
+    let msg = super::db::insert_message(
+        &db,
+        &ChannelType::Issue,
+        Some(&ctx.issue_key),
+        None, // No sender_run_id — user-initiated, all agents should see it
+        "system",
+        None,
+        &content,
+    );
+
+    if msg.is_ok() {
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "messages", "action": "insert"}),
         );
-
-        if msg.is_ok() {
-            let _ = orch.services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "messages", "action": "insert"}),
-            );
-        }
     }
-}
-
-fn lookup_run_job_id(db: Arc<LocalDb>, run_id: &str) -> Option<String> {
-    let run_id = run_id.to_string();
-    run_db_blocking(move || async move { lookup_run_job_id_async(&db, &run_id).await })
-        .ok()
-        .flatten()
-}
-
-async fn lookup_run_job_id_async(db: &LocalDb, run_id: &str) -> Result<Option<String>, String> {
-    let run_id = run_id.to_string();
-    let job_id = db
-        .read(|conn| {
-            let run_id = run_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT job_id FROM runs WHERE id = ?1 LIMIT 1",
-                        params![run_id.as_str()],
-                    )
-                    .await?;
-
-                crate::storage::next_opt_text(&mut rows, 0).await
-            })
-        })
-        .await
-        .map_err(|error| format!("Failed to look up run job: {error}"))?;
-
-    Ok(job_id)
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ use crate::models::Message;
 /// The canonical reply-to URI for a direct message, or `None` when the sender
 /// is not addressable by URI (e.g. a project-level agent whose `sender_name`
 /// is a bare node name rather than a `cairn://` URI).
-pub fn reply_to_uri(sender_name: &str) -> Option<String> {
+fn reply_to_uri(sender_name: &str) -> Option<String> {
     if sender_name == "external" {
         return Some("external".to_string());
     }
@@ -33,7 +33,7 @@ pub fn reply_to_uri(sender_name: &str) -> Option<String> {
 /// Render a direct message for its recipient: the `[Direct message from …]`
 /// header followed by the content, plus a reply-to hint pointing at the
 /// sender's canonical `/messages` collection when the sender is URI-addressable.
-pub fn render_direct_message(msg: &Message) -> String {
+pub(crate) fn render_direct_message(msg: &Message) -> String {
     let head = format!("[Direct message from {}] {}", msg.sender_name, msg.content);
     match reply_to_uri(&msg.sender_name) {
         Some(reply_to) => {

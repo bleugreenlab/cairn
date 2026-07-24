@@ -9,23 +9,23 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IssueRef {
-    pub uri: String,
-    pub project_key: String,
-    pub issue_id: String,
-    pub number: i32,
-    pub title: String,
-    pub status: IssueStatus,
+    pub(crate) uri: String,
+    pub(crate) project_key: String,
+    pub(crate) issue_id: String,
+    pub(crate) number: i32,
+    pub(crate) title: String,
+    pub(crate) status: IssueStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyRef {
-    pub uri: String,
-    pub project_key: String,
-    pub number: i32,
-    pub title: String,
-    pub status: IssueStatus,
-    pub met: bool,
+    uri: String,
+    project_key: String,
+    number: i32,
+    title: String,
+    status: IssueStatus,
+    met: bool,
 }
 
 fn issue_ref_from_row(
@@ -47,7 +47,7 @@ fn issue_ref_from_row(
     })
 }
 
-pub fn canonicalize_issue_uri(value: &str) -> Result<String, String> {
+pub(crate) fn canonicalize_issue_uri(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err("dependency URI must be a non-empty string".to_string());
@@ -61,11 +61,11 @@ pub fn canonicalize_issue_uri(value: &str) -> Result<String, String> {
     }
 }
 
-pub fn is_complete_status(status: &IssueStatus) -> bool {
+pub(crate) fn is_complete_status(status: &IssueStatus) -> bool {
     matches!(status, IssueStatus::Closed | IssueStatus::Merged)
 }
 
-pub async fn list_dependency_uris(
+pub(crate) async fn list_dependency_uris(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
@@ -111,7 +111,7 @@ pub(crate) async fn list_dependency_uris_for_issues(
     Ok(dependencies)
 }
 
-pub async fn list_dependent_issue_ids(
+pub(crate) async fn list_dependent_issue_ids(
     conn: &cairn_db::turso::Connection,
     depends_on_uri: &str,
 ) -> DbResult<Vec<String>> {
@@ -162,7 +162,7 @@ pub async fn list_issue_dependencies(
     Ok(dependencies)
 }
 
-pub async fn resolve_issue_uri(
+pub(crate) async fn resolve_issue_uri(
     conn: &cairn_db::turso::Connection,
     uri: &str,
 ) -> DbResult<Option<IssueRef>> {
@@ -258,7 +258,7 @@ pub(crate) fn filter_unmet_dependencies_from_resolved(
     Ok(unmet)
 }
 
-pub async fn issue_uri_for_id(
+pub(crate) async fn issue_uri_for_id(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<String> {
@@ -281,7 +281,7 @@ pub async fn issue_uri_for_id(
     Ok(build_issue_uri(&row.text(0)?, row.i64(1)? as i32))
 }
 
-pub async fn issue_uri_for_id_db(db: &LocalDb, issue_id: &str) -> DbResult<String> {
+pub(crate) async fn issue_uri_for_id_db(db: &LocalDb, issue_id: &str) -> DbResult<String> {
     let issue_id = issue_id.to_string();
     db.read(|conn| {
         let issue_id = issue_id.clone();
@@ -292,7 +292,7 @@ pub async fn issue_uri_for_id_db(db: &LocalDb, issue_id: &str) -> DbResult<Strin
 
 /// Resolve a `(project key, issue number)` pair to its issue id, if it exists.
 /// The project key is matched case-insensitively, mirroring issue-URI lookups.
-pub async fn issue_id_for_project_number(
+pub(crate) async fn issue_id_for_project_number(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -353,7 +353,7 @@ pub async fn issue_key_for_messages(db: &LocalDb, issue_id: &str) -> DbResult<St
 /// `None` is returned when the issue has no parent, or neither lookup finds a
 /// worktree-backed branch. Every consumer (child base-branch resolution, PR
 /// target, pack anchor) then routes the child onto the project default branch.
-pub async fn resolve_parent_branch(
+pub(crate) async fn resolve_parent_branch(
     conn: &cairn_db::turso::Connection,
     child_issue_id: &str,
 ) -> DbResult<Option<String>> {
@@ -417,7 +417,7 @@ pub async fn resolve_parent_branch(
     Ok(Some(row.text(0)?))
 }
 
-pub async fn validate_no_cycle(
+async fn validate_no_cycle(
     conn: &cairn_db::turso::Connection,
     current_uri: &str,
     proposed_dependencies: &[String],
@@ -464,7 +464,7 @@ pub async fn validate_no_cycle(
 /// would form a parent-chain cycle. Each issue has at most one parent, so this
 /// is a bounded linear walk up from the proposed parent; a self-parent is caught
 /// on the first iteration.
-pub async fn validate_no_parent_cycle(
+pub(crate) async fn validate_no_parent_cycle(
     conn: &cairn_db::turso::Connection,
     child_issue_id: &str,
     proposed_parent_id: &str,
@@ -494,7 +494,7 @@ pub async fn validate_no_parent_cycle(
     Ok(())
 }
 
-pub async fn replace_dependencies(
+pub(crate) async fn replace_dependencies(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
     dependencies: &[String],
@@ -539,7 +539,7 @@ pub async fn replace_dependencies(
 /// Filter a pre-listed set of dependency URIs down to those that have not yet
 /// reached a complete status (Merged/Closed), preserving order. Unresolvable
 /// URIs count as unmet and are returned in canonical form for display.
-pub async fn filter_unmet_dependencies(
+async fn filter_unmet_dependencies(
     conn: &cairn_db::turso::Connection,
     uris: &[String],
 ) -> DbResult<Vec<String>> {
@@ -751,7 +751,7 @@ mod parent_tests {
 
 /// Canonical issue URIs of this issue's dependencies that have not yet reached
 /// Merged or Closed. These are what the issue is currently "blocked on".
-pub async fn unmet_dependency_uris(
+async fn unmet_dependency_uris(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
@@ -759,14 +759,14 @@ pub async fn unmet_dependency_uris(
     filter_unmet_dependencies(conn, &uris).await
 }
 
-pub async fn unmet_dependency_count(
+async fn unmet_dependency_count(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<i64> {
     Ok(unmet_dependency_uris(conn, issue_id).await?.len() as i64)
 }
 
-pub async fn dependencies_ready(
+pub(crate) async fn dependencies_ready(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<bool> {

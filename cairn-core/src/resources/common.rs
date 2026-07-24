@@ -28,8 +28,8 @@ pub(super) struct ResourceJob {
 #[derive(Debug, Clone)]
 pub(super) struct ResourceArtifact {
     pub(super) data: String,
-    pub(super) output_name: Option<String>,
-    pub(super) artifact_type: String,
+    output_name: Option<String>,
+    artifact_type: String,
 }
 
 impl ResourceArtifact {
@@ -73,7 +73,7 @@ pub(super) fn storage_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
 }
 
-pub(super) async fn resolve_home_relative_resource_uri(
+pub(crate) async fn resolve_home_relative_resource_uri(
     dbs: &crate::db::DbState,
     request: &McpCallbackRequest,
     uri: &str,
@@ -773,7 +773,7 @@ pub(super) async fn list_named_artifacts_for_job(
     artifacts
 }
 
-pub(super) async fn find_task_by_name(
+async fn find_task_by_name(
     conn: &cairn_db::turso::Connection,
     parent_job_id: &str,
     task_name: &str,

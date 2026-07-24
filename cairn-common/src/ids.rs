@@ -164,7 +164,7 @@ impl RoutableId {
     /// Wrap a string already known to be a routable id — a value read back from
     /// the database or carried across a trusted boundary. Does not validate;
     /// route resolution happens at [`RoutableId::route_scope`].
-    pub fn from_trusted(id: impl Into<String>) -> Self {
+    fn from_trusted(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
@@ -247,7 +247,7 @@ pub fn mint_local() -> RoutableId {
 /// propagates down an object graph (job→run→turn→event, artifact, comment) with
 /// no route lookup. A parent that fails to parse (a corrupted id — never produced
 /// by minting) falls back to Local.
-pub fn mint_inheriting(parent: &RoutableId) -> RoutableId {
+fn mint_inheriting(parent: &RoutableId) -> RoutableId {
     mint(parent.route_scope().unwrap_or(RouteScope::Local))
 }
 

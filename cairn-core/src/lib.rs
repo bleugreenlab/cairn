@@ -22,6 +22,7 @@ pub mod messages;
 pub mod pr_data;
 pub mod pressure;
 pub mod projects;
+pub mod repl_host;
 pub mod runs;
 pub mod scratch;
 pub mod search;
@@ -68,9 +69,9 @@ pub mod transcripts;
 // ── Internal implementation modules ────────────────────
 mod agent_process;
 mod backends;
-pub(crate) mod build_slots;
 mod clock;
 mod db;
+pub(crate) mod fleet;
 pub use cairn_db::db_records;
 mod effects;
 mod embeddings;

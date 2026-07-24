@@ -160,7 +160,7 @@ pub fn load_identity_store(config_dir: &Path) -> Result<Option<IdentityStore>, S
 }
 
 /// Save identity store to `<config_dir>/identity.yaml` in v2 format.
-pub fn save_identity_store(config_dir: &Path, store: &IdentityStore) -> Result<(), String> {
+pub(crate) fn save_identity_store(config_dir: &Path, store: &IdentityStore) -> Result<(), String> {
     let machine_id = get_machine_id();
     let file = store_to_v2_file(store, &machine_id)?;
 
@@ -216,7 +216,7 @@ pub fn detect_local_accounts() -> Vec<ProviderAccount> {
 }
 
 /// Auto-populate a new identity store from git config (for first-run).
-pub fn identity_store_from_git_config() -> IdentityStore {
+pub(crate) fn identity_store_from_git_config() -> IdentityStore {
     let name = git_config_value("user.name").unwrap_or_default();
     let email = git_config_value("user.email").unwrap_or_default();
 
@@ -303,12 +303,6 @@ pub fn save_local_identity(config_dir: &Path, identity: &UserIdentity) -> Result
     );
 
     save_identity_store(config_dir, &store)
-}
-
-/// Auto-populate identity fields from git config (backward-compatible).
-pub fn identity_from_git_config() -> UserIdentity {
-    let store = identity_store_from_git_config();
-    store.resolve(None, None)
 }
 
 // === Internal helpers ===

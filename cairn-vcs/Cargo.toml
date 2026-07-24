@@ -1,0 +1,24 @@
+[package]
+name = "cairn-vcs"
+version.workspace = true
+edition = "2021"
+description = "Embedded version-control transactions quarantined from cairn-core"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "vcs"]
+
+[dependencies]
+# The runner must read an unreferenced Git commit by backend ID and rewrite one
+# jj working-copy commit without manufacturing a Git ref. jj-lib owns that
+# transaction here so its gix-heavy graph never enters cairn-core directly.
+# Keep this exactly aligned with the bundled jj sidecar in scripts/fetch-jj.ts.
+jj-lib = "=0.42.0"
+futures = "0.3"
+tokio = { version = "1", features = ["rt"] }
+# gix's broad kstring range otherwise selects 2.0.3, whose MSRV is newer than
+# the toolchain supported by jj-lib 0.42/Cairn.
+kstring = "=2.0.2"
+
+[dev-dependencies]
+tempfile = "3"

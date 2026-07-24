@@ -10,7 +10,7 @@ use serde_json::Value;
 /// Build the embeddable text for an artifact of `artifact_type` from its `data`
 /// JSON. Returns `None` when no prose is present (an empty result should enqueue
 /// a delete rather than an upsert).
-pub fn artifact_embed_text(artifact_type: &str, data: &Value) -> Option<String> {
+pub(crate) fn artifact_embed_text(artifact_type: &str, data: &Value) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     match artifact_type {
         "document" | "plan" => {

@@ -94,10 +94,7 @@ impl Orchestrator {
     /// One `?` here must not empty every picker (the CAIRN-2194 failure mode), so
     /// the middle layer is simply absent until it exists. This is READ-path
     /// resolution; the WRITE path resolves its root fail-closed instead.
-    pub(crate) fn team_workspace_path(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<(String, PathBuf)>, String> {
+    fn team_workspace_path(&self, project_id: &str) -> Result<Option<(String, PathBuf)>, String> {
         let dbs = self.db.clone();
         let project_id = project_id.to_string();
         run_db_blocking(move || async move {
@@ -147,11 +144,7 @@ impl Orchestrator {
     /// resolves it — supplies it (a real local path both same-machine processes
     /// read). Requires the team replica to be open (the `is_workspace` row lives
     /// there); returns `Err` otherwise, unlike the graceful-degrade read path.
-    pub fn ensure_team_workspace(
-        &self,
-        resource_dir: &Path,
-        team_id: &str,
-    ) -> Result<PathBuf, String> {
+    fn ensure_team_workspace(&self, resource_dir: &Path, team_id: &str) -> Result<PathBuf, String> {
         let ws_path = self
             .config_dir
             .join("teams")
@@ -381,6 +374,8 @@ pub(crate) trait ConfigResource {
     fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String>;
 
     fn file_is_project_scoped(file: &Self::File) -> bool;
+    fn file_bundles(file: &Self::File) -> &[String];
+    fn package_kind() -> crate::config::contextual_packages::ContextualPackageKind;
     fn to_config(
         file: Self::File,
         workspace_id: Option<String>,
@@ -450,15 +445,15 @@ pub(crate) trait ConfigResource {
 #[serde(rename_all = "camelCase")]
 pub struct InvalidConfig {
     /// ID derived from the filename (the file stem).
-    pub id: String,
+    pub(crate) id: String,
     /// One of `agent`, `recipe`, `skill`.
-    pub entity_type: String,
+    pub(crate) entity_type: String,
     /// Absolute path to the offending file.
-    pub path: String,
+    pub(crate) path: String,
     /// Project this file belongs to, or `None` for a workspace-scoped file.
-    pub project_id: Option<String>,
+    pub(crate) project_id: Option<String>,
     /// The parse error, verbatim.
-    pub error: String,
+    pub(crate) error: String,
 }
 
 /// Log a dropped config file and record it as an `InvalidConfig`.
@@ -495,7 +490,7 @@ pub(crate) fn list_configs<R: ConfigResource>(
 /// parse. Both arms share one implementation so agents, recipes, and skills
 /// surface broken files identically. Dropped files are always logged via
 /// [`record_invalid`].
-pub(crate) fn list_configs_with_invalid<R: ConfigResource>(
+fn list_configs_with_invalid<R: ConfigResource>(
     orch: &Orchestrator,
     workspace_id: Option<&str>,
     project_id: Option<&str>,
@@ -819,21 +814,36 @@ pub(crate) fn delete_config<R: ConfigResource>(
     Ok(())
 }
 
+pub(crate) fn migrate_contextual_disables_blocking(
+    orch: &Orchestrator,
+    project_id: &str,
+    project_path: &Path,
+) -> Result<usize, String> {
+    let db = orch.db.local.clone();
+    let project_id = project_id.to_string();
+    let project_path = project_path.to_path_buf();
+    run_db_blocking(move || async move {
+        crate::config_disables::migrate_contextual_disables(&db, &project_id, &project_path).await
+    })
+}
+
 pub(crate) fn list_for_context<R: ConfigResource>(
     orch: &Orchestrator,
     project_id: &str,
 ) -> Result<Vec<R::Config>, String> {
     let project_path = orch.project_path(project_id)?;
+    migrate_contextual_disables_blocking(orch, project_id, &project_path)?;
     let team_workspace = orch.team_workspace_path(project_id)?;
-    let mut configs_map: HashMap<String, R::Config> = HashMap::new();
+    let mut configs_map: HashMap<String, (R::Config, Vec<String>)> = HashMap::new();
     let now = now_timestamp();
 
     for result in R::list_files(&orch.config_dir, None)? {
         match result {
             ConfigResult::Ok(file) => {
                 if !R::file_is_project_scoped(&file) {
+                    let bundles = R::file_bundles(&file).to_vec();
                     let config = R::to_config(file, Some("default".to_string()), None, now);
-                    configs_map.insert(R::config_id(&config), config);
+                    configs_map.insert(R::config_id(&config), (config, bundles));
                 }
             }
             ConfigResult::Err { path, error } => {
@@ -854,8 +864,9 @@ pub(crate) fn list_for_context<R: ConfigResource>(
             match result {
                 ConfigResult::Ok(file) => {
                     if !R::file_is_project_scoped(&file) {
+                        let bundles = R::file_bundles(&file).to_vec();
                         let config = R::to_config(file, Some(ws_id.clone()), None, now);
-                        configs_map.insert(R::config_id(&config), config);
+                        configs_map.insert(R::config_id(&config), (config, bundles));
                     }
                 }
                 ConfigResult::Err { path, error } => {
@@ -874,8 +885,9 @@ pub(crate) fn list_for_context<R: ConfigResource>(
         match result {
             ConfigResult::Ok(file) => {
                 if R::file_is_project_scoped(&file) {
+                    let bundles = R::file_bundles(&file).to_vec();
                     let config = R::to_config(file, None, Some(project_id.to_string()), now);
-                    configs_map.insert(R::config_id(&config), config);
+                    configs_map.insert(R::config_id(&config), (config, bundles));
                 }
             }
             ConfigResult::Err { path, error } => {
@@ -891,31 +903,17 @@ pub(crate) fn list_for_context<R: ConfigResource>(
         }
     }
 
-    // Per-project disabled inherited artifacts drop out of the effective set.
-    // This is the agent-facing/editor-dropdown view; the settings UI renders
-    // disabled inherited items separately via `list_disabled_configs`.
-    let disabled = disabled_keys_blocking(orch, project_id, R::ENTITY_TYPE)?;
+    let policy = crate::config::contextual_packages::load_contextual_packages(Some(&project_path));
     let mut configs: Vec<R::Config> = configs_map
         .into_values()
-        .filter(|config| !disabled.contains(&R::config_id(config)))
+        .filter_map(|(config, bundles)| {
+            policy
+                .is_selected(R::package_kind(), &R::config_id(&config), &bundles)
+                .then_some(config)
+        })
         .collect();
     sort_configs::<R>(&mut configs);
     Ok(configs)
-}
-
-/// Blocking fetch of the disabled shadow-key set for a (project, entity_type),
-/// for the synchronous file-type resolution paths.
-pub(crate) fn disabled_keys_blocking(
-    orch: &Orchestrator,
-    project_id: &str,
-    entity_type: &str,
-) -> Result<HashSet<String>, String> {
-    let db = orch.db.local.clone();
-    let project_id = project_id.to_string();
-    let entity_type = entity_type.to_string();
-    run_db_blocking(move || async move {
-        crate::config_disables::list_disabled_keys(&db, &project_id, &entity_type).await
-    })
 }
 
 fn find_for_update<R: ConfigResource>(

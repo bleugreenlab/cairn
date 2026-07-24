@@ -41,11 +41,11 @@ pub use turn::{apply_turn_outcome, interrupt_turn, start_turn, yield_turn};
 /// Error type for invalid state transitions.
 #[derive(Debug, Clone)]
 pub struct TransitionError {
-    pub entity: &'static str,
-    pub id: String,
-    pub from: String,
-    pub to: String,
-    pub reason: String,
+    pub(crate) entity: &'static str,
+    pub(crate) id: String,
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) reason: String,
 }
 
 impl std::fmt::Display for TransitionError {

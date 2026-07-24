@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use cairn_common::protocol::{
     CallbackRequest, WarmSearchDeclineReason, WarmSearchRequest, WarmSearchStdin,
 };
+use cairn_symbols::search_util::render_grep_lines;
 
-use super::search_translate::{translate_search_invocation, TranslatedSearch};
+use super::search_translate::{pattern_compiles, translate_search_invocation, TranslatedSearch};
 use crate::mcp::handlers::{run_context, search};
 use crate::orchestrator::Orchestrator;
 
@@ -58,6 +59,11 @@ pub async fn execute_warm_search(
         Ok(translated) => translated,
         Err(reason) => return WarmSearchDecision::pass(reason),
     };
+    // The shim's fallback is the real binary, so an uncompilable pattern is best
+    // answered by letting it print its own diagnostic and exit code.
+    if !pattern_compiles(&translated) {
+        return WarmSearchDecision::pass(WarmSearchDeclineReason::InvalidRegex);
+    }
 
     // The first serving rollout is intentionally limited to content searches.
     // `rg --files` and count/file-list modes need independent native parity
@@ -106,12 +112,26 @@ pub async fn execute_warm_search(
             show_line_numbers,
         };
         let deny = deny_read.clone();
-        let body = match tokio::task::spawn_blocking(move || scope.search.try_grep(&params, &deny))
-            .await
+        // Partial coverage buys nothing here: this shim's fallback is the real
+        // binary, which is fast and exact, so anything the index could not
+        // cover is better answered by passing the whole invocation through.
+        let outcome = match tokio::task::spawn_blocking(move || {
+            scope.search.try_grep(&params, &deny)
+        })
+        .await
         {
-            Ok(Some(body)) => body,
+            Ok(Some(outcome)) if outcome.uncovered.is_empty() => outcome,
             _ => return WarmSearchDecision::pass(WarmSearchDeclineReason::ColdOrIncompleteIndex),
         };
+        // This endpoint promises the real binary's bytes, so it renders in
+        // ripgrep's native context form (`path-N-text`), not Cairn's.
+        let body = render_grep_lines(
+            outcome.lines,
+            &output_mode,
+            show_line_numbers,
+            true,
+            before_context > 0 || after_context > 0,
+        );
         let body = reprefix_search_body(&body, path_arg.as_deref());
         if !body.is_empty() {
             if !combined.is_empty() {

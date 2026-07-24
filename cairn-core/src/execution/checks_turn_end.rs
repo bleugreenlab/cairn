@@ -35,7 +35,7 @@
 //!
 //! ## Slot-backed concurrency
 //!
-//! Cache-miss review checks run concurrently through persistent build slots. The
+//! Cache-miss review checks run sequentially through one persistent cell lease. The
 //! slot scheduler owns admission and backpressure; the shared check engine still
 //! owns caching, parsing, ordered results, cancellation, and wake delivery. There
 //! is no clone or in-place fallback. Substrate failures become infrastructure
@@ -45,26 +45,25 @@
 //!
 //! - Single-flight (`Orchestrator::try_begin_turn_end_checks`): a rapid re-idle
 //!   never stacks a second suite for the same job.
-//! - Loop-break (the cache): a plan whose `(project_id, name, input_hash)` is already
-//!   cached is dropped before launch. A resume from a failing check produces a
-//!   follow-up turn; if it commits a fix the affected check's input hash changes
-//!   and it runs once; if it commits nothing every input hash is unchanged, every
-//!   check is already cached, and nothing relaunches — so the agent is resumed at
-//!   most ONCE per failing tree.
+//! - Delivery-state dampening: red checks may intentionally execute again, but an
+//!   unchanged sealed tree plus unchanged canonical outcome fingerprint wakes the
+//!   author only once. Distinct failures and post-green regressions wake normally.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use cairn_common::uri::build_node_checks_uri;
+use cairn_common::uri::{build_node_checks_uri, build_task_checks_uri};
+use sha2::{Digest, Sha256};
 
-use crate::build_slots::{BuildSlotPriority, BuildSlotRequest, MutationPolicy};
 use crate::execution::cache::{get_check_result, store_check_result, CheckResultCacheWrite};
 use crate::execution::checks::{
-    applicable_turn_end_checks, check_platform_identity, check_result_key,
+    applicable_turn_end_checks, check_platform_identity, check_resource_identity, check_result_key,
     check_toolchain_identity, load_live_project_checks, resolve_check_timeout_ms,
-    run_planned_checks, submit_review_check, CheckExecMode, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
+    run_planned_checks, submit_planned_check_batch, CheckExecMode, CheckFailureKind, CheckOutcome,
+    PlannedCheckBatchItem, PlannedCheckBatchRequest, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::selection::CheckPlan;
+use crate::fleet::CellPriority;
 use crate::jj::{node_changed_files, sealed_tree_entries, sealed_tree_hash, JjEnv};
 use crate::orchestrator::{attention_push, Orchestrator, TurnEndCancel};
 use crate::storage::{LocalDb, RowExt};
@@ -81,7 +80,7 @@ const LOG_TAIL_CHARS: usize = 2_000;
 /// release the single-flight slot. The caller ([`spawn_turn_end_checks`] in
 /// lifecycle) has already claimed the slot via `try_begin_turn_end_checks`; this
 /// function is responsible for releasing it on every path.
-pub async fn run_turn_end_checks(orch: Orchestrator, job_id: String, cancel: TurnEndCancel) {
+pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, cancel: TurnEndCancel) {
     if let Err(e) = run_turn_end_checks_inner(&orch, &job_id, &cancel).await {
         log::warn!(
             "turn-end checks for job {}: {}",
@@ -292,10 +291,13 @@ async fn run_turn_end_checks_inner(
     })
     .await
     .map_err(|error| format!("turn-end commit-id task failed: {error}"))??;
-    let canonical_repo = crate::config::get_project_path(&orch.db.local, &coords.project_id)
-        .await?
-        .to_string_lossy()
-        .into_owned();
+    let (canonical_repo, store_dir) = crate::execution::checks::resolve_check_repository(
+        orch,
+        &coords.project_id,
+        job_id,
+        repo_root,
+    )
+    .await?;
 
     // Publish the immutable facts the 1 Hz status poll needs. They remain valid
     // until the single-flight slot is released because this suite is pinned to
@@ -361,7 +363,7 @@ async fn run_turn_end_checks_inner(
                             executor_id: entry.executor_id,
                             executor_device_id: entry.executor_device_id,
                             executor_connection_generation: entry.executor_connection_generation,
-                            executor_slot_id: entry.executor_slot_id,
+                            executor_cell_id: entry.executor_cell_id,
                             executor_lease_epoch: entry.executor_lease_epoch,
                             executor_started_at_unix_ms: entry.executor_started_at_unix_ms,
                             executor_finished_at_unix_ms: entry.executor_finished_at_unix_ms,
@@ -407,7 +409,7 @@ async fn run_turn_end_checks_inner(
     );
 
     // 9. Build the changed-files override consumed by diff-scoped check scripts.
-    // Slot workspaces are materialized at the immutable request base, so the
+    // Cell checkouts are materialized at the immutable request base, so the
     // already-computed agent delta remains the canonical attribution source.
     let changed_files_path = log_dir.join("changed-files.txt");
     let changed_files_body = changed
@@ -425,55 +427,77 @@ async fn run_turn_end_checks_inner(
         .map_err(|error| format!("failed to write review changed-files input: {error}"))?;
 
     for (plan, _) in &mut to_run {
-        plan.externally_admitted = true;
+        plan.requires_runner_local_admission = false;
     }
 
-    // 10. Run the misses through the shared engine, concurrently and bounded.
-    // `to_run` is already miss-only, so the engine's cache-hit branch never fires:
-    // it runs every plan, stores each verdict (`cached: false`, `job_id`), and
-    // parses per-test detail exactly as the old inline loop did. `notify` is a
-    // no-op — review has no `check-status` frontend consumer; its live surface is
-    // the per-check log tail plus the bracketing `db-change`s.
-    let to_run_ref = &to_run;
-    // Per-check effective timeout, aligned to plan index. A check's schema
-    // `timeout` overrides the review cadence default (sized for a cold, uncached
-    // full Rust build; a healthy-but-slow suite is no longer killed at 10 min).
+    // 10. Submit every miss through one sequential pure-verdict lease, then feed
+    // the keyed outcomes through the shared persistence, parsing, and ordering path.
     let timeouts: Vec<u32> = to_run
         .iter()
         .map(|(plan, _)| {
             resolve_check_timeout_ms(checks.get(&plan.name), DEFAULT_REVIEW_CHECK_TIMEOUT_MS)
         })
         .collect();
-    let timeouts_ref = &timeouts;
-    let extra_env_ref = &extra_env;
-    let slot_config = crate::config::settings::load_build_slots(&orch.config_dir);
-    let acquisition_deadline_ms = slot_config
-        .acquisition_deadline_seconds
-        .saturating_mul(1_000);
-    let slot_project_id = coords.project_id.clone();
-    let slot_repository = canonical_repo;
-    let slot_commit = sealed_commit;
-    let slot_job_id = job_id.to_string();
-    let slot_cancel = cancel.clone();
-    // Hoisted out of the `select!` below: a `&format!(...)` temporary passed inline
-    // would be dropped at the end of the (macro-expanded) statement while still
-    // borrowed by `run_planned_checks`.
     let checks_tool_id = format!("turn-checks:{job_id}");
-    // Race the suite against cancellation: if the issue merges/closes while a
-    // review check is running, dropping the `run_planned_checks` future drops each
-    // in-flight check's `execute` future, whose `KillOnDrop` guard SIGKILLs the
-    // check's process group. `biased` polls cancellation first, so a cancel that
-    // arrives before the first check even spawns is honored immediately (CAIRN-2648).
-    let outcomes = tokio::select! {
+    let items: Vec<_> = to_run
+        .iter()
+        .enumerate()
+        .map(|(index, (plan, input_hash))| {
+            let log_path = turn_end_log_path(orch, job_id, &plan.name);
+            let _ = std::fs::write(log_path, b"");
+            PlannedCheckBatchItem {
+                index,
+                name: plan.name.clone(),
+                input_hash: input_hash.clone(),
+                resource_identity_key: check_resource_identity(
+                    &plan.name,
+                    checks
+                        .get(&plan.name)
+                        .expect("planned check must retain its configured definition"),
+                )
+                .key,
+                command: plan.command.clone(),
+                stream_id: crate::mcp::handlers::run::check_stream_id(&checks_tool_id, index),
+                env: extra_env.clone(),
+                timeout_ms: timeouts[index],
+                constraints: checks
+                    .get(&plan.name)
+                    .and_then(|check| check.constraints.clone()),
+            }
+        })
+        .collect();
+    let delivery_commit = sealed_commit.trim().to_string();
+    let batch = PlannedCheckBatchRequest {
+        project_id: coords.project_id.clone(),
+        repository: canonical_repo,
+        store_dir,
+        sealed_commit: sealed_commit.clone(),
+        requesting_job_id: job_id.to_string(),
+        owner: cairn_common::executor_protocol::CellOwnerRef {
+            project_id: coords.project_id.clone(),
+            project_key: Some(coords.project_key.clone()),
+            issue_number: Some(coords.number),
+            job_id: Some(job_id.to_string()),
+            execution_seq: Some(coords.exec_seq),
+            node_kind: Some(coords.node_segment.clone()),
+        },
+        affinity_key: Some(job_id.to_string()),
+        priority: CellPriority::ReviewCheck,
+        env: extra_env,
+        items,
+        run_context: None,
+        mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
+        status_board: None,
+    };
+    let batched_results = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             log::info!(
-                "turn-end checks for job {}: cancelled mid-suite (issue resolved); \
-                 abandoning {} check(s)",
+                "turn-end checks for job {}: cancelled mid-suite (issue resolved); abandoning {} check(s)",
                 short_id(job_id),
                 to_run.len()
             );
-            if orch.build_slots.cancel_job_requests(job_id) > 0 {
+            if orch.fleet.cancel_job_requests(job_id) > 0 {
                 let _ = orch.services.emitter.emit(
                     "db-change",
                     serde_json::json!({"table": "build_slots", "action": "cancel"}),
@@ -481,70 +505,45 @@ async fn run_turn_end_checks_inner(
             }
             return Ok(false);
         }
-        outcomes = run_planned_checks(
+        results = submit_planned_check_batch(orch, batch) => results
+            .map_err(|error| format!("turn-end check batch configuration failed: {error}"))?,
+    };
+    for (index, result) in &batched_results.results {
+        if let Ok(result) = result {
+            let _ = std::fs::write(
+                turn_end_log_path(orch, job_id, &to_run[*index].0.name),
+                &result.output,
+            );
+        }
+    }
+    let batched_results = std::sync::Arc::new(std::sync::Mutex::new(batched_results.results));
+    let outcomes = run_planned_checks(
         db.clone(),
         &coords.project_id,
         &tree_hash,
         job_id,
         &to_run,
         &checks_tool_id,
-        CheckExecMode::Isolated,
+        CheckExecMode::Shared,
         &orch.check_admission,
         Some(orch),
-        move |index, command, _stream_id| {
-            let slot_project_id = slot_project_id.clone();
-            let slot_repository = slot_repository.clone();
-            let slot_commit = slot_commit.clone();
-            let slot_job_id = slot_job_id.clone();
-            let slot_cancel = slot_cancel.clone();
-            let name = to_run_ref[index].0.name.clone();
-            let constraints = checks.get(&name).and_then(|check| check.constraints.clone());
-            let log_path = turn_end_log_path(orch, job_id, &name);
+        move |index, _command, _stream_id| {
+            let batched_results = batched_results.clone();
             async move {
-                let _ = std::fs::write(&log_path, b"");
-                let _ = orch.services.emitter.emit(
-                    "db-change",
-                    serde_json::json!({"table": "check_result_cache", "action": "update"}),
-                );
-                let request = BuildSlotRequest {
-                    request_id: uuid::Uuid::new_v4().to_string(),
-                    attempt_id: uuid::Uuid::new_v4().to_string(),
-                    project_id: slot_project_id.clone(),
-                    repository: cairn_common::executor_protocol::RepositoryLocator::ColocatedPath {
-                        project_id: slot_project_id.clone(),
-                        repository_id: slot_project_id.clone(),
-                        absolute_path: slot_repository,
-                    },
-                    base_commit: slot_commit.clone(),
-                    command,
-                    cwd: String::new(),
-                    env: extra_env_ref.clone(),
-                    priority: BuildSlotPriority::ReviewCheck,
-                    deadline_unix_ms: unix_time_ms() + acquisition_deadline_ms,
-                    timeout_ms: timeouts_ref[index],
-                    mutation_policy: MutationPolicy::PureVerdict,
-                    requesting_job_id: Some(slot_job_id.clone()),
-                    affinity_key: None,
-                    constraints,
-                };
-                match submit_review_check(orch, request).await {
-                    Ok(result) => {
-                        let _ = std::fs::write(&log_path, &result.output);
-                        Ok(result)
-                    }
-                    Err(crate::execution::checks::CheckExecutionFailure::Substrate(error))
-                        if error.contains("build slot request was cancelled") =>
-                    {
-                        slot_cancel.cancel();
-                        std::future::pending().await
-                    }
-                    Err(error) => Err(error),
-                }
+                batched_results
+                    .lock()
+                    .unwrap()
+                    .remove(&index)
+                    .unwrap_or_else(|| {
+                        Err(crate::execution::checks::CheckExecutionFailure::Substrate(
+                            format!("Cairn check infrastructure failure: missing review batch outcome for plan index {index}"),
+                        ))
+                    })
             }
         },
         |_| {},
-    ) => outcomes,
-    };
+    )
+    .await;
 
     let any_failed = outcomes.iter().any(|o| !o.passed);
     let verdicts: Vec<String> = outcomes
@@ -572,48 +571,180 @@ async fn run_turn_end_checks_inner(
         if any_failed { "wake" } else { "passive" }
     );
 
-    // 10. Deliver the results into the session. A failure ROUSES the idle builder
-    // (Wake + nudge) so it resumes with the failing detail inlined; a clean run
-    // rides along PASSIVELY — never a wasted turn on green, but the green verdict
-    // is still delivered on the session's next resume and recorded on the wake
-    // card. The push key is the same for both, so same-key supersession keeps at
-    // most one checks push pending: a later red supersedes an undelivered green,
-    // and vice versa.
-    let checks_uri = build_node_checks_uri(
-        &coords.project_key,
-        coords.number,
-        coords.exec_seq,
-        &coords.node_segment,
-    );
+    // 10. Deliver one push per distinct sealed check state. Red execution evidence
+    // is deliberately not reusable, so the attention ledger, not the result cache,
+    // owns notification dampening. Green remains passive and records a transition
+    // that allows a later identical-looking red to wake again.
+    let checks_uri = checks_uri_for_job(&coords);
     let key = format!("turn-checks:{checks_uri}");
-    if let Err(e) = attention_push::push(
-        &owning,
-        job_id,
-        &checks_uri,
-        delivery_wake(any_failed),
-        attention_push::Boundary::Event,
-        &key,
-    )
-    .await
-    {
-        return Err(format!("failed to queue turn-check results push: {e}"));
-    }
-    // Only a failure wakes an idle builder now; a passive green push waits for the
-    // session's next natural resume.
-    if any_failed {
-        if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
-            orch,
+    let fingerprint = turn_check_fingerprint(&tree_hash, &delivery_commit, &outcomes);
+    let latest = attention_push::latest_push_fingerprint(&owning, job_id, &key)
+        .await
+        .map_err(|error| format!("failed to read turn-check fingerprint: {error}"))?;
+    let duplicate_failure = any_failed
+        && fingerprint.is_some()
+        && latest.as_ref().and_then(|value| value.as_ref()) == fingerprint.as_ref();
+
+    if duplicate_failure {
+        log::info!(
+            "turn-end checks for job {}: deduped unchanged failing delivery",
+            short_id(job_id)
+        );
+    } else {
+        let decision = if fingerprint.is_none() {
+            "ambiguous/fail-open"
+        } else if !any_failed {
+            "green"
+        } else if latest.is_none() {
+            "new"
+        } else {
+            "changed"
+        };
+        log::info!(
+            "turn-end checks for job {}: delivery decision {}",
+            short_id(job_id),
+            decision
+        );
+        let (_, effective_wake) = attention_push::push_with_fingerprint(
+            &owning,
             job_id,
-            crate::messages::queued::DeliveryUrgency::Steer,
+            &checks_uri,
+            delivery_wake(any_failed),
+            attention_push::Boundary::Event,
+            &key,
+            fingerprint.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("failed to queue turn-check results push: {error}"))?;
+        if any_failed && effective_wake == attention_push::Wake::Wake {
+            if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
+                orch,
+                job_id,
+                crate::messages::queued::DeliveryUrgency::Steer,
+            ) {
+                log::warn!(
+                    "turn-check failure wake for job {} failed: {}",
+                    short_id(job_id),
+                    error
+                );
+            }
+        }
+    }
+
+    if any_failed
+        && outcomes.iter().any(|outcome| {
+            outcome
+                .failure_kind
+                .is_some_and(CheckFailureKind::is_infrastructure)
+        })
+    {
+        if let (Some(issue_id), Some(fingerprint)) = (
+            issue_id_for_job(&owning, job_id).await,
+            fingerprint.as_deref(),
         ) {
+            let operator_key = format!("turn-checks-infrastructure:{checks_uri}");
+            match crate::orchestrator::parent_wake::queue_passive_parent_push(
+                &owning,
+                &issue_id,
+                &checks_uri,
+                &operator_key,
+                fingerprint,
+            )
+            .await
+            {
+                Ok(true) => log::info!(
+                    "turn-end checks for job {}: queued passive infrastructure signal",
+                    short_id(job_id)
+                ),
+                Ok(false) => log::debug!(
+                    "turn-end checks for job {}: infrastructure signal deduped or has no parent route",
+                    short_id(job_id)
+                ),
+                Err(error) => log::warn!(
+                    "turn-end checks for job {}: failed to route infrastructure signal: {}",
+                    short_id(job_id),
+                    error
+                ),
+            }
+        } else {
             log::warn!(
-                "turn-check failure wake for job {} failed: {}",
-                short_id(job_id),
-                e
+                "turn-end checks for job {}: infrastructure signal fingerprint or parent issue unavailable",
+                short_id(job_id)
             );
         }
     }
     Ok(any_failed)
+}
+
+const TURN_CHECK_FINGERPRINT_VERSION: &str = "turn-check-state-v1";
+const SALIENT_FAILURE_CHARS: usize = 1_500;
+
+fn normalized_salient(value: &str) -> Option<String> {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return None;
+    }
+    Some(tail(trimmed, SALIENT_FAILURE_CHARS))
+}
+
+fn turn_check_fingerprint(
+    tree_hash: &str,
+    sealed_commit: &str,
+    outcomes: &[CheckOutcome],
+) -> Option<String> {
+    let tree_hash = normalized_salient(tree_hash)?;
+    let sealed_commit = normalized_salient(sealed_commit)?;
+    if outcomes.is_empty() {
+        return None;
+    }
+    let mut canonical = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        let name = normalized_salient(&outcome.name)?;
+        let kind = if outcome.passed {
+            if outcome.failure_kind.is_some() {
+                return None;
+            }
+            "pass".to_string()
+        } else {
+            outcome
+                .failure_kind
+                .map(|kind| kind.as_str().to_string())
+                .unwrap_or_else(|| "ordinary_failure".to_string())
+        };
+        let salient = if outcome.passed {
+            None
+        } else if let Some(parsed) = &outcome.parsed {
+            if parsed.failures.is_empty() {
+                Some(normalized_salient(&outcome.output_tail)?)
+            } else {
+                let mut failures = Vec::with_capacity(parsed.failures.len());
+                for failure in &parsed.failures {
+                    failures.push((
+                        normalized_salient(&failure.name)?,
+                        match failure.message.as_deref() {
+                            Some(message) => Some(normalized_salient(message)?),
+                            None => None,
+                        },
+                    ));
+                }
+                failures.sort();
+                Some(serde_json::to_string(&failures).ok()?)
+            }
+        } else {
+            Some(normalized_salient(&outcome.output_tail)?)
+        };
+        canonical.push((name, outcome.passed, kind, salient));
+    }
+    canonical.sort_by(|left, right| left.0.cmp(&right.0));
+    let payload = serde_json::to_vec(&(
+        TURN_CHECK_FINGERPRINT_VERSION,
+        tree_hash,
+        sealed_commit,
+        canonical,
+    ))
+    .ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(payload)))
 }
 
 /// The wake level a completed turn-end run is delivered at: a failure ROUSES the
@@ -640,7 +771,10 @@ fn short_id(job_id: &str) -> &str {
 /// resolvable worktree/tree, and neither a running suite nor any cached verdict) —
 /// callers omit the section entirely. Shared by the PR-node view and the `/checks`
 /// read projection.
-pub async fn render_turn_end_checks_section(orch: &Orchestrator, job_id: &str) -> Option<String> {
+pub(crate) async fn render_turn_end_checks_section(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Option<String> {
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
     format_checks_section(&statuses)
 }
@@ -713,9 +847,35 @@ pub(crate) struct JobCoords {
     pub(crate) number: i32,
     pub(crate) exec_seq: i32,
     pub(crate) node_segment: String,
+    parent_segment: Option<String>,
+    is_workflow: bool,
     /// The issue's stored lifecycle status (`active`, `merged`, `closed`, …). Read
     /// by the runner to skip a suite whose issue already resolved (CAIRN-2648).
-    pub(crate) issue_status: String,
+    issue_status: String,
+}
+
+fn checks_uri_for_job(coords: &JobCoords) -> String {
+    match (coords.is_workflow, coords.parent_segment.as_deref()) {
+        (true, _) => build_node_checks_uri(
+            &coords.project_key,
+            coords.number,
+            coords.exec_seq,
+            &coords.node_segment,
+        ),
+        (false, Some(parent)) => build_task_checks_uri(
+            &coords.project_key,
+            coords.number,
+            coords.exec_seq,
+            parent,
+            &coords.node_segment,
+        ),
+        (false, None) => build_node_checks_uri(
+            &coords.project_key,
+            coords.number,
+            coords.exec_seq,
+            &coords.node_segment,
+        ),
+    }
 }
 
 /// Resolve everything the runner and renderer need from a `job_id`: the project
@@ -733,11 +893,12 @@ pub(crate) async fn resolve_job_coords(
                 .query(
                     "SELECT j.project_id, j.worktree_path, j.base_branch,
                             j.base_commit, p.key, i.number, e.seq, j.uri_segment,
-                            i.status
+                            parent.uri_segment, i.status, j.agent_config_id
                      FROM jobs j
                      JOIN projects p ON p.id = j.project_id
                      JOIN issues i ON i.id = j.issue_id
                      JOIN executions e ON e.id = j.execution_id
+                     LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                      WHERE j.id = ?1 LIMIT 1",
                     (job_id.as_str(),),
                 )
@@ -752,7 +913,9 @@ pub(crate) async fn resolve_job_coords(
                     number: row.i64(5)? as i32,
                     exec_seq: row.i64(6)? as i32,
                     node_segment: row.opt_text(7)?.unwrap_or_default(),
-                    issue_status: row.opt_text(8)?.unwrap_or_default(),
+                    parent_segment: row.opt_text(8)?,
+                    issue_status: row.opt_text(9)?.unwrap_or_default(),
+                    is_workflow: row.opt_text(10)?.as_deref() == Some("workflow"),
                 })),
                 None => Ok(None),
             }
@@ -861,17 +1024,28 @@ fn tail(s: &str, max_chars: usize) -> String {
     s.chars().skip(count - max_chars).collect()
 }
 
-fn unix_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
+
+    fn outcome(
+        name: &str,
+        passed: bool,
+        kind: Option<CheckFailureKind>,
+        output: &str,
+    ) -> CheckOutcome {
+        CheckOutcome {
+            name: name.to_string(),
+            passed,
+            exit_code: if passed { Some(0) } else { Some(1) },
+            failure_kind: kind,
+            parsed: None,
+            output_tail: output.to_string(),
+            cached: false,
+            duration_ms: 1,
+        }
+    }
 
     fn status(name: &str, state: NodeCheckState) -> NodeCheckStatus {
         NodeCheckStatus {
@@ -889,6 +1063,84 @@ mod tests {
             output_tail: None,
             failure_kind: None,
         }
+    }
+
+    #[test]
+    fn fingerprint_is_order_independent_and_state_sensitive() {
+        let rust = outcome("rust", false, None, "assertion A");
+        let lint = outcome("lint", true, None, "");
+        let first = turn_check_fingerprint("tree", "commit", &[rust, lint]).unwrap();
+        let second = turn_check_fingerprint(
+            "tree",
+            "commit",
+            &[
+                outcome("lint", true, None, ""),
+                outcome("rust", false, None, "assertion A"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            turn_check_fingerprint(
+                "tree",
+                "commit",
+                &[outcome("rust", false, None, "assertion B")]
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            turn_check_fingerprint(
+                "tree-2",
+                "commit",
+                &[outcome("rust", false, None, "assertion A")]
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            turn_check_fingerprint(
+                "tree",
+                "commit-2",
+                &[outcome("rust", false, None, "assertion A")]
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_green_ordinary_and_infrastructure_red() {
+        let green =
+            turn_check_fingerprint("tree", "commit", &[outcome("rust", true, None, "")]).unwrap();
+        let red = turn_check_fingerprint("tree", "commit", &[outcome("rust", false, None, "same")])
+            .unwrap();
+        let infrastructure = turn_check_fingerprint(
+            "tree",
+            "commit",
+            &[outcome(
+                "rust",
+                false,
+                Some(CheckFailureKind::Infrastructure),
+                "same",
+            )],
+        )
+        .unwrap();
+        assert_ne!(green, red);
+        assert_ne!(red, infrastructure);
+    }
+
+    #[test]
+    fn fingerprint_fails_open_when_required_identity_or_failure_detail_is_ambiguous() {
+        assert!(turn_check_fingerprint("", "commit", &[outcome("rust", true, None, "")]).is_none());
+        assert!(turn_check_fingerprint("tree", "", &[outcome("rust", true, None, "")]).is_none());
+        assert!(turn_check_fingerprint("tree", "commit", &[]).is_none());
+        assert!(turn_check_fingerprint(
+            "tree",
+            "commit",
+            &[outcome("rust", false, None, "  \r\n  ")]
+        )
+        .is_none());
     }
 
     #[test]
@@ -1031,6 +1283,43 @@ mod tests {
     fn tail_keeps_last_chars_on_boundary() {
         assert_eq!(tail("abcdef", 3), "def");
         assert_eq!(tail("abc", 10), "abc");
+    }
+
+    #[test]
+    fn checks_uri_uses_canonical_job_shape() {
+        let mut coords = JobCoords {
+            project_id: "p".into(),
+            worktree_path: None,
+            base_branch: None,
+            base_commit: None,
+            project_key: "CAIRN".into(),
+            number: 42,
+            exec_seq: 2,
+            node_segment: "review-rust".into(),
+            parent_segment: Some("builder".into()),
+            is_workflow: false,
+            issue_status: "active".into(),
+        };
+        assert_eq!(
+            checks_uri_for_job(&coords),
+            "cairn://p/CAIRN/42/2/builder/task/review-rust/checks"
+        );
+
+        coords.node_segment = "workflow".into();
+        coords.parent_segment = Some("coordinator".into());
+        coords.is_workflow = true;
+        assert_eq!(
+            checks_uri_for_job(&coords),
+            "cairn://p/CAIRN/42/2/workflow/checks"
+        );
+
+        coords.node_segment = "builder".into();
+        coords.parent_segment = None;
+        coords.is_workflow = false;
+        assert_eq!(
+            checks_uri_for_job(&coords),
+            "cairn://p/CAIRN/42/2/builder/checks"
+        );
     }
 
     #[test]

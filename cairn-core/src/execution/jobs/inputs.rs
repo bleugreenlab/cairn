@@ -24,7 +24,7 @@ pub(super) async fn load_execution_snapshot_conn(
         .transpose()
 }
 
-pub(super) async fn require_execution_snapshot_conn(
+async fn require_execution_snapshot_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<ExecutionSnapshot> {
@@ -54,7 +54,7 @@ pub(super) async fn load_nodes_from_execution(
     .map_err(|e| db_error("Failed to load execution nodes", e))
 }
 
-pub(super) fn snapshot_edges_to_db(snapshot: &ExecutionSnapshot) -> Vec<DbRecipeEdge> {
+fn snapshot_edges_to_db(snapshot: &ExecutionSnapshot) -> Vec<DbRecipeEdge> {
     let recipe_id = &snapshot.recipe.id;
     snapshot
         .recipe
@@ -104,7 +104,7 @@ pub(super) async fn find_job_downstream_artifact_schema(
     .map_err(|e| db_error("Failed to resolve artifact schema", e))
 }
 
-pub(super) async fn resolve_job_inputs_conn(
+async fn resolve_job_inputs_conn(
     conn: &cairn_db::turso::Connection,
     job: &DbJob,
 ) -> DbResult<Vec<ResolvedInput>> {
@@ -259,7 +259,7 @@ pub(super) async fn resolve_job_inputs_conn(
 /// that producer's artifact keyed by the ArtifactNode's `name` (its stored
 /// `output_name`). When the ArtifactNode has no producer but carries inline
 /// literal `content`, it is a static input document (the collapsed Context node).
-pub(super) async fn load_artifact_node_input_conn(
+async fn load_artifact_node_input_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
     rnode_map: &HashMap<&str, &RecipeNode>,
@@ -321,7 +321,7 @@ pub(super) async fn load_artifact_node_input_conn(
     Ok(None)
 }
 
-pub(super) async fn build_trigger_context_conn(
+async fn build_trigger_context_conn(
     conn: &cairn_db::turso::Connection,
     snapshot: &ExecutionSnapshot,
     job: &DbJob,
@@ -391,7 +391,7 @@ pub(super) async fn build_trigger_context_conn(
     })
 }
 
-pub(super) async fn load_issue_by_project_key_number_conn(
+async fn load_issue_by_project_key_number_conn(
     conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
@@ -411,7 +411,7 @@ pub(super) async fn load_issue_by_project_key_number_conn(
         .transpose()
 }
 
-pub(super) async fn load_issue_title_description_conn(
+async fn load_issue_title_description_conn(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Option<(String, Option<String>)>> {
@@ -468,7 +468,7 @@ fn ctx_self_names_from_edges(
 /// higher-versioned ctx-self doc (e.g. `plan`) can never be served as a
 /// consumer's terminal input in place of the real terminal artifact (e.g.
 /// `create-pr`).
-pub(super) async fn load_artifact_for_edge_conn(
+async fn load_artifact_for_edge_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     output_name: &str,
@@ -508,7 +508,7 @@ pub(super) async fn load_artifact_for_edge_conn(
     Ok(None)
 }
 
-pub(super) async fn load_last_assistant_message_conn(
+async fn load_last_assistant_message_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
@@ -785,10 +785,7 @@ pub(crate) async fn resolve_instruction_prompt_conn(
 /// whose content is a work packet delivered to the initial user message rather
 /// than framing, is deliberately ignored — so the result is empty for any
 /// recipe with no Instruction node.
-pub(crate) fn instruction_prompt_from_snapshot(
-    snapshot: &ExecutionSnapshot,
-    node_id: &str,
-) -> String {
+fn instruction_prompt_from_snapshot(snapshot: &ExecutionSnapshot, node_id: &str) -> String {
     let mut matched: Vec<(f32, f32, usize, &str)> = Vec::new();
     for (idx, edge) in snapshot.recipe.edges.iter().enumerate() {
         if edge.edge_type != crate::models::RecipeEdgeType::Context
@@ -824,7 +821,7 @@ pub(crate) fn instruction_prompt_from_snapshot(
         .join("\n\n")
 }
 
-pub(super) async fn load_action_config_schema_conn(
+async fn load_action_config_schema_conn(
     conn: &cairn_db::turso::Connection,
     action_config_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
@@ -853,7 +850,7 @@ pub(super) async fn load_action_config_schema_conn(
     }))
 }
 
-pub(super) fn extract_schema_from_slot_config(
+fn extract_schema_from_slot_config(
     schema_config: &crate::models::SchemaConfig,
 ) -> DbResult<Option<OutputSchemaInfo>> {
     let tool_name = schema_config.tool_name.clone();

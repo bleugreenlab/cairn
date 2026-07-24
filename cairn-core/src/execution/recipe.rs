@@ -12,6 +12,42 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::get_recipe_from_files;
+
+fn get_selected_recipe(
+    config_dir: &std::path::Path,
+    project_path: &std::path::Path,
+    project_id: &str,
+    recipe_id: &str,
+) -> Result<crate::models::Recipe, String> {
+    let file_recipe =
+        crate::config::recipes::get_recipe(config_dir, recipe_id, Some(project_path))?
+            .ok_or_else(|| format!("Recipe not found: {recipe_id}"))?;
+    let policy = crate::config::contextual_packages::load_contextual_packages(Some(project_path));
+    let selection = policy.selection(
+        crate::config::contextual_packages::ContextualPackageKind::Recipe,
+        recipe_id,
+        &file_recipe.bundles,
+    );
+    if !policy.is_selected(
+        crate::config::contextual_packages::ContextualPackageKind::Recipe,
+        recipe_id,
+        &file_recipe.bundles,
+    ) {
+        let reason = if matches!(
+            selection,
+            crate::config::contextual_packages::ContextualPackageSelection::ExplicitlyDisabled
+        ) {
+            "disabled"
+        } else {
+            "not enabled"
+        };
+        return Err(format!(
+            "Recipe '{}' is {reason} for project {project_id}",
+            file_recipe.recipe.name
+        ));
+    }
+    Ok(file_recipe.recipe)
+}
 use crate::config::presets::{
     available_selections, load_effective_presets, resolve_agent_snapshot,
     resolve_selection_with_provenance, LaunchSelectionOverride, PresetsConfig, ResolutionSource,
@@ -52,7 +88,7 @@ pub fn create_jobs_for_execution(
 /// orchestrator effect queue; hosts without an effect queue (`effect_tx == None`)
 /// get the execution + jobs created and must advance the DAG themselves.
 #[allow(clippy::too_many_arguments)]
-pub fn start_recipe_execution_and_advance(
+pub(crate) fn start_recipe_execution_and_advance(
     orch: &Orchestrator,
     issue_id: &str,
     recipe_id: Option<&str>,
@@ -152,7 +188,7 @@ pub fn start_recipe_execution_impl(
 
     // Get the recipe (use provided or find default)
     let recipe = match recipe_id {
-        Some(id) => get_recipe_from_files(&orch.config_dir, Some(&project_path), id)?,
+        Some(id) => get_selected_recipe(&orch.config_dir, &project_path, project_id, id)?,
         None => return Err("No recipe specified for execution".to_string()),
     };
 
@@ -202,6 +238,7 @@ pub fn start_recipe_execution_impl(
                             hooks: None,
                             backend_preference: agent_snapshot.backend_preference.clone(),
                             icon: None,
+                            bundles: Vec::new(),
                             is_project_scoped: true,
                             file_path: std::path::PathBuf::new(),
                         },
@@ -302,7 +339,7 @@ pub fn start_manual_execution_impl(
     let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
 
     // Verify recipe exists (load from files)
-    let recipe = get_recipe_from_files(&orch.config_dir, Some(&project_path), recipe_id)?;
+    let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
 
     // Build execution snapshot
     let snapshot = build_execution_snapshot_from_files(
@@ -359,7 +396,7 @@ pub fn start_manual_execution_impl(
 /// - Stores `event_payload` in TriggerContext
 /// - Uses the triggering execution's initiator for credential resolution
 /// - Supports optional issue_id (Issue-scoped vs Project-scoped triggers)
-pub fn start_event_triggered_execution(
+pub(crate) fn start_event_triggered_execution(
     orch: &Orchestrator,
     recipe: &crate::models::Recipe,
     trigger_type: TriggerType,
@@ -453,8 +490,8 @@ pub fn start_event_triggered_execution(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchPlan {
-    pub recipe: RecipeSnapshot,
-    pub nodes: Vec<ResolvedLaunchNode>,
+    recipe: RecipeSnapshot,
+    nodes: Vec<ResolvedLaunchNode>,
 }
 
 /// One agent node's resolution row. `resolved` is `None` (with `error: Some`)
@@ -462,19 +499,19 @@ pub struct LaunchPlan {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedLaunchNode {
-    pub node_id: String,
-    pub agent_id: String,
-    pub agent_name: String,
+    node_id: String,
+    agent_id: String,
+    agent_name: String,
     /// Prompt source signal (avoids shipping the full prompt by default).
-    pub prompt_present: bool,
+    prompt_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolved: Option<ResolvedAgentRow>,
+    resolved: Option<ResolvedAgentRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    error: Option<String>,
     /// Atomic dropdown options for this node: the global tier-resolved list unioned
     /// with the row's own resolved selection. Present on every node, including
     /// error rows, so an unresolvable node still renders a selectable dropdown.
-    pub available: Vec<ModelSelection>,
+    available: Vec<ModelSelection>,
 }
 
 /// The concrete resolved settings for one agent node.
@@ -482,15 +519,15 @@ pub struct ResolvedLaunchNode {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedAgentRow {
     /// The chosen atomic backend+model (single-dropdown value).
-    pub selection: ModelSelection,
-    pub extras: RuntimeExtras,
+    selection: ModelSelection,
+    extras: RuntimeExtras,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fence: Option<Fence>,
+    fence: Option<Fence>,
     /// Which level decided the selection.
-    pub source: ResolutionSource,
+    source: ResolutionSource,
     /// Atomic options for the dropdown (each a backend+model pair). MAY ship
     /// empty now and be filled in the composer follow-up.
-    pub available: Vec<ModelSelection>,
+    available: Vec<ModelSelection>,
 }
 
 /// Per-node launch overrides, keyed by node id — one selection knob per node.
@@ -498,13 +535,13 @@ pub struct ResolvedAgentRow {
 #[serde(rename_all = "camelCase")]
 pub struct LaunchOverrides {
     #[serde(default)]
-    pub nodes: HashMap<String, LaunchSelectionOverride>,
+    nodes: HashMap<String, LaunchSelectionOverride>,
     /// Optional edited recipe structure. When the composer appends/removes nodes
     /// or rewires the graph, it sends the working snapshot so resolution reflects
     /// the edited structure rather than the file-loaded recipe. Echoed back in
     /// `LaunchPlan.recipe`.
     #[serde(default)]
-    pub recipe: Option<RecipeSnapshot>,
+    recipe: Option<RecipeSnapshot>,
 }
 
 /// Resolve a recipe's per-agent-node launch settings with provenance and loud,
@@ -517,7 +554,7 @@ pub fn resolve_recipe_launch(
 ) -> Result<LaunchPlan, String> {
     let db = resolve_owning_db_for_project(orch, project_id)?;
     let project_path = project_path_for_recipe(db, project_id.to_string())?;
-    let recipe = get_recipe_from_files(&orch.config_dir, Some(&project_path), recipe_id)?;
+    let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
     let presets = load_effective_presets(&orch.config_dir, Some(&project_path));
     let overrides = overrides.unwrap_or_default();
 
@@ -942,6 +979,7 @@ mod tests {
             hooks: None,
             backend_preference: None,
             icon: None,
+            bundles: Vec::new(),
             is_project_scoped: true,
             file_path: std::path::PathBuf::new(),
         }

@@ -14,7 +14,7 @@ use crate::orchestrator::Orchestrator;
 use cairn_common::uri::{build_action_uri, build_project_action_uri};
 
 /// Workspace id used for workspace-scoped action definitions.
-pub(crate) const WORKSPACE_ID: &str = "default";
+const WORKSPACE_ID: &str = "default";
 
 fn scope_label(action: &ActionConfig) -> &'static str {
     if action.project_id.is_some() {

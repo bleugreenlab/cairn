@@ -38,7 +38,7 @@ pub struct PlainStdin {
 }
 
 impl PlainStdin {
-    pub fn new(inner: Box<dyn Write + Send>) -> Self {
+    fn new(inner: Box<dyn Write + Send>) -> Self {
         Self { inner }
     }
 }
@@ -59,7 +59,7 @@ impl BackendStdin for PlainStdin {
     }
 }
 
-pub fn wrap_plain_stdin(writer: Box<dyn Write + Send>) -> Box<dyn BackendStdin> {
+pub(crate) fn wrap_plain_stdin(writer: Box<dyn Write + Send>) -> Box<dyn BackendStdin> {
     Box::new(PlainStdin::new(writer))
 }
 
@@ -184,28 +184,28 @@ pub enum SuspendKind {
 /// A live process attachment with its stdin handle for bidirectional communication.
 pub struct RunHandle {
     /// The child process handle
-    pub child: Arc<Mutex<Option<Box<dyn ChildProcess>>>>,
+    pub(crate) child: Arc<Mutex<Option<Box<dyn ChildProcess>>>>,
     /// The stdin handle for writing messages
-    pub stdin: StdinHandle,
+    stdin: StdinHandle,
     /// Process lifecycle state
-    pub lifecycle: RunLifecycle,
+    lifecycle: RunLifecycle,
     /// Occupancy state (what the process is doing)
-    pub occupancy: RunOccupancy,
+    occupancy: RunOccupancy,
     /// Last activity timestamp (for GC relevance scoring)
-    pub last_activity: Instant,
+    pub(crate) last_activity: Instant,
     /// The backend session ID for this process
-    pub session_id: Option<String>,
+    session_id: Option<String>,
     /// The job ID associated with this process (if any)
-    pub job_id: Option<String>,
+    pub(crate) job_id: Option<String>,
     /// Cursor for channel message polling
     pub message_cursor: Arc<Mutex<i64>>,
     /// Backend name ("codex", etc.). None = Claude (default).
-    pub backend: Option<String>,
+    pub(crate) backend: Option<String>,
     /// The effective model this process was started with. Used by warm reuse to
     /// detect when the job's requested model has diverged from the live process.
-    pub model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Set when a turn-ending artifact/tool should trigger a boundary interrupt.
-    pub terminal_tool_called: Arc<AtomicBool>,
+    pub(crate) terminal_tool_called: Arc<AtomicBool>,
     /// cairn:// resources this run has read.
     /// Lazily seeded once from prior events, then appended on each read.
     pub consumed_uris: Arc<Mutex<HashSet<String>>>,
@@ -217,7 +217,7 @@ pub struct RunHandle {
     pub last_recommend_pos: Arc<Mutex<Option<Vec<u8>>>>,
     /// Turn-scoped fingerprints of tool calls already made this turn, for
     /// flail dedup (CAIRN-1230). Self-resets on turn change.
-    pub turn_seen_calls: Arc<Mutex<TurnSeenCalls>>,
+    turn_seen_calls: Arc<Mutex<TurnSeenCalls>>,
     /// Whether the backend driving this run owns its turn/tool loop in-process
     /// (OpenRouter). Owned-loop runs suspend on a foreground question or inline
     /// task instead of inline-waiting; warm-process backends (Claude/Codex)
@@ -225,7 +225,7 @@ pub struct RunHandle {
     pub owns_turn_loop: bool,
     /// Structured suspend request for an owned-loop run, set by a blocking
     /// handler and consumed by the owned loop after the tool dispatch returns.
-    pub pending_suspend: Arc<Mutex<Option<SuspendKind>>>,
+    pending_suspend: Arc<Mutex<Option<SuspendKind>>>,
     /// Content hashes of affordance blocks already shown in full this session
     /// (CAIRN-2592 session-scoped affordance dedup). The full block for a
     /// resource kind renders once per run; a later read whose affordance block
@@ -240,11 +240,11 @@ pub struct RunHandle {
     /// after a cold host restart correctly re-shows blocks into the freshly
     /// re-dispatched context. Compaction keeps the live process (and this set)
     /// up, which is exactly why the pointer must stay reachable one read away.
-    pub seen_affordances: Arc<Mutex<HashSet<u64>>>,
+    seen_affordances: Arc<Mutex<HashSet<u64>>>,
 }
 
 /// Backwards-compatible alias.
-pub type ActiveProcess = RunHandle;
+pub(crate) type ActiveProcess = RunHandle;
 
 impl RunHandle {
     /// Create a new run handle in Starting/Idle state.
@@ -289,7 +289,7 @@ impl RunHandle {
     }
 
     /// Whether the process is warm (live + idle, GC candidate).
-    pub fn is_warm(&self) -> bool {
+    pub(crate) fn is_warm(&self) -> bool {
         self.lifecycle == RunLifecycle::Live && self.occupancy == RunOccupancy::Idle
     }
 
@@ -300,7 +300,7 @@ impl RunHandle {
     }
 
     /// Whether the process is actively working (serving a turn or awaiting host).
-    pub fn is_active(&self) -> bool {
+    fn is_active(&self) -> bool {
         !matches!(self.occupancy, RunOccupancy::Idle)
     }
 
@@ -312,7 +312,7 @@ impl RunHandle {
     }
 
     /// Yield the current turn for host interaction (ask_user, permission).
-    pub fn yield_for_host(&mut self, turn_id: &str) {
+    fn yield_for_host(&mut self, turn_id: &str) {
         self.occupancy = RunOccupancy::AwaitingHost {
             turn_id: turn_id.to_string(),
         };
@@ -320,7 +320,7 @@ impl RunHandle {
     }
 
     /// End the current turn, transition to idle.
-    pub fn end_turn(&mut self) {
+    fn end_turn(&mut self) {
         self.occupancy = RunOccupancy::Idle;
         self.last_activity = Instant::now();
         // The terminal-tool boundary interrupt is armed by an output-artifact
@@ -331,7 +331,7 @@ impl RunHandle {
     }
 
     /// Get the current turn ID (if serving or awaiting).
-    pub fn current_turn_id(&self) -> Option<&str> {
+    fn current_turn_id(&self) -> Option<&str> {
         match &self.occupancy {
             RunOccupancy::Busy => None,
             RunOccupancy::ServingTurn(id) => Some(id),
@@ -344,7 +344,7 @@ impl RunHandle {
 
     /// Transition process to warm state (after completing a turn).
     /// Equivalent to `end_turn()` + setting lifecycle to Live.
-    pub fn transition_to_warm(&mut self) {
+    pub(crate) fn transition_to_warm(&mut self) {
         self.lifecycle = RunLifecycle::Live;
         self.occupancy = RunOccupancy::Idle;
         self.last_activity = Instant::now();
@@ -360,7 +360,7 @@ impl RunHandle {
 
     /// Transition process to active state (when starting a new turn).
     /// For backwards compat — prefer `begin_turn(turn_id)` when a real turn exists.
-    pub fn transition_to_active(&mut self) {
+    fn transition_to_active(&mut self) {
         self.lifecycle = RunLifecycle::Live;
         if matches!(self.occupancy, RunOccupancy::Idle) {
             self.occupancy = RunOccupancy::Busy;
@@ -376,7 +376,7 @@ impl RunHandle {
     }
 
     /// Get seconds since last activity
-    pub fn seconds_since_activity(&self) -> u64 {
+    fn seconds_since_activity(&self) -> u64 {
         self.last_activity.elapsed().as_secs()
     }
 }
@@ -393,15 +393,15 @@ pub struct RunRegistry {
 }
 
 impl RunRegistry {
-    pub fn get(&self, run_id: &str) -> Option<&RunHandle> {
+    pub(crate) fn get(&self, run_id: &str) -> Option<&RunHandle> {
         self.by_id.get(run_id)
     }
 
-    pub fn get_mut(&mut self, run_id: &str) -> Option<&mut RunHandle> {
+    fn get_mut(&mut self, run_id: &str) -> Option<&mut RunHandle> {
         self.by_id.get_mut(run_id)
     }
 
-    pub fn get_by_session(&self, session_id: &str) -> Option<&str> {
+    fn get_by_session(&self, session_id: &str) -> Option<&str> {
         self.session_index.get(session_id).map(|s| s.as_str())
     }
 
@@ -412,7 +412,7 @@ impl RunRegistry {
         self.by_id.insert(run_id, handle);
     }
 
-    pub fn remove(&mut self, run_id: &str) -> Option<RunHandle> {
+    pub(crate) fn remove(&mut self, run_id: &str) -> Option<RunHandle> {
         if let Some(handle) = self.by_id.remove(run_id) {
             if let Some(ref sid) = handle.session_id {
                 self.session_index.remove(sid);
@@ -443,7 +443,7 @@ impl RunRegistry {
         self.by_id.iter_mut()
     }
 
-    pub fn values(&self) -> impl Iterator<Item = &RunHandle> {
+    fn values(&self) -> impl Iterator<Item = &RunHandle> {
         self.by_id.values()
     }
 }
@@ -461,10 +461,10 @@ pub type ProcessMap = RunRegistry;
 /// RSS instead of an arbitrary count (CAIRN-2543).
 #[derive(Debug, Clone)]
 pub struct WarmProcess {
-    pub run_id: String,
-    pub pid: Option<u32>,
-    pub seconds_since_activity: u64,
-    pub job_id: Option<String>,
+    pub(crate) run_id: String,
+    pub(crate) pid: Option<u32>,
+    pub(crate) seconds_since_activity: u64,
+    pub(crate) job_id: Option<String>,
 }
 
 /// State for tracking active agent processes
@@ -483,20 +483,41 @@ pub struct AgentProcessState {
     /// handle) so it survives the handle's removal during the kill. In-memory is
     /// sufficient: a host restart before the process dies is itself a crash,
     /// which is correctly re-dispatched.
-    pub workflow_stop_requested: Mutex<std::collections::HashSet<String>>,
+    workflow_stop_requested: Mutex<std::collections::HashSet<String>>,
+    /// Live workflow executor bindings keyed by run id. Workflow rows are durable,
+    /// but the incarnation/epoch fence is intentionally process-local authority.
+    workflow_leases: Mutex<
+        std::collections::HashMap<String, cairn_common::executor_protocol::LifetimeLeaseFence>,
+    >,
 }
 
 impl AgentProcessState {
-    /// Get the stdin Arc for a run.
-    pub fn get_stdin_handle(&self, run_id: &str) -> Option<StdinHandle> {
-        let processes = self.processes.lock().ok()?;
-        processes.get(run_id).map(|p| p.stdin.clone())
+    pub(crate) fn bind_workflow_lease(
+        &self,
+        run_id: String,
+        fence: cairn_common::executor_protocol::LifetimeLeaseFence,
+    ) {
+        if let Ok(mut leases) = self.workflow_leases.lock() {
+            leases.insert(run_id, fence);
+        }
     }
 
-    /// Get the lifecycle state of a process by run_id.
-    pub fn get_process_state(&self, run_id: &str) -> Option<RunLifecycle> {
+    pub(crate) fn workflow_lease(
+        &self,
+        run_id: &str,
+    ) -> Option<cairn_common::executor_protocol::LifetimeLeaseFence> {
+        self.workflow_leases.lock().ok()?.get(run_id).cloned()
+    }
+
+    pub(crate) fn clear_workflow_lease(&self, run_id: &str) {
+        if let Ok(mut leases) = self.workflow_leases.lock() {
+            leases.remove(run_id);
+        }
+    }
+    /// Get the stdin Arc for a run.
+    pub(crate) fn get_stdin_handle(&self, run_id: &str) -> Option<StdinHandle> {
         let processes = self.processes.lock().ok()?;
-        processes.get(run_id).map(|p| p.lifecycle)
+        processes.get(run_id).map(|p| p.stdin.clone())
     }
 
     /// Get the occupancy of a process by run_id.
@@ -510,7 +531,7 @@ impl AgentProcessState {
     /// handle is registered — mirrors [`RunHandle::is_active`] at the
     /// state level so callers can ask "is this recipient mid-turn right
     /// now?" without reaching into the lock themselves.
-    pub fn is_active(&self, run_id: &str) -> bool {
+    pub(crate) fn is_active(&self, run_id: &str) -> bool {
         let Ok(processes) = self.processes.lock() else {
             return false;
         };
@@ -521,7 +542,7 @@ impl AgentProcessState {
     }
 
     /// Transition a process to warm state.
-    pub fn transition_to_warm(&self, run_id: &str) -> bool {
+    pub(crate) fn transition_to_warm(&self, run_id: &str) -> bool {
         if let Ok(mut processes) = self.processes.lock() {
             if let Some(process) = processes.get_mut(run_id) {
                 process.transition_to_warm();
@@ -533,7 +554,7 @@ impl AgentProcessState {
     }
 
     /// Transition a process to active state (begin serving).
-    pub fn transition_to_active(&self, run_id: &str) -> bool {
+    pub(crate) fn transition_to_active(&self, run_id: &str) -> bool {
         if let Ok(mut processes) = self.processes.lock() {
             if let Some(process) = processes.get_mut(run_id) {
                 process.transition_to_active();
@@ -556,7 +577,7 @@ impl AgentProcessState {
     }
 
     /// Yield a turn for host interaction.
-    pub fn yield_for_host(&self, run_id: &str, turn_id: &str) -> bool {
+    pub(crate) fn yield_for_host(&self, run_id: &str, turn_id: &str) -> bool {
         if let Ok(mut processes) = self.processes.lock() {
             if let Some(process) = processes.get_mut(run_id) {
                 process.yield_for_host(turn_id);
@@ -567,7 +588,7 @@ impl AgentProcessState {
     }
 
     /// Arm the boundary-interrupt flag for a run-ending artifact/tool.
-    pub fn arm_terminal_tool(&self, run_id: &str) -> bool {
+    pub(crate) fn arm_terminal_tool(&self, run_id: &str) -> bool {
         if let Ok(processes) = self.processes.lock() {
             if let Some(process) = processes.get(run_id) {
                 process.terminal_tool_called.store(true, Ordering::Release);
@@ -585,7 +606,7 @@ impl AgentProcessState {
     /// backends (OpenRouter) read this after a tool boundary to end the turn once
     /// the agent has written its output artifact, mirroring the boundary
     /// interrupt the warm-process backends send at the same point.
-    pub fn terminal_tool_armed(&self, run_id: &str) -> bool {
+    pub(crate) fn terminal_tool_armed(&self, run_id: &str) -> bool {
         self.processes
             .lock()
             .ok()
@@ -600,7 +621,7 @@ impl AgentProcessState {
     /// Record that a workflow run was deliberately stopped by the user, so the
     /// supervisor's finalize maps its killed process to a terminal, non-crashed
     /// outcome instead of a crash. Set BEFORE killing the process (CAIRN-2516).
-    pub fn mark_workflow_stop_requested(&self, run_id: &str) {
+    pub(crate) fn mark_workflow_stop_requested(&self, run_id: &str) {
         if let Ok(mut set) = self.workflow_stop_requested.lock() {
             set.insert(run_id.to_string());
         }
@@ -609,7 +630,7 @@ impl AgentProcessState {
     /// Check-and-clear the deliberate-stop marker for a run. One-shot: the
     /// supervisor calls this exactly once on finalize, so a later crash-driven
     /// finalize of a re-dispatched run never sees a stale marker.
-    pub fn take_workflow_stop_requested(&self, run_id: &str) -> bool {
+    pub(crate) fn take_workflow_stop_requested(&self, run_id: &str) -> bool {
         self.workflow_stop_requested
             .lock()
             .map(|mut set| set.remove(run_id))
@@ -651,7 +672,7 @@ impl AgentProcessState {
     /// GC can measure each warm process's RSS; a process whose child handle was
     /// already taken (e.g. mid-teardown) reports `None` and the GC imputes its
     /// size from measured siblings.
-    pub fn warm_processes(&self) -> Vec<WarmProcess> {
+    pub(crate) fn warm_processes(&self) -> Vec<WarmProcess> {
         let processes = match self.processes.lock() {
             Ok(p) => p,
             Err(_) => return vec![],
@@ -679,7 +700,7 @@ impl AgentProcessState {
     }
 
     /// Count GC-safe (idle) processes.
-    pub fn warm_process_count(&self) -> usize {
+    pub(crate) fn warm_process_count(&self) -> usize {
         self.processes
             .lock()
             .map(|p| p.values().filter(|proc| proc.is_warm()).count())
@@ -687,7 +708,7 @@ impl AgentProcessState {
     }
 
     /// Count active processes (serving turn or awaiting host).
-    pub fn active_process_count(&self) -> usize {
+    pub(crate) fn active_process_count(&self) -> usize {
         self.processes
             .lock()
             .map(|p| p.values().filter(|proc| proc.is_active()).count())
@@ -730,16 +751,6 @@ impl AgentProcessState {
         result
     }
 
-    /// Get the message cursor for a run and advance it to `now`.
-    pub fn advance_message_cursor(&self, run_id: &str) -> Option<i64> {
-        let processes = self.processes.lock().ok()?;
-        let process = processes.get(run_id)?;
-        let mut cursor = process.message_cursor.lock().ok()?;
-        let prev = *cursor;
-        *cursor = chrono::Utc::now().timestamp();
-        Some(prev)
-    }
-
     /// Record that a run read a cairn:// resource (adds to the consumed-set).
     pub fn note_read(&self, run_id: &str, uri: &str) {
         if let Ok(processes) = self.processes.lock() {
@@ -768,7 +779,7 @@ impl AgentProcessState {
     /// Session-scoped, not turn-scoped: a block shown in an earlier turn stays
     /// collapsed for the rest of the run. Returns an empty set when the run is
     /// unknown (external/untracked runs keep full blocks every time).
-    pub fn mark_affordances_seen(&self, run_id: &str, hashes: &[u64]) -> HashSet<u64> {
+    pub(crate) fn mark_affordances_seen(&self, run_id: &str, hashes: &[u64]) -> HashSet<u64> {
         let Ok(processes) = self.processes.lock() else {
             return HashSet::new();
         };
@@ -854,7 +865,7 @@ impl AgentProcessState {
     /// last recorded, so turn-to-turn and `Busy -> ServingTurn` transitions are
     /// handled without any `begin_turn` hook. The `processes` lock serializes
     /// concurrent calls (the parallel-block case).
-    pub fn check_and_record_content(
+    pub(crate) fn check_and_record_content(
         &self,
         run_id: &str,
         fingerprint: &str,
@@ -911,7 +922,7 @@ impl AgentProcessState {
     /// a distinct fingerprint namespace (`terminal_poll\u{1}...`), so it never
     /// collides with the content-aware dedup's `read_batch_target\u{1}...`
     /// records and never perturbs the broad-thrash (`is_dup`) signal.
-    pub fn record_repeat(&self, run_id: &str, fingerprint: &str) -> u32 {
+    pub(crate) fn record_repeat(&self, run_id: &str, fingerprint: &str) -> u32 {
         let Ok(processes) = self.processes.lock() else {
             return 0;
         };
@@ -934,7 +945,7 @@ impl AgentProcessState {
     }
 
     /// Get the current turn ID for a process by run_id.
-    pub fn get_current_turn_id(&self, run_id: &str) -> Option<String> {
+    pub(crate) fn get_current_turn_id(&self, run_id: &str) -> Option<String> {
         let processes = self.processes.lock().ok()?;
         processes.get(run_id)?.current_turn_id().map(String::from)
     }
@@ -954,7 +965,7 @@ impl AgentProcessState {
 
     /// Whether the backend driving `run_id` owns its turn/tool loop in-process
     /// (OpenRouter). Returns false for warm-process backends and unknown runs.
-    pub fn run_owns_turn_loop(&self, run_id: &str) -> bool {
+    pub(crate) fn run_owns_turn_loop(&self, run_id: &str) -> bool {
         self.processes
             .lock()
             .ok()
@@ -965,7 +976,7 @@ impl AgentProcessState {
     /// Record a structured suspend request for an owned-loop run. Runs
     /// synchronously on the owned loop's tool-dispatch thread, so the loop reads
     /// it back immediately via [`take_suspend`](Self::take_suspend) with no race.
-    pub fn request_suspend(&self, run_id: &str, kind: SuspendKind) {
+    pub(crate) fn request_suspend(&self, run_id: &str, kind: SuspendKind) {
         if let Ok(processes) = self.processes.lock() {
             if let Some(process) = processes.get(run_id) {
                 if let Ok(mut slot) = process.pending_suspend.lock() {
@@ -984,7 +995,7 @@ impl AgentProcessState {
     }
 
     /// Find any process (active or warm) by session_id.
-    pub fn find_process_by_session(&self, session_id: &str) -> Option<String> {
+    pub(crate) fn find_process_by_session(&self, session_id: &str) -> Option<String> {
         let processes = self.processes.lock().ok()?;
         // Use session index for O(1) lookup
         if let Some(run_id) = processes.get_by_session(session_id) {
@@ -995,7 +1006,7 @@ impl AgentProcessState {
 
     /// Remove a process by session_id. Returns the run_id if found.
     /// Used to evict warm processes when sessions are closed.
-    pub fn remove_by_session(&self, session_id: &str) -> Option<String> {
+    pub(crate) fn remove_by_session(&self, session_id: &str) -> Option<String> {
         let mut processes = self.processes.lock().ok()?;
         if let Some(run_id) = processes.get_by_session(session_id).map(|s| s.to_string()) {
             processes.remove(&run_id);
@@ -1017,7 +1028,7 @@ impl AgentProcessState {
     }
 
     /// Get the effective model recorded for a process by run_id.
-    pub fn get_model(&self, run_id: &str) -> Option<String> {
+    pub(crate) fn get_model(&self, run_id: &str) -> Option<String> {
         let processes = self.processes.lock().ok()?;
         processes.get(run_id).and_then(|p| p.model.clone())
     }
@@ -1043,7 +1054,7 @@ impl AgentProcessState {
     /// Remove a process from the registry (clearing the session index) and then
     /// gracefully stop its child process outside the registry lock. Returns true
     /// if a process was found and removed.
-    pub fn stop_and_remove(&self, run_id: &str) -> bool {
+    pub(crate) fn stop_and_remove(&self, run_id: &str) -> bool {
         let handle = match self.processes.lock() {
             Ok(mut processes) => processes.remove(run_id),
             Err(_) => return false,
@@ -1066,13 +1077,14 @@ impl Default for AgentProcessState {
             processes: Mutex::new(RunRegistry::default()),
             cli_binary_path: Mutex::new(None),
             workflow_stop_requested: Mutex::new(std::collections::HashSet::new()),
+            workflow_leases: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
 
 /// Gracefully stop Claude process (SIGTERM, wait, fallback to SIGKILL on Unix; direct kill on Windows)
 #[cfg(unix)]
-pub fn graceful_stop(child: &mut dyn ChildProcess) {
+pub(crate) fn graceful_stop(child: &mut dyn ChildProcess) {
     let pid = Pid::from_raw(child.id() as i32);
 
     // Try SIGTERM first

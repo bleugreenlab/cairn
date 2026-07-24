@@ -13,7 +13,7 @@ use crate::orchestrator::Orchestrator;
 /// Summary of what happened during effect execution.
 #[derive(Debug, Default)]
 pub struct EffectLoopReport {
-    pub effects_executed: usize,
+    pub(crate) effects_executed: usize,
 }
 
 /// Drive the reduce→execute→reduce loop until quiescent.

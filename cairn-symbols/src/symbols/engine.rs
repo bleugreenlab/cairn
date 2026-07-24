@@ -37,19 +37,19 @@ pub fn parse(src: &str, lang: SupportLang) -> AstGrep<Doc> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AstMatch {
     /// 0-based start line.
-    pub start_line: usize,
+    pub(crate) start_line: usize,
     /// 0-based end line.
-    pub end_line: usize,
+    end_line: usize,
     /// Byte range of the match within the source.
-    pub byte_range: Range<usize>,
+    byte_range: Range<usize>,
     /// The matched node's full source text.
-    pub text: String,
+    text: String,
 }
 
 impl AstMatch {
     /// The first non-empty source line of the match, trimmed — the single-line
     /// snippet used in `path:line:snippet` rows.
-    pub fn snippet(&self) -> String {
+    pub(crate) fn snippet(&self) -> String {
         first_line(&self.text)
     }
 }
@@ -58,7 +58,7 @@ impl AstMatch {
 /// error when the pattern is malformed rather than panicking. ast-grep's
 /// `str` matcher builds patterns with the infallible `Pattern::new` (which can
 /// panic), so callers that accept untrusted patterns must route through here.
-pub fn compile_pattern(pattern: &str, lang: SupportLang) -> Result<Pattern, String> {
+pub(crate) fn compile_pattern(pattern: &str, lang: SupportLang) -> Result<Pattern, String> {
     if pattern.trim().is_empty() {
         return Err("empty ast pattern".to_string());
     }
@@ -66,7 +66,7 @@ pub fn compile_pattern(pattern: &str, lang: SupportLang) -> Result<Pattern, Stri
 }
 
 /// Run a compiled pattern over a parsed tree, collecting owned match rows.
-pub fn run_pattern(ast: &AstGrep<Doc>, pattern: &Pattern) -> Vec<AstMatch> {
+pub(crate) fn run_pattern(ast: &AstGrep<Doc>, pattern: &Pattern) -> Vec<AstMatch> {
     ast.root()
         .find_all(pattern)
         .map(|m| AstMatch {
@@ -86,7 +86,7 @@ pub fn search_source(src: &str, lang: SupportLang, pattern: &str) -> Result<Vec<
 }
 
 /// The first non-empty line of `text`, trimmed of surrounding whitespace.
-pub fn first_line(text: &str) -> String {
+pub(crate) fn first_line(text: &str) -> String {
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty())

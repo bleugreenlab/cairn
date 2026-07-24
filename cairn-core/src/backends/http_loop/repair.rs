@@ -176,7 +176,7 @@ pub(in crate::backends) fn parse_tool_arguments(raw: &str) -> ParsedArguments {
 /// code fences, balance unclosed strings/brackets (the observed truncation
 /// case), and drop trailing commas. The result is best-effort and may still be
 /// invalid JSON; callers re-parse and fall back when it is.
-pub(super) fn repair_json_arguments(raw: &str) -> String {
+fn repair_json_arguments(raw: &str) -> String {
     let s = strip_code_fences(raw);
     let s = balance_brackets(&s);
     strip_trailing_commas(&s)

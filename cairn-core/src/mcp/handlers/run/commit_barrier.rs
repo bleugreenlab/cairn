@@ -24,6 +24,17 @@ pub(super) struct CommitBarrierOutcome {
     pub committed_patch: Option<String>,
 }
 
+/// Aggregate `(additions, deletions)` across a captured working-copy patch. The
+/// commit barrier appends this to the committed-changes message so the run's
+/// commit row can show lines-changed the way a write's file rows do.
+fn aggregate_diff_stat(patch: &str) -> (i32, i32) {
+    crate::jj::parse_git_patch(patch)
+        .iter()
+        .fold((0, 0), |(add, del), change| {
+            (add + change.additions, del + change.deletions)
+        })
+}
+
 /// Enforce the worktree==HEAD invariant after a `run` batch.
 ///
 /// The single decision point for what happens to the worktree once a batch
@@ -65,9 +76,23 @@ pub(super) fn run_commit_barrier(
                             .pr_number
                             .map(|pr| format!(" updated PR#{}", pr))
                             .unwrap_or_default();
+                        // Annotate the committed-changes line with the sealed
+                        // commit's aggregate `+adds/-dels`, kept OUTSIDE the
+                        // `(sha)` parens so the sha parsers (frontend and archival
+                        // `run_commit_sha`, both anchored on `(<sha>)`) stay
+                        // intact. The run's commit-msg row parses this back out to
+                        // render a diff stat like a write's per-file rows. Omitted
+                        // for a zero-line change (a pure rename or mode change),
+                        // where the row's DiffStat renders nothing anyway.
+                        let stat_suffix = committed_patch
+                            .as_deref()
+                            .map(aggregate_diff_stat)
+                            .filter(|&(add, del)| add > 0 || del > 0)
+                            .map(|(add, del)| format!(" +{add}/-{del}"))
+                            .unwrap_or_default();
                         message.push_str(&format!(
-                            "\u{2713} Committed changes ({}){}",
-                            commit_result.sha, pr_suffix
+                            "\u{2713} Committed changes ({}){}{}",
+                            commit_result.sha, stat_suffix, pr_suffix
                         ));
                         // Surface an amend that was converted to a child commit
                         // because the target commit is shared with a sibling
@@ -246,6 +271,50 @@ mod commit_barrier_tests {
         assert!(out.worktree_changed);
         assert!(out.committed, "a real commit must set committed");
         assert!(out.message.contains("Committed"), "got: {}", out.message);
+    }
+
+    #[test]
+    fn commit_message_carries_aggregate_diff_stat() {
+        // A successful seal annotates the committed-changes line with the sealed
+        // commit's aggregate `+adds/-dels`, kept outside the `(sha)` parens. This
+        // is what the run's commit-msg row parses back out to render lines-changed
+        // like a write's file rows.
+        let patch =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,3 @@\n a\n-b\n+c\n+d\n";
+        let vcs = FakeVcs::new()
+            .dirty(Ok(true))
+            .capture(Some(patch.to_string()));
+        let out = run_commit_barrier(&vcs, wt(), Some("edit x"), true, None, None);
+        assert!(out.committed);
+        // The stat sits after the sha's closing paren so `run_commit_sha` and the
+        // frontend hash parser (both anchored on `(<sha>)`) still work.
+        assert!(
+            out.message.contains(") +2/-1"),
+            "message must carry the aggregate stat after the sha: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn commit_message_omits_stat_for_zero_line_change() {
+        // A hunkless patch (a pure rename or mode change) has no `+`/`-` lines, so
+        // no stat suffix is appended — the row's DiffStat would render nothing.
+        let patch = "diff --git a/x.rs b/y.rs\nrename from x.rs\nrename to y.rs\n";
+        let vcs = FakeVcs::new()
+            .dirty(Ok(true))
+            .capture(Some(patch.to_string()));
+        let out = run_commit_barrier(&vcs, wt(), Some("rename x"), true, None, None);
+        assert!(out.committed);
+        assert!(
+            out.message.contains("Committed changes"),
+            "got: {}",
+            out.message
+        );
+        assert!(
+            !out.message.contains('+') && !out.message.contains("/-"),
+            "a zero-line change carries no stat suffix: {}",
+            out.message
+        );
     }
 
     #[test]

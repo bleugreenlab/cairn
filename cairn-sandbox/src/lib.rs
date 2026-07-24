@@ -60,6 +60,15 @@ pub struct SandboxPolicy {
     pub worktree_writable: bool,
 }
 
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    // Compare canonical forms so macOS /var -> /private/var and /tmp ->
+    // /private/tmp aliases cannot smuggle an ancestor write allowance back over
+    // a read-only checkout.
+    let a = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
+    let b = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
 impl SandboxPolicy {
     /// Build a policy for a worktree run.
     ///
@@ -108,10 +117,14 @@ impl SandboxPolicy {
             // grant would include it) must NOT re-open the checkout to writes: the
             // read-only guarantee outranks any session grant. Dropped here so the
             // policy is bulletproof regardless of caller.
-            .filter(|p| !(p.starts_with(checkout) || checkout.starts_with(p)))
+            .filter(|p| !paths_overlap(p, checkout))
             .collect();
 
         let mut writable_extra = default_writable_extra();
+        // The read-only checkout outranks every writable carve-out, including a
+        // temp/toolchain root that happens to contain it. An ancestor allowance
+        // would otherwise re-open the checkout on allowlist sandboxes.
+        writable_extra.retain(|path| !paths_overlap(path, checkout));
         writable_extra.extend(granted_paths);
 
         Self {
@@ -173,7 +186,7 @@ impl SandboxPolicy {
     /// covering a prefix of the checkout can never block the agent from reading
     /// its own source, and a read-only checkout stays fully readable while its
     /// writes are denied.
-    pub fn readable_paths(&self) -> Vec<PathBuf> {
+    fn readable_paths(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.worktree.clone()];
         paths.extend(self.writable_extra.iter().cloned());
         paths
@@ -268,7 +281,12 @@ pub fn install_pre_exec(cmd: &mut std::process::Command, policy: &SandboxPolicy)
 pub enum SandboxDenial {
     /// A precise denied path was recovered (macOS unified log) — the fence can
     /// raise a path-scoped crossing whose grant generalizes across commands.
-    Path(PathBuf),
+    Path {
+        path: PathBuf,
+        /// Kernel operation reported by the sandbox log, such as
+        /// `file-write-create`, when the platform exposes it.
+        operation: Option<String>,
+    },
     /// A denial occurred but no path was recovered — the fence raises a
     /// command-scoped crossing.
     Command,
@@ -315,7 +333,10 @@ pub fn detect_denial(
         // command output rather than synthesizing a denial.
         match pid {
             Some(pid) => match macos::detect_violation(pid, since) {
-                Some(path) => Some(SandboxDenial::Path(path)),
+                Some(violation) => Some(SandboxDenial::Path {
+                    path: violation.path,
+                    operation: Some(violation.operation),
+                }),
                 None if command_scoped_fallback => Some(SandboxDenial::Command),
                 None => None,
             },
@@ -335,7 +356,7 @@ pub fn detect_denial(
 }
 
 /// Whether output carries a filesystem permission-denial signature.
-pub fn has_denial_signature(output: &str) -> bool {
+fn has_denial_signature(output: &str) -> bool {
     const SIGS: [&str; 4] = [
         "Operation not permitted",
         "Permission denied",
@@ -560,6 +581,19 @@ mod tests {
         // A safely-outside grant still applies.
         assert!(writable.contains(&PathBuf::from("/scratch/ok")));
         // And the checkout stays readable throughout.
+        assert!(policy.readable_paths().contains(&checkout));
+    }
+
+    #[test]
+    fn for_readonly_checkout_drops_overlapping_default_writable_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("cairn-readonly-checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let policy = SandboxPolicy::for_readonly_checkout(&checkout, &[], vec![]);
+        assert!(policy
+            .writable_paths()
+            .iter()
+            .all(|path| !(path.starts_with(&checkout) || checkout.starts_with(path))));
         assert!(policy.readable_paths().contains(&checkout));
     }
 

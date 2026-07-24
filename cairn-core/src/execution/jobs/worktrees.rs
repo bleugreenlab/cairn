@@ -1,6 +1,86 @@
 use super::*;
 
-/// Create a worktree for a job using the orchestrator's service traits.
+/// Emit a durable phase timing with the project store as its correlation key.
+fn emit_phase_timing(
+    sink: &setup_progress::SetupSink,
+    job_id: &str,
+    issue_id: Option<String>,
+    phase: &str,
+    elapsed: std::time::Duration,
+    store: &Path,
+) {
+    let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    log::info!(
+        "managed workspace setup phase complete: job_id={job_id}, phase={phase}, elapsed_ms={elapsed_ms}, store={}",
+        store.display()
+    );
+    setup_progress::emit_timing(
+        sink,
+        job_id,
+        issue_id,
+        phase,
+        elapsed_ms,
+        store.to_string_lossy().into_owned(),
+    );
+}
+
+fn acquire_store_guard(
+    orch: &Orchestrator,
+    store: &Path,
+    operation: String,
+) -> crate::orchestrator::JjStoreGuard {
+    run_db({
+        let orch = orch.clone();
+        let store = store.to_path_buf();
+        async move { Ok(orch.acquire_jj_store_lock(&store, operation).await) }
+    })
+    .expect("jj store lock acquisition cannot fail")
+}
+
+/// Forget store registration under the store lock, then remove the directory
+/// without retaining the project-wide lock across filesystem I/O.
+fn cleanup_prepared_worktree(
+    orch: &Orchestrator,
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    worktree_path: &Path,
+    workspace_name: &str,
+    branch: &str,
+    job_id: &str,
+    issue_id: Option<String>,
+    sink: &setup_progress::SetupSink,
+) {
+    let started = std::time::Instant::now();
+    {
+        let _guard = acquire_store_guard(
+            orch,
+            store,
+            format!("workspace provisioning cleanup for {job_id}"),
+        );
+        let _ = crate::jj::forget_workspace_name(jj, store, workspace_name);
+        // Workspace creation also creates the job bookmark. A failed setup must
+        // not leave that coordinate occupying the next allocation attempt.
+        let _ = jj.run(store, &["bookmark", "delete", branch], "jj bookmark delete");
+    }
+    if let Err(error) = std::fs::remove_dir_all(worktree_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                "failed to remove managed workspace {} during cleanup: {error}",
+                worktree_path.display()
+            );
+        }
+    }
+    emit_phase_timing(sink, job_id, issue_id, "cleanup", started.elapsed(), store);
+}
+
+fn cleanup_owned_mutation_failure(cleanup_allowed: bool, cleanup: impl FnOnce()) {
+    if cleanup_allowed {
+        cleanup();
+    }
+}
+
+/// Create and prepare a worktree. Each store-mutating phase acquires its own
+/// short guard; population and arbitrary project setup commands never hold it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_worktree_for_job(
     orch: &Orchestrator,
@@ -19,24 +99,27 @@ pub(crate) fn prepare_worktree_for_job(
     let settings = load_project_settings(Path::new(repo_path));
     let populate_config = settings.populate_config();
     let setup_commands = settings.setup_commands.unwrap_or_default();
-
     let git = &*orch.services.git;
     let fs = &*orch.services.fs;
     let process = &*orch.services.process;
     let repo = Path::new(repo_path);
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo);
 
     let cleanup = || {
-        // A jj workspace is .jj-only and not registered as a git worktree, so
-        // `git worktree remove` would fail and strand both the directory and the
-        // shared-store registration. Forget it from the store (handles a
-        // partially-created workspace too) and remove the dir.
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        let store = crate::jj::project_store_dir(&orch.config_dir, repo);
-        let _ = crate::jj::forget_workspace_name(&jj, &store, &identity.workspace_name);
-        let _ = std::fs::remove_dir_all(worktree_path);
+        cleanup_prepared_worktree(
+            orch,
+            &jj,
+            &store,
+            worktree_path,
+            &identity.workspace_name,
+            branch,
+            job_id,
+            issue_id.clone(),
+            sink,
+        );
     };
 
-    // 1. Create worktree
     setup_progress::emit(
         sink,
         job_id,
@@ -49,96 +132,139 @@ pub(crate) fn prepare_worktree_for_job(
             worktree_path.display()
         )),
     );
-    // Provision one shared jj store (a Cairn-managed jj repo backed by the
-    // project's existing .git, so the user's checkout is never touched) and add
-    // this job's working dir as a jj workspace off it. jj is the only substrate.
-    // See docs/jj-migration.md.
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, repo);
-    crate::jj::ensure_project_store(&jj, &store, repo).map_err(|message| {
-        crate::git::worktree::SetupError::Spawn {
-            command: "jj git init --git-repo".to_string(),
-            message,
-        }
-    })?;
-    // Resolve the base to a revision jj can always find in the shared store, so a
-    // local-only repo whose configured default branch has no matching ref (or an
-    // unborn/empty repo) still provisions instead of failing
-    // `Revision <x> doesn't exist`. See crate::jj::resolve_base_rev.
-    let mut base_rev = crate::jj::resolve_base_rev(&jj, &store, base_ref, |r| {
-        git.rev_parse(repo, vec![r.to_string()])
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
 
-    let marker_matches = crate::jj::read_workspace_identity(worktree_path)
-        .map(|marker| {
-            marker.lineage_root_job_id == identity.lineage_root_job_id
-                && marker.owner_job_id == identity.owner_job_id
-                && marker.project_id == identity.project_id
-                && marker.project_root == identity.project_root
-                && marker.worktree_path == identity.worktree_path
-                && marker.branch == identity.branch
-                && marker.workspace_name == identity.workspace_name
-        })
-        .unwrap_or(false);
-    let registration_exists =
-        crate::jj::workspace_registered(&jj, &store, &identity.workspace_name);
-    let bookmark_tip = crate::jj::bookmark_commit(&jj, &store, branch);
-    let any_existing = worktree_path.exists() || registration_exists || bookmark_tip.is_some();
-    if any_existing {
-        let safe_retry = allow_retry_cleanup
-            && crate::jj::workspace_retry_is_clean(&jj, worktree_path)
-            && (marker_matches || registration_exists);
-        if !safe_retry {
-            return Err(crate::git::worktree::SetupError::Spawn {
-                command: "managed workspace ownership check".to_string(),
-                message: format!(
-                    "workspace slot is occupied by another or unproven lineage: path={}, branch={}, workspace={}",
-                    worktree_path.display(),
-                    branch,
-                    identity.workspace_name
-                ),
-            });
-        }
-        if marker_matches {
-            if let Some(tip) = bookmark_tip {
-                base_rev = tip;
+    // Store initialization, retry ownership validation, workspace creation,
+    // identity markers, and populate exclusions form the only provisioning
+    // mutation critical section. Exclusions must exist before copied files do.
+    let wait_started = std::time::Instant::now();
+    let guard = acquire_store_guard(
+        orch,
+        &store,
+        format!("workspace provisioning mutation for {job_id}"),
+    );
+    emit_phase_timing(
+        sink,
+        job_id,
+        issue_id.clone(),
+        "store-lock-wait",
+        wait_started.elapsed(),
+        &store,
+    );
+    let mutation_started = std::time::Instant::now();
+    // Destructive cleanup is legal only after this invocation has either proven
+    // retry ownership or successfully created the workspace. A collision refusal
+    // must leave the unproven path, registration, and bookmark untouched.
+    let cleanup_allowed = std::cell::Cell::new(false);
+    let mutation_result = (|| {
+        crate::jj::ensure_project_store(&jj, &store, repo).map_err(|message| {
+            crate::git::worktree::SetupError::Spawn {
+                command: "jj git init --git-repo".to_string(),
+                message,
             }
-        }
-        crate::jj::cleanup_workspace_retry(&jj, &store, worktree_path, &identity.workspace_name)
+        })?;
+        let mut base_rev = crate::jj::resolve_base_rev(&jj, &store, base_ref, |r| {
+            git.rev_parse(repo, vec![r.to_string()])
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+        let marker_matches = crate::jj::read_workspace_identity(worktree_path)
+            .map(|marker| {
+                marker.lineage_root_job_id == identity.lineage_root_job_id
+                    && marker.owner_job_id == identity.owner_job_id
+                    && marker.project_id == identity.project_id
+                    && marker.project_root == identity.project_root
+                    && marker.worktree_path == identity.worktree_path
+                    && marker.branch == identity.branch
+                    && marker.workspace_name == identity.workspace_name
+            })
+            .unwrap_or(false);
+        let registration_exists =
+            crate::jj::workspace_registered(&jj, &store, &identity.workspace_name);
+        let bookmark_tip = crate::jj::bookmark_commit(&jj, &store, branch);
+        let any_existing = worktree_path.exists() || registration_exists || bookmark_tip.is_some();
+        if any_existing {
+            let safe_retry = allow_retry_cleanup
+                && crate::jj::workspace_retry_is_clean(&jj, worktree_path)
+                && (marker_matches || registration_exists);
+            if !safe_retry {
+                return Err(crate::git::worktree::SetupError::Spawn {
+                    command: "managed workspace ownership check".to_string(),
+                    message: format!(
+                        "workspace slot is occupied by another or unproven lineage: path={}, branch={}, workspace={}",
+                        worktree_path.display(), branch, identity.workspace_name
+                    ),
+                });
+            }
+            if marker_matches {
+                if let Some(tip) = bookmark_tip {
+                    base_rev = tip;
+                }
+            }
+            cleanup_allowed.set(true);
+            crate::jj::cleanup_workspace_retry(
+                &jj,
+                &store,
+                worktree_path,
+                &identity.workspace_name,
+            )
             .map_err(|message| crate::git::worktree::SetupError::Spawn {
                 command: "jj workspace retry cleanup".to_string(),
                 message,
             })?;
+        }
+        if let Err(message) =
+            crate::jj::add_workspace(&jj, &store, worktree_path, branch, &base_rev, None)
+        {
+            // `add_workspace` spans the jj mutation and marker/bookmark writes.
+            // The slot was proven empty above while this same store guard was
+            // held, so any expected coordinate that appeared is evidence of a
+            // partial creation by this invocation, not an earlier collision.
+            let partially_created = worktree_path.exists()
+                || crate::jj::workspace_registered(&jj, &store, &identity.workspace_name)
+                || crate::jj::bookmark_commit(&jj, &store, branch).is_some();
+            cleanup_allowed.set(partially_created);
+            return Err(crate::git::worktree::SetupError::Spawn {
+                command: "jj workspace add".to_string(),
+                message,
+            });
+        }
+        cleanup_allowed.set(true);
+        if let Err(error) = crate::jj::write_base_marker(worktree_path, base_ref, &base_rev) {
+            log::warn!("failed to write base marker for {branch}: {error}");
+        }
+        if let Err(error) = crate::jj::write_project_root_marker(worktree_path, repo) {
+            log::warn!("failed to write project root marker for {branch}: {error}");
+        }
+        crate::jj::write_workspace_identity(worktree_path, identity).map_err(|message| {
+            crate::git::worktree::SetupError::Spawn {
+                command: "write managed workspace identity".to_string(),
+                message,
+            }
+        })?;
+        if !populate_config.is_empty() {
+            crate::jj::set_populate_auto_track(&jj, &store, &populate_config, &[]).map_err(
+                |message| crate::git::worktree::SetupError::Spawn {
+                    command: "configure populate exclusions".to_string(),
+                    message,
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    drop(guard);
+    emit_phase_timing(
+        sink,
+        job_id,
+        issue_id.clone(),
+        "workspace-mutation",
+        mutation_started.elapsed(),
+        &store,
+    );
+    if let Err(error) = mutation_result {
+        cleanup_owned_mutation_failure(cleanup_allowed.get(), cleanup);
+        return Err(error);
     }
 
-    crate::jj::add_workspace(&jj, &store, worktree_path, branch, &base_rev, None).map_err(
-        |message| crate::git::worktree::SetupError::Spawn {
-            command: "jj workspace add".to_string(),
-            message,
-        },
-    )?;
-    // Record the integration base for in-fence check tooling (diff-vs-base
-    // attribution). The base BRANCH is what the changed-file diff resolves
-    // against — it auto-advances with the integration tip — while the resolved
-    // SHA is a stable cache key. Auxiliary metadata: a write failure must not
-    // fail provisioning. See scripts/lib/check-base.ts / docs/check-harness.md.
-    if let Err(error) = crate::jj::write_base_marker(worktree_path, base_ref, &base_rev) {
-        log::warn!("failed to write base marker for {branch}: {error}");
-    }
-    // Record the project's primary checkout so in-worktree dev tooling can
-    // borrow machine-local artifacts (sidecar binaries) from it. Auxiliary
-    // metadata like the markers above: never fails provisioning.
-    if let Err(error) = crate::jj::write_project_root_marker(worktree_path, repo) {
-        log::warn!("failed to write project root marker for {branch}: {error}");
-    }
-    crate::jj::write_workspace_identity(worktree_path, identity).map_err(|message| {
-        crate::git::worktree::SetupError::Spawn {
-            command: "write managed workspace identity".to_string(),
-            message,
-        }
-    })?;
     setup_progress::emit(
         sink,
         job_id,
@@ -153,7 +279,6 @@ pub(crate) fn prepare_worktree_for_job(
         return Err(crate::git::worktree::SetupError::Cancelled);
     }
 
-    // 2. Populate gitignored content per explicit rules
     if !populate_config.is_empty() {
         setup_progress::emit(
             sink,
@@ -164,16 +289,7 @@ pub(crate) fn prepare_worktree_for_job(
             None,
             Some("[info] Populating gitignored content".to_string()),
         );
-        // Establish the jj-native exclude BEFORE populate copies files in: jj
-        // auto-tracks a new file on the first snapshot after it appears, and a
-        // later rule cannot un-track it, so explicitly-populated gitignored
-        // content (e.g. .env, node_modules) must be kept out of
-        // snapshot.auto-track up front. Best-effort here — the post-populate
-        // backstop below is the real guarantee and fails setup loudly if any
-        // populated path is still snapshot-visible.
-        if let Err(e) = crate::jj::set_populate_auto_track(&jj, &store, &populate_config, &[]) {
-            log::warn!("Failed to set snapshot.auto-track for populate excludes: {e}");
-        }
+        let populate_started = std::time::Instant::now();
         match crate::git::worktree::populate_worktree(
             git,
             fs,
@@ -197,8 +313,8 @@ pub(crate) fn prepare_worktree_for_job(
                     Some(line),
                 );
             }
-            Err(e) => {
-                let line = format!("[info] Worktree population failed (continuing): {e}");
+            Err(error) => {
+                let line = format!("[info] Worktree population failed (continuing): {error}");
                 log::warn!("{line}");
                 setup_progress::emit(
                     sink,
@@ -211,16 +327,22 @@ pub(crate) fn prepare_worktree_for_job(
                 );
             }
         }
-        // Security backstop: explicitly-populated gitignored content must stay
-        // UNCOMMITTED so a later run/write seal can never commit secrets or
-        // build artifacts. At this point only populate has run (no setup
-        // commands, no agent edits), so ANY path visible in `@` is populated
-        // content that leaked past the auto-track exclude. Self-heal a
-        // conservative glob-translation miss by adding the exact leaked paths to
-        // auto-track and un-tracking them; fail setup loudly if anything still
-        // leaks rather than provision a worktree where populated content could
-        // be sealed.
-        match crate::jj::working_copy_dirty_paths(&jj, worktree_path) {
+        emit_phase_timing(
+            sink,
+            job_id,
+            issue_id.clone(),
+            "populate-discovery-copy",
+            populate_started.elapsed(),
+            &store,
+        );
+
+        let verification_started = std::time::Instant::now();
+        let _guard = acquire_store_guard(
+            orch,
+            &store,
+            format!("workspace populate verification for {job_id}"),
+        );
+        let verification = match crate::jj::working_copy_dirty_paths(&jj, worktree_path) {
             Ok(leaked) if !leaked.is_empty() => {
                 log::warn!(
                     "populate exclude missed {} path(s); self-healing: {:?}",
@@ -231,28 +353,36 @@ pub(crate) fn prepare_worktree_for_job(
                 let _ = crate::jj::untrack_paths(&jj, worktree_path, &leaked);
                 let still = crate::jj::working_copy_dirty_paths(&jj, worktree_path)
                     .unwrap_or_else(|_| leaked.clone());
-                if !still.is_empty() {
-                    cleanup();
-                    return Err(crate::git::worktree::SetupError::Spawn {
+                if still.is_empty() {
+                    Ok(())
+                } else {
+                    Err(crate::git::worktree::SetupError::Spawn {
                         command: "populate exclude verification".to_string(),
                         message: format!(
-                            "explicitly-populated gitignored content is still snapshot-visible \
-                             and could be committed: {}. Refusing to provision the worktree.",
+                            "explicitly-populated gitignored content is still snapshot-visible and could be committed: {}. Refusing to provision the worktree.",
                             still.join(", ")
                         ),
-                    });
+                    })
                 }
             }
-            Ok(_) => {}
-            Err(e) => {
-                // Can't verify the security invariant — fail loud rather than
-                // provision a worktree where populated content might be sealed.
-                cleanup();
-                return Err(crate::git::worktree::SetupError::Spawn {
-                    command: "populate exclude verification".to_string(),
-                    message: format!("could not verify populate excludes: {e}"),
-                });
-            }
+            Ok(_) => Ok(()),
+            Err(error) => Err(crate::git::worktree::SetupError::Spawn {
+                command: "populate exclude verification".to_string(),
+                message: format!("could not verify populate excludes: {error}"),
+            }),
+        };
+        drop(_guard);
+        emit_phase_timing(
+            sink,
+            job_id,
+            issue_id.clone(),
+            "populate-verification",
+            verification_started.elapsed(),
+            &store,
+        );
+        if let Err(error) = verification {
+            cleanup();
+            return Err(error);
         }
         if cancel.load(Ordering::SeqCst) {
             cleanup();
@@ -260,9 +390,9 @@ pub(crate) fn prepare_worktree_for_job(
         }
     }
 
-    // 3. Run setup commands
+    let setup_started = std::time::Instant::now();
     if !setup_commands.is_empty() {
-        if let Err(e) = crate::git::worktree::run_setup_commands_with_process_streaming(
+        if let Err(error) = crate::git::worktree::run_setup_commands_with_process_streaming(
             process,
             worktree_path,
             &setup_commands,
@@ -272,12 +402,27 @@ pub(crate) fn prepare_worktree_for_job(
             cancel,
             child_slot,
         ) {
-            log::error!("Setup commands failed, cleaning up worktree: {}", e);
+            emit_phase_timing(
+                sink,
+                job_id,
+                issue_id.clone(),
+                "setup-commands",
+                setup_started.elapsed(),
+                &store,
+            );
+            log::error!("Setup commands failed, cleaning up worktree: {error}");
             cleanup();
-            return Err(e);
+            return Err(error);
         }
     }
-
+    emit_phase_timing(
+        sink,
+        job_id,
+        issue_id,
+        "setup-commands",
+        setup_started.elapsed(),
+        &store,
+    );
     Ok(())
 }
 
@@ -395,6 +540,20 @@ pub(crate) fn ensure_ephemeral_task_worktree(
 mod plan_tests {
     use super::*;
     use crate::execution::jobs::CallWorktree;
+
+    #[test]
+    fn unproven_collision_never_runs_destructive_cleanup() {
+        let cleanup_calls = std::cell::Cell::new(0);
+        cleanup_owned_mutation_failure(false, || cleanup_calls.set(cleanup_calls.get() + 1));
+        assert_eq!(cleanup_calls.get(), 0);
+    }
+
+    #[test]
+    fn owned_post_creation_failure_runs_cleanup() {
+        let cleanup_calls = std::cell::Cell::new(0);
+        cleanup_owned_mutation_failure(true, || cleanup_calls.set(cleanup_calls.get() + 1));
+        assert_eq!(cleanup_calls.get(), 1);
+    }
 
     #[test]
     fn inherit_from_worktree_backed_parent_shares() {

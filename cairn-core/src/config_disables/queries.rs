@@ -83,6 +83,45 @@ pub async fn enable_config(
     .map_err(|e| format!("Failed to enable config: {e}"))
 }
 
+/// Move legacy skill/recipe/agent disables into the repository-owned project policy.
+/// Rows are deleted only after the config save succeeds; action rows are untouched.
+pub async fn migrate_contextual_disables(
+    db: &LocalDb,
+    project_id: &str,
+    project_path: &std::path::Path,
+) -> Result<usize, String> {
+    let rows = list_disabled_configs(db, project_id).await?;
+    let contextual: Vec<_> = rows
+        .into_iter()
+        .filter(|row| matches!(row.entity_type.as_str(), "skill" | "recipe" | "agent"))
+        .collect();
+    if contextual.is_empty() {
+        return Ok(0);
+    }
+
+    let mut settings = crate::config::project_settings::load_project_settings(project_path);
+    let policy = settings.contextual_packages.get_or_insert_default();
+    for row in &contextual {
+        let kind = match row.entity_type.as_str() {
+            "skill" => crate::config::contextual_packages::ContextualPackageKind::Skill,
+            "recipe" => crate::config::contextual_packages::ContextualPackageKind::Recipe,
+            "agent" => crate::config::contextual_packages::ContextualPackageKind::Agent,
+            _ => unreachable!(),
+        };
+        policy.disable(crate::config::contextual_packages::ContextualPackageRef {
+            kind,
+            id: row.config_key.clone(),
+        });
+    }
+    policy.normalize()?;
+    crate::config::project_settings::save_project_settings(project_path, &settings)?;
+
+    for row in &contextual {
+        enable_config(db, project_id, &row.entity_type, &row.config_key).await?;
+    }
+    Ok(contextual.len())
+}
+
 /// The set of disabled shadow keys for one (project, entity_type) — the hot path
 /// for resolution filters.
 pub async fn list_disabled_keys(
@@ -171,6 +210,35 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_moves_contextual_rows_and_preserves_actions() {
+        let db = db().await;
+        let project = tempfile::tempdir().unwrap();
+        disable_config(&db, "p", "skill", "ui").await.unwrap();
+        disable_config(&db, "p", "agent", "review").await.unwrap();
+        disable_config(&db, "p", "action", "deploy").await.unwrap();
+
+        assert_eq!(
+            migrate_contextual_disables(&db, "p", project.path())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            migrate_contextual_disables(&db, "p", project.path())
+                .await
+                .unwrap(),
+            0
+        );
+
+        let settings = crate::config::project_settings::load_project_settings(project.path());
+        let disabled = settings.contextual_packages.unwrap().disabled;
+        assert_eq!(disabled.len(), 2);
+        let remaining = list_disabled_configs(&db, "p").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entity_type, "action");
     }
 
     #[tokio::test]

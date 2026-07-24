@@ -37,7 +37,7 @@ async fn run_ids_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<String>, 
 /// This is the single source of truth for issue deletion. The `delete_issue`
 /// Tauri command and the resource `delete` mutation both call it so they perform
 /// identical side effects.
-pub async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), String> {
+pub(crate) async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), String> {
     // The issue row lives in its owning database (CAIRN-2181): the private DB for
     // a local project, the team replica for a team project. The URI lookup and
     // the row delete must target that DB; the run-kill + worktree teardown below

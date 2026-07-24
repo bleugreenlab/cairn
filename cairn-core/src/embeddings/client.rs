@@ -23,7 +23,7 @@ pub enum InputType {
 }
 
 impl InputType {
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::SearchDocument => "search_document",
             Self::SearchQuery => "search_query",

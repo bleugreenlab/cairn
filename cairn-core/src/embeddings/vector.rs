@@ -18,7 +18,7 @@ pub fn from_bytes(bytes: &[u8]) -> Vec<f32> {
 
 /// Cosine similarity between two equal-length vectors.
 /// Returns a value in [-1.0, 1.0]; 0.0 if either vector is all zeros.
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vectors must have same dimensions");
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();

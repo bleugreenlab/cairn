@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct AgentFrontmatter {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub name: String,
-    pub description: String,
+    id: Option<String>,
+    name: String,
+    description: String,
     /// Comma-separated list of tools (Claude Code format) or YAML array.
     ///
     /// Optional. A missing or empty `tools` field means "the default surface":
@@ -22,37 +22,39 @@ pub struct AgentFrontmatter {
     /// UI agent form has no tools editor and legitimately writes empty tools, so
     /// the loader must accept what the form writes rather than reject it.
     #[serde(default, deserialize_with = "deserialize_tools")]
-    pub tools: String,
+    tools: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(alias = "model")]
-    pub tier: Option<String>,
+    pub(crate) tier: Option<String>,
     /// Worktree fence behavior for sandbox escapes.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fence: Option<Fence>,
+    fence: Option<Fence>,
     /// Legacy permission fields accepted on read and collapsed into `fence`.
     #[serde(default)]
     #[serde(skip_serializing)]
-    pub sandbox: Option<LegacySandbox>,
+    sandbox: Option<LegacySandbox>,
     #[serde(default)]
     #[serde(skip_serializing)]
-    pub on_escape: Option<LegacyOnEscape>,
+    on_escape: Option<LegacyOnEscape>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<serde_json::Value>,
+    hooks: Option<serde_json::Value>,
     /// Tools to disallow (added to blocked list)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub disallowed_tools: Option<Vec<String>>,
+    disallowed_tools: Option<Vec<String>>,
     /// Skills to inject into the prompt
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub skills: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
     /// Preferred backend when multiple providers are available.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<String>,
+    backend_preference: Option<String>,
     /// Optional lucide icon name (kebab-case, e.g. `hammer`) giving the agent a
     /// compact visual identity. Absent means no icon (a `Bot` fallback renders).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
+    icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bundles: Vec<String>,
 }
 
 /// Custom deserializer that handles both comma-separated string and YAML array
@@ -118,6 +120,7 @@ pub struct ParsedAgent {
     pub skills: Option<Vec<String>>,
     pub backend_preference: Option<String>,
     pub icon: Option<String>,
+    pub bundles: Vec<String>,
 }
 
 /// Generate a slug from a name (for ID generation)
@@ -152,8 +155,9 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
     let (frontmatter_str, prompt) = crate::markdown_frontmatter::split_yaml_frontmatter(content)?;
 
     // Parse YAML frontmatter
-    let frontmatter: AgentFrontmatter = serde_yaml::from_str(frontmatter_str)
+    let mut frontmatter: AgentFrontmatter = serde_yaml::from_str(frontmatter_str)
         .map_err(|e| format!("Failed to parse frontmatter: {}", e))?;
+    crate::config::contextual_packages::normalize_bundles(&mut frontmatter.bundles)?;
 
     // Validate required fields
     if frontmatter.name.is_empty() {
@@ -205,6 +209,7 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         skills: frontmatter.skills,
         backend_preference: frontmatter.backend_preference,
         icon: frontmatter.icon,
+        bundles: frontmatter.bundles,
     })
 }
 
@@ -224,6 +229,7 @@ pub struct AgentExportData<'a> {
     pub backend_preference: Option<&'a str>,
     /// Optional lucide icon name; an `icon:` line is emitted only when set.
     pub icon: Option<&'a str>,
+    pub bundles: &'a [String],
 }
 
 /// Convert agent to Claude Code-compatible markdown format for export
@@ -241,6 +247,7 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         hooks,
         backend_preference,
         icon,
+        bundles,
     } = data;
 
     let mut frontmatter = format!("---\nname: {}\ndescription: {}\n", name, description);
@@ -251,6 +258,10 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
     // optional, defaulted `tools` field.
     if !tools.is_empty() {
         frontmatter.push_str(&format!("tools: {}\n", tools.join(", ")));
+    }
+
+    if !bundles.is_empty() {
+        frontmatter.push_str(&format!("bundles: [{}]\n", bundles.join(", ")));
     }
 
     if let Some(t) = tier {
@@ -342,6 +353,7 @@ mod tests {
             hooks: None,
             backend_preference: None,
             icon: None,
+            bundles: &[],
         });
         assert!(
             !markdown.contains("tools:"),
@@ -486,6 +498,7 @@ Prompt
             hooks: None,
             backend_preference: None,
             icon: None,
+            bundles: &[],
         });
 
         assert!(markdown.contains("name: Test Agent"));
@@ -514,6 +527,7 @@ Prompt
             hooks: None,
             backend_preference: None,
             icon: None,
+            bundles: &[],
         });
 
         assert!(markdown.contains("disallowedTools:"));
@@ -671,6 +685,7 @@ Build stuff.
             hooks: agent.hooks.as_ref(),
             backend_preference: None,
             icon: None,
+            bundles: &[],
         });
 
         assert!(markdown.contains("hooks:"));
@@ -706,6 +721,7 @@ Build with Codex.
             hooks: None,
             backend_preference: agent.backend_preference.as_deref(),
             icon: None,
+            bundles: &[],
         });
 
         assert!(markdown.contains("backend: codex"));
@@ -726,6 +742,7 @@ Build with Codex.
             hooks: None,
             backend_preference: None,
             icon: None,
+            bundles: &[],
         });
 
         assert!(!markdown.contains("backendPreference"));
@@ -761,6 +778,7 @@ Build stuff.
             hooks: None,
             backend_preference: None,
             icon: agent.icon.as_deref(),
+            bundles: &agent.bundles,
         });
 
         assert!(markdown.contains("icon: hammer"));
@@ -785,6 +803,7 @@ Build stuff.
             hooks: None,
             backend_preference: None,
             icon: None,
+            bundles: &[],
         });
 
         assert!(!markdown.contains("icon:"));

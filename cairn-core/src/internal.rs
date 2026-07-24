@@ -55,8 +55,8 @@ pub mod browser_network {
     pub use crate::browser_network::*;
 }
 
-pub mod build_slots {
-    pub use crate::build_slots::*;
+pub mod fleet {
+    pub use crate::fleet::*;
 }
 
 pub mod browsers {
@@ -137,6 +137,10 @@ pub mod services {
 
 pub mod storage {
     pub use crate::storage::*;
+}
+
+pub mod repl_host {
+    pub use crate::repl_host::*;
 }
 
 pub mod terminal_host {

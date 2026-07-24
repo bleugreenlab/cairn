@@ -163,10 +163,32 @@ async fn create_repl(
         ));
     }
 
-    let session = repl::spawn_session(orch, &ctx, &cwd, interpreter, slug, deps).await?;
-    orch.repl_state
-        .insert(target_job, slug.to_string(), session);
-    Ok(format!("Started {} REPL {slug}", interpreter.label()))
+    let session = repl::spawn_session(
+        orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        interpreter,
+        slug,
+        deps,
+    )
+    .await?;
+    // Insert only if the slot is still vacant: a concurrent create that spawned
+    // between the check above and here must not have its session orphaned.
+    if orch
+        .repl_state
+        .insert_if_absent(target_job.clone(), slug.to_string(), session.clone())
+    {
+        repl::emit_repl_state(orch, &target_job, slug, interpreter, "created");
+        Ok(format!("Started {} REPL {slug}", interpreter.label()))
+    } else {
+        session.stop_and_release(orch).await;
+        Ok(format!(
+            "REPL {slug} is already running ({})",
+            interpreter.label()
+        ))
+    }
 }
 
 async fn delete_repl(
@@ -185,7 +207,9 @@ async fn delete_repl(
             })?;
     match orch.repl_state.remove(&target_job, slug) {
         Some(session) => {
-            session.kill();
+            let interpreter = session.interpreter;
+            session.stop_and_release(orch).await;
+            repl::emit_repl_state(orch, &target_job, slug, interpreter, "deleted");
             Ok(format!("Stopped REPL {slug}"))
         }
         None => Ok(format!(

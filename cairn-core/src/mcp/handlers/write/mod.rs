@@ -6,7 +6,8 @@ mod preview;
 mod types;
 
 use self::file_mutations::{
-    apply_file_batch, emit_worktree_changed, finalize_file_commit, CommitOutcome, FileBatchSuccess,
+    apply_logical_file_batch, apply_prepared_logical, emit_worktree_changed, finalize_file_commit,
+    record_file_change_async, CommitOutcome, FileBatchSuccess,
 };
 use self::preview::{handle_apply_change, preview_change};
 use self::types::{
@@ -115,281 +116,49 @@ fn apply_file_changes<'a>(
     batch: &'a [IndexedChange<'a>],
     allow_escape: bool,
     atomic: bool,
+    logical_snapshot: &mut std::collections::HashMap<String, Option<String>>,
 ) -> Vec<Result<FileBatchSuccess, Box<IndexedFailure>>> {
     if atomic {
-        return vec![apply_file_batch(request, batch, allow_escape)];
+        let result = apply_logical_file_batch(request, batch, allow_escape, logical_snapshot);
+        if let Ok(success) = &result {
+            apply_snapshot_mutations(logical_snapshot, &success.logical_mutations);
+        }
+        return vec![result];
     }
-
-    batch
-        .iter()
-        .map(|change| {
-            apply_file_batch(
-                request,
-                &[IndexedChange {
-                    index: change.index,
-                    item: change.item,
-                }],
-                allow_escape,
-            )
-        })
-        .collect()
-}
-
-/// Persist a give-up discard's would-be-lost edits to the job scratch dir
-/// (`$TMPDIR`, in the sandbox writable set per `docs/worktree-fence.md`) so the
-/// agent can re-apply them after retrying — making the recovery invariant's
-/// "preserved/recoverable" clause true from the agent's seat, not just from the
-/// jj operation log an agent cannot realistically reach. `patch` is captured
-/// BEFORE any `update-stale`/`discard`, so it reflects the agent's full intended
-/// batch against the pre-advance base. Best-effort: a `None`/empty patch or a
-/// write failure yields `None` and the error simply omits the path.
-fn preserve_discarded_edits(patch: Option<&str>) -> Option<std::path::PathBuf> {
-    let patch = patch?;
-    if patch.trim().is_empty() {
-        return None;
-    }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("cairn-discarded-edits-{ts}.patch"));
-    std::fs::write(&path, patch).ok()?;
-    Some(path)
-}
-
-/// Build the give-up failure message: the seal failed, `detail` names the
-/// recovery step that couldn't proceed, the worktree was restored to HEAD (or
-/// that restore itself failed), and — when edits were preserved — the scratch
-/// path the agent can re-apply from. Pure, so the give-up contract is unit-tested
-/// without an Orchestrator or jj binary.
-fn give_up_error_message(
-    seal_error: &str,
-    detail: &str,
-    restore: &Result<(), String>,
-    preserved: Option<&std::path::Path>,
-) -> String {
-    let recovery = match preserved {
-        Some(path) => format!(
-            " Your edits were saved to {} — re-apply them after retrying.",
-            path.display()
-        ),
-        None => String::new(),
-    };
-    match restore {
-        Ok(()) => format!(
-            "Applied file changes but commit failed: {seal_error}; {detail}, so the worktree was restored to HEAD. Retry the write.{recovery}"
-        ),
-        Err(re) => format!(
-            "Applied file changes but commit failed: {seal_error}; {detail}, and restoring the worktree to HEAD also failed: {re}.{recovery}"
-        ),
-    }
-}
-
-/// Build the typed failure for a write whose seal was refused because the branch
-/// bookmark tip carries a recorded conflict and `@` diverged from it (a
-/// deliberate resolve-at-base flatten). Unlike every other seal failure this does
-/// NOT discard — the on-disk edits are PRESERVED, because `@` holds the agent's
-/// resolved work a discard would destroy — so the message names that and points at
-/// the pure-jj flatten procedure rather than the futile "retry" advice the stale
-/// family gets. Pure, so the contract is unit-testable without a jj binary.
-fn conflicted_branch_failure(
-    first_file_change: &IndexedChange<'_>,
-    seal_error: &str,
-) -> Box<IndexedFailure> {
-    let error = format!(
-        "Applied file changes but the seal was refused: {seal_error}. This branch has conflicted \
-         intermediate commits jj will not fold, so sealing `@` forward can't clear them. The \
-         on-disk edits were PRESERVED (not discarded). To land a flattened resolution, run the \
-         pure-jj resolve-at-base flatten with NO commit_msg (see the git-workflow skill); do not \
-         retry the write with commit_msg."
-    );
-    Box::new(IndexedFailure {
-        failure: ChangeFailure {
-            index: first_file_change.index,
-            target: first_file_change.item.target.clone(),
-            mode: mode_name(first_file_change.item.mode).to_string(),
-            kind: "file".to_string(),
-            error: error.clone(),
-        },
-        commit: Some(CommitReport {
-            status: "failed".to_string(),
-            sha: None,
-            pr_number: None,
-            message: Some(error),
-        }),
-    })
-}
-
-/// Recover a write+commit_msg batch whose seal hit a STALE working copy
-/// ([`CommitOutcome::StaleRetry`]). A sibling advanced `@` over the shared store
-/// between apply and seal; the loose edits are still on disk. Clear the staleness
-/// (which discards those edits and re-bases `@` onto the advanced tip), re-apply
-/// the batch's file changes against that fresh base, and re-seal. Anchored edits
-/// re-match the advanced base — preserving a sibling's edits elsewhere in a
-/// touched file and failing cleanly when the sibling rewrote the anchored region
-/// itself. Every failure mode falls back to a stale-resilient discard, so the
-/// worktree==HEAD invariant holds even when recovery can't land the batch — and
-/// each give-up first persists the agent's would-be-lost edits to scratch (see
-/// [`preserve_discarded_edits`]) so "recoverable" is true from the agent's seat.
-async fn recover_stale_file_commit(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    payload: &ChangePayload,
-    allow_escape: bool,
-    promoted_memory_uris: &[String],
-    first_file_change: &IndexedChange<'_>,
-    seal_error: &str,
-) -> Result<Option<CommitReport>, Box<IndexedFailure>> {
-    let cwd = std::path::Path::new(&request.cwd);
-    let atomic = payload.atomic.unwrap_or(false);
-    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, cwd);
-
-    // Capture the agent's loose edits NOW, before any update-stale/discard can
-    // overwrite them, so a give-up can persist them to scratch (Fix B). This
-    // reflects the full intended batch against the pre-advance base regardless of
-    // which give-up branch fires later. Best-effort: `None` if jj can't diff.
-    let captured_patch = vcs.capture_patch(cwd);
-
-    // Giveup failure: revert via the stale-resilient discard and report that the
-    // worktree was restored to HEAD (the Phase-1 invariant), with retry guidance.
-    // `detail` names the recovery step that couldn't proceed; the captured patch
-    // is persisted to scratch so the discarded edits are recoverable.
-    let give_up = |vcs: &dyn crate::mcp::vcs::WorktreeVcs, detail: &str| -> Box<IndexedFailure> {
-        let preserved = preserve_discarded_edits(captured_patch.as_deref());
-        let restore = vcs.discard(cwd);
-        let error = give_up_error_message(seal_error, detail, &restore, preserved.as_deref());
-        Box::new(IndexedFailure {
-            failure: ChangeFailure {
-                index: first_file_change.index,
-                target: first_file_change.item.target.clone(),
-                mode: mode_name(first_file_change.item.mode).to_string(),
-                kind: "file".to_string(),
-                error: error.clone(),
-            },
-            commit: Some(CommitReport {
-                status: "failed".to_string(),
-                sha: None,
-                pr_number: None,
-                message: Some(error),
-            }),
-        })
-    };
-
-    // A rename in the batch can't be safely re-derived here (its edit set is a
-    // structural plan that would have to be recomputed against the advanced
-    // base), so re-applying only the non-rename items would seal an incomplete
-    // batch. Revert cleanly instead.
-    let has_rename = payload.changes.iter().any(|item| {
-        item.mode == ChangeMode::Rename
-            && matches!(target_family(&item.target), Ok(TargetFamily::File))
-    });
-    if has_rename {
-        let failure = give_up(
-            vcs.as_ref(),
-            "the batch includes a structural rename that can't be re-derived against the advanced base",
+    let mut results = Vec::with_capacity(batch.len());
+    for change in batch {
+        let result = apply_logical_file_batch(
+            request,
+            &[IndexedChange {
+                index: change.index,
+                item: change.item,
+            }],
+            allow_escape,
+            logical_snapshot,
         );
-        emit_worktree_changed(orch, &request.cwd);
-        return Err(failure);
+        if let Ok(success) = &result {
+            apply_snapshot_mutations(logical_snapshot, &success.logical_mutations);
+        }
+        results.push(result);
     }
+    results
+}
 
-    // (a) Clear staleness: advances `@` onto the sibling's tip and discards the
-    // loose edits, so the on-disk base is now the advanced sibling state.
-    if let Err(e) = vcs.update_stale(cwd) {
-        let failure = give_up(
-            vcs.as_ref(),
-            &format!("recovering the stale worktree failed ({e})"),
+fn apply_snapshot_mutations(
+    snapshot: &mut std::collections::HashMap<String, Option<String>>,
+    mutations: &[cairn_vcs::LogicalTreeMutation],
+) {
+    for mutation in mutations {
+        snapshot.insert(
+            format!("file:{}", mutation.path),
+            mutation
+                .content
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
         );
-        emit_worktree_changed(orch, &request.cwd);
-        return Err(failure);
-    }
-
-    // (b) Re-apply the ordered non-rename file changes against the fresh base.
-    let file_batch: Vec<IndexedChange> = payload
-        .changes
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| {
-            matches!(target_family(&item.target), Ok(TargetFamily::File))
-                && item.mode != ChangeMode::Rename
-        })
-        .map(|(index, item)| IndexedChange { index, item })
-        .collect();
-
-    let mut affected_paths: Vec<String> = Vec::new();
-    let mut recorded_changes = Vec::new();
-    for result in apply_file_changes(request, &file_batch, allow_escape, atomic) {
-        match result {
-            Ok(success) => {
-                affected_paths.extend(success.affected_paths);
-                recorded_changes.extend(success.recorded_changes);
-            }
-            Err(_) => {
-                let failure = give_up(
-                    vcs.as_ref(),
-                    "an anchored edit no longer matched the advanced base",
-                );
-                emit_worktree_changed(orch, &request.cwd);
-                return Err(failure);
-            }
-        }
-    }
-
-    // (c) Re-seal against the advanced base.
-    match finalize_file_commit(
-        orch,
-        request,
-        payload.commit_msg.as_deref(),
-        &affected_paths,
-        &recorded_changes,
-        first_file_change,
-        promoted_memory_uris,
-    )
-    .await
-    {
-        Ok(CommitOutcome::Done(report)) => Ok(report),
-        Ok(CommitOutcome::StaleRetry { seal_error: e2 }) => {
-            let failure = give_up(
-                vcs.as_ref(),
-                &format!("the worktree advanced again during recovery ({e2})"),
-            );
-            emit_worktree_changed(orch, &request.cwd);
-            Err(failure)
-        }
-        Ok(CommitOutcome::LineageMismatch { seal_error: e2 }) => {
-            emit_worktree_changed(orch, &request.cwd);
-            let error = format!(
-                "{e2}. The re-applied edits were PRESERVED exactly; no discard was attempted."
-            );
-            Err(Box::new(IndexedFailure {
-                failure: ChangeFailure {
-                    index: first_file_change.index,
-                    target: first_file_change.item.target.clone(),
-                    mode: mode_name(first_file_change.item.mode).to_string(),
-                    kind: "file".to_string(),
-                    error: error.clone(),
-                },
-                commit: Some(CommitReport {
-                    status: "failed".to_string(),
-                    sha: None,
-                    pr_number: None,
-                    message: Some(error),
-                }),
-            }))
-        }
-        Ok(CommitOutcome::ConflictedBranch { seal_error: e2 }) => {
-            // The just-advanced base itself presents a conflicted bookmark tip:
-            // preserve the edits (no discard) and surface the flatten guidance,
-            // same as the primary path. Reaching here from stale-recovery is rare
-            // but must NOT fall through to the discarding give-up.
-            emit_worktree_changed(orch, &request.cwd);
-            Err(conflicted_branch_failure(first_file_change, &e2))
-        }
-        // A non-stale re-seal error already discarded inside finalize.
-        Err(failure) => Err(failure),
     }
 }
 
-/// Handle canonical change tool call.
 pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     // Authoritative validation gate, shared with cairn-cmd's pre-flight check so
     // the contract and error text are identical everywhere. Collects every
@@ -700,30 +469,25 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     }
 
     let mut bookmark_observation = None;
-
-    // Pre-flight staleness reconcile for a file-touching write: heal a stale /
-    // behind-its-branch-tip working copy BEFORE applying edits (which land on disk,
-    // then seal), serialized on the per-store jj lock the base-advance reconcile
-    // and merge-fold hold, so the batch applies and seals against a fresh base and
-    // can never race a concurrent rebase. Best-effort; finalize_file_commit's
-    // seal-time stale-recovery remains the mid-batch fallback. Resource-only writes
-    // never reach here (no file target); a non-worktree cwd was rejected above.
-    if crate::jj::is_jj_dir(std::path::Path::new(&request.cwd))
-        && payload
-            .changes
-            .iter()
-            .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)))
-    {
+    let has_file_targets = payload
+        .changes
+        .iter()
+        .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)));
+    // The logical coordinate and every anchor evaluation must belong to the
+    // same serialized writer epoch as publication. Acquiring here prevents a
+    // second runner writer from advancing the bookmark between preparation and
+    // the expected-head CAS; no workspace stale/reapply path is involved.
+    let write_store_guard = if has_file_targets {
         let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
-        let _guard = match store.as_deref() {
-            Some(store) => Some(
-                orch.acquire_jj_store_lock(store, "write pre-flight reconcile")
-                    .await,
-            ),
-            None => None,
-        };
-        let context = match crate::mcp::vcs::prepare_managed_workspace(orch, request).await {
-            Ok(context) => context,
+        match crate::mcp::vcs::acquire_store_lock(
+            orch,
+            store.as_deref(),
+            "logical write transaction",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await
+        {
+            Ok(guard) => guard,
             Err(error) => {
                 return serde_json::to_string(&empty_change_report(
                     Vec::new(),
@@ -732,12 +496,12 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                         target: payload
                             .changes
                             .first()
-                            .map(|c| c.target.clone())
+                            .map(|change| change.target.clone())
                             .unwrap_or_default(),
                         mode: payload
                             .changes
                             .first()
-                            .map(|c| mode_name(c.mode))
+                            .map(|change| mode_name(change.mode))
                             .unwrap_or("patch")
                             .to_string(),
                         kind: "file".to_string(),
@@ -747,17 +511,17 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     payload.atomic.unwrap_or(false),
                     false,
                 ))
-                .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"));
+                .unwrap_or_else(|serialize_error| serialize_error.to_string());
             }
-        };
-        bookmark_observation = crate::mcp::vcs::observe_managed_bookmark(orch, context.as_ref());
-        let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
-            orch,
-            std::path::Path::new(&request.cwd),
-            context.as_ref(),
-        );
-        if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&request.cwd)) {
-            if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) {
+        }
+    } else {
+        None
+    };
+    let store_trace = write_store_guard.as_ref().map(|guard| guard.trace());
+    let logical_resolution = if has_file_targets {
+        match super::branch::resolve_current_for_read(orch, request).await {
+            Ok(resolution) => Some(resolution),
+            Err(error) => {
                 return serde_json::to_string(&empty_change_report(
                     Vec::new(),
                     vec![ChangeFailure {
@@ -765,24 +529,148 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                         target: payload
                             .changes
                             .first()
-                            .map(|c| c.target.clone())
+                            .map(|change| change.target.clone())
                             .unwrap_or_default(),
                         mode: payload
                             .changes
                             .first()
-                            .map(|c| mode_name(c.mode))
+                            .map(|change| mode_name(change.mode))
                             .unwrap_or("patch")
                             .to_string(),
                         kind: "file".to_string(),
-                        error: e,
+                        error: format!("Resolve authoritative logical head for write: {error}"),
                     }],
                     None,
                     payload.atomic.unwrap_or(false),
                     false,
                 ))
-                .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"));
+                .unwrap_or_else(|serialize_error| {
+                    format!(
+                        "Failed to serialize logical-head resolution failure: {serialize_error}"
+                    )
+                });
             }
-            log::warn!("pre-flight workspace reconcile (write) failed: {e}");
+        }
+    } else {
+        None
+    };
+    if has_file_targets {
+        if let Ok((run, db)) = super::run_context::lookup_run_routed(&orch.db, request).await {
+            if let Ok(context) =
+                crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
+                    db, run.job_id,
+                )
+                .await
+            {
+                bookmark_observation =
+                    crate::mcp::vcs::observe_managed_bookmark(orch, context.as_ref());
+            }
+        }
+    }
+    let mut logical_snapshot = std::collections::HashMap::new();
+    if let Some(resolution) = logical_resolution.as_ref() {
+        let has_rename = payload.changes.iter().any(|change| {
+            change.mode == ChangeMode::Rename
+                && matches!(target_family(&change.target), Ok(TargetFamily::File))
+        });
+        type LogicalSnapshot = Vec<(String, Option<Vec<u8>>)>;
+        let snapshot_result: Result<LogicalSnapshot, String> = if has_rename {
+            super::read::files_at_commit(
+                resolution.object_repository_path.clone(),
+                resolution.commit_id.clone(),
+            )
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|(path, bytes)| (path, Some(bytes)))
+                    .collect()
+            })
+        } else {
+            let indexed = payload
+                .changes
+                .iter()
+                .enumerate()
+                .filter(|(_, change)| {
+                    matches!(target_family(&change.target), Ok(TargetFamily::File))
+                })
+                .map(|(index, item)| IndexedChange { index, item })
+                .collect::<Vec<_>>();
+            file_mutations::logical_paths_for_changes(
+                std::path::Path::new(&request.cwd),
+                &indexed,
+                allow_escape,
+            )
+            .and_then(|paths| {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        super::read::file_at_commit(
+                            resolution.object_repository_path.clone(),
+                            resolution.commit_id.clone(),
+                            &path,
+                        )
+                        .map(|bytes| (path, bytes))
+                    })
+                    .collect()
+            })
+        };
+        match snapshot_result {
+            Ok(files) => {
+                for (path, bytes) in files {
+                    let content = bytes
+                        .map(String::from_utf8)
+                        .transpose()
+                        .map_err(|_| format!("File `{path}` is not valid UTF-8"));
+                    match content {
+                        Ok(content) => {
+                            logical_snapshot.insert(format!("file:{path}"), content);
+                        }
+                        Err(error) => {
+                            return serde_json::to_string(&empty_change_report(
+                                Vec::new(),
+                                vec![ChangeFailure {
+                                    index: 0,
+                                    target: format!("file:{path}"),
+                                    mode: "write".to_string(),
+                                    kind: "file".to_string(),
+                                    error,
+                                }],
+                                None,
+                                payload.atomic.unwrap_or(false),
+                                false,
+                            ))
+                            .unwrap_or_else(|serialize_error| format!("Failed to serialize logical-head snapshot failure: {serialize_error}"));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                return serde_json::to_string(&empty_change_report(
+                    Vec::new(),
+                    vec![ChangeFailure {
+                        index: 0,
+                        target: payload
+                            .changes
+                            .first()
+                            .map(|change| change.target.clone())
+                            .unwrap_or_default(),
+                        mode: payload
+                            .changes
+                            .first()
+                            .map(|change| mode_name(change.mode))
+                            .unwrap_or("patch")
+                            .to_string(),
+                        kind: "file".to_string(),
+                        error: format!("Read authoritative logical head for write: {error}"),
+                    }],
+                    None,
+                    payload.atomic.unwrap_or(false),
+                    false,
+                ))
+                .unwrap_or_else(|serialize_error| {
+                    format!("Failed to serialize logical-head snapshot failure: {serialize_error}")
+                });
+            }
         }
     }
 
@@ -826,6 +714,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     let mut commit: Option<CommitReport> = None;
     let mut affected_paths: Vec<String> = Vec::new();
     let mut recorded_changes = Vec::new();
+    let mut logical_mutations = Vec::new();
     let mut first_file_change: Option<IndexedChange<'_>> = None;
     let mut promoted_memories: Vec<(usize, String, String, PromotedMemoryRef)> = Vec::new();
     let mut index = 0;
@@ -844,8 +733,19 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         {
             let worktree = std::path::Path::new(&request.cwd);
             let rename_result = match file_mutations::parse_rename_spec(worktree, item) {
-                Ok((route_file, spec, new_name)) => {
-                    crate::symbols::rename::compute_plan(worktree, &route_file, spec, &new_name)
+                Ok((_route_file, spec, new_name)) => {
+                    let files = logical_snapshot
+                        .iter()
+                        .filter_map(|(target, content)| {
+                            content.as_ref().map(|content| {
+                                (
+                                    worktree.join(target.strip_prefix("file:").unwrap_or(target)),
+                                    content.clone(),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    crate::symbols::rename::compute_plan_from_files(&files, spec, &new_name)
                 }
                 Err(error) => Err(error),
             };
@@ -854,7 +754,12 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     let (prepared, rename_applied, summaries) =
                         file_mutations::prepare_rename_changes(worktree, index, &plan);
                     let synthetic = [IndexedChange { index, item }];
-                    match file_mutations::apply_prepared(&synthetic, &prepared, &summaries) {
+                    match apply_prepared_logical(
+                        &synthetic,
+                        &prepared,
+                        &summaries,
+                        &logical_snapshot,
+                    ) {
                         Ok(success) => {
                             if first_file_change.is_none() {
                                 first_file_change = Some(IndexedChange { index, item });
@@ -862,6 +767,11 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                             applied.extend(rename_applied);
                             affected_paths.extend(success.affected_paths);
                             recorded_changes.extend(success.recorded_changes);
+                            apply_snapshot_mutations(
+                                &mut logical_snapshot,
+                                &success.logical_mutations,
+                            );
+                            logical_mutations.extend(success.logical_mutations);
                         }
                         Err(failure) => {
                             if !affected_paths.is_empty() {
@@ -998,7 +908,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 item,
             })
             .collect::<Vec<_>>();
-        let batch_results = apply_file_changes(request, &batch, allow_escape, atomic);
+        let batch_results =
+            apply_file_changes(request, &batch, allow_escape, atomic, &mut logical_snapshot);
         for result in batch_results {
             match result {
                 Ok(success) => {
@@ -1016,6 +927,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     applied.extend(success.applied);
                     affected_paths.extend(success.affected_paths);
                     recorded_changes.extend(success.recorded_changes);
+                    logical_mutations.extend(success.logical_mutations);
                 }
                 Err(failure) => {
                     if !affected_paths.is_empty() {
@@ -1049,24 +961,13 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
 
     let first_file_change_index = first_file_change.as_ref().map(|change| change.index);
     let had_file_change = first_file_change.is_some();
+    let mut publication_requirement =
+        crate::merge_requests::queries::PublicationRequirement::DeferredUntilPublication;
+    let mut post_seal_publication = None;
     if let Some(first_file_change) = first_file_change {
-        // Serialize the seal/discard (and its stale-recovery: update-stale →
-        // re-apply → re-seal → fallback discard) on the per-store jj lock that
-        // base-advance reconcile and merge-fold hold, so a write-path seal never
-        // forks the shared store's operation log against a concurrent
-        // reconcile/fold. The guard must span the recovery too, so it is bound
-        // here across the whole finalize+recover branch. Disk-apply of edits
-        // happened earlier (pure FS writes, no shared-store mutation) and stays
-        // outside the lock. `None` for a non-worktree cwd. The held guard crosses
-        // `.await`s; tokio's MutexGuard is Send, so this is correct.
-        let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
-        let _store_guard = match store.as_deref() {
-            Some(store) => Some(
-                orch.acquire_jj_store_lock(store, "write commit barrier")
-                    .await,
-            ),
-            None => None,
-        };
+        let _seal_phase = write_store_guard
+            .as_ref()
+            .map(|guard| guard.phase("logical tree publication"));
         match finalize_file_commit(
             orch,
             request,
@@ -1075,86 +976,17 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             &recorded_changes,
             &first_file_change,
             &promoted_memory_uris,
+            logical_resolution
+                .as_ref()
+                .expect("file writes require a resolved logical head"),
+            &logical_mutations,
         )
         .await
         {
-            Ok(CommitOutcome::Done(commit_report)) => commit = commit_report,
-            Ok(CommitOutcome::LineageMismatch { seal_error }) => {
-                let error = format!(
-                    "Applied file changes but the seal was refused: {seal_error}. The on-disk edits were PRESERVED exactly; no stale retry, update-stale, or discard was attempted."
-                );
-                failures.push(ChangeFailure {
-                    index: first_file_change.index,
-                    target: first_file_change.item.target.clone(),
-                    mode: mode_name(first_file_change.item.mode).to_string(),
-                    kind: "file".to_string(),
-                    error: error.clone(),
-                });
-                commit = Some(CommitReport {
-                    status: "failed".to_string(),
-                    sha: None,
-                    pr_number: None,
-                    message: Some(error),
-                });
-            }
-            Ok(CommitOutcome::ConflictedBranch { seal_error }) => {
-                // The seal was refused because the branch bookmark tip carries a
-                // recorded conflict and `@` diverged from it — a deliberate
-                // resolve-at-base flatten. Preserve the on-disk edits (no discard,
-                // no update-stale retry which can never converge) and surface a
-                // typed error pointing at the flatten procedure. The worktree==HEAD
-                // invariant is deliberately left broken here because the only safe
-                // automatic action is to keep the agent's resolved state; the
-                // flatten the message references converges it.
-                let IndexedFailure {
-                    failure,
-                    commit: failure_commit,
-                } = *conflicted_branch_failure(&first_file_change, &seal_error);
-                if atomic {
-                    rollback_promoted_memory_decisions(orch, &promoted_memories).await;
-                    return change_report_json(applied, vec![failure], failure_commit, atomic);
-                }
-                if let Some(failure_commit) = failure_commit {
-                    commit = Some(failure_commit);
-                }
-                failures.push(failure);
-            }
-            Ok(CommitOutcome::StaleRetry { seal_error }) => {
-                // A sibling advanced `@` between apply and seal. Try to land the
-                // batch on the advanced base rather than lose it; any failure
-                // falls back to a stale-resilient revert inside the recovery.
-                match recover_stale_file_commit(
-                    orch,
-                    request,
-                    &payload,
-                    allow_escape,
-                    &promoted_memory_uris,
-                    &first_file_change,
-                    &seal_error,
-                )
-                .await
-                {
-                    Ok(commit_report) => commit = commit_report,
-                    Err(failure) => {
-                        let IndexedFailure {
-                            failure,
-                            commit: failure_commit,
-                        } = *failure;
-                        if atomic {
-                            rollback_promoted_memory_decisions(orch, &promoted_memories).await;
-                            return change_report_json(
-                                applied,
-                                vec![failure],
-                                failure_commit,
-                                atomic,
-                            );
-                        }
-                        if let Some(failure_commit) = failure_commit {
-                            commit = Some(failure_commit);
-                        }
-                        failures.push(failure);
-                    }
-                }
+            Ok(CommitOutcome::Done(mut completed)) => {
+                commit = completed.report.take();
+                publication_requirement = completed.publication_requirement;
+                post_seal_publication = completed.publication;
             }
             Err(failure) => {
                 let IndexedFailure {
@@ -1171,13 +1003,109 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 failures.push(failure);
             }
         }
+        drop(_seal_phase);
+    }
+    drop(write_store_guard);
+
+    if commit
+        .as_ref()
+        .and_then(|report| report.sha.as_ref())
+        .is_some()
+    {
+        for change in &recorded_changes {
+            if let Err(error) = record_file_change_async(
+                orch,
+                &request.cwd,
+                &change.path,
+                change.status,
+                change.additions,
+                change.deletions,
+                None,
+            )
+            .await
+            {
+                log::warn!("Failed to record file change: {error}");
+            }
+        }
+    }
+
+    let append_commit_warning = |commit: &mut Option<CommitReport>, warning: String| {
+        if let Some(report) = commit.as_mut() {
+            report.message = Some(match report.message.take() {
+                Some(message) => format!("{message}; {warning}"),
+                None => warning,
+            });
+        }
+    };
+    if publication_requirement
+        == crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr
+    {
+        let _phase = store_trace.as_ref().map(|trace| trace.phase("origin push"));
+        let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&request.cwd));
+        if let Err(error) = crate::mcp::vcs::publish_required_origin(
+            vcs.as_ref(),
+            std::path::Path::new(&request.cwd),
+        ) {
+            let index = first_file_change_index.unwrap_or(0);
+            let sealed_sha = commit.as_ref().and_then(|report| report.sha.clone());
+            let error = format!(
+                "Commit {} was sealed locally but remains unpublished because the required open-PR origin push failed: {error}. Retry a file-touching write to publish the current bookmark.",
+                sealed_sha.as_deref().unwrap_or("(unknown)")
+            );
+            failures.push(ChangeFailure {
+                index,
+                target: payload
+                    .changes
+                    .get(index)
+                    .map(|c| c.target.clone())
+                    .unwrap_or_else(|| "file:".to_string()),
+                mode: payload
+                    .changes
+                    .get(index)
+                    .map(|c| mode_name(c.mode).to_string())
+                    .unwrap_or_else(|| "patch".to_string()),
+                kind: "publication".to_string(),
+                error: error.clone(),
+            });
+            commit = Some(CommitReport {
+                status: "sealed locally; unpublished".to_string(),
+                sha: sealed_sha,
+                pr_number: commit.as_ref().and_then(|report| report.pr_number),
+                message: Some(error),
+            });
+            return change_report_json(applied, failures, commit, atomic);
+        }
+    } else if had_file_change {
+        if let Some(trace) = &store_trace {
+            trace.deferred("origin push deferred");
+        }
+    }
+    if let Some(publication) = post_seal_publication {
+        let _phase = store_trace
+            .as_ref()
+            .map(|trace| trace.phase("sealed pack publication"));
+        if let Err(error) = crate::mcp::vcs::publish_sealed_commit_pack(
+            publication.db.as_ref(),
+            &publication.project_id,
+            &publication.repository,
+            commit
+                .as_ref()
+                .and_then(|report| report.sha.as_deref())
+                .expect("post-seal publication requires a sealed sha"),
+        )
+        .await
+        {
+            append_commit_warning(
+                &mut commit,
+                format!("sealed commit cloud publication failed: {error}"),
+            );
+        }
     }
 
     // The file-seal guard has been released. Propagation takes the same store
     // mutex, so it must run here rather than inside finalize_file_commit.
     if let Err(error) =
-        crate::mcp::vcs::propagate_observed_bookmark_advance(orch, bookmark_observation.as_ref())
-            .await
+        crate::mcp::vcs::acknowledge_logical_bookmark_advance(orch, bookmark_observation.as_ref())
     {
         let index = first_file_change_index.unwrap_or(0);
         failures.push(ChangeFailure {
@@ -1192,9 +1120,9 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 .get(index)
                 .map(|change| mode_name(change.mode).to_string())
                 .unwrap_or_else(|| "patch".to_string()),
-            kind: "reconciliation".to_string(),
+            kind: "publication".to_string(),
             error: format!(
-                "Managed branch advancement was committed, but downstream workspace reconciliation failed: {error}"
+                "Managed branch advancement was committed, but logical bookmark validation failed: {error}"
             ),
         });
     }
@@ -1335,46 +1263,6 @@ mod change_preview_tests {
                 "new_string": new,
             })),
         }
-    }
-
-    #[test]
-    fn conflicted_branch_failure_preserves_edits_and_points_at_flatten() {
-        // The write-path contract for a seal refused because the branch bookmark
-        // tip carries a recorded conflict (a deliberate resolve-at-base flatten):
-        // the typed failure says the on-disk edits were PRESERVED (no discard),
-        // points at the no-commit_msg flatten, and does NOT advise retrying the
-        // write with commit_msg. The CommitReport is a non-sha "failed" record.
-        let item = patch_item("file:src/lib.rs", "old", "new");
-        let change = IndexedChange {
-            index: 3,
-            item: &item,
-        };
-        let IndexedFailure { failure, commit } =
-            *conflicted_branch_failure(&change, crate::jj::CONFLICTED_BRANCH_SEAL_MSG);
-
-        assert_eq!(failure.index, 3);
-        assert_eq!(failure.target, "file:src/lib.rs");
-        assert_eq!(failure.kind, "file");
-        assert!(
-            failure.error.contains("PRESERVED"),
-            "names that the edits were preserved: {}",
-            failure.error
-        );
-        assert!(
-            failure.error.contains("NO commit_msg") && failure.error.contains("git-workflow"),
-            "points at the no-commit_msg flatten procedure: {}",
-            failure.error
-        );
-        assert!(
-            failure
-                .error
-                .contains("do not retry the write with commit_msg"),
-            "explicitly warns against retrying with commit_msg: {}",
-            failure.error
-        );
-        let commit = commit.expect("carries a failed CommitReport");
-        assert_eq!(commit.status, "failed");
-        assert!(commit.sha.is_none(), "a refused seal has no sha");
     }
 
     #[test]
@@ -2260,78 +2148,25 @@ mod change_preview_tests {
         assert!(!object.contains_key("transactional"));
     }
 
-    // ---- Fix B: give-up edit preservation (the #158 residual recoverability) ----
-
     #[test]
-    fn preserve_discarded_edits_writes_patch_to_scratch() {
-        let patch = "diff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-old\n+new\n";
-        let path = preserve_discarded_edits(Some(patch))
-            .expect("a non-empty patch is persisted to scratch");
-        assert!(path.exists(), "the patch file is written");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), patch);
-        assert!(
-            path.starts_with(std::env::temp_dir()),
-            "the patch lands in the scratch/temp dir (in the sandbox writable set): {path:?}"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
+    fn logical_write_lock_precedes_head_resolution_and_publication() {
+        let source = include_str!("mod.rs");
+        let lock = source.find("\"logical write transaction\"").unwrap();
+        let resolve = source[lock..]
+            .find("resolve_current_for_read")
+            .map(|offset| lock + offset)
+            .unwrap();
+        let prepare = source[resolve..]
+            .find("apply_logical_file_batch")
+            .map(|offset| resolve + offset)
+            .unwrap();
+        let publish = source[prepare..]
+            .find("finalize_file_commit")
+            .map(|offset| prepare + offset)
+            .unwrap();
 
-    #[test]
-    fn preserve_discarded_edits_skips_empty_or_absent() {
-        assert!(
-            preserve_discarded_edits(None).is_none(),
-            "nothing to preserve when no patch was captured"
-        );
-        assert!(
-            preserve_discarded_edits(Some("   \n")).is_none(),
-            "a whitespace-only patch is not worth a scratch file"
-        );
-    }
-
-    #[test]
-    fn give_up_error_message_cites_preserved_path_and_retry() {
-        let preserved = std::path::PathBuf::from("/tmp/scratch/cairn-discarded-edits-1.patch");
-        let msg = give_up_error_message(
-            "seal captured no change",
-            "an anchored edit no longer matched the advanced base",
-            &Ok(()),
-            Some(preserved.as_path()),
-        );
-        assert!(msg.contains("restored to HEAD"), "got: {msg}");
-        assert!(msg.contains("Retry the write"), "got: {msg}");
-        assert!(
-            msg.contains("cairn-discarded-edits-1.patch"),
-            "the scratch path is cited so the agent can re-apply: {msg}"
-        );
-        assert!(msg.contains("re-apply"), "got: {msg}");
-    }
-
-    #[test]
-    fn give_up_error_message_omits_path_when_nothing_preserved() {
-        let msg = give_up_error_message(
-            "the working copy is stale",
-            "recovering the stale worktree failed (x)",
-            &Ok(()),
-            None,
-        );
-        assert!(msg.contains("restored to HEAD"), "got: {msg}");
-        assert!(
-            !msg.contains("saved to"),
-            "no recovery clause without a preserved patch: {msg}"
-        );
-    }
-
-    #[test]
-    fn give_up_error_message_surfaces_failed_restore() {
-        let msg = give_up_error_message(
-            "seal failed",
-            "the batch includes a structural rename that can't be re-derived",
-            &Err("restore blew up".to_string()),
-            None,
-        );
-        assert!(
-            msg.contains("restoring the worktree to HEAD also failed: restore blew up"),
-            "got: {msg}"
-        );
+        assert!(lock < resolve && resolve < prepare && prepare < publish);
+        assert!(!source.contains(&["recover_stale", "file_commit"].concat()));
+        assert!(!source.contains(&["update", "_stale"].concat()));
     }
 }

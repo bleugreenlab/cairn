@@ -21,7 +21,7 @@
 /// `log_level` (a `LogLevel` name: "quiet"/"standard"/"verbose") is set as
 /// `CAIRN_LOG_LEVEL` so the child's `logging::init` resolves the same file-log
 /// verbosity as the app that spawned it.
-pub fn build_mcp_config_json(
+fn build_mcp_config_json(
     cairn_cmd_path: &str,
     callback_url: &str,
     available_agents: Option<&str>,
@@ -72,7 +72,7 @@ pub fn build_mcp_config_json(
 /// `mcp_binary_path` is the path to the cairn-cmd binary.
 /// `callback_port` is the host HTTP port serving `/api/mcp` (the runner
 /// transport port locally, or the server port in headless deployments).
-pub fn build_mcp_config_string(
+pub(crate) fn build_mcp_config_string(
     mcp_binary_path: &str,
     callback_port: u16,
     available_agents: Option<&str>,

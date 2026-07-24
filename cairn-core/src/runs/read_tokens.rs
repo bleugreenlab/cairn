@@ -29,20 +29,20 @@ fn bpe() -> &'static CoreBPE {
 
 /// Approximate token count of `text` using the `o200k_base` BPE. Ordinary
 /// encoding (no special-token handling) so arbitrary file content never errors.
-pub fn count_tokens(text: &str) -> usize {
+fn count_tokens(text: &str) -> usize {
     bpe().encode_ordinary(text).len()
 }
 
 /// True when `name` denotes the unified `read` tool, matching the frontend's
 /// `normalizeToolName` (strip an `mcp__<server>__` prefix, case-insensitive).
-pub fn is_read_tool(name: &str) -> bool {
+pub(crate) fn is_read_tool(name: &str) -> bool {
     let base = name.rsplit("__").next().unwrap_or(name);
     base.eq_ignore_ascii_case("read")
 }
 
 /// Extract the `paths` array from a read tool-call input, ignoring per-target
 /// query scoping (kept intact — headers carry the full target string).
-pub fn extract_paths(input: &serde_json::Value) -> Vec<String> {
+pub(crate) fn extract_paths(input: &serde_json::Value) -> Vec<String> {
     input
         .get("paths")
         .and_then(|p| p.as_array())
@@ -188,7 +188,10 @@ fn extract_output(result: &str) -> String {
 /// while the input path is canonical `cairn://p/X/…`). When the counts disagree
 /// (a stray content frame, say), fall back to matching each header against the
 /// input paths. A single unframed read yields one whole-body segment.
-pub fn read_segment_tokens(result_body: &str, expected: &[String]) -> Vec<ReadSegmentTokens> {
+pub(crate) fn read_segment_tokens(
+    result_body: &str,
+    expected: &[String],
+) -> Vec<ReadSegmentTokens> {
     let output = extract_output(result_body);
     if !is_framed(&output, expected) {
         return vec![ReadSegmentTokens {

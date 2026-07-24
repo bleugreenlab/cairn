@@ -188,6 +188,15 @@ pub(crate) async fn resolve_skill_script_path(
         project_path.as_deref(),
     )?
     .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
+    let policy =
+        crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
+    if !policy.is_selected(
+        crate::config::contextual_packages::ContextualPackageKind::Skill,
+        &skill.id,
+        &skill.bundles,
+    ) {
+        return Err(format!("Skill not found: {skill_id}"));
+    }
 
     resolve_safe_path(&skill.dir_path, &path)
 }
@@ -218,37 +227,35 @@ pub(crate) async fn read_skills_collection(
     explicit_project: Option<&str>,
 ) -> String {
     // Resolve project context: explicit project key + id + path, or current run.
-    let (project_id, project_key, project_path): (Option<String>, Option<String>, Option<PathBuf>) =
-        if let Some(project) = explicit_project {
-            match project_path_by_key(orch, project).await {
-                Ok(base) => {
-                    let id = super::run_context::project_id_by_key(&orch.db.local, project)
-                        .await
-                        .ok();
-                    // Prefer the active run's worktree when it targets this project,
-                    // so skills it just authored/edited on its branch are visible.
-                    let worktree =
-                        active_run_worktree_for_project(orch, request, id.as_deref()).await;
-                    let path = prefer_worktree_root(worktree.as_deref(), Some(base));
-                    (id, Some(project.to_uppercase()), path)
-                }
-                Err(e) => return e,
+    let (_project_id, project_key, project_path) = if let Some(project) = explicit_project {
+        match project_path_by_key(orch, project).await {
+            Ok(base) => {
+                let id = super::run_context::project_id_by_key(&orch.db.local, project)
+                    .await
+                    .ok();
+                // Prefer the active run's worktree when it targets this project,
+                // so skills it just authored/edited on its branch are visible.
+                let worktree = active_run_worktree_for_project(orch, request, id.as_deref()).await;
+                let path = prefer_worktree_root(worktree.as_deref(), Some(base));
+                (id, Some(project.to_uppercase()), path)
             }
-        } else {
-            match super::run_context::lookup_run(&orch.db.local, request).await {
-                Ok(ctx) => {
-                    let base = super::run_context::project_path(&orch.db.local, &ctx.project_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(PathBuf::from);
-                    // Contextual reads come from the current run; prefer its worktree.
-                    let path = prefer_worktree_root(ctx.worktree_path.as_deref(), base);
-                    (Some(ctx.project_id), Some(ctx.project_key), path)
-                }
-                Err(_) => (None, None, None),
+            Err(e) => return e,
+        }
+    } else {
+        match super::run_context::lookup_run(&orch.db.local, request).await {
+            Ok(ctx) => {
+                let base = super::run_context::project_path(&orch.db.local, &ctx.project_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(PathBuf::from);
+                // Contextual reads come from the current run; prefer its worktree.
+                let path = prefer_worktree_root(ctx.worktree_path.as_deref(), base);
+                (Some(ctx.project_id), Some(ctx.project_key), path)
             }
-        };
+            Err(_) => (None, None, None),
+        }
+    };
 
     let skills = match config_skills::list_skills(&orch.config_dir, project_path.as_deref()) {
         Ok(skills) => skills,
@@ -266,16 +273,15 @@ pub(crate) async fn read_skills_collection(
         }
     }
 
-    // Drop inherited workspace skills the project has disabled. A project-scoped
-    // skill of the same id has already shadowed it above, so only an inherited
-    // (workspace) skill remains to hide.
-    if let Some(pid) = project_id.as_deref() {
-        if let Ok(disabled) =
-            crate::config_disables::list_disabled_keys(&orch.db.local, pid, "skill").await
-        {
-            by_id.retain(|_, skill| skill.is_project_scoped || !disabled.contains(&skill.id));
-        }
-    }
+    let policy =
+        crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
+    by_id.retain(|id, skill| {
+        policy.is_selected(
+            crate::config::contextual_packages::ContextualPackageKind::Skill,
+            id,
+            &skill.bundles,
+        )
+    });
 
     let header = match project_key.as_deref() {
         Some(key) => format!("# Skills — {key} context\n\n"),
@@ -318,9 +324,7 @@ pub(crate) async fn read_skill(
     path: &[String],
     explicit_project: Option<&str>,
 ) -> String {
-    let (project_id, project_path): (Option<String>, Option<PathBuf>) = if let Some(project) =
-        explicit_project
-    {
+    let (_project_id, project_path) = if let Some(project) = explicit_project {
         match project_path_by_key(orch, project).await {
             Ok(base) => {
                 let id = super::run_context::project_id_by_key(&orch.db.local, project)
@@ -371,24 +375,20 @@ pub(crate) async fn read_skill(
         Err(e) => return format!("Error loading skill: {e}"),
     };
 
-    // An inherited workspace skill disabled for this project reads as not-found.
-    // A project-scoped skill is the project's own and is never hidden.
-    if !skill.is_project_scoped {
-        if let Some(pid) = project_id.as_deref() {
-            if let Ok(disabled) =
-                crate::config_disables::list_disabled_keys(&orch.db.local, pid, "skill").await
-            {
-                if disabled.contains(&skill.id) {
-                    return match explicit_project {
-                        Some(project) => format!(
-                            "Skill not found in project {}: {skill_id}",
-                            project.to_uppercase()
-                        ),
-                        None => format!("Skill not found: {skill_id}"),
-                    };
-                }
-            }
-        }
+    let policy =
+        crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
+    if !policy.is_selected(
+        crate::config::contextual_packages::ContextualPackageKind::Skill,
+        &skill.id,
+        &skill.bundles,
+    ) {
+        return match explicit_project {
+            Some(project) => format!(
+                "Skill not found in project {}: {skill_id}",
+                project.to_uppercase()
+            ),
+            None => format!("Skill not found: {skill_id}"),
+        };
     }
 
     let scope = match explicit_project {

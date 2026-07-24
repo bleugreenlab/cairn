@@ -154,10 +154,10 @@ pub use super::provider_options::{Choice, OptionControl, ProviderOption};
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchProviderInfo {
-    pub id: SearchProviderId,
-    pub label: String,
-    pub secret_var: String,
-    pub options: Vec<ProviderOption>,
+    id: SearchProviderId,
+    label: String,
+    secret_var: String,
+    options: Vec<ProviderOption>,
 }
 
 /// The resolved provider that backs a web search.
@@ -194,7 +194,7 @@ pub fn load_web_search_options(
 
 /// Resolve which provider backs web search. Absent / empty / unknown name ⇒
 /// [`ActiveSearch::Unconfigured`] (no silent fallback).
-pub fn resolve_active_search(config_dir: &Path) -> ActiveSearch {
+pub(crate) fn resolve_active_search(config_dir: &Path) -> ActiveSearch {
     let name = match active_web_search_name(config_dir) {
         Some(n) if !n.trim().is_empty() => n,
         _ => return ActiveSearch::Unconfigured,
@@ -214,7 +214,7 @@ pub fn resolve_active_search(config_dir: &Path) -> ActiveSearch {
 /// Validate a provider's submitted options against its descriptor. Unknown keys
 /// and type/range/choice mismatches are rejected so only well-formed options
 /// reach `settings.yaml`.
-pub fn validate_options(
+fn validate_options(
     id: SearchProviderId,
     options: &HashMap<String, serde_yaml::Value>,
 ) -> Result<(), String> {

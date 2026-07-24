@@ -19,14 +19,66 @@
 //! See `docs/jj-migration.md`.
 
 use std::path::Path;
+use std::time::Duration;
 
 use super::git::{CommitResult, GitAuthor};
+
+pub(crate) const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+
+pub(crate) async fn acquire_store_lock(
+    orch: &crate::orchestrator::Orchestrator,
+    store: Option<&Path>,
+    operation: &str,
+    timeout: Duration,
+) -> Result<Option<crate::orchestrator::JjStoreGuard>, String> {
+    let Some(store) = store else { return Ok(None) };
+    orch.acquire_jj_store_lock_with_timeout(store, operation, Some(timeout))
+        .await
+        .map(Some)
+        .map_err(|()| {
+            let holder = orch
+                .jj_store_lock_holder(store)
+                .unwrap_or_else(|| "another version-control operation".to_string());
+            format!("The project's version-control store is busy behind: {holder}; retry this operation.")
+        })
+}
+
+/// Confirm that a runner-owned logical bookmark advanced without materializing
+/// or rebasing any retained workspace. Coordinate-keyed read overlays observe
+/// the new SHA directly, so this seam is intentionally validation-only.
+pub(crate) fn acknowledge_logical_bookmark_advance(
+    orch: &crate::orchestrator::Orchestrator,
+    observation: Option<&ManagedBookmarkObservation>,
+) -> Result<bool, String> {
+    let Some(observation) = observation else {
+        return Ok(false);
+    };
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, &observation.repo_path);
+    let after_tip =
+        crate::jj::bookmark_commit(&jj, &store, &observation.branch).ok_or_else(|| {
+            format!(
+                "managed bookmark `{}` disappeared after publication",
+                observation.branch
+            )
+        })?;
+    Ok(Some(after_tip) != observation.before_tip)
+}
+
+/// Publish the current bookmark when the project has an `origin`. Publication
+/// failures propagate, while a project with no remote has nothing to publish.
+pub(crate) fn publish_required_origin(
+    vcs: &dyn WorktreeVcs,
+    worktree: &Path,
+) -> Result<(), String> {
+    vcs.propagate_seal(worktree)
+}
 
 /// Opaque pre-batch working-copy snapshot, captured before a batch runs so the
 /// barrier can attribute new dirt to the call that caused it. Carries the jj `@`
 /// change id.
 #[derive(Debug, Clone)]
-pub struct VcsSnapshot(pub String);
+pub struct VcsSnapshot(pub(crate) String);
 
 impl VcsSnapshot {
     /// The backend-internal string this snapshot carries.
@@ -70,6 +122,16 @@ pub trait WorktreeVcs: Send + Sync {
         msg: &str,
         author: Option<&GitAuthor>,
     ) -> Result<CommitResult, String>;
+    /// Propagate an already-sealed bookmark to origin. This is intentionally a
+    /// separate operation so callers run network I/O after releasing the store lock.
+    fn propagate_seal(&self, _worktree: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn workspace_needs_reconcile(&self, worktree: &Path) -> Result<bool, String> {
+        let _ = worktree;
+        Ok(false)
+    }
     /// Discard working-copy changes, returning the worktree to its committed state.
     fn discard(&self, worktree: &Path) -> Result<(), String>;
     /// Clear a STALE working copy by advancing `@` onto the rewritten/advanced
@@ -121,7 +183,7 @@ pub struct JjBackend {
 }
 
 impl JjBackend {
-    pub fn new(jj: crate::jj::JjEnv) -> Self {
+    pub(crate) fn new(jj: crate::jj::JjEnv) -> Self {
         Self { jj, identity: None }
     }
 
@@ -167,14 +229,11 @@ impl JjBackend {
     /// coordinator's resolve-and-reseal immediately restores a pushable, mergeable
     /// branch instead of a silently-failing push whose origin head goes stale until
     /// the next base advance.
-    fn push_after_seal(&self, worktree: &Path) {
+    fn heal_after_seal(&self, worktree: &Path) {
         let Some(branch) = crate::jj::read_branch_marker(worktree) else {
             return;
         };
         self.heal_conflicted_intermediates(worktree, &branch);
-        if let Err(e) = crate::jj::push_to_origin(&self.jj, worktree, &branch) {
-            log::warn!("jj push failed (seal succeeded locally): {e}");
-        }
     }
 
     /// After a successful seal, collapse a clean-tip / conflicted-intermediate
@@ -270,7 +329,7 @@ impl WorktreeVcs for JjBackend {
     ) -> Result<CommitResult, String> {
         self.validate_identity(worktree)?;
         let result = crate::jj::seal(&self.jj, worktree, msg, author)?;
-        self.push_after_seal(worktree);
+        self.heal_after_seal(worktree);
         Ok(result)
     }
 
@@ -289,8 +348,24 @@ impl WorktreeVcs for JjBackend {
         // deliberately leave such dirt in `@`, so a later file-scoped write must
         // not claim it.
         let result = crate::jj::seal_paths(&self.jj, worktree, msg, author, files)?;
-        self.push_after_seal(worktree);
+        self.heal_after_seal(worktree);
         Ok(result)
+    }
+
+    fn propagate_seal(&self, worktree: &Path) -> Result<(), String> {
+        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
+            return Ok(());
+        };
+        match crate::jj::push_to_origin(&self.jj, worktree, &branch) {
+            Ok(()) => Ok(()),
+            Err(error) => match crate::jj::discover_origin_presence(&self.jj, worktree) {
+                crate::jj::OriginPresence::Absent => {
+                    log::info!("jj publish: no `origin` remote; nothing to publish for {branch}");
+                    Ok(())
+                }
+                _ => Err(error),
+            },
+        }
     }
 
     fn discard(&self, worktree: &Path) -> Result<(), String> {
@@ -310,6 +385,14 @@ impl WorktreeVcs for JjBackend {
         Ok(())
     }
 
+    fn workspace_needs_reconcile(&self, worktree: &Path) -> Result<bool, String> {
+        self.validate_identity(worktree)?;
+        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
+            return Ok(false);
+        };
+        crate::jj::managed_workspace_needs_reconcile(&self.jj, worktree, worktree, &branch)
+    }
+
     fn capture_patch(&self, worktree: &Path) -> Option<String> {
         // Best-effort: a diff failure (e.g. jj refusing on a stale copy) yields
         // `None`, so the give-up error simply omits the recovery path.
@@ -322,7 +405,7 @@ impl WorktreeVcs for JjBackend {
 /// Rejection returned when a seal is attempted in a non-worktree cwd. Changes
 /// can only happen in a worktree; the project's live checkout is read-only for
 /// agents.
-pub(crate) const NON_WORKTREE_SEAL_ERROR: &str =
+const NON_WORKTREE_SEAL_ERROR: &str =
     "Changes can only be made in a worktree. This agent runs on the project's live \
      checkout (no worktree) and cannot commit.";
 
@@ -422,7 +505,7 @@ impl WorktreeVcs for NonWorktreeVcs {
 /// live checkout behind a no-worktree triage / read-only agent —
 /// resolves to the read-only [`NonWorktreeVcs`], so the commit barrier never
 /// shells jj in (or reverts) a plain checkout.
-pub fn resolve_worktree_vcs(
+pub(crate) fn resolve_worktree_vcs(
     orch: &crate::orchestrator::Orchestrator,
     worktree: &Path,
 ) -> Box<dyn WorktreeVcs> {
@@ -643,30 +726,8 @@ pub(crate) async fn prepare_managed_workspace(
                     "pending base transition disagrees with the physical marker base",
                 ));
             }
-            if identity.base_commit == pending.old_base {
-                crate::execution::jobs::workspace_identity::compare_and_swap_owner_base(
-                    db.clone(),
-                    identity.owner_job_id.clone(),
-                    identity.worktree_path.to_string_lossy().to_string(),
-                    pending.old_base.clone(),
-                    pending.new_base.clone(),
-                    chrono::Utc::now().timestamp() as i32,
-                )
-                .await
-                .map_err(|error| {
-                    lineage_mismatch_diagnostic(
-                        &jj,
-                        &context,
-                        Some(&actual.lineage_root_job_id),
-                        &format!(
-                            "could not resume pending base transition {} -> {}: {error}",
-                            pending.old_base, pending.new_base
-                        ),
-                    )
-                })?;
-                identity.base_commit = pending.new_base.clone();
-                context.identity.base_commit = pending.new_base.clone();
-            } else if identity.base_commit != pending.new_base {
+            if identity.base_commit != pending.old_base && identity.base_commit != pending.new_base
+            {
                 return Err(lineage_mismatch_diagnostic(
                     &jj,
                     &context,
@@ -674,13 +735,27 @@ pub(crate) async fn prepare_managed_workspace(
                     "database base is neither endpoint of the pending base transition",
                 ));
             }
-            actual.base_commit = pending.new_base;
-            actual.pending_base_transition = None;
-            crate::jj::write_workspace_identity(cwd, actual).map_err(|error| {
-                format!(
-                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} database base transition completed, but finalizing its physical marker failed: {error}; retry the same write or run to finish the recorded transition"
+            crate::execution::jobs::workspace_identity::apply_base_transition(
+                db.as_ref(),
+                cwd,
+                actual,
+                &pending.old_base,
+                &pending.new_base,
+            )
+            .await
+            .map_err(|error| {
+                lineage_mismatch_diagnostic(
+                    &jj,
+                    &context,
+                    Some(&actual.lineage_root_job_id),
+                    &format!(
+                        "could not resume pending base transition {} -> {}: {error}",
+                        pending.old_base, pending.new_base
+                    ),
                 )
             })?;
+            identity.base_commit = pending.new_base.clone();
+            context.identity.base_commit = pending.new_base;
         }
     }
 
@@ -695,7 +770,74 @@ pub(crate) async fn prepare_managed_workspace(
     }
     let head = head_commit_healing_stale(&jj, cwd)
         .map_err(|reason| lineage_mismatch_diagnostic(&jj, &context, None, &reason))?;
-    if !crate::jj::revision_descends_from(&jj, &store, &head, &identity.base_commit) {
+
+    if let Some(actual) = marker.as_mut() {
+        let lineage = crate::jj::classify_durable_base_lineage(
+            &jj,
+            &store,
+            &actual.base_commit,
+            &identity.base_commit,
+            &head,
+        );
+        if !lineage.repairable() {
+            return Err(lineage_mismatch_diagnostic(
+                &jj,
+                &context,
+                Some(&actual.lineage_root_job_id),
+                &format!(
+                    "durable base mismatch: marker={} (resolved={}, ancestor_or_equal_to_target={}); database={} (resolved={}, ancestor_or_equal_to_target={}); target={head}; relationship={}; inspect the named commits, confirm the workspace assignment, then run cairn:~/workspace-recovery action=rebind; do not force-push or use a destructive reset",
+                    actual.base_commit,
+                    lineage.marker_resolved().unwrap_or("false"),
+                    lineage.marker_on_target,
+                    identity.base_commit,
+                    lineage.database_resolved().unwrap_or("false"),
+                    lineage.database_on_target,
+                    lineage.relationship.label(),
+                ),
+            ));
+        }
+        let chosen = lineage
+            .newer_base
+            .clone()
+            .expect("repairable durable lineage has a normalization point");
+        if actual.base_commit != chosen || identity.base_commit != chosen {
+            log::warn!(
+                "self-healing preflight durable base mismatch: workspace={}, owner_job={}, marker_base={}, database_base={}, resolved_marker={}, resolved_database={}, chosen_base={}, target={}, relationship={}",
+                cwd.display(),
+                identity.owner_job_id,
+                actual.base_commit,
+                identity.base_commit,
+                lineage.marker_resolved().unwrap_or("unresolved"),
+                lineage.database_resolved().unwrap_or("unresolved"),
+                chosen,
+                head,
+                lineage.relationship.label(),
+            );
+            if actual.base_commit != chosen {
+                actual.pending_base_transition = Some(crate::jj::WorkspaceBaseTransition {
+                    old_base: actual.base_commit.clone(),
+                    new_base: chosen.clone(),
+                });
+                crate::jj::write_workspace_identity(cwd, actual)?;
+                actual.base_commit = chosen.clone();
+                actual.pending_base_transition = None;
+                crate::jj::write_workspace_identity(cwd, actual)?;
+            }
+            if identity.base_commit != chosen {
+                let old_base = identity.base_commit.clone();
+                crate::execution::jobs::workspace_identity::apply_base_transition(
+                    db.as_ref(),
+                    cwd,
+                    actual,
+                    &old_base,
+                    &chosen,
+                )
+                .await?;
+            }
+            identity.base_commit = chosen.clone();
+            context.identity.base_commit = chosen;
+        }
+    } else if !crate::jj::revision_descends_from(&jj, &store, &head, &identity.base_commit) {
         let repaired_base =
             crate::jj::forward_resolve_ancestor(&jj, &store, &identity.base_commit, &head)
                 .filter(|commit| commit != &identity.base_commit);
@@ -703,13 +845,13 @@ pub(crate) async fn prepare_managed_workspace(
             return Err(lineage_mismatch_diagnostic(
                 &jj,
                 &context,
-                marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
+                None,
                 "recorded base is not an ancestor of the physical workspace @- and could not be proven as a rewritten predecessor",
             ));
         };
         let old_base = identity.base_commit.clone();
         crate::execution::jobs::workspace_identity::compare_and_swap_owner_base(
-            db.clone(),
+            db.as_ref(),
             identity.owner_job_id.clone(),
             identity.worktree_path.to_string_lossy().to_string(),
             old_base.clone(),
@@ -721,38 +863,14 @@ pub(crate) async fn prepare_managed_workspace(
             lineage_mismatch_diagnostic(
                 &jj,
                 &context,
-                marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
+                None,
                 &format!(
                     "recorded base {old_base} rewrote to {repaired_base}, but persisting the repaired lineage coordinate failed: {error}"
                 ),
             )
         })?;
-        identity.base_commit = repaired_base;
-        context.identity.base_commit = identity.base_commit.clone();
-        if let Some(actual) = marker.as_mut() {
-            actual.base_commit = identity.base_commit.clone();
-            crate::jj::write_workspace_identity(cwd, actual).map_err(|error| {
-                format!(
-                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} repaired the durable base coordinate but updating the physical identity marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
-                )
-            })?;
-        }
-    } else if let Some(actual) = marker.as_mut() {
-        if actual.base_commit != identity.base_commit {
-            let marker_base_matches =
-                crate::jj::forward_resolve_ancestor(&jj, &store, &actual.base_commit, &head)
-                    .is_some_and(|commit| commit == identity.base_commit);
-            if !marker_base_matches {
-                return Err(lineage_mismatch_diagnostic(
-                    &jj,
-                    &context,
-                    Some(&actual.lineage_root_job_id),
-                    "identity marker base differs from the database assignment and is not its rewritten predecessor",
-                ));
-            }
-            actual.base_commit = identity.base_commit.clone();
-            crate::jj::write_workspace_identity(cwd, actual)?;
-        }
+        identity.base_commit = repaired_base.clone();
+        context.identity.base_commit = repaired_base;
     }
 
     let branch_marker = crate::jj::read_branch_marker(cwd);
@@ -937,7 +1055,7 @@ pub(crate) async fn workspace_recovery_status(
 /// is best-effort by design: the seal still proceeds without the guard, matching
 /// today's behavior — every real agent worktree resolves a run + repo_path, so
 /// the fallback only fires where there is no shared store to protect.
-pub async fn resolve_store_lock(
+pub(crate) async fn resolve_store_lock(
     orch: &crate::orchestrator::Orchestrator,
     request: &cairn_common::protocol::CallbackRequest,
 ) -> Option<std::path::PathBuf> {
@@ -998,7 +1116,7 @@ pub async fn resolve_store_lock(
 ///    bare-`jj git push` non-regression test in `mcp_run_commit_hygiene`. (The
 ///    jj store lives under `~/.cairn/jj-stores`, never between a worktree and
 ///    this parent ceiling, so even a discovery-based op could not be trapped.)
-pub fn worktree_shell_vcs_env(
+pub(crate) fn worktree_shell_vcs_env(
     orch: &crate::orchestrator::Orchestrator,
     cwd: &Path,
 ) -> Vec<(String, String)> {
@@ -1027,12 +1145,146 @@ pub fn worktree_shell_vcs_env(
 /// code). Each query returns a programmed result; the mutation counters let a
 /// test assert whether a seal or discard happened. Defined at module scope (not
 /// inside `mod tests`) so the barrier tests in other modules can reach it.
+/// Publish immutable cloud coverage for a runner-sealed commit.
+///
+/// Call this after releasing the project-store lock. For the first cloud-visible
+/// root we upload a self-contained
+/// reachable pack. Once the direct parent is cataloged for this repository, later
+/// seals upload only the complete (non-thin) range from that covered parent.
+/// Bytes are put before the catalog/reference transaction.
+pub(crate) async fn publish_sealed_commit_pack(
+    db: &crate::storage::LocalDb,
+    project_id: &str,
+    repository: &Path,
+    sealed_commit: &str,
+) -> Result<(), String> {
+    let Some(store) = db.content_store().cloned() else {
+        return Ok(());
+    };
+    let project_id = project_id.to_string();
+    let repository_id = db
+        .query_text(
+            "SELECT repository_id FROM projects WHERE id = ?1",
+            (project_id.clone(),),
+        )
+        .await
+        .map_err(|error| format!("resolve sealed-pack repository identity: {error}"))?
+        .ok_or_else(|| "project has no durable repository identity".to_string())?;
+
+    let tip = git_stdout(
+        repository,
+        &["rev-parse", &format!("{sealed_commit}^{{commit}}")],
+    )?;
+    let parent = git_stdout(repository, &["rev-parse", &format!("{tip}^")]).ok();
+    let covered_parent = match parent.as_deref() {
+        Some(parent) => {
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM pack_catalog c
+                 JOIN pack_catalog_references r
+                   ON r.content_hash = c.content_hash
+                  AND r.project_id = c.project_id
+                  AND r.repository_id = c.repository_id
+                  AND r.object_format = c.object_format
+                 WHERE c.project_id = ?1 AND c.repository_id = ?2
+                   AND c.object_format = 'sha1' AND c.tip_commit = ?3
+                   AND r.owner_kind = 'sealed_commit' AND r.owner_id = ?3",
+                (
+                    project_id.clone(),
+                    repository_id.clone(),
+                    parent.to_string(),
+                ),
+            )
+            .await
+            .map_err(|error| format!("inspect sealed-pack parent coverage: {error}"))?
+            .unwrap_or(0)
+                > 0
+        }
+        None => false,
+    };
+
+    let repository = repository.to_path_buf();
+    let tip_for_pack = tip.clone();
+    let parent_for_pack = parent.clone();
+    let (pack, index, kind, base_commit) = tokio::task::spawn_blocking(move || {
+        if covered_parent {
+            let base = parent_for_pack
+                .as_deref()
+                .ok_or_else(|| "covered sealed root lost its parent coordinate".to_string())?;
+            let (pack, index) = cairn_codec::packfile::build_reachable_range_pack(
+                &repository,
+                &tip_for_pack,
+                base,
+            )?;
+            Ok::<_, String>((
+                pack,
+                index,
+                crate::storage::pack_catalog::PackKind::ExecutionRange,
+                Some(base.to_string()),
+            ))
+        } else {
+            let (pack, index) =
+                cairn_codec::packfile::build_reachable_pack(&repository, &tip_for_pack)?;
+            Ok((
+                pack,
+                index,
+                crate::storage::pack_catalog::PackKind::Reachable,
+                None,
+            ))
+        }
+    })
+    .await
+    .map_err(|error| format!("sealed-pack build task failed: {error}"))??;
+
+    let validated = crate::orchestrator::object_plane::validate_pack_bytes(pack)
+        .map_err(|error| format!("validate sealed pack: {error}"))?;
+    if validated.index != index {
+        return Err("sealed pack builder index disagrees with independent validation".into());
+    }
+    crate::orchestrator::object_plane::publish_validated_pack(
+        db,
+        Some(store.as_ref()),
+        &validated,
+        crate::storage::pack_catalog::PackCatalogPublication {
+            content_hash: String::new(),
+            project_id,
+            repository_id,
+            object_format: "sha1".into(),
+            byte_count: 0,
+            pack_checksum: String::new(),
+            object_count: 0,
+            kind,
+            base_commit,
+            tip_commit: tip.clone(),
+            owner_kind: "sealed_commit".into(),
+            owner_id: tip,
+        },
+    )
+    .await
+    .map_err(|error| format!("publish sealed pack: {error}"))
+}
+
+fn git_stdout(repository: &Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repository)
+        .output()
+        .map_err(|error| format!("spawn git {args:?}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 #[cfg(test)]
 pub(crate) struct FakeVcs {
     dirty: Result<bool, String>,
     changed: Result<bool, String>,
     seal: Result<CommitResult, String>,
     discard_result: Result<(), String>,
+    discard_results: std::sync::Mutex<std::collections::VecDeque<Result<(), String>>>,
     can_revert: bool,
     capture: Option<String>,
     seal_calls: std::sync::atomic::AtomicUsize,
@@ -1042,7 +1294,7 @@ pub(crate) struct FakeVcs {
 
 #[cfg(test)]
 impl FakeVcs {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             dirty: Ok(true),
             changed: Ok(true),
@@ -1052,6 +1304,7 @@ impl FakeVcs {
                 amend_note: None,
             }),
             discard_result: Ok(()),
+            discard_results: std::sync::Mutex::new(std::collections::VecDeque::new()),
             can_revert: true,
             capture: None,
             seal_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -1060,40 +1313,40 @@ impl FakeVcs {
         }
     }
 
-    pub fn can_revert(mut self, v: bool) -> Self {
+    pub(crate) fn can_revert(mut self, v: bool) -> Self {
         self.can_revert = v;
         self
     }
 
-    pub fn capture(mut self, v: Option<String>) -> Self {
+    pub(crate) fn capture(mut self, v: Option<String>) -> Self {
         self.capture = v;
         self
     }
 
-    pub fn dirty(mut self, v: Result<bool, String>) -> Self {
+    pub(crate) fn dirty(mut self, v: Result<bool, String>) -> Self {
         self.dirty = v;
         self
     }
 
-    pub fn changed(mut self, v: Result<bool, String>) -> Self {
+    pub(crate) fn changed(mut self, v: Result<bool, String>) -> Self {
         self.changed = v;
         self
     }
 
-    pub fn seal(mut self, v: Result<CommitResult, String>) -> Self {
+    pub(crate) fn seal(mut self, v: Result<CommitResult, String>) -> Self {
         self.seal = v;
         self
     }
 
-    pub fn seals(&self) -> usize {
+    pub(crate) fn seals(&self) -> usize {
         self.seal_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub fn discards(&self) -> usize {
+    pub(crate) fn discards(&self) -> usize {
         self.discard_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub fn update_stales(&self) -> usize {
+    pub(crate) fn update_stales(&self) -> usize {
         self.update_stale_calls
             .load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1139,7 +1392,11 @@ impl WorktreeVcs for FakeVcs {
     fn discard(&self, _worktree: &Path) -> Result<(), String> {
         self.discard_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.discard_result.clone()
+        self.discard_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| self.discard_result.clone())
     }
 
     fn update_stale(&self, _worktree: &Path) -> Result<(), String> {
@@ -1262,8 +1519,8 @@ mod tests {
         assert!(ws.join("sibling.rs").exists());
     }
 
-    /// `JjBackend::seal_all` lands one addressable commit AND pushes the
-    /// workspace's bookmark to a bare origin — the seam's git-parity push.
+    /// `JjBackend::seal_all` lands one addressable commit locally, then the
+    /// post-lock propagation seam pushes its bookmark to a bare origin.
     #[test]
     #[serial_test::serial(jj)]
     fn jj_backend_seal_all_lands_commit_and_pushes() {
@@ -1295,6 +1552,15 @@ mod tests {
 
         let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
         let result = backend.seal_all(&ws, "agent work", None).unwrap();
+        let refs_before_propagation = git_stdout(
+            origin.path(),
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        );
+        assert!(
+            !refs_before_propagation.contains(branch),
+            "local sealing must not publish {branch} before the post-lock propagation seam"
+        );
+        backend.propagate_seal(&ws).unwrap();
         assert!(
             !result.sha.is_empty(),
             "seal_all returns the sealed commit id"
@@ -1310,7 +1576,7 @@ mod tests {
         );
         assert!(
             refs.contains(branch),
-            "seal_all must push the bookmark {branch} to origin: {refs}"
+            "post-lock propagation must push the bookmark {branch} to origin: {refs}"
         );
     }
 
@@ -1639,6 +1905,31 @@ mod tests {
         let db_state = Arc::new(DbState::new(Arc::new(db), search));
         let services = Arc::new(TestServicesBuilder::new().build());
         crate::orchestrator::Orchestrator::builder(db_state, services, config_dir).build()
+    }
+
+    #[tokio::test]
+    async fn store_lock_timeout_names_current_holder() {
+        let root = TempDir::new().unwrap();
+        let orch = orch_with_config("store_lock_holder", root.path().to_path_buf()).await;
+        let store = root.path().join("store");
+        let _holder = orch
+            .acquire_jj_store_lock(&store, "sibling reconcile (external advance on main)")
+            .await;
+
+        let error = acquire_store_lock(
+            &orch,
+            Some(&store),
+            "test waiter",
+            Duration::from_millis(10),
+        )
+        .await
+        .err()
+        .expect("waiter times out");
+
+        assert!(
+            error.contains("sibling reconcile (external advance on main)"),
+            "{error}"
+        );
     }
 
     /// Seed the minimum rows so `lookup_run`/`project_path` resolve a worktree
@@ -2141,9 +2432,16 @@ mod tests {
             "the wedged branch is unpushable before the heal"
         );
 
-        // The reseal heal flattens, re-parents `@`, and pushes.
+        // The local reseal heal flattens and re-parents `@`; propagation runs
+        // separately after the caller releases the project-store lock.
         let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
-        backend.push_after_seal(&ws);
+        backend.heal_after_seal(&ws);
+        let origin_after_local_heal = git_stdout(origin.path(), &["rev-parse", builder]);
+        assert_eq!(
+            origin_before, origin_after_local_heal,
+            "local reseal healing must not publish before the post-lock propagation seam"
+        );
+        backend.propagate_seal(&ws).unwrap();
 
         assert!(!crate::jj::branch_has_conflict(&jj, &store, builder).unwrap());
         let range = format!("{int_tip}..bookmarks(exact:{builder:?})");
@@ -2199,7 +2497,7 @@ mod tests {
 
         let tip_before = crate::jj::bookmark_commit(&jj, &store, builder).unwrap();
         let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
-        backend.push_after_seal(&ws);
+        backend.heal_after_seal(&ws);
         let tip_after = crate::jj::bookmark_commit(&jj, &store, builder).unwrap();
         assert_eq!(
             tip_before, tip_after,

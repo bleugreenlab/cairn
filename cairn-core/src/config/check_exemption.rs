@@ -80,7 +80,7 @@ const TARGETS: &str = "{targets}";
 /// Both `checks` and `scripts` MUST be sourced from the canonical main checkout
 /// (see the module docs) so a branch cannot self-grant an unconfined command by
 /// editing its own worktree config.
-pub fn is_exempt_check_command(
+pub(crate) fn is_exempt_check_command(
     command: &str,
     checks: &HashMap<String, CheckCommand>,
     scripts: &BTreeSet<String>,
@@ -105,7 +105,7 @@ pub fn is_exempt_check_command(
 /// when the file is absent, unparseable, or declares no scripts — a non-JS project
 /// simply exempts nothing via recognizer A. Reads only; the caller points this at
 /// the canonical main checkout.
-pub fn load_project_scripts(repo_root: &Path) -> BTreeSet<String> {
+pub(crate) fn load_project_scripts(repo_root: &Path) -> BTreeSet<String> {
     let Ok(content) = std::fs::read_to_string(repo_root.join("package.json")) else {
         return BTreeSet::new();
     };

@@ -5,11 +5,6 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
 use cairn_db::turso::params;
 
-pub async fn create_for_job(db: &LocalDb, job_id: &str, backend: &str) -> Result<Session, String> {
-    let id = ids::mint_session_id().into_string();
-    create_with_id(db, &id, Some(job_id), None, backend).await
-}
-
 pub async fn create_with_id(
     db: &LocalDb,
     id: &str,
@@ -76,10 +71,6 @@ pub async fn get(db: &LocalDb, session_id: &str) -> Result<Session, String> {
     .map_err(|e| format!("Session not found ({session_id}): {e}"))
 }
 
-pub async fn get_for_job(db: &LocalDb, job_id: &str) -> Result<Option<Session>, String> {
-    get_for_parent(db, "jobs", job_id).await
-}
-
 pub async fn update_status(
     db: &LocalDb,
     session_id: &str,
@@ -116,7 +107,7 @@ pub async fn update_status(
     .map_err(|e| format!("Failed to update session status: {e}"))
 }
 
-pub async fn rotate_job_session(
+pub(crate) async fn rotate_job_session(
     db: &LocalDb,
     old: &Session,
     job_id: &str,
@@ -130,93 +121,13 @@ pub async fn rotate_job_session(
 /// (e.g. Claude -> Codex). The prior backend's resume handle is invalid on the
 /// new backend, so continuation must start a fresh session; the successor
 /// records `new_backend` instead of inheriting the source session's backend.
-pub async fn rotate_job_session_to_backend(
+pub(crate) async fn rotate_job_session_to_backend(
     db: &LocalDb,
     old: &Session,
     job_id: &str,
     new_backend: &str,
 ) -> Result<Session, String> {
     rotate_session(db, old, job_id, true, Some(new_backend.to_string())).await
-}
-
-pub async fn fork_job_session(
-    db: &LocalDb,
-    source: &Session,
-    job_id: &str,
-    make_active: bool,
-) -> Result<Session, String> {
-    rotate_session(db, source, job_id, make_active, None).await
-}
-
-pub async fn set_backend_id(
-    db: &LocalDb,
-    session_id: &str,
-    backend_id: &str,
-) -> Result<(), String> {
-    let session_id = session_id.to_string();
-    let backend_id = backend_id.to_string();
-    db.write(|conn| {
-        let session_id = session_id.clone();
-        let backend_id = backend_id.clone();
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE sessions SET backend_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![
-                    backend_id.as_str(),
-                    chrono::Utc::now().timestamp(),
-                    session_id.as_str()
-                ],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to set backend_id: {e}"))
-}
-
-pub async fn close_sessions_for_issue(
-    db: &LocalDb,
-    issue_id: &str,
-    reason: &str,
-) -> Result<Vec<String>, String> {
-    let issue_id = issue_id.to_string();
-    let reason = reason.to_string();
-    db.write(|conn| {
-        let issue_id = issue_id.clone();
-        let reason = reason.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT s.id
-                     FROM sessions s
-                     JOIN jobs j ON s.job_id = j.id
-                     WHERE j.issue_id = ?1 AND s.status = 'open'",
-                    params![issue_id.as_str()],
-                )
-                .await?;
-            let mut session_ids = Vec::new();
-            while let Some(row) = rows.next().await? {
-                session_ids.push(row.text(0)?);
-            }
-            drop(rows);
-
-            let now = chrono::Utc::now().timestamp();
-            for session_id in &session_ids {
-                conn.execute(
-                    "UPDATE sessions
-                     SET status = 'closed', terminal_reason = ?1, closed_at = ?2, updated_at = ?3
-                     WHERE id = ?4",
-                    params![reason.as_str(), now, now, session_id.as_str()],
-                )
-                .await?;
-            }
-
-            Ok(session_ids)
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to close sessions: {e}"))
 }
 
 async fn rotate_session(
@@ -280,38 +191,6 @@ async fn rotate_session(
     })
     .await
     .map_err(|e| format!("Failed to rotate session: {e}"))
-}
-
-async fn get_for_parent(
-    db: &LocalDb,
-    table: &str,
-    parent_id: &str,
-) -> Result<Option<Session>, String> {
-    let parent_id = parent_id.to_string();
-    let sql = format!("SELECT current_session_id FROM {table} WHERE id = ?1");
-    db.read(|conn| {
-        let parent_id = parent_id.clone();
-        let sql = sql.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(sql.as_str(), params![parent_id.as_str()])
-                .await?;
-            let session_id = rows
-                .next()
-                .await?
-                .map(|row| row.opt_text(0))
-                .transpose()?
-                .flatten();
-            drop(rows);
-
-            match session_id {
-                Some(session_id) => load_session_conn(conn, &session_id).await,
-                None => Ok(None),
-            }
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to load session: {e}"))
 }
 
 async fn create_with_id_and_lineage_conn(

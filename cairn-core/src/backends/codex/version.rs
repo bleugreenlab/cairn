@@ -1,7 +1,7 @@
 const MIN_CODEX_VERSION: (u32, u32, u32) = (0, 37, 0);
 
 /// Parse a version string like "codex 0.37.1" or "0.37.1" into (major, minor, patch).
-pub(super) fn parse_codex_version(version_str: &str) -> Option<(u32, u32, u32)> {
+fn parse_codex_version(version_str: &str) -> Option<(u32, u32, u32)> {
     // Find the version number portion — skip any leading text like "codex "
     let version_part = version_str
         .split_whitespace()

@@ -52,6 +52,11 @@ pub(crate) struct PreparedWorkflowRun {
     pub job_id: String,
     pub run_id: String,
     pub session_id: String,
+    pub project_id: String,
+    pub repository_path: PathBuf,
+    pub anchor_branch: String,
+    pub worktree_mode: String,
+    pub package_path: PathBuf,
     pub working_dir: String,
     pub script_path: PathBuf,
     pub args_json: String,
@@ -109,7 +114,7 @@ pub(crate) fn prepare_workflow_run(
                     parent_job.issue_id.clone(),
                     execution_id,
                     parent_job.worktree_path.clone(),
-                    parent_job.base_branch.clone(),
+                    parent_job.branch.clone().or(parent_job.base_branch.clone()),
                 )
             }
             None => {
@@ -281,6 +286,19 @@ pub(crate) fn prepare_workflow_run(
         job_id: job_id.clone(),
         session_id: Some(session_id.clone()),
         workflow_id: input.workflow_id.clone(),
+        project_id: project_id.clone(),
+        execution_id: execution_id.clone(),
+        anchor_branch: parent_base_branch.clone(),
+        worktree_mode: match input.worktree {
+            CallWorktree::None => "none".to_string(),
+            CallWorktree::Inherit => "inherit".to_string(),
+        },
+        package_path: input
+            .script_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy()
+            .into_owned(),
         script_path: input.script_path.to_string_lossy().into_owned(),
         args_json: input.args_json.clone(),
         working_dir: working_dir.clone(),
@@ -298,6 +316,19 @@ pub(crate) fn prepare_workflow_run(
         job_id,
         run_id,
         session_id,
+        project_id,
+        repository_path: project_path.ok_or("Workflow project has no local repository path")?,
+        anchor_branch: parent_base_branch
+            .ok_or("Workflow execution anchor has no logical branch")?,
+        worktree_mode: match input.worktree {
+            CallWorktree::None => "none".to_string(),
+            CallWorktree::Inherit => "inherit".to_string(),
+        },
+        package_path: input
+            .script_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
         working_dir,
         script_path: input.script_path,
         args_json: input.args_json,
@@ -345,6 +376,11 @@ pub(crate) struct WorkflowRunRow {
     pub job_id: String,
     pub session_id: Option<String>,
     pub workflow_id: String,
+    pub project_id: String,
+    pub execution_id: Option<String>,
+    pub anchor_branch: Option<String>,
+    pub worktree_mode: String,
+    pub package_path: String,
     pub script_path: String,
     pub args_json: String,
     pub working_dir: String,
@@ -369,14 +405,20 @@ pub(crate) async fn persist_workflow_run_row(
         Box::pin(async move {
             conn.execute(
                 "INSERT OR REPLACE INTO workflow_run \
-                 (run_id, job_id, session_id, workflow_id, script_path, args_json, \
+                 (run_id, job_id, session_id, workflow_id, project_id, execution_id, \
+                  anchor_branch, worktree_mode, package_path, script_path, args_json, \
                   working_dir, output_name, node_path, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     row.run_id.as_str(),
                     row.job_id.as_str(),
                     row.session_id.as_deref(),
                     row.workflow_id.as_str(),
+                    row.project_id.as_str(),
+                    row.execution_id.as_deref(),
+                    row.anchor_branch.as_deref(),
+                    row.worktree_mode.as_str(),
+                    row.package_path.as_str(),
                     row.script_path.as_str(),
                     row.args_json.as_str(),
                     row.working_dir.as_str(),
@@ -404,8 +446,9 @@ pub(crate) async fn load_all_workflow_run_rows(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT run_id, job_id, session_id, workflow_id, script_path, \
-                     args_json, working_dir, output_name, node_path \
+                    "SELECT run_id, job_id, session_id, workflow_id, project_id, execution_id, \
+                     anchor_branch, worktree_mode, package_path, script_path, args_json, \
+                     working_dir, output_name, node_path \
                      FROM workflow_run",
                     (),
                 )
@@ -417,11 +460,16 @@ pub(crate) async fn load_all_workflow_run_rows(
                     job_id: row.text(1)?,
                     session_id: row.opt_text(2)?,
                     workflow_id: row.text(3)?,
-                    script_path: row.text(4)?,
-                    args_json: row.text(5)?,
-                    working_dir: row.text(6)?,
-                    output_name: row.text(7)?,
-                    node_path: row.opt_text(8)?,
+                    project_id: row.opt_text(4)?.unwrap_or_default(),
+                    execution_id: row.opt_text(5)?,
+                    anchor_branch: row.opt_text(6)?,
+                    worktree_mode: row.text(7)?,
+                    package_path: row.opt_text(8)?.unwrap_or_default(),
+                    script_path: row.text(9)?,
+                    args_json: row.text(10)?,
+                    working_dir: row.text(11)?,
+                    output_name: row.text(12)?,
+                    node_path: row.opt_text(13)?,
                 });
             }
             Ok(out)
@@ -586,18 +634,32 @@ async fn respawn_workflow_run(
     )
     .await?;
 
+    let (repository_path, _) =
+        crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, &row.project_id)
+            .await
+            .map_err(|error| error.to_string())?;
     crate::backends::workflow::spawn_workflow_process(
         orch,
         crate::backends::workflow::WorkflowSpawnParams {
             run_id: row.run_id.clone(),
-            working_dir: row.working_dir.clone(),
+            project_id: row.project_id.clone(),
+            repository_path: PathBuf::from(
+                repository_path.ok_or("Workflow project has no local repository path")?,
+            ),
+            anchor_branch: row
+                .anchor_branch
+                .clone()
+                .ok_or("Workflow execution anchor has no logical branch")?,
+            worktree_mode: row.worktree_mode.clone(),
+            package_path: PathBuf::from(&row.package_path),
             script_path: PathBuf::from(&row.script_path),
             args_json: row.args_json.clone(),
             turn_id,
             session_id: Some(session_id),
             output_name: row.output_name.clone(),
         },
-    )?;
+    )
+    .await?;
     Ok(true)
 }
 
@@ -652,8 +714,9 @@ pub(crate) async fn load_workflow_run_row_by_job(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT run_id, job_id, session_id, workflow_id, script_path, \
-                     args_json, working_dir, output_name, node_path \
+                    "SELECT run_id, job_id, session_id, workflow_id, project_id, execution_id, \
+                     anchor_branch, worktree_mode, package_path, script_path, args_json, \
+                     working_dir, output_name, node_path \
                      FROM workflow_run WHERE job_id = ?1 LIMIT 1",
                     (job_id.as_str(),),
                 )
@@ -664,11 +727,16 @@ pub(crate) async fn load_workflow_run_row_by_job(
                     job_id: row.text(1)?,
                     session_id: row.opt_text(2)?,
                     workflow_id: row.text(3)?,
-                    script_path: row.text(4)?,
-                    args_json: row.text(5)?,
-                    working_dir: row.text(6)?,
-                    output_name: row.text(7)?,
-                    node_path: row.opt_text(8)?,
+                    project_id: row.opt_text(4)?.unwrap_or_default(),
+                    execution_id: row.opt_text(5)?,
+                    anchor_branch: row.opt_text(6)?,
+                    worktree_mode: row.text(7)?,
+                    package_path: row.opt_text(8)?.unwrap_or_default(),
+                    script_path: row.text(9)?,
+                    args_json: row.text(10)?,
+                    working_dir: row.text(11)?,
+                    output_name: row.text(12)?,
+                    node_path: row.opt_text(13)?,
                 })),
                 None => Ok(None),
             }
@@ -780,7 +848,7 @@ async fn reset_run_for_redispatch(db: &LocalDb, run_id: &str, job_id: &str) -> R
 }
 
 /// Spawn the supervised `bun <script>` process for a prepared workflow run.
-pub(crate) fn start_workflow_run(
+pub(crate) async fn start_workflow_run(
     orch: &Orchestrator,
     prepared: &PreparedWorkflowRun,
 ) -> Result<(), String> {
@@ -788,7 +856,11 @@ pub(crate) fn start_workflow_run(
         orch,
         crate::backends::workflow::WorkflowSpawnParams {
             run_id: prepared.run_id.clone(),
-            working_dir: prepared.working_dir.clone(),
+            project_id: prepared.project_id.clone(),
+            repository_path: prepared.repository_path.clone(),
+            anchor_branch: prepared.anchor_branch.clone(),
+            worktree_mode: prepared.worktree_mode.clone(),
+            package_path: prepared.package_path.clone(),
             script_path: prepared.script_path.clone(),
             args_json: prepared.args_json.clone(),
             turn_id: prepared.turn_id.clone(),
@@ -796,6 +868,7 @@ pub(crate) fn start_workflow_run(
             output_name: prepared.output_name.clone(),
         },
     )
+    .await
 }
 
 /// The addressing a standalone launch returns so the UI can open the new
@@ -1002,7 +1075,7 @@ pub async fn launch_standalone_workflow(
         },
     )?;
 
-    if let Err(e) = start_workflow_run(orch, &prepared) {
+    if let Err(e) = start_workflow_run(orch, &prepared).await {
         // The anchor (issue + execution + job/run/turn) and the `workflow_run`
         // re-dispatch record are already persisted. A spawn failure (missing
         // `bun`, MCP auth, a process-spawn error) must NOT leave a durable issue
@@ -1082,6 +1155,11 @@ mod redispatch_tests {
             job_id: "j-wf".to_string(),
             session_id: Some("sess".to_string()),
             workflow_id: "deep-research".to_string(),
+            project_id: "p".to_string(),
+            execution_id: Some("e".to_string()),
+            anchor_branch: Some("agent/PRJ-9-parent".to_string()),
+            worktree_mode: "inherit".to_string(),
+            package_path: "/wf".to_string(),
             script_path: "/wf/main.ts".to_string(),
             args_json: "{\"q\":1}".to_string(),
             working_dir: "/tmp/wf".to_string(),
@@ -1201,6 +1279,11 @@ mod redispatch_tests {
             job_id: job,
             session_id: Some(format!("sess-{tag}")),
             workflow_id: "deep-research".to_string(),
+            project_id: "p".to_string(),
+            execution_id: Some("e".to_string()),
+            anchor_branch: Some("main".to_string()),
+            worktree_mode: "none".to_string(),
+            package_path: "/wf".to_string(),
             script_path: "/wf/main.ts".to_string(),
             args_json: "{}".to_string(),
             working_dir: "/tmp/wf".to_string(),
@@ -1262,6 +1345,11 @@ mod redispatch_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].run_id, "wf-run");
         assert_eq!(rows[0].script_path, "/wf/main.ts");
+        assert_eq!(rows[0].project_id, "p");
+        assert_eq!(rows[0].execution_id.as_deref(), Some("e"));
+        assert_eq!(rows[0].anchor_branch.as_deref(), Some("agent/PRJ-9-parent"));
+        assert_eq!(rows[0].worktree_mode, "inherit");
+        assert_eq!(rows[0].package_path, "/wf");
         assert_eq!(rows[0].args_json, "{\"q\":1}");
         assert_eq!(rows[0].node_path.as_deref(), Some("/repo/node_modules"));
         delete_workflow_run_row(&db, "wf-run").await.unwrap();

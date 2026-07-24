@@ -61,7 +61,7 @@ pub(super) async fn resolve_run_item(
             } else {
                 command.to_string()
             };
-            let header = command.clone();
+            let header = item_header(item, &command);
             (
                 header,
                 Ok(RunSpec::Shell {
@@ -72,7 +72,7 @@ pub(super) async fn resolve_run_item(
         }
         ["target"] => {
             let target = item.target.as_deref().unwrap_or_default();
-            let header = target.to_string();
+            let header = item_header(item, target);
             // Branch on the target URI family: MCP gateway tool calls are
             // proxied RPC; everything else is a skill-script process exec.
             match cairn_common::uri::parse_uri(target) {
@@ -91,6 +91,62 @@ pub(super) async fn resolve_run_item(
     }
 }
 
+fn resolve_matlab_spec(
+    code: &str,
+    matlab_binary: Option<std::path::PathBuf>,
+) -> Result<(String, Vec<String>, Option<String>), String> {
+    let program = matlab_binary.ok_or_else(|| {
+        "MATLAB was not found on the agent PATH or in /Applications/MATLAB_R*.app/bin/matlab. Install MATLAB there or add its bin directory to PATH, then read cairn://skills/matlab for setup guidance."
+            .to_string()
+    })?;
+    Ok((
+        program.to_string_lossy().into_owned(),
+        vec!["-batch".to_string(), code.to_string()],
+        None,
+    ))
+}
+
+/// Resolve PATH first so explicit user configuration wins. A Finder-launched
+/// macOS app often lacks MATLAB on PATH, so fall back to the newest release in
+/// the standard application directory.
+fn discover_matlab_binary() -> Option<std::path::PathBuf> {
+    if let Ok(path) = crate::env::find_binary_on_agent_path("matlab") {
+        return Some(path.into());
+    }
+    discover_macos_matlab_in(std::path::Path::new("/Applications"))
+}
+
+#[cfg(target_os = "macos")]
+fn discover_macos_matlab_in(applications: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut candidates = std::fs::read_dir(applications)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name.starts_with("MATLAB_R") && name.ends_with(".app"))
+                .then(|| entry.path().join("bin/matlab"))
+        })
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.pop()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn discover_macos_matlab_in(_applications: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
+}
+
+fn item_header(item: &RunItem, fallback: &str) -> String {
+    item.description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 /// Resolve a `repl`-keyed item into a header + `ReplSend` spec. `repl` requires
 /// inline `code` + an `interpreter` matching a supported REPL language, and
 /// rejects `command`/`target`/`payload`. The interpreter is validated to parse
@@ -98,10 +154,7 @@ pub(super) async fn resolve_run_item(
 /// actual language.
 fn resolve_repl_send(item: &RunItem, slug: &str) -> (String, Result<RunSpec, String>) {
     let code = item.code.as_deref().unwrap_or_default();
-    let header = item
-        .description
-        .clone()
-        .unwrap_or_else(|| first_line_header(code));
+    let header = item_header(item, &first_line_header(code));
     let slug = slug.trim();
     if slug.is_empty() {
         return (
@@ -172,10 +225,7 @@ fn resolve_repl_send(item: &RunItem, slug: &str) -> (String, Result<RunSpec, Str
 /// TypeScript gets zero-config `@cairn/sdk` from the worktree `node_modules`.
 fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
     let code = item.code.as_deref().unwrap_or_default();
-    let header = item
-        .description
-        .clone()
-        .unwrap_or_else(|| first_line_header(code));
+    let header = item_header(item, &first_line_header(code));
 
     // `payload` (args / args_json) is meaningless for inline code — reject it so
     // the item kinds stay cleanly separated rather than silently dropping it.
@@ -191,7 +241,7 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
         None => {
             return (
                 header,
-                Err("Run item has `code` but no `interpreter`; set `interpreter` to one of: typescript (ts), javascript (js), python (py)".to_string()),
+                Err("Run item has `code` but no `interpreter`; set `interpreter` to one of: typescript (ts), javascript (js), python (py), matlab".to_string()),
             )
         }
     };
@@ -208,11 +258,15 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
         // The env probe is isolated from the pure ladder so the decision logic
         // stays hermetically testable.
         "python" | "py" => resolve_python_spec(code, uv_on_agent_path()),
+        "matlab" => match resolve_matlab_spec(code, discover_matlab_binary()) {
+            Ok(spec) => spec,
+            Err(error) => return (header, Err(error)),
+        },
         other => {
             return (
                 header,
                 Err(format!(
-                    "Run item has an unknown `interpreter` '{other}'; accepted values: typescript (ts), javascript (js), python (py)"
+                    "Run item has an unknown `interpreter` '{other}'; accepted values: typescript (ts), javascript (js), python (py), matlab"
                 )),
             )
         }
@@ -512,7 +566,18 @@ mod tests {
             interpreter: interpreter.map(str::to_string),
             background: None,
             repl: None,
+            wait_for: None,
         }
+    }
+
+    #[test]
+    fn run_item_header_prefers_a_nonempty_description() {
+        let mut item = code_item("echo hidden", Some("ts"));
+        item.description = Some("Measure runner response".to_string());
+        assert_eq!(item_header(&item, "echo hidden"), "Measure runner response");
+
+        item.description = Some("  ".to_string());
+        assert_eq!(item_header(&item, "echo visible"), "echo visible");
     }
 
     fn script(spec: Result<RunSpec, String>) -> (String, Vec<String>) {
@@ -573,6 +638,41 @@ mod tests {
     }
 
     #[test]
+    fn resolve_matlab_spec_uses_direct_batch_argv() {
+        let (program, args, stdin) = resolve_matlab_spec(
+            "disp('hello world')",
+            Some(std::path::PathBuf::from("/opt/matlab/bin/matlab")),
+        )
+        .unwrap();
+        assert_eq!(program, "/opt/matlab/bin/matlab");
+        assert_eq!(args, vec!["-batch", "disp('hello world')"]);
+        assert_eq!(stdin, None);
+    }
+
+    #[test]
+    fn resolve_matlab_spec_missing_binary_is_actionable() {
+        let error = resolve_matlab_spec("disp(1)", None).unwrap_err();
+        assert!(error.contains("/Applications/MATLAB_R*.app/bin/matlab"));
+        assert!(error.contains("PATH"));
+        assert!(error.contains("cairn://skills/matlab"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn matlab_application_fallback_picks_newest_release() {
+        let dir = tempfile::tempdir().unwrap();
+        for release in ["MATLAB_R2024b.app", "MATLAB_R2025a.app"] {
+            let bin = dir.path().join(release).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("matlab"), "").unwrap();
+        }
+        assert_eq!(
+            discover_macos_matlab_in(dir.path()).unwrap(),
+            dir.path().join("MATLAB_R2025a.app/bin/matlab")
+        );
+    }
+
+    #[test]
     fn resolve_code_spec_missing_interpreter_errors() {
         let (_h, spec) = resolve_code_spec(&code_item("print(1)", None));
         let err = err(spec);
@@ -584,7 +684,7 @@ mod tests {
         let (_h, spec) = resolve_code_spec(&code_item("puts 1", Some("ruby")));
         let err = err(spec);
         assert!(
-            err.contains("typescript") && err.contains("python"),
+            err.contains("typescript") && err.contains("python") && err.contains("matlab"),
             "the error must name the accepted set: {err}"
         );
     }

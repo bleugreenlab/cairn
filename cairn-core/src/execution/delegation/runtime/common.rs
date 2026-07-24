@@ -67,10 +67,7 @@ where
 /// satisfies the resume gate. Walking back through any pending dependency-unblock
 /// successors to the real executing turn makes concurrent task spawns coalesce
 /// onto one shared wait (all anchored to T1, sharing successor S1).
-pub(super) async fn resolve_delegated_wait_anchor(
-    db: &LocalDb,
-    current_turn_id: &str,
-) -> Option<String> {
+async fn resolve_delegated_wait_anchor(db: &LocalDb, current_turn_id: &str) -> Option<String> {
     let mut turn_id = current_turn_id.to_string();
     // Bounded walk: with coalescing, chains never form, but guard regardless
     // (also collapses any chain left by an older build).

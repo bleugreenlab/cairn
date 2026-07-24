@@ -30,36 +30,13 @@ use crate::storage::TeamId;
 /// sha256 of this framed object (see [`content_hash`]), so a fetched object can
 /// be verified against the `pack_hash` pointer that addressed it. One object,
 /// one fetch, one column.
-pub fn frame_pack(pack: &[u8], idx: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16 + pack.len() + idx.len());
-    out.extend_from_slice(&(pack.len() as u64).to_le_bytes());
-    out.extend_from_slice(pack);
-    out.extend_from_slice(&(idx.len() as u64).to_le_bytes());
-    out.extend_from_slice(idx);
-    out
-}
+pub use cairn_codec::transfer::frame_pack;
 
 /// Split a framed pack object (see [`frame_pack`]) back into `(pack, pack_idx)`.
 /// `None` on malformed framing (a truncated or corrupt object), which
 /// reconstruction treats as a missing pack and degrades to a labeled stub.
-pub fn unframe_pack(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    fn take_len(bytes: &[u8], cur: &mut usize) -> Option<usize> {
-        let end = cur.checked_add(8)?;
-        let slice = bytes.get(*cur..end)?;
-        let mut len = [0u8; 8];
-        len.copy_from_slice(slice);
-        *cur = end;
-        usize::try_from(u64::from_le_bytes(len)).ok()
-    }
-    let mut cur = 0usize;
-    let pack_len = take_len(bytes, &mut cur)?;
-    let pack_end = cur.checked_add(pack_len)?;
-    let pack = bytes.get(cur..pack_end)?.to_vec();
-    cur = pack_end;
-    let idx_len = take_len(bytes, &mut cur)?;
-    let idx_end = cur.checked_add(idx_len)?;
-    let idx = bytes.get(cur..idx_end)?.to_vec();
-    Some((pack, idx))
+pub(crate) fn unframe_pack(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    cairn_codec::transfer::unframe_pack(bytes).ok()
 }
 
 /// The content-store key for `bytes`: their sha256 as lowercase hex.

@@ -137,6 +137,7 @@ pub(super) async fn apply_skill_create(
         description: description.to_string(),
         prompt: prompt.to_string(),
         allowed_tools,
+        bundles: Vec::new(),
         is_project_scoped,
         file_path: std::path::PathBuf::new(),
         dir_path: std::path::PathBuf::new(),

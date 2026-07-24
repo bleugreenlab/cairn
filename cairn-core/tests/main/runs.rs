@@ -617,7 +617,9 @@ async fn list_events_for_session_spans_reseed_rotation_lineage() {
     );
 
     // The initial delta load carries the same full lineage.
-    let delta = queries::list_events_for_session_delta(db.clone(), "session-new", None).unwrap();
+    let delta =
+        queries::list_events_for_job_session_delta(db.clone(), "job-1", "session-new", None)
+            .unwrap();
     assert_eq!(
         delta
             .events
@@ -717,13 +719,39 @@ async fn list_events_for_session_excludes_cross_job_fork_parent() {
     )
     .await;
 
-    let events = queries::list_events_for_session(db.clone(), "fork-session").unwrap();
+    let parent = queries::list_events_for_job_session_delta(
+        db.clone(),
+        "job-parent",
+        "parent-session",
+        None,
+    )
+    .unwrap();
     assert_eq!(
-        events
+        parent
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["parent-ev"]
+    );
+
+    let child =
+        queries::list_events_for_job_session_delta(db.clone(), "job-child", "fork-session", None)
+            .unwrap();
+    assert_eq!(
+        child
+            .events
             .iter()
             .map(|event| event.id.as_str())
             .collect::<Vec<_>>(),
         vec!["fork-ev"]
+    );
+
+    let error = queries::list_events_for_job_session_delta(db, "job-parent", "fork-session", None)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "session fork-session belongs to job job-child, not requested job job-parent"
     );
 }
 

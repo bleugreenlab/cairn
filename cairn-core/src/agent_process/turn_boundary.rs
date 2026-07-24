@@ -22,13 +22,13 @@ pub struct TurnBoundaryChecker {
 }
 
 impl TurnBoundaryChecker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Update state based on an incoming event.
     /// Returns true if we're at a safe injection boundary after this event.
-    pub fn update(&mut self, event: &TranscriptEvent) -> bool {
+    pub(crate) fn update(&mut self, event: &TranscriptEvent) -> bool {
         // Result events are always definitive boundaries
         if event.event_type.starts_with("result:") {
             self.pending_tool_ids.clear();
@@ -80,13 +80,13 @@ impl TurnBoundaryChecker {
 
     /// Check if we're currently at a safe boundary (without updating state)
     #[cfg(test)]
-    pub fn is_at_boundary(&self) -> bool {
+    fn is_at_boundary(&self) -> bool {
         self.at_definitive_boundary || self.pending_tool_ids.is_empty()
     }
 
     /// Get the number of pending tool calls
     #[cfg(test)]
-    pub fn pending_tool_count(&self) -> usize {
+    fn pending_tool_count(&self) -> usize {
         self.pending_tool_ids.len()
     }
 
@@ -101,7 +101,7 @@ impl TurnBoundaryChecker {
 /// Return true exactly once when a terminal artifact/tool flag is armed and the
 /// reader has reached a safe turn boundary. The caller performs the actual
 /// backend interrupt after this returns true.
-pub fn should_interrupt_terminal_tool_at_boundary(
+pub(crate) fn should_interrupt_terminal_tool_at_boundary(
     terminal_tool_called: &AtomicBool,
     at_boundary: bool,
     already_suspended: &mut bool,

@@ -24,7 +24,7 @@ use cairn_core::internal::storage::{
     DbError, DbResult, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
 };
 use cairn_db::turso::params;
-use cairn_executor::{BuildSlotPool as ExecutorPool, ExecutorRuntime};
+use cairn_executor::{ExecutorRuntime, Fleet as ExecutorPool};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tokio::sync::mpsc;
@@ -106,24 +106,37 @@ fn attach_executor(
     projects_served: Vec<String>,
 ) {
     let projects_served = Arc::new(projects_served);
-    let core_pool = orch.build_slots.clone();
+    let core_pool = orch.fleet.clone();
     let snapshot_pool = core_pool.clone();
     let generation = Arc::new(AtomicU64::new(0));
     let snapshot_generation = generation.clone();
     let callback_pool = core_pool.clone();
     let callback_orch = orch.clone();
-    let runtime = ExecutorRuntime::new(executor_home, jj_bin().unwrap_or_else(|| "jj".to_string()))
-        .with_snapshot_callback(move |snapshot| {
+    let lifetime_event_pool = core_pool.clone();
+    let lifetime_event_generation = generation.clone();
+    let runtime = ExecutorRuntime::new(executor_home)
+        .with_snapshot_callback(move |snapshot, health| {
             snapshot_pool.handle_executor_message(
                 executor_id,
                 snapshot_generation.load(Ordering::Acquire),
-                ExecutorMessage::SnapshotUpdated { snapshot },
+                ExecutorMessage::SnapshotUpdated { snapshot, health },
             );
         })
         .with_runner_callback(move |callback| {
             let pool = callback_pool.clone();
             let orch = callback_orch.clone();
             Box::pin(async move { pool.handle_runner_callback(&orch, callback).await })
+        })
+        .with_lifetime_process_event_callback(move |event| {
+            let pool = lifetime_event_pool.clone();
+            let generation = lifetime_event_generation.clone();
+            Box::pin(async move {
+                pool.handle_executor_message(
+                    executor_id,
+                    generation.load(Ordering::Acquire),
+                    ExecutorMessage::LifetimeProcessEvent { event },
+                );
+            })
         });
     let executor_pool = ExecutorPool::new(runtime);
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -150,7 +163,6 @@ fn attach_executor(
                 logical_cores: 1,
                 toolchains: Vec::new(),
                 projects_served: projects_served.as_ref().clone(),
-                slot_capacity: usize::MAX,
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
             },
@@ -160,6 +172,7 @@ fn attach_executor(
         },
         tx,
         colocated,
+        None,
     );
     generation.store(attached_generation, Ordering::Release);
     executor_pool.configure_object_channel(
@@ -218,7 +231,6 @@ fn attach_executor(
                                         logical_cores: 1,
                                         toolchains: Vec::new(),
                                         projects_served: projects_served.as_ref().clone(),
-                                        slot_capacity: usize::MAX,
                                         disk_budget_bytes: None,
                                         memory_budget_bytes: None,
                                     },
@@ -236,6 +248,24 @@ fn attach_executor(
                 ExecutorMessage::CancelJob { job_id } => {
                     executor_pool.cancel_job_requests(&job_id);
                 }
+                ExecutorMessage::LifetimeLeaseRequest {
+                    correlation_id,
+                    operation,
+                } => {
+                    let executor_pool = executor_pool.clone();
+                    let core_pool = core_pool.clone();
+                    tokio::spawn(async move {
+                        let result = executor_pool.operate_lifetime_lease(operation).await;
+                        core_pool.handle_executor_message(
+                            executor_id,
+                            attached_generation,
+                            ExecutorMessage::LifetimeLeaseResponse {
+                                correlation_id,
+                                result,
+                            },
+                        );
+                    });
+                }
                 ExecutorMessage::SnapshotRequest { correlation_id } => {
                     core_pool.handle_executor_message(
                         executor_id,
@@ -243,6 +273,7 @@ fn attach_executor(
                         ExecutorMessage::SnapshotResponse {
                             correlation_id,
                             snapshot: executor_pool.snapshot(),
+                            health: executor_pool.substrate_report(),
                         },
                     );
                 }

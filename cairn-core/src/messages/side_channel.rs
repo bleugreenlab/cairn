@@ -22,18 +22,18 @@ pub enum SideChannelOrigin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SideChannelNotice {
-    pub id: String,
-    pub parent_job_id: String,
-    pub child_uri: String,
-    pub content: String,
+    pub(crate) id: String,
+    pub(crate) parent_job_id: String,
+    pub(crate) child_uri: String,
+    pub(crate) content: String,
     #[serde(default)]
-    pub origin: SideChannelOrigin,
-    pub created_at: i64,
-    pub delivered_at: Option<i64>,
+    pub(crate) origin: SideChannelOrigin,
+    pub(crate) created_at: i64,
+    pub(crate) delivered_at: Option<i64>,
 }
 
 impl SideChannelNotice {
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         match &self.origin {
             SideChannelOrigin::UserChild => format!(
                 "[Side-channel] the user messaged your child {}:\n{}",
@@ -64,7 +64,7 @@ impl SideChannelNotice {
         }
     }
 
-    pub fn channel_type(&self) -> &'static str {
+    pub(crate) fn channel_type(&self) -> &'static str {
         match &self.origin {
             SideChannelOrigin::UserChild => "child_side_channel",
             SideChannelOrigin::IssueComment { .. } => "issue_comment",
@@ -173,21 +173,7 @@ fn notice_from_wake(wake: crate::orchestrator::wakes::SuppressedWake) -> SideCha
     }
 }
 
-pub fn record_user_child_side_channel(
-    orch: &Orchestrator,
-    child_issue_id: &str,
-    child_uri: &str,
-    content: &str,
-) -> Result<Option<SideChannelNotice>, String> {
-    let child_issue_id = child_issue_id.to_string();
-    let child_uri = child_uri.to_string();
-    let content = content.to_string();
-    run_db_blocking(move || async move {
-        record_user_child_side_channel_async(orch, &child_issue_id, &child_uri, &content).await
-    })
-}
-
-pub async fn record_user_child_side_channel_async(
+async fn record_user_child_side_channel_async(
     orch: &Orchestrator,
     child_issue_id: &str,
     child_uri: &str,
@@ -218,29 +204,6 @@ pub async fn record_user_child_side_channel_async(
     Ok(None)
 }
 
-pub fn record_issue_comment_side_channel(
-    orch: &Orchestrator,
-    issue_id: &str,
-    source: &str,
-    content: &str,
-    exclude_job_id: Option<&str>,
-) -> Result<usize, String> {
-    let issue_id = issue_id.to_string();
-    let source = source.to_string();
-    let content = content.to_string();
-    let exclude_job_id = exclude_job_id.map(ToString::to_string);
-    run_db_blocking(move || async move {
-        record_issue_comment_side_channel_async(
-            orch,
-            &issue_id,
-            &source,
-            &content,
-            exclude_job_id.as_deref(),
-        )
-        .await
-    })
-}
-
 pub async fn record_issue_comment_side_channel_async(
     orch: &Orchestrator,
     issue_id: &str,
@@ -259,7 +222,7 @@ pub async fn record_issue_comment_side_channel_async(
     .await
 }
 
-pub async fn record_issue_comment_side_channel_for_intent_async(
+pub(crate) async fn record_issue_comment_side_channel_for_intent_async(
     orch: &Orchestrator,
     issue_id: &str,
     source: &str,
@@ -343,30 +306,7 @@ async fn record_issue_side_channel_async(
     Ok(delivered)
 }
 
-pub fn record_issue_message_side_channel(
-    orch: &Orchestrator,
-    issue_id: &str,
-    source: &str,
-    content: &str,
-    exclude_job_id: Option<&str>,
-) -> Result<usize, String> {
-    let issue_id = issue_id.to_string();
-    let source = source.to_string();
-    let content = content.to_string();
-    let exclude_job_id = exclude_job_id.map(ToString::to_string);
-    run_db_blocking(move || async move {
-        record_issue_message_side_channel_async(
-            orch,
-            &issue_id,
-            &source,
-            &content,
-            exclude_job_id.as_deref(),
-        )
-        .await
-    })
-}
-
-pub async fn record_issue_message_side_channel_async(
+async fn record_issue_message_side_channel_async(
     orch: &Orchestrator,
     issue_id: &str,
     source: &str,
@@ -385,7 +325,7 @@ pub async fn record_issue_message_side_channel_async(
     .await
 }
 
-pub async fn record_issue_message_side_channel_by_issue_number(
+pub(crate) async fn record_issue_message_side_channel_by_issue_number(
     orch: &Orchestrator,
     project_key: &str,
     issue_number: i32,
@@ -400,7 +340,7 @@ pub async fn record_issue_message_side_channel_by_issue_number(
     record_issue_message_side_channel_async(orch, &issue_id, source, content, exclude_job_id).await
 }
 
-pub async fn record_user_child_side_channel_by_issue_number(
+pub(crate) async fn record_user_child_side_channel_by_issue_number(
     orch: &Orchestrator,
     project_key: &str,
     issue_number: i32,
@@ -415,40 +355,7 @@ pub async fn record_user_child_side_channel_by_issue_number(
     record_user_child_side_channel_async(orch, &child_issue_id, child_uri, content).await
 }
 
-pub fn record_user_child_side_channel_for_job(
-    orch: &Orchestrator,
-    child_job_id: &str,
-    content: &str,
-) -> Result<Option<SideChannelNotice>, String> {
-    let child_job_id = child_job_id.to_string();
-    let content = content.to_string();
-    run_db_blocking(move || async move {
-        let Some((child_issue_id, child_uri)) =
-            child_issue_and_uri_for_job(&orch.db.local, &child_job_id).await?
-        else {
-            return Ok(None);
-        };
-        record_user_child_side_channel_async(orch, &child_issue_id, &child_uri, &content).await
-    })
-}
-
-/// Non-stamping read of the pending side-channel notices for `job_id`.
-///
-/// Mirrors the SELECT in [`claim_pending_side_channel_for_job`] but does NOT
-/// stamp `delivered_at`, so the flush-on-idle path can decide whether to resume
-/// the parent job before committing to delivery. Delivery is stamped via
-/// [`claim_pending_side_channel_for_job`] only after the resume succeeds.
-pub fn peek_pending_side_channel_for_job(
-    db: &LocalDb,
-    job_id: &str,
-) -> Result<Vec<SideChannelNotice>, String> {
-    let job_id = job_id.to_string();
-    run_db_blocking(
-        move || async move { peek_pending_side_channel_for_job_async(db, &job_id).await },
-    )
-}
-
-pub async fn peek_pending_side_channel_for_job_async(
+pub(crate) async fn peek_pending_side_channel_for_job_async(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<SideChannelNotice>, String> {
@@ -457,7 +364,7 @@ pub async fn peek_pending_side_channel_for_job_async(
         .map(|rows| rows.into_iter().map(notice_from_wake).collect())
 }
 
-pub fn claim_pending_side_channel_for_job(
+pub(crate) fn claim_pending_side_channel_for_job(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<SideChannelNotice>, String> {
@@ -467,7 +374,7 @@ pub fn claim_pending_side_channel_for_job(
     )
 }
 
-pub async fn claim_pending_side_channel_for_job_async(
+pub(crate) async fn claim_pending_side_channel_for_job_async(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<SideChannelNotice>, String> {
@@ -476,12 +383,7 @@ pub async fn claim_pending_side_channel_for_job_async(
         .map(|rows| rows.into_iter().map(notice_from_wake).collect())
 }
 
-pub fn stamp_delivered_by_id(db: &LocalDb, id: &str) -> Result<(), String> {
-    let id = id.to_string();
-    run_db_blocking(move || async move { stamp_delivered_by_id_async(db, &id).await })
-}
-
-pub async fn stamp_delivered_by_id_async(db: &LocalDb, id: &str) -> Result<(), String> {
+pub(crate) async fn stamp_delivered_by_id_async(db: &LocalDb, id: &str) -> Result<(), String> {
     let id = id.to_string();
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
@@ -504,7 +406,7 @@ pub async fn stamp_delivered_by_id_async(db: &LocalDb, id: &str) -> Result<(), S
     .map_err(|error| format!("Failed to dismiss pending side-channel wake message: {error}"))
 }
 
-pub async fn job_id_for_run(db: &LocalDb, run_id: &str) -> Option<String> {
+pub(crate) async fn job_id_for_run(db: &LocalDb, run_id: &str) -> Option<String> {
     let run_id = run_id.to_string();
     db.read(|conn| {
         let run_id = run_id.clone();
@@ -575,61 +477,6 @@ async fn issue_id_for_key_number(
     })
     .await
     .map_err(|error| error.to_string())
-}
-
-async fn child_issue_and_uri_for_job(
-    db: &LocalDb,
-    child_job_id: &str,
-) -> Result<Option<(String, String)>, String> {
-    let child_job_id = child_job_id.to_string();
-    let resolved: Option<(String, String, i32, i32)> = db
-        .read(|conn| {
-            let child_job_id = child_job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT i.id, p.key, i.number, e.seq
-                         FROM jobs j
-                         JOIN issues i ON j.issue_id = i.id
-                         JOIN projects p ON i.project_id = p.id
-                         JOIN executions e ON j.execution_id = e.id
-                         WHERE j.id = ?1
-                         LIMIT 1",
-                        params![child_job_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        Ok((
-                            row.text(0)?,
-                            row.text(1)?,
-                            row.i64(2)? as i32,
-                            row.i64(3)? as i32,
-                        ))
-                    })
-                    .transpose()
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let Some((issue_id, project_key, issue_number, exec_seq)) = resolved else {
-        return Ok(None);
-    };
-    let Some(segment) = crate::jobs::queries::node_uri_segment_for_job(db, &child_job_id).await
-    else {
-        return Ok(None);
-    };
-    let parent_segment = crate::jobs::queries::parent_uri_segment_for_job(db, &child_job_id).await;
-    let child_uri = cairn_common::uri::build_job_base_uri(
-        &project_key,
-        issue_number,
-        exec_seq,
-        &segment,
-        parent_segment.as_deref(),
-    );
-    Ok(Some((issue_id, child_uri)))
 }
 
 #[cfg(test)]

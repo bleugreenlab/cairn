@@ -56,35 +56,35 @@ pub enum Resolution {
 #[derive(Debug, Clone)]
 pub struct JobFacts {
     /// Upstream control dependencies are satisfied (`is_job_ready_conn`).
-    pub dag_ready: bool,
+    pub(crate) dag_ready: bool,
     /// Some upstream control-dependency job is `Failed`.
-    pub upstream_failed: bool,
+    pub(crate) upstream_failed: bool,
     /// The latest turn for the job is live (Running/Pending/Yielded). Host waits
     /// (Yielded) keep the job Running.
-    pub live_turn: bool,
+    pub(crate) live_turn: bool,
     /// The latest turn ended in genuine failure (`TurnState::Failed`).
     /// Interrupt/Cancel are user-initiated pauses, NOT failures — they leave the
     /// job resumable (no terminal turn) so it never cascades to downstream.
-    pub turn_failed: bool,
+    pub(crate) turn_failed: bool,
     /// The latest turn completed successfully.
-    pub turn_complete: bool,
+    pub(crate) turn_complete: bool,
     /// The checkpoint classification of the job's node.
-    pub checkpoint: CheckpointGate,
+    pub(crate) checkpoint: CheckpointGate,
     /// The resolution of the blocking gate.
-    pub resolution: Resolution,
+    pub(crate) resolution: Resolution,
     /// The node declares an output contract — either its own output schema, or
     /// it feeds a downstream consumer's input schema (e.g. a builder feeding a
     /// `pr` node's `create-pr`). It was told to produce a `cairn:~/<name>`
     /// artifact, so completing without one is a soft-lock, not a real finish.
-    pub requires_output: bool,
+    pub(crate) requires_output: bool,
     /// An artifact row exists for this job (the declared output was produced).
-    pub artifact_present: bool,
+    pub(crate) artifact_present: bool,
     /// The node derives as long-running from its recipe's topology (a
     /// contract-less control-terminal in a recipe with no terminal action node):
     /// at clean turn-end with no unmet output contract it settles Idle
     /// (non-terminal, resumable) instead of Complete, so it keeps taking wakes
     /// until the issue is closed. Sourced from `is_long_running_node`, not a flag.
-    pub long_running: bool,
+    pub(crate) long_running: bool,
 }
 
 impl JobFacts {
@@ -136,7 +136,7 @@ impl JobFacts {
 /// already ran to completion is not retroactively failed by an upstream that
 /// fails later — its work stands. Cascade (rung 4) therefore only reaches jobs
 /// that have not produced a terminal turn (unstarted, or a checkpoint node).
-pub fn derive_job_status(facts: &JobFacts) -> JobStatus {
+pub(crate) fn derive_job_status(facts: &JobFacts) -> JobStatus {
     // 1. A live turn is active work — never preempted by cascade or readiness.
     if facts.live_turn {
         return JobStatus::Running;

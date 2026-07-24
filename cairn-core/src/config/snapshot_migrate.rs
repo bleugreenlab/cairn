@@ -35,7 +35,7 @@ pub fn load(json: &str) -> Result<ExecutionSnapshot, String> {
 /// active backend; extras are recovered from the frozen preset matrix when
 /// present. Clears the legacy fields and the frozen presets afterward so the
 /// atomic field is the single representation going forward.
-pub fn migrate_on_read(snapshot: &mut ExecutionSnapshot) {
+fn migrate_on_read(snapshot: &mut ExecutionSnapshot) {
     let frozen = snapshot.presets.as_ref().map(PresetsConfig::from);
     for packet in &mut snapshot.delegated_packets {
         if packet.ownership.fence.is_none()

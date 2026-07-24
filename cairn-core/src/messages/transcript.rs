@@ -23,7 +23,7 @@ use std::sync::Arc;
 /// feeding the same transcript-event + reminder sink as directs and side-channel
 /// notices. Best-effort: an insert failure is logged and leaves the pushes
 /// pending to redeliver, matching the surrounding augmentation behaviour.
-pub async fn insert_attention_push_events(
+pub(crate) async fn insert_attention_push_events(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
@@ -79,7 +79,7 @@ pub async fn insert_attention_push_events(
 }
 
 /// Insert a general quiet system message with structured metadata.
-pub fn insert_system_message_sync(
+pub(crate) fn insert_system_message_sync(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
@@ -129,7 +129,7 @@ pub fn insert_system_message_sync(
 /// Insert a `user` transcript event per delivered queued user message, so the
 /// follow-ups the user queued show up as normal "You" blocks once delivered.
 /// Used by the tool-boundary `steer` delivery path in `dispatch`.
-pub async fn insert_queued_user_events(
+pub(crate) async fn insert_queued_user_events(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
@@ -178,7 +178,7 @@ pub async fn insert_queued_user_events(
 }
 
 /// Render side-channel notices for model prompt injection.
-pub fn render_side_channel_prompt_block(notices: &[SideChannelNotice]) -> String {
+pub(crate) fn render_side_channel_prompt_block(notices: &[SideChannelNotice]) -> String {
     notices
         .iter()
         .map(SideChannelNotice::render)
@@ -187,7 +187,7 @@ pub fn render_side_channel_prompt_block(notices: &[SideChannelNotice]) -> String
 }
 
 /// Insert a `system:message` event per delivered child side-channel notice.
-pub async fn insert_side_channel_events(
+pub(crate) async fn insert_side_channel_events(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
@@ -244,7 +244,7 @@ pub async fn insert_side_channel_events(
 
 /// Synchronous counterpart for resume-prompt construction, where the notices
 /// must be claimed and recorded before the backend receives the next turn.
-pub fn insert_side_channel_events_sync(
+pub(crate) fn insert_side_channel_events_sync(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
@@ -503,7 +503,7 @@ async fn next_event_sequence(conn: &cairn_db::turso::Connection, run_id: &str) -
 /// Look up `(session_id, run_id)` for the calling run. Useful for the dispatch
 /// augmentation path, which has run_id from the request but needs the
 /// session_id to attach the transcript event to the right session.
-pub async fn run_session_for_event(db: &LocalDb, run_id: &str) -> Option<String> {
+pub(crate) async fn run_session_for_event(db: &LocalDb, run_id: &str) -> Option<String> {
     let run_id = run_id.to_string();
     db.read(|conn| {
         let run_id = run_id.clone();

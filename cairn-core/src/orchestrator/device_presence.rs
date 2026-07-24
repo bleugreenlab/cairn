@@ -39,7 +39,7 @@ impl Orchestrator {
     }
 
     /// Upsert this machine's presence row into every currently-open team replica.
-    pub async fn upsert_device_presence_all_teams(&self, device_id: &str, device_name: &str) {
+    async fn upsert_device_presence_all_teams(&self, device_id: &str, device_name: &str) {
         for team_id in self.db.open_team_ids().await {
             let Some(team_db) = self.db.team_db(&team_id).await else {
                 continue;
@@ -53,7 +53,7 @@ impl Orchestrator {
 /// Project keys THIS machine has a local clone for, in one team — read from the
 /// private routing overlay (`project_routes.local_repo_path`), NOT the synced
 /// project rows (which carry the creator's path).
-pub async fn local_cloned_project_keys(private_db: &LocalDb, team_id: &str) -> Vec<String> {
+async fn local_cloned_project_keys(private_db: &LocalDb, team_id: &str) -> Vec<String> {
     let team_id = team_id.to_string();
     private_db
         .query_all(
@@ -68,7 +68,7 @@ pub async fn local_cloned_project_keys(private_db: &LocalDb, team_id: &str) -> V
 
 /// Upsert one machine's presence row into a team replica. Best-effort: a missing
 /// table or write error is logged and swallowed. Timestamps are SECONDS.
-pub async fn upsert_presence(
+async fn upsert_presence(
     team_db: &LocalDb,
     device_id: &str,
     device_name: &str,
@@ -109,12 +109,12 @@ pub async fn upsert_presence(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DevicePresence {
-    pub device_id: String,
-    pub device_name: String,
-    pub last_seen: i64,
+    device_id: String,
+    device_name: String,
+    last_seen: i64,
     /// Project keys this device has a local clone for.
-    pub project_keys: Vec<String>,
-    pub updated_at: i64,
+    project_keys: Vec<String>,
+    updated_at: i64,
 }
 
 /// Read all device-presence rows from one team replica (newest heartbeat first).

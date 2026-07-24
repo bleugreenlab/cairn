@@ -40,6 +40,10 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// port) before relaunching over it.
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bound startup reconciliation after a daemon launch. A foreground service
+/// should either become healthy or exit with its bind error almost immediately.
+const STARTUP_RECONCILE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The rustc-wrapper / CMake compiler launcher, compiled into the binary from
 /// its single source of truth `scripts/cache-wrapper.sh`. Installed to a stable
 /// host path at startup (see `install_cache_wrapper`) so the `RUSTC_WRAPPER` the
@@ -57,7 +61,7 @@ const CACHE_WRAPPER: &str = include_str!("../../../../../scripts/cache-wrapper.s
 /// on PATH (`exec "$@"`), so installing it is harmless even where the injected
 /// env is never used. Best-effort at the call site: a failure is logged, never
 /// fatal.
-pub(crate) fn install_cache_wrapper(cairn_home: &Path) -> std::io::Result<PathBuf> {
+fn install_cache_wrapper(cairn_home: &Path) -> std::io::Result<PathBuf> {
     let bin_dir = cairn_home.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
     let dest = bin_dir.join("cache-wrapper.sh");
@@ -77,7 +81,7 @@ pub(crate) fn install_cache_wrapper(cairn_home: &Path) -> std::io::Result<PathBu
 /// to its `state_dir` (or `cairn_home` as a harmless fallback) + temp + the
 /// configured write globs, and receives the service's own `env` so it knows
 /// where to listen / cache.
-pub(crate) fn build_service_spawn_config(
+fn build_service_spawn_config(
     cfg: &BuildServiceConfig,
     templates: &Templates,
     deny_read: Vec<PathBuf>,
@@ -118,7 +122,7 @@ pub(crate) fn build_service_spawn_config(
 }
 
 /// Launch one service daemon via the spawner under its service sandbox.
-pub(crate) fn launch_service(
+fn launch_service(
     spawner: &dyn ProcessSpawner,
     cfg: &BuildServiceConfig,
     templates: &Templates,
@@ -176,7 +180,7 @@ pub(crate) enum ServiceHealth {
 ///   that fails within the deadline is `Wedged`. The deadline is enforced here in
 ///   the (unfenced) runner process, never via a shell `timeout` (absent on macOS,
 ///   and it would run outside the fence anyway).
-pub(crate) fn probe_health(
+fn probe_health(
     spawner: &dyn ProcessSpawner,
     probe: &ReadyProbe,
     env: &HashMap<String, String>,
@@ -273,9 +277,222 @@ fn tcp_reachable(addr: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenerProcess {
+    pid: u32,
+    executable: PathBuf,
+}
+
+trait ListenerProcessControl: Send + Sync {
+    fn listener(&self, addr: &str) -> Result<Option<ListenerProcess>, String>;
+    fn terminate(&self, pid: u32) -> Result<(), String>;
+}
+
+struct OsListenerProcessControl;
+
+impl ListenerProcessControl for OsListenerProcessControl {
+    fn listener(&self, addr: &str) -> Result<Option<ListenerProcess>, String> {
+        let resolved: Vec<_> = addr
+            .to_socket_addrs()
+            .map_err(|e| format!("resolve TCP address '{addr}': {e}"))?
+            .collect();
+        let port = resolved
+            .first()
+            .map(|addr| addr.port().to_string())
+            .ok_or_else(|| format!("TCP address '{addr}' resolved to no endpoints"))?;
+        let endpoints: Vec<String> = resolved.iter().map(ToString::to_string).collect();
+        let output = crate::env::command("lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"])
+            .output()
+            .map_err(|e| format!("inspect listener on {addr}: {e}"))?;
+        if !output.status.success() && output.stdout.is_empty() {
+            return Ok(None);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some(pid) = listener_pid_from_lsof(&stdout, &endpoints)? else {
+            return Ok(None);
+        };
+        let executable = process_executable(pid)?;
+        Ok(Some(ListenerProcess { pid, executable }))
+    }
+
+    fn terminate(&self, pid: u32) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .map_err(|e| format!("terminate listener pid {pid}: {e}"))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Err("listener termination is unsupported on this platform".to_string())
+        }
+    }
+}
+
+fn listener_pid_from_lsof(output: &str, endpoints: &[String]) -> Result<Option<u32>, String> {
+    let mut current_pid = None;
+    let mut matches = Vec::new();
+    for line in output.lines() {
+        if let Some(pid) = line
+            .strip_prefix('p')
+            .and_then(|pid| pid.parse::<u32>().ok())
+        {
+            current_pid = Some(pid);
+            continue;
+        }
+        let Some(name) = line.strip_prefix('n') else {
+            continue;
+        };
+        let endpoint = name
+            .strip_prefix("TCP ")
+            .unwrap_or(name)
+            .strip_suffix(" (LISTEN)")
+            .unwrap_or(name);
+        if endpoints.iter().any(|expected| expected == endpoint) {
+            if let Some(pid) = current_pid {
+                matches.push(pid);
+            }
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [pid] => Ok(Some(*pid)),
+        _ => Err(format!(
+            "multiple listener processes matched configured endpoints {}: {:?}",
+            endpoints.join(", "),
+            matches
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable(pid: u32) -> Result<PathBuf, String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map_err(|e| format!("resolve executable for listener pid {pid}: {e}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_executable(pid: u32) -> Result<PathBuf, String> {
+    let output = crate::env::command("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .map_err(|e| format!("resolve executable for listener pid {pid}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "resolve executable for listener pid {pid}: ps failed"
+        ));
+    }
+    let executable = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if executable.is_empty() {
+        return Err(format!(
+            "resolve executable for listener pid {pid}: empty path"
+        ));
+    }
+    Ok(PathBuf::from(executable))
+}
+
+fn expected_service_executable(cfg: &BuildServiceConfig, templates: &Templates) -> Option<PathBuf> {
+    let program = cfg.expanded_start(templates).into_iter().next()?;
+    let path = PathBuf::from(&program);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        PathBuf::from(crate::env::find_binary(&program).ok()?)
+    };
+    Some(std::fs::canonicalize(&resolved).unwrap_or(resolved))
+}
+
+fn service_config_fingerprint(cfg: &BuildServiceConfig) -> String {
+    serde_json::to_string(cfg).unwrap_or_else(|_| format!("{cfg:?}"))
+}
+
+fn same_executable(actual: &Path, expected: &Path) -> bool {
+    let actual = std::fs::canonicalize(actual).unwrap_or_else(|_| actual.to_path_buf());
+    let expected = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+    actual == expected
+}
+
+fn recover_listener_conflict(
+    control: &dyn ListenerProcessControl,
+    addr: &str,
+    expected_executable: &Path,
+) -> Result<u32, String> {
+    let listener = control
+        .listener(addr)?
+        .ok_or_else(|| format!("sccache port conflict: no listener found on {addr}"))?;
+    if !same_executable(&listener.executable, expected_executable) {
+        return Err(format!(
+            "sccache port conflict: refusing to terminate pid {} at {} (expected {})",
+            listener.pid,
+            listener.executable.display(),
+            expected_executable.display()
+        ));
+    }
+    control.terminate(listener.pid)?;
+    Ok(listener.pid)
+}
+
+fn reconcile_launched_service(
+    spawner: &dyn ProcessSpawner,
+    control: &dyn ListenerProcessControl,
+    cfg: &BuildServiceConfig,
+    templates: &Templates,
+    deny_read: Vec<PathBuf>,
+) -> Result<Option<Box<dyn ChildProcess>>, String> {
+    let mut child = launch_service(spawner, cfg, templates, deny_read.clone())?;
+    let Some(probe) = cfg.ready.as_ref() else {
+        return Ok(Some(child));
+    };
+    let client_env = cfg.expanded_env(templates);
+    let deadline = std::time::Instant::now() + STARTUP_RECONCILE_TIMEOUT;
+    loop {
+        if probe_health(spawner, probe, &client_env, HEALTH_ROUND_TRIP_DEADLINE)
+            == ServiceHealth::Healthy
+        {
+            return match child.try_wait() {
+                Ok(Some(_)) => Ok(None),
+                Ok(None) | Err(_) => Ok(Some(child)),
+            };
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(HEALTH_POLL_INTERVAL);
+    }
+
+    let Some(addr) = probe.tcp.as_deref() else {
+        return Err("build service exited before becoming healthy".to_string());
+    };
+    let expected = expected_service_executable(cfg, templates).ok_or_else(|| {
+        "sccache port conflict: launch executable could not be resolved".to_string()
+    })?;
+
+    // A compatible server that won the startup race is safe to adopt. Only an
+    // unhealthy listener whose executable is exactly the configured service
+    // binary is eligible for termination; unrelated listeners are never killed.
+    if probe_health(spawner, probe, &client_env, HEALTH_ROUND_TRIP_DEADLINE)
+        == ServiceHealth::Healthy
+    {
+        return Ok(None);
+    }
+    recover_listener_conflict(control, addr, &expected)?;
+    let reap_deadline = std::time::Instant::now() + CHILD_REAP_TIMEOUT;
+    while tcp_reachable(addr) && std::time::Instant::now() < reap_deadline {
+        std::thread::sleep(HEALTH_POLL_INTERVAL);
+    }
+    launch_service(spawner, cfg, templates, deny_read).map(Some)
+}
+
 /// Merge the expanded client env of every enabled service. Injected into fenced
 /// agent spawns so their tooling connects to the Cairn-owned daemons.
-pub(crate) fn merge_client_env(
+fn merge_client_env(
     services: &HashMap<String, BuildServiceConfig>,
     templates: &Templates,
 ) -> HashMap<String, String> {
@@ -292,43 +509,60 @@ pub(crate) fn merge_client_env(
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildServiceRuntimeDiagnostic {
-    pub last_health: Option<String>,
-    pub last_checked_at: Option<i64>,
-    pub last_restart_at: Option<i64>,
-    pub last_restart_reason: Option<String>,
+    pub(crate) last_health: Option<String>,
+    pub(crate) last_checked_at: Option<i64>,
+    pub(crate) last_restart_at: Option<i64>,
+    pub(crate) last_restart_reason: Option<String>,
+    /// The current supervisor-owned startup/recovery failure. Cleared as soon as
+    /// the service is healthy, started, or adopted; unlike the persistent error
+    /// log this is causal state suitable for check-failure classification.
+    pub(crate) current_failure: Option<String>,
+    /// Fingerprint of the service configuration that produced `current_failure`.
+    /// A settings change invalidates the failure even before the next supervisor tick.
+    pub(crate) failure_config: Option<String>,
 }
 
 /// Read-only build-service state captured at an infrastructure failure boundary.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildServiceDiagnosticSnapshot {
-    pub name: String,
-    pub configured: bool,
-    pub supervised_child: bool,
-    pub state_dir: Option<String>,
-    pub error_log_tail: Option<String>,
-    pub runtime: BuildServiceRuntimeDiagnostic,
+    pub(crate) name: String,
+    pub(crate) configured: bool,
+    pub(crate) enabled: bool,
+    /// Whether this process retained a child handle after spawning the service.
+    /// A healthy daemon adopted from an earlier process reports `false` here.
+    pub(crate) supervised_child: bool,
+    pub(crate) config_fingerprint: Option<String>,
+    pub(crate) state_dir: Option<String>,
+    pub(crate) error_log_tail: Option<String>,
+    pub(crate) runtime: BuildServiceRuntimeDiagnostic,
 }
 
 impl BuildServiceDiagnosticSnapshot {
-    pub fn compact_summary(&self) -> String {
-        let error = self
-            .error_log_tail
-            .as_deref()
-            .and_then(|tail| tail.lines().last())
-            .map(|line| line.chars().take(200).collect::<String>())
-            .unwrap_or_else(|| "unavailable".to_string());
-        format!(
-            "build service {}: configured={}, supervisedChild={}, lastHealth={}, lastRestart={}, lastError={error}",
+    pub(crate) fn current_failure(&self) -> Option<&str> {
+        (self.enabled && self.runtime.failure_config == self.config_fingerprint)
+            .then_some(self.runtime.current_failure.as_deref())
+            .flatten()
+    }
+
+    pub(crate) fn compact_summary(&self) -> String {
+        let mut summary = format!(
+            "build service {}: configured={}, enabled={}, supervisedChild={}, lastHealth={}, lastRestart={}",
             self.name,
             self.configured,
+            self.enabled,
             self.supervised_child,
             self.runtime.last_health.as_deref().unwrap_or("unknown"),
             self.runtime
                 .last_restart_at
                 .map(|timestamp| timestamp.to_string())
                 .unwrap_or_else(|| "never".to_string())
-        )
+        );
+        if let Some(error) = self.current_failure() {
+            summary.push_str(", lastError=");
+            summary.extend(error.chars().take(200));
+        }
+        summary
     }
 }
 
@@ -336,26 +570,26 @@ impl BuildServiceDiagnosticSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildServiceStatus {
-    pub name: String,
+    pub(crate) name: String,
     /// Whether the service is enabled in settings.
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// Whether the launch program resolves on PATH (or is an absolute path).
-    pub installed: bool,
+    pub(crate) installed: bool,
     /// Whether the full health probe currently reports the daemon healthy (live
     /// and answering a round-trip) — what the supervisor's recovery path sees, so
     /// a wedged-but-listening daemon reads as not reachable.
-    pub reachable: bool,
+    pub(crate) reachable: bool,
     /// The launch argv, templates expanded (for display).
-    pub start: Vec<String>,
+    start: Vec<String>,
     /// The cross-worktree writable globs, templates expanded (the grant).
-    pub write: Vec<String>,
+    write: Vec<String>,
     /// The daemon's state dir, templates expanded.
-    pub state_dir: Option<String>,
+    state_dir: Option<String>,
     /// Sorted client-env keys this service injects (values omitted).
-    pub env_keys: Vec<String>,
+    env_keys: Vec<String>,
     /// The raw, template-unexpanded config — the editable source of truth the
     /// settings UI binds its form to (so edits round-trip `{worktrees}` etc.).
-    pub config: BuildServiceConfig,
+    config: BuildServiceConfig,
 }
 
 /// Whether the service's launch program resolves (on PATH or an absolute path).
@@ -451,6 +685,10 @@ impl Orchestrator {
                 let state = diagnostics.entry(name.clone()).or_default();
                 state.last_health = Some(health_name.to_string());
                 state.last_checked_at = Some(chrono::Utc::now().timestamp());
+                if health == ServiceHealth::Healthy {
+                    state.current_failure = None;
+                    state.failure_config = None;
+                }
             }
             match health {
                 ServiceHealth::Healthy => {
@@ -483,20 +721,42 @@ impl Orchestrator {
                 state.last_restart_at = Some(chrono::Utc::now().timestamp());
                 state.last_restart_reason = Some(health_name.to_string());
             }
-            match launch_service(
+            match reconcile_launched_service(
                 self.services.process.as_ref(),
+                &OsListenerProcessControl,
                 &cfg,
                 &templates,
                 deny_read.clone(),
             ) {
-                Ok(child) => {
+                Ok(Some(child)) => {
                     log::info!("started build service '{name}'");
+                    self.build_service_runtime
+                        .lock()
+                        .unwrap()
+                        .entry(name.clone())
+                        .or_default()
+                        .current_failure = None;
                     self.build_service_children
                         .lock()
                         .unwrap()
                         .insert(name, child);
                 }
-                Err(e) => log::warn!("failed to start build service '{name}': {e}"),
+                Ok(None) => {
+                    log::info!("adopted existing healthy build service '{name}'");
+                    self.build_service_runtime
+                        .lock()
+                        .unwrap()
+                        .entry(name)
+                        .or_default()
+                        .current_failure = None;
+                }
+                Err(e) => {
+                    log::warn!("failed to start build service '{name}': {e}");
+                    let mut diagnostics = self.build_service_runtime.lock().unwrap();
+                    let state = diagnostics.entry(name).or_default();
+                    state.current_failure = Some(e);
+                    state.failure_config = Some(service_config_fingerprint(&cfg));
+                }
             }
         }
     }
@@ -614,7 +874,7 @@ impl Orchestrator {
 
     /// Read-only failure-boundary snapshot. It never probes, restarts, or otherwise
     /// mutates the service; the periodic supervisor remains the sole recovery owner.
-    pub fn build_service_diagnostic_snapshot(
+    pub(crate) fn build_service_diagnostic_snapshot(
         &self,
         service_name: &str,
     ) -> BuildServiceDiagnosticSnapshot {
@@ -639,6 +899,8 @@ impl Orchestrator {
         BuildServiceDiagnosticSnapshot {
             name: service_name.to_string(),
             configured: config.is_some(),
+            enabled: config.as_ref().is_some_and(|config| config.enabled),
+            config_fingerprint: config.as_ref().map(service_config_fingerprint),
             supervised_child: self
                 .build_service_children
                 .lock()
@@ -658,7 +920,10 @@ impl Orchestrator {
 
     /// The merged client env for enabled build services, expanded for the given
     /// per-spawn `worktree`. Injected into fenced agent spawns.
-    pub fn build_service_client_env(&self, worktree: Option<&Path>) -> HashMap<String, String> {
+    pub(crate) fn build_service_client_env(
+        &self,
+        worktree: Option<&Path>,
+    ) -> HashMap<String, String> {
         let templates =
             settings::build_service_templates(&self.config_dir, worktree.map(Path::to_path_buf));
         merge_client_env(&settings::load_build_services(&self.config_dir), &templates)
@@ -754,6 +1019,56 @@ mod tests {
         }
     }
 
+    struct FakeListenerControl {
+        listener: std::sync::Mutex<Option<std::net::TcpListener>>,
+        process: ListenerProcess,
+        terminated: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl ListenerProcessControl for FakeListenerControl {
+        fn listener(&self, _addr: &str) -> Result<Option<ListenerProcess>, String> {
+            Ok(self
+                .listener
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|_| self.process.clone()))
+        }
+
+        fn terminate(&self, pid: u32) -> Result<(), String> {
+            self.terminated.lock().unwrap().push(pid);
+            self.listener.lock().unwrap().take();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lsof_listener_selection_matches_exact_configured_address() {
+        let output = concat!(
+            "p100\n",
+            "nTCP 0.0.0.0:4227 (LISTEN)\n",
+            "p200\n",
+            "nTCP 127.0.0.1:4227 (LISTEN)\n",
+            "p300\n",
+            "nTCP [::1]:4227 (LISTEN)\n",
+        );
+        assert_eq!(
+            listener_pid_from_lsof(output, &["127.0.0.1:4227".to_string()]).unwrap(),
+            Some(200)
+        );
+        assert_eq!(
+            listener_pid_from_lsof(output, &["[::1]:4227".to_string()]).unwrap(),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn lsof_listener_selection_refuses_ambiguous_exact_matches() {
+        let output = "p100\nn127.0.0.1:4227\np200\nn127.0.0.1:4227\n";
+        let error = listener_pid_from_lsof(output, &["127.0.0.1:4227".to_string()]).unwrap_err();
+        assert!(error.contains("multiple listener processes"));
+    }
+
     #[test]
     fn launch_service_spawns_expected_command() {
         let mut spawner = MockProcessSpawner::new();
@@ -770,6 +1085,115 @@ mod tests {
         let child = launch_service(&spawner, &default_sccache_service(), &templates(), vec![])
             .expect("launch should succeed");
         assert_eq!(child.id(), 7);
+    }
+
+    #[test]
+    #[serial_test::serial(build_service_port)]
+    fn startup_bind_conflict_adopts_healthy_compatible_server() {
+        use mockall::Sequence;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut cfg = default_sccache_service();
+        cfg.ready.as_mut().unwrap().tcp = Some(addr);
+
+        let mut sequence = Sequence::new();
+        let mut spawner = MockProcessSpawner::new();
+        spawner
+            .expect_spawn()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(Box::new(MockChildProcess::failing(10, "bind conflict", 1))));
+        spawner
+            .expect_spawn()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(Box::new(MockChildProcess::failing(11, "", 0))));
+
+        let control = FakeListenerControl {
+            listener: std::sync::Mutex::new(Some(listener)),
+            process: ListenerProcess {
+                pid: 42,
+                executable: PathBuf::from("/unused/sccache"),
+            },
+            terminated: std::sync::Mutex::new(Vec::new()),
+        };
+        let child = reconcile_launched_service(&spawner, &control, &cfg, &templates(), vec![])
+            .expect("healthy server should be adopted");
+        assert!(child.is_none());
+        assert!(control.terminated.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(build_service_port)]
+    fn startup_bind_conflict_terminates_verified_orphan_then_relaunches() {
+        use mockall::Sequence;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("sccache");
+        std::fs::write(&executable, "fake").unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut cfg = default_sccache_service();
+        cfg.start = vec![executable.to_string_lossy().to_string()];
+        cfg.ready.as_mut().unwrap().tcp = Some(addr);
+
+        let mut sequence = Sequence::new();
+        let mut spawner = MockProcessSpawner::new();
+        spawner
+            .expect_spawn()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(Box::new(MockChildProcess::failing(20, "bind conflict", 1))));
+        for id in [21, 22] {
+            spawner
+                .expect_spawn()
+                .times(1)
+                .in_sequence(&mut sequence)
+                .returning(move |_| Ok(Box::new(MockChildProcess::failing(id, "unhealthy", 1))));
+        }
+        spawner
+            .expect_spawn()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(Box::new(MockChildProcess::with_stdout(23, vec![]))));
+
+        let control = FakeListenerControl {
+            listener: std::sync::Mutex::new(Some(listener)),
+            process: ListenerProcess {
+                pid: 4242,
+                executable,
+            },
+            terminated: std::sync::Mutex::new(Vec::new()),
+        };
+        let child = reconcile_launched_service(&spawner, &control, &cfg, &templates(), vec![])
+            .expect("verified orphan should be replaced")
+            .expect("replacement should be supervised");
+        assert_eq!(child.id(), 23);
+        assert_eq!(*control.terminated.lock().unwrap(), vec![4242]);
+    }
+
+    #[test]
+    fn foreign_listener_is_never_terminated() {
+        let temp = tempfile::tempdir().unwrap();
+        let expected = temp.path().join("sccache");
+        let foreign = temp.path().join("postgres");
+        std::fs::write(&expected, "fake").unwrap();
+        std::fs::write(&foreign, "fake").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let control = FakeListenerControl {
+            listener: std::sync::Mutex::new(Some(listener)),
+            process: ListenerProcess {
+                pid: 99,
+                executable: foreign,
+            },
+            terminated: std::sync::Mutex::new(Vec::new()),
+        };
+        let error = recover_listener_conflict(&control, &addr, &expected).unwrap_err();
+        assert!(error.contains("refusing to terminate pid 99"));
+        assert!(control.terminated.lock().unwrap().is_empty());
     }
 
     // Serialized under one key: these tests bind an ephemeral port and then
@@ -947,6 +1371,33 @@ mod tests {
             probe_health(&spawner, &probe, &HashMap::new(), Duration::from_secs(1)),
             ServiceHealth::Down
         );
+    }
+
+    #[test]
+    fn compact_summary_omits_historical_error_log_after_recovery() {
+        let snapshot = BuildServiceDiagnosticSnapshot {
+            name: "sccache".into(),
+            configured: true,
+            enabled: true,
+            supervised_child: false,
+            config_fingerprint: Some("current".into()),
+            state_dir: None,
+            error_log_tail: Some("sccache: error: Address already in use (os error 48)".into()),
+            runtime: BuildServiceRuntimeDiagnostic {
+                last_health: Some("healthy".into()),
+                failure_config: Some("current".into()),
+                current_failure: None,
+                ..BuildServiceRuntimeDiagnostic::default()
+            },
+        };
+
+        let summary = snapshot.compact_summary();
+        assert!(summary.contains("lastHealth=healthy"));
+        assert!(!summary.contains("lastError"));
+        assert!(!summary.contains("Address already in use"));
+        assert!(snapshot.error_log_tail.is_some());
+        assert!(!snapshot.supervised_child);
+        assert_eq!(snapshot.runtime.last_health.as_deref(), Some("healthy"));
     }
 
     #[cfg(unix)]

@@ -5,7 +5,7 @@
 //! writable set; everything else becomes read-only at the kernel level. Reads
 //! are left unrestricted so the toolchain (cargo/npm/git/compilers) works.
 //!
-//! v1 scope: **write confinement only.** The sensitive-read denylist is enforced
+//! v2 scope: **write confinement only.** The sensitive-read denylist is enforced
 //! on macOS but not yet on Linux — landlock would require allowlisting every
 //! readable root minus the denylist (or a `bwrap` mount-mask), tracked as a
 //! follow-up. The headless target still gains a kernel write boundary.
@@ -15,16 +15,17 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
-use landlock::{AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
+use landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
 
-const ABI_VERSION: ABI = ABI::V1;
+const ABI_VERSION: ABI = ABI::V2;
 
-/// Probe whether the running kernel supports landlock (ABI ≥ 1).
+/// Probe whether the running kernel supports landlock ABI ≥ 2.
 ///
 /// Creates (but does not enforce) a ruleset; the `landlock_create_ruleset`
 /// syscall fails on kernels without landlock or with it disabled.
 pub fn is_available() -> bool {
     Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_write(ABI_VERSION))
         .and_then(|r| r.create())
         .is_ok()
@@ -37,7 +38,7 @@ pub fn is_available() -> bool {
 /// For a read-only-checkout policy the live checkout is absent from
 /// [`SandboxPolicy::writable_paths`], so write-confinement excludes it
 /// automatically here — the kernel denies writes into the checkout while reads
-/// stay unconfined (the v1 Linux scope). No Linux-specific branch is needed.
+/// stay unconfined (the v2 Linux scope). No Linux-specific branch is needed.
 pub fn install_pre_exec(cmd: &mut std::process::Command, policy: &SandboxPolicy) {
     let mut writable = policy.writable_paths();
     // /dev is I/O plumbing (tty, null, fd) and must stay writable.
@@ -52,15 +53,15 @@ pub fn install_pre_exec(cmd: &mut std::process::Command, policy: &SandboxPolicy)
 }
 
 fn restrict_writes(writable: &[PathBuf]) -> io::Result<()> {
-    // NOTE (ABI gap): `from_write(ABI::V1)` does not include `TRUNCATE` (added
-    // in landlock ABI 3), so an out-of-worktree `truncate()` of an existing
-    // file is not blocked under V1. Inode metadata ops (chmod/chown/utimes) are
-    // not landlock-gated at all. Since write-confinement is currently the only
-    // Linux guarantee, bumping the ABI (with `CompatLevel::BestEffort`) to cover
-    // TRUNCATE is a tracked follow-up; it is left at V1 here because the Linux
-    // path is not yet runtime-verified.
+    // ABI 2 is the minimum viable write sandbox for build commands. ABI 1
+    // implicitly rejects cross-directory rename/link with EXDEV because it
+    // cannot grant REFER, breaking package managers that stage files in a temp
+    // directory before installing them into the checkout. Require ABI 2 rather
+    // than silently falling back to that behavior. TRUNCATE (ABI 3) and inode
+    // metadata operations remain outside the current confinement guarantee.
     let write_access = AccessFs::from_write(ABI_VERSION);
     let ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(write_access)
         .map_err(to_io)?
         .create()

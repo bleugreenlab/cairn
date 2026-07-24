@@ -4,9 +4,9 @@
 //! threshold check that claims exact-scope pending memories and starts a normal
 //! issue execution on the `memory-triage` recipe.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::mcp::handlers::issues::{create_issue_in_project, CreateExecutionSpec};
 use crate::memories::canon::{resolve_role_canon_home, RoleCanonHome};
@@ -17,6 +17,37 @@ use crate::storage::LocalDb;
 const MEMORY_TRIAGE_RECIPE: &str = "memory-triage";
 const TRIAGE_NEIGHBOR_MIN_SIMILARITY: f32 = 0.72;
 const TRIAGE_NEIGHBOR_LIMIT: usize = 5;
+
+type ScopeSpawnLock = tokio::sync::Mutex<()>;
+
+#[allow(dead_code)]
+struct SpawnSynchronization {
+    entered_count_window: tokio::sync::mpsc::UnboundedSender<()>,
+    release_count_window: Arc<tokio::sync::Notify>,
+}
+
+fn scope_spawn_lock(db: &Arc<LocalDb>, scope: &str, scope_value: &str) -> Arc<ScopeSpawnLock> {
+    static LOCKS: OnceLock<Mutex<HashMap<(usize, String, String), Weak<ScopeSpawnLock>>>> =
+        OnceLock::new();
+
+    let key = (
+        Arc::as_ptr(db) as usize,
+        scope.to_string(),
+        scope_value.to_string(),
+    );
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("memory triage scope-lock registry poisoned");
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(ScopeSpawnLock::new(()));
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 /// The database that owns a triage pool.
 ///
@@ -227,17 +258,15 @@ pub(crate) fn distinct_scopes_from_memories(memories: &[Memory]) -> Vec<(String,
     scopes
 }
 
-/// Claim every full threshold batch for one exact-scope pending pool and create a
-/// normal issue execution to triage each. Returns one created issue URI per full
-/// batch, so a pool of N pending memories at threshold T drains as floor(N/T)
-/// issues in a single pass instead of one issue per reconcile check.
+/// Claim full threshold batches for one exact-scope pending pool until either
+/// the pending pool is smaller than the threshold or the scope reaches its
+/// configured maximum number of open triage issues.
 ///
-/// The atomic claim is the only guard against double-triage: each batch flips its
-/// memories to `claimed`, removing them from the pending pool, so a memory can
-/// never land in two batches. Consequently the existence or status of other
-/// triage issues for the scope is irrelevant and is never consulted — an
-/// already-running triage issue does not block spawning more for the remaining
-/// backlog. Shared core for both the event-driven fast path
+/// Open ownership is determined structurally through the issue-memory batch links,
+/// rather than by issue titles. The count is refreshed before every claim, so a
+/// successfully linked batch consumes one slot before another iteration begins.
+/// Atomic claiming still guarantees that a memory cannot land in two batches.
+/// Shared core for both the event-driven fast path
 /// (`maybe_spawn_triage`) and the reconciliation sweep
 /// (`reconcile_pending_triage`), so the two can never diverge.
 async fn spawn_triage_for_scope(
@@ -245,10 +274,53 @@ async fn spawn_triage_for_scope(
     scope: &str,
     scope_value: &str,
     threshold: i64,
+    max_open_per_scope: i64,
+) -> Result<Vec<String>, String> {
+    spawn_triage_for_scope_inner(
+        orch,
+        scope,
+        scope_value,
+        threshold,
+        max_open_per_scope,
+        None,
+    )
+    .await
+}
+
+async fn spawn_triage_for_scope_inner(
+    orch: &Orchestrator,
+    scope: &str,
+    scope_value: &str,
+    threshold: i64,
+    max_open_per_scope: i64,
+    synchronization: Option<Arc<SpawnSynchronization>>,
 ) -> Result<Vec<String>, String> {
     let db = pool_db(orch, scope, scope_value).await?;
+    // Count, claim, issue creation, and batch-link recording collectively consume
+    // a cap slot. Serialize that full sequence per owning database and exact scope
+    // so concurrent fast-path and reconcile tasks cannot both observe the same slot.
+    let spawn_lock = scope_spawn_lock(&db, scope, scope_value);
+    let _scope_guard = spawn_lock.lock().await;
     let mut spawned = Vec::new();
+    let mut synchronized_count_window = false;
     loop {
+        let open = crate::memories::db::count_open_triage_issues_for_scope(&db, scope, scope_value)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !synchronized_count_window {
+            if let Some(synchronization) = &synchronization {
+                synchronization
+                    .entered_count_window
+                    .send(())
+                    .map_err(|_| "triage spawn synchronization receiver dropped".to_string())?;
+                synchronization.release_count_window.notified().await;
+            }
+            synchronized_count_window = true;
+        }
+        if open >= max_open_per_scope {
+            break;
+        }
+
         let count = crate::memories::db::count_pending_memories_for_scope(&db, scope, scope_value)
             .await
             .map_err(|error| error.to_string())?;
@@ -311,13 +383,17 @@ pub async fn maybe_spawn_triage(
     confirmed_scopes: Vec<(String, String)>,
 ) -> Result<Vec<String>, String> {
     let settings = orch.get_settings();
-    if !settings.memory_review_enabled {
+    if !settings.memory_triage_enabled {
         return Ok(Vec::new());
     }
     let threshold = settings.pending_memory_threshold.max(1) as i64;
+    let max_open_per_scope = settings.max_open_triage_issues_per_scope.max(1) as i64;
     let mut spawned = Vec::new();
     for (scope, scope_value) in confirmed_scopes {
-        spawned.extend(spawn_triage_for_scope(&orch, &scope, &scope_value, threshold).await?);
+        spawned.extend(
+            spawn_triage_for_scope(&orch, &scope, &scope_value, threshold, max_open_per_scope)
+                .await?,
+        );
     }
     Ok(spawned)
 }
@@ -337,10 +413,11 @@ pub async fn maybe_spawn_triage(
 /// private scan nor a local project's in a replica scan.
 pub async fn reconcile_pending_triage(orch: &Orchestrator) -> Result<Vec<String>, String> {
     let settings = orch.get_settings();
-    if !settings.memory_review_enabled {
+    if !settings.memory_triage_enabled {
         return Ok(Vec::new());
     }
     let threshold = settings.pending_memory_threshold.max(1) as i64;
+    let max_open_per_scope = settings.max_open_triage_issues_per_scope.max(1) as i64;
     let private = orch.db.local.clone();
     let mut spawned = Vec::new();
     for db in orch.db.all_dbs().await {
@@ -354,7 +431,10 @@ pub async fn reconcile_pending_triage(orch: &Orchestrator) -> Result<Vec<String>
             if !is_private && scope != "project" {
                 continue;
             }
-            spawned.extend(spawn_triage_for_scope(orch, &scope, &scope_value, threshold).await?);
+            spawned.extend(
+                spawn_triage_for_scope(orch, &scope, &scope_value, threshold, max_open_per_scope)
+                    .await?,
+            );
         }
     }
     Ok(spawned)
@@ -1210,6 +1290,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn triage_toggle_is_independent_from_review_toggle() {
+        let test = test_orch().await;
+        std::fs::write(
+            test.orch.config_dir.join("settings.yaml"),
+            "memoryReviewEnabled: false\nmemoryTriageEnabled: true\n",
+        )
+        .unwrap();
+        for idx in 0..5 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();
+
+        assert_eq!(spawned.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_triage_does_not_spawn_when_review_is_enabled() {
+        let test = test_orch().await;
+        std::fs::write(
+            test.orch.config_dir.join("settings.yaml"),
+            "memoryReviewEnabled: true\nmemoryTriageEnabled: false\n",
+        )
+        .unwrap();
+        for idx in 0..5 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();
+
+        assert!(spawned.is_empty());
+    }
+
+    #[tokio::test]
     async fn reconcile_is_idempotent_when_nothing_stranded() {
         let test = test_orch().await;
         for idx in 0..5 {
@@ -1415,22 +1545,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_ignores_existing_open_triage_issue() {
+    async fn cap_blocks_second_linked_open_issue_at_default() {
         let test = test_orch().await;
-        // An open (non-terminal) triage issue already exists for this scope. It
-        // owns no pending memories itself; a fresh full pool accumulated since.
-        // The existence of that issue must NOT block triaging the new backlog —
-        // the atomic claim is the only double-triage guard.
         test.orch
             .db
             .local
             .execute(
                 "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-                 VALUES ('issue-open', 'project-1', 8, 'Memory triage: project=project-1 (5 pending)', 'active', 1, 1)",
+                 VALUES ('issue-open', 'project-1', 8, 'Memory triage', 'active', 1, 1)",
                 (),
             )
             .await
             .unwrap();
+        insert_memory_with_status(
+            &test,
+            "owned",
+            "claimed",
+            "project",
+            "project-1",
+            "job-main",
+            20,
+            20,
+        )
+        .await;
+        link_memory_to_issue(&test, "issue-open", "owned").await;
         for idx in 0..5 {
             insert_pending_memory(
                 &test,
@@ -1443,25 +1581,177 @@ mod tests {
             .await;
         }
 
-        super::reconcile_memory_triage(test.orch.clone())
-            .await
-            .unwrap();
+        let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();
 
-        // A second triage issue spawns and claims the whole new pool.
-        assert_eq!(triage_issue_count(&test).await, 2);
+        assert!(spawned.is_empty());
         assert_eq!(
-            memory_status_count(&test, "claimed", "project", "project-1").await,
-            5
+            crate::memories::db::count_open_triage_issues_for_scope(
+                &test.orch.db.local,
+                "project",
+                "project-1",
+            )
+            .await
+            .unwrap(),
+            1
         );
         assert_eq!(
             memory_status_count(&test, "pending", "project", "project-1").await,
-            0
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_allows_up_to_configured_open_issues() {
+        let test = test_orch().await;
+        std::fs::write(
+            test.orch.config_dir.join("settings.yaml"),
+            "maxOpenTriageIssuesPerScope: 2\n",
+        )
+        .unwrap();
+        test.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                 VALUES ('issue-open', 'project-1', 8, 'Memory triage', 'active', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        insert_memory_with_status(
+            &test,
+            "owned",
+            "claimed",
+            "project",
+            "project-1",
+            "job-main",
+            20,
+            20,
+        )
+        .await;
+        link_memory_to_issue(&test, "issue-open", "owned").await;
+        for idx in 0..10 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();
+
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(
+            crate::memories::db::count_open_triage_issues_for_scope(
+                &test.orch.db.local,
+                "project",
+                "project-1",
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            memory_status_count(&test, "pending", "project", "project-1").await,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_spawn_attempts_share_one_cap_slot() {
+        let test = test_orch().await;
+        for idx in 0..10 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let synchronization = Arc::new(super::SpawnSynchronization {
+            entered_count_window: entered_tx,
+            release_count_window: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let first_orch = test.orch.clone();
+        let first_sync = synchronization.clone();
+        let first = tokio::spawn(async move {
+            super::spawn_triage_for_scope_inner(
+                &first_orch,
+                "project",
+                "project-1",
+                5,
+                1,
+                Some(first_sync),
+            )
+            .await
+        });
+        entered_rx.recv().await.unwrap();
+
+        let second_orch = test.orch.clone();
+        let second_sync = synchronization.clone();
+        let second = tokio::spawn(async move {
+            super::spawn_triage_for_scope_inner(
+                &second_orch,
+                "project",
+                "project-1",
+                5,
+                1,
+                Some(second_sync),
+            )
+            .await
+        });
+
+        // The first contender is paused immediately after reading open=0. The
+        // second must remain outside that same window until the first links its
+        // issue. Removing the production scope lock makes this receive succeed.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), entered_rx.recv(),)
+                .await
+                .is_err(),
+            "second contender entered the count-to-claim window concurrently"
+        );
+
+        synchronization.release_count_window.notify_one();
+        let first_spawned = first.await.unwrap().unwrap();
+        entered_rx.recv().await.unwrap();
+        synchronization.release_count_window.notify_one();
+        let second_spawned = second.await.unwrap().unwrap();
+
+        assert_eq!(first_spawned.len() + second_spawned.len(), 1);
+        assert_eq!(
+            crate::memories::db::count_open_triage_issues_for_scope(
+                &test.orch.db.local,
+                "project",
+                "project-1",
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            memory_status_count(&test, "pending", "project", "project-1").await,
+            5
         );
     }
 
     #[tokio::test]
     async fn reconcile_spawns_one_issue_per_full_batch_in_a_single_pass() {
         let test = test_orch().await;
+        std::fs::write(
+            test.orch.config_dir.join("settings.yaml"),
+            "maxOpenTriageIssuesPerScope: 2\n",
+        )
+        .unwrap();
         // Ten pending memories at the default threshold of five must drain as two
         // triage issues in one reconcile pass, not one issue per check.
         for idx in 0..10 {

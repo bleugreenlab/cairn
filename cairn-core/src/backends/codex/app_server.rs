@@ -188,7 +188,7 @@ impl AppServerClient {
         }))
     }
 
-    pub fn respond(&self, id: &Value, result: Value) -> Result<(), String> {
+    pub(crate) fn respond(&self, id: &Value, result: Value) -> Result<(), String> {
         self.send_message(json!({
             "jsonrpc": "2.0",
             "id": id.clone(),
@@ -196,7 +196,7 @@ impl AppServerClient {
         }))
     }
 
-    pub fn respond_error(&self, id: &Value, code: i32, message: &str) -> Result<(), String> {
+    pub(crate) fn respond_error(&self, id: &Value, code: i32, message: &str) -> Result<(), String> {
         self.send_message(json!({
             "jsonrpc": "2.0",
             "id": id.clone(),
@@ -212,7 +212,7 @@ impl AppServerClient {
     /// Normal user Stop uses `turn/interrupt`, which hard-aborts the active turn
     /// while preserving the app-server for a warm follow-up. Reserve shutdown for
     /// hard teardown paths such as crashes, watchdog expiry, and session eviction.
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.take();
         }

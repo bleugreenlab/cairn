@@ -100,8 +100,12 @@ pub struct Settings {
     pub transcript_text_size: TranscriptTextSize,
     /// Vertical rhythm preset for transcript markdown.
     pub transcript_density: TranscriptDensity,
-    /// Whether memory review prompts and automatic memory-triage issue creation are enabled.
+    /// Whether end-of-job memory review prompts are enabled.
     pub memory_review_enabled: bool,
+    /// Whether automatic memory-triage issue creation is enabled.
+    pub memory_triage_enabled: bool,
+    /// Maximum open memory-triage issues for an exact scope.
+    pub max_open_triage_issues_per_scope: i32,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: i32,
     /// Behavior for replies to the documented `to: "external"` target.
@@ -163,8 +167,12 @@ pub struct UpdateSettings {
     pub transcript_text_size: Option<TranscriptTextSize>,
     /// Vertical rhythm preset for transcript markdown.
     pub transcript_density: Option<TranscriptDensity>,
-    /// Whether memory review prompts and automatic memory-triage issue creation are enabled.
+    /// Whether end-of-job memory review prompts are enabled.
     pub memory_review_enabled: Option<bool>,
+    /// Whether automatic memory-triage issue creation is enabled.
+    pub memory_triage_enabled: Option<bool>,
+    /// Maximum open memory-triage issues for an exact scope.
+    pub max_open_triage_issues_per_scope: Option<i32>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: Option<i32>,
     /// Behavior for replies to the documented `to: "external"` target.

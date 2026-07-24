@@ -4,6 +4,337 @@ use super::*;
 // on_job_complete_impl
 // ============================================================================
 
+#[derive(Debug)]
+enum PushJobCoordinate {
+    Node {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node: String,
+    },
+    Task {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node: String,
+        task: String,
+    },
+}
+
+fn push_job_coordinate(content_ref: &str) -> Option<PushJobCoordinate> {
+    use cairn_common::uri::CairnResource;
+    match cairn_common::uri::parse_uri(content_ref)? {
+        CairnResource::Node {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeChat {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeChatRaw {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeArtifact {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            ..
+        }
+        | CairnResource::NodeDiff {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeTasks {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeCalls {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeWakes {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeChecks {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeQuestions {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeQuestion {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            ..
+        }
+        | CairnResource::NodePermissions {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodePermission {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            ..
+        }
+        | CairnResource::NodeMessages {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeProgress {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeMemories {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        }
+        | CairnResource::NodeSymbols {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            ..
+        } => Some(PushJobCoordinate::Node {
+            project,
+            number,
+            exec_seq,
+            node: node_id,
+        }),
+        CairnResource::Task {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        }
+        | CairnResource::TaskChat {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        }
+        | CairnResource::TaskChatRaw {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        }
+        | CairnResource::TaskArtifact {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            ..
+        }
+        | CairnResource::TaskChecks {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        }
+        | CairnResource::TaskPermissions {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        }
+        | CairnResource::TaskPermission {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            ..
+        }
+        | CairnResource::TaskMessages {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => Some(PushJobCoordinate::Task {
+            project,
+            number,
+            exec_seq,
+            node: node_id,
+            task: task_name,
+        }),
+        CairnResource::JobTodos {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => Some(match task_name {
+            Some(task) => PushJobCoordinate::Task {
+                project,
+                number,
+                exec_seq,
+                node: node_id,
+                task,
+            },
+            None => PushJobCoordinate::Node {
+                project,
+                number,
+                exec_seq,
+                node: node_id,
+            },
+        }),
+        _ => None,
+    }
+}
+
+async fn push_job_coordinate_exists(
+    db: &LocalDb,
+    coordinate: PushJobCoordinate,
+) -> Result<bool, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let exists = match coordinate {
+                PushJobCoordinate::Node {
+                    project,
+                    number,
+                    exec_seq,
+                    node,
+                } => {
+                    let mut rows = conn
+                        .query(
+                            "SELECT EXISTS(
+                           SELECT 1 FROM jobs j
+                           JOIN projects p ON p.id = j.project_id
+                           JOIN issues i ON i.id = j.issue_id
+                           JOIN executions e ON e.id = j.execution_id
+                           WHERE p.key = ?1 AND i.number = ?2 AND e.seq = ?3
+                             AND j.uri_segment = ?4
+                             AND (j.parent_job_id IS NULL OR j.agent_config_id = 'workflow')
+                         )",
+                            params![project, number as i64, exec_seq as i64, node],
+                        )
+                        .await?;
+                    rows.next()
+                        .await?
+                        .is_some_and(|row| row.i64(0).unwrap_or(0) != 0)
+                }
+                PushJobCoordinate::Task {
+                    project,
+                    number,
+                    exec_seq,
+                    node,
+                    task,
+                } => {
+                    let mut rows = conn
+                        .query(
+                            "SELECT EXISTS(
+                           SELECT 1 FROM jobs j
+                           JOIN jobs parent ON parent.id = j.parent_job_id
+                           JOIN projects p ON p.id = j.project_id
+                           JOIN issues i ON i.id = j.issue_id
+                           JOIN executions e ON e.id = j.execution_id
+                           WHERE p.key = ?1 AND i.number = ?2 AND e.seq = ?3
+                             AND parent.uri_segment = ?4 AND j.uri_segment = ?5
+                             AND j.agent_config_id != 'workflow'
+                         )",
+                            params![project, number as i64, exec_seq as i64, node, task],
+                        )
+                        .await?;
+                    rows.next()
+                        .await?
+                        .is_some_and(|row| row.i64(0).unwrap_or(0) != 0)
+                }
+            };
+            Ok(exists)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn retain_resolvable_pushes(
+    db: &LocalDb,
+    recipient: &str,
+    pushes: Vec<crate::orchestrator::attention_push::Push>,
+) -> Vec<crate::orchestrator::attention_push::Push> {
+    let mut retained = Vec::with_capacity(pushes.len());
+    for push in pushes {
+        let Some(coordinate) = push_job_coordinate(&push.content_ref) else {
+            retained.push(push);
+            continue;
+        };
+        match push_job_coordinate_exists(db, coordinate).await {
+            Ok(true) => retained.push(push),
+            Ok(false) => {
+                match crate::orchestrator::attention_push::delete_pending_by_id(db, &push.id).await {
+                    Ok(()) => log::warn!(
+                        "dropping unresolved attention push: recipient={} id={} key={} content_ref={}",
+                        recipient,
+                        push.id,
+                        push.key,
+                        push.content_ref
+                    ),
+                    Err(error) => {
+                        log::warn!(
+                            "failed to delete unresolved attention push {}; delivering fail-open: {}",
+                            push.id,
+                            error
+                        );
+                        retained.push(push);
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "attention push coordinate probe failed for {} ({}); delivering fail-open: {}",
+                    push.id,
+                    push.content_ref,
+                    error
+                );
+                retained.push(push);
+            }
+        }
+    }
+    retained
+}
+
 /// Called when a job finishes. Advances the execution DAG if applicable.
 ///
 /// Only advances for jobs that are part of a recipe DAG (have both `execution_id`
@@ -259,12 +590,15 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
         let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-        let lock_orch = orch.clone();
-        let lock_store = store.clone();
-        let lock_operation = format!("workspace provisioning for {job_id}");
-        let _store_guard = run_db(async move {
-            Ok(lock_orch
-                .acquire_jj_store_lock(&lock_store, lock_operation)
+        // Allocation is serialized separately from workspace mutation. The DB
+        // reservation made below keeps the chosen coordinates fail-closed after
+        // this brief guard is released.
+        let allocation_orch = orch.clone();
+        let allocation_store = store.clone();
+        let allocation_operation = format!("workspace provisioning allocation for {job_id}");
+        let allocation_guard = run_db(async move {
+            Ok(allocation_orch
+                .acquire_jj_store_lock(&allocation_store, allocation_operation)
                 .await)
         })?;
         crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path))?;
@@ -340,6 +674,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             branch.clone(),
             now,
         ))?;
+        drop(allocation_guard);
         let cancel = Arc::new(AtomicBool::new(false));
         let child_slot = Arc::new(Mutex::new(None));
         let sink = setup_progress::make_sink(orch, job_id, job.issue_id.clone());
@@ -382,6 +717,19 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             &child_slot,
         );
         orch.setup_registry.lock().unwrap().remove(job_id);
+        let restore_assignment = || {
+            if let Err(error) = run_db(workspace_identity::restore_workspace_assignment(
+                owning_db.clone(),
+                job_id.to_string(),
+                wt_path.to_string_lossy().to_string(),
+                branch.clone(),
+                job.worktree_path.clone(),
+                job.branch.clone(),
+                chrono::Utc::now().timestamp() as i32,
+            )) {
+                log::error!("failed to restore workspace ownership after setup failure for {job_id}: {error}");
+            }
+        };
         match setup_result {
             Ok(()) => setup_progress::emit(
                 &sink,
@@ -393,6 +741,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
                 None,
             ),
             Err(crate::git::worktree::SetupError::Cancelled) => {
+                restore_assignment();
                 setup_progress::emit(
                     &sink,
                     job_id,
@@ -405,6 +754,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
                 return Err(SETUP_CANCELLED_ERROR.to_string());
             }
             Err(e) => {
+                restore_assignment();
                 setup_progress::emit(
                     &sink,
                     job_id,
@@ -420,8 +770,18 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
         log::info!("[prepare_job] job {job_id}: worktree setup complete");
         let wt_path_str = wt_path.to_string_lossy().to_string();
-        // The freshly created worktree's HEAD is the tip of its base branch.
+        // Reading jj's head may snapshot the workspace, so serialize this final
+        // short store access without extending the guard into DB activation.
+        let head_orch = orch.clone();
+        let head_store = store.clone();
+        let head_operation = format!("workspace provisioning head read for {job_id}");
+        let head_guard = run_db(async move {
+            Ok(head_orch
+                .acquire_jj_store_lock(&head_store, head_operation)
+                .await)
+        })?;
         let base_commit = worktree_head_commit(orch, &wt_path);
+        drop(head_guard);
         let now = chrono::Utc::now().timestamp() as i32;
         run_db(update_job_worktree(
             owning_db.clone(),
@@ -622,6 +982,49 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 /// resume, advancement) keep calling [`continue_job_impl`] directly: they run at
 /// genuine turn boundaries where no turn is active and must not be silently
 /// converted into queued messages.
+const FORCED_DIGEST_RESUME_TRIGGER: &str = "Continue from the conversation digest above.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationIntent {
+    Normal,
+    ForceDigestReseed,
+}
+
+pub fn resume_job_from_digest(
+    orch: &Orchestrator,
+    job_id: &str,
+    identity_override: Option<crate::identity::UserIdentity>,
+) -> Result<Run, String> {
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    if crate::messages::delivery::head_turn_active_sync(&owning_db, job_id) {
+        return Err(
+            "Resume from digest is available only after the current turn finishes.".to_string(),
+        );
+    }
+
+    continue_job_impl_with_intent(
+        orch,
+        job_id,
+        Some(FORCED_DIGEST_RESUME_TRIGGER),
+        identity_override,
+        Some(ResumeContext {
+            suppress_user_event: true,
+            suppress_self_suspend_note: true,
+            supersede_pending_retry: true,
+            ..Default::default()
+        }),
+        ContinuationIntent::ForceDigestReseed,
+    )
+}
+
 pub fn continue_job_or_enqueue(
     orch: &Orchestrator,
     job_id: &str,
@@ -695,14 +1098,79 @@ pub fn continue_job_or_enqueue(
 #[derive(Debug, Clone, Default)]
 pub struct ResumeContext {
     /// When true, skip storing the resume message as a `user` transcript event.
-    pub suppress_user_event: bool,
+    pub(crate) suppress_user_event: bool,
+    /// Suppress the self-suspend framing note when the hidden trigger belongs to
+    /// another typed lifecycle action, such as manual digest resume.
+    pub(crate) suppress_self_suspend_note: bool,
     /// Consume this already-claimed pending retry turn instead of creating a
     /// follow-up. Used only by best-effort automatic backend retries.
-    pub preclaimed_retry_turn_id: Option<String>,
+    pub(crate) preclaimed_retry_turn_id: Option<String>,
     /// User-facing continuation may take over an unstarted automatic retry.
     /// Reclassifying that pending head as a follow-up resets the retry budget
     /// and makes the sleeping timer's retry-head check fail.
-    pub supersede_pending_retry: bool,
+    pub(crate) supersede_pending_retry: bool,
+    /// Reuse this pre-created, still-pending successor turn (an owned-wait
+    /// resolution's `WaitResolved` turn) instead of allocating a follow-up. It is
+    /// started on the resumed run here — exactly once. Distinct from
+    /// `preclaimed_retry_turn_id`, which carries automatic-retry claim semantics.
+    pub(crate) preclaimed_successor_turn_id: Option<String>,
+}
+
+/// Validate a pre-created owned-wait successor turn before `continue_job_impl`
+/// reuses it: it must belong to this job and the resolved session and still be
+/// pending (its start happens here). Rejecting a mismatch keeps a stale or
+/// foreign turn from being driven as this run's successor (CAIRN-2970).
+fn validate_preclaimed_successor(
+    db: Arc<LocalDb>,
+    job_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<(), String> {
+    let info = run_db({
+        let db = db.clone();
+        let turn_id = turn_id.to_string();
+        async move {
+            db.read(|conn| {
+                let turn_id = turn_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT job_id, session_id, state FROM turns WHERE id = ?1 LIMIT 1",
+                            (turn_id.as_str(),),
+                        )
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => Ok(Some((row.opt_text(0)?, row.text(1)?, row.text(2)?))),
+                        None => Ok(None),
+                    }
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    })?;
+    let Some((turn_job, turn_session, state)) = info else {
+        return Err(format!("preclaimed successor turn {turn_id} not found"));
+    };
+    if turn_job.as_deref() != Some(job_id) {
+        return Err(format!(
+            "preclaimed successor turn {turn_id} belongs to a different job"
+        ));
+    }
+    if turn_session != session_id {
+        return Err(format!(
+            "preclaimed successor turn {turn_id} belongs to session {turn_session}, not {session_id}"
+        ));
+    }
+    let state: TurnState = state
+        .parse()
+        .map_err(|e| format!("preclaimed successor turn {turn_id} has invalid state: {e}"))?;
+    if state != TurnState::Pending {
+        return Err(format!(
+            "preclaimed successor turn {turn_id} is {state}, not pending"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn continue_automatic_retry(
@@ -717,8 +1185,10 @@ pub(crate) fn continue_automatic_retry(
         None,
         Some(ResumeContext {
             suppress_user_event: true,
+            suppress_self_suspend_note: false,
             preclaimed_retry_turn_id: Some(retry_turn_id.to_string()),
             supersede_pending_retry: false,
+            preclaimed_successor_turn_id: None,
         }),
     )
 }
@@ -733,6 +1203,24 @@ pub fn continue_job_impl(
     message: Option<&str>,
     identity_override: Option<crate::identity::UserIdentity>,
     prompt_resume: Option<ResumeContext>,
+) -> Result<Run, String> {
+    continue_job_impl_with_intent(
+        orch,
+        job_id,
+        message,
+        identity_override,
+        prompt_resume,
+        ContinuationIntent::Normal,
+    )
+}
+
+fn continue_job_impl_with_intent(
+    orch: &Orchestrator,
+    job_id: &str,
+    message: Option<&str>,
+    identity_override: Option<crate::identity::UserIdentity>,
+    prompt_resume: Option<ResumeContext>,
+    continuation_intent: ContinuationIntent,
 ) -> Result<Run, String> {
     // Resolve the job's owning database ONCE (fail-closed): a team job resumes
     // against its synced replica, never the private DB.
@@ -756,6 +1244,13 @@ pub fn continue_job_impl(
     let preclaimed_retry_turn_id = prompt_resume
         .as_ref()
         .and_then(|context| context.preclaimed_retry_turn_id.clone());
+    let preclaimed_successor_turn_id = prompt_resume
+        .as_ref()
+        .and_then(|context| context.preclaimed_successor_turn_id.clone());
+    // An owned-wait resolution pre-creates its `WaitResolved` successor turn and
+    // hands it here to reuse; that changes reconcile, reseed, and turn-selection
+    // below (CAIRN-2970).
+    let resuming_owned_wait = preclaimed_successor_turn_id.is_some();
     if let Some(retry_turn_id) = preclaimed_retry_turn_id.as_deref() {
         if job.parent_job_id.is_some()
             || job.recipe_node_id.is_some()
@@ -857,119 +1352,155 @@ pub fn continue_job_impl(
     ))? {
         Some(session) => match session.status {
             SessionStatus::Open => {
-                // A prompt edit since this session spawned marks the job for a
-                // fresh session (the system prompt is fixed at spawn). Read-and-
-                // clear it here, between turns, so a live turn's output is never
-                // orphaned. A backend rotation below also produces a fresh
-                // session, so consuming the flag here is correct either way.
-                let needs_fresh_session = run_db(take_needs_fresh_session(
-                    owning_db.clone(),
-                    job_id.to_string(),
-                ))?;
-                match decide_continue_action(
-                    &session.backend,
-                    session.backend_id.as_deref(),
-                    desired_backend.as_deref(),
-                    needs_fresh_session,
-                ) {
-                    ContinueSessionAction::RotateToBackend(want) => {
-                        // Evict any live process bound to the old session first.
-                        if let Some(old_run) =
-                            orch.process_state.find_process_by_session(&session.id)
-                        {
-                            orch.process_state.stop_and_remove(&old_run);
+                if continuation_intent == ContinuationIntent::ForceDigestReseed {
+                    // Digest construction and rotation must succeed before the
+                    // prompt-edit flag is consumed. On failure the old session and
+                    // its pending fresh-prompt requirement remain usable.
+                    let outcome = finish_forced_session_reseed(
+                        owning_db.clone(),
+                        job_id,
+                        force_session_reseed(orch, &owning_db, &job, &session),
+                    )?;
+                    let session_start = crate::backends::SessionStart::New {
+                        session_id: outcome.new_session_id.clone(),
+                    };
+                    let run_start_mode = run_start_mode(&session_start).to_string();
+                    let new_id = outcome.new_session_id.clone();
+                    reseed_outcome = Some(outcome);
+                    (new_id, session_start, run_start_mode)
+                } else {
+                    // Ordinary continuation consumes the flag while choosing its
+                    // action, exactly as before manual digest resume existed.
+                    let needs_fresh_session = run_db(take_needs_fresh_session(
+                        owning_db.clone(),
+                        job_id.to_string(),
+                    ))?;
+                    match decide_continue_action(
+                        &session.backend,
+                        session.backend_id.as_deref(),
+                        desired_backend.as_deref(),
+                        needs_fresh_session,
+                    ) {
+                        ContinueSessionAction::RotateToBackend(want) => {
+                            // Evict any live process bound to the old session first.
+                            if let Some(old_run) =
+                                orch.process_state.find_process_by_session(&session.id)
+                            {
+                                orch.process_state.stop_and_remove(&old_run);
+                            }
+                            log::info!(
+                                "Backend change {} -> {} for job {}; rotating to a fresh session",
+                                session.backend,
+                                want,
+                                job_id
+                            );
+                            let new_session = run_db({
+                                let db = owning_db.clone();
+                                let session = session.clone();
+                                let job_id = job_id.to_string();
+                                let want = want.to_string();
+                                async move {
+                                    crate::sessions::queries::rotate_job_session_to_backend(
+                                        db.as_ref(),
+                                        &session,
+                                        &job_id,
+                                        &want,
+                                    )
+                                    .await
+                                }
+                            })?;
+                            let session_start = crate::backends::SessionStart::New {
+                                session_id: new_session.id.clone(),
+                            };
+                            let run_start_mode = run_start_mode(&session_start).to_string();
+                            (new_session.id, session_start, run_start_mode)
                         }
-                        log::info!(
-                            "Backend change {} -> {} for job {}; rotating to a fresh session",
-                            session.backend,
-                            want,
-                            job_id
-                        );
-                        let new_session = run_db({
-                            let db = owning_db.clone();
-                            let session = session.clone();
-                            let job_id = job_id.to_string();
-                            let want = want.to_string();
-                            async move {
-                                crate::sessions::queries::rotate_job_session_to_backend(
-                                    db.as_ref(),
-                                    &session,
-                                    &job_id,
-                                    &want,
-                                )
-                                .await
+                        ContinueSessionAction::RotateFresh => {
+                            // Evict any live process bound to the old session, then
+                            // rotate to a fresh same-backend session so this turn
+                            // rebuilds the edited system prompt.
+                            if let Some(old_run) =
+                                orch.process_state.find_process_by_session(&session.id)
+                            {
+                                orch.process_state.stop_and_remove(&old_run);
                             }
-                        })?;
-                        let session_start = crate::backends::SessionStart::New {
-                            session_id: new_session.id.clone(),
-                        };
-                        let run_start_mode = run_start_mode(&session_start).to_string();
-                        (new_session.id, session_start, run_start_mode)
-                    }
-                    ContinueSessionAction::RotateFresh => {
-                        // Evict any live process bound to the old session, then
-                        // rotate to a fresh same-backend session so this turn
-                        // rebuilds the edited system prompt.
-                        if let Some(old_run) =
-                            orch.process_state.find_process_by_session(&session.id)
-                        {
-                            orch.process_state.stop_and_remove(&old_run);
+                            log::info!(
+                                "Prompt change for job {}; rotating to a fresh session",
+                                job_id
+                            );
+                            let new_session = run_db({
+                                let db = owning_db.clone();
+                                let session = session.clone();
+                                let job_id = job_id.to_string();
+                                async move {
+                                    crate::sessions::queries::rotate_job_session(
+                                        db.as_ref(),
+                                        &session,
+                                        &job_id,
+                                    )
+                                    .await
+                                }
+                            })?;
+                            let session_start = crate::backends::SessionStart::New {
+                                session_id: new_session.id.clone(),
+                            };
+                            let run_start_mode = run_start_mode(&session_start).to_string();
+                            (new_session.id, session_start, run_start_mode)
                         }
-                        log::info!(
-                            "Prompt change for job {}; rotating to a fresh session",
-                            job_id
-                        );
-                        let new_session = run_db({
-                            let db = owning_db.clone();
-                            let session = session.clone();
-                            let job_id = job_id.to_string();
-                            async move {
-                                crate::sessions::queries::rotate_job_session(
-                                    db.as_ref(),
-                                    &session,
-                                    &job_id,
-                                )
-                                .await
-                            }
-                        })?;
-                        let session_start = crate::backends::SessionStart::New {
-                            session_id: new_session.id.clone(),
-                        };
-                        let run_start_mode = run_start_mode(&session_start).to_string();
-                        (new_session.id, session_start, run_start_mode)
-                    }
-                    ContinueSessionAction::Resume => {
-                        // Native backend resume of the open session (e.g. a Codex
-                        // session carrying its stored thread id). Reseed is
-                        // bypassed so a reply never restarts at the system prompt
-                        // (CAIRN-2598).
-                        let session_start = resolve_continue_session_start(&session)?;
-                        let run_start_mode = run_start_mode(&session_start).to_string();
-                        (session.id.clone(), session_start, run_start_mode)
-                    }
-                    ContinueSessionAction::MaybeReseed => {
-                        // Reseed-eligible open session. If it has gone stale (last
-                        // event older than the staleness threshold), a native
-                        // backend resume would reload a prompt cache the provider
-                        // has likely evicted; reseed instead by rotating to a
-                        // fresh session primed with the node's `/chat` digest
-                        // (CAIRN-2534). Any failure in the attempt falls open to
-                        // native resume with session state untouched.
-                        let now_secs = orch.services.clock.now();
-                        match attempt_session_reseed(orch, &owning_db, &job, &session, now_secs) {
-                            Some(outcome) => {
-                                let session_start = crate::backends::SessionStart::New {
-                                    session_id: outcome.new_session_id.clone(),
-                                };
-                                let run_start_mode = run_start_mode(&session_start).to_string();
-                                let new_id = outcome.new_session_id.clone();
-                                reseed_outcome = Some(outcome);
-                                (new_id, session_start, run_start_mode)
-                            }
-                            None => {
-                                let session_start = resolve_continue_session_start(&session)?;
-                                let run_start_mode = run_start_mode(&session_start).to_string();
-                                (session.id.clone(), session_start, run_start_mode)
+                        ContinueSessionAction::RetryStart => {
+                            // A handle-less open session is a provisional startup that
+                            // never reached the backend handshake. Retry the fresh start
+                            // under the same Cairn session identity so its transcript and
+                            // pending turn remain attached rather than rotating again.
+                            let session_start = crate::backends::SessionStart::New {
+                                session_id: session.id.clone(),
+                            };
+                            let run_start_mode = run_start_mode(&session_start).to_string();
+                            (session.id.clone(), session_start, run_start_mode)
+                        }
+                        ContinueSessionAction::Resume => {
+                            // Native backend resume of the open session (e.g. a Codex
+                            // session carrying its stored thread id). Reseed is
+                            // bypassed so a reply never restarts at the system prompt
+                            // (CAIRN-2598).
+                            let session_start = resolve_continue_session_start(&session)?;
+                            let run_start_mode = run_start_mode(&session_start).to_string();
+                            (session.id.clone(), session_start, run_start_mode)
+                        }
+                        ContinueSessionAction::MaybeReseed => {
+                            // Reseed-eligible open session. If it has gone stale (last
+                            // event older than the staleness threshold), a native
+                            // backend resume would reload a prompt cache the provider
+                            // has likely evicted; reseed instead by rotating to a
+                            // fresh session primed with the node's `/chat` digest
+                            // (CAIRN-2534). Any failure in the attempt falls open to
+                            // native resume with session state untouched.
+                            //
+                            // An owned-wait resume is the exception: it reuses a
+                            // successor turn already bound to this session, so a
+                            // reseed rotation would strand that turn. Take native
+                            // resume instead (CAIRN-2970).
+                            let now_secs = orch.services.clock.now();
+                            let reseed = if resuming_owned_wait {
+                                None
+                            } else {
+                                attempt_session_reseed(orch, &owning_db, &job, &session, now_secs)
+                            };
+                            match reseed {
+                                Some(outcome) => {
+                                    let session_start = crate::backends::SessionStart::New {
+                                        session_id: outcome.new_session_id.clone(),
+                                    };
+                                    let run_start_mode = run_start_mode(&session_start).to_string();
+                                    let new_id = outcome.new_session_id.clone();
+                                    reseed_outcome = Some(outcome);
+                                    (new_id, session_start, run_start_mode)
+                                }
+                                None => {
+                                    let session_start = resolve_continue_session_start(&session)?;
+                                    let run_start_mode = run_start_mode(&session_start).to_string();
+                                    (session.id.clone(), session_start, run_start_mode)
+                                }
                             }
                         }
                     }
@@ -1035,7 +1566,9 @@ pub fn continue_job_impl(
         }
         None => None,
     };
-    if existing_run_id.is_none() {
+    // The owned-wait successor IS the intended (pending) active turn; reconcile
+    // would cancel it, and the yielded predecessor leaves nothing else stale.
+    if existing_run_id.is_none() && !resuming_owned_wait {
         let _ = reconcile_stale_active_turn_for_continue(orch, job_id, &session_id)?;
     }
     let (run_id, is_process_reuse) = if let Some(existing_id) = existing_run_id {
@@ -1090,7 +1623,13 @@ pub fn continue_job_impl(
     let supersede_pending_retry = prompt_resume
         .as_ref()
         .is_some_and(|context| context.supersede_pending_retry);
-    let turn_id = if let Some(retry_turn_id) = preclaimed_retry_turn_id {
+    let turn_id = if let Some(successor_id) = preclaimed_successor_turn_id.as_deref() {
+        // Reuse the pre-created owned-wait successor instead of allocating a
+        // follow-up; it is started (pending -> running on this run) below like any
+        // other pending successor.
+        validate_preclaimed_successor(owning_db.clone(), job_id, &session_id, successor_id)?;
+        successor_id.to_string()
+    } else if let Some(retry_turn_id) = preclaimed_retry_turn_id {
         if !pending_retry_head_matches(owning_db.clone(), job_id, &retry_turn_id)? {
             return Err("automatic retry was superseded before launch".to_string());
         }
@@ -1147,9 +1686,10 @@ pub fn continue_job_impl(
         let db = owning_db.clone();
         let recipient = job_id.to_string();
         run_db(async move {
-            crate::orchestrator::attention_push::list_pending_live(&db, &recipient)
+            let pushes = crate::orchestrator::attention_push::list_pending_live(&db, &recipient)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(retain_resolvable_pushes(&db, &recipient, pushes).await)
         })
         .unwrap_or_default()
     };
@@ -1240,9 +1780,13 @@ pub fn continue_job_impl(
         .as_ref()
         .map(|ctx| ctx.suppress_user_event)
         .unwrap_or(false);
+    let suppress_self_suspend_note = prompt_resume
+        .as_ref()
+        .is_some_and(|ctx| ctx.suppress_self_suspend_note);
     let artifact_handoff_note = artifact_handoff_resume_note(owning_db.clone(), job_id)?;
     let resume_note = match (
-        suppress_user_event.then_some(RESUME_AFTER_SELF_SUSPEND_NOTE),
+        (suppress_user_event && !suppress_self_suspend_note)
+            .then_some(RESUME_AFTER_SELF_SUSPEND_NOTE),
         artifact_handoff_note.as_deref(),
     ) {
         (Some(self_suspend), Some(handoff)) => Some(format!("{self_suspend}\n\n{handoff}")),
@@ -1632,6 +2176,9 @@ enum ContinueSessionAction {
     /// A prompt edit since spawn requires a fresh same-backend session so this
     /// turn rebuilds the edited system prompt.
     RotateFresh,
+    /// Retry a provisional session whose backend startup never confirmed a
+    /// native resume handle. The Cairn session identity and transcript survive.
+    RetryStart,
     /// Attempt the stale cold-resume reseed, falling back to native resume.
     MaybeReseed,
     /// Native backend resume of the open session.
@@ -1640,9 +2187,10 @@ enum ContinueSessionAction {
 
 /// Decide how an open session continues on a user reply. Ordering matters: a
 /// cross-backend model change rotates first, then a prompt edit forces a fresh
-/// same-backend session, then a session that resumes natively (Codex with a
-/// stored thread id) resumes directly, and only the remaining sessions are
-/// eligible for the cold-resume reseed.
+/// same-backend session. A session without a confirmed backend handle retries
+/// its original startup; a session that resumes natively (Codex with a stored
+/// thread id) resumes directly, and only the remaining sessions are eligible for
+/// the cold-resume reseed.
 fn decide_continue_action(
     session_backend: &str,
     session_backend_id: Option<&str>,
@@ -1654,6 +2202,9 @@ fn decide_continue_action(
     }
     if needs_fresh_session {
         return ContinueSessionAction::RotateFresh;
+    }
+    if session_backend_id.is_none() {
+        return ContinueSessionAction::RetryStart;
     }
     if session_prefers_native_resume(session_backend, session_backend_id) {
         return ContinueSessionAction::Resume;
@@ -1711,49 +2262,69 @@ fn attempt_session_reseed(
         return None;
     }
 
-    // Render the digest of the prior history before rotating or storing any
-    // event, through the one canonical digest path.
-    let digest = {
-        let db = owning_db.clone();
-        let job = job.clone();
-        run_db(
-            async move { Ok::<_, String>(crate::resources::render_reseed_digest(&db, &job).await) },
-        )
-        .ok()?
-    };
-    if digest.trim().is_empty() || digest == "No runs found for this node." {
-        return None;
-    }
-    let seed_content = build_reseed_seed_content(&digest);
-
-    // Evict any live process bound to the old session; the fresh session id then
-    // cold-spawns naturally (its warm-process lookup returns None).
-    if let Some(old_run) = orch.process_state.find_process_by_session(&session.id) {
-        orch.process_state.stop_and_remove(&old_run);
-    }
-
-    // Rotate LAST — the only persisted mutation. A failure here still leaves the
-    // native-resume path fully intact.
-    let new_session =
-        run_db({
-            let db = owning_db.clone();
-            let session = session.clone();
-            let job_id = job.id.clone();
-            async move {
-                crate::sessions::queries::rotate_job_session(db.as_ref(), &session, &job_id).await
-            }
-        })
-        .ok()?;
+    let outcome = force_session_reseed(orch, owning_db, job, session).ok()?;
 
     log::info!(
         "Cold-resume reseed for job {}: rotated session {} -> {} ({}s idle > {}s)",
         &job.id[..job.id.len().min(8)],
         &session.id[..session.id.len().min(8)],
-        &new_session.id[..new_session.id.len().min(8)],
+        &outcome.new_session_id[..outcome.new_session_id.len().min(8)],
         now - last_event_at,
         staleness_threshold_secs(),
     );
-    Some(ReseedOutcome {
+    Some(outcome)
+}
+
+fn finish_forced_session_reseed(
+    owning_db: Arc<LocalDb>,
+    job_id: &str,
+    outcome: Result<ReseedOutcome, String>,
+) -> Result<ReseedOutcome, String> {
+    let outcome = outcome?;
+    // The successful fresh session was built with the current agent snapshot, so
+    // its pending prompt-edit rotation has now been satisfied. Consume only after
+    // success; an error must preserve the flag for the next ordinary continuation.
+    run_db(take_needs_fresh_session(owning_db, job_id.to_string()))?;
+    Ok(outcome)
+}
+
+fn force_session_reseed(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    session: &Session,
+) -> Result<ReseedOutcome, String> {
+    // Construct the complete seed before any process or session mutation.
+    let digest = {
+        let db = owning_db.clone();
+        let job = job.clone();
+        run_db(
+            async move { Ok::<_, String>(crate::resources::render_reseed_digest(&db, &job).await) },
+        )?
+    };
+    if digest.trim().is_empty() || digest == "No runs found for this node." {
+        return Err(
+            "Cannot resume from digest because this job has no resumable transcript.".to_string(),
+        );
+    }
+    let seed_content = build_reseed_seed_content(&digest);
+
+    if let Some(old_run) = orch.process_state.find_process_by_session(&session.id) {
+        orch.process_state.stop_and_remove(&old_run);
+    }
+
+    let new_session = run_db({
+        let db = owning_db.clone();
+        let session = session.clone();
+        let job_id = job.id.clone();
+        async move {
+            crate::sessions::queries::rotate_job_session(db.as_ref(), &session, &job_id)
+                .await
+                .map_err(|error| format!("Failed to rotate session for digest resume: {error}"))
+        }
+    })?;
+
+    Ok(ReseedOutcome {
         new_session_id: new_session.id,
         seed_content,
     })
@@ -1818,13 +2389,13 @@ fn ensure_reused_process_model(
     }
 }
 
-pub(super) struct ActiveTurnForContinue {
+struct ActiveTurnForContinue {
     turn_id: String,
     state: TurnState,
     run_id: Option<String>,
 }
 
-pub(super) fn load_active_turn_for_continue(
+fn load_active_turn_for_continue(
     db: Arc<LocalDb>,
     job_id: String,
 ) -> Result<Option<ActiveTurnForContinue>, String> {
@@ -1861,7 +2432,7 @@ pub(super) fn load_active_turn_for_continue(
     })
 }
 
-pub(super) fn mark_stale_active_turn_for_continue(
+fn mark_stale_active_turn_for_continue(
     db: Arc<LocalDb>,
     active: ActiveTurnForContinue,
 ) -> Result<(), String> {
@@ -1916,7 +2487,7 @@ pub(super) fn mark_stale_active_turn_for_continue(
     })
 }
 
-pub(super) fn reconcile_stale_active_turn_for_continue(
+fn reconcile_stale_active_turn_for_continue(
     orch: &Orchestrator,
     job_id: &str,
     session_id: &str,
@@ -1991,14 +2562,93 @@ pub fn reconcile_stale_active_turn_for_continue_for_test(
 mod tests {
     use super::{
         apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content,
-        decide_continue_action, ensure_reused_process_model, is_session_stale,
-        prepend_resume_stamp, previous_turn_end_for_resume, session_prefers_native_resume,
-        staleness_threshold_secs, ContinueSessionAction, ReseedOutcome, ReuseDecision,
-        RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
+        decide_continue_action, ensure_reused_process_model, finish_forced_session_reseed,
+        is_session_stale, prepend_resume_stamp, previous_turn_end_for_resume, push_job_coordinate,
+        session_prefers_native_resume, staleness_threshold_secs, take_needs_fresh_session,
+        ContinueSessionAction, PushJobCoordinate, ReseedOutcome, ReuseDecision, RESEED_SEED_HEADER,
+        SESSION_STALENESS_THRESHOLD_SECS,
     };
     use crate::agent_process::process::{wrap_plain_stdin, AgentProcessState, RunHandle};
     use crate::storage::migrated_test_db;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn wake_coordinate_parser_distinguishes_nested_tasks() {
+        match push_job_coordinate("cairn://p/CAIRN/42/2/builder/task/review-rust/checks") {
+            Some(PushJobCoordinate::Task {
+                project,
+                number,
+                exec_seq,
+                node,
+                task,
+            }) => {
+                assert_eq!(
+                    (
+                        project.as_str(),
+                        number,
+                        exec_seq,
+                        node.as_str(),
+                        task.as_str()
+                    ),
+                    ("CAIRN", 42, 2, "builder", "review-rust")
+                );
+            }
+            other => panic!("expected task coordinate, got {other:?}"),
+        }
+        assert!(push_job_coordinate("cairn://p/CAIRN/42").is_none());
+        assert!(push_job_coordinate("not-a-cairn-uri").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_forced_reseed_consumes_prompt_edit_flag() {
+        let db = Arc::new(migrated_test_db("forced-reseed-consumes-prompt-edit").await);
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','P','P','/tmp/p',1,1);
+             INSERT INTO jobs(id, project_id, status, needs_fresh_session, created_at, updated_at)
+               VALUES('j','p','blocked',1,1,1);",
+        )
+        .await
+        .unwrap();
+
+        let outcome = finish_forced_session_reseed(
+            db.clone(),
+            "j",
+            Ok(ReseedOutcome {
+                new_session_id: "new-session".to_string(),
+                seed_content: "seed".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(outcome.new_session_id, "new-session");
+        assert!(!take_needs_fresh_session(db, "j".to_string()).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_forced_reseed_preserves_prompt_edit_flag() {
+        let db = Arc::new(migrated_test_db("failed-reseed-preserves-prompt-edit").await);
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','P','P','/tmp/p',1,1);
+             INSERT INTO jobs(id, project_id, status, needs_fresh_session, created_at, updated_at)
+               VALUES('j','p','blocked',1,1,1);",
+        )
+        .await
+        .unwrap();
+
+        let error = match finish_forced_session_reseed(
+            db.clone(),
+            "j",
+            Err("digest rendering failed".to_string()),
+        ) {
+            Ok(_) => panic!("failed forced reseed unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "digest rendering failed");
+        assert!(take_needs_fresh_session(db, "j".to_string()).await.unwrap());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn resume_elapsed_uses_stored_predecessor_turn_end() {
@@ -2221,18 +2871,23 @@ mod tests {
     }
 
     #[test]
-    fn matching_backend_without_native_handle_is_reseed_eligible() {
-        // A Claude session (no native-resume policy) still flows through the
-        // cold-resume reseed path.
+    fn matching_backend_without_native_handle_retries_startup() {
+        // A confirmed Claude session (Claude does not have Codex's native-resume
+        // preference) still flows through the cold-resume reseed path.
         assert_eq!(
             decide_continue_action("claude", Some("sess-abc"), Some("claude"), false),
             ContinueSessionAction::MaybeReseed
         );
-        // A Codex session with no stored thread id can't resume natively, so it
-        // is reseed-eligible too.
+        // A handle-less open session never completed its backend startup. Retry
+        // that startup under the same Cairn session instead of trying to resume
+        // an identifier that does not exist.
+        assert_eq!(
+            decide_continue_action("claude", None, Some("claude"), false),
+            ContinueSessionAction::RetryStart
+        );
         assert_eq!(
             decide_continue_action("codex", None, Some("codex"), false),
-            ContinueSessionAction::MaybeReseed
+            ContinueSessionAction::RetryStart
         );
     }
 

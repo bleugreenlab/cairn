@@ -58,21 +58,6 @@ pub async fn load_action_node(
         .ok_or_else(|| format!("Node {} not found in snapshot", node_id))
 }
 
-/// Find the worktree path for the execution that owns an action_run.
-///
-/// Both hosts use identical logic: look up execution_id from the action_run,
-/// then find the first job in that execution with a worktree_path.
-pub async fn find_worktree_for_action_run(
-    orch: &Orchestrator,
-    action_run_id: &str,
-) -> Result<String, String> {
-    let db = crate::execution::routing::owning_db_for_action_run(&orch.db, action_run_id).await?;
-    let execution_id = action_run_execution_id(&db, action_run_id).await?;
-    let worktree = first_worktree_for_execution(&db, &execution_id).await?;
-
-    worktree.ok_or_else(|| "No worktree found for action checkpoint".to_string())
-}
-
 /// Complete an action_run after execution: mark it complete in the database.
 ///
 /// This is the shared post-execution logic that was duplicated in both
@@ -309,7 +294,7 @@ async fn execute_builtin_action(
 /// builder job, and fire the fixed `open` port. The action_run is left `Running`;
 /// the shared `complete_action_run` flips it to `Blocked` (holding the DAG open
 /// while the PR awaits merge/close). See CAIRN-1220.
-pub async fn handle_pr_node(
+async fn handle_pr_node(
     orch: &Orchestrator,
     action_run: &ActionRun,
     inputs: HashMap<String, serde_json::Value>,
@@ -653,9 +638,13 @@ impl PrVcs {
         }
     }
 
-    /// The branch HEAD commit recorded as the merge_request `head_sha`.
-    fn head_sha(&self, worktree: &str) -> Result<String, String> {
-        crate::jj::head_commit(&self.jj, Path::new(worktree))
+    /// Resolve the runner-owned logical bookmark recorded as the merge request
+    /// head. The retained worktree may intentionally lag this coordinate.
+    async fn head_sha(&self) -> Result<String, String> {
+        let store = crate::jj::project_store_dir(&self.config_dir, &self.gh_cwd);
+        cairn_vcs::resolve_coordinate(&store, &self.branch)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -679,7 +668,7 @@ fn triage_ledger_relative_path(issue_number: i32) -> String {
 async fn commit_triage_ledger_if_needed(
     orch: &Orchestrator,
     action_run: &ActionRun,
-    worktree_path: &str,
+    _worktree_path: &str,
     repo_path: &str,
 ) -> Result<(), String> {
     let Some(issue_id) = action_run.issue_id.as_deref() else {
@@ -710,48 +699,63 @@ async fn commit_triage_ledger_if_needed(
         &memories,
     );
     let relative_path = triage_ledger_relative_path(issue.number);
-    let worktree = Path::new(worktree_path);
-    let full_path = worktree.join(&relative_path);
-    if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Failed to create memory triage ledger directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-    std::fs::write(&full_path, rendered).map_err(|error| {
-        format!(
-            "Failed to write memory triage ledger {}: {error}",
-            full_path.display()
-        )
-    })?;
-
-    if !crate::jj::is_jj_dir(worktree) {
-        return Err(format!(
-            "Memory triage ledger was written to {}, but the implementation context is not a jj worktree and cannot be sealed",
-            full_path.display()
-        ));
-    }
-
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    if !crate::jj::scoped_dirty(&jj, worktree, &[relative_path.as_str()])? {
-        return Ok(());
-    }
-
+    let parent_job_id = action_run
+        .parent_job_id
+        .as_deref()
+        .ok_or("Memory triage PR action has no parent job")?;
+    let branch = {
+        let parent_job_id = parent_job_id.to_string();
+        db.read(|conn| {
+            let parent_job_id = parent_job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT branch FROM jobs WHERE id = ?1 LIMIT 1",
+                        (parent_job_id.as_str(),),
+                    )
+                    .await?;
+                crate::storage::next_text(&mut rows, 0).await
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("Memory triage parent job has no logical branch")?
+    };
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
     let _store_guard = orch
-        .acquire_jj_store_lock(&store, "memory triage ledger seal")
+        .acquire_jj_store_lock(&store, "memory triage logical publication")
         .await;
-    if !crate::jj::scoped_dirty(&jj, worktree, &[relative_path.as_str()])? {
+    let expected = cairn_vcs::resolve_coordinate(&store, &branch)
+        .await
+        .map_err(|error| error.to_string())?;
+    let current = crate::mcp::handlers::read::file_at_commit(
+        PathBuf::from(repo_path),
+        expected.clone(),
+        &relative_path,
+    )?;
+    if current.as_deref() == Some(rendered.as_bytes()) {
         return Ok(());
     }
-
-    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, worktree);
     let commit_msg = format!("memory triage ledger: {scope}={scope_value}");
-    vcs.seal_files(worktree, &[relative_path.as_str()], &commit_msg, None)
-        .map(|_| ())
-        .map_err(|error| format!("Failed to seal memory triage ledger commit: {error}"))
+    tokio::task::spawn_blocking(move || {
+        cairn_vcs::publish_logical_mutations(
+            &store,
+            &branch,
+            &expected,
+            vec![cairn_vcs::LogicalTreeMutation {
+                path: relative_path,
+                content: Some(rendered.into_bytes()),
+            }],
+            cairn_vcs::PublicationMode::Child {
+                description: commit_msg,
+                author: None,
+            },
+        )
+    })
+    .await
+    .map_err(|error| format!("Memory triage publication worker failed: {error}"))?
+    .map(|_| ())
+    .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))
 }
 
 /// Load a project's repo checkout path (the git-backed checkout that carries
@@ -947,12 +951,12 @@ async fn fire_pr_open_review(
     orch: &Orchestrator,
     db: &LocalDb,
     vcs: &PrVcs,
-    worktree_path: &str,
+    _worktree_path: &str,
     job_id: &str,
     issue_id: Option<&str>,
     branch_name: &str,
 ) {
-    if let Ok(head_sha) = vcs.head_sha(worktree_path) {
+    if let Ok(head_sha) = vcs.head_sha().await {
         if let Err(e) = set_mr_head_sha(db, job_id, &head_sha).await {
             log::warn!(
                 "Failed to record merge_request head_sha for job {}: {}",
@@ -1557,34 +1561,6 @@ async fn action_run_node_id(db: &LocalDb, action_run_id: &str) -> Result<String,
     .await
     .and_then(|value| value.ok_or_else(|| DbError::Row("action_run not found".to_string())))
     .map_err(|e| format!("action_run not found: {}", e))
-}
-
-async fn action_run_execution_id(db: &LocalDb, action_run_id: &str) -> Result<String, String> {
-    let action_run_id = action_run_id.to_string();
-    db.query_text(
-        "SELECT execution_id FROM action_runs WHERE id = ?1",
-        params![action_run_id.as_str()],
-    )
-    .await
-    .and_then(|value| value.ok_or_else(|| DbError::Row("action_run not found".to_string())))
-    .map_err(|e| format!("Action run not found: {}", e))
-}
-
-async fn first_worktree_for_execution(
-    db: &LocalDb,
-    execution_id: &str,
-) -> Result<Option<String>, String> {
-    let execution_id = execution_id.to_string();
-    db.query_text(
-        "SELECT worktree_path
-         FROM jobs
-         WHERE execution_id = ?1
-           AND worktree_path IS NOT NULL
-         LIMIT 1",
-        params![execution_id.as_str()],
-    )
-    .await
-    .map_err(|e| format!("Failed to query worktree: {}", e))
 }
 
 async fn get_action_run(db: &LocalDb, action_run_id: &str) -> Result<ActionRun, String> {
@@ -3059,9 +3035,11 @@ mod tests {
             .await
             .unwrap();
         let repo_path = project_repo.to_string_lossy().to_string();
+        let ws_path_db = ws_path.to_string_lossy().to_string();
         db_local
             .write(|conn| {
                 let repo_path = repo_path.clone();
+                let ws_path_db = ws_path_db.clone();
                 Box::pin(async move {
                     conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
                     conn.execute(
@@ -3070,7 +3048,7 @@ mod tests {
                     ).await?;
                     conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-7','p-1',7,'Memory triage: project=P (2 pending)','active','none',1,1)", ()).await?;
                     conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','memory-triage','i-7','p-1','running',1,1,'{}')", ()).await?;
-                    conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('job-x','e-1','i-7','p-1','complete','Integrator','integrator',1,1)", ()).await?;
+                    conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, branch, worktree_path, created_at, updated_at) VALUES ('job-x','e-1','i-7','p-1','complete','Integrator','integrator','agent/CAIRN-7-integrator-0',?1,1,1)", params![ws_path_db]).await?;
                     let rows: [(&str, &str, Option<&str>); 2] =
                         [("m-1", "discard", None), ("m-2", "defer", Some("workspace"))];
                     for (seq, (id, decision, deferred)) in rows.iter().enumerate() {
@@ -3110,7 +3088,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             created_at: 1,
-            parent_job_id: None,
+            parent_job_id: Some("job-x".to_string()),
             uri_segment: Some("pr".to_string()),
         };
 
@@ -3123,13 +3101,25 @@ mod tests {
         // "No commits between main and <branch>". `@-` is the sealed commit; the
         // ledger file `7.md` lives there (base `main` carries only the prior
         // `1.md`), and the working copy is left clean.
-        let listed = crate::jj::file_list(&jj, &ws_path, "@-", "docs/memory-triage").unwrap();
+        let listed = crate::jj::file_list(
+            &jj,
+            &store_dir,
+            "agent/CAIRN-7-integrator-0",
+            "docs/memory-triage",
+        )
+        .unwrap();
         assert!(
             listed.iter().any(|f| f.ends_with("7.md")),
             "the no-promotion ledger file is committed in @-: {listed:?}"
         );
         let ledger = String::from_utf8(
-            crate::jj::file_show(&jj, &ws_path, "@-", "docs/memory-triage/7.md").unwrap(),
+            crate::jj::file_show(
+                &jj,
+                &store_dir,
+                "agent/CAIRN-7-integrator-0",
+                "docs/memory-triage/7.md",
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(

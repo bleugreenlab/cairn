@@ -26,7 +26,7 @@ pub fn build_issue_messages_uri(project: &str, number: i32) -> String {
     format!("{}/messages", build_issue_uri(project, number))
 }
 
-pub fn build_issue_comments_uri(project: &str, number: i32) -> String {
+pub(crate) fn build_issue_comments_uri(project: &str, number: i32) -> String {
     format!("{}/comments", build_issue_uri(project, number))
 }
 
@@ -38,15 +38,15 @@ pub fn build_issue_comment_uri(project: &str, number: i32, comment_seq: i32) -> 
     )
 }
 
-pub fn build_node_messages_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+fn build_node_messages_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "messages")
 }
 
-pub fn build_node_progress_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+fn build_node_progress_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "progress")
 }
 
-pub fn build_task_messages_uri(
+fn build_task_messages_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -56,7 +56,7 @@ pub fn build_task_messages_uri(
     build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "messages")
 }
 
-pub fn build_issue_changed_uri(project: &str, number: i32) -> String {
+fn build_issue_changed_uri(project: &str, number: i32) -> String {
     format!("{}/changed", build_issue_uri(project, number))
 }
 
@@ -64,7 +64,7 @@ pub fn build_issue_executions_uri(project: &str, number: i32) -> String {
     format!("{}/executions", build_issue_uri(project, number))
 }
 
-pub fn build_issue_execution_uri(project: &str, number: i32, exec_seq: i32) -> String {
+pub(crate) fn build_issue_execution_uri(project: &str, number: i32, exec_seq: i32) -> String {
     format!(
         "{}/{}",
         build_issue_executions_uri(project, number),
@@ -176,7 +176,7 @@ pub fn build_node_artifact_uri_named(
     )
 }
 
-pub fn build_node_diff_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+fn build_node_diff_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "diff")
 }
 
@@ -190,7 +190,7 @@ pub fn build_node_terminal_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "terminal", slug)
 }
 
-pub fn build_node_repl_uri(
+fn build_node_repl_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -270,11 +270,11 @@ pub fn build_job_todos_uri(
     }
 }
 
-pub fn build_node_tasks_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+fn build_node_tasks_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "tasks")
 }
 
-pub fn build_node_calls_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+fn build_node_calls_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "calls")
 }
 
@@ -286,12 +286,17 @@ pub fn build_node_checks_uri(project: &str, number: i32, exec_seq: i32, node_id:
     build_node_subresource_uri(project, number, exec_seq, node_id, "checks")
 }
 
-pub fn build_node_questions_uri(
+pub fn build_task_checks_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
     node_id: &str,
+    task_name: &str,
 ) -> String {
+    build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "checks")
+}
+
+fn build_node_questions_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "questions")
 }
 
@@ -305,12 +310,7 @@ pub fn build_node_question_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "questions", segment)
 }
 
-pub fn build_node_permissions_uri(
-    project: &str,
-    number: i32,
-    exec_seq: i32,
-    node_id: &str,
-) -> String {
+fn build_node_permissions_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "permissions")
 }
 
@@ -324,7 +324,7 @@ pub fn build_node_permission_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "permissions", segment)
 }
 
-pub fn build_task_permissions_uri(
+fn build_task_permissions_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -353,7 +353,7 @@ pub fn build_project_terminal_uri(project: &str, slug: &str) -> String {
     format!("{}/terminal/{}", build_project_uri(project), slug)
 }
 
-pub fn build_node_browser_uri(
+fn build_node_browser_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -363,7 +363,7 @@ pub fn build_node_browser_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "browser", slug)
 }
 
-pub fn build_task_browser_uri(
+fn build_task_browser_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -378,7 +378,7 @@ pub fn build_task_browser_uri(
     )
 }
 
-pub fn build_project_browser_uri(project: &str, slug: &str) -> String {
+fn build_project_browser_uri(project: &str, slug: &str) -> String {
     format!("{}/browser/{}", build_project_uri(project), slug)
 }
 
@@ -464,7 +464,7 @@ pub fn build_project_skill_uri(project: &str, skill_id: &str, path: &[String]) -
     )
 }
 
-pub fn build_labels_uri() -> String {
+fn build_labels_uri() -> String {
     "cairn://labels".to_string()
 }
 
@@ -472,11 +472,11 @@ pub fn build_label_uri(label_id: &str) -> String {
     format!("cairn://labels/{}", label_id)
 }
 
-pub fn build_node_memories_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+fn build_node_memories_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "memories")
 }
 
-pub fn build_node_symbols_uri(
+fn build_node_symbols_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -490,7 +490,7 @@ pub fn build_node_symbols_uri(
     }
 }
 
-pub fn build_project_symbols_uri(project: &str, symbol: Option<&str>) -> String {
+fn build_project_symbols_uri(project: &str, symbol: Option<&str>) -> String {
     let base = format!("{}/symbols", build_project_uri(project));
     match symbol {
         Some(symbol) => format!("{base}/{symbol}"),
@@ -512,7 +512,7 @@ pub fn build_node_memory_uri(
     )
 }
 
-pub fn build_recipes_uri() -> String {
+fn build_recipes_uri() -> String {
     "cairn://recipes".to_string()
 }
 
@@ -520,7 +520,7 @@ pub fn build_recipe_uri(recipe_id: &str) -> String {
     format!("cairn://recipes/{}", recipe_id)
 }
 
-pub fn build_project_recipes_uri(project: &str) -> String {
+fn build_project_recipes_uri(project: &str) -> String {
     format!("{}/recipes", build_project_uri(project))
 }
 
@@ -528,7 +528,7 @@ pub fn build_project_recipe_uri(project: &str, recipe_id: &str) -> String {
     format!("{}/recipes/{}", build_project_uri(project), recipe_id)
 }
 
-pub fn build_workflows_uri() -> String {
+fn build_workflows_uri() -> String {
     "cairn://workflows".to_string()
 }
 
@@ -536,7 +536,7 @@ pub fn build_workflow_uri(workflow_id: &str) -> String {
     format!("cairn://workflows/{}", workflow_id)
 }
 
-pub fn build_project_workflows_uri(project: &str) -> String {
+fn build_project_workflows_uri(project: &str) -> String {
     format!("{}/workflows", build_project_uri(project))
 }
 
@@ -544,7 +544,7 @@ pub fn build_project_workflow_uri(project: &str, workflow_id: &str) -> String {
     format!("{}/workflows/{}", build_project_uri(project), workflow_id)
 }
 
-pub fn build_agents_uri() -> String {
+fn build_agents_uri() -> String {
     "cairn://agents".to_string()
 }
 
@@ -552,7 +552,7 @@ pub fn build_agent_uri(agent_id: &str) -> String {
     format!("cairn://agents/{}", agent_id)
 }
 
-pub fn build_project_agents_uri(project: &str) -> String {
+fn build_project_agents_uri(project: &str) -> String {
     format!("{}/agents", build_project_uri(project))
 }
 
@@ -560,7 +560,7 @@ pub fn build_project_agent_uri(project: &str, agent_id: &str) -> String {
     format!("{}/agents/{}", build_project_uri(project), agent_id)
 }
 
-pub fn build_actions_uri() -> String {
+fn build_actions_uri() -> String {
     "cairn://actions".to_string()
 }
 
@@ -568,7 +568,7 @@ pub fn build_action_uri(action_id: &str) -> String {
     format!("cairn://actions/{}", action_id)
 }
 
-pub fn build_project_actions_uri(project: &str) -> String {
+fn build_project_actions_uri(project: &str) -> String {
     format!("{}/actions", build_project_uri(project))
 }
 
@@ -576,15 +576,15 @@ pub fn build_project_action_uri(project: &str, action_id: &str) -> String {
     format!("{}/actions/{}", build_project_uri(project), action_id)
 }
 
-pub fn build_settings_uri() -> String {
+fn build_settings_uri() -> String {
     "cairn://settings".to_string()
 }
 
-pub fn build_projects_uri() -> String {
+fn build_projects_uri() -> String {
     "cairn://projects".to_string()
 }
 
-pub fn build_project_settings_uri(project: &str) -> String {
+fn build_project_settings_uri(project: &str) -> String {
     format!("{}/settings", build_project_uri(project))
 }
 
@@ -802,6 +802,13 @@ impl CairnResource {
                 exec_seq,
                 node_id,
             } => build_node_checks_uri(project, *number, *exec_seq, node_id),
+            Self::TaskChecks {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_task_checks_uri(project, *number, *exec_seq, node_id, task_name),
             Self::NodeQuestions {
                 project,
                 number,

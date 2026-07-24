@@ -57,7 +57,6 @@ impl schemars::JsonSchema for ChangeInput {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "ChangeInput".into()
     }
-
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         serde_json::from_value::<schemars::Schema>(serde_json::json!({
             "type": "object",
@@ -126,6 +125,29 @@ pub(crate) struct ReadFileInput {
 pub(crate) fn validate_run_input(input: &RunInput) -> Result<(), String> {
     if input.commands.is_empty() {
         return Err("`commands` must contain at least one item".to_string());
+    }
+    if input.commands.iter().any(|item| item.wait_for.is_some()) {
+        if input.commands.len() != 1 {
+            return Err("a waitFor item must be the only item in its run batch".to_string());
+        }
+        if input.branch.is_some() || input.commit_msg.is_some() {
+            return Err("a waitFor run cannot use branch or commit_msg".to_string());
+        }
+        if input.sequential.is_some() || input.stop_on_error.is_some() {
+            return Err("a waitFor run cannot use sequential or stop_on_error".to_string());
+        }
+        let item = &input.commands[0];
+        if item.command.is_some()
+            || item.target.is_some()
+            || item.code.is_some()
+            || item.repl.is_some()
+            || item.payload.is_some()
+            || item.interpreter.is_some()
+            || item.timeout.is_some()
+        {
+            return Err("a waitFor item cannot include command, target, code, repl, payload, interpreter, or timeout".to_string());
+        }
+        return Ok(());
     }
     for (i, item) in input.commands.iter().enumerate() {
         // A `repl` key routes inline `code` into a live REPL session; it requires
@@ -229,7 +251,7 @@ pub(crate) struct RunInput {
     pub(crate) sequential: Option<bool>,
     /// In sequential mode, abort remaining items after a failure (default: true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    stop_on_error: Option<bool>,
+    pub(crate) stop_on_error: Option<bool>,
     /// Commit message for successful worktree-bound batches that dirty the tree.
     /// Stages all changes and commits once after success. Use "^" to amend the
     /// previous commit. Without a commit_msg, a batch that dirties the worktree
@@ -243,7 +265,27 @@ pub(crate) struct RunInput {
     /// Branch/ref resolved to its head commit for verdict-only build-slot execution.
     /// Cannot be combined with commit_msg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    branch: Option<String>,
+    pub(crate) branch: Option<String>,
+    /// Hard executor placement requirements for the entire batch. The callback
+    /// handler owns semantic validation; cairn-cmd must preserve this object
+    /// verbatim so independently managed executors remain addressable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) constraints: Option<RunPlacementConstraintsInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunPlacementConstraintsInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    required_toolchains: Vec<String>,
 }
 
 /// A single run item: exactly one of `command` (shell), inline `code` (with an
@@ -256,7 +298,9 @@ pub(crate) struct RunItemInput {
     /// Short description of what this command does (5-10 words).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    /// Timeout in milliseconds (default: 120000, max: 600000).
+    /// Timeout in milliseconds (max: 600000). Explicit values win. Omitted
+    /// direct-host items fall back to 120000; executor-routed items use the
+    /// configured build-slot default after seconds-to-milliseconds conversion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout: Option<u32>,
     /// A `cairn://skills/<id>/scripts/<name>` target. Mutually exclusive with `command` and `code`.
@@ -270,12 +314,14 @@ pub(crate) struct RunItemInput {
     /// `interpreter`. The interpreter execs the source directly (no shell, no
     /// quoting): typescript/javascript via bun with the worktree `node_modules`
     /// and zero-config `@cairn/sdk`, python via the bundled `uv` with PEP 723
-    /// dependency blocks and automatic project-env pickup.
+    /// dependency blocks and automatic project-env pickup, or MATLAB via
+    /// `matlab -batch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) code: Option<String>,
     /// Language for an inline `code` item: `typescript`/`ts` or `javascript`/`js`
     /// (both via bun), or `python`/`py` (via the bundled `uv`, with PEP 723 deps
-    /// and project-env pickup). Required iff `code` is present.
+    /// and project-env pickup), or `matlab` (via `matlab -batch`). Required iff
+    /// `code` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) interpreter: Option<String>,
     /// Route this item's inline `code` into a live stateful REPL session (by
@@ -285,6 +331,49 @@ pub(crate) struct RunItemInput {
     /// with `write cairn:~/repl/<slug> {interpreter:"python"}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repl: Option<String>,
+    /// Suspend this turn without polling until a duration elapses or a terminal
+    /// exits/prints a phrase. This must be the sole item in the batch. Examples:
+    /// `{waitFor:{duration:"3m"}}`,
+    /// `{waitFor:{kind:"terminal",ref:"cairn:~/terminal/tests",on:"exit"}}`,
+    /// `{waitFor:{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}}`.
+    #[serde(default, rename = "waitFor", skip_serializing_if = "Option::is_none")]
+    pub(crate) wait_for: Option<WaitForInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum WaitForInput {
+    Duration {
+        duration: WaitDurationInput,
+    },
+    Terminal {
+        kind: TerminalWaitKindInput,
+        #[serde(rename = "ref")]
+        reference: String,
+        on: TerminalWaitEventInput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phrase: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum WaitDurationInput {
+    Human(String),
+    Milliseconds(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TerminalWaitKindInput {
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TerminalWaitEventInput {
+    Exit,
+    Output,
 }
 
 /// Structured args for a `target`: positional `args` for a skill script, or a
@@ -409,6 +498,60 @@ mod tests {
             reser["commands"][0]["payload"]["args_json"],
             serde_json::json!({ "app": "Finder" })
         );
+    }
+
+    #[test]
+    fn run_input_preserves_executor_constraints_when_forwarded() {
+        let input = run_input(serde_json::json!({
+            "commands": [{"command": "uname -m"}],
+            "constraints": {
+                "executorId": "linux-builder",
+                "deviceId": "linux-device",
+                "os": "linux",
+                "arch": "x86_64",
+                "requiredToolchains": ["rust"]
+            }
+        }));
+        let forwarded = serde_json::to_value(input).expect("serialize RunInput");
+        assert_eq!(
+            forwarded["constraints"],
+            serde_json::json!({
+                "executorId": "linux-builder",
+                "deviceId": "linux-device",
+                "os": "linux",
+                "arch": "x86_64",
+                "requiredToolchains": ["rust"]
+            })
+        );
+    }
+
+    #[test]
+    fn validate_run_input_accepts_each_wait_form_and_rejects_mixtures() {
+        for wait_for in [
+            serde_json::json!({"duration":"3m"}),
+            serde_json::json!({"duration":25}),
+            serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/tests","on":"exit"}),
+            serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/dev","on":"output","phrase":"ready"}),
+        ] {
+            let input = run_input(serde_json::json!({"commands":[{"waitFor":wait_for}]}));
+            assert!(validate_run_input(&input).is_ok());
+        }
+        let mixed = run_input(
+            serde_json::json!({"commands":[{"waitFor":{"duration":"3m"}},{"command":"echo no"}]}),
+        );
+        assert!(validate_run_input(&mixed)
+            .unwrap_err()
+            .contains("only item"));
+        let branch = run_input(
+            serde_json::json!({"commands":[{"waitFor":{"duration":"3m"}}],"branch":"main"}),
+        );
+        assert!(validate_run_input(&branch).unwrap_err().contains("branch"));
+        let commit = run_input(
+            serde_json::json!({"commands":[{"waitFor":{"duration":"3m"}}],"commit_msg":"no"}),
+        );
+        assert!(validate_run_input(&commit)
+            .unwrap_err()
+            .contains("commit_msg"));
     }
 
     #[test]

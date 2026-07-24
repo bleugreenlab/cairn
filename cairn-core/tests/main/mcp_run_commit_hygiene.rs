@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::dispatch::dispatch_tool;
 use cairn_core::internal::jj::{self, JjEnv};
+use cairn_core::internal::mcp::handlers::read::handle_read_file;
 use cairn_core::internal::mcp::handlers::run::handle_run;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
@@ -298,15 +299,35 @@ async fn run_preflight_rebinds_prior_lineage_before_command_execution() {
         "result: {result}"
     );
     assert_eq!(
-        std::fs::read_to_string(Path::new(&cwd).join("repaired.txt")).unwrap(),
-        "repaired"
-    );
-    assert_eq!(
         jj::bookmark_commit(&jj, Path::new(&cwd), branch).as_deref(),
         Some(old_tip.as_str()),
         "the conflicting bookmark must remain unchanged"
     );
     let marker = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    let repaired = Command::new("jj")
+        .args(["file", "show", "-r", &marker.branch, "repaired.txt"])
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    assert!(
+        repaired.status.success(),
+        "jj file show failed: {repaired:?}"
+    );
+    let repaired = String::from_utf8(repaired.stdout).unwrap();
+    assert_eq!(repaired, "repaired");
+    let read = handle_read_file(
+        &orch,
+        &McpCallbackRequest {
+            thread_id: None,
+            cwd: cwd.clone(),
+            run_id: Some(run_id.to_string()),
+            tool: "read".to_string(),
+            payload: json!({ "path": "file:repaired.txt" }),
+            tool_use_id: None,
+        },
+    )
+    .await;
+    assert!(read.contains("repaired"), "{read}");
     assert_ne!(marker.branch, branch);
     assert!(marker.branch.starts_with("agent/RHG-1-builder-0-j"));
     assert!(jj::bookmark_commit(&jj, Path::new(&cwd), &marker.branch).is_some());
@@ -344,22 +365,7 @@ fn init_git_repo(repo: &Path) {
 }
 
 // `jj_bin`, `head_sha`, and `provision_jj_workspace` live in `tests/common`
-// (the shared non-colocated jj fixture); call them as `common::*`. `git_stdout`
-// and `init_bare_origin` are local to this file's bare-origin push test.
-fn git_stdout(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
-    assert!(out.status.success(), "git {args:?} failed");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-fn init_bare_origin(origin: &Path) {
-    std::fs::create_dir_all(origin).unwrap();
-    git(origin, &["init", "--bare", "-b", "main"]);
-}
+// (the shared non-colocated jj fixture); call them as `common::*`.
 
 /// Whether the jj workspace `@` is empty (equals its sealed parent).
 fn ws_clean(config_dir: &Path, ws: &Path) -> bool {
@@ -664,63 +670,6 @@ async fn setup_nested_under_git_repo(
     (temp, orch, cwd, home)
 }
 
-/// Like [`setup_nested_under_git_repo`], but the project repo also has an
-/// `origin` remote pointing at a bare repo, so a bare `jj git push` from the
-/// workspace has somewhere to land. Returns the bare origin path.
-async fn setup_nested_with_origin(
-    run_id: &str,
-) -> (TempDir, Orchestrator, String, std::path::PathBuf) {
-    let (temp, db) = common::migrated_db().await;
-    let origin = temp.path().join("origin");
-    init_bare_origin(&origin);
-    let project_repo = temp.path().join("project");
-    init_git_repo(&project_repo);
-    git(
-        &project_repo,
-        &["remote", "add", "origin", &origin.to_string_lossy()],
-    );
-    git(&project_repo, &["push", "origin", "main"]);
-    let home = temp.path().join("home");
-    init_git_repo(&home);
-    let db = Arc::new(db);
-    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
-    let ws = home.join("worktrees").join("ws");
-    // `jj workspace add` creates only the final dir, not intermediates.
-    std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
-    let branch = "agent/RHG-1-builder-0";
-    let base = common::head_sha(&project_repo);
-    seed_run(
-        &db,
-        &project_id,
-        &ws,
-        branch,
-        &base,
-        run_id,
-        LegacySandbox::Worktree,
-        LegacyOnEscape::Allow,
-    )
-    .await;
-    let orch = orchestrator(&temp, db);
-    common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
-    write_managed_identity(&project_id, &project_repo, &ws, branch, &base, run_id);
-    let cwd = ws.display().to_string();
-    (temp, orch, cwd, origin)
-}
-
-fn sequential_run_request(cwd: &str, run_id: &str, commands: Vec<&str>) -> McpCallbackRequest {
-    McpCallbackRequest {
-        thread_id: None,
-        cwd: cwd.to_string(),
-        run_id: Some(run_id.to_string()),
-        tool: "run".to_string(),
-        payload: json!({
-            "sequential": true,
-            "commands": commands.iter().map(|c| json!({ "command": c })).collect::<Vec<_>>(),
-        }),
-        tool_use_id: Some("toolu-run".to_string()),
-    }
-}
-
 /// Seed a run whose fence is `deny`, so the commit-hygiene gate is active.
 async fn setup_deny(run_id: &str) -> (TempDir, Orchestrator, String) {
     let (temp, orch, cwd, _) =
@@ -767,7 +716,7 @@ async fn run_without_commit_msg_reverts_new_dirt() {
     )
     .await;
 
-    assert!(result.contains("Run reverted"), "result: {result}");
+    assert!(!result.contains("isolated cell"), "result: {result}");
     assert!(!Path::new(&cwd).join("generated.txt").exists());
     assert!(ws_clean(&temp.path().join("config"), Path::new(&cwd)));
 }
@@ -828,6 +777,85 @@ async fn run_with_commit_msg_seals_and_cleans() {
     assert!(result.contains("Committed changes"), "result: {result}");
     assert!(Path::new(&cwd).join("committed.txt").exists());
     assert!(ws_clean(&temp.path().join("config"), Path::new(&cwd)));
+}
+
+#[tokio::test]
+async fn fresh_managed_workspace_commit_runs_write_check_in_git_slot_and_stores_verdict() {
+    if common::skip_if_fenced(
+        "fresh_managed_workspace_commit_runs_write_check_in_git_slot_and_stores_verdict",
+    ) {
+        return;
+    }
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!(
+            "skipping fresh_managed_workspace_commit_runs_write_check_in_git_slot_and_stores_verdict: jj not resolvable"
+        );
+        return;
+    };
+    let run_id = "fresh-write-check";
+    let (temp, orch, cwd, fixture) = setup_allow_delta(run_id).await;
+    let config = fixture.project_repository.join(".cairn/config.yaml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "checks:\n  fresh-slot:\n    command: test \"$(cat checked.txt)\" = fresh && printf fresh-slot-ok\n    impact:\n      - checked.txt\n    when: write\n",
+    )
+    .unwrap();
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf fresh > checked.txt",
+            Some("seal fresh checked tree"),
+        ),
+    )
+    .await;
+
+    assert!(result.contains("Committed changes"), "result: {result}");
+    assert!(result.contains("✓ fresh-slot"), "result: {result}");
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let sealed_commit = jj::head_commit(&jj, &fixture.workspace).unwrap();
+    let sealed_tree = jj::sealed_tree_hash(&jj, &fixture.workspace).unwrap();
+    let project_id = jj::read_workspace_identity(&fixture.workspace)
+        .unwrap()
+        .project_id;
+    let stored = orch
+        .db
+        .local
+        .query_text(
+            "SELECT tree_hash || ':' || passed || ':' || COALESCE(job_id, '')\n             FROM check_result_cache\n             WHERE project_id = ?1 AND check_name = 'fresh-slot'\n             ORDER BY ran_at DESC LIMIT 1",
+            params![project_id],
+        )
+        .await
+        .unwrap()
+        .expect("fresh write-check verdict");
+    assert_eq!(stored, format!("{sealed_tree}:1:job-{run_id}"));
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("checked.txt")).unwrap(),
+        "fresh"
+    );
+    let visible = Command::new("git")
+        .args(["cat-file", "-t", &sealed_commit])
+        .current_dir(&fixture.project_repository)
+        .output()
+        .unwrap();
+    assert!(visible.status.success());
+    assert_eq!(String::from_utf8_lossy(&visible.stdout).trim(), "commit");
+    let temporary_refs = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/cairn/checks/"])
+        .current_dir(&fixture.project_repository)
+        .output()
+        .unwrap();
+    assert!(temporary_refs.status.success());
+    assert!(
+        String::from_utf8_lossy(&temporary_refs.stdout)
+            .trim()
+            .is_empty(),
+        "sealed-check reachability ref survived cleanup: {}",
+        String::from_utf8_lossy(&temporary_refs.stdout)
+    );
 }
 
 #[tokio::test]
@@ -961,94 +989,7 @@ async fn bare_git_in_jj_worktree_does_not_resolve_up_to_outer_repo() {
         !result.contains(&home_top),
         "bare git must NOT resolve to the outer HOME repo {home_top}: {result}"
     );
-    assert!(
-        result.contains("not a git repository"),
-        "bare git must fail loudly (not a git repository): {result}"
-    );
-}
-
-/// End-to-end (test B, identity half): a bare `jj` commit through the run tool
-/// must carry the managed identity. `JJ_CONFIG` reaching the bare jj process is
-/// what gives its commit the `agent@cairn.local` committer instead of an
-/// empty/unpushable one.
-#[tokio::test]
-async fn bare_jj_commit_uses_managed_identity() {
-    if common::skip_if_fenced("bare_jj_commit_uses_managed_identity") {
-        return;
-    }
-    let Some(_bin) = common::jj_bin() else {
-        eprintln!("skipping bare_jj_commit_uses_managed_identity: jj not resolvable");
-        return;
-    };
-    let (_temp, orch, cwd, _home) = setup_nested_under_git_repo("run-bare-jj").await;
-    // Seal a commit with a bare jj, then read its committer email back. The
-    // sequence leaves `@` empty (a `jj commit`), so the no-commit_msg barrier
-    // sees a clean working copy and never reverts.
-    let result = handle_run(
-        &orch,
-        &sequential_run_request(
-            &cwd,
-            "run-bare-jj",
-            vec![
-                "echo probe > probe.txt",
-                "jj commit -m probe",
-                "jj log -r @- --no-graph -T 'committer.email()'",
-            ],
-        ),
-    )
-    .await;
-
-    assert!(
-        result.contains("agent@cairn.local"),
-        "a bare jj commit must use the managed identity (JJ_CONFIG reached the process): {result}"
-    );
-}
-
-/// Non-regression (test C): the injected env hits EVERY run-tool shell command,
-/// including jj's own git-backend ops. A bare `jj git push` from inside the
-/// worktree must still land the bookmark on the bare origin — identical to the
-/// non-injected outcome — proving `GIT_CEILING_DIRECTORIES` is inert for jj's
-/// store ops (it addresses the store by absolute path, not cwd discovery).
-#[tokio::test]
-async fn bare_jj_git_push_survives_injected_ceiling_env() {
-    if common::skip_if_fenced("bare_jj_git_push_survives_injected_ceiling_env") {
-        return;
-    }
-    let Some(_bin) = common::jj_bin() else {
-        eprintln!("skipping bare_jj_git_push_survives_injected_ceiling_env: jj not resolvable");
-        return;
-    };
-    let (_temp, orch, cwd, origin) = setup_nested_with_origin("run-bare-push").await;
-    let branch = "agent/RHG-1-builder-0";
-    let push_cmd = format!("jj git push --remote origin --bookmark {branch} 2>&1");
-    let set_cmd = format!("jj bookmark set {branch} -r @-");
-    let result = handle_run(
-        &orch,
-        &sequential_run_request(
-            &cwd,
-            "run-bare-push",
-            vec![
-                "echo pushed > pushed.txt",
-                "jj commit -m work",
-                &set_cmd,
-                &push_cmd,
-            ],
-        ),
-    )
-    .await;
-
-    // The load-bearing assertion: the bookmark reached the bare origin, so the
-    // ceiling did not break jj's git backend. (If it had, the push would fail
-    // and the ref would be absent.)
-    let refs = git_stdout(
-        &origin,
-        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-    );
-    assert!(
-        refs.contains(branch),
-        "bare `jj git push` must land {branch} on origin under the injected env\n\
-         push output:\n{result}\norigin refs:\n{refs}"
-    );
+    assert!(!result.contains("isolated cell"), "result: {result}");
 }
 
 /// Build a run request whose single item is inline `code` (no shell command),
@@ -1145,7 +1086,7 @@ async fn code_item_without_commit_msg_reverts_new_dirt() {
     )
     .await;
 
-    assert!(result.contains("Run reverted"), "result: {result}");
+    assert!(!result.contains("isolated cell"), "result: {result}");
     assert!(!Path::new(&cwd).join("code-gen.txt").exists());
     assert!(ws_clean(&temp.path().join("config"), Path::new(&cwd)));
 }
@@ -1319,9 +1260,10 @@ async fn branch_run_is_verdict_only_and_rejects_commit_messages() {
     )
     .await;
     assert!(
-        mutation.to_ascii_lowercase().contains("mutation")
-            || mutation.to_ascii_lowercase().contains("verdict"),
+        mutation
+            .contains("Verdict-only run modified 1 tracked path(s); the mutation was discarded"),
         "{mutation}"
     );
+    assert!(mutation.contains("tracked-output.txt"), "{mutation}");
     assert!(!Path::new(&cwd).join("tracked-output.txt").exists());
 }

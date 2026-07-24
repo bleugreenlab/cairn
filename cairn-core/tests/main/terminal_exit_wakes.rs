@@ -3,6 +3,7 @@
 //! precise unknown-slug error.
 
 use crate::common;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,14 +31,52 @@ async fn real_pty_orchestrator_fixture() -> (tempfile::TempDir, Arc<LocalDb>, Or
             .build(),
     );
     let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    common::attach_test_executor(&orch);
     (temp, db, orch)
 }
 
-async fn set_project_repo_path(db: &LocalDb, repo_path: &std::path::Path) {
+async fn prepare_terminal_repository(
+    db: &LocalDb,
+    repo_path: &std::path::Path,
+    config_dir: &std::path::Path,
+) {
+    std::fs::create_dir_all(repo_path).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "test@example.com"][..],
+        &["config", "user.name", "Test"][..],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(repo_path.join("fixture"), "terminal fixture\n").unwrap();
+    for args in [&["add", "fixture"][..], &["commit", "-qm", "fixture"][..]] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let base_commit = common::head_sha(repo_path);
+    let branch = "agent/TXW-1-builder-0";
+    let worktree = repo_path.parent().unwrap().join("agent-worktree");
+    common::provision_jj_workspace(config_dir, repo_path, &worktree, branch);
     let repo_path = repo_path.to_string_lossy().to_string();
+    let worktree_path = worktree.to_string_lossy().to_string();
     db.execute(
         "UPDATE projects SET repo_path = ?1 WHERE key = 'TXW'",
         params![repo_path.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE jobs SET worktree_path = ?1, branch = 'agent/TXW-1-builder-0', base_commit = ?2 WHERE id = 'job-1'",
+        params![worktree_path.as_str(), base_commit.as_str()],
     )
     .await
     .unwrap();
@@ -75,7 +114,11 @@ async fn terminal_count(db: &LocalDb, slug: &str) -> i64 {
 }
 
 async fn wait_for_output_wake_consumed(db: &LocalDb, job_id: &str, phrase: &str) {
-    for _ in 0..50 {
+    // Generous bound: real-PTY finalization + wake routing can lag under
+    // concurrent-suite contention. Production delivery is not stranded (the
+    // finalizer routes the exit against the persisted subscription); this only
+    // needs to outlast test-host scheduling jitter.
+    for _ in 0..100 {
         let subs = wakes::list_subscriptions_for_job(db, job_id).await.unwrap();
         if !subs
             .iter()
@@ -320,6 +363,39 @@ async fn subscribe_already_exited_terminal_fires_and_consumes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn output_phrase_subscription_is_woken_by_exit_before_phrase() {
+    let (_t, db, orch) = resource_orchestrator_fixture().await;
+    seed_node(&db).await;
+    let uri = "cairn://p/TXW/1/1/builder/terminal/run-1";
+    // An agent waiting for a phrase subscribes an output one-shot.
+    wakes::subscribe_terminal_output_one_shot(&db, "job-1", uri, "ready", "agent")
+        .await
+        .unwrap();
+
+    // The terminal dies (nonzero) before ever printing "ready".
+    let action =
+        wakes::route_terminal_exit_async(&orch, "run-1", uri, Some(1), Some(2), Some("boom"))
+            .await
+            .unwrap();
+    assert_eq!(
+        action,
+        wakes::WakeRouteAction::Delivered,
+        "exit before phrase must wake the agent"
+    );
+
+    // The one-shot output subscription is consumed, so the agent is not stranded.
+    let subs = wakes::list_subscriptions_for_job(&db, "job-1")
+        .await
+        .unwrap();
+    assert!(
+        !subs
+            .iter()
+            .any(|s| s.match_phrase.as_deref() == Some("ready")),
+        "exit before phrase must consume the output-phrase subscription"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn subscribe_unknown_terminal_errors_with_existing_slugs() {
     let (_t, db, orch) = resource_orchestrator_fixture().await;
     seed_node(&db).await;
@@ -351,9 +427,8 @@ async fn subscribe_unknown_terminal_errors_with_existing_slugs() {
 async fn create_terminal_with_exit_wake_subscribes_to_canonical_uri() {
     let (t, db, orch) = real_pty_orchestrator_fixture().await;
     let repo_path = t.path().join("repo");
-    std::fs::create_dir_all(&repo_path).unwrap();
     seed_node(&db).await;
-    set_project_repo_path(&db, &repo_path).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
 
     let out = change_resource_as_run(
         &orch,
@@ -403,9 +478,8 @@ async fn create_terminal_with_exit_wake_subscribes_to_canonical_uri() {
 async fn create_terminal_with_output_wake_routes_when_phrase_prints() {
     let (t, db, orch) = real_pty_orchestrator_fixture().await;
     let repo_path = t.path().join("repo");
-    std::fs::create_dir_all(&repo_path).unwrap();
     seed_node(&db).await;
-    set_project_repo_path(&db, &repo_path).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
 
     let out = change_resource_as_run(
         &orch,
@@ -455,12 +529,36 @@ async fn create_terminal_with_output_wake_routes_when_phrase_prints() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn output_wake_fires_when_process_exits_before_phrase() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    seed_node(&db).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
+
+    // Watch for a phrase the command never prints, then let the process die.
+    let out = change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/wait-ready",
+            "mode": "create",
+            "payload": {"command": "echo starting; exit 3", "wake": "neverphrase"}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert!(out.contains("watching output for"), "{out}");
+
+    // The process exits (code 3) before ever printing "neverphrase". The exit must
+    // consume the output-phrase subscription so the waiting agent is woken.
+    wait_for_output_wake_consumed(&db, "job-1", "neverphrase").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn create_terminal_rejects_invalid_wake_before_spawning() {
     let (t, db, orch) = real_pty_orchestrator_fixture().await;
     let repo_path = t.path().join("repo");
-    std::fs::create_dir_all(&repo_path).unwrap();
     seed_node(&db).await;
-    set_project_repo_path(&db, &repo_path).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
 
     let empty = change_resource_as_run(
         &orch,
@@ -496,9 +594,8 @@ async fn create_terminal_rejects_invalid_wake_before_spawning() {
 async fn project_terminal_create_wake_subscribes_calling_job() {
     let (t, db, orch) = real_pty_orchestrator_fixture().await;
     let repo_path = t.path().join("repo");
-    std::fs::create_dir_all(&repo_path).unwrap();
     seed_node(&db).await;
-    set_project_repo_path(&db, &repo_path).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
 
     let out = change_resource_as_run(
         &orch,
@@ -538,9 +635,8 @@ async fn project_terminal_create_wake_subscribes_calling_job() {
 async fn project_terminal_wake_requires_agent_caller_before_spawning() {
     let (t, db, orch) = real_pty_orchestrator_fixture().await;
     let repo_path = t.path().join("repo");
-    std::fs::create_dir_all(&repo_path).unwrap();
     seed_node(&db).await;
-    set_project_repo_path(&db, &repo_path).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
 
     let out = change_resource(
         &orch,

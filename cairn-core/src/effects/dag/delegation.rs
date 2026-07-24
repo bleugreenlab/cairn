@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn ensure_agent_snapshot(
+fn ensure_agent_snapshot(
     snapshot: &mut ExecutionSnapshot,
     agent_id: &str,
     tier_override: Option<&str>,

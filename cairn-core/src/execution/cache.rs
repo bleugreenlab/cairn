@@ -8,6 +8,23 @@ use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CheckResultIdentity {
+    pub project_id: String,
+    pub check_name: String,
+    pub input_hash: String,
+}
+
+impl CheckResultIdentity {
+    pub(crate) fn new(project_id: &str, check_name: &str, input_hash: &str) -> Self {
+        Self {
+            project_id: project_id.to_string(),
+            check_name: check_name.to_string(),
+            input_hash: input_hash.to_string(),
+        }
+    }
+}
+
 fn row_to_check_result(
     row: &cairn_db::turso::Row,
 ) -> Result<CheckResultCacheEntry, crate::storage::DbError> {
@@ -28,7 +45,7 @@ fn row_to_check_result(
         executor_id: row.opt_text(13)?,
         executor_device_id: row.opt_text(14)?,
         executor_connection_generation: row.opt_i64(15)?,
-        executor_slot_id: row.opt_text(16)?,
+        executor_cell_id: row.opt_text(16)?,
         executor_lease_epoch: row.opt_i64(17)?,
         executor_started_at_unix_ms: row.opt_i64(18)?,
         executor_finished_at_unix_ms: row.opt_i64(19)?,
@@ -40,18 +57,18 @@ fn row_to_check_result(
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointCacheResult {
-    pub command: String,
-    pub exit_code: i32,
-    pub commit_sha: String,
-    pub is_valid: bool,
-    pub ran_at: i32,
+    command: String,
+    exit_code: i32,
+    commit_sha: String,
+    is_valid: bool,
+    ran_at: i32,
 }
 
 /// Get a cached project-declared check result by project, check name, and the
 /// per-check INPUT hash (the content identity of just that check's impact-matched
 /// files). Keying on the input hash — rather than the whole sealed tree — is what
 /// lets a commit that touched none of a check's inputs reuse the stored verdict.
-pub fn get_check_result(
+pub(crate) fn get_check_result(
     db: Arc<LocalDb>,
     project_id: &str,
     check_name: &str,
@@ -129,7 +146,10 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         passed = excluded.passed,
                         output_tail = excluded.output_tail,
                         duration_ms = excluded.duration_ms,
-                        ran_at = excluded.ran_at,
+                        ran_at = CASE
+                            WHEN excluded.cached = 1 THEN check_result_cache.ran_at
+                            ELSE excluded.ran_at
+                        END,
                         target_results_json = excluded.target_results_json,
                         job_id = excluded.job_id,
                         cached = excluded.cached,
@@ -163,7 +183,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         result.executor_id.as_deref(),
                         result.executor_device_id.as_deref(),
                         result.executor_connection_generation,
-                        result.executor_slot_id.as_deref(),
+                        result.executor_cell_id.as_deref(),
                         result.executor_lease_epoch,
                         result.executor_started_at_unix_ms,
                         result.executor_finished_at_unix_ms,
@@ -182,7 +202,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
 /// List every cached check result for a project at one sealed tree identity,
 /// ordered by check name. Powers the `/checks` projection and the PR-node
 /// `### Systematic checks` section, which render all of a tree's verdicts at once.
-pub fn list_check_results(
+pub(crate) fn list_check_results(
     db: Arc<LocalDb>,
     project_id: &str,
     tree_hash: &str,
@@ -282,7 +302,7 @@ pub fn list_latest_check_results_for_project(
 /// List the most recent cached result per check name for one job, independent of
 /// the current worktree/tree pointer. This is the durable fallback for node-level
 /// surfaces after worktree teardown or movement.
-pub fn list_check_results_for_job(
+pub(crate) fn list_check_results_for_job(
     db: Arc<LocalDb>,
     job_id: &str,
 ) -> Result<Vec<CheckResultCacheEntry>, String> {
@@ -378,33 +398,33 @@ pub fn list_check_results_for_executor_generation(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckResultCacheEntry {
-    pub project_id: String,
-    pub tree_hash: String,
+    pub(crate) project_id: String,
+    pub(crate) tree_hash: String,
     /// Per-check input hash: the content identity of just this check's impact-
     /// matched files. The cache's real key (with project + check name).
-    pub input_hash: String,
-    pub check_name: String,
-    pub exit_code: i32,
-    pub passed: bool,
-    pub output_tail: String,
-    pub duration_ms: i64,
-    pub ran_at: i64,
-    pub target_results_json: Option<String>,
-    pub job_id: Option<String>,
-    pub cached: Option<bool>,
+    pub(crate) input_hash: String,
+    pub(crate) check_name: String,
+    pub(crate) exit_code: i32,
+    pub(crate) passed: bool,
+    pub(crate) output_tail: String,
+    pub(crate) duration_ms: i64,
+    pub(crate) ran_at: i64,
+    pub(crate) target_results_json: Option<String>,
+    pub(crate) job_id: Option<String>,
+    pub(crate) cached: Option<bool>,
     /// Terminal classification of a FAILING check — `"timed_out"`,
     /// `"spawn_error"`, or `"killed"` — refining the binary `passed` verdict so
     /// abnormal deaths render as themselves. `None` for a pass, an ordinary
     /// non-zero exit, and legacy rows. See [`crate::execution::checks::CheckFailureKind`].
-    pub failure_kind: Option<String>,
-    pub executor_id: Option<String>,
-    pub executor_device_id: Option<String>,
-    pub executor_connection_generation: Option<i64>,
-    pub executor_slot_id: Option<String>,
-    pub executor_lease_epoch: Option<i64>,
-    pub executor_started_at_unix_ms: Option<i64>,
-    pub executor_finished_at_unix_ms: Option<i64>,
-    pub toolchain_fingerprint: Option<String>,
+    pub(crate) failure_kind: Option<String>,
+    pub(crate) executor_id: Option<String>,
+    pub(crate) executor_device_id: Option<String>,
+    pub(crate) executor_connection_generation: Option<i64>,
+    pub(crate) executor_cell_id: Option<String>,
+    pub(crate) executor_lease_epoch: Option<i64>,
+    pub(crate) executor_started_at_unix_ms: Option<i64>,
+    pub(crate) executor_finished_at_unix_ms: Option<i64>,
+    pub(crate) toolchain_fingerprint: Option<String>,
 }
 
 /// Write payload for a check-result cache row.
@@ -428,7 +448,7 @@ pub struct CheckResultCacheWrite {
     pub executor_id: Option<String>,
     pub executor_device_id: Option<String>,
     pub executor_connection_generation: Option<i64>,
-    pub executor_slot_id: Option<String>,
+    pub executor_cell_id: Option<String>,
     pub executor_lease_epoch: Option<i64>,
     pub executor_started_at_unix_ms: Option<i64>,
     pub executor_finished_at_unix_ms: Option<i64>,
@@ -586,7 +606,7 @@ mod tests {
             executor_id: None,
             executor_device_id: None,
             executor_connection_generation: None,
-            executor_slot_id: None,
+            executor_cell_id: None,
             executor_lease_epoch: None,
             executor_started_at_unix_ms: None,
             executor_finished_at_unix_ms: None,
@@ -929,7 +949,7 @@ mod tests {
         pass.executor_id = Some("executor-a".to_string());
         pass.executor_device_id = Some("device-a".to_string());
         pass.executor_connection_generation = Some(7);
-        pass.executor_slot_id = Some("slot-a".to_string());
+        pass.executor_cell_id = Some("slot-a".to_string());
         pass.executor_lease_epoch = Some(9);
         pass.executor_started_at_unix_ms = Some(100);
         pass.executor_finished_at_unix_ms = Some(200);
@@ -950,7 +970,7 @@ mod tests {
         assert_eq!(row.executor_id.as_deref(), Some("executor-a"));
         assert_eq!(row.executor_device_id.as_deref(), Some("device-a"));
         assert_eq!(row.executor_connection_generation, Some(7));
-        assert_eq!(row.executor_slot_id.as_deref(), Some("slot-a"));
+        assert_eq!(row.executor_cell_id.as_deref(), Some("slot-a"));
         assert_eq!(row.executor_lease_epoch, Some(9));
         assert_eq!(row.executor_started_at_unix_ms, Some(100));
         assert_eq!(row.executor_finished_at_unix_ms, Some(200));

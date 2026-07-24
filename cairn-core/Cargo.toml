@@ -70,6 +70,8 @@ cairn-symbols = { path = "../cairn-symbols" }
 # cairn-core entirely; the load-bearing gix rationale now lives in that manifest.
 cairn-analytics = { path = "../cairn-analytics" }
 cairn-codec = { path = "../cairn-codec" }
+cairn-vcs = { path = "../cairn-vcs" }
+cairn-worktree = { path = "../cairn-worktree" }
 
 # The database layer (domain models, table records, and the storage engine with
 # its full-text search index) descends into cairn-db; cairn-core re-exports it at
@@ -89,6 +91,7 @@ lsp-types = "0.97"
 # and text/markdown pass through unchanged.
 htmd = "0.5"
 pdf-extract = "0.7"
+matfile = "0.5"
 
 # OS keychain access for MCP server secrets. Backend is selected per target so a
 # Finder-launched app (minimal process env) still resolves token-bearing
@@ -99,7 +102,7 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
 
 # Linux: keyring (secret-service) for MCP secrets + landlock for the OS-level
 # worktree-fence sandbox (origin/main).

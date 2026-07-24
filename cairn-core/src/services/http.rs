@@ -11,9 +11,9 @@ use std::time::Duration;
 
 /// Configuration for HTTP client retry behavior.
 pub struct HttpConfig {
-    pub timeout: Duration,
-    pub max_retries: u32,
-    pub initial_backoff: Duration,
+    timeout: Duration,
+    max_retries: u32,
+    initial_backoff: Duration,
 }
 
 impl Default for HttpConfig {
@@ -47,17 +47,17 @@ type HttpResultFuture<'a> = Pin<Box<dyn Future<Output = Result<HttpResponse, Str
 
 impl HttpResponse {
     /// Check if status is 2xx.
-    pub fn is_success(&self) -> bool {
+    pub(crate) fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
 
     /// Get body as string.
-    pub fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
     /// Parse body as JSON.
-    pub fn json<T: DeserializeOwned>(&self) -> Result<T, String> {
+    pub(crate) fn json<T: DeserializeOwned>(&self) -> Result<T, String> {
         serde_json::from_slice(&self.body).map_err(|e| format!("Failed to parse JSON: {}", e))
     }
 }
@@ -129,7 +129,7 @@ impl RealHttpClient {
         Self::with_config(HttpConfig::default())
     }
 
-    pub fn with_config(config: HttpConfig) -> Self {
+    fn with_config(config: HttpConfig) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(config.timeout)

@@ -17,34 +17,34 @@ pub struct ProjectReference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub(crate) path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
+    pub(crate) branch: Option<String>,
 }
 
 /// Status of a resolved reference.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceStatus {
-    pub name: String,
-    pub description: String,
-    pub reference_type: ReferenceType,
-    pub resolved_path: Option<String>,
-    pub exists: bool,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) reference_type: ReferenceType,
+    pub(crate) resolved_path: Option<String>,
+    pub(crate) exists: bool,
 }
 
 /// A globally cloned reference (discovered by scanning the references directory).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobalReference {
-    pub name: String,
-    pub path: String,
+    name: String,
+    path: String,
     /// Git remote URL, if this is a git clone.
-    pub git_url: Option<String>,
+    git_url: Option<String>,
     /// Description from contents.yaml.
-    pub description: Option<String>,
+    description: Option<String>,
 }
 
 /// Contents of `references/contents.yaml` — maps reference name to description.
@@ -59,7 +59,7 @@ pub enum ReferenceType {
 }
 
 /// Get the global references directory: `{config_dir}/references/`
-pub fn get_references_dir(config_dir: &Path) -> PathBuf {
+fn get_references_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("references")
 }
 
@@ -111,7 +111,7 @@ pub fn save_reference_description(
 /// - Local references: expanded `~` path
 ///
 /// Returns `None` if the path doesn't exist.
-pub fn resolve_reference_path(config_dir: &Path, reference: &ProjectReference) -> Option<PathBuf> {
+fn resolve_reference_path(config_dir: &Path, reference: &ProjectReference) -> Option<PathBuf> {
     let path = if reference.git.is_some() {
         get_references_dir(config_dir).join(&reference.name)
     } else if let Some(ref local_path) = reference.path {
@@ -271,14 +271,27 @@ pub fn list_global_references(config_dir: &Path) -> Vec<GlobalReference> {
             None => continue,
         };
 
-        // Try to get git remote URL
-        let git_url = std::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .current_dir(&path)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        // The remote of this reference, when it is a clone at all. Ask git only
+        // once the directory is known to be a repository root: run from a plain
+        // directory, `git remote get-url` does not fail — it walks up to the
+        // nearest enclosing repository and reports *that* remote with exit 0. A
+        // reference dropped into `~/.cairn/references` by hand would otherwise be
+        // labelled a clone of whatever repository happens to contain the config
+        // directory. A worktree or submodule stores `.git` as a file rather than a
+        // directory, so test existence rather than directory-ness.
+        let git_url = path
+            .join(".git")
+            .exists()
+            .then(|| {
+                std::process::Command::new("git")
+                    .args(["remote", "get-url", "origin"])
+                    .current_dir(&path)
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            })
+            .flatten();
 
         let description = contents.0.get(&name).cloned();
 
@@ -296,7 +309,10 @@ pub fn list_global_references(config_dir: &Path) -> Vec<GlobalReference> {
 
 /// Build the "Project References" prompt section for agent injection.
 /// Returns empty string if no references are available.
-pub fn build_references_prompt(config_dir: &Path, references: &[ProjectReference]) -> String {
+pub(crate) fn build_references_prompt(
+    config_dir: &Path,
+    references: &[ProjectReference],
+) -> String {
     let contents = load_contents(config_dir);
     let mut lines = Vec::new();
     for reference in references {

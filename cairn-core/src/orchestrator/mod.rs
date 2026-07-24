@@ -14,7 +14,7 @@ pub mod build_services;
 pub mod config_resource;
 pub mod device_presence;
 pub mod docs;
-pub mod executor_registry; // Synced visibility; live placement remains in build_slots.
+pub mod executor_registry; // Synced visibility; live placement remains in fleet.
 pub mod identity;
 pub mod lifecycle;
 pub mod object_plane;
@@ -27,7 +27,7 @@ mod team_attention_push;
 pub mod wakes;
 pub mod workflow_configs;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -94,7 +94,7 @@ pub struct OrchestratorBuilder {
 }
 
 impl OrchestratorBuilder {
-    pub fn new(db: Arc<DbState>, services: Arc<Services>, config_dir: PathBuf) -> Self {
+    pub(crate) fn new(db: Arc<DbState>, services: Arc<Services>, config_dir: PathBuf) -> Self {
         let process_state = Arc::new(AgentProcessState::default());
         let mcp_auth = Arc::new(McpAuthState::new(config_dir.clone()));
         let pty_state = Arc::new(PtyState::default());
@@ -256,7 +256,7 @@ impl OrchestratorBuilder {
     }
 
     #[cfg(test)]
-    pub(crate) fn team_attention_sender(
+    fn team_attention_sender(
         mut self,
         sender: Arc<dyn team_attention_push::TeamAttentionSender>,
     ) -> Self {
@@ -304,6 +304,9 @@ impl OrchestratorBuilder {
             self.db.clone(),
             self.api_config.clone(),
         ));
+        let fleet = Arc::new(crate::fleet::Fleet::with_lifetime_route_path(
+            self.config_dir.join("build-slot-lifetime-routes.json"),
+        ));
         Orchestrator {
             db: self.db,
             services: self.services,
@@ -313,11 +316,14 @@ impl OrchestratorBuilder {
             pty_state: self.pty_state,
             repl_state: self.repl_state,
             worktree_search: Arc::new(crate::worktree_search::WorktreeSearchPool::default()),
+            project_overlays: Arc::new(
+                crate::mcp::handlers::read::overlay::ProjectOverlayRegistry::default(),
+            ),
             call_admission: Arc::new(crate::execution::jobs::CallAdmission::default()),
             check_admission: Arc::new(
                 crate::execution::check_admission::CheckAdmissionController::default(),
             ),
-            build_slots: Arc::new(crate::build_slots::BuildSlotPool::default()),
+            fleet,
             object_plane: Arc::new(crate::orchestrator::object_plane::ObjectPlaneState::default()),
             permission_responses: self.permission_responses,
             run_completions: self.run_completions,
@@ -354,34 +360,229 @@ impl OrchestratorBuilder {
             team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
+            jj_store_lock_metrics: Arc::new(Mutex::new(HashMap::new())),
             setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         }
     }
 }
 
 const JJ_STORE_LOCK_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+const JJ_STORE_LOCK_SAMPLE_CAPACITY: usize = 256;
+
+#[derive(Default)]
+pub struct JjStoreLockMetrics {
+    waiter_count: usize,
+    current_operation: Option<String>,
+    current_task: Option<tokio::task::Id>,
+    waits_ms: VecDeque<u64>,
+    holds_ms: VecDeque<u64>,
+    phase_ms: HashMap<String, VecDeque<u64>>,
+}
+
+/// Correlates phase timings that belong to one top-level store operation, even
+/// when later phases deliberately run after the store guard has been released.
+#[derive(Clone)]
+pub struct JjStoreOperationTrace {
+    operation: Arc<str>,
+    store: Arc<str>,
+    correlation_id: Arc<str>,
+    metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
+}
+
+pub struct JjStorePhaseTimer {
+    trace: JjStoreOperationTrace,
+    phase: Arc<str>,
+    started_at: std::time::Instant,
+}
+
+impl JjStoreOperationTrace {
+    pub(crate) fn phase(&self, phase: impl Into<Arc<str>>) -> JjStorePhaseTimer {
+        JjStorePhaseTimer {
+            trace: self.clone(),
+            phase: phase.into(),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn deferred(&self, phase: &str) {
+        log::debug!(
+            "jj_store_phase correlation_id={} operation={} store={} phase={}",
+            self.correlation_id,
+            self.operation,
+            self.store,
+            phase
+        );
+    }
+}
+
+impl Drop for JjStorePhaseTimer {
+    fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        let duration_ms = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
+        let phase_key = format!("{}/{}", self.trace.operation, self.phase);
+        if let Some(metrics) = self
+            .trace
+            .metrics
+            .lock()
+            .unwrap()
+            .get_mut(self.trace.store.as_ref())
+        {
+            record_bounded(metrics.phase_ms.entry(phase_key).or_default(), duration_ms);
+        }
+        if elapsed >= JJ_STORE_LOCK_WARN_AFTER {
+            log::info!(
+                "jj_store_phase correlation_id={} operation={} store={} phase={} duration_ms={}",
+                self.trace.correlation_id,
+                self.trace.operation,
+                self.trace.store,
+                self.phase,
+                duration_ms
+            );
+        } else {
+            log::debug!(
+                "jj_store_phase correlation_id={} operation={} store={} phase={} duration_ms={}",
+                self.trace.correlation_id,
+                self.trace.operation,
+                self.trace.store,
+                self.phase,
+                duration_ms
+            );
+        }
+    }
+}
+
+fn record_bounded(samples: &mut VecDeque<u64>, value: u64) {
+    if samples.len() == JJ_STORE_LOCK_SAMPLE_CAPACITY {
+        samples.pop_front();
+    }
+    samples.push_back(value);
+}
+
+fn summarize_bounded(
+    samples: &VecDeque<u64>,
+) -> cairn_common::executor_protocol::BoundedDurationSummary {
+    let mut sorted: Vec<_> = samples.iter().copied().collect();
+    sorted.sort_unstable();
+    let percentile = |n: usize| {
+        sorted
+            .get((sorted.len().saturating_sub(1) * n) / 100)
+            .copied()
+    };
+    cairn_common::executor_protocol::BoundedDurationSummary {
+        sample_count: sorted.len() as u64,
+        p50_ms: percentile(50),
+        p95_ms: percentile(95),
+        max_ms: sorted.last().copied(),
+    }
+}
+
+fn substrate_health_status(
+    reasons: &[cairn_common::executor_protocol::SubstrateHealthReason],
+) -> cairn_common::executor_protocol::SubstrateHealthStatus {
+    use cairn_common::executor_protocol::{SubstrateHealthReason, SubstrateHealthStatus};
+
+    if reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            SubstrateHealthReason::NoExecutors
+                | SubstrateHealthReason::DiskFull { .. }
+                | SubstrateHealthReason::StorageCleanupFailed { .. }
+        )
+    }) {
+        SubstrateHealthStatus::Blocked
+    } else if reasons.is_empty() {
+        SubstrateHealthStatus::Healthy
+    } else if reasons
+        .iter()
+        .all(|reason| matches!(reason, SubstrateHealthReason::ReadingUnavailable { .. }))
+    {
+        SubstrateHealthStatus::Unknown
+    } else {
+        SubstrateHealthStatus::Degraded
+    }
+}
+
+struct JjStoreWaiterRegistration {
+    store: String,
+    wait_started: std::time::Instant,
+    metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
+    record_wait: bool,
+}
+
+impl JjStoreWaiterRegistration {
+    fn finish(mut self) -> std::time::Duration {
+        self.record_wait = true;
+        let waited = self.wait_started.elapsed();
+        self.release(waited);
+        std::mem::forget(self);
+        waited
+    }
+
+    fn release(&mut self, waited: std::time::Duration) {
+        if let Some(metrics) = self.metrics.lock().unwrap().get_mut(&self.store) {
+            metrics.waiter_count = metrics.waiter_count.saturating_sub(1);
+            if self.record_wait {
+                record_bounded(
+                    &mut metrics.waits_ms,
+                    waited.as_millis().try_into().unwrap_or(u64::MAX),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for JjStoreWaiterRegistration {
+    fn drop(&mut self) {
+        self.release(self.wait_started.elapsed());
+    }
+}
 
 pub struct JjStoreGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
-    operation: String,
-    store: String,
+    trace: JjStoreOperationTrace,
     acquired_at: std::time::Instant,
+}
+
+impl JjStoreGuard {
+    pub(crate) fn trace(&self) -> JjStoreOperationTrace {
+        self.trace.clone()
+    }
+
+    pub(crate) fn phase(&self, phase: impl Into<Arc<str>>) -> JjStorePhaseTimer {
+        self.trace.phase(phase)
+    }
 }
 
 impl Drop for JjStoreGuard {
     fn drop(&mut self) {
         let held = self.acquired_at.elapsed();
+        if let Some(metrics) = self
+            .trace
+            .metrics
+            .lock()
+            .unwrap()
+            .get_mut(self.trace.store.as_ref())
+        {
+            metrics.current_operation = None;
+            metrics.current_task = None;
+            record_bounded(
+                &mut metrics.holds_ms,
+                held.as_millis().try_into().unwrap_or(u64::MAX),
+            );
+        }
         if held >= JJ_STORE_LOCK_WARN_AFTER {
             log::warn!(
-                "jj store lock hold exceeded {:.1}s: operation={}, store={}",
+                "jj store lock hold exceeded {:.1}s: correlation_id={}, operation={}, store={}",
                 held.as_secs_f64(),
-                self.operation,
-                self.store
+                self.trace.correlation_id,
+                self.trace.operation,
+                self.trace.store
             );
         }
     }
@@ -424,7 +625,7 @@ impl Default for TurnEndCancel {
 
 impl TurnEndCancel {
     /// Signal cancellation. Idempotent.
-    pub fn cancel(&self) {
+    fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::SeqCst);
         // `notify_one` stores a permit when no waiter is parked, so a cancel that
         // races just ahead of the runner's `cancelled().await` is not lost.
@@ -432,13 +633,13 @@ impl TurnEndCancel {
     }
 
     /// Whether cancellation has been signalled.
-    pub fn is_cancelled(&self) -> bool {
+    fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
     }
 
     /// Resolve as soon as cancellation is signalled — immediately when already
     /// cancelled, otherwise when [`Self::cancel`] next fires.
-    pub async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         loop {
             if self.is_cancelled() {
                 return;
@@ -508,20 +709,23 @@ pub struct Orchestrator {
     /// re-walking the tree; cold/ineligible queries fall back to the ripgrep
     /// walk. Dropped per worktree at teardown and LRU-evicted at capacity.
     pub worktree_search: Arc<crate::worktree_search::WorktreeSearchPool>,
+    /// Runner-owned immutable base tables and SHA-keyed corrections for
+    /// store-native branch tree projections.
+    pub(crate) project_overlays: Arc<crate::mcp::handlers::read::overlay::ProjectOverlayRegistry>,
 
     /// Generic bounded-admission ledger for ephemeral (call) fan-out. The calls
     /// path (only) consults it; every real backend reports an unbounded ceiling
     /// today, so `admit` is a pure passthrough in production. Shared across
     /// clones behind the `Arc`.
-    pub call_admission: Arc<crate::execution::jobs::CallAdmission>,
+    pub(crate) call_admission: Arc<crate::execution::jobs::CallAdmission>,
 
     // === Broadcast channels for cross-component communication ===
     /// Permission response broadcast: (request_id, response_json)
     /// Hosts send on this channel when a user responds to a permission prompt.
-    pub permission_responses: broadcast::Sender<(String, String)>,
+    pub(crate) permission_responses: broadcast::Sender<(String, String)>,
     /// Run completion broadcast: run_id
     /// Emitted when a run finishes (used by sub-agent handlers to unblock).
-    pub run_completions: broadcast::Sender<String>,
+    pub(crate) run_completions: broadcast::Sender<String>,
     /// Prompt response broadcast: (prompt_id, response_text)
     /// Hosts send on this channel when a user responds to an ask_user prompt.
     pub prompt_responses: broadcast::Sender<(String, String)>,
@@ -565,7 +769,7 @@ pub struct Orchestrator {
 
     /// Tools auto-allowed via "Allow for Session" permission responses.
     /// Checked in the Codex permission flow before prompting the user.
-    pub session_allowed_tools: Arc<Mutex<HashSet<String>>>,
+    pub(crate) session_allowed_tools: Arc<Mutex<HashSet<String>>>,
 
     /// Worktree-fence crossings auto-allowed via an `allow` + `scope: session`
     /// permission answer. Keyed by the crossing's canonical descriptor (the
@@ -578,11 +782,11 @@ pub struct Orchestrator {
 
     /// Multi-account identity store. None = anonymous/legacy mode.
     /// Populated from local identity store (desktop) or JWT claims (server).
-    pub identity_store: Arc<Mutex<Option<IdentityStore>>>,
+    identity_store: Arc<Mutex<Option<IdentityStore>>>,
 
     // === Host-specific paths (set by Tauri or cairn-server) ===
     /// Path to the cairn-cmd binary
-    pub mcp_binary_path: String,
+    pub(crate) mcp_binary_path: String,
     /// Path to the jj binary (bundled sidecar; falls back to PATH `jj`).
     pub jj_binary_path: String,
     /// Directory for writing MCP config files
@@ -593,14 +797,16 @@ pub struct Orchestrator {
     /// reads to show a "running" state; and the lever a merge/close pulls to quit a
     /// minutes-long suite mid-flight ([`Orchestrator::cancel_turn_end_checks`]).
     /// Runtime-only; never persisted.
-    pub build_service_runtime: Arc<
+    build_service_runtime: Arc<
         Mutex<HashMap<String, crate::orchestrator::build_services::BuildServiceRuntimeDiagnostic>>,
     >,
-    pub turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
+    turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
+    /// Job ids with a synchronous when:write batch in flight. Runtime-only.
+    write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Fair, runner-wide resource admission shared by write and review checks.
-    pub check_admission: Arc<crate::execution::check_admission::CheckAdmissionController>,
+    pub(crate) check_admission: Arc<crate::execution::check_admission::CheckAdmissionController>,
     /// Runner-owned persistent commit-addressed execution workspaces.
-    pub build_slots: Arc<crate::build_slots::BuildSlotPool>,
+    pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
     pub object_plane: Arc<crate::orchestrator::object_plane::ObjectPlaneState>,
     /// Pool of long-lived Codex app-servers for EPHEMERAL CALLS (CAIRN-2549).
@@ -609,9 +815,9 @@ pub struct Orchestrator {
     /// `process_state.processes`, so warm-process GC never treats it as an
     /// evictable per-session process. Empty and inert until the first Codex
     /// call.
-    pub codex_pool: Arc<crate::backends::codex::pool::CodexAppServerPool>,
+    pub(crate) codex_pool: Arc<crate::backends::codex::pool::CodexAppServerPool>,
     /// Directory containing bundled preset schemas (None if not available)
-    pub schema_dir: Option<PathBuf>,
+    pub(crate) schema_dir: Option<PathBuf>,
     /// Port for the MCP callback server
     pub mcp_callback_port: u16,
     /// Desktop UI attached over the runner's `/ws` channel. The window-owning
@@ -623,9 +829,9 @@ pub struct Orchestrator {
     /// Runtime-only; never persisted.
     attached_ui: Arc<Mutex<AttachedUi>>,
     /// Vibe state for embedding-based color assignment (None if centroids unavailable)
-    pub vibe_state: Option<Arc<VibeState>>,
+    vibe_state: Option<Arc<VibeState>>,
     /// Sender into the async event-embed worker. None until the worker is started.
-    pub embed_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EmbedJob>>>>,
+    embed_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EmbedJob>>>>,
 
     // === Team connection state (multi-team) ===
     /// Multi-team manager: handles DB-backed team configs, JWT refresh, credential resolution
@@ -640,11 +846,11 @@ pub struct Orchestrator {
 
     // === Unified notification ===
     /// Emits frontend `db-change` events for write operations. Shares `emitter`.
-    pub notifier: Notifier,
+    pub(crate) notifier: Notifier,
 
     // === Cloud API ===
     /// Cloud API endpoint configuration (account, sync, bug reports)
-    pub api_config: ApiConfig,
+    api_config: ApiConfig,
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
     team_attention_push_dedupe: Arc<TokioMutex<HashMap<String, String>>>,
 
@@ -672,7 +878,7 @@ pub struct Orchestrator {
     /// page loaded but the content-script bridge failed", so a slow first compile
     /// reads as still-loading rather than a misleading hard timeout. Volatile by
     /// nature: in-memory, never persisted, reset cleanly on restart.
-    pub browser_loading: Arc<Mutex<HashMap<String, bool>>>,
+    pub(crate) browser_loading: Arc<Mutex<HashMap<String, bool>>>,
 
     /// Host-specific effect executor for `StartAgentJobs` and `ExecuteAction`.
     ///
@@ -680,24 +886,24 @@ pub struct Orchestrator {
     /// derives Clone) and settable after construction via `&self`. The executor
     /// may need a reference to the host's wrapper (e.g. `Arc<ServerState>`)
     /// which isn't available until after the Orchestrator is built.
-    pub executor: Arc<OnceLock<Arc<dyn EffectExecutor>>>,
+    pub(crate) executor: Arc<OnceLock<Arc<dyn EffectExecutor>>>,
 
     /// Host-specific gateway to external MCP servers (the `cairn://mcp/...`
     /// family). `None` until a host sets it; `read`/`run` MCP dispatch returns a
     /// clear error when unset. Wrapped like `executor` so it's Clone-compatible
     /// and settable after construction via `&self`.
-    pub mcp_gateway: Arc<OnceLock<Arc<dyn McpGateway>>>,
+    mcp_gateway: Arc<OnceLock<Arc<dyn McpGateway>>>,
 
     /// Cached provider model catalog loaded at startup and refreshed on demand.
-    pub model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
+    model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     /// Latest provider/account usage snapshots keyed by backend name.
     pub provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
     /// Latest normalized context-token snapshots keyed by durable session id.
-    pub context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
+    context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
 
     /// Per-execution locks to serialize read-modify-write operations on snapshots.
     /// Prevents concurrent `persist_task_packet` calls from losing packets.
-    pub execution_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    execution_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 
     /// Per-store locks serializing base-advance reconcile and merge-fold
     /// mutations on a shared jj project store, keyed by the store directory.
@@ -705,7 +911,8 @@ pub struct Orchestrator {
     /// mint divergent conflicted copies of the same change-id; this single-writer
     /// discipline closes that window. Keyed by store path (not execution/job) so
     /// reconciles from different executions on the same project store serialize.
-    pub jj_store_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    jj_store_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    jj_store_lock_metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
 
     /// In-flight worktree/setup preparation handles, keyed by job id.
     pub setup_registry: Arc<Mutex<HashMap<String, SetupHandle>>>,
@@ -715,14 +922,14 @@ pub struct Orchestrator {
     /// child (`SCCACHE_NO_DAEMON`), so its handle controls the server directly:
     /// held so the supervisor can kill-then-relaunch a wedged daemon and so the
     /// server is stopped on shutdown. See `orchestrator::build_services`.
-    pub build_service_children: Arc<Mutex<HashMap<String, Box<dyn ChildProcess>>>>,
+    build_service_children: Arc<Mutex<HashMap<String, Box<dyn ChildProcess>>>>,
 
     /// Per-run dedupe for legacy `agent-attention` terminal toasts.
     ///
     /// The completion toast now fires at the turn idle boundary while the same
     /// run may later EOF/finalize. Keying by run id suppresses cleanup-path
     /// duplicates and repeated crash finalization attempts.
-    pub agent_completion_attention_dedupe: Arc<Mutex<HashSet<String>>>,
+    agent_completion_attention_dedupe: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Resolve the `/embed` gateway token: account JWT preferred, anonymous device
@@ -740,12 +947,196 @@ fn resolve_embed_token(account: &AccountManager, anon: &AnonDeviceManager) -> Op
 }
 
 impl Orchestrator {
-    pub fn build_slot_snapshot(&self) -> crate::build_slots::BuildSlotPoolSnapshot {
-        self.build_slots.snapshot()
+    pub fn substrate_health_snapshot(
+        &self,
+    ) -> cairn_common::executor_protocol::SubstrateHealthSnapshot {
+        use cairn_common::executor_protocol::{
+            CellInventoryHealth, CellOccupancy, DiskHealthStatus, ExecutorHealthStatus,
+            InventoryAuthorityState, PersistentCellLifecycle, StoreLockHealth,
+            SubstrateHealthReason, SubstrateHealthSnapshot, SUBSTRATE_HEALTH_SCHEMA_VERSION,
+        };
+        let captured_at_unix_ms = self.services.clock.now_u64().saturating_mul(1_000);
+        let fleet = self.fleet.snapshot();
+        let executors = self.fleet.executor_health(captured_at_unix_ms);
+        let mut occupancy = CellOccupancy {
+            total: fleet.cells.len(),
+            ..CellOccupancy::default()
+        };
+        for cell in &fleet.cells {
+            match cell.lifecycle {
+                PersistentCellLifecycle::Provisioning => occupancy.provisioning += 1,
+                PersistentCellLifecycle::Idle => occupancy.idle += 1,
+                PersistentCellLifecycle::Queued => occupancy.queued += 1,
+                PersistentCellLifecycle::Running => occupancy.running += 1,
+                PersistentCellLifecycle::AwaitingReclaim
+                | PersistentCellLifecycle::Releasing
+                | PersistentCellLifecycle::Recovering => occupancy.recovering += 1,
+                PersistentCellLifecycle::Retired => occupancy.retired += 1,
+                PersistentCellLifecycle::Quarantined => occupancy.quarantined += 1,
+            }
+        }
+        let mut inventory = CellInventoryHealth {
+            authority: if executors.is_empty()
+                || executors.iter().any(|executor| {
+                    executor.status != ExecutorHealthStatus::Online
+                        || executor.inventory.authority != InventoryAuthorityState::Authoritative
+                }) {
+                InventoryAuthorityState::Unknown
+            } else {
+                InventoryAuthorityState::Authoritative
+            },
+            ..CellInventoryHealth::default()
+        };
+        for executor in &executors {
+            inventory.checked_out_count += executor.inventory.checked_out_count;
+            inventory.idle_count += executor.inventory.idle_count;
+            inventory.transient_occupancy += executor.inventory.transient_occupancy;
+            inventory.lifetime_cell_occupancy += executor.inventory.lifetime_cell_occupancy;
+            inventory.active_transient_reservation.memory_bytes = inventory
+                .active_transient_reservation
+                .memory_bytes
+                .saturating_add(executor.inventory.active_transient_reservation.memory_bytes);
+            inventory.active_transient_reservation.disk_growth_bytes = inventory
+                .active_transient_reservation
+                .disk_growth_bytes
+                .saturating_add(
+                    executor
+                        .inventory
+                        .active_transient_reservation
+                        .disk_growth_bytes,
+                );
+            inventory.active_transient_reservation.concurrency_units = inventory
+                .active_transient_reservation
+                .concurrency_units
+                .saturating_add(
+                    executor
+                        .inventory
+                        .active_transient_reservation
+                        .concurrency_units,
+                );
+            inventory.active_lifetime_reservation.memory_bytes = inventory
+                .active_lifetime_reservation
+                .memory_bytes
+                .saturating_add(executor.inventory.active_lifetime_reservation.memory_bytes);
+            inventory.active_lifetime_reservation.disk_growth_bytes = inventory
+                .active_lifetime_reservation
+                .disk_growth_bytes
+                .saturating_add(
+                    executor
+                        .inventory
+                        .active_lifetime_reservation
+                        .disk_growth_bytes,
+                );
+            inventory.active_lifetime_reservation.concurrency_units = inventory
+                .active_lifetime_reservation
+                .concurrency_units
+                .saturating_add(
+                    executor
+                        .inventory
+                        .active_lifetime_reservation
+                        .concurrency_units,
+                );
+            inventory.retirement_in_progress |= executor.inventory.retirement_in_progress;
+            if executor.inventory.sweep_status
+                == cairn_common::executor_protocol::StorageSweepStatus::InFlight
+            {
+                inventory.sweep_status =
+                    cairn_common::executor_protocol::StorageSweepStatus::InFlight;
+            } else if inventory.sweep_status
+                == cairn_common::executor_protocol::StorageSweepStatus::NotStarted
+            {
+                inventory.sweep_status = executor.inventory.sweep_status;
+            }
+            if executor.inventory.last_reclaimed_at_unix_ms > inventory.last_reclaimed_at_unix_ms {
+                inventory.last_reclaimed_cell_id =
+                    executor.inventory.last_reclaimed_cell_id.clone();
+                inventory.last_reclaimed_at_unix_ms = executor.inventory.last_reclaimed_at_unix_ms;
+                inventory.last_reclaimed_bytes = executor.inventory.last_reclaimed_bytes;
+            }
+        }
+        let store_locks = self
+            .jj_store_lock_metrics
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(store, metrics)| StoreLockHealth {
+                store: store.clone(),
+                waiter_count: metrics.waiter_count,
+                waits: summarize_bounded(&metrics.waits_ms),
+                holds: summarize_bounded(&metrics.holds_ms),
+            })
+            .collect::<Vec<_>>();
+        let mut reasons = Vec::new();
+        if executors.is_empty() {
+            reasons.push(SubstrateHealthReason::NoExecutors);
+        }
+        for executor in &executors {
+            let id = executor.identity.executor_id.clone();
+            if executor.status == ExecutorHealthStatus::Stale {
+                reasons.push(SubstrateHealthReason::StaleExecutor {
+                    executor_id: id.clone(),
+                });
+            }
+            if executor.host.pressure.is_some() {
+                reasons.push(SubstrateHealthReason::HostPressure {
+                    executor_id: id.clone(),
+                });
+            }
+            match executor.disk.status {
+                DiskHealthStatus::Pressured => reasons.push(SubstrateHealthReason::DiskPressured {
+                    executor_id: id.clone(),
+                }),
+                DiskHealthStatus::Full => reasons.push(SubstrateHealthReason::DiskFull {
+                    executor_id: id.clone(),
+                }),
+                DiskHealthStatus::Unknown => {
+                    reasons.push(SubstrateHealthReason::ReadingUnavailable {
+                        section: format!("executor:{id}:disk"),
+                    })
+                }
+                DiskHealthStatus::Ok => {}
+            }
+            if executor.disk.cleanup_blocked {
+                reasons.push(SubstrateHealthReason::StorageCleanupFailed {
+                    executor_id: id.clone(),
+                });
+            }
+            if let Some(skipped_entries) = executor
+                .disk
+                .accounting_skipped_entries
+                .filter(|skipped_entries| *skipped_entries > 0)
+            {
+                reasons.push(SubstrateHealthReason::DiskAccountingPartial {
+                    executor_id: id.clone(),
+                    skipped_entries,
+                });
+            }
+            if executor
+                .admission
+                .concurrency_capacity
+                .is_some_and(|capacity| {
+                    executor.admission.active_reservation.concurrency_units >= capacity
+                })
+            {
+                reasons.push(SubstrateHealthReason::AdmissionSaturated { executor_id: id });
+            }
+        }
+        let status = substrate_health_status(&reasons);
+        SubstrateHealthSnapshot {
+            schema_version: SUBSTRATE_HEALTH_SCHEMA_VERSION,
+            captured_at_unix_ms,
+            status,
+            reasons,
+            executors,
+            occupancy,
+            inventory,
+            fleet,
+            store_locks,
+        }
     }
 
-    pub fn cancel_build_slot_request(&self, request_id: &str) -> bool {
-        let cancelled = self.build_slots.cancel_request(request_id);
+    pub fn cancel_cell_request(&self, request_id: &str) -> bool {
+        let cancelled = self.fleet.cancel_request(request_id);
         if cancelled {
             let _ = self.services.emitter.emit(
                 "db-change",
@@ -823,7 +1214,7 @@ impl Orchestrator {
 
     /// Whether a browser's page is currently loading (defaults to `false` for an
     /// id never seen — a webview that has never navigated is treated as idle).
-    pub fn is_browser_loading(&self, browser_id: &str) -> bool {
+    pub(crate) fn is_browser_loading(&self, browser_id: &str) -> bool {
         self.browser_loading
             .lock()
             .ok()
@@ -867,7 +1258,7 @@ impl Orchestrator {
     }
 
     /// Acquire a project store lock while recording slow waits and holds.
-    pub async fn acquire_jj_store_lock(
+    pub(crate) async fn acquire_jj_store_lock(
         &self,
         store_dir: &Path,
         operation: impl Into<String>,
@@ -877,7 +1268,7 @@ impl Orchestrator {
             .expect("an acquisition without a timeout cannot time out")
     }
 
-    pub async fn acquire_jj_store_lock_with_timeout(
+    pub(crate) async fn acquire_jj_store_lock_with_timeout(
         &self,
         store_dir: &Path,
         operation: impl Into<String>,
@@ -885,13 +1276,35 @@ impl Orchestrator {
     ) -> Result<JjStoreGuard, ()> {
         let operation = operation.into();
         let store = store_dir.to_string_lossy().into_owned();
+        let current_task = tokio::task::try_id();
+        debug_assert!(
+            current_task.is_none()
+                || self
+                    .jj_store_lock_metrics
+                    .lock()
+                    .unwrap()
+                    .get(&store)
+                    .and_then(|metrics| metrics.current_task)
+                    != current_task,
+            "task attempted to re-acquire jj store lock for {store} while already holding it"
+        );
         let wait_started = std::time::Instant::now();
         let lock = self.jj_store_lock(store_dir);
+        {
+            let mut all = self.jj_store_lock_metrics.lock().unwrap();
+            all.entry(store.clone()).or_default().waiter_count += 1;
+        }
+        let waiter = JjStoreWaiterRegistration {
+            store: store.clone(),
+            wait_started,
+            metrics: self.jj_store_lock_metrics.clone(),
+            record_wait: false,
+        };
         let guard = match timeout {
             Some(timeout) => match tokio::time::timeout(timeout, lock.lock_owned()).await {
                 Ok(guard) => guard,
                 Err(_) => {
-                    let waited = wait_started.elapsed();
+                    let waited = waiter.finish();
                     log::warn!(
                         "jj store lock wait timed out after {:.1}s: operation={operation}, store={store}",
                         waited.as_secs_f64()
@@ -901,19 +1314,36 @@ impl Orchestrator {
             },
             None => lock.lock_owned().await,
         };
-        let waited = wait_started.elapsed();
+        let waited = waiter.finish();
         if waited >= JJ_STORE_LOCK_WARN_AFTER {
             log::warn!(
                 "jj store lock wait exceeded {:.1}s: operation={operation}, store={store}",
                 waited.as_secs_f64()
             );
         }
+        let trace = JjStoreOperationTrace {
+            operation: Arc::from(operation.clone()),
+            store: Arc::from(store.clone()),
+            correlation_id: Arc::from(uuid::Uuid::new_v4().to_string()),
+            metrics: self.jj_store_lock_metrics.clone(),
+        };
+        if let Some(metrics) = self.jj_store_lock_metrics.lock().unwrap().get_mut(&store) {
+            metrics.current_operation = Some(operation.clone());
+            metrics.current_task = current_task;
+        }
         Ok(JjStoreGuard {
             _guard: guard,
-            operation,
-            store,
+            trace,
             acquired_at: std::time::Instant::now(),
         })
+    }
+
+    pub(crate) fn jj_store_lock_holder(&self, store_dir: &Path) -> Option<String> {
+        self.jj_store_lock_metrics
+            .lock()
+            .unwrap()
+            .get(store_dir.to_string_lossy().as_ref())
+            .and_then(|metrics| metrics.current_operation.clone())
     }
 
     /// Emit a typed attention event to any in-flight `watch` long-poll.
@@ -1012,6 +1442,45 @@ impl Orchestrator {
     /// resource embedding always runs (the gateway returns `Ok(None)` with no
     /// account, so starting unconditionally is safe). Jobs enqueued before this
     /// is called are dropped.
+    /// Fence an executor's exact-object request, resolve its team from the
+    /// synced project owner, and mint through the runner's device identity.
+    pub async fn mint_authorized_cloud_object_grant(
+        &self,
+        request: &cairn_common::executor_protocol::CloudObjectGrantRequest,
+        base_commit: &str,
+    ) -> Result<cairn_common::executor_protocol::CloudObjectGrant, String> {
+        if !self
+            .object_plane
+            .authorizes_cloud_grant(request, base_commit)
+        {
+            return Err(
+                "Cloud object grant is not authorized for this execution generation".into(),
+            );
+        }
+        let team_id = self
+            .db
+            .team_id_for_project(&request.coordinate.repository.project_id)
+            .await?
+            .ok_or_else(|| "Cloud object grants require a connected team project".to_string())?;
+        let device_jwt = crate::account::read_device_jwt(&self.db.local)
+            .await?
+            .ok_or_else(|| "Cloud object grants require a connected runner account".to_string())?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|error| error.to_string())?;
+        crate::account::mint_cloud_object_grant(
+            &client,
+            &device_jwt,
+            &team_id,
+            &request.content_hash,
+            request.operation,
+            request.byte_count,
+            &self.api_config,
+        )
+        .await
+    }
+
     pub fn start_embed_worker(&self) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let client = EmbeddingClient::new(self.api_config.clone(), self.embed_token_provider());
@@ -1058,6 +1527,30 @@ impl Orchestrator {
             .unwrap_or(false)
     }
 
+    pub(crate) fn begin_write_checks(&self, job_id: &str) {
+        if let Ok(mut jobs) = self.write_checks_in_flight.lock() {
+            *jobs.entry(job_id.to_string()).or_default() += 1;
+        }
+    }
+
+    pub(crate) fn end_write_checks(&self, job_id: &str) {
+        if let Ok(mut jobs) = self.write_checks_in_flight.lock() {
+            if let Some(count) = jobs.get_mut(job_id) {
+                *count -= 1;
+                if *count == 0 {
+                    jobs.remove(job_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn write_checks_in_flight(&self, job_id: &str) -> bool {
+        self.write_checks_in_flight
+            .lock()
+            .map(|jobs| jobs.contains_key(job_id))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn turn_end_check_runtime_status(
         &self,
         job_id: &str,
@@ -1085,7 +1578,7 @@ impl Orchestrator {
     /// Token provider for the `/embed` gateway: prefers the connected account's
     /// JWT, falling back to the anonymous device JWT when logged out. Returns
     /// `None` only when neither is available (embedding then no-ops).
-    pub fn embed_token_provider(&self) -> crate::embeddings::TokenProvider {
+    fn embed_token_provider(&self) -> crate::embeddings::TokenProvider {
         let am = self.account_manager.clone();
         let anon = self.anon_device_manager.clone();
         Arc::new(move || resolve_embed_token(&am, &anon))
@@ -1121,6 +1614,12 @@ impl Orchestrator {
     /// database file: file-size reclamation is a separate one-time, offline step
     /// run via the `vacuum_reclaim` cargo example (see the `archival::backfill`
     /// module docs, docs/database.md, and CAIRN-1556).
+    pub async fn run_archival_maintenance(&self) {
+        if let Err(e) = crate::archival::run_archival_maintenance(&self.db.local).await {
+            log::warn!("archival maintenance failed: {e}");
+        }
+    }
+
     pub fn spawn_archival_maintenance(&self) {
         let db = self.db.local.clone();
         tokio::spawn(async move {
@@ -1166,6 +1665,16 @@ impl Orchestrator {
     /// that predate that per-event seam. Gated by `analytics_rollup_backfill_state`
     /// so it runs once, never on every startup, and detached so it never blocks
     /// startup or the UI (best-effort: a failure logs and is retried next start).
+    pub async fn run_analytics_rollup_backfill(&self) {
+        if let Err(e) = cairn_analytics::run_historical_backfill(&self.db.local).await {
+            log::warn!("analytics rollup backfill failed: {e}");
+        }
+    }
+
+    pub async fn run_worktree_gc(&self) {
+        crate::execution::worktree_gc::run_worktree_gc(self).await;
+    }
+
     pub fn spawn_analytics_rollup_backfill(&self) {
         let db = self.db.local.clone();
         tokio::spawn(async move {
@@ -1198,6 +1707,13 @@ impl Orchestrator {
     /// instead of re-running them. Called once at host startup, after the MCP
     /// callback server is bound so the re-spawned scripts can call back. Owned
     /// by the always-on hosts (runner, non-inert server).
+    /// Re-arm durable inline waits after a host restart. Overdue deadlines and
+    /// retained terminal conditions resolve immediately; pending conditions are
+    /// watched again from their authoritative database rows.
+    pub async fn reconcile_owned_waits(&self) {
+        crate::mcp::handlers::owned_wait::reconcile_owned_waits(self).await;
+    }
+
     pub async fn redispatch_crashed_workflows(&self) {
         crate::execution::jobs::redispatch_crashed_workflows(self).await;
     }
@@ -1231,17 +1747,29 @@ impl Orchestrator {
     /// issue creation, drafts stranded on failed/interrupted jobs). Idempotent;
     /// errors are logged, never fatal. Must be called from within a tokio
     /// runtime context.
+    pub async fn run_memory_triage_reconcile(&self) {
+        if let Err(error) = crate::memories::triage::reconcile_memory_triage(self.clone()).await {
+            log::warn!("memory triage reconcile failed: {error}");
+        }
+    }
+
     pub fn spawn_memory_triage_reconcile(&self) {
-        /// Cadence of the reconciliation sweep after its immediate startup pass.
-        /// Hourly: this is a safety net behind the event-driven fast path, not a
-        /// latency-sensitive path.
+        self.spawn_memory_triage_reconcile_loop(false);
+    }
+
+    pub fn spawn_memory_triage_reconcile_periodic(&self) {
+        self.spawn_memory_triage_reconcile_loop(true);
+    }
+
+    fn spawn_memory_triage_reconcile_loop(&self, skip_initial: bool) {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
         let orch = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            if skip_initial {
+                interval.tick().await;
+            }
             loop {
-                // The first tick fires immediately, so reconciliation runs once
-                // at startup, then every RECONCILE_INTERVAL.
                 interval.tick().await;
                 if let Err(error) =
                     crate::memories::triage::reconcile_memory_triage(orch.clone()).await
@@ -1256,11 +1784,38 @@ impl Orchestrator {
     /// startup, then periodically. This backstops jobs that were already marked
     /// `memory_review_state = 'sent'` before the direct-delivery path moved to
     /// attention pushes. It is conservative and idempotent; errors are logged.
+    pub async fn run_memory_review_reconcile(&self) {
+        let orch = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::memories::commands::reconcile_stranded_memory_reviews(orch)
+        })
+        .await
+        {
+            Ok(Ok(count)) if count > 0 => {
+                log::info!("memory review reconcile resumed {count} stranded review(s)")
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => log::warn!("memory review reconcile failed: {error}"),
+            Err(error) => log::warn!("memory review reconcile task failed: {error}"),
+        }
+    }
+
     pub fn spawn_memory_review_reconcile(&self) {
+        self.spawn_memory_review_reconcile_loop(false);
+    }
+
+    pub fn spawn_memory_review_reconcile_periodic(&self) {
+        self.spawn_memory_review_reconcile_loop(true);
+    }
+
+    fn spawn_memory_review_reconcile_loop(&self, skip_initial: bool) {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
         let orch = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            if skip_initial {
+                interval.tick().await;
+            }
             loop {
                 interval.tick().await;
                 match crate::memories::commands::reconcile_stranded_memory_reviews(orch.clone()) {
@@ -1281,6 +1836,12 @@ impl Orchestrator {
     /// recurring timer here.
     ///
     /// Must be called from within a tokio runtime context.
+    pub async fn run_default_advance_reconcile(&self) {
+        crate::projects::crud::reconcile_default_branches(&self.db.local).await;
+        crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
+        crate::orchestrator::base_advance::sweep_reconcile_intents(self).await;
+    }
+
     pub fn spawn_default_advance_reconcile(&self) {
         let orch = self.clone();
         tokio::spawn(async move {
@@ -1293,6 +1854,14 @@ impl Orchestrator {
 
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
+
+            // Durable sibling intents outlive their initiating tool call. Consume
+            // pending work at startup and periodically reclaim expired leases
+            // left by task cancellation or runner shutdown.
+            loop {
+                crate::orchestrator::base_advance::sweep_reconcile_intents(&orch).await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
         });
     }
 
@@ -1301,7 +1870,9 @@ impl Orchestrator {
     /// other detached background-spawn methods (`spawn_memory_*`,
     /// `spawn_default_advance_reconcile`) — same fire-and-forget pattern, owned by
     /// runtime teardown. The actual per-team push/pull tasks then spawn lazily as
-    /// teams open. Inert with no team configured. Must run within a tokio runtime.
+    /// teams open. When no device JWT exists, the runtime is retained but its
+    /// network tasks remain paused until the account connect transition re-arms
+    /// them. Inert with no team configured. Must run within a tokio runtime.
     pub fn start_team_sync(&self) {
         let db = self.db.clone();
         let runtime = crate::db::SyncRuntime {
@@ -1309,6 +1880,16 @@ impl Orchestrator {
             cadence: crate::storage::SyncCadence::default(),
         };
         tokio::spawn(async move {
+            let authorized = match crate::account::team_sync::read_device_jwt(&db.local).await {
+                Ok(jwt) => jwt.is_some(),
+                Err(error) => {
+                    log::warn!(
+                        "failed to determine team sync authentication state; starting paused: {error}"
+                    );
+                    false
+                }
+            };
+            db.set_team_sync_authorized(authorized).await;
             db.enable_team_sync(runtime).await;
         });
     }
@@ -1548,7 +2129,7 @@ impl Orchestrator {
     /// (no session position). Used by the outbox replay/recovery path, where
     /// re-folding would double-count. Non-blocking; a no-op if the worker
     /// hasn't been started.
-    pub fn enqueue_event_embed(&self, event_id: &str, text: String) {
+    pub(crate) fn enqueue_event_embed(&self, event_id: &str, text: String) {
         self.send_embed_job(EmbedJob::Event {
             event_id: event_id.to_string(),
             text,
@@ -1561,7 +2142,7 @@ impl Orchestrator {
     /// (user / agent content / change signal); `tokens` is the event's token
     /// count when known, used to weight its contribution. Non-blocking; a no-op
     /// if the worker hasn't been started.
-    pub fn enqueue_position_embed(
+    pub(crate) fn enqueue_position_embed(
         &self,
         session_id: &str,
         event_id: &str,
@@ -1594,7 +2175,7 @@ impl Orchestrator {
 
     /// Evict warm processes to satisfy the memory budget before a new spawn.
     /// Returns the run ids evicted.
-    pub fn collect_warm_if_needed(&self) -> Vec<String> {
+    pub(crate) fn collect_warm_if_needed(&self) -> Vec<String> {
         self.collect_warm(true)
     }
 
@@ -1741,7 +2322,7 @@ impl Orchestrator {
     ///
     /// Snapshots are keyed by durable session id and represent the latest turn's
     /// full prompt plus that turn's output, not cumulative usage across turns.
-    pub fn store_context_token_snapshot(&self, state: ContextTokenState) {
+    pub(crate) fn store_context_token_snapshot(&self, state: ContextTokenState) {
         let Some(session_id) = state.session_id.clone() else {
             return;
         };
@@ -1827,7 +2408,7 @@ impl Orchestrator {
         None
     }
 
-    pub fn refresh_model_catalog(&self) {
+    fn refresh_model_catalog(&self) {
         for backend_name in ["claude", "codex", "openrouter"] {
             let backend = backend_for_name(Some(backend_name));
             let entry = match backend.discover_models() {
@@ -1849,6 +2430,14 @@ impl Orchestrator {
             if let Ok(mut catalog) = self.model_catalog.write() {
                 catalog.insert(backend_name.to_string(), entry);
             }
+        }
+    }
+
+    pub async fn run_model_catalog_refresh(&self) {
+        let orch = self.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || orch.refresh_model_catalog()).await
+        {
+            log::warn!("model catalog refresh task failed: {error}");
         }
     }
 
@@ -1888,6 +2477,137 @@ mod tests {
         Arc::new(DbState::new(Arc::new(local), search))
     }
 
+    #[test]
+    fn substrate_health_status_precedence_reaches_unknown() {
+        use cairn_common::executor_protocol::{SubstrateHealthReason, SubstrateHealthStatus};
+
+        assert_eq!(substrate_health_status(&[]), SubstrateHealthStatus::Healthy);
+        assert_eq!(
+            substrate_health_status(&[SubstrateHealthReason::ReadingUnavailable {
+                section: "executor:one:disk".into(),
+            }]),
+            SubstrateHealthStatus::Unknown
+        );
+        assert_eq!(
+            substrate_health_status(&[
+                SubstrateHealthReason::ReadingUnavailable {
+                    section: "executor:one:disk".into(),
+                },
+                SubstrateHealthReason::StaleExecutor {
+                    executor_id: "one".into(),
+                },
+            ]),
+            SubstrateHealthStatus::Degraded
+        );
+        assert_eq!(
+            substrate_health_status(&[SubstrateHealthReason::DiskAccountingPartial {
+                executor_id: "one".into(),
+                skipped_entries: 2,
+            }]),
+            SubstrateHealthStatus::Degraded
+        );
+        assert_eq!(
+            substrate_health_status(&[SubstrateHealthReason::NoExecutors]),
+            SubstrateHealthStatus::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn store_phase_trace_is_correlated_bounded_and_does_not_retain_guard() {
+        let db = test_db().await;
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir.clone(),
+        )
+        .build();
+        let store = config_dir.join("jj-stores").join("phase-test");
+
+        let guard = orch.acquire_jj_store_lock(&store, "phase operation").await;
+        let trace = guard.trace();
+        let correlation = trace.correlation_id.clone();
+        let phase = trace.phase("local mutation");
+        drop(guard);
+
+        // A phase may deliberately outlive the lock (push/publication). Keeping
+        // its timer alive must not keep the mutex locked.
+        orch.acquire_jj_store_lock_with_timeout(
+            &store,
+            "phase overlap probe",
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("phase instrumentation does not retain the guard");
+        drop(phase);
+
+        for _ in 0..(JJ_STORE_LOCK_SAMPLE_CAPACITY + 20) {
+            drop(trace.phase("local mutation"));
+        }
+
+        let all = orch.jj_store_lock_metrics.lock().unwrap();
+        let metrics = all.get(store.to_string_lossy().as_ref()).unwrap();
+        let samples = metrics
+            .phase_ms
+            .get("phase operation/local mutation")
+            .unwrap();
+        assert_eq!(samples.len(), JJ_STORE_LOCK_SAMPLE_CAPACITY);
+        assert!(!correlation.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborted_store_lock_waiter_releases_registration() {
+        let db = test_db().await;
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir.clone(),
+        )
+        .build();
+        let store = config_dir.join("jj-stores").join("abort-test");
+        let held = orch
+            .acquire_jj_store_lock(&store, "abort test holder")
+            .await;
+        let waiting_orch = orch.clone();
+        let waiting_store = store.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_orch
+                .acquire_jj_store_lock_with_timeout(&waiting_store, "aborted waiter", None)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiter_count = orch
+                    .substrate_health_snapshot()
+                    .store_locks
+                    .iter()
+                    .find(|lock| lock.store == store.to_string_lossy())
+                    .map_or(0, |lock| lock.waiter_count);
+                if waiter_count == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the blocked acquisition registers as a waiter");
+
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(
+            orch.substrate_health_snapshot()
+                .store_locks
+                .iter()
+                .find(|lock| lock.store == store.to_string_lossy())
+                .unwrap()
+                .waiter_count,
+            0
+        );
+        drop(held);
+    }
+
     #[tokio::test]
     async fn store_lock_timeout_returns_without_acquiring_and_releases_waiter() {
         let db = test_db().await;
@@ -1920,6 +2640,19 @@ mod tests {
         )
         .await
         .expect("the lock remains usable after a timed-out waiter");
+
+        let snapshot = orch.substrate_health_snapshot();
+        let lock = snapshot
+            .store_locks
+            .iter()
+            .find(|lock| lock.store == store.to_string_lossy())
+            .expect("the per-store lock metrics remain queryable");
+        assert_eq!(lock.waiter_count, 0);
+        assert!(lock.waits.sample_count >= 3);
+        assert!(lock.waits.max_ms.is_some_and(|wait| wait >= 10));
+        assert!(lock.holds.sample_count >= 1);
+        assert!(lock.waits.sample_count <= JJ_STORE_LOCK_SAMPLE_CAPACITY as u64);
+        assert!(lock.holds.sample_count <= JJ_STORE_LOCK_SAMPLE_CAPACITY as u64);
     }
 
     async fn insert_account_jwt(db: &DbState, jwt: &str) {

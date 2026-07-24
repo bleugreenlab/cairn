@@ -54,7 +54,7 @@ fn normalize_capacity_error(message: &str) -> String {
         .join(" ")
 }
 
-pub(super) fn is_selected_model_capacity_error(message: &str) -> bool {
+fn is_selected_model_capacity_error(message: &str) -> bool {
     normalize_capacity_error(message)
         == "selected model is at capacity please try a different model"
 }

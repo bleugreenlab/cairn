@@ -23,7 +23,7 @@ struct ReadWebPayload {
 /// Handle a `read_web` callback. Thin String entry kept for the legacy dispatch
 /// route; the batch path calls [`read_web_markdown`] so it can window the
 /// markdown and surface a failure as an `Error`-kind segment.
-pub async fn handle_read_web(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+pub(crate) async fn handle_read_web(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     match read_web_markdown(orch, request).await {
         Ok(markdown) => markdown,
         Err(message) => message,

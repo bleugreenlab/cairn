@@ -1,8 +1,8 @@
 /// Resolved input from an upstream job's artifact.
 #[derive(Debug, Clone)]
 pub struct ResolvedInput {
-    pub artifact_type: String,
-    pub data: serde_json::Value,
+    pub(crate) artifact_type: String,
+    pub(crate) data: serde_json::Value,
 }
 
 /// Format resolved inputs as markdown for injection into agent prompt.

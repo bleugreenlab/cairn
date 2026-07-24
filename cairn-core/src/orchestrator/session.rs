@@ -29,7 +29,7 @@ fn sha256_hex(text: &str) -> String {
 /// Returns the next transcript sequence the backend reader should use. Even when
 /// the prompt event dedupes, this returns `MAX(sequence) + 1` so resumed streams
 /// append after the existing transcript instead of restarting at zero.
-pub fn persist_system_prompt_event(
+pub(crate) fn persist_system_prompt_event(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
@@ -489,11 +489,7 @@ fn build_orientation_block(
     // function only adjusts per-run coordinates.
     ambient: bool,
 ) -> String {
-    let clock = crate::clock::HostClock::local();
-    let mut out = format!(
-        "## Orientation\n\nYour coordinates for this run:\n\n- {}\n",
-        clock.orientation_line(chrono::Utc::now())
-    );
+    let mut out = String::from("## Orientation\n\nYour coordinates for this run:\n\n");
     if ambient {
         out.push_str(&format!(
             "- Working directory (cwd): `{}` \u{2014} the project's live checkout (shared with the user)\n",
@@ -628,13 +624,13 @@ fn build_available_terminals_section(
     Some(out)
 }
 
-pub struct PromptMessage {
+pub(crate) struct PromptMessage {
     /// `messages.rowid` — monotonic with insertion order; the key for the
     /// per-session channel-injection cursor (`Option<i64>`).
-    pub rowid: i64,
-    pub sender_name: String,
-    pub content: String,
-    pub created_at: i64,
+    pub(crate) rowid: i64,
+    pub(crate) sender_name: String,
+    pub(crate) content: String,
+    pub(crate) created_at: i64,
 }
 
 struct PeerAgent {
@@ -755,16 +751,38 @@ fn build_messaging_context(
 }
 
 /// Compose the per-run user message from the base task prompt and the dynamic
-/// messaging catch-up. Messaging rides the user turn (not the cached system
-/// prompt) so the system-prompt prefix stays byte-identical across resumes; an
-/// empty piece on either side collapses cleanly so a pure wake (no task text)
-/// or a quiet channel (no messaging) never injects stray separators.
-fn compose_user_message(prompt: &str, messaging: &str) -> String {
-    match (prompt.is_empty(), messaging.is_empty()) {
+/// messaging catch-up. Initial turns receive their clock here, outside the cached
+/// system prompt. Resume inputs already carry the richer elapsed-time prefix from
+/// the lifecycle boundary, including warm resumes that bypass this composer.
+fn compose_user_message_at(
+    prompt: &str,
+    messaging: &str,
+    clock: &crate::clock::HostClock,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let content = match (prompt.is_empty(), messaging.is_empty()) {
         (_, true) => prompt.to_string(),
         (true, false) => messaging.to_string(),
         (false, false) => format!("{prompt}\n\n{messaging}"),
+    };
+    if content.is_empty()
+        || prompt.lines().next().is_some_and(|line| {
+            line.starts_with('[') && line.ends_with(']') && line.contains(" — resumed")
+        })
+    {
+        content
+    } else {
+        format!("{}\n\n{content}", clock.initial_turn_prefix(now))
     }
+}
+
+fn compose_user_message(prompt: &str, messaging: &str) -> String {
+    compose_user_message_at(
+        prompt,
+        messaging,
+        &crate::clock::HostClock::local(),
+        chrono::Utc::now(),
+    )
 }
 
 async fn issue_key(
@@ -927,7 +945,7 @@ async fn recent_messages_for_run(
 /// pending-delivery chips. This intentionally returns the non-system subset of
 /// messages that may be injected on the next messaging-context build, so passive
 /// lifecycle awareness can reach agents without becoming dismissible UI noise.
-pub async fn pending_channel_messages_for_job(
+pub(crate) async fn pending_channel_messages_for_job(
     db: &LocalDb,
     job_id: &str,
     limit: i64,
@@ -977,7 +995,7 @@ pub async fn pending_channel_messages_for_job(
 /// The cursor is monotonic and channel-scoped: dismissing one channel chip marks
 /// that message and all older pending channel messages caught up, matching the
 /// injection cursor used when messages are delivered to the agent.
-pub async fn dismiss_channel_message_for_job(
+pub(crate) async fn dismiss_channel_message_for_job(
     db: &LocalDb,
     job_id: &str,
     rowid: i64,
@@ -1214,7 +1232,7 @@ fn get_prompt_tmp_dir() -> PathBuf {
 /// path. Claude delivers the entire uniform stack (cairn + workspace + project +
 /// role + orientation) as one `--system-prompt-file`, fully replacing CC's
 /// default; the file bytes equal the persisted segment concatenation exactly.
-pub fn write_system_prompt_file(run_id: &str, content: &str) -> Result<PathBuf, String> {
+pub(crate) fn write_system_prompt_file(run_id: &str, content: &str) -> Result<PathBuf, String> {
     let tmp_dir = get_prompt_tmp_dir();
     fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
 
@@ -1237,11 +1255,11 @@ pub fn write_system_prompt_file(run_id: &str, content: &str) -> Result<PathBuf, 
 /// constant, the workspace doctrine, or an agent's role body) and is
 /// content-addressed into `archival_blobs` at teardown; the dynamic tail (the
 /// per-run orientation block) stays inline on the event.
-pub const SEGMENT_KIND_CAIRN: &str = "cairn";
-pub const SEGMENT_KIND_WORKSPACE: &str = "workspace";
-pub const SEGMENT_KIND_PROJECT: &str = "project";
-pub const SEGMENT_KIND_AGENT: &str = "agent";
-pub const SEGMENT_KIND_DYNAMIC: &str = "dynamic";
+const SEGMENT_KIND_CAIRN: &str = "cairn";
+const SEGMENT_KIND_WORKSPACE: &str = "workspace";
+const SEGMENT_KIND_PROJECT: &str = "project";
+const SEGMENT_KIND_AGENT: &str = "agent";
+pub(crate) const SEGMENT_KIND_DYNAMIC: &str = "dynamic";
 
 /// One labeled span of an assembled system prompt. Concatenating every segment's
 /// `text` in order reproduces the full prompt byte for byte; persisting the
@@ -1249,12 +1267,12 @@ pub const SEGMENT_KIND_DYNAMIC: &str = "dynamic";
 /// static spans and inline only the per-run dynamic tail.
 #[derive(Debug, Clone)]
 pub struct PromptSegment {
-    pub kind: &'static str,
-    pub text: String,
+    kind: &'static str,
+    pub(crate) text: String,
 }
 
 impl PromptSegment {
-    pub fn new(kind: &'static str, text: impl Into<String>) -> Self {
+    fn new(kind: &'static str, text: impl Into<String>) -> Self {
         Self {
             kind,
             text: text.into(),
@@ -1275,7 +1293,7 @@ impl PromptSegment {
 /// body (each header is added here). `agent` is the full agent role content;
 /// when `dynamic_tail` does not apply, the whole agent content stays one static
 /// segment (still correct, just less dedup).
-pub fn assemble_prompt_segments(
+pub(crate) fn assemble_prompt_segments(
     cairn: &str,
     workspace: Option<&str>,
     project: Option<&str>,
@@ -1336,7 +1354,7 @@ pub fn assemble_prompt_segments(
 /// Concatenate every segment's text into the full system prompt string. Used by
 /// backends that deliver the prompt as a single blob (Claude's
 /// `--system-prompt-file`, OpenRouter's `system` message).
-pub fn flatten_prompt_segments(segments: &[PromptSegment]) -> String {
+pub(crate) fn flatten_prompt_segments(segments: &[PromptSegment]) -> String {
     segments.iter().map(|s| s.text.as_str()).collect()
 }
 
@@ -1344,7 +1362,7 @@ pub fn flatten_prompt_segments(segments: &[PromptSegment]) -> String {
 /// segment texts concatenated. Slicing the assembled segments (rather than
 /// rebuilding the string independently) makes Codex's sent bytes equal the
 /// persisted segments by construction, not by coincidence.
-pub fn base_instructions_from_segments(segments: &[PromptSegment]) -> String {
+pub(crate) fn base_instructions_from_segments(segments: &[PromptSegment]) -> String {
     segments
         .iter()
         .filter(|s| {
@@ -1359,7 +1377,7 @@ pub fn base_instructions_from_segments(segments: &[PromptSegment]) -> String {
 /// The Codex `developerInstructions` payload: the `agent` + `dynamic` segment
 /// texts concatenated, or `None` when the agent content is empty. Paired with
 /// [`base_instructions_from_segments`] so base + developer == the full prompt.
-pub fn developer_instructions_from_segments(segments: &[PromptSegment]) -> Option<String> {
+pub(crate) fn developer_instructions_from_segments(segments: &[PromptSegment]) -> Option<String> {
     let combined: String = segments
         .iter()
         .filter(|s| s.kind == SEGMENT_KIND_AGENT || s.kind == SEGMENT_KIND_DYNAMIC)
@@ -1373,7 +1391,7 @@ pub fn developer_instructions_from_segments(segments: &[PromptSegment]) -> Optio
 }
 
 /// Clean up a specific prompt file after a run completes
-pub fn cleanup_prompt_file(run_id: &str) {
+pub(crate) fn cleanup_prompt_file(run_id: &str) {
     let file_path = get_prompt_tmp_dir().join(format!("prompt-{}.md", run_id));
     if file_path.exists() {
         if let Err(e) = fs::remove_file(&file_path) {
@@ -1470,44 +1488,56 @@ pub fn start_agent_session(
     // Resolve session DB context early — home_uri is required for the MCP config.
     let db_context = session_db_context(orch, run_id)?;
     let home_uri = db_context.home_uri.clone();
+    let session_project_id = db_context.project_id.clone();
     log::info!("Session home URI: {}", home_uri);
 
-    // Serialize available agents for MCP config
-    let (agents_json, _session_project_path, session_project_id) = {
-        let project_path = db_context.project_path.clone();
-        let project_id = db_context.project_id.clone();
+    if let (Some(project_id), Some(project_path)) = (
+        db_context.project_id.as_deref(),
+        db_context.project_path.as_deref(),
+    ) {
+        super::config_resource::migrate_contextual_disables_blocking(
+            orch,
+            project_id,
+            project_path,
+        )?;
+    }
+    let contextual_policy = crate::config::contextual_packages::load_contextual_packages(
+        db_context.project_path.as_deref(),
+    );
 
-        // Get available agents from files
-        let agents = {
-            use crate::config::{agents as config_agents, ConfigResult};
-
-            let file_agents = config_agents::list_agents(&orch.config_dir, project_path.as_deref())
-                .unwrap_or_default();
-
-            let mut agent_infos: Vec<serde_json::Value> = file_agents
-                .into_iter()
-                .filter_map(|r| match r {
-                    ConfigResult::Ok(agent) => Some(
-                        serde_json::json!({"name": agent.name, "description": agent.description}),
-                    ),
-                    ConfigResult::Err { .. } => None,
-                })
-                .collect();
-
-            agent_infos.sort_by(|a, b| {
-                let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                a_name.cmp(b_name)
-            });
-
-            if !agent_infos.is_empty() {
-                serde_json::to_string(&agent_infos).ok()
-            } else {
-                None
+    // Compose and shadow once, then apply the same selected agent set to both
+    // MCP initialization and the Available Agents prompt roster.
+    let selected_file_agents = {
+        use crate::config::contextual_packages::ContextualPackageKind;
+        use crate::config::{agents as config_agents, ConfigResult};
+        let mut by_id = std::collections::BTreeMap::new();
+        for result in
+            config_agents::list_agents(&orch.config_dir, db_context.project_path.as_deref())
+                .unwrap_or_default()
+        {
+            if let ConfigResult::Ok(agent) = result {
+                by_id.entry(agent.id.clone()).or_insert(agent);
             }
-        };
+        }
+        by_id.retain(|id, agent| {
+            contextual_policy.is_selected(ContextualPackageKind::Agent, id, &agent.bundles)
+        });
+        by_id.into_values().collect::<Vec<_>>()
+    };
 
-        (agents, project_path, project_id)
+    let agents_json = {
+        let mut agent_infos: Vec<serde_json::Value> = selected_file_agents
+            .iter()
+            .map(|agent| serde_json::json!({"name": agent.name, "description": agent.description}))
+            .collect();
+        agent_infos.sort_by(|a, b| {
+            let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            a_name.cmp(b_name)
+        });
+        (!agent_infos.is_empty())
+            .then(|| serde_json::to_string(&agent_infos).ok())
+            .flatten()
     };
 
     // Build the MCP config inline (passed per-run to the backend, never written
@@ -1561,7 +1591,7 @@ pub fn start_agent_session(
         reasoning_effort,
         service_tier,
     ) = {
-        use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
+        use crate::config::{skills as config_skills, ConfigResult};
         let run_issue_id = db_context.run_issue_id.clone();
         let project_key = db_context.project_key.clone();
         let project_path_for_prompt = db_context.project_path.clone();
@@ -1584,41 +1614,18 @@ pub fn start_agent_session(
             )
         };
 
-        // Inherited workspace agents/skills a project has disabled drop out of the
-        // prompt surfaces entirely. Skills auto-surface into the prompt, so this is
-        // the real per-project disable lever for an inherited skill.
-        let (disabled_agents, disabled_skills) = match session_project_id.as_deref() {
-            Some(pid) => (
-                super::config_resource::disabled_keys_blocking(orch, pid, "agent")
-                    .unwrap_or_default(),
-                super::config_resource::disabled_keys_blocking(orch, pid, "skill")
-                    .unwrap_or_default(),
-            ),
-            None => (
-                std::collections::HashSet::new(),
-                std::collections::HashSet::new(),
-            ),
-        };
-
-        // Get list of available agents from files
+        // The MCP config and prompt roster intentionally share the same already
+        // shadowed, policy-selected agent set.
         let available_agents: Vec<(String, String, String)> = {
-            let agents =
-                config_agents::list_agents(&orch.config_dir, project_path_for_prompt.as_deref())
-                    .unwrap_or_default();
-            let mut by_id = std::collections::BTreeMap::new();
-            for result in agents {
-                if let ConfigResult::Ok(agent) = result {
-                    // config_root_subdirs yields project first, so keep the first
-                    // occurrence for each id to avoid duplicate prompt entries.
-                    by_id
-                        .entry(agent.id)
-                        .or_insert((agent.name, agent.description));
-                }
-            }
-            by_id.retain(|id, _| !disabled_agents.contains(id));
-            let mut result: Vec<(String, String, String)> = by_id
-                .into_iter()
-                .map(|(id, (name, description))| (id, name, description))
+            let mut result: Vec<_> = selected_file_agents
+                .iter()
+                .map(|agent| {
+                    (
+                        agent.id.clone(),
+                        agent.name.clone(),
+                        agent.description.clone(),
+                    )
+                })
                 .collect();
             result.sort_by(|a, b| a.1.cmp(&b.1));
             result
@@ -1632,17 +1639,20 @@ pub fn start_agent_session(
             let mut by_id = std::collections::BTreeMap::new();
             for result in skills {
                 if let ConfigResult::Ok(skill) = result {
-                    // config_root_subdirs yields project first, so keep the first
-                    // occurrence for each id to avoid duplicate prompt entries.
-                    by_id
-                        .entry(skill.id)
-                        .or_insert((skill.name, skill.description));
+                    // Shadow first, then evaluate the winning package metadata.
+                    by_id.entry(skill.id.clone()).or_insert(skill);
                 }
             }
-            by_id.retain(|id, _| !disabled_skills.contains(id));
+            by_id.retain(|id, skill| {
+                contextual_policy.is_selected(
+                    crate::config::contextual_packages::ContextualPackageKind::Skill,
+                    id,
+                    &skill.bundles,
+                )
+            });
             let mut result: Vec<(String, String, String)> = by_id
                 .into_iter()
-                .map(|(id, (name, description))| (id, name, description))
+                .map(|(id, skill)| (id, skill.name, skill.description))
                 .collect();
             result.sort_by(|a, b| a.1.cmp(&b.1));
             result
@@ -2075,13 +2085,8 @@ mod tests {
             false,
         );
         assert!(block.contains("## Orientation"));
-        let clock_line = block
-            .lines()
-            .find(|line| line.starts_with("- Clock: "))
-            .expect("orientation clock line");
-        assert!(clock_line.contains("("));
-        assert!(clock_line.contains("UTC"));
-        assert_eq!(clock_line.split_whitespace().nth(2).unwrap().len(), 3);
+        assert!(!block.contains("Clock:"));
+        assert!(!block.contains("UTC"));
         // The resolved model is surfaced as part of the per-run dynamic tail.
         assert!(block.contains("Model: `claude-opus-4`"));
         assert!(block.contains("/work/CAIRN-1288-builder-0"));
@@ -2574,17 +2579,34 @@ mod tests {
     /// collapses cleanly when either side is empty so a pure wake or a quiet
     /// channel never injects stray whitespace.
     #[test]
-    fn compose_user_message_appends_messaging_after_task() {
+    fn compose_user_message_prefixes_initial_turn_and_appends_messaging() {
+        let clock = crate::clock::HostClock::fixed("America/Los_Angeles");
+        let now = chrono::DateTime::from_timestamp(1_752_381_600, 0).unwrap();
+        let compose = |prompt, messaging| compose_user_message_at(prompt, messaging, &clock, now);
         assert_eq!(
-            compose_user_message("do the thing", "## Agent Messaging\n\nhi"),
-            "do the thing\n\n## Agent Messaging\n\nhi"
+            compose("do the thing", "## Agent Messaging\n\nhi"),
+            "[Sat 2025-07-12 21:40 America/Los_Angeles (UTC-7)]\n\ndo the thing\n\n## Agent Messaging\n\nhi"
         );
-        assert_eq!(compose_user_message("do the thing", ""), "do the thing");
         assert_eq!(
-            compose_user_message("", "## Agent Messaging\n\nhi"),
-            "## Agent Messaging\n\nhi"
+            compose("", "## Agent Messaging\n\nhi"),
+            "[Sat 2025-07-12 21:40 America/Los_Angeles (UTC-7)]\n\n## Agent Messaging\n\nhi"
         );
-        assert_eq!(compose_user_message("", ""), "");
+        assert_eq!(compose("", ""), "");
+    }
+
+    #[test]
+    fn compose_user_message_preserves_existing_resume_prefix() {
+        let clock = crate::clock::HostClock::fixed("America/Los_Angeles");
+        let now = chrono::DateTime::from_timestamp(1_752_381_600, 0).unwrap();
+        assert_eq!(
+            compose_user_message_at(
+                "[Sat 21:40 — resumed after 3h 12m]\n\ncontinue",
+                "## Agent Messaging\n\nhi",
+                &clock,
+                now,
+            ),
+            "[Sat 21:40 — resumed after 3h 12m]\n\ncontinue\n\n## Agent Messaging\n\nhi"
+        );
     }
 
     #[test]

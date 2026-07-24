@@ -380,6 +380,14 @@ async fn notify_spawner_after_background_task_completion(
     // id when neither resolves.
     let content_ref = if total <= 1 {
         match trigger.result_artifact_job_id.as_deref() {
+            Some(job_id)
+                if matches!(
+                    trigger.status,
+                    DelegatedStatus::Failed | DelegatedStatus::Cancelled
+                ) =>
+            {
+                crate::messages::delivery::node_uri_for_job(db, job_id).await
+            }
             Some(job_id) => compute_artifact_uri_for_child_job(db, job_id).await,
             None => None,
         }

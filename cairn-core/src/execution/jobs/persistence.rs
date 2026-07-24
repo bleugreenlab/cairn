@@ -4,7 +4,7 @@ pub(crate) fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
 }
 
-pub(super) fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> {
+fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> {
     Ok(Session {
         id: row.text(0)?,
         job_id: row.opt_text(1)?,
@@ -276,7 +276,7 @@ pub(super) fn worktree_head_commit(orch: &Orchestrator, worktree_path: &Path) ->
 /// ancestor resolved and stored its own anchor at its own creation, one hop
 /// chases the chain to the durable root, so the rule is depth-proof for nested
 /// coordinators. Unresolvable bases stay NULL (never guessed).
-pub(super) async fn resolve_pack_anchor_conn(
+async fn resolve_pack_anchor_conn(
     conn: &cairn_db::turso::Connection,
     job: &DbJob,
     base_commit: Option<&str>,
@@ -379,7 +379,7 @@ pub(super) async fn update_job_worktree(
     .map_err(|e| db_error("Failed to update job", e))
 }
 
-pub(super) async fn load_session_conn(
+async fn load_session_conn(
     conn: &cairn_db::turso::Connection,
     session_id: &str,
 ) -> DbResult<Option<Session>> {
@@ -486,7 +486,7 @@ pub(super) async fn insert_session_conn(
     Ok(())
 }
 
-pub(super) async fn resolve_prepare_session_start_conn(
+async fn resolve_prepare_session_start_conn(
     conn: &cairn_db::turso::Connection,
     job: &DbJob,
     session: &Session,

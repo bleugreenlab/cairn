@@ -14,14 +14,14 @@ pub enum CanonDestinationKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonDestinationCandidate {
-    pub path: PathBuf,
-    pub kind: CanonDestinationKind,
-    pub exists: bool,
+    path: PathBuf,
+    kind: CanonDestinationKind,
+    exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonDestination {
-    pub candidates: Vec<CanonDestinationCandidate>,
+    candidates: Vec<CanonDestinationCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +35,7 @@ fn candidate(path: PathBuf, kind: CanonDestinationKind) -> CanonDestinationCandi
     CanonDestinationCandidate { path, kind, exists }
 }
 
-pub fn resolve_role_canon_home<'a, I>(
+pub(crate) fn resolve_role_canon_home<'a, I>(
     config_dir: &Path,
     role: &str,
     project_paths: I,
@@ -58,7 +58,7 @@ where
     RoleCanonHome::Workspace
 }
 
-pub fn resolve_canon_destination(
+fn resolve_canon_destination(
     config_dir: &Path,
     scope: MemoryScope,
     scope_value: &str,

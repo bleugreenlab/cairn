@@ -27,21 +27,21 @@ pub struct BuildServiceConfig {
     pub enabled: bool,
     /// Argv Cairn spawns (under the service sandbox) to start the daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub start: Vec<String>,
+    pub(crate) start: Vec<String>,
     /// Reachability/health probe. Absent = assume healthy once spawned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ready: Option<ReadyProbe>,
+    pub(crate) ready: Option<ReadyProbe>,
     /// The daemon's own writable cache/state dir (auto-added to its writable set
     /// so it never needs a broader grant just to write its own cache).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_dir: Option<String>,
+    pub(crate) state_dir: Option<String>,
     /// Extra writable scopes (absolute globs) beyond `state_dir` + temp — the
     /// explicit cross-worktree grant, e.g. `{worktrees}/**/target/**`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub write: Vec<String>,
+    pub(crate) write: Vec<String>,
     /// Env injected into fenced agent spawns so client tooling connects here.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
+    pub(crate) env: HashMap<String, String>,
     /// Env applied to the daemon **launch only**, never injected into fenced
     /// client spawns. Daemon-only controls that must not leak into build tooling
     /// live here — e.g. sccache's `SCCACHE_START_SERVER`/`SCCACHE_NO_DAEMON`
@@ -50,7 +50,7 @@ pub struct BuildServiceConfig {
     /// (which would otherwise spam build output). `env`, by contrast, is the
     /// client env that is also passed to the daemon.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub launch_env: HashMap<String, String>,
+    pub(crate) launch_env: HashMap<String, String>,
 }
 
 /// A health/reachability probe for a build service. YAML reads as
@@ -62,10 +62,10 @@ pub struct BuildServiceConfig {
 pub struct ReadyProbe {
     /// TCP connect to `host:port` succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tcp: Option<String>,
+    pub(crate) tcp: Option<String>,
     /// A command exits 0. A cheap liveness check, run with no deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<Vec<String>>,
+    pub(crate) command: Option<Vec<String>>,
     /// A request/response health round-trip, run under a hard Rust-enforced
     /// deadline (see `orchestrator::build_services`). Unlike `command`, a
     /// deadline-exceeded run is treated as **wedged** (unhealthy) — this is what
@@ -74,7 +74,7 @@ pub struct ReadyProbe {
     /// `sccache --show-stats`, a full round-trip that hangs identically against a
     /// wedged server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub round_trip: Option<Vec<String>>,
+    pub(crate) round_trip: Option<Vec<String>>,
 }
 
 impl ReadyProbe {
@@ -95,16 +95,16 @@ impl ReadyProbe {
 /// when no per-spawn worktree is in scope.
 #[derive(Debug, Clone)]
 pub struct Templates {
-    pub home: PathBuf,
-    pub cairn_home: PathBuf,
-    pub worktrees: PathBuf,
-    pub worktree: Option<PathBuf>,
+    pub(crate) home: PathBuf,
+    pub(crate) cairn_home: PathBuf,
+    pub(crate) worktrees: PathBuf,
+    pub(crate) worktree: Option<PathBuf>,
 }
 
 impl Templates {
     /// Expand `{home}`, `{cairnHome}`, `{worktrees}`, and (when in scope)
     /// `{worktree}` in a string value.
-    pub fn expand(&self, s: &str) -> String {
+    pub(crate) fn expand(&self, s: &str) -> String {
         let mut out = s
             .replace("{home}", &self.home.to_string_lossy())
             .replace("{cairnHome}", &self.cairn_home.to_string_lossy())
@@ -118,22 +118,22 @@ impl Templates {
 
 impl BuildServiceConfig {
     /// The launch argv with templates expanded.
-    pub fn expanded_start(&self, t: &Templates) -> Vec<String> {
+    pub(crate) fn expanded_start(&self, t: &Templates) -> Vec<String> {
         self.start.iter().map(|s| t.expand(s)).collect()
     }
 
     /// The extra writable globs with templates expanded.
-    pub fn expanded_write(&self, t: &Templates) -> Vec<String> {
+    pub(crate) fn expanded_write(&self, t: &Templates) -> Vec<String> {
         self.write.iter().map(|s| t.expand(s)).collect()
     }
 
     /// The daemon's state dir with templates expanded, if configured.
-    pub fn expanded_state_dir(&self, t: &Templates) -> Option<PathBuf> {
+    pub(crate) fn expanded_state_dir(&self, t: &Templates) -> Option<PathBuf> {
         self.state_dir.as_ref().map(|s| PathBuf::from(t.expand(s)))
     }
 
     /// The client env with templates expanded.
-    pub fn expanded_env(&self, t: &Templates) -> HashMap<String, String> {
+    pub(crate) fn expanded_env(&self, t: &Templates) -> HashMap<String, String> {
         self.env
             .iter()
             .map(|(k, v)| (k.clone(), t.expand(v)))
@@ -141,7 +141,7 @@ impl BuildServiceConfig {
     }
 
     /// The daemon-only launch env with templates expanded.
-    pub fn expanded_launch_env(&self, t: &Templates) -> HashMap<String, String> {
+    pub(crate) fn expanded_launch_env(&self, t: &Templates) -> HashMap<String, String> {
         self.launch_env
             .iter()
             .map(|(k, v)| (k.clone(), t.expand(v)))
@@ -217,7 +217,7 @@ const CAIRN_SCCACHE_DIR: &str = "{home}/.cache/sccache-cairn";
 /// registry deps and non-incremental CI builds, and the worktree GC bounds the
 /// resulting per-worktree `target/*/incremental` disk growth (see
 /// [`crate::execution::worktree_gc`]).
-pub fn default_sccache_service() -> BuildServiceConfig {
+pub(crate) fn default_sccache_service() -> BuildServiceConfig {
     let mut env = HashMap::new();
     env.insert(
         "SCCACHE_SERVER_PORT".to_string(),

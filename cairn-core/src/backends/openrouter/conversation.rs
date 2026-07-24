@@ -1,6 +1,6 @@
 //! Rebuild the OpenAI-style message array the OpenRouter turn sends: assemble the
-//! system + prior transcript + new user message, reorder tool results to match
-//! their assistant call order, and map stored transcript events to chat messages.
+//! system + prior transcript + new user message, normalize assistant/tool groups,
+//! and map stored transcript events to chat messages.
 
 use super::wire::{default_function_type, ChatMessage, ToolCall, ToolFunction};
 use crate::agent_process::stream::TranscriptEvent;
@@ -8,6 +8,9 @@ use crate::backends::{SessionConfig, SessionStart};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, RowExt};
 use serde_json::Value;
+use std::collections::HashMap;
+
+const INTERRUPTED_TOOL_RESULT: &str = "Interrupted before the tool result was recorded.";
 
 /// Concatenate assembled prompt segments into the full system prompt. This is
 /// byte-identical to what `persist_system_prompt_event` records, so the wire
@@ -46,8 +49,7 @@ fn load_prior_chat_messages(
                              WHERE session_id = ?1
                                AND run_id != ?2
                                AND event_type IN ('user', 'assistant', 'tool_result')
-                             ORDER BY created_at ASC, rowid ASC
-                             LIMIT 200",
+                             ORDER BY created_at ASC, rowid ASC",
                             (session_id.as_str(), current_run_id.as_str()),
                         )
                         .await?;
@@ -69,48 +71,60 @@ fn load_prior_chat_messages(
             .await
             .map_err(|error| error.to_string())
     })?;
-    Ok(reorder_tool_results_by_call_order(messages))
+    Ok(normalize_tool_call_groups(messages))
 }
 
-/// Reorder each assistant message's following `tool` results to match the order
-/// of that assistant message's `tool_calls`, regardless of the order the events
-/// were persisted in. The OpenRouter rebuild reads transcript events by
-/// `(created_at, rowid)`, but a suspended turn persists the un-executed calls'
-/// placeholder results at suspend time and the suspended call's real result only
-/// later on resume (a higher sequence). Without this, a suspended non-last tool
-/// call replays its later sibling's result before its own, which is not the
-/// OpenAI/OpenRouter tool-result ordering for the assistant message. The sort is
-/// stable and keyed by `tool_call_id` position, so an already-ordered run is a
-/// no-op and any result whose id is not in the call list is left at the end.
-pub(super) fn reorder_tool_results_by_call_order(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
-    let mut iter = messages.into_iter().peekable();
-    while let Some(message) = iter.next() {
-        let call_order: Option<Vec<String>> = if message.role == "assistant" {
-            message
-                .tool_calls
-                .as_ref()
-                .map(|calls| calls.iter().map(|call| call.id.clone()).collect())
-        } else {
-            None
-        };
-        result.push(message);
-        let Some(order) = call_order else {
+/// Reconstruct protocol-valid assistant/tool groups from persisted history.
+/// Results may be stored after unrelated events when a foreground prompt
+/// suspends a turn, so association is by call id rather than adjacency.
+pub(super) fn normalize_tool_call_groups(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut stored_results = HashMap::new();
+    let mut duplicate_results = Vec::new();
+    for message in messages.iter().filter(|message| message.role == "tool") {
+        let Some(tool_call_id) = message.tool_call_id.as_ref() else {
             continue;
         };
-        // Gather the contiguous run of tool results that answer this assistant
-        // message, then order them by their position in its `tool_calls`.
-        let mut tools: Vec<ChatMessage> = Vec::new();
-        while iter.peek().map(|m| m.role == "tool").unwrap_or(false) {
-            tools.push(iter.next().expect("peeked tool message"));
+        if stored_results
+            .insert(tool_call_id.clone(), message.clone())
+            .is_some()
+        {
+            duplicate_results.push(tool_call_id.clone());
         }
-        tools.sort_by_key(|tool| {
-            tool.tool_call_id
-                .as_ref()
-                .and_then(|id| order.iter().position(|call_id| call_id == id))
-                .unwrap_or(usize::MAX)
-        });
-        result.extend(tools);
+    }
+
+    let mut result = Vec::with_capacity(messages.len());
+    let mut synthesized = Vec::new();
+    for message in messages
+        .into_iter()
+        .filter(|message| message.role != "tool")
+    {
+        let call_ids = message
+            .tool_calls
+            .as_ref()
+            .filter(|_| message.role == "assistant")
+            .map(|calls| calls.iter().map(|call| call.id.clone()).collect::<Vec<_>>());
+        result.push(message);
+        for call_id in call_ids.into_iter().flatten() {
+            if let Some(tool_result) = stored_results.remove(&call_id) {
+                result.push(tool_result);
+            } else {
+                synthesized.push(call_id.clone());
+                result.push(ChatMessage::tool(
+                    call_id,
+                    INTERRUPTED_TOOL_RESULT.to_string(),
+                ));
+            }
+        }
+    }
+
+    if !synthesized.is_empty() || !duplicate_results.is_empty() || !stored_results.is_empty() {
+        let orphan_ids = stored_results.keys().cloned().collect::<Vec<_>>();
+        log::warn!(
+            "Repaired OpenRouter tool history: synthesized={:?}, duplicates={:?}, orphans={:?}",
+            synthesized,
+            duplicate_results,
+            orphan_ids
+        );
     }
     result
 }

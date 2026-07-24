@@ -1,7 +1,7 @@
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
 
-pub async fn fire_pr_node_port_conn(
+async fn fire_pr_node_port_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
     recipe_node_id: &str,
@@ -20,7 +20,7 @@ pub async fn fire_pr_node_port_conn(
 
 /// Fire a `pr` node port for a known execution + recipe node. Used by the PR
 /// action handler, which already holds both ids on its action_run.
-pub async fn fire_pr_node_port(
+pub(crate) async fn fire_pr_node_port(
     db: &LocalDb,
     execution_id: &str,
     recipe_node_id: &str,
@@ -46,7 +46,7 @@ pub async fn fire_pr_node_port(
 /// `parent_job_id` is that producing job; legacy `create_pr` rows have no PR node
 /// port and no-op here. The action-run-id lookup remains as a compatibility
 /// fallback for unrepaired historical rows.
-pub async fn fire_pr_node_port_for_owner(
+pub(crate) async fn fire_pr_node_port_for_owner(
     db: &LocalDb,
     owner_id: &str,
     port: &str,
@@ -89,7 +89,7 @@ pub async fn fire_pr_node_port_for_owner(
     .map_err(|error| format!("Failed to fire PR node port: {error}"))
 }
 
-pub async fn pr_node_port_fired_conn(
+pub(crate) async fn pr_node_port_fired_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
     recipe_node_id: &str,

@@ -18,7 +18,7 @@ const IDENTITY_KEY_DOMAIN: &[u8] = b"cairn-identity-v1";
 /// Encrypt a credential value for storage.
 ///
 /// Format: [version: 1 byte][nonce: 12 bytes][ciphertext + 16-byte auth tag]
-pub fn encrypt_credential(plaintext: &str, machine_id: &str) -> Result<String, String> {
+pub(crate) fn encrypt_credential(plaintext: &str, machine_id: &str) -> Result<String, String> {
     const VERSION: u8 = 0x01;
 
     let derived_key = derive_key(machine_id);
@@ -42,7 +42,7 @@ pub fn encrypt_credential(plaintext: &str, machine_id: &str) -> Result<String, S
 }
 
 /// Decrypt a credential value from storage.
-pub fn decrypt_credential(encrypted_b64: &str, machine_id: &str) -> Result<String, String> {
+pub(crate) fn decrypt_credential(encrypted_b64: &str, machine_id: &str) -> Result<String, String> {
     let encrypted = BASE64
         .decode(encrypted_b64)
         .map_err(|e| format!("Invalid base64: {}", e))?;

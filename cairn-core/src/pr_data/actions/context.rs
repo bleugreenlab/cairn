@@ -15,35 +15,35 @@ pub enum PrNodeResolution {
 #[derive(Debug, Clone)]
 pub struct MrContext {
     pub mr_id: String,
-    pub pr_url: String,
+    pub(crate) pr_url: String,
     pub github_pr_number: Option<i32>,
     pub repo_path: String,
     pub job_id: String,
     /// Creation-time fact: the PR was opened without a GitHub remote. Stored, not
     /// inferred from a missing `github_pr_number` (which a remote PR also lacks
     /// during the window between opening it and GitHub returning its number).
-    pub is_local: bool,
+    pub(crate) is_local: bool,
 }
 
 /// `MrContext` plus the issue/branch/project fields a merge needs.
 #[derive(Debug, Clone)]
 pub struct MergeMrContext {
-    pub mr: MrContext,
-    pub issue_id: Option<String>,
-    pub default_branch: String,
-    pub project_id: String,
+    pub(crate) mr: MrContext,
+    pub(crate) issue_id: Option<String>,
+    pub(crate) default_branch: String,
+    pub(crate) project_id: String,
     /// The branch the PR merges *into* (`merge_requests.target_branch`). For a
     /// normal PR this is the project default; for a Coordinator child PR it is
     /// the integration branch a sibling worktree has checked out.
-    pub target_branch: String,
-    pub source_branch: String,
-    pub title: String,
-    pub is_workspace: bool,
+    pub(crate) target_branch: String,
+    pub(crate) source_branch: String,
+    pub(crate) title: String,
+    pub(crate) is_workspace: bool,
     /// Whether the issue owns a memory-triage batch (rows in
     /// `memory_triage_issue_memories`). Drives canon resolution: resolve/revert
     /// the triage batch on merge/close. This is the structural truth — it does
     /// not depend on a label being applied.
-    pub has_triage_batch: bool,
+    pub(crate) has_triage_batch: bool,
 }
 
 pub(super) fn db_error(context: &str, error: DbError) -> String {

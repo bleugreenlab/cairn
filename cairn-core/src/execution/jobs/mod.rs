@@ -76,9 +76,10 @@ pub(crate) use lifecycle::continue_automatic_retry;
 #[cfg(any(test, feature = "test-utils"))]
 pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;
 pub use lifecycle::{
-    continue_job_impl, continue_job_or_enqueue, on_job_complete_impl, prepare_job, ResumeContext,
+    continue_job_impl, continue_job_or_enqueue, on_job_complete_impl, prepare_job,
+    resume_job_from_digest, ResumeContext,
 };
-pub use slash_commands::resolve_skill_slash_command;
+pub(crate) use slash_commands::resolve_skill_slash_command;
 pub use snapshots::store_tool_result_event_with_turn;
 pub(crate) use workflow::{
     delete_workflow_run_row, prepare_workflow_run, reclaim_ephemeral_workflow_worktree,
@@ -93,7 +94,7 @@ pub use workflow::restart_workflow;
 pub use workflow::{launch_standalone_workflow, LaunchedWorkflow};
 // The canonical, routing-aware turn-start. Host job-start paths call this
 // instead of hand-rolling the turns UPDATE against the private DB (CAIRN-2206).
-pub use turns::start_turn;
+pub(crate) use turns::start_turn;
 pub(crate) use turns::{
     abandon_pending_retry_if_head_matches, claim_retry_successor_if_head_matches,
     claim_retry_turn_start, consecutive_retry_turn_count,
@@ -120,22 +121,22 @@ use crate::runs::queries::{run_from_row, RUN_COLUMNS};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateChildTaskInput {
-    pub parent_job_id: String,
-    pub description: String,
-    pub prompt: String,
-    pub subagent_type: String,
+    pub(crate) parent_job_id: String,
+    pub(crate) description: String,
+    pub(crate) prompt: String,
+    pub(crate) subagent_type: String,
     #[serde(alias = "model")]
-    pub tier: Option<String>,
+    pub(crate) tier: Option<String>,
     #[serde(rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<String>,
+    pub(crate) backend_preference: Option<String>,
 }
 
 /// Result of creating a child task.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateChildTaskResult {
-    pub job_id: String,
-    pub run_id: String,
+    pub(crate) job_id: String,
+    run_id: String,
 }
 
 /// Worktree binding for an ephemeral call (CAIRN-2481).
@@ -150,26 +151,26 @@ pub enum CallWorktree {
 }
 
 /// Input for creating an ephemeral agent-call run.
-pub struct CreateCallRunInput {
-    pub parent_job_id: String,
+pub(crate) struct CreateCallRunInput {
+    pub(crate) parent_job_id: String,
     /// The parent's task-execution id (the snapshot that carries the call
     /// packet); falls back to the parent job's execution_id when absent.
-    pub execution_id: Option<String>,
-    pub subagent_type: String,
-    pub description: String,
-    pub prompt: String,
-    pub tier: Option<String>,
-    pub backend_preference: Option<String>,
-    pub output_contract: crate::models::DelegatedOutputContract,
-    pub worktree: CallWorktree,
-    pub label: Option<String>,
-    pub phase: Option<String>,
-    pub parent_tool_use_id: Option<String>,
-    pub task_index: Option<i32>,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) subagent_type: String,
+    pub(crate) description: String,
+    pub(crate) prompt: String,
+    pub(crate) tier: Option<String>,
+    pub(crate) backend_preference: Option<String>,
+    pub(crate) output_contract: crate::models::DelegatedOutputContract,
+    pub(crate) worktree: CallWorktree,
+    pub(crate) label: Option<String>,
+    pub(crate) phase: Option<String>,
+    pub(crate) parent_tool_use_id: Option<String>,
+    pub(crate) task_index: Option<i32>,
     /// When set (a workflow-parented call that missed the journal), the call's
     /// run is linked to this journal key so its result is journaled on
     /// completion (CAIRN-2498). `None` for an ordinary call.
-    pub workflow_journal_link: Option<crate::workflow_journal::CallLink>,
+    pub(crate) workflow_journal_link: Option<crate::workflow_journal::CallLink>,
 }
 
 /// A prepared ephemeral call run: all DB rows and the transcript seed exist, but
@@ -180,27 +181,27 @@ pub struct CreateCallRunInput {
 /// while the spawn path still reads the borrowed original after `start_call_run`.
 #[derive(Clone)]
 pub struct PreparedCallRun {
-    pub job_id: String,
-    pub run_id: String,
-    pub session_id: String,
-    pub agent_config: AgentConfig,
-    pub selected_model: Option<Model>,
-    pub working_dir: String,
-    pub prompt: String,
-    pub output_schema: OutputSchemaInfo,
-    pub execution_id: Option<String>,
-    pub worktree_path: Option<String>,
+    pub(crate) job_id: String,
+    pub(crate) run_id: String,
+    session_id: String,
+    pub(crate) agent_config: AgentConfig,
+    selected_model: Option<Model>,
+    working_dir: String,
+    prompt: String,
+    output_schema: OutputSchemaInfo,
+    execution_id: Option<String>,
+    pub(crate) worktree_path: Option<String>,
     /// True when this call minted its own ephemeral worktree (an Inherit call
     /// from an ambient, no-worktree parent). Drives the startup-failure reclaim
     /// in the spawn path so a call that never starts cannot strand a worktree.
-    pub owns_ephemeral_worktree: bool,
+    owns_ephemeral_worktree: bool,
 }
 
 /// Everything needed by the host layer to spawn a Claude process for a job.
 ///
 /// Returned by [`prepare_job`] after all DB work, worktree setup, run creation,
 /// and initial user-event storage are complete.
-pub const SETUP_CANCELLED_ERROR: &str = "__cairn_setup_cancelled__";
+const SETUP_CANCELLED_ERROR: &str = "__cairn_setup_cancelled__";
 
 pub struct PreparedJob {
     pub run_id: String,

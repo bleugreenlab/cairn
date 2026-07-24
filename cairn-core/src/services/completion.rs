@@ -14,13 +14,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     /// The prompt text to send.
-    pub prompt: String,
+    pub(crate) prompt: String,
     /// Model identifier (e.g. "haiku", "gpt-5.6-luna").
-    pub model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Backend override ("claude", "codex"). Inferred from model if absent.
-    pub backend: Option<String>,
+    pub(crate) backend: Option<String>,
     /// Output format.
-    pub output_format: OutputFormat,
+    pub(crate) output_format: OutputFormat,
 }
 
 /// Output format for completions.
@@ -36,7 +36,7 @@ pub enum OutputFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionResponse {
     /// The text content of the response.
-    pub text: String,
+    pub(crate) text: String,
 }
 
 /// Trait for one-shot AI completions (no session state).

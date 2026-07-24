@@ -14,6 +14,28 @@ use std::process::{Command, Stdio};
 /// A built execution range pack: packfile bytes and pack index bytes.
 pub type ExecutionPack = (Vec<u8>, Vec<u8>);
 
+/// Build a self-contained pack containing every object reachable from `tip`.
+/// This is the canonical first checkpoint for a repository with no prior cloud
+/// coverage; later sealed roots may publish smaller ranges from a covered parent.
+pub fn build_reachable_pack(git_dir: &Path, tip: &str) -> Result<ExecutionPack, String> {
+    let rev_list = run_git(git_dir, &["rev-list", "--objects", tip])?;
+    build_pack_from_rev_list(git_dir, &rev_list)?
+        .ok_or_else(|| format!("reachable pack for {tip} unexpectedly contained no objects"))
+}
+
+/// Build all objects reachable from `tip` but not from the already-covered `base`.
+/// Unlike archival ranges, this deliberately does not exclude the default branch:
+/// the base pack plus this range must reconstruct the complete tip in isolation.
+pub fn build_reachable_range_pack(
+    git_dir: &Path,
+    tip: &str,
+    base: &str,
+) -> Result<ExecutionPack, String> {
+    let rev_list = run_git(git_dir, &["rev-list", "--objects", tip, "--not", base])?;
+    build_pack_from_rev_list(git_dir, &rev_list)?
+        .ok_or_else(|| format!("reachable range {base}..{tip} unexpectedly contained no objects"))
+}
+
 /// Build the execution range pack for the range `pack_anchor..tip`.
 ///
 /// `git_dir` is the git repository the range is computed and packed in, and
@@ -52,6 +74,13 @@ pub fn build_execution_pack(
         ],
     )?;
 
+    build_pack_from_rev_list(git_dir, &rev_list)
+}
+
+fn build_pack_from_rev_list(
+    git_dir: &Path,
+    rev_list: &str,
+) -> Result<Option<ExecutionPack>, String> {
     // `rev-list --objects` emits "<oid> [path]" per line; pack-objects only wants
     // the object names.
     let mut oids = String::new();

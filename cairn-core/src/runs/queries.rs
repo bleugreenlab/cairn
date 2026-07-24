@@ -18,10 +18,66 @@ use std::sync::Arc;
 #[serde(rename_all = "camelCase")]
 pub struct LastEventDigest {
     #[serde(rename = "type")]
-    pub kind: String,
-    pub content: String,
-    pub tool_name: Option<String>,
-    pub is_pending: bool,
+    kind: String,
+    content: String,
+    tool_name: Option<String>,
+    is_pending: bool,
+}
+
+pub async fn list_runs_for_job_async(db: &LocalDb, job_id: &str) -> Result<Vec<Run>, CairnError> {
+    load_runs_by_sql(
+        db,
+        "SELECT id, issue_id, project_id, job_id, status, session_id, error_message,
+                started_at, exited_at, created_at, updated_at, chat_id, exit_reason,
+                start_mode
+         FROM runs
+         WHERE job_id = ?1
+         ORDER BY created_at DESC",
+        job_id.to_string(),
+    )
+    .await
+}
+
+/// Incremental transcript loader for application views. The displayed job is
+/// part of the trust boundary: stale session pointers must fail rather than
+/// returning another job's transcript from either storage or the live stream.
+pub fn list_events_for_job_session_delta(
+    db: Arc<LocalDb>,
+    job_id: &str,
+    session_id: &str,
+    after_rowid: Option<i64>,
+) -> Result<SessionEventsDelta, CairnError> {
+    let job_id = job_id.to_string();
+    let session_id = session_id.to_string();
+    let validation_db = db.clone();
+    let validation_job_id = job_id.clone();
+    let validation_session_id = session_id.clone();
+    run_query_db(async move {
+        let lineage = load_session_lineage_ids(&validation_db, &validation_session_id).await?;
+        for lineage_session_id in lineage {
+            let owner = validation_db
+                .query_opt(
+                    "SELECT job_id FROM sessions WHERE id = ?1",
+                    params![lineage_session_id.as_str()],
+                    |row| row.opt_text(0),
+                )
+                .await
+                .map_err(CairnError::from)?
+                .flatten()
+                .ok_or_else(|| CairnError::NotFound {
+                    entity: "session",
+                    id: lineage_session_id.clone(),
+                })?;
+            if owner != validation_job_id {
+                return Err(CairnError::Internal(format!(
+                    "session {lineage_session_id} belongs to job {owner}, not requested job {validation_job_id}"
+                )));
+            }
+        }
+        Ok(())
+    })?;
+
+    list_events_for_session_delta(db, &session_id, after_rowid)
 }
 
 /// Incremental session-event delta. Durable events insert monotonically per
@@ -721,10 +777,7 @@ pub fn load_event_by_id(db: Arc<LocalDb>, event_id: &str) -> Result<Option<Event
 ///
 /// Kept strictly out of the skyline event-load path, which needs real bodies to
 /// compute bar line counts.
-pub(crate) async fn apply_lean_read_projection(
-    db: &LocalDb,
-    events: &mut [Event],
-) -> Result<(), CairnError> {
+async fn apply_lean_read_projection(db: &LocalDb, events: &mut [Event]) -> Result<(), CairnError> {
     if events.is_empty() {
         return Ok(());
     }

@@ -19,7 +19,7 @@ use crate::storage::{LocalDb, RowExt};
 /// Read `executions.runner_device_id` for one execution. `None` when the
 /// execution is missing OR the column is NULL — a legacy pre-CAIRN-2629 row,
 /// which the ownership guard treats as "anyone may run" so nothing regresses.
-pub async fn execution_runner_device_id(db: &LocalDb, execution_id: &str) -> Option<String> {
+async fn execution_runner_device_id(db: &LocalDb, execution_id: &str) -> Option<String> {
     let execution_id = execution_id.to_string();
     db.read(|conn| {
         let execution_id = execution_id.clone();
@@ -62,7 +62,7 @@ pub async fn deferred_owner(
 }
 
 /// The normalized key of a project id, or `None` when unknown.
-pub async fn project_key(db: &LocalDb, project_id: &str) -> Option<String> {
+pub(crate) async fn project_key(db: &LocalDb, project_id: &str) -> Option<String> {
     let project_id = project_id.to_string();
     db.read(|conn| {
         let project_id = project_id.clone();

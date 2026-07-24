@@ -182,7 +182,7 @@ pub(crate) async fn apply_browser_action(
 /// host-side await budget. Pure (no orchestrator) so the arg validation is unit
 /// testable. The `waitFor` budget exceeds the page's own timeout so the host
 /// awaiter outlives the poll rather than reporting a false bridge timeout.
-pub(crate) fn build_interaction_request(
+fn build_interaction_request(
     action: &str,
     args: BrowserInteractionArgs,
 ) -> Result<(BridgeRequest, Duration), String> {

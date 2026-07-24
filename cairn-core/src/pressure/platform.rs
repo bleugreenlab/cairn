@@ -13,12 +13,12 @@
 /// A lightweight host memory and load snapshot for failure diagnostics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostResourceReading {
-    pub total_memory_bytes: Option<u64>,
-    pub available_memory_bytes: Option<u64>,
-    pub load_average: Option<[f64; 3]>,
+    pub(crate) total_memory_bytes: Option<u64>,
+    pub(crate) available_memory_bytes: Option<u64>,
+    pub(crate) load_average: Option<[f64; 3]>,
 }
 
-pub fn read_host_resources() -> HostResourceReading {
+pub(crate) fn read_host_resources() -> HostResourceReading {
     let (total_memory_bytes, available_memory_bytes) = host_memory();
     HostResourceReading {
         total_memory_bytes,
@@ -104,21 +104,25 @@ fn host_memory() -> (Option<u64>, Option<u64>) {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResourceReading {
     /// Compressed-memory-aware physical footprint, bytes (macOS only).
-    pub phys_footprint_bytes: Option<u64>,
+    pub(crate) phys_footprint_bytes: Option<u64>,
     /// Resident set size, bytes.
-    pub rss_bytes: u64,
+    pub(crate) rss_bytes: u64,
     /// Cumulative user + system CPU time across all threads, nanoseconds.
-    pub cpu_time_nanos: u64,
+    pub(crate) cpu_time_nanos: u64,
     /// Cumulative billed energy, nanojoules (macOS; `None` when 0/unavailable —
     /// it reads 0 on some macOS versions, so 0 is treated as "no signal").
-    pub energy_nanojoules: Option<u64>,
+    pub(crate) energy_nanojoules: Option<u64>,
 }
 
 impl ResourceReading {
     /// CPU utilization between two readings taken `elapsed_nanos` apart,
     /// expressed as a percentage of ONE core (can exceed 100 across cores).
     /// `None` when no wall time elapsed.
-    pub fn cpu_percent_since(&self, prev: &ResourceReading, elapsed_nanos: u128) -> Option<f64> {
+    pub(crate) fn cpu_percent_since(
+        &self,
+        prev: &ResourceReading,
+        elapsed_nanos: u128,
+    ) -> Option<f64> {
         if elapsed_nanos == 0 {
             return None;
         }
@@ -128,7 +132,7 @@ impl ResourceReading {
 }
 
 #[cfg(target_os = "macos")]
-pub fn read_process_resources() -> ResourceReading {
+pub(crate) fn read_process_resources() -> ResourceReading {
     // SAFETY: `proc_pid_rusage` fills a zeroed `rusage_info_v4` for our own pid;
     // the cast matches the C `(rusage_info_t *)&buf` calling convention.
     unsafe {

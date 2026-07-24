@@ -13,15 +13,15 @@
 //! for codex tiers.
 
 /// Date the price table was last reviewed against public list prices.
-pub const PRICE_SOURCE_DATE: &str = "2026-07-09";
+pub(crate) const PRICE_SOURCE_DATE: &str = "2026-07-09";
 
 /// Per-million-token USD prices for one model tier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPrice {
-    pub input: f64,
-    pub cache_read: f64,
-    pub cache_write: f64,
-    pub output: f64,
+    input: f64,
+    cache_read: f64,
+    cache_write: f64,
+    output: f64,
 }
 
 impl ModelPrice {
@@ -52,7 +52,7 @@ const GPT_5_4_MINI: ModelPrice = ModelPrice::new(0.75, 0.075, 0.75, 4.50);
 
 /// Resolve a `jobs.model` value to its price tier, or `None` when the model is
 /// unrecognized.
-pub fn price_for(model: Option<&str>) -> Option<ModelPrice> {
+fn price_for(model: Option<&str>) -> Option<ModelPrice> {
     let model = model?.to_ascii_lowercase();
     // Order matters: match the most specific aliases first.
     if model.contains("fable") || model.contains("mythos") {
@@ -105,7 +105,7 @@ fn is_legacy_opus(model: &str) -> bool {
 
 /// Compute USD cost for a normalized token-component bundle. Persisted
 /// components are disjoint, so every backend uses the same componentwise math.
-pub fn cost_usd(
+pub(crate) fn cost_usd(
     _backend: &str,
     model: Option<&str>,
     input: i64,

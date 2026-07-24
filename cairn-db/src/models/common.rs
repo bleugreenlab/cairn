@@ -369,7 +369,7 @@ impl PresetOptionValue {
         }
     }
 
-    pub fn as_bool(&self) -> Option<bool> {
+    fn as_bool(&self) -> Option<bool> {
         match self {
             PresetOptionValue::Bool(value) => Some(*value),
             _ => None,

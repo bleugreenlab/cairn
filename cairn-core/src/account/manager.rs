@@ -41,7 +41,7 @@ impl Drop for RefreshHandle {
 }
 
 impl AccountManager {
-    pub fn new(db: Arc<DbState>, emitter: Arc<dyn EventEmitter>) -> Self {
+    pub(crate) fn new(db: Arc<DbState>, emitter: Arc<dyn EventEmitter>) -> Self {
         Self {
             db,
             emitter,
@@ -99,6 +99,7 @@ impl AccountManager {
         };
 
         upsert_account(&self.db, db_account).await?;
+        self.db.set_team_sync_authorized(true).await;
 
         let connection = AccountConnection {
             user_id: claims.sub,
@@ -162,7 +163,12 @@ impl AccountManager {
         // Clear org token cache
         self.org_token_cache.lock().await.clear();
 
-        delete_account(&self.db).await?;
+        self.db.set_team_sync_authorized(false).await;
+        if let Err(error) = delete_account(&self.db).await {
+            // The account is still connected, so roll back the runtime gate.
+            self.db.set_team_sync_authorized(true).await;
+            return Err(error);
+        }
 
         let _ = self.emitter.emit(
             "db-change",
@@ -187,57 +193,13 @@ impl AccountManager {
     /// calls (every gateway 401s it) and would shadow the anonymous `/embed`
     /// fallback, so it is treated as absent. The background refresh loop reads
     /// the raw token via `get_jwt_data`, so it can still renew an expired token.
-    pub fn get_jwt(&self) -> Result<Option<String>, String> {
+    pub(crate) fn get_jwt(&self) -> Result<Option<String>, String> {
         let db = self.db.clone();
         block_on_account_db(async move { get_jwt_from_db(&db).await })
     }
 
-    /// Get a cached org JWT, or fetch a new one by exchanging the device JWT.
-    pub async fn get_or_fetch_org_jwt(&self, org_id: &str) -> Result<Option<String>, String> {
-        // Check cache first
-        {
-            let cache = self.org_token_cache.lock().await;
-            if let Some(token) = cache.get(org_id) {
-                return Ok(Some(token.to_string()));
-            }
-        }
-
-        // Need to fetch — get device JWT
-        let device_jwt = match get_jwt_from_db(&self.db).await? {
-            Some(jwt) => jwt,
-            None => return Ok(None),
-        };
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let (token, expires_at) = super::org_tokens::fetch_org_token(
-            &client,
-            &device_jwt,
-            org_id,
-            &self.api_config.base_url,
-        )
-        .await?;
-
-        // Cache the result
-        {
-            let mut cache = self.org_token_cache.lock().await;
-            cache.set(org_id, token.clone(), expires_at);
-        }
-
-        Ok(Some(token))
-    }
-
-    /// Clear all cached org tokens (e.g. on logout).
-    pub async fn clear_org_tokens(&self) {
-        let mut cache = self.org_token_cache.lock().await;
-        cache.clear();
-    }
-
     /// Start the JWT refresh background task.
-    pub async fn start_refresh(&self) {
+    async fn start_refresh(&self) {
         let mut handle = self.refresh_handle.lock().await;
 
         // Stop existing task
@@ -424,6 +386,7 @@ async fn refresh_loop(
                         "Account refresh: {} consecutive 401s, clearing account and disconnecting",
                         consecutive_401s
                     );
+                    db.set_team_sync_authorized(false).await;
                     if let Err(e) = delete_account(&db).await {
                         log::error!("Account refresh: failed to clear account row: {}", e);
                     }

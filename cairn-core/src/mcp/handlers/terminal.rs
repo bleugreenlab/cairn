@@ -3,32 +3,26 @@
 //! Long-lived terminal resources are managed separately from synchronous `run`
 //! batches, but share the same process/sandbox primitives where behavior overlaps.
 
-use super::run::{
-    apply_non_interactive_pager_env_to_pty, build_run_sandbox_policy,
-    scrub_dev_instance_routing_pty, PromotedTerminal, MAX_BUFFER_SIZE,
-};
-use crate::services::{
-    ensure_submitted_line, get_default_shell, sandbox, submit_command_exiting_shell, PtySession,
-    TerminalChild,
-};
+use super::run::MAX_BUFFER_SIZE;
+use crate::services::{ensure_submitted_line, get_default_shell, PtySession};
 use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_common::executor_protocol::{
+    CellOccupant, CellOwnerRef, CellPriority, LifetimeLeaseAcquireRequest,
+    LifetimeLeaseDeclaration, LifetimeLeaseFence, LifetimeLeaseOperation, LifetimeLeaseOwner,
+    LifetimeLeaseOwnerKind, LifetimeLeaseResult, LifetimeOwnerDeathPolicy, LifetimeProcessEvent,
+    LifetimeProcessEventKind, LifetimeProcessIoMode, LifetimeProcessSpec, LifetimeProcessStatus,
+    LifetimePtySize, LifetimeSandboxPolicy, ProcessSandboxMode, RepositoryLocator,
+    ResourceReservation, ResourceReservationSource,
+};
 use cairn_common::ids;
 use cairn_common::uri::CairnResource;
 use cairn_db::turso::params;
-use portable_pty::{CommandBuilder, PtySize};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
-use std::thread;
+use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::SystemTime;
 use uuid::Uuid;
 
-use crate::mcp::types::McpCallbackRequest;
-use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 
 /// PTY data event payload (mirrors Tauri-side PtyDataPayload)
@@ -37,6 +31,975 @@ use crate::orchestrator::Orchestrator;
 pub struct PtyDataPayload {
     pub session_id: String,
     pub data: String,
+}
+
+/// Undo every runner- and executor-side artifact created while starting a
+/// terminal. Creation owns the lease until it returns success, so no failure
+/// path may leave retained admission or a half-bound terminal row behind.
+async fn rollback_terminal_creation(
+    orch: &Orchestrator,
+    session_id: &str,
+    fence: &LifetimeLeaseFence,
+) {
+    if let Ok(mut handlers) = orch.pty_state.lifetime_handlers.lock() {
+        handlers.remove(&(fence.lease_id.clone(), session_id.to_string()));
+    }
+    remove_pty_session(&orch.pty_state, session_id);
+
+    let session_id_owned = session_id.to_string();
+    if let Err(error) = orch
+        .db
+        .local
+        .write(|conn| {
+            let session_id = session_id_owned.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "DELETE FROM job_terminals WHERE session_id = ?1",
+                    (session_id.as_str(),),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    {
+        tracing::warn!(%session_id, %error, "failed to remove terminal row during creation rollback");
+    }
+
+    let binding = crate::services::LeaseTerminalBinding {
+        fence: fence.clone(),
+        process_key: session_id.to_string(),
+        process_generation: 0,
+    };
+    let release_error = release_terminal_process(orch, &binding).await.err();
+    let lease_id = fence.lease_id.clone();
+    let has_siblings = orch
+        .db
+        .local
+        .read(|conn| {
+            let lease_id = lease_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM job_terminals WHERE lease_id = ?1 AND status = 'running' LIMIT 1",
+                        (lease_id.as_str(),),
+                    )
+                    .await?;
+                Ok(rows.next().await?.is_some())
+            })
+        })
+        .await
+        .unwrap_or(true);
+    if !has_siblings {
+        // No connected cell means there cannot be a visible sibling process to
+        // preserve. Release is fenced and therefore harmless if the lease already
+        // disappeared or was replaced concurrently.
+        let release = orch
+            .fleet
+            .operate_lifetime_lease(
+                orch,
+                LifetimeLeaseOperation::Release {
+                    fence: fence.clone(),
+                },
+            )
+            .await;
+        tracing::debug!(lease_id = %fence.lease_id, error = ?release_error, result = ?release, "terminal creation rollback released an owner lease with no persisted siblings");
+    }
+}
+
+pub async fn restart_terminal_lease(
+    orch: &Orchestrator,
+    fence: LifetimeLeaseFence,
+) -> Result<String, String> {
+    let lease_id = fence.lease_id.clone();
+    let restartable_processes: std::collections::HashSet<String> = orch
+        .fleet
+        .snapshot()
+        .cells
+        .into_iter()
+        .filter_map(|cell| {
+            cell.occupant
+                .and_then(|occupant| occupant.lifetime().cloned())
+        })
+        .filter(|lease| lease.declaration.lease_id == lease_id)
+        .flat_map(|lease| lease.processes.into_iter())
+        .filter_map(|(key, process)| match process.status {
+            LifetimeProcessStatus::Starting | LifetimeProcessStatus::Running { .. } => Some(key),
+            LifetimeProcessStatus::Exited {
+                restartable: true,
+                executor_lost: true,
+                ..
+            } => Some(key),
+            _ => None,
+        })
+        .collect();
+    let slugs = terminal_slugs_for_lease(&orch.db.local, &fence, &restartable_processes).await?;
+    if slugs.is_empty() {
+        return Err(format!("No terminal row is bound to lease {lease_id}"));
+    }
+    let mut sessions = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        sessions.push(restart_terminal_process(orch, fence.clone(), &slug).await?);
+    }
+    Ok(sessions.join(","))
+}
+
+async fn terminal_slugs_for_lease(
+    db: &LocalDb,
+    fence: &LifetimeLeaseFence,
+    restartable_processes: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let fence = fence.clone();
+    let restartable_processes = restartable_processes.clone();
+    db.read(|conn| {
+        let fence = fence.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT slug, status, session_id FROM job_terminals
+                 WHERE lease_id = ?1 AND lease_incarnation_id = ?2 AND lease_epoch = ?3
+                 ORDER BY created_at, slug",
+                    (
+                        fence.lease_id.as_str(),
+                        fence.incarnation_id.as_str(),
+                        fence.lease_epoch as i64,
+                    ),
+                )
+                .await?;
+            let mut slugs = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let status = row.text(1)?;
+                let session_id = row.text(2)?;
+                if status != "closing"
+                    && (status == "running"
+                        || status == "recovering"
+                        || restartable_processes.contains(&session_id))
+                {
+                    slugs.push(row.text(0)?);
+                }
+            }
+            Ok(slugs)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn restart_terminal_process(
+    orch: &Orchestrator,
+    fence: LifetimeLeaseFence,
+    slug: &str,
+) -> Result<String, String> {
+    let lease_id = fence.lease_id.clone();
+    let incarnation_id = fence.incarnation_id.clone();
+    let lease_epoch = fence.lease_epoch;
+    let slug = slug.to_string();
+    let row = orch
+        .db
+        .local
+        .read(|conn| {
+            let lease_id = lease_id.clone();
+            let slug = slug.clone();
+            let incarnation_id = incarnation_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT job_id, project_id, slug, command, title, lease_id
+                 FROM job_terminals
+                 WHERE slug = ?2 AND ((lease_id = ?1 AND lease_incarnation_id = ?3 AND lease_epoch = ?4)
+                    OR (status = 'exited'
+                        AND ('terminal:' || COALESCE(job_id, project_id)) = ?1))
+                 LIMIT 1",
+                        (lease_id.as_str(), slug.as_str(), incarnation_id.as_str(), lease_epoch as i64),
+                    )
+                    .await?;
+                let row = rows.next().await?.ok_or_else(|| {
+                    crate::storage::DbError::Row(format!(
+                        "No terminal row is bound to lease {lease_id}"
+                    ))
+                })?;
+                Ok((
+                    row.opt_text(0)?,
+                    row.opt_text(1)?,
+                    row.text(2)?,
+                    row.text(3)?,
+                    row.opt_text(4)?,
+                    row.opt_text(5)?,
+                ))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let resource = if let Some(job_id) = row.0.as_deref() {
+        terminal_resource_for_job(&orch.db.local, job_id, row.2.clone()).await?
+    } else {
+        terminal_resource_for_project(
+            &orch.db.local,
+            row.1
+                .as_deref()
+                .ok_or("project terminal row has no project")?,
+            row.2.clone(),
+        )
+        .await?
+    };
+    let mut target = resolve_terminal_resource_target(&orch.db.local, &resource)
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_terminal_slug_available(&orch.db.local, &target)
+        .await
+        .map_err(|error| error.to_string())?;
+    let cell = orch.fleet.snapshot().cells.into_iter().find(|cell| {
+        cell.lease_epoch == fence.lease_epoch
+            && cell
+                .occupant
+                .as_ref()
+                .and_then(CellOccupant::lifetime)
+                .is_some_and(|lease| {
+                    lease.declaration.lease_id == fence.lease_id
+                        && lease.incarnation_id == fence.incarnation_id
+                        && lease.declaration.owner == fence.owner
+                })
+    });
+    let Some(cell) = cell else {
+        if !crate::terminal_host::terminal_owner_recovery_window_elapsed() {
+            return Err(
+                "terminal lease fence is stale while its executor may still reclaim it".into(),
+            );
+        }
+        if row.5.is_some() {
+            crate::terminal_host::resolve_missing_terminal_lease(
+                &orch.db.local,
+                &fence.lease_id,
+                &fence.incarnation_id,
+                fence.lease_epoch,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        let target = materialize_terminal_lease(orch, target).await?;
+        let interactive = row.4.is_some();
+        return spawn_terminal_session(
+            orch,
+            resource,
+            target,
+            if interactive { String::new() } else { row.3 },
+            None,
+            !interactive,
+            None,
+            LifetimePtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await;
+    };
+    let lease = cell
+        .occupant
+        .as_ref()
+        .and_then(CellOccupant::lifetime)
+        .ok_or("terminal lease has no lifetime state")?;
+    if lease.phase == cairn_common::executor_protocol::LifetimeLeasePhase::AwaitingReclaim {
+        let reclaimed = orch
+            .fleet
+            .operate_lifetime_lease(
+                orch,
+                LifetimeLeaseOperation::Reclaim {
+                    fence: fence.clone(),
+                },
+            )
+            .await;
+        if !matches!(reclaimed, LifetimeLeaseResult::State { .. }) {
+            return Err(format!("failed to reclaim terminal lease: {reclaimed:?}"));
+        }
+    }
+    target.cwd = cell.path;
+    // Reconnecting to (or reclaiming) an existing lease can find a checkout the
+    // bookmark advanced past while the executor was disconnected. Refresh to the
+    // current tip before spawning so the terminal never reports running against
+    // stale source. Project/user terminals (no branch) run in the live checkout and
+    // skip the gate.
+    if let Some(tip) = resolve_job_terminal_tip(orch, &target).await? {
+        ensure_terminal_checkout_current(orch, &fence, &tip).await?;
+    }
+    target.lease = Some(fence);
+    let interactive = row.4.is_some();
+    spawn_terminal_session(
+        orch,
+        resource,
+        target,
+        if interactive { String::new() } else { row.3 },
+        None,
+        !interactive,
+        None,
+        LifetimePtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn release_terminal_by_session(
+    orch: &Orchestrator,
+    session_id: &str,
+) -> Result<(), String> {
+    let binding = terminal_binding_by_session(orch, session_id).await?;
+    release_terminal_process(orch, &binding).await?;
+    if let Ok(mut sessions) = orch.pty_state.sessions.lock() {
+        sessions.remove(session_id);
+    }
+    if let Ok(mut handlers) = orch.pty_state.lifetime_handlers.lock() {
+        handlers.remove(&(binding.fence.lease_id.clone(), binding.process_key.clone()));
+    }
+    Ok(())
+}
+
+async fn release_terminal_process(
+    orch: &Orchestrator,
+    binding: &crate::services::LeaseTerminalBinding,
+) -> Result<(), String> {
+    let stop = orch
+        .fleet
+        .operate_lifetime_lease(
+            orch,
+            LifetimeLeaseOperation::StopProcess {
+                fence: binding.fence.clone(),
+                process_key: binding.process_key.clone(),
+            },
+        )
+        .await;
+    let cell = match stop {
+        LifetimeLeaseResult::State { cell } => cell,
+        other => orch
+            .fleet
+            .snapshot()
+            .cells
+            .into_iter()
+            .find(|cell| {
+                cell.lease_epoch == binding.fence.lease_epoch
+                    && cell
+                        .occupant
+                        .as_ref()
+                        .and_then(CellOccupant::lifetime)
+                        .is_some_and(|lease| {
+                            lease.declaration.lease_id == binding.fence.lease_id
+                                && lease.incarnation_id == binding.fence.incarnation_id
+                        })
+            })
+            .ok_or_else(|| format!("Failed to stop terminal before release: {other:?}"))?,
+    };
+    let release_group = cell
+        .occupant
+        .as_ref()
+        .and_then(CellOccupant::lifetime)
+        .is_some_and(|lease| {
+            lease.processes.values().all(|process| {
+                !matches!(
+                    process.status,
+                    LifetimeProcessStatus::Starting | LifetimeProcessStatus::Running { .. }
+                )
+            })
+        });
+    if release_group {
+        let release = orch
+            .fleet
+            .operate_lifetime_lease(
+                orch,
+                LifetimeLeaseOperation::Release {
+                    fence: binding.fence.clone(),
+                },
+            )
+            .await;
+        if !matches!(release, LifetimeLeaseResult::Released { .. }) {
+            return Err(format!("Failed to release terminal lease: {release:?}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn terminal_resource_for_cwd(
+    db: &LocalDb,
+    cwd: &str,
+    slug: String,
+) -> Result<CairnResource, String> {
+    let cwd = cwd.to_string();
+    let match_row = db
+        .read(|conn| {
+            let cwd = cwd.clone();
+            Box::pin(async move {
+                let mut jobs = conn
+                    .query(
+                        "SELECT id FROM jobs
+                         WHERE worktree_path IS NOT NULL
+                           AND (?1 = worktree_path OR ?1 LIKE worktree_path || '/%')
+                         ORDER BY length(worktree_path) DESC LIMIT 1",
+                        (cwd.as_str(),),
+                    )
+                    .await?;
+                if let Some(row) = jobs.next().await? {
+                    return Ok((Some(row.text(0)?), None));
+                }
+                let mut projects = conn
+                    .query(
+                        "SELECT id FROM projects
+                         WHERE ?1 = repo_path OR ?1 LIKE repo_path || '/%'
+                         ORDER BY length(repo_path) DESC LIMIT 1",
+                        (cwd.as_str(),),
+                    )
+                    .await?;
+                Ok((
+                    None,
+                    projects.next().await?.map(|row| row.text(0)).transpose()?,
+                ))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(job_id) = match_row.0 {
+        terminal_resource_for_job(db, &job_id, slug).await
+    } else if let Some(project_id) = match_row.1 {
+        terminal_resource_for_project(db, &project_id, slug).await
+    } else {
+        Err(format!(
+            "Terminal cwd is not inside a managed project or agent worktree: {cwd}"
+        ))
+    }
+}
+
+pub(crate) async fn resize_terminal_by_session(
+    orch: &Orchestrator,
+    session_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let binding = terminal_binding_by_session(orch, session_id).await?;
+    let result = orch
+        .fleet
+        .operate_lifetime_lease(
+            orch,
+            LifetimeLeaseOperation::ResizePty {
+                fence: binding.fence,
+                process_key: binding.process_key,
+                process_generation: binding.process_generation,
+                size: LifetimePtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            },
+        )
+        .await;
+    if matches!(result, LifetimeLeaseResult::State { .. }) {
+        Ok(())
+    } else {
+        Err(format!("Failed to resize terminal: {result:?}"))
+    }
+}
+
+fn terminal_binding_from_cells(
+    cells: &[cairn_common::executor_protocol::PersistentCellState],
+    lease_id: &str,
+    incarnation_id: &str,
+    lease_epoch: u64,
+    slug: Option<&str>,
+    process_generation: Option<u64>,
+) -> Option<crate::services::LeaseTerminalBinding> {
+    cells.iter().find_map(|cell| {
+        if cell.lease_epoch != lease_epoch {
+            return None;
+        }
+        let lease = cell.occupant.as_ref().and_then(CellOccupant::lifetime)?;
+        if lease.declaration.lease_id != lease_id || lease.incarnation_id != incarnation_id {
+            return None;
+        }
+        let process_key = slug
+            .filter(|slug| lease.processes.contains_key(*slug))
+            .map(str::to_owned)
+            .or_else(|| {
+                let mut matches = lease.processes.iter().filter(|(_, process)| {
+                    process_generation.is_none_or(|generation| process.generation == generation)
+                });
+                let (process_key, _) = matches.next()?;
+                matches.next().is_none().then(|| process_key.clone())
+            })?;
+        let process_generation = lease.processes.get(&process_key)?.generation;
+        Some(crate::services::LeaseTerminalBinding {
+            fence: LifetimeLeaseFence {
+                lease_id: lease.declaration.lease_id.clone(),
+                owner: lease.declaration.owner.clone(),
+                incarnation_id: lease.incarnation_id.clone(),
+                lease_epoch: cell.lease_epoch,
+            },
+            process_key,
+            process_generation,
+        })
+    })
+}
+
+async fn persisted_terminal_binding_by_session(
+    orch: &Orchestrator,
+    session_id: &str,
+) -> Result<crate::services::LeaseTerminalBinding, String> {
+    let session_id = session_id.to_string();
+    let (slug, lease_id, incarnation_id, lease_epoch, process_generation) = orch
+        .db
+        .local
+        .read(|conn| {
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT slug, lease_id, lease_incarnation_id, lease_epoch, process_generation
+                         FROM job_terminals
+                         WHERE session_id = ?1 AND status = 'running'
+                         LIMIT 1",
+                        (session_id.as_str(),),
+                    )
+                    .await?;
+                let row = rows.next().await?.ok_or_else(|| {
+                    crate::storage::DbError::Row(format!(
+                        "Terminal session not running: {session_id}"
+                    ))
+                })?;
+                Ok((
+                    row.opt_text(0)?,
+                    row.opt_text(1)?,
+                    row.opt_text(2)?,
+                    row.opt_i64(3)?.map(|value| value as u64),
+                    row.opt_i64(4)?.map(|value| value as u64),
+                ))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let lease_id = lease_id
+        .ok_or_else(|| format!("Terminal session has no retained executor lease: {session_id}"))?;
+    let incarnation_id = incarnation_id.ok_or_else(|| {
+        format!("Terminal session has no retained lease incarnation: {session_id}")
+    })?;
+    let lease_epoch = lease_epoch
+        .ok_or_else(|| format!("Terminal session has no retained lease epoch: {session_id}"))?;
+    terminal_binding_from_cells(
+        &orch.fleet.snapshot().cells,
+        &lease_id,
+        &incarnation_id,
+        lease_epoch,
+        slug.as_deref(),
+        process_generation,
+    )
+    .ok_or_else(|| format!("Terminal executor lease is not connected: {session_id}"))
+}
+
+async fn terminal_binding_by_session(
+    orch: &Orchestrator,
+    session_id: &str,
+) -> Result<crate::services::LeaseTerminalBinding, String> {
+    let session = orch
+        .pty_state
+        .sessions
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(session_id)
+        .cloned();
+    if let Some(session) = session {
+        return session
+            .lock()
+            .map_err(|error| error.to_string())?
+            .lease
+            .clone()
+            .ok_or_else(|| "This terminal has no executor process binding".to_string());
+    }
+    persisted_terminal_binding_by_session(orch, session_id).await
+}
+
+pub(crate) async fn stop_terminal_by_session(
+    orch: &Orchestrator,
+    session_id: &str,
+) -> Result<(), String> {
+    let binding = terminal_binding_by_session(orch, session_id).await?;
+    let result = orch
+        .fleet
+        .operate_lifetime_lease(
+            orch,
+            LifetimeLeaseOperation::StopProcess {
+                fence: binding.fence,
+                process_key: binding.process_key,
+            },
+        )
+        .await;
+    if matches!(result, LifetimeLeaseResult::State { .. }) {
+        Ok(())
+    } else {
+        Err(format!("Failed to stop terminal: {result:?}"))
+    }
+}
+
+pub(crate) async fn terminal_resource_for_job(
+    db: &LocalDb,
+    job_id: &str,
+    slug: String,
+) -> Result<CairnResource, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        let slug = slug.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT p.key, i.number, e.seq, j.uri_segment, parent.uri_segment
+                     FROM jobs j
+                     JOIN projects p ON p.id = j.project_id
+                     JOIN issues i ON i.id = j.issue_id
+                     JOIN executions e ON e.id = j.execution_id
+                     LEFT JOIN jobs parent ON parent.id = j.parent_job_id
+                     WHERE j.id = ?1 LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| crate::storage::DbError::Row(format!("Job not found: {job_id}")))?;
+            let project = row.text(0)?;
+            let number = row.i64(1)? as i32;
+            let exec_seq = row.i64(2)? as i32;
+            let segment = row.text(3)?;
+            Ok(match row.opt_text(4)? {
+                Some(node_id) => CairnResource::TaskTerminal {
+                    project,
+                    number,
+                    exec_seq,
+                    node_id,
+                    task_name: segment,
+                    slug,
+                },
+                None => CairnResource::NodeTerminal {
+                    project,
+                    number,
+                    exec_seq,
+                    node_id: segment,
+                    slug,
+                },
+            })
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn terminal_resource_for_project(
+    db: &LocalDb,
+    project_id: &str,
+    slug: String,
+) -> Result<CairnResource, String> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        let slug = slug.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT key FROM projects WHERE id = ?1 LIMIT 1",
+                    (project_id.as_str(),),
+                )
+                .await?;
+            let row = rows.next().await?.ok_or_else(|| {
+                crate::storage::DbError::Row(format!("Project not found: {project_id}"))
+            })?;
+            Ok(CairnResource::ProjectTerminal {
+                project: row.text(0)?,
+                slug,
+            })
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn create_interactive_terminal_from_resource(
+    orch: &Orchestrator,
+    resource: CairnResource,
+    initial_command: Option<String>,
+    title: String,
+    shell: Option<String>,
+    size: LifetimePtySize,
+) -> Result<String, String> {
+    let started_at = std::time::Instant::now();
+    let target = resolve_terminal_resource_target(&orch.db.local, &resource)
+        .await
+        .map_err(|error| error.to_string())?;
+    let resolution_ms = started_at.elapsed().as_millis();
+    ensure_terminal_slug_available(&orch.db.local, &target)
+        .await
+        .map_err(|error| error.to_string())?;
+    let lease_started_at = std::time::Instant::now();
+    let target = materialize_terminal_lease(orch, target).await?;
+    let lease_ms = lease_started_at.elapsed().as_millis();
+    let spawn_started_at = std::time::Instant::now();
+    let session_id = spawn_terminal_session(
+        orch,
+        resource,
+        target,
+        initial_command.unwrap_or_default(),
+        None,
+        false,
+        shell,
+        size,
+    )
+    .await?;
+    let spawn_ms = spawn_started_at.elapsed().as_millis();
+    let session = session_id.clone();
+    orch.db
+        .local
+        .write(|conn| {
+            let session = session.clone();
+            let title = title.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE job_terminals SET title = ?1 WHERE session_id = ?2",
+                    (title.as_str(), session.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let total_ms = started_at.elapsed().as_millis();
+    if total_ms >= 2_000 {
+        tracing::warn!(
+            total_ms,
+            resolution_ms,
+            lease_ms,
+            spawn_ms,
+            "interactive terminal creation was slow"
+        );
+    }
+    Ok(session_id)
+}
+
+async fn materialize_terminal_lease(
+    orch: &Orchestrator,
+    mut target: TerminalResourceTarget,
+) -> Result<TerminalResourceTarget, String> {
+    let (lease_id, owner, request) = terminal_lease_acquisition(orch, &target).await?;
+    // The freshly resolved bookmark tip lives in the declaration before the fleet's
+    // idempotent route resolution can overwrite initial_base_commit with a reused
+    // lease's pinned commit. Capture it now so the residency gate below refreshes to
+    // the true current head, not the pinned identity commit.
+    let resolved_tip = request.declaration.initial_base_commit.clone();
+    // Job terminals run in a managed cell (a resolved job branch); project/user
+    // terminals run in the externally owned live checkout (ExistingCheckout), which
+    // is at HEAD by definition and needs no residency gate.
+    let job_terminal = target.branch.is_some();
+    let result = orch
+        .fleet
+        .operate_lifetime_lease(orch, LifetimeLeaseOperation::Acquire { request })
+        .await;
+    let LifetimeLeaseResult::State { cell } = result else {
+        return Err(format!("failed to acquire terminal lease: {result:?}"));
+    };
+    let fence = {
+        let lease = cell
+            .occupant
+            .as_ref()
+            .and_then(CellOccupant::lifetime)
+            .ok_or_else(|| {
+                "terminal lease acquisition returned no lifetime occupant".to_string()
+            })?;
+        LifetimeLeaseFence {
+            lease_id,
+            owner,
+            incarnation_id: lease.incarnation_id.clone(),
+            lease_epoch: cell.lease_epoch,
+        }
+    };
+    let cwd = cell.path;
+    if job_terminal {
+        // Force the managed checkout to the current bookmark tip before the shell
+        // spawns. The executor judges currency against the actual checkout HEAD and
+        // is the residency authority, so send unconditionally and let it self-heal a
+        // lease whose recorded base lies. Fail closed: release the freshly acquired
+        // lease so no stale terminal is left behind.
+        if let Err(error) = ensure_terminal_checkout_current(orch, &fence, &resolved_tip).await {
+            let _ = orch
+                .fleet
+                .operate_lifetime_lease(
+                    orch,
+                    LifetimeLeaseOperation::Release {
+                        fence: fence.clone(),
+                    },
+                )
+                .await;
+            return Err(error);
+        }
+    }
+    target.cwd = cwd;
+    target.lease = Some(fence);
+    Ok(target)
+}
+
+/// Force a job terminal's managed checkout to `tip` before its shell spawns. The
+/// fleet pins a reused lease route to its originally declared commit for lease
+/// identity, and the executor never re-materializes an idle cell beyond the acquire
+/// binding, so without this gate a reconnected or reacquired terminal can run
+/// against stale source. The executor is the residency authority (it judges the
+/// request against the actual checkout HEAD); any failure propagates so terminal
+/// creation aborts before the shell spawns and before a running row is inserted.
+async fn ensure_terminal_checkout_current(
+    orch: &Orchestrator,
+    fence: &LifetimeLeaseFence,
+    tip: &str,
+) -> Result<(), String> {
+    let result = orch
+        .fleet
+        .operate_lifetime_lease(
+            orch,
+            LifetimeLeaseOperation::RefreshCheckout {
+                fence: fence.clone(),
+                base_commit: tip.to_string(),
+            },
+        )
+        .await;
+    match result {
+        LifetimeLeaseResult::State { .. } => Ok(()),
+        other => Err(format!(
+            "failed to refresh terminal checkout to {tip}: {other:?}"
+        )),
+    }
+}
+
+/// Resolve the current committed tip of a job terminal's managed branch. Returns
+/// `None` for project/user terminals (no branch), which run in the live checkout
+/// and skip the residency gate.
+async fn resolve_job_terminal_tip(
+    orch: &Orchestrator,
+    target: &TerminalResourceTarget,
+) -> Result<Option<String>, String> {
+    let Some(branch) = target.branch.clone() else {
+        return Ok(None);
+    };
+    let repo_path = target.repo_path.clone();
+    let jj_binary_path = orch.jj_binary_path.clone();
+    let config_dir = orch.config_dir.clone();
+    let tip = tokio::task::spawn_blocking(move || {
+        let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+        let store = crate::jj::project_store_dir(&config_dir, std::path::Path::new(&repo_path));
+        crate::jj::bookmark_commit(&jj, &store, &branch).ok_or_else(|| {
+            format!("agent terminal branch `{branch}` does not resolve to a committed head")
+        })
+    })
+    .await
+    .map_err(|error| format!("terminal branch resolution task failed: {error}"))??;
+    Ok(Some(tip))
+}
+
+async fn terminal_lease_acquisition(
+    orch: &Orchestrator,
+    target: &TerminalResourceTarget,
+) -> Result<(String, LifetimeLeaseOwner, LifetimeLeaseAcquireRequest), String> {
+    let owner_id = target
+        .job_id
+        .clone()
+        .unwrap_or_else(|| target.project_id.clone());
+    let branch = target.branch.clone();
+    let repo_path = target.repo_path.clone();
+    let project_id = target.project_id.clone();
+    let jj_binary_path = orch.jj_binary_path.clone();
+    let config_dir = orch.config_dir.clone();
+    let job_terminal = target.job_id.is_some();
+    let (repository, base_commit, purpose) = tokio::task::spawn_blocking(move || {
+        if let Some(branch) = branch {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            let store = crate::jj::project_store_dir(&config_dir, std::path::Path::new(&repo_path));
+            let base_commit =
+                crate::jj::bookmark_commit(&jj, &store, &branch).ok_or_else(|| {
+                    format!("agent terminal branch `{branch}` does not resolve to a committed head")
+                })?;
+            Ok((
+                RepositoryLocator::ColocatedPath {
+                    project_id: project_id.clone(),
+                    repository_id: project_id.clone(),
+                    absolute_path: repo_path.clone(),
+                },
+                base_commit,
+                "agent terminals".to_string(),
+            ))
+        } else {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo_path)
+                .output()
+                .map_err(|error| format!("resolve project checkout head: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "resolve project checkout head: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok((
+                RepositoryLocator::ExistingCheckout {
+                    project_id: project_id.clone(),
+                    repository_id: project_id,
+                    absolute_path: repo_path,
+                },
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                if job_terminal {
+                    "agent terminals".to_string()
+                } else {
+                    "project terminals".to_string()
+                },
+            ))
+        }
+    })
+    .await
+    .map_err(|error| format!("terminal VCS resolution task failed: {error}"))??;
+    let disk_growth_bytes = if matches!(repository, RepositoryLocator::ExistingCheckout { .. }) {
+        0
+    } else {
+        1024 * 1024 * 1024
+    };
+    let owner = LifetimeLeaseOwner {
+        kind: LifetimeLeaseOwnerKind::Terminal,
+        owner_id: owner_id.clone(),
+    };
+    let lease_id = format!("terminal:{owner_id}");
+    let request = LifetimeLeaseAcquireRequest {
+        declaration: LifetimeLeaseDeclaration {
+            lease_id: lease_id.clone(),
+            owner: owner.clone(),
+            owner_ref: target.owner_ref.clone(),
+            name: "terminals".to_string(),
+            purpose,
+            repository,
+            initial_base_commit: base_commit,
+            resource_reservation: ResourceReservation {
+                memory_bytes: 64 * 1024 * 1024,
+                disk_growth_bytes,
+                // The executor rejects lifetime leases declaring zero concurrency
+                // units (InvalidDeclaration), so a terminal must reserve one.
+                concurrency_units: 1,
+                source: ResourceReservationSource::Declared,
+            },
+            owner_death_policy: LifetimeOwnerDeathPolicy {
+                heartbeat_timeout_ms: crate::terminal_host::TERMINAL_HEARTBEAT_TIMEOUT_MS,
+                reclaim_grace_ms: crate::terminal_host::TERMINAL_RECLAIM_GRACE_MS,
+            },
+        },
+        priority: CellPriority::AgentInteractive,
+        deadline_unix_ms: SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+            + 30_000,
+    };
+    Ok((lease_id, owner, request))
 }
 
 /// PTY exit event payload (mirrors Tauri-side PtyExitPayload)
@@ -64,6 +1027,10 @@ struct TerminalResourceTarget {
     project_id: String,
     run_id: Option<String>,
     cwd: String,
+    branch: Option<String>,
+    repo_path: String,
+    owner_ref: Option<CellOwnerRef>,
+    lease: Option<LifetimeLeaseFence>,
 }
 
 async fn resolve_terminal_resource_target(
@@ -91,7 +1058,8 @@ async fn resolve_terminal_resource_target(
                     let mut rows = conn
                         .query(
                             "
-                            SELECT j.project_id, COALESCE(j.worktree_path, p.repo_path), r.id
+                            SELECT j.project_id, COALESCE(j.worktree_path, p.repo_path), r.id,
+                                   j.branch, p.repo_path
                             FROM jobs j
                             JOIN projects p ON j.project_id = p.id
                             LEFT JOIN runs r ON r.job_id = j.id
@@ -107,10 +1075,18 @@ async fn resolve_terminal_resource_target(
                     })?;
                     Ok(TerminalResourceTarget {
                         slug,
-                        job_id: Some(job_id),
+                        job_id: Some(job_id.clone()),
                         project_id: row.text(0)?,
                         cwd: row.text(1)?,
                         run_id: row.opt_text(2)?,
+                        branch: row.opt_text(3)?,
+                        repo_path: row.text(4)?,
+                        owner_ref: Some(CellOwnerRef {
+                            project_id: row.text(0)?, project_key: Some(project.clone()),
+                            issue_number: Some(number), job_id: Some(job_id.clone()),
+                            execution_seq: Some(exec_seq), node_kind: Some(node_id),
+                        }),
+                        lease: None,
                     })
                 }
                 CairnResource::TaskTerminal {
@@ -138,7 +1114,8 @@ async fn resolve_terminal_resource_target(
                     let mut rows = conn
                         .query(
                             "
-                            SELECT j.project_id, COALESCE(j.worktree_path, p.repo_path), r.id
+                            SELECT j.project_id, COALESCE(j.worktree_path, p.repo_path), r.id,
+                                   j.branch, p.repo_path
                             FROM jobs j
                             JOIN projects p ON j.project_id = p.id
                             LEFT JOIN runs r ON r.job_id = j.id
@@ -154,10 +1131,21 @@ async fn resolve_terminal_resource_target(
                     })?;
                     Ok(TerminalResourceTarget {
                         slug,
-                        job_id: Some(job_id),
+                        job_id: Some(job_id.clone()),
                         project_id: row.text(0)?,
                         cwd: row.text(1)?,
                         run_id: row.opt_text(2)?,
+                        branch: row.opt_text(3)?,
+                        repo_path: row.text(4)?,
+                        owner_ref: Some(CellOwnerRef {
+                            project_id: row.text(0)?,
+                            project_key: Some(project.clone()),
+                            issue_number: Some(number),
+                            job_id: Some(job_id.clone()),
+                            execution_seq: Some(exec_seq),
+                            node_kind: Some(task_name),
+                        }),
+                        lease: None,
                     })
                 }
                 CairnResource::ProjectTerminal { project, slug } => {
@@ -177,6 +1165,10 @@ async fn resolve_terminal_resource_target(
                         project_id: row.text(0)?,
                         cwd: row.text(1)?,
                         run_id: None,
+                        branch: None,
+                        repo_path: row.text(1)?,
+                        owner_ref: None,
+                        lease: None,
                     })
                 }
                 _ => Err(crate::storage::DbError::Row(
@@ -232,6 +1224,7 @@ async fn insert_terminal_resource(
     let session_id = session_id.to_string();
     let command = command.to_string();
     let description = description.map(ToOwned::to_owned);
+    let lease = target.lease.clone();
 
     db.write(|conn| {
         let job_id = job_id.clone();
@@ -241,6 +1234,7 @@ async fn insert_terminal_resource(
         let session_id = session_id.clone();
         let command = command.clone();
         let description = description.clone();
+        let lease = lease.clone();
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp() as i32;
             let id = Uuid::new_v4().to_string();
@@ -267,11 +1261,12 @@ async fn insert_terminal_resource(
                 "
                 INSERT INTO job_terminals (
                     id, job_id, project_id, run_id, session_id, command, title,
-                    description, status, exit_code, created_at, exited_at, slug
+                    description, status, exit_code, created_at, exited_at, slug,
+                    lease_id, lease_incarnation_id, lease_epoch
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'running', NULL, ?8, NULL, ?9)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'running', NULL, ?8, NULL, ?9, ?10, ?11, ?12)
                 ",
-                (
+                params![
                     id.as_str(),
                     job_id.as_deref(),
                     if job_id.is_some() {
@@ -285,51 +1280,12 @@ async fn insert_terminal_resource(
                     description.as_deref(),
                     now,
                     slug.as_str(),
-                ),
+                    lease.as_ref().map(|fence| fence.lease_id.as_str()),
+                    lease.as_ref().map(|fence| fence.incarnation_id.as_str()),
+                    lease.as_ref().map(|fence| fence.lease_epoch as i64),
+                ],
             )
             .await?;
-            Ok(())
-        })
-    })
-    .await
-}
-
-async fn update_terminal_resource_session(
-    db: &LocalDb,
-    target: &TerminalResourceTarget,
-    session_id: &str,
-) -> DbResult<()> {
-    let job_id = target.job_id.clone();
-    let project_id = target.project_id.clone();
-    let slug = target.slug.clone();
-    let session_id = session_id.to_string();
-    db.write(|conn| {
-        let job_id = job_id.clone();
-        let project_id = project_id.clone();
-        let slug = slug.clone();
-        let session_id = session_id.clone();
-        Box::pin(async move {
-            if let Some(job_id) = job_id {
-                conn.execute(
-                    "
-                    UPDATE job_terminals
-                    SET session_id = ?3, status = 'running', exit_code = NULL, exited_at = NULL
-                    WHERE job_id = ?1 AND slug = ?2
-                    ",
-                    (job_id.as_str(), slug.as_str(), session_id.as_str()),
-                )
-                .await?;
-            } else {
-                conn.execute(
-                    "
-                    UPDATE job_terminals
-                    SET session_id = ?3, status = 'running', exit_code = NULL, exited_at = NULL
-                    WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2
-                    ",
-                    (project_id.as_str(), slug.as_str(), session_id.as_str()),
-                )
-                .await?;
-            }
             Ok(())
         })
     })
@@ -623,6 +1579,7 @@ pub(crate) async fn subscribe_terminal_exit_wake_once(
     slug: &str,
     uri: &str,
     row: Option<&TerminalWakeRow>,
+    session_id: Option<&str>,
     created_by: &str,
 ) -> Result<TerminalWakeSubscriptionOutcome, String> {
     // Store the canonical terminal URI as the source ref, not the bare slug:
@@ -639,15 +1596,39 @@ pub(crate) async fn subscribe_terminal_exit_wake_once(
     )
     .await?;
 
-    if let Some(row) = row.filter(|row| row.status == "exited") {
-        let runtime_secs = row.exited_at.map(|exited| (exited - row.created_at).max(0));
+    // Re-read status AFTER persisting the subscription to close the spawn/persist
+    // race: a process that exits before this persist routes its exit wake with no
+    // subscriber (dropped), and the pre-persist `row` still reads `running`. Since
+    // finalize commits `status='exited'` before routing the exit wake, a fresh
+    // read here observes that exit and re-routes it, so the agent is never
+    // stranded when the process dies before the subscription exists.
+    //
+    // Propagate a read failure rather than swallowing it: when the exit already
+    // fired and was dropped before the subscription persisted, this read is the
+    // only recovery path, so treating an error as "still running" would report
+    // an active wake that no future exit event will ever satisfy. Surfacing the
+    // error lets the caller tell the agent to subscribe manually instead.
+    let fresh = match session_id {
+        Some(session_id) => lookup_terminal_for_wake_by_session_id(&orch.db.local, session_id)
+            .await
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    let exited = fresh
+        .as_ref()
+        .filter(|row| row.status == "exited")
+        .or_else(|| row.filter(|row| row.status == "exited"));
+    if let Some(exit_row) = exited {
+        let runtime_secs = exit_row
+            .exited_at
+            .map(|exited| (exited - exit_row.created_at).max(0));
         crate::orchestrator::wakes::route_terminal_exit_async(
             orch,
             slug,
             uri,
-            row.exit_code,
+            exit_row.exit_code,
             runtime_secs,
-            row.output_tail.as_deref(),
+            exit_row.output_tail.as_deref(),
         )
         .await?;
         Ok(TerminalWakeSubscriptionOutcome::ExitAlreadyQueued)
@@ -679,15 +1660,39 @@ pub(crate) async fn subscribe_terminal_output_wake_once(
     )
     .await?;
 
-    if let Some(row) = row.filter(|row| row.status == "exited") {
-        let runtime_secs = row.exited_at.map(|exited| (exited - row.created_at).max(0));
+    // Re-read the terminal's status AFTER persisting the subscription to close a
+    // spawn/persist race: a process that exits between the PTY start and this
+    // persist routes its exit wake before any subscriber exists (dropped), and
+    // the pre-persist `row` snapshot still reads `running`. Because finalize
+    // commits `status='exited'` before routing the exit wake, a fresh read here
+    // is guaranteed to observe that exit, so we re-route it and the agent waiting
+    // on a phrase is never stranded when the build dies before the phrase prints.
+    //
+    // Propagate a read failure rather than swallowing it: this read is the sole
+    // recovery path when the exit fired and was dropped before the subscription
+    // persisted, so treating an error as "still running" would falsely report an
+    // active output wake that no future exit event will satisfy.
+    let fresh = match session_id {
+        Some(session_id) => lookup_terminal_for_wake_by_session_id(&orch.db.local, session_id)
+            .await
+            .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    let exited = fresh
+        .as_ref()
+        .filter(|row| row.status == "exited")
+        .or_else(|| row.filter(|row| row.status == "exited"));
+    if let Some(exit_row) = exited {
+        let runtime_secs = exit_row
+            .exited_at
+            .map(|exited| (exited - exit_row.created_at).max(0));
         crate::orchestrator::wakes::route_terminal_exit_async(
             orch,
             slug,
             uri,
-            row.exit_code,
+            exit_row.exit_code,
             runtime_secs,
-            row.output_tail.as_deref(),
+            exit_row.output_tail.as_deref(),
         )
         .await?;
         return Ok(TerminalWakeSubscriptionOutcome::ExitAlreadyQueued);
@@ -739,12 +1744,31 @@ async fn terminal_slug_taken_any(db: &LocalDb, target: &TerminalResourceTarget) 
     .await
 }
 
-fn block_on_background_db<T>(fut: impl std::future::Future<Output = DbResult<T>>) -> DbResult<T> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(crate::storage::DbError::from)?
-        .block_on(fut)
+fn block_on_background_db<T, F>(fut: F) -> DbResult<T>
+where
+    T: Send,
+    F: std::future::Future<Output = DbResult<T>> + Send,
+{
+    let run = move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(crate::storage::DbError::from)?
+            .block_on(fut)
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Lifetime events are delivered from the runner's Tokio transport.
+        // A nested runtime would panic there, so cross a real thread boundary
+        // while preserving the finalizer's synchronous exactly-once contract.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(run)
+                .join()
+                .map_err(|_| crate::storage::DbError::Row("terminal finalizer panicked".into()))?
+        })
+    } else {
+        run()
+    }
 }
 
 /// Context loaded while marking a terminal exited: the row's `created_at` (for
@@ -970,118 +1994,190 @@ async fn lookup_terminal_session_id_for_target(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn promote_to_terminal(
+pub(crate) async fn activate_promoted_executor_terminal(
     orch: &Orchestrator,
     ctx: &super::RunContext,
-    cwd: &str,
+    fence: LifetimeLeaseFence,
+    process_key: String,
     command: &str,
-    child: Arc<Mutex<Box<dyn crate::services::ChildProcess>>>,
-    output_buffer: Arc<Mutex<VecDeque<u8>>>,
-    last_output_at: Option<Arc<Mutex<SystemTime>>>,
-    inline_command_id: &str,
-) -> Result<PromotedTerminal, String> {
+    output: Vec<u8>,
+    process_generation: u64,
+) -> Result<cairn_common::executor_protocol::PromotedTerminalProcess, String> {
     let mut target = TerminalResourceTarget {
         slug: String::new(),
         job_id: Some(ctx.job_id.clone()),
         project_id: ctx.project_id.clone(),
         run_id: Some(ctx.run_id.clone()),
-        cwd: cwd.to_string(),
+        cwd: String::new(),
+        branch: None,
+        repo_path: String::new(),
+        owner_ref: None,
+        lease: Some(fence.clone()),
     };
-
-    // Auto slug: run-1, run-2, ... until one is free in this job's scope.
-    let mut slug = String::new();
     for n in 1..=10_000 {
-        let candidate = format!("run-{n}");
-        target.slug = candidate.clone();
-        // Any-state check: an exited run slug stays taken so run numbers remain
-        // monotonic across promotions within a job.
+        target.slug = format!("run-{n}");
         if !terminal_slug_taken_any(&orch.db.local, &target)
             .await
             .unwrap_or(true)
         {
-            slug = candidate;
             break;
         }
     }
-    if slug.is_empty() {
-        return Err("could not allocate a terminal slug".to_string());
+    if target.slug.is_empty() {
+        return Err("could not allocate a promoted terminal slug".into());
     }
-
+    let uri = build_promoted_terminal_uri(orch, ctx, &target.slug).await;
     let session_id = ids::mint_session_id().into_string();
-    insert_terminal_resource(&orch.db.local, &target, &session_id, command, None)
-        .await
-        .map_err(|e| format!("Database error: {e}"))?;
-
-    // A pipe-backed session: no PTY master/writer (input/resize unavailable),
-    // while exit tracking and buffer reads work the same as any terminal.
-    let session = PtySession {
+    let event_process_key = process_key.clone();
+    let mut terminal_log = crate::scratch::TerminalLog::open(&ctx.job_id, &target.slug);
+    if let Some(log) = terminal_log.as_mut() {
+        // The executor snapshots every byte observed before adoption and sends
+        // later bytes as lifetime events. Persist the snapshot before installing
+        // the event handler so post-exit reads preserve the same exact boundary
+        // as the live ring buffer without duplicating either side.
+        log.append(&output);
+    }
+    let output_buffer = Arc::new(Mutex::new(VecDeque::from(output)));
+    let last_output_at = Arc::new(Mutex::new(SystemTime::now()));
+    let session = Arc::new(Mutex::new(PtySession {
         master: None,
         writer: None,
-        child: Box::new(crate::services::InlineTerminalChild::new(child.clone())),
+        lease: Some(crate::services::LeaseTerminalBinding {
+            fence: fence.clone(),
+            process_key,
+            process_generation,
+        }),
+        child: Box::new(crate::services::RemoteTerminalChild),
         output_buffer: Some(output_buffer.clone()),
         is_agent_spawned: true,
-        last_output_at,
-        // Agent/promoted sessions are non-interactive: no prompt markers, no busy signal.
+        last_output_at: Some(last_output_at.clone()),
         command_state: None,
-        // Promoted runs have no chunked read loop to scan; output phrase wakes
-        // are an agent-PTY-terminal feature only.
         output_watchers: None,
-    };
+    }));
+    orch.pty_state
+        .sessions
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(session_id.clone(), session.clone());
+    if let Err(error) =
+        insert_terminal_resource(&orch.db.local, &target, &session_id, command, None).await
     {
-        let mut sessions = orch
-            .pty_state
+        orch.pty_state
             .sessions
             .lock()
-            .map_err(|e| format!("Failed to store session: {e}"))?;
-        sessions.insert(session_id.clone(), Arc::new(Mutex::new(session)));
+            .ok()
+            .map(|mut sessions| sessions.remove(&session_id));
+        return Err(format!("Database error: {error}"));
     }
-
-    // Ownership of the process has moved to the terminal; stop the inline
-    // interrupt bookkeeping for it.
-    orch.pty_state
-        .unregister_inline_command(&ctx.run_id, inline_command_id);
-
-    // Round-trips for a top-level node; a sub-task job still gets a readable,
-    // killable terminal via the UI and job teardown.
-    let uri = build_promoted_terminal_uri(orch, ctx, &slug).await;
-
-    let wake_subscribed = subscribe_promoted_terminal_exit_wake(orch, &ctx.job_id, &uri).await;
-
-    // Promoted-process exit watcher: block on the inline child, then run the same
-    // finalization a PTY terminal does on EOF. Plain OS thread, so the blocking
-    // wait and `block_on_background_db` inside finalize are safe.
+    if !orch
+        .pty_state
+        .lifetime_subscription_installed
+        .swap(true, Ordering::SeqCst)
     {
-        let orch_t = orch.clone();
-        let job_id = ctx.job_id.clone();
-        let command_t = command.to_string();
-        let buffer_t = output_buffer.clone();
-        let watch_child = child.clone();
-        let sid = session_id.clone();
-        let process_ref = slug.clone();
-        let detail_uri = uri.clone();
-        thread::spawn(move || {
-            let mut tc = crate::services::InlineTerminalChild::new(watch_child);
-            let _ = tc.wait();
-            let exit_code = tc.try_wait_exit();
-            finalize_terminal_session(
-                &orch_t,
-                &sid,
-                exit_code,
-                &buffer_t,
-                &command_t,
-                Some(job_id),
-                &process_ref,
-                &detail_uri,
-            );
+        let state = orch.pty_state.clone();
+        orch.fleet.subscribe_lifetime_process_events(move |event| {
+            let handler = state.lifetime_handlers.lock().ok().and_then(|handlers| {
+                handlers
+                    .get(&(event.lease_id.clone(), event.process_key.clone()))
+                    .cloned()
+            });
+            if let Some(handler) = handler {
+                handler(event);
+            }
         });
     }
+    let terminal_log = Arc::new(Mutex::new(terminal_log));
+    let event_orch = orch.clone();
+    let event_sid = session_id.clone();
+    let event_fence = fence.clone();
+    let event_buffer = output_buffer.clone();
+    let event_last = last_output_at.clone();
+    let event_command = command.to_string();
+    let event_job = ctx.job_id.clone();
+    let event_ref = target.slug.clone();
+    let event_uri = uri.clone();
+    let handler_process_key = event_process_key.clone();
+    let handler = Arc::new(move |event: LifetimeProcessEvent| {
+        if event.incarnation_id != event_fence.incarnation_id
+            || event.lease_epoch != event_fence.lease_epoch
+            || event.process_key != event_process_key
+            || event.process_generation != process_generation
+        {
+            return;
+        }
+        match event.event {
+            LifetimeProcessEventKind::Output { data, .. } => {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                emit_terminal_data(
+                    &*event_orch.services.emitter,
+                    &event_sid,
+                    &text,
+                    &event_buffer,
+                    &terminal_log,
+                );
+                if let Ok(mut last) = event_last.lock() {
+                    *last = SystemTime::now();
+                }
+            }
+            LifetimeProcessEventKind::State {
+                status: LifetimeProcessStatus::Exited { exit_code, .. },
+            } => {
+                finalize_terminal_session(
+                    &event_orch,
+                    &event_sid,
+                    exit_code,
+                    &event_buffer,
+                    &event_command,
+                    Some(event_job.clone()),
+                    &event_ref,
+                    &event_uri,
+                );
+                if let Ok(mut handlers) = event_orch.pty_state.lifetime_handlers.lock() {
+                    handlers.remove(&(event_fence.lease_id.clone(), event_process_key.clone()));
+                }
+            }
+            _ => {}
+        }
+    });
+    orch.pty_state
+        .lifetime_handlers
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert((fence.lease_id.clone(), handler_process_key), handler);
 
-    // Surface the new terminal to the UI.
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "job_terminals", "action": "update"}),
-    );
+    let heartbeat_orch = orch.clone();
+    let heartbeat_session = session_id.clone();
+    let heartbeat_fence = fence.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let still_bound = heartbeat_orch
+                .pty_state
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|sessions| sessions.get(&heartbeat_session).cloned())
+                .is_some();
+            if !still_bound {
+                break;
+            }
+            let renewed = heartbeat_orch
+                .fleet
+                .operate_lifetime_lease(
+                    &heartbeat_orch,
+                    LifetimeLeaseOperation::Renew {
+                        fence: heartbeat_fence.clone(),
+                    },
+                )
+                .await;
+            if !matches!(renewed, LifetimeLeaseResult::State { .. }) {
+                break;
+            }
+        }
+    });
+    let wake_subscribed = subscribe_promoted_terminal_exit_wake(orch, &ctx.job_id, &uri).await;
     let _ = orch.services.emitter.emit(
         "agent-terminal-created",
         serde_json::to_value(AgentTerminalCreatedPayload {
@@ -1092,9 +2188,9 @@ pub(super) async fn promote_to_terminal(
         })
         .unwrap_or_default(),
     );
-
-    Ok(PromotedTerminal {
-        slug,
+    Ok(cairn_common::executor_protocol::PromotedTerminalProcess {
+        fence,
+        slug: target.slug,
         uri,
         wake_subscribed,
     })
@@ -1105,8 +2201,16 @@ async fn subscribe_promoted_terminal_exit_wake(
     job_id: &str,
     terminal_uri: &str,
 ) -> bool {
-    match subscribe_terminal_exit_wake_once(orch, job_id, terminal_uri, terminal_uri, None, "agent")
-        .await
+    match subscribe_terminal_exit_wake_once(
+        orch,
+        job_id,
+        terminal_uri,
+        terminal_uri,
+        None,
+        None,
+        "agent",
+    )
+    .await
     {
         Ok(_) => true,
         Err(error) => {
@@ -1253,219 +2357,24 @@ fn finalize_terminal_session(
 
 /// Exit code recorded for a terminal we intentionally killed: the SIGKILL
 /// convention (128 + 9). A killed-mid-run command must never read as success.
-const KILLED_EXIT_CODE: i32 = 137;
-
 /// The fields finalize-by-session needs from a `job_terminals` row.
-struct TerminalFinalizeRow {
-    status: String,
-    job_id: Option<String>,
-    project_id: Option<String>,
-    slug: Option<String>,
-    command: String,
-}
-
-async fn load_terminal_finalize_row(
-    db: &LocalDb,
-    session_id: &str,
-) -> DbResult<Option<TerminalFinalizeRow>> {
-    let session_id = session_id.to_string();
-    db.query_opt(
-        "SELECT status, job_id, project_id, slug, command
-         FROM job_terminals WHERE session_id = ?1 LIMIT 1",
-        params![session_id.as_str()],
-        |row| {
-            Ok(TerminalFinalizeRow {
-                status: row.text(0)?,
-                job_id: row.opt_text(1)?,
-                project_id: row.opt_text(2)?,
-                slug: row.opt_text(3)?,
-                command: row.text(4)?,
-            })
-        },
-    )
-    .await
-}
-
-/// Reconstruct a terminal's canonical detail URI from its row. Mirrors
-/// `build_promoted_terminal_uri` and the subscribe path (`dispatch.rs`) so the
-/// `terminal_exit` wake's match key matches what a subscriber stored, without a
-/// stored-URI column: job-owned with a resolvable issue/exec/node → node URI;
-/// otherwise the project URI.
-async fn build_terminal_detail_uri(
-    orch: &Orchestrator,
-    job_id: Option<&str>,
-    project_id: Option<&str>,
-    slug: &str,
-) -> String {
-    if let Some(job_id) = job_id {
-        if let Some((project_key, number, exec_seq)) =
-            load_job_uri_parts(&orch.db.local, job_id).await
-        {
-            if let Some(parent_segment) =
-                crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, job_id).await
-            {
-                if let Some(task_segment) =
-                    crate::jobs::queries::task_uri_segment_for_job(&orch.db.local, job_id).await
-                {
-                    return cairn_common::uri::build_task_terminal_uri(
-                        &project_key,
-                        number,
-                        exec_seq,
-                        &parent_segment,
-                        &task_segment,
-                        slug,
-                    );
-                }
-            }
-            if let Some(segment) =
-                crate::jobs::queries::node_uri_segment_for_job(&orch.db.local, job_id).await
-            {
-                return cairn_common::uri::build_node_terminal_uri(
-                    &project_key,
-                    number,
-                    exec_seq,
-                    &segment,
-                    slug,
-                );
-            }
-            return cairn_common::uri::build_project_terminal_uri(&project_key, slug);
-        }
-    }
-    if let Some(project_id) = project_id {
-        if let Some(project_key) = load_project_key(&orch.db.local, project_id).await {
-            return cairn_common::uri::build_project_terminal_uri(&project_key, slug);
-        }
-    }
-    cairn_common::uri::build_project_terminal_uri(project_id.unwrap_or_default(), slug)
-}
-
-async fn load_job_uri_parts(db: &LocalDb, job_id: &str) -> Option<(String, i32, i32)> {
-    let job_id = job_id.to_string();
-    db.query_opt(
-        "SELECT p.key, i.number, e.seq
-         FROM jobs j
-         JOIN issues i ON i.id = j.issue_id
-         JOIN projects p ON p.id = i.project_id
-         LEFT JOIN executions e ON e.id = j.execution_id
-         WHERE j.id = ?1 LIMIT 1",
-        params![job_id.as_str()],
-        |row| Ok((row.text(0)?, row.i64(1)? as i32, row.opt_i64(2)?)),
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|(key, number, seq)| seq.map(|seq| (key, number, seq as i32)))
-}
-
-async fn load_project_key(db: &LocalDb, project_id: &str) -> Option<String> {
-    db.query_opt_text(
-        "SELECT key FROM projects WHERE id = ?1 LIMIT 1",
-        params![project_id.to_string()],
-    )
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Take a live session out of the PTY map, capture its buffer, kill the child,
-/// and derive an honest non-success exit code. `try_wait_exit` can report `0`
-/// (or `None`) for a signalled child — portable_pty drops the signal and std's
-/// `ExitStatus::code()` is `None` on signal death — so any zero/unknown is
-/// normalized to the SIGKILL convention. Neither the row's `exit_code` nor the
-/// wake message can then read as success for a killed terminal.
-fn take_and_kill_session(
-    pty_state: &crate::services::PtyState,
-    session_id: &str,
-) -> (Arc<Mutex<VecDeque<u8>>>, Option<i32>) {
-    let session_arc = pty_state
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|mut sessions| sessions.remove(session_id));
-    let empty = || Arc::new(Mutex::new(VecDeque::new()));
-    match session_arc {
-        Some(arc) => match arc.lock() {
-            Ok(mut session) => {
-                let buffer = session.output_buffer.clone().unwrap_or_else(empty);
-                let _ = session.child.kill();
-                let _ = session.child.wait();
-                let exit_code = session
-                    .child
-                    .try_wait_exit()
-                    .filter(|code| *code != 0)
-                    .or(Some(KILLED_EXIT_CODE));
-                (buffer, exit_code)
-            }
-            Err(_) => (empty(), Some(KILLED_EXIT_CODE)),
-        },
-        None => (empty(), Some(KILLED_EXIT_CODE)),
-    }
-}
-
-/// Converge an externally-triggered terminal end-of-life (UI tab close, resource
-/// "stop", session hard kill) on the single finalize sink: kill the live child,
-/// mark the row exited with an honest non-success code, route the exit wake, and
-/// retain the row. No-ops when the row is missing or already exited — the reader
-/// EOF that follows the kill hits the conditional UPDATE (0 rows) and no-ops too.
-/// Deletion is reserved for job teardown.
-///
-/// The work runs on a dedicated plain thread because finalize blocks on a fresh
-/// current-thread runtime, which panics on any thread that carries a tokio
-/// context (a `spawn_blocking` worker or a runtime thread). Callers come from
-/// both sync and async contexts, so this isolates uniformly. Async callers
-/// should still wrap the call in `spawn_blocking` so the join does not stall an
-/// executor worker.
+/// Stop an executor-hosted terminal from a synchronous lifecycle path. The
+/// executor's durable `ProcessExited` event remains the sole finalization source.
 pub fn finalize_terminal_by_session_id(
     orch: &Orchestrator,
     session_id: &str,
 ) -> Result<(), String> {
     let orch = orch.clone();
     let session_id = session_id.to_string();
-    std::thread::spawn(move || finalize_terminal_by_session_id_inner(&orch, &session_id))
-        .join()
-        .map_err(|_| "terminal finalize thread panicked".to_string())?
-}
-
-fn finalize_terminal_by_session_id_inner(
-    orch: &Orchestrator,
-    session_id: &str,
-) -> Result<(), String> {
-    let loaded = block_on_background_db(async {
-        let Some(row) = load_terminal_finalize_row(&orch.db.local, session_id).await? else {
-            return Ok(None);
-        };
-        if row.status != "running" {
-            return Ok(None);
-        }
-        let slug = row.slug.clone().unwrap_or_default();
-        let detail_uri = build_terminal_detail_uri(
-            orch,
-            row.job_id.as_deref(),
-            row.project_id.as_deref(),
-            &slug,
-        )
-        .await;
-        Ok(Some((row, detail_uri)))
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(stop_terminal_by_session(&orch, &session_id))
     })
-    .map_err(|e: crate::storage::DbError| e.to_string())?;
-
-    let Some((row, detail_uri)) = loaded else {
-        return Ok(());
-    };
-
-    let (buffer, exit_code) = take_and_kill_session(&orch.pty_state, session_id);
-    let process_ref = row.slug.as_deref().unwrap_or("terminal");
-    finalize_terminal_session(
-        orch,
-        session_id,
-        exit_code,
-        &buffer,
-        &row.command,
-        row.job_id.clone(),
-        process_ref,
-        &detail_uri,
-    );
-    Ok(())
+    .join()
+    .map_err(|_| "terminal finalize thread panicked".to_string())?
 }
 
 #[derive(Clone, Debug)]
@@ -1489,12 +2398,6 @@ pub(crate) enum TerminalWakeSubscriptionOutcome {
     OutputRegistered,
     OutputAlreadyQueued,
     OutputPersisted,
-}
-
-#[derive(Clone, Copy)]
-enum TerminalSpawnMode {
-    Create,
-    Respawn,
 }
 
 pub(crate) async fn create_terminal_from_resource(
@@ -1525,13 +2428,22 @@ pub(crate) async fn create_terminal_from_resource(
     ensure_terminal_slug_available(&orch.db.local, &target)
         .await
         .map_err(|e| e.to_string())?;
+    let target = materialize_terminal_lease(orch, target).await?;
+    let one_shot = matches!(wake, Some(TerminalWakeSpec::Exit));
     let session_id = spawn_terminal_session(
         orch,
         resource.clone(),
         target,
         command.to_string(),
         description.map(ToOwned::to_owned),
-        TerminalSpawnMode::Create,
+        one_shot,
+        None,
+        LifetimePtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
     )
     .await?;
 
@@ -1546,8 +2458,16 @@ pub(crate) async fn create_terminal_from_resource(
         .map_err(|error| error.to_string());
     let wake_result = match (row.as_ref(), &wake) {
         (Ok(row), TerminalWakeSpec::Exit) => {
-            subscribe_terminal_exit_wake_once(orch, &job_id, &slug, &uri, row.as_ref(), "agent")
-                .await
+            subscribe_terminal_exit_wake_once(
+                orch,
+                &job_id,
+                &slug,
+                &uri,
+                row.as_ref(),
+                Some(&session_id),
+                "agent",
+            )
+            .await
         }
         (Ok(row), TerminalWakeSpec::Output(phrase)) => {
             subscribe_terminal_output_wake_once(
@@ -1627,395 +2547,420 @@ fn resource_slug(resource: &CairnResource) -> String {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn spawn_terminal_session(
     orch: &Orchestrator,
     resource: CairnResource,
     target: TerminalResourceTarget,
     command: String,
     description: Option<String>,
-    mode: TerminalSpawnMode,
+    one_shot: bool,
+    shell: Option<String>,
+    size: LifetimePtySize,
 ) -> Result<String, String> {
-    let services = &orch.services;
-    let pty_state = &orch.pty_state;
-
-    let pair = services
-        .pty_factory
-        .create_pty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("Failed to create PTY: {e}"))?;
-
-    let shell_path = get_default_shell();
-
-    // Sandbox the interactive shell for worktree agents. On macOS the shell runs
-    // under `sandbox-exec`; on Linux Landlock needs a `pre_exec` hook and the PTY
-    // spawning backend does not expose one, so terminal async fence detection is
-    // macOS-only until PTY spawning can apply Landlock before exec.
-    let sandbox = build_run_sandbox_policy(
-        orch,
-        &target.cwd,
-        target.run_id.as_deref(),
-        Some(target.project_id.as_str()),
-        Some(&command),
-    )
-    .await;
-    let fence_mode = sandbox.as_ref().map(|(_, fence)| *fence);
-    let sandbox_applied = sandbox.is_some() && cfg!(target_os = "macos");
-    let sandbox_policy = sandbox.map(|(policy, _)| policy);
-    let (shell_program, shell_args): (String, Vec<String>) = match &sandbox_policy {
-        Some(policy) if cfg!(target_os = "macos") => sandbox::wrap_argv(&shell_path, &[], policy),
-        Some(_) => {
-            log::warn!(
-                "PTY terminal not OS-sandboxed on this platform (cwd={}); inline run is confined",
-                target.cwd
-            );
-            (shell_path.clone(), Vec::new())
-        }
-        None => (shell_path.clone(), Vec::new()),
-    };
-
-    let spawn_started = SystemTime::now();
-    let mut cmd = CommandBuilder::new(&shell_program);
-    for arg in &shell_args {
-        cmd.arg(arg);
-    }
-    cmd.cwd(&target.cwd);
-    for (key, value) in std::env::vars() {
-        cmd.env(key, value);
-    }
-    // Strip a host dev-instance's shared build-target routing so this worktree
-    // shell builds into its own target dir (CAIRN-2533).
-    scrub_dev_instance_routing_pty(&mut cmd);
-    cmd.env("PATH", crate::env::agent_shell_path());
-    apply_non_interactive_pager_env_to_pty(&mut cmd);
-    // Same jj-only worktree VCS env as the inline spawn path, applied to the PTY /
-    // background-terminal spawn too (the background-terminal regression hides if
-    // only the inline path is patched). Empty for a non-worktree cwd.
-    for (k, v) in crate::mcp::vcs::worktree_shell_vcs_env(orch, std::path::Path::new(&target.cwd)) {
-        cmd.env(k, v);
-    }
-    cmd.env("CAIRN_WORKTREE", &target.cwd);
-    cmd.env(
-        "CAIRN_CALLBACK_URL",
-        format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
-    );
-    // Shared per-home uv package cache (`<cairn_home>/uv-cache`); same rationale
-    // as the inline `run` path (warm shared cache in a fence-permitted location).
-    cmd.env("UV_CACHE_DIR", crate::env::uv_cache_dir());
-    if let Ok(secret) = orch.mcp_auth.get_secret_for_mcp() {
-        cmd.env("CAIRN_MCP_SECRET", secret);
-    }
-    if let Some(run_id) = target.run_id.as_deref() {
-        cmd.env("CAIRN_RUN_ID", run_id);
-    }
-    // Managed Build Services: the interactive PTY shell (e.g. the Dev terminal
-    // running `bun run build:cmd`) is fenced on macOS, so inject the build-
-    // service client env + CAIRN_SANDBOXED here too. The PTY path uses
-    // CommandBuilder, not the process spawner, so CAIRN_SANDBOXED is set
-    // explicitly rather than by `build_command`.
-    if sandbox_applied {
-        cmd.env("CAIRN_SANDBOXED", "1");
-        for (k, v) in orch.build_service_client_env(Some(std::path::Path::new(&target.cwd))) {
-            cmd.env(k, v);
-        }
+    let fence = target
+        .lease
+        .clone()
+        .ok_or("terminal directory has no lifetime lease")?;
+    if !orch
+        .pty_state
+        .lifetime_subscription_installed
+        .swap(true, Ordering::SeqCst)
+    {
+        let state = orch.pty_state.clone();
+        orch.fleet.subscribe_lifetime_process_events(move |event| {
+            let handler = state.lifetime_handlers.lock().ok().and_then(|handlers| {
+                handlers
+                    .get(&(event.lease_id.clone(), event.process_key.clone()))
+                    .cloned()
+            });
+            if let Some(handler) = handler {
+                handler(event);
+            }
+        });
     }
 
-    let components = pair
-        .spawn_and_split(cmd)
-        .map_err(|e| format!("Failed to spawn shell: {e}"))?;
-    let mut reader = components.reader;
-    let child_pid = components.child.process_id();
     let session_id = ids::mint_session_id().into_string();
-    let output_buffer: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let last_output_at: Arc<Mutex<SystemTime>> = Arc::new(Mutex::new(SystemTime::now()));
-    // Shared phrase-watcher registry: the read loop below scans output against it,
-    // and the wake-subscribe path registers watchers into the same `Arc` while the
-    // terminal runs.
-    let output_watchers: Arc<Mutex<Vec<crate::services::TerminalOutputWatcher>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let session = PtySession {
-        master: Some(components.master),
-        writer: Some(components.writer),
-        child: Box::new(crate::services::PortableTerminalChild::new(
-            components.child,
-        )),
+    let output_buffer = Arc::new(Mutex::new(VecDeque::new()));
+    let last_output_at = Arc::new(Mutex::new(SystemTime::now()));
+    let output_watchers = Arc::new(Mutex::new(Vec::new()));
+    let session = Arc::new(Mutex::new(PtySession {
+        master: None,
+        writer: None,
+        lease: Some(crate::services::LeaseTerminalBinding {
+            fence: fence.clone(),
+            process_key: session_id.clone(),
+            process_generation: 0,
+        }),
+        child: Box::new(crate::services::RemoteTerminalChild),
         output_buffer: Some(output_buffer.clone()),
         is_agent_spawned: true,
         last_output_at: Some(last_output_at.clone()),
-        // Agent terminals are non-interactive: no prompt markers, no busy signal.
         command_state: None,
         output_watchers: Some(output_watchers.clone()),
-    };
-    let session_arc = Arc::new(Mutex::new(session));
+    }));
+    let session_insert = orch
+        .pty_state
+        .sessions
+        .lock()
+        .map(|mut sessions| {
+            sessions.insert(session_id.clone(), session.clone());
+        })
+        .map_err(|error| error.to_string());
+    if let Err(error) = session_insert {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(error);
+    }
 
+    // The durable binding must predate handler registration and StartProcess.
+    // An executor may emit Exited before StartProcess returns; the finalizer
+    // therefore needs a running row to transition before any event can arrive.
+    if let Err(error) = insert_terminal_resource(
+        &orch.db.local,
+        &target,
+        &session_id,
+        &command,
+        description.as_deref(),
+    )
+    .await
     {
-        let mut sessions = pty_state
-            .sessions
-            .lock()
-            .map_err(|e| format!("Failed to store session: {e}"))?;
-        sessions.insert(session_id.clone(), session_arc.clone());
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(format!("Database error: {error}"));
     }
-
-    // Hydrate persisted output-phrase watchers for this terminal so an output
-    // wake is durable across sessions: a respawn (e.g. after a worktree-fence
-    // approval restarts the terminal) and a subscribe made while no session was
-    // live both re-attach their watchers here. The wake_subscriptions row is the
-    // source of truth; this in-memory list is only the per-session cache the
-    // read loop scans.
-    {
-        let detail_uri = resource.to_uri();
-        match crate::orchestrator::wakes::list_terminal_output_watchers(&orch.db.local, &detail_uri)
-            .await
-        {
-            Ok(persisted) if !persisted.is_empty() => {
-                if let Ok(mut guard) = output_watchers.lock() {
-                    for (subscription_id, watcher_job_id, phrase, terminal_uri) in persisted {
-                        guard.push(crate::services::TerminalOutputWatcher {
-                            subscription_id,
-                            job_id: watcher_job_id,
-                            phrase,
-                            carry: String::new(),
-                            terminal_uri,
-                        });
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                log::warn!("failed to hydrate terminal output watchers: {error}")
-            }
-        }
-    }
-
-    let db_result = match mode {
-        TerminalSpawnMode::Create => {
-            insert_terminal_resource(
-                &orch.db.local,
-                &target,
-                &session_id,
-                &command,
-                description.as_deref(),
-            )
-            .await
-        }
-        TerminalSpawnMode::Respawn => {
-            update_terminal_resource_session(&orch.db.local, &target, &session_id).await
-        }
-    };
-    if let Err(e) = db_result {
-        if let Ok(mut sessions) = pty_state.sessions.lock() {
-            sessions.remove(&session_id);
-        }
-        if let Ok(mut session) = session_arc.lock() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-        }
-        return Err(format!("Database error: {e}"));
-    }
-
-    let _ = services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "job_terminals", "action": "update"}),
-    );
-
-    let sid = session_id.clone();
-    let orch_t = orch.clone();
-    let emitter = services.emitter.clone();
-    let buffer = output_buffer.clone();
-    let last_output_thread = last_output_at.clone();
-    let job_id = target.job_id.clone();
-    let command_for_thread = command.clone();
-    let target_for_thread = target.clone();
-    let resource_for_thread = resource.clone();
-    let description_for_thread = description.clone();
-    let watchers_for_thread = output_watchers.clone();
-    let fence_handled = Arc::new(AtomicBool::new(false));
-    let suppress_cleanup = Arc::new(AtomicBool::new(false));
-    let fence_handled_thread = fence_handled.clone();
-    let suppress_cleanup_thread = suppress_cleanup.clone();
-
-    // Tee terminal output to a per-job scratch log so the full history survives
-    // past the 64KB in-memory ring buffer, both live and after exit. Shared so
-    // every writer of terminal output lands in it: the reader thread's PTY chunks
-    // AND the fence-prompt thread's synthetic Cairn messages. Because the tee
-    // lives inside `emit_terminal_data`, the log stays an exact mirror of the ring
-    // buffer (and thus `output_tail`), so a post-exit read shows what a live read
-    // displayed — fence denials and restart notices included, not just raw PTY
-    // bytes. Job-scoped agent terminals only; a project terminal (job_id None) has
-    // no log. Keyed by slug, so a fence respawn appends into one file separated by
-    // a session marker.
-    let terminal_log =
-        Arc::new(Mutex::new(target.job_id.as_deref().and_then(|job_id| {
-            crate::scratch::TerminalLog::open(job_id, &target.slug)
-        })));
-
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+    let heartbeat_orch = orch.clone();
+    let heartbeat_session = session_id.clone();
+    let heartbeat_fence = fence.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
         loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    if suppress_cleanup_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let exit_code = get_exit_code_from_session(&orch_t.pty_state, &sid);
-                    let process_ref = resource_slug(&resource_for_thread);
-                    let detail_uri = resource_for_thread.to_uri();
-                    finalize_terminal_session(
-                        &orch_t,
-                        &sid,
-                        exit_code,
-                        &buffer,
-                        &command_for_thread,
-                        job_id.clone(),
-                        &process_ref,
-                        &detail_uri,
-                    );
-                    break;
-                }
-                Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    emit_terminal_data(&*emitter, &sid, &data, &buffer, &terminal_log);
-                    if let Ok(mut last) = last_output_thread.lock() {
-                        *last = SystemTime::now();
-                    }
-                    crate::orchestrator::wakes::scan_and_route_terminal_output(
-                        &orch_t,
-                        &watchers_for_thread,
-                        &data,
-                    );
-                    if should_handle_terminal_denial(sandbox_applied, fence_mode, &data)
-                        && !fence_handled_thread.swap(true, Ordering::SeqCst)
-                    {
-                        let crossing =
-                            terminal_denial_crossing(child_pid, spawn_started, &command_for_thread);
-                        match fence_mode {
-                            Some(Fence::Deny) => {
-                                emit_terminal_data(
-                                    &*emitter,
-                                    &sid,
-                                    &format!(
-                                        "\r\nDenied by agent fence policy (fence: deny): {}\r\n",
-                                        crossing.summary
-                                    ),
-                                    &buffer,
-                                    &terminal_log,
-                                );
-                                suppress_cleanup_thread.store(true, Ordering::SeqCst);
-                                // Kill the denied process, then converge on
-                                // finalize so the row is marked exited (denied →
-                                // exit code unknown) and retained, not deleted.
-                                // The buffer is an independent Arc, so the tail
-                                // survives the session removal terminate performs.
-                                let process_ref = resource_slug(&resource_for_thread);
-                                let detail_uri = resource_for_thread.to_uri();
-                                terminate_pty_session(&orch_t, &sid);
-                                finalize_terminal_session(
-                                    &orch_t,
-                                    &sid,
-                                    None,
-                                    &buffer,
-                                    &command_for_thread,
-                                    job_id.clone(),
-                                    &process_ref,
-                                    &detail_uri,
-                                );
-                                break;
-                            }
-                            Some(Fence::Ask) => {
-                                emit_terminal_data(
-                                    &*emitter,
-                                    &sid,
-                                    "\r\nTerminal is waiting for worktree-fence approval. The command will restart if allowed for the session.\r\n",
-                                    &buffer,
-                                    &terminal_log,
-                                );
-                                suppress_cleanup_thread.store(true, Ordering::SeqCst);
-                                let orch_bg = orch_t.clone();
-                                let sid_bg = sid.clone();
-                                let buffer_bg = buffer.clone();
-                                let target_bg = target_for_thread.clone();
-                                let resource_bg = resource_for_thread.clone();
-                                let command_bg = command_for_thread.clone();
-                                let description_bg = description_for_thread.clone();
-                                let log_bg = terminal_log.clone();
-                                thread::spawn(move || {
-                                    handle_terminal_fence_prompt(
-                                        orch_bg,
-                                        sid_bg,
-                                        buffer_bg,
-                                        target_bg,
-                                        resource_bg,
-                                        command_bg,
-                                        description_bg,
-                                        crossing,
-                                        log_bg,
-                                    );
-                                });
-                                terminate_pty_session(&orch_t, &sid);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(e) => {
-                    if suppress_cleanup_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    log::error!("Agent PTY read error: {e}");
-                    // Converge on finalize (emits pty-exit, marks exited with
-                    // exit code unknown, routes the wake, drops the session)
-                    // rather than a bare delete.
-                    let process_ref = resource_slug(&resource_for_thread);
-                    let detail_uri = resource_for_thread.to_uri();
-                    finalize_terminal_session(
-                        &orch_t,
-                        &sid,
-                        None,
-                        &buffer,
-                        &command_for_thread,
-                        job_id.clone(),
-                        &process_ref,
-                        &detail_uri,
-                    );
-                    break;
-                }
+            interval.tick().await;
+            let still_bound = heartbeat_orch
+                .pty_state
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|sessions| sessions.get(&heartbeat_session).cloned())
+                .and_then(|session| session.lock().ok().and_then(|guard| guard.lease.clone()))
+                .is_some_and(|binding| binding.fence == heartbeat_fence);
+            if !still_bound {
+                break;
             }
-        }
-        // Flush on every end-of-life path (EOF, error, fence deny/ask) before the
-        // exit callback fires.
-        if let Ok(mut guard) = terminal_log.lock() {
-            if let Some(log) = guard.as_mut() {
-                log.flush();
+            let renewed = heartbeat_orch
+                .fleet
+                .operate_lifetime_lease(
+                    &heartbeat_orch,
+                    LifetimeLeaseOperation::Renew {
+                        fence: heartbeat_fence.clone(),
+                    },
+                )
+                .await;
+            if !matches!(renewed, LifetimeLeaseResult::State { .. }) {
+                tracing::warn!(
+                    lease_id = %heartbeat_fence.lease_id,
+                    result = ?renewed,
+                    "terminal lease heartbeat failed"
+                );
+                break;
             }
         }
     });
 
-    // Wrap so the shell exits with the command: EOF (which drives
-    // `finalize_terminal_session`) then coincides with command completion and the
-    // shell's exit code equals the command's. Respawn-after-fence-approval routes
-    // through this same site, so it stays consistent.
-    write_terminal_input_by_session(orch, &session_id, &submit_command_exiting_shell(&command))
-        .await?;
+    let detail_uri = resource.to_uri();
+    if let Ok(persisted) =
+        crate::orchestrator::wakes::list_terminal_output_watchers(&orch.db.local, &detail_uri).await
+    {
+        if let Ok(mut watchers) = output_watchers.lock() {
+            for (subscription_id, job_id, phrase, terminal_uri) in persisted {
+                watchers.push(crate::services::TerminalOutputWatcher {
+                    subscription_id,
+                    job_id,
+                    phrase,
+                    carry: String::new(),
+                    terminal_uri,
+                });
+            }
+        }
+    }
+    let terminal_log =
+        Arc::new(Mutex::new(target.job_id.as_deref().and_then(|job| {
+            crate::scratch::TerminalLog::open(job, &target.slug)
+        })));
+    let event_orch = orch.clone();
+    let event_sid = session_id.clone();
+    let event_fence = fence.clone();
+    let event_session = session.clone();
+    let event_buffer = output_buffer.clone();
+    let event_last = last_output_at.clone();
+    let event_watchers = output_watchers.clone();
+    let event_log = terminal_log.clone();
+    let event_command = command.clone();
+    let event_job = target.job_id.clone();
+    let event_process_ref = resource_slug(&resource);
+    let event_uri = detail_uri.clone();
+    let handler = Arc::new(move |event: LifetimeProcessEvent| {
+        if event.incarnation_id != event_fence.incarnation_id
+            || event.lease_epoch != event_fence.lease_epoch
+        {
+            return;
+        }
+        let matches = event_session
+            .lock()
+            .ok()
+            .and_then(|s| s.lease.as_ref().map(|l| l.process_generation))
+            .is_some_and(|generation| generation == 0 || generation == event.process_generation);
+        if !matches {
+            return;
+        }
+        match event.event {
+            LifetimeProcessEventKind::Output { data, .. } => {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                emit_terminal_data(
+                    &*event_orch.services.emitter,
+                    &event_sid,
+                    &text,
+                    &event_buffer,
+                    &event_log,
+                );
+                if let Ok(mut last) = event_last.lock() {
+                    *last = SystemTime::now();
+                }
+                crate::orchestrator::wakes::scan_and_route_terminal_output(
+                    &event_orch,
+                    &event_watchers,
+                    &text,
+                );
+            }
+            LifetimeProcessEventKind::State {
+                status:
+                    LifetimeProcessStatus::Exited {
+                        exit_code,
+                        executor_lost,
+                        ..
+                    },
+            } => {
+                if executor_lost {
+                    emit_terminal_data(&*event_orch.services.emitter, &event_sid,
+                            "\r\nExecutor disconnected; restart reuses the retained terminal lease.\r\n",
+                            &event_buffer, &event_log);
+                }
+                finalize_terminal_session(
+                    &event_orch,
+                    &event_sid,
+                    exit_code,
+                    &event_buffer,
+                    &event_command,
+                    event_job.clone(),
+                    &event_process_ref,
+                    &event_uri,
+                );
+                if let Ok(mut handlers) = event_orch.pty_state.lifetime_handlers.lock() {
+                    handlers.remove(&(event_fence.lease_id.clone(), event_sid.clone()));
+                }
+                let release_orch = event_orch.clone();
+                let release_binding = crate::services::LeaseTerminalBinding {
+                    fence: event_fence.clone(),
+                    process_key: event_sid.clone(),
+                    process_generation: event.process_generation,
+                };
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        release_terminal_process(&release_orch, &release_binding).await
+                    {
+                        tracing::warn!(process_key = %release_binding.process_key, %error, "failed to release settled terminal process");
+                    }
+                });
+            }
+            _ => {}
+        }
+    });
+    let handler_insert = orch
+        .pty_state
+        .lifetime_handlers
+        .lock()
+        .map(|mut handlers| {
+            handlers.insert((fence.lease_id.clone(), session_id.clone()), handler);
+        })
+        .map_err(|error| error.to_string());
+    if let Err(error) = handler_insert {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(error);
+    }
 
+    let mut env: Vec<(String, String)> = std::env::vars().collect();
+    env.push(("PATH".into(), crate::env::agent_shell_path()));
+    env.push(("CAIRN_WORKTREE".into(), target.cwd.clone()));
+    env.push((
+        "CAIRN_CALLBACK_URL".into(),
+        format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
+    ));
+    env.push((
+        "UV_CACHE_DIR".into(),
+        crate::env::uv_cache_dir().to_string_lossy().into_owned(),
+    ));
+    if let Ok(secret) = orch.mcp_auth.get_secret_for_mcp() {
+        env.push(("CAIRN_MCP_SECRET".into(), secret));
+    }
+    if let Some(run_id) = target.run_id.as_deref() {
+        env.push(("CAIRN_RUN_ID".into(), run_id.to_string()));
+    }
+    if let Some(branch) = target.branch.as_deref() {
+        // A job terminal's managed cell is a detached-HEAD checkout with no .jj
+        // markers, so branch-keyed tooling (bun dev:instance, bun run changelog)
+        // resolves the branch from this variable. Mirrors detached_route_env on
+        // the run path. Project terminals carry no branch and run in the live
+        // checkout, where git resolves the branch directly.
+        env.push(("CAIRN_WORKTREE_BRANCH".into(), branch.to_string()));
+    }
+    let resolved_sandbox = super::run::build_run_sandbox_policy(
+        orch,
+        &target.cwd,
+        target.run_id.as_deref(),
+        Some(&target.project_id),
+        (!command.is_empty()).then_some(command.as_str()),
+    )
+    .await;
+    let sandbox_mode = if resolved_sandbox.is_some() {
+        if target.branch.is_some() {
+            ProcessSandboxMode::Confined
+        } else {
+            ProcessSandboxMode::ReadOnlyCheckout
+        }
+    } else {
+        ProcessSandboxMode::Unconfined
+    };
+    let sandbox_policy = resolved_sandbox.map(|(policy, _)| LifetimeSandboxPolicy {
+        worktree: policy.worktree.to_string_lossy().into_owned(),
+        writable_extra: policy
+            .writable_extra
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        deny_read: policy
+            .deny_read
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        writable_regex: policy.writable_regex,
+        worktree_writable: policy.worktree_writable,
+    });
+    let program = shell.unwrap_or_else(get_default_shell);
+    let args = if one_shot {
+        if cfg!(windows) {
+            vec!["-Command".to_string(), command.clone()]
+        } else {
+            vec!["-c".to_string(), command.clone()]
+        }
+    } else {
+        Vec::new()
+    };
+    let result = orch
+        .fleet
+        .operate_lifetime_lease(
+            orch,
+            LifetimeLeaseOperation::StartProcess {
+                fence: fence.clone(),
+                process_key: session_id.clone(),
+                process: LifetimeProcessSpec {
+                    program,
+                    args,
+                    cwd: String::new(),
+                    cwd_root: cairn_common::executor_protocol::LifetimeProcessCwdRoot::Checkout,
+                    env,
+                    sandbox_mode,
+                    sandbox_policy,
+                    runtime_assets: Vec::new(),
+                    io: LifetimeProcessIoMode::Pty { size },
+                },
+            },
+        )
+        .await;
+    let LifetimeLeaseResult::State { cell } = result else {
+        let error = format!("failed to start terminal PTY: {result:?}");
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(error);
+    };
+    let Some(generation) = cell
+        .occupant
+        .as_ref()
+        .and_then(CellOccupant::lifetime)
+        .and_then(|lease| lease.processes.get(&session_id))
+        .map(|process| process.generation)
+    else {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err("terminal PTY start returned no process generation".to_string());
+    };
+    if let Ok(mut guard) = session.lock() {
+        if let Some(binding) = guard.lease.as_mut() {
+            binding.process_generation = generation;
+        }
+    }
+
+    if let Err(error) =
+        persist_terminal_process_generation(&orch.db.local, &target, generation).await
+    {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(format!("Database error: {error}"));
+    }
+    if !one_shot && !command.is_empty() {
+        let input = ensure_submitted_line(&command).into_owned();
+        if let Err(error) = write_terminal_input_by_session(orch, &session_id, &input).await {
+            rollback_terminal_creation(orch, &session_id, &fence).await;
+            return Err(error);
+        }
+    }
+
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "job_terminals", "action": "update"}),
+    );
     if let Some(run_id) = target.run_id.clone() {
-        let _ = services.emitter.emit(
+        let _ = orch.services.emitter.emit(
             "agent-terminal-created",
             serde_json::to_value(AgentTerminalCreatedPayload {
                 run_id,
                 session_id: session_id.clone(),
-                command: command.to_string(),
+                command,
                 description,
             })
             .unwrap_or_default(),
         );
     }
-
     Ok(session_id)
+}
+
+async fn persist_terminal_process_generation(
+    db: &LocalDb,
+    target: &TerminalResourceTarget,
+    generation: u64,
+) -> DbResult<()> {
+    let job_id = target.job_id.clone();
+    let project_id = target.project_id.clone();
+    let slug = target.slug.clone();
+    db.write(|conn| {
+        let job_id = job_id.clone();
+        let project_id = project_id.clone();
+        let slug = slug.clone();
+        Box::pin(async move {
+        let updated = if let Some(job_id) = job_id.as_deref() {
+            conn.execute(
+                "UPDATE job_terminals SET process_generation = ?1 WHERE job_id = ?2 AND slug = ?3",
+                params![generation as i64, job_id, slug.as_str()],
+            ).await?
+        } else {
+            conn.execute(
+                "UPDATE job_terminals SET process_generation = ?1 WHERE project_id = ?2 AND job_id IS NULL AND slug = ?3",
+                params![generation as i64, project_id.as_str(), slug.as_str()],
+            ).await?
+        };
+        if updated != 1 {
+            return Err(crate::storage::DbError::Row(format!(
+                "terminal generation binding disappeared for slug {slug}"
+            )));
+        }
+        Ok(())
+        })
+    }).await
 }
 
 fn emit_terminal_data(
@@ -2051,261 +2996,45 @@ fn emit_terminal_data(
     }
 }
 
-pub(super) fn should_handle_terminal_denial(
-    sandbox_applied: bool,
-    fence: Option<Fence>,
-    data: &str,
-) -> bool {
-    cfg!(target_os = "macos")
-        && sandbox_applied
-        && matches!(fence, Some(Fence::Ask | Fence::Deny))
-        && sandbox::has_denial_signature(data)
-}
-
-pub(super) fn terminal_denial_crossing(
-    child_pid: Option<u32>,
-    spawned_at: SystemTime,
-    command: &str,
-) -> crate::mcp::handlers::fence::Crossing {
-    use crate::mcp::handlers::fence::Crossing;
-    #[cfg(target_os = "macos")]
-    if let Some(path) = child_pid.and_then(|pid| sandbox::macos::detect_violation(pid, spawned_at))
-    {
-        return Crossing::shell_path(path.as_path(), &path.display().to_string());
-    }
-    let _ = (child_pid, spawned_at);
-    Crossing::shell_command(
-        format!("terminal command blocked by the worktree sandbox: {command}"),
-        command,
-    )
-}
-
-fn terminate_pty_session(orch: &Orchestrator, session_id: &str) {
-    let session_arc = orch
-        .pty_state
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|mut sessions| sessions.remove(session_id));
-    if let Some(session_arc) = session_arc {
-        if let Ok(mut session) = session_arc.lock() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_terminal_fence_prompt(
-    orch: Orchestrator,
-    old_session_id: String,
-    buffer: Arc<Mutex<VecDeque<u8>>>,
-    target: TerminalResourceTarget,
-    resource: CairnResource,
-    command: String,
-    description: Option<String>,
-    crossing: crate::mcp::handlers::fence::Crossing,
-    log: Arc<Mutex<Option<crate::scratch::TerminalLog>>>,
-) {
-    let Some(run_id) = target.run_id.clone() else {
-        return;
-    };
-    let request_id = match block_on_background_db(async {
-        let request = McpCallbackRequest {
-            thread_id: None,
-            cwd: target.cwd.clone(),
-            run_id: Some(run_id.clone()),
-            tool: "run".to_string(),
-            payload: serde_json::Value::Null,
-            tool_use_id: Some(format!("terminal-{}", old_session_id)),
-        };
-        let tool_input = serde_json::json!({
-            "kind": crossing.kind.tag(),
-            "verb": crossing.verb,
-            "descriptor": crossing.descriptor.clone(),
-            "summary": crossing.summary.clone(),
-            "request": request,
-            "origin": "terminal",
-        });
-        crate::mcp::handlers::permission::create_background_permission_request(
-            &orch,
-            &run_id,
-            &format!("terminal-{}", old_session_id),
-            crossing.verb,
-            &tool_input,
-        )
-        .await
-        .map_err(crate::storage::DbError::Row)
-    }) {
-        Ok(id) => id,
-        Err(e) => {
-            emit_terminal_data(
-                &*orch.services.emitter,
-                &old_session_id,
-                &format!("\r\nFailed to create worktree-fence permission request: {e}\r\n"),
-                &buffer,
-                &log,
-            );
-            return;
-        }
-    };
-
-    let mut rx = orch.permission_responses.subscribe();
-    let response = match block_on_background_db(async move {
-        loop {
-            match rx.recv().await {
-                Ok((resp_request_id, response_json)) if resp_request_id == request_id => {
-                    return Ok(response_json)
-                }
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(crate::storage::DbError::Row(
-                        "permission response channel closed".to_string(),
-                    ))
-                }
-            }
-        }
-    }) {
-        Ok(response) => response,
-        Err(e) => {
-            emit_terminal_data(
-                &*orch.services.emitter,
-                &old_session_id,
-                &format!("\r\nWorktree-fence permission wait failed: {e}\r\n"),
-                &buffer,
-                &log,
-            );
-            return;
-        }
-    };
-
-    let allowed = serde_json::from_str::<serde_json::Value>(&response)
-        .ok()
-        .and_then(|v| {
-            v.get("behavior")
-                .and_then(|b| b.as_str())
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some("allow");
-
-    if !allowed {
-        emit_terminal_data(
-            &*orch.services.emitter,
-            &old_session_id,
-            &format!("\r\nDenied by worktree fence: {}\r\n", crossing.summary),
-            &buffer,
-            &log,
-        );
-        // Converge on finalize: mark the row exited (denied → exit code unknown)
-        // and route the wake, retaining the row. The session was already removed
-        // by the reader thread's terminate before this prompt handler ran, so
-        // there is no child to kill here.
-        let process_ref = resource_slug(&resource);
-        let detail_uri = resource.to_uri();
-        finalize_terminal_session(
-            &orch,
-            &old_session_id,
-            None,
-            &buffer,
-            &command,
-            target.job_id.clone(),
-            &process_ref,
-            &detail_uri,
-        );
-        return;
-    }
-
-    let session_granted = orch
-        .session_allowed_crossings
-        .lock()
-        .ok()
-        .is_some_and(|allowed| allowed.contains(&crossing.descriptor));
-    if !session_granted {
-        emit_terminal_data(
-            &*orch.services.emitter,
-            &old_session_id,
-            "\r\nTerminal worktree-fence approvals must be allowed for the session; not restarting.\r\n",
-            &buffer,
-            &log,
-        );
-        // Converge on finalize: mark the row exited (denied → exit code unknown)
-        // and route the wake, retaining the row. The session was already removed
-        // by the reader thread's terminate before this prompt handler ran, so
-        // there is no child to kill here.
-        let process_ref = resource_slug(&resource);
-        let detail_uri = resource.to_uri();
-        finalize_terminal_session(
-            &orch,
-            &old_session_id,
-            None,
-            &buffer,
-            &command,
-            target.job_id.clone(),
-            &process_ref,
-            &detail_uri,
-        );
-        return;
-    }
-
-    emit_terminal_data(
-        &*orch.services.emitter,
-        &old_session_id,
-        "\r\nWorktree-fence approval granted for this session; restarting terminal.\r\n",
-        &buffer,
-        &log,
-    );
-    let respawn = block_on_background_db(async {
-        spawn_terminal_session(
-            &orch,
-            resource,
-            target,
-            command,
-            description,
-            TerminalSpawnMode::Respawn,
-        )
-        .await
-        .map_err(crate::storage::DbError::Row)
-    });
-    if let Err(e) = respawn {
-        emit_terminal_data(
-            &*orch.services.emitter,
-            &old_session_id,
-            &format!("\r\nFailed to restart terminal after worktree-fence approval: {e}\r\n"),
-            &buffer,
-            &log,
-        );
-    }
-}
-
-async fn write_terminal_input_by_session(
+pub(crate) async fn write_terminal_input_by_session(
     orch: &Orchestrator,
     session_id: &str,
     content: &str,
 ) -> Result<(), String> {
-    let sessions = orch
+    let session = orch
         .pty_state
         .sessions
         .lock()
-        .map_err(|e| format!("Failed to access sessions: {e}"))?;
-    let session = sessions
+        .map_err(|e| format!("Failed to access sessions: {e}"))?
         .get(session_id)
+        .cloned()
         .ok_or_else(|| format!("Terminal session not running: {session_id}"))?;
-    let mut session = session
-        .lock()
-        .map_err(|e| format!("Failed to lock terminal session: {e}"))?;
-    let writer = session
-        .writer
-        .as_mut()
-        .ok_or_else(|| "This terminal does not accept input".to_string())?;
-    writer
-        .write_all(content.as_bytes())
-        .map_err(|e| format!("Failed to write terminal input: {e}"))?;
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to flush terminal input: {e}"))?;
-    Ok(())
+    let binding = {
+        let guard = session
+            .lock()
+            .map_err(|e| format!("Failed to lock terminal session: {e}"))?;
+        guard
+            .lease
+            .clone()
+            .ok_or_else(|| "This terminal has no executor process binding".to_string())?
+    };
+    let result = orch
+        .fleet
+        .operate_lifetime_lease(
+            orch,
+            LifetimeLeaseOperation::WriteProcessInput {
+                fence: binding.fence,
+                process_key: binding.process_key,
+                process_generation: binding.process_generation,
+                data: content.as_bytes().to_vec(),
+            },
+        )
+        .await;
+    if matches!(result, LifetimeLeaseResult::State { .. }) {
+        Ok(())
+    } else {
+        Err(format!("Failed to write terminal input: {result:?}"))
+    }
 }
 
 pub async fn append_terminal_input(
@@ -2322,32 +3051,12 @@ pub async fn append_terminal_input(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Terminal not found: {}", target.slug))?;
 
-    let sessions = orch
-        .pty_state
-        .sessions
-        .lock()
-        .map_err(|e| format!("Failed to access sessions: {e}"))?;
-    let session = sessions
-        .get(&session_id)
-        .ok_or_else(|| format!("Terminal session not running: {}", target.slug))?;
-    let mut session = session
-        .lock()
-        .map_err(|e| format!("Failed to lock terminal session: {e}"))?;
     let to_write = if submit {
         ensure_submitted_line(content)
     } else {
         std::borrow::Cow::Borrowed(content)
     };
-    let writer = session
-        .writer
-        .as_mut()
-        .ok_or_else(|| "This terminal does not accept input".to_string())?;
-    writer
-        .write_all(to_write.as_bytes())
-        .map_err(|e| format!("Failed to write terminal input: {e}"))?;
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to flush terminal input: {e}"))?;
+    write_terminal_input_by_session(orch, &session_id, &to_write).await?;
 
     Ok(format!(
         "Sent {} chars to terminal {}",
@@ -2368,34 +3077,15 @@ pub async fn delete_terminal_by_resource(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Terminal not found: {}", target.slug))?;
 
-    // "Stop" converges on the single finalize sink: kill the child, mark the row
-    // exited (honest non-success code) + route the wake, and retain the row.
-    // Deletion is reserved for job teardown. Run on a blocking worker so the
-    // finalize thread's join does not stall the async executor.
-    let orch_for_finalize = orch.clone();
-    let session_for_finalize = session_id.clone();
-    tokio::task::spawn_blocking(move || {
-        finalize_terminal_by_session_id(&orch_for_finalize, &session_for_finalize)
-    })
-    .await
-    .map_err(|e| format!("terminal finalize task failed: {e}"))??;
+    // Stop the fenced executor process but retain the lifetime lease and
+    // materialization. The executor's ProcessExited event converges on the
+    // canonical conditional finalizer and makes the same slug restartable.
+    stop_terminal_by_session(orch, &session_id).await?;
 
     Ok(format!("Stopped terminal {}", target.slug))
 }
 
 /// Get exit code from PTY session using non-blocking try_wait.
-fn get_exit_code_from_session(
-    pty_state: &crate::services::PtyState,
-    session_id: &str,
-) -> Option<i32> {
-    let sessions = pty_state.sessions.lock().ok()?;
-    let session_arc = sessions.get(session_id)?;
-    let mut session = session_arc.lock().ok()?;
-
-    // Use try_wait to avoid blocking - process should have exited if we got EOF
-    session.child.try_wait_exit()
-}
-
 /// Send terminal context to Claude via stdin when a background process exits with error.
 fn send_terminal_exit_context(
     orch: &Orchestrator,
@@ -2461,10 +3151,137 @@ fn send_terminal_exit_context(
 mod terminal_finalize_tests {
     use super::*;
     use crate::db::DbState;
-    use crate::services::testing::TestServicesBuilder;
+    use crate::fleet::Fleet;
+    use crate::models::Fence;
+    use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
     use crate::storage::SearchIndex;
+    use cairn_common::executor_protocol::{
+        CellCheckoutKind, ExecutorMessage, ExecutorSubstrateReport, FleetSnapshot,
+        LifetimeLeaseFailureKind, LifetimeLeasePhase, LifetimeLeaseState, LifetimeProcessState,
+        PersistentCellLifecycle, PersistentCellState,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
+
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_git_checkout(path: &std::path::Path) -> String {
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.email", "test@cairn.local"]);
+        git(path, &["config", "user.name", "Cairn Test"]);
+        std::fs::write(path.join("README"), "fixture\n").unwrap();
+        git(path, &["add", "README"]);
+        git(path, &["commit", "-q", "-m", "fixture"]);
+        git(path, &["rev-parse", "HEAD"])
+    }
+
+    fn lease_target(
+        repo_path: &std::path::Path,
+        branch: Option<String>,
+        owner_ref: CellOwnerRef,
+    ) -> TerminalResourceTarget {
+        TerminalResourceTarget {
+            slug: "direct".into(),
+            job_id: Some("job-7".into()),
+            project_id: "p".into(),
+            run_id: Some("run-7".into()),
+            cwd: repo_path.to_string_lossy().into_owned(),
+            branch,
+            repo_path: repo_path.to_string_lossy().into_owned(),
+            owner_ref: Some(owner_ref),
+            lease: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ambient_job_terminal_acquisition_preserves_owner_and_uses_live_checkout_head() {
+        let db = crate::storage::migrated_test_db("term_ambient_acquire.db").await;
+        let orch = test_orchestrator(db);
+        let checkout = tempdir().unwrap();
+        let head = init_git_checkout(checkout.path());
+        let owner_ref = CellOwnerRef {
+            project_id: "p".into(),
+            project_key: Some("P".into()),
+            issue_number: Some(7),
+            job_id: Some("job-7".into()),
+            execution_seq: Some(2),
+            node_kind: Some("builder".into()),
+        };
+        let target = lease_target(checkout.path(), None, owner_ref.clone());
+
+        let (lease_id, owner, request) = terminal_lease_acquisition(&orch, &target).await.unwrap();
+
+        assert_eq!(lease_id, "terminal:job-7");
+        assert_eq!(owner.owner_id, "job-7");
+        assert_eq!(request.declaration.owner, owner);
+        assert_eq!(request.declaration.owner_ref, Some(owner_ref));
+        assert_eq!(request.declaration.initial_base_commit, head);
+        assert_eq!(
+            request.declaration.repository,
+            RepositoryLocator::ExistingCheckout {
+                project_id: "p".into(),
+                repository_id: "p".into(),
+                absolute_path: checkout.path().to_string_lossy().into_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn managed_job_terminal_acquisition_resolves_bookmark_and_uses_colocated_path() {
+        let db = crate::storage::migrated_test_db("term_managed_acquire.db").await;
+        let orch = test_orchestrator(db);
+        let checkout = tempdir().unwrap();
+        init_git_checkout(checkout.path());
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, checkout.path());
+        crate::jj::ensure_project_store(&jj, &store, checkout.path()).unwrap();
+        let expected = crate::jj::bookmark_commit(&jj, &store, "main").unwrap();
+        let target = lease_target(
+            checkout.path(),
+            Some("main".into()),
+            CellOwnerRef::default(),
+        );
+
+        let (_, _, request) = terminal_lease_acquisition(&orch, &target).await.unwrap();
+
+        assert_eq!(request.declaration.initial_base_commit, expected);
+        assert_eq!(
+            request.declaration.repository,
+            RepositoryLocator::ColocatedPath {
+                project_id: "p".into(),
+                repository_id: "p".into(),
+                absolute_path: checkout.path().to_string_lossy().into_owned(),
+            }
+        );
+    }
+
+    struct SharedCapturingEmitter(Arc<CapturingEmitter>);
+
+    impl crate::services::EventEmitter for SharedCapturingEmitter {
+        fn emit(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            self.0.emit(event, payload)
+        }
+
+        fn emit_empty(&self, event: &str) -> Result<(), String> {
+            self.0.emit_empty(event)
+        }
+    }
 
     /// Run an async block on a throwaway current-thread runtime. Each call
     /// creates and drops its own runtime, so the test thread carries no ambient
@@ -2486,6 +3303,23 @@ mod terminal_finalize_tests {
         Orchestrator::builder(db_state, services, config_dir).build()
     }
 
+    fn test_orchestrator_with_emitter(db: LocalDb) -> (Orchestrator, Arc<CapturingEmitter>) {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.keep();
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search));
+        let emitter = Arc::new(CapturingEmitter::new());
+        let services = Arc::new(
+            TestServicesBuilder::new()
+                .with_emitter(SharedCapturingEmitter(emitter.clone()))
+                .build(),
+        );
+        (
+            Orchestrator::builder(db_state, services, config_dir).build(),
+            emitter,
+        )
+    }
+
     async fn seed(db: &LocalDb) {
         db.execute_script(
             "
@@ -2501,6 +3335,96 @@ mod terminal_finalize_tests {
         )
         .await
         .unwrap();
+    }
+
+    async fn seed_terminal_fence(orch: &Orchestrator, fence: Fence) {
+        let snapshot = serde_json::json!({
+            "recipe": {
+                "id": "rec",
+                "name": "Recipe",
+                "description": null,
+                "trigger": "manual",
+                "nodes": [],
+                "edges": []
+            },
+            "agents": {
+                "build": {
+                    "id": "build",
+                    "name": "Build",
+                    "description": "Build",
+                    "prompt": "prompt",
+                    "tools": [],
+                    "disallowedTools": null,
+                    "skills": null,
+                    "fence": fence
+                }
+            },
+            "skills": {},
+            "triggerContext": {
+                "issueId": "i",
+                "projectId": "p",
+                "triggerType": "manual"
+            },
+            "delegatedPackets": [],
+            "createdAt": 1
+        })
+        .to_string();
+        orch.db
+            .local
+            .execute(
+                "UPDATE executions SET snapshot = ?1 WHERE id = 'e'",
+                params![snapshot.as_str()],
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET agent_config_id = 'build' WHERE id = 'j'",
+                (),
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO runs(id, issue_id, project_id, job_id, status, created_at, updated_at)
+                 VALUES('run-terminal-policy','i','p','j','running',1,1)",
+                (),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_lease_restart_excludes_completed_one_shots() {
+        let db = crate::storage::migrated_test_db("term_shared_restart_set.db").await;
+        seed(&db).await;
+        db.execute_script(
+            "UPDATE job_terminals SET status = 'exited', lease_id = 'terminal:j', lease_incarnation_id = 'inc', lease_epoch = 7 WHERE id = 't';
+             INSERT INTO job_terminals(id, job_id, session_id, command, title, status, created_at, slug, lease_id)
+             VALUES('interactive','j','s2','','Shell','running',2,'shell','terminal:j');
+             INSERT INTO job_terminals(id, job_id, session_id, command, title, status, created_at, slug, lease_id)
+             VALUES('watch','j','s3','bun test --watch','Watch','running',3,'watch','terminal:j');",
+        )
+        .await
+        .unwrap();
+
+        db.execute_script("UPDATE job_terminals SET lease_incarnation_id = 'inc', lease_epoch = 7 WHERE lease_id = 'terminal:j';").await.unwrap();
+        let fence = LifetimeLeaseFence {
+            lease_id: "terminal:j".into(),
+            owner: LifetimeLeaseOwner {
+                kind: LifetimeLeaseOwnerKind::Terminal,
+                owner_id: "j".into(),
+            },
+            incarnation_id: "inc".into(),
+            lease_epoch: 7,
+        };
+        let slugs = terminal_slugs_for_lease(&db, &fence, &std::collections::HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(slugs, vec!["shell", "watch"]);
     }
 
     async fn read_terminal(
@@ -2528,8 +3452,848 @@ mod terminal_finalize_tests {
         cairn_common::uri::build_node_terminal_uri("P", 7, 2, "builder", "run-1")
     }
 
-    fn task_uri() -> String {
-        cairn_common::uri::build_task_terminal_uri("P", 7, 2, "builder", "Explore", "run-1")
+    #[derive(Clone, Copy)]
+    enum FakeTerminalStart {
+        ImmediateExit,
+        FailStart,
+        DeleteBindingBeforeResponse,
+        FailRefresh,
+    }
+
+    fn test_terminal_target(slug: &str) -> (TerminalResourceTarget, LifetimeLeaseFence) {
+        let owner = LifetimeLeaseOwner {
+            kind: LifetimeLeaseOwnerKind::Terminal,
+            owner_id: "j".into(),
+        };
+        let fence = LifetimeLeaseFence {
+            lease_id: "terminal:j".into(),
+            owner,
+            incarnation_id: "incarnation".into(),
+            lease_epoch: 7,
+        };
+        (
+            TerminalResourceTarget {
+                slug: slug.into(),
+                job_id: Some("j".into()),
+                project_id: "p".into(),
+                run_id: None,
+                cwd: "/cell".into(),
+                branch: Some("branch".into()),
+                repo_path: "/tmp".into(),
+                owner_ref: None,
+                lease: Some(fence.clone()),
+            },
+            fence,
+        )
+    }
+
+    async fn spawn_and_capture_terminal_process(
+        orch: &Orchestrator,
+        mut target: TerminalResourceTarget,
+        fence: LifetimeLeaseFence,
+        command: &str,
+    ) -> LifetimeProcessSpec {
+        target.run_id = Some("run-terminal-policy".into());
+        let (executor, _, _, start_process) =
+            attach_fake_terminal_executor(orch, fence, FakeTerminalStart::ImmediateExit);
+        spawn_terminal_session(
+            orch,
+            node_terminal_resource(&target.slug),
+            target,
+            command.to_string(),
+            None,
+            true,
+            Some("/bin/sh".into()),
+            LifetimePtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let process = start_process
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("terminal spawn must submit a process specification");
+        executor.abort();
+        process
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_spawn_honors_fence_allow_as_unconfined() {
+        let db = crate::storage::migrated_test_db("term_policy_allow.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        seed_terminal_fence(&orch, Fence::Allow).await;
+        let checkout = tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".jj")).unwrap();
+        let (mut target, fence) = test_terminal_target("policy-allow");
+        target.cwd = checkout.path().to_string_lossy().into_owned();
+
+        let process =
+            spawn_and_capture_terminal_process(&orch, target, fence, "bun dev:instance").await;
+
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Unconfined);
+        assert!(process.sandbox_policy.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_spawn_honors_fence_ask_as_worktree_confined() {
+        let db = crate::storage::migrated_test_db("term_policy_ask.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        seed_terminal_fence(&orch, Fence::Ask).await;
+        let checkout = tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".jj")).unwrap();
+        let (mut target, fence) = test_terminal_target("policy-ask");
+        target.cwd = checkout.path().to_string_lossy().into_owned();
+
+        let process =
+            spawn_and_capture_terminal_process(&orch, target, fence, "bun dev:instance").await;
+
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Confined);
+        let policy = process
+            .sandbox_policy
+            .expect("ask fence must carry a policy");
+        assert_eq!(policy.worktree, checkout.path().to_string_lossy());
+        assert!(policy.worktree_writable);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_spawn_keeps_branchless_live_checkout_read_only() {
+        let db = crate::storage::migrated_test_db("term_policy_readonly.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        seed_terminal_fence(&orch, Fence::Allow).await;
+        let checkout = tempdir().unwrap();
+        let (mut target, fence) = test_terminal_target("policy-readonly");
+        target.cwd = checkout.path().to_string_lossy().into_owned();
+        target.branch = None;
+
+        let process =
+            spawn_and_capture_terminal_process(&orch, target, fence, "touch forbidden").await;
+
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::ReadOnlyCheckout);
+        let policy = process
+            .sandbox_policy
+            .expect("live checkout must carry a read-only policy");
+        assert!(!policy.worktree_writable);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_spawn_runs_accepted_scopeless_dev_command_unconfined() {
+        let db = crate::storage::migrated_test_db("term_policy_dev_unconfined.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        seed_terminal_fence(&orch, Fence::Ask).await;
+        let checkout = tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".jj")).unwrap();
+        std::fs::create_dir(checkout.path().join(".cairn")).unwrap();
+        std::fs::write(
+            checkout.path().join(".cairn/config.yaml"),
+            "terminalCommands:\n  - name: Dev\n    command: bun dev:instance\n",
+        )
+        .unwrap();
+        crate::config::settings::set_accepted_fence_command(
+            &orch.config_dir,
+            "p",
+            "bun dev:instance",
+            true,
+        )
+        .unwrap();
+        let (mut target, fence) = test_terminal_target("policy-dev-unconfined");
+        target.cwd = checkout.path().to_string_lossy().into_owned();
+
+        let process =
+            spawn_and_capture_terminal_process(&orch, target, fence, "bun dev:instance").await;
+
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Unconfined);
+        assert!(process.sandbox_policy.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_spawn_confines_accepted_scoped_dev_command_with_expanded_glob() {
+        let db = crate::storage::migrated_test_db("term_policy_dev_scoped.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        seed_terminal_fence(&orch, Fence::Ask).await;
+        let checkout = tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".jj")).unwrap();
+        std::fs::create_dir(checkout.path().join(".cairn")).unwrap();
+        std::fs::write(
+            checkout.path().join(".cairn/config.yaml"),
+            "terminalCommands:\n  - name: Dev\n    command: bun dev:instance\n    write:\n      - ~/.cairn-dev-*\n",
+        )
+        .unwrap();
+        crate::config::settings::set_accepted_fence_command(
+            &orch.config_dir,
+            "p",
+            "bun dev:instance",
+            true,
+        )
+        .unwrap();
+        let (mut target, fence) = test_terminal_target("policy-dev-scoped");
+        target.cwd = checkout.path().to_string_lossy().into_owned();
+
+        let process =
+            spawn_and_capture_terminal_process(&orch, target, fence, "bun dev:instance").await;
+
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Confined);
+        let policy = process
+            .sandbox_policy
+            .expect("scoped accepted command must carry a policy");
+        let expanded = dirs::home_dir().unwrap().join(".cairn-dev-*");
+        assert!(policy
+            .writable_regex
+            .contains(&crate::services::sandbox::glob_to_regex(
+                &expanded.to_string_lossy()
+            )));
+    }
+
+    fn test_terminal_slot(fence: &LifetimeLeaseFence) -> PersistentCellState {
+        let declaration = LifetimeLeaseDeclaration {
+            lease_id: fence.lease_id.clone(),
+            owner: fence.owner.clone(),
+            owner_ref: None,
+            name: "fast".into(),
+            purpose: "test terminal".into(),
+            repository: RepositoryLocator::ExistingCheckout {
+                project_id: "p".into(),
+                repository_id: "p".into(),
+                absolute_path: "/tmp".into(),
+            },
+            initial_base_commit: "base".into(),
+            resource_reservation: ResourceReservation {
+                memory_bytes: 1,
+                disk_growth_bytes: 1,
+                concurrency_units: 1,
+                source: ResourceReservationSource::Declared,
+            },
+            owner_death_policy: LifetimeOwnerDeathPolicy {
+                heartbeat_timeout_ms: 60_000,
+                reclaim_grace_ms: 60_000,
+            },
+        };
+        PersistentCellState {
+            executor_id: String::new(),
+            executor_display_name: None,
+            project_id: "p".into(),
+            cell_id: "cell".into(),
+            path: "/cell".into(),
+            workspace_name: "cell".into(),
+            repository: "/tmp".into(),
+            checkout_kind: CellCheckoutKind::ExistingCheckout,
+            git_common_dir: None,
+            authority_path: "/cell/.authority".into(),
+            lifecycle: PersistentCellLifecycle::Running,
+            lease_epoch: fence.lease_epoch,
+            last_sealed_commit: Some("base".into()),
+            last_used_unix_ms: 1,
+            last_affinity_key: None,
+            preparation_fingerprint: None,
+            occupant: Some(CellOccupant::Lifetime(LifetimeLeaseState {
+                declaration,
+                incarnation_id: fence.incarnation_id.clone(),
+                current_base_commit: "base".into(),
+                phase: LifetimeLeasePhase::Active,
+                last_heartbeat_unix_ms: 1,
+                reclaim_deadline_unix_ms: 0,
+                state_revision: 1,
+                command_settled: true,
+                processes: std::collections::BTreeMap::from([(
+                    "main".into(),
+                    LifetimeProcessState {
+                        generation: 1,
+                        spec: None,
+                        status: LifetimeProcessStatus::Starting,
+                    },
+                )]),
+                events: Vec::new(),
+            })),
+        }
+    }
+
+    #[test]
+    fn persisted_terminal_binding_recovers_without_an_in_memory_session() {
+        let (_, fence) = test_terminal_target("fast");
+        let cell = test_terminal_slot(&fence);
+
+        let binding = terminal_binding_from_cells(
+            &[cell],
+            &fence.lease_id,
+            &fence.incarnation_id,
+            fence.lease_epoch,
+            Some("fast"),
+            Some(1),
+        )
+        .expect("retained executor cell should recover the terminal binding");
+
+        assert_eq!(binding.fence, fence);
+        assert_eq!(binding.process_key, "main");
+        assert_eq!(binding.process_generation, 1);
+    }
+
+    fn fence_from_cell(cell: &PersistentCellState) -> LifetimeLeaseFence {
+        let lease = cell
+            .occupant
+            .as_ref()
+            .and_then(CellOccupant::lifetime)
+            .expect("terminal fixture cell has a lifetime occupant");
+        LifetimeLeaseFence {
+            lease_id: lease.declaration.lease_id.clone(),
+            owner: lease.declaration.owner.clone(),
+            incarnation_id: lease.incarnation_id.clone(),
+            lease_epoch: cell.lease_epoch,
+        }
+    }
+
+    /// A cell whose lifetime declaration mirrors `declaration`, so the fleet's
+    /// acquire-route resolution treats a pre-registered fake lease as the same
+    /// identity the runner is acquiring — letting a test drive a real Acquire.
+    fn terminal_slot_for_declaration(
+        declaration: LifetimeLeaseDeclaration,
+        path: &std::path::Path,
+    ) -> PersistentCellState {
+        let base = declaration.initial_base_commit.clone();
+        let mut cell = test_terminal_slot(&LifetimeLeaseFence {
+            lease_id: declaration.lease_id.clone(),
+            owner: declaration.owner.clone(),
+            incarnation_id: "incarnation".into(),
+            lease_epoch: 7,
+        });
+        cell.path = path.to_string_lossy().into_owned();
+        cell.repository = path.to_string_lossy().into_owned();
+        cell.last_sealed_commit = Some(base.clone());
+        if let Some(CellOccupant::Lifetime(lease)) = cell.occupant.as_mut() {
+            lease.declaration = declaration;
+            lease.current_base_commit = base;
+        }
+        cell
+    }
+
+    fn attach_fake_terminal_executor(
+        orch: &Orchestrator,
+        fence: LifetimeLeaseFence,
+        behavior: FakeTerminalStart,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Option<LifetimeProcessSpec>>>,
+    ) {
+        attach_fake_terminal_executor_with_cell(orch, test_terminal_slot(&fence), behavior)
+    }
+
+    fn attach_fake_terminal_executor_with_cell(
+        orch: &Orchestrator,
+        cell: PersistentCellState,
+        behavior: FakeTerminalStart,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Option<LifetimeProcessSpec>>>,
+    ) {
+        let fence = fence_from_cell(&cell);
+        let pool: Arc<Fleet> = orch.fleet.clone();
+        let db = orch.db.local.clone();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let connection_generation = pool.attach_executor(sender);
+        assert!(pool.set_executor_snapshot(
+            "colocated",
+            connection_generation,
+            FleetSnapshot {
+                cells: vec![cell.clone()],
+                ..Default::default()
+            },
+            ExecutorSubstrateReport::default(),
+        ));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let release_count = releases.clone();
+        let ops = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ops_log = ops.clone();
+        let start_process: Arc<Mutex<Option<LifetimeProcessSpec>>> = Arc::new(Mutex::new(None));
+        let start_process_log = start_process.clone();
+        let task = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                let ExecutorMessage::LifetimeLeaseRequest {
+                    correlation_id,
+                    operation,
+                } = message
+                else {
+                    continue;
+                };
+                ops_log.lock().unwrap().push(
+                    match &operation {
+                        LifetimeLeaseOperation::Acquire { .. } => "Acquire",
+                        LifetimeLeaseOperation::RefreshCheckout { .. } => "RefreshCheckout",
+                        LifetimeLeaseOperation::StartProcess { .. } => "StartProcess",
+                        LifetimeLeaseOperation::Release { .. } => "Release",
+                        LifetimeLeaseOperation::StopProcess { .. } => "StopProcess",
+                        _ => "Other",
+                    }
+                    .to_string(),
+                );
+                if let LifetimeLeaseOperation::StartProcess { process, .. } = &operation {
+                    *start_process_log.lock().unwrap() = Some(process.clone());
+                }
+                let result = match operation {
+                    LifetimeLeaseOperation::RefreshCheckout { .. }
+                        if matches!(behavior, FakeTerminalStart::FailRefresh) =>
+                    {
+                        LifetimeLeaseResult::Failed {
+                            kind: LifetimeLeaseFailureKind::Cleanup,
+                            diagnostic: "injected refresh failure".into(),
+                            cell_outcome: None,
+                        }
+                    }
+                    LifetimeLeaseOperation::StartProcess { process_key, .. } => match behavior {
+                        FakeTerminalStart::FailStart | FakeTerminalStart::FailRefresh => {
+                            LifetimeLeaseResult::Failed {
+                                kind: LifetimeLeaseFailureKind::Process,
+                                diagnostic: "injected start failure".into(),
+                                cell_outcome: None,
+                            }
+                        }
+                        FakeTerminalStart::ImmediateExit => {
+                            let mut started_slot = cell.clone();
+                            let Some(CellOccupant::Lifetime(lease)) =
+                                started_slot.occupant.as_mut()
+                            else {
+                                unreachable!("terminal fixture always has a lifetime occupant")
+                            };
+                            let process = lease
+                                .processes
+                                .remove("main")
+                                .expect("terminal fixture process");
+                            lease.processes.insert(process_key.clone(), process);
+                            assert!(pool.set_executor_snapshot(
+                                "colocated",
+                                connection_generation,
+                                FleetSnapshot {
+                                    cells: vec![started_slot.clone()],
+                                    ..Default::default()
+                                },
+                                ExecutorSubstrateReport::default(),
+                            ));
+                            let event = LifetimeProcessEvent {
+                                lease_id: fence.lease_id.clone(),
+                                incarnation_id: fence.incarnation_id.clone(),
+                                lease_epoch: fence.lease_epoch,
+                                process_key: process_key.clone(),
+                                process_generation: 1,
+                                event: LifetimeProcessEventKind::State {
+                                    status: LifetimeProcessStatus::Exited {
+                                        finished_at_unix_ms: 2,
+                                        exit_code: Some(0),
+                                        restartable: true,
+                                        executor_lost: false,
+                                    },
+                                },
+                            };
+                            // Delivery before StartProcess responds is the race
+                            // that creation must tolerate. A duplicate proves
+                            // finalization and event emission remain idempotent.
+                            pool.handle_executor_message(
+                                "colocated",
+                                connection_generation,
+                                ExecutorMessage::LifetimeProcessEvent {
+                                    event: event.clone(),
+                                },
+                            );
+                            pool.handle_executor_message(
+                                "colocated",
+                                connection_generation,
+                                ExecutorMessage::LifetimeProcessEvent { event },
+                            );
+                            LifetimeLeaseResult::State { cell: started_slot }
+                        }
+                        FakeTerminalStart::DeleteBindingBeforeResponse => {
+                            db.execute(
+                                "DELETE FROM job_terminals WHERE slug = ?1",
+                                params!["fast"],
+                            )
+                            .await
+                            .unwrap();
+                            let mut started_slot = cell.clone();
+                            let Some(CellOccupant::Lifetime(lease)) =
+                                started_slot.occupant.as_mut()
+                            else {
+                                unreachable!("terminal fixture always has a lifetime occupant")
+                            };
+                            let process = lease
+                                .processes
+                                .remove("main")
+                                .expect("terminal fixture process");
+                            lease.processes.insert(process_key, process);
+                            LifetimeLeaseResult::State { cell: started_slot }
+                        }
+                    },
+                    LifetimeLeaseOperation::Release { .. } => {
+                        release_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        LifetimeLeaseResult::Released {
+                            lease_id: fence.lease_id.clone(),
+                            lease_epoch: fence.lease_epoch,
+                        }
+                    }
+                    _ => LifetimeLeaseResult::State { cell: cell.clone() },
+                };
+                pool.handle_executor_message(
+                    "colocated",
+                    connection_generation,
+                    ExecutorMessage::LifetimeLeaseResponse {
+                        correlation_id,
+                        result,
+                    },
+                );
+            }
+        });
+        (task, releases, ops, start_process)
+    }
+
+    async fn terminal_row_count(db: &LocalDb, slug: &str) -> i64 {
+        db.query_one(
+            "SELECT COUNT(*) FROM job_terminals WHERE slug = ?1",
+            params![slug],
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn immediate_executor_exit_finalizes_the_preinserted_terminal_once() {
+        let db = crate::storage::migrated_test_db("term_immediate_exit.db").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("fast");
+        let (executor, _, _, _) =
+            attach_fake_terminal_executor(&orch, fence, FakeTerminalStart::ImmediateExit);
+
+        let session_id = spawn_terminal_session(
+            &orch,
+            CairnResource::NodeTerminal {
+                project: "P".into(),
+                number: 7,
+                exec_seq: 2,
+                node_id: "builder".into(),
+                slug: "fast".into(),
+            },
+            target,
+            String::new(),
+            None,
+            true,
+            None,
+            LifetimePtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (status, code, _) = read_terminal(&orch.db.local, &session_id).await;
+        assert_eq!(status, "exited");
+        assert_eq!(code, Some(0));
+        assert_eq!(emitter.events_named("pty-exit").len(), 1);
+        executor.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_failure_rolls_back_row_session_handler_and_retained_lease() {
+        let db = crate::storage::migrated_test_db("term_start_rollback.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("fast");
+        let lease_id = fence.lease_id.clone();
+        let (executor, releases, _, _) =
+            attach_fake_terminal_executor(&orch, fence, FakeTerminalStart::FailStart);
+
+        let result = spawn_terminal_session(
+            &orch,
+            CairnResource::NodeTerminal {
+                project: "P".into(),
+                number: 7,
+                exec_seq: 2,
+                node_id: "builder".into(),
+                slug: "fast".into(),
+            },
+            target,
+            String::new(),
+            None,
+            true,
+            None,
+            LifetimePtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(terminal_row_count(&orch.db.local, "fast").await, 0);
+        assert!(orch.pty_state.sessions.lock().unwrap().is_empty());
+        assert!(!orch
+            .pty_state
+            .lifetime_handlers
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(candidate, _)| candidate == &lease_id));
+        assert_eq!(releases.load(AtomicOrdering::SeqCst), 1);
+        executor.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_generation_binding_rolls_back_started_process_and_lease() {
+        let db = crate::storage::migrated_test_db("term_persist_rollback.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("fast");
+        let (executor, releases, _, _) = attach_fake_terminal_executor(
+            &orch,
+            fence,
+            FakeTerminalStart::DeleteBindingBeforeResponse,
+        );
+
+        let result = spawn_terminal_session(
+            &orch,
+            CairnResource::NodeTerminal {
+                project: "P".into(),
+                number: 7,
+                exec_seq: 2,
+                node_id: "builder".into(),
+                slug: "fast".into(),
+            },
+            target,
+            String::new(),
+            None,
+            true,
+            None,
+            LifetimePtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .contains("terminal generation binding disappeared"));
+        assert_eq!(terminal_row_count(&orch.db.local, "fast").await, 0);
+        assert!(orch.pty_state.sessions.lock().unwrap().is_empty());
+        assert_eq!(releases.load(AtomicOrdering::SeqCst), 1);
+        executor.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_residency_gate_refreshes_the_checkout_to_the_tip() {
+        let db = crate::storage::migrated_test_db("term_residency_refresh_ok.db").await;
+        let orch = test_orchestrator(db);
+        let (_target, fence) = test_terminal_target("fast");
+        let (executor, _releases, ops, _) =
+            attach_fake_terminal_executor(&orch, fence.clone(), FakeTerminalStart::ImmediateExit);
+
+        ensure_terminal_checkout_current(&orch, &fence, "new-tip")
+            .await
+            .expect("a healthy executor must accept the residency refresh");
+
+        assert_eq!(
+            *ops.lock().unwrap(),
+            vec!["RefreshCheckout".to_string()],
+            "the residency gate must issue exactly one RefreshCheckout to the tip"
+        );
+        executor.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_residency_gate_fails_closed_on_refresh_failure() {
+        let db = crate::storage::migrated_test_db("term_residency_refresh_fail.db").await;
+        let orch = test_orchestrator(db);
+        let (_target, fence) = test_terminal_target("fast");
+        let (executor, _releases, _ops, _) =
+            attach_fake_terminal_executor(&orch, fence.clone(), FakeTerminalStart::FailRefresh);
+
+        let error = ensure_terminal_checkout_current(&orch, &fence, "new-tip")
+            .await
+            .expect_err("a refresh failure must fail the residency gate closed");
+        assert!(
+            error.contains("refresh terminal checkout to new-tip"),
+            "the failure must name the tip it could not reach: {error}"
+        );
+        executor.abort();
+    }
+
+    /// Point project `p` and job `j` at a real jj checkout so a NodeTerminal
+    /// resolves to a managed job terminal on branch `main`.
+    async fn seed_managed_job_terminal_checkout(orch: &Orchestrator, checkout: &std::path::Path) {
+        seed(&orch.db.local).await;
+        init_git_checkout(checkout);
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, checkout);
+        crate::jj::ensure_project_store(&jj, &store, checkout).unwrap();
+        let cp = checkout.to_string_lossy().into_owned();
+        orch.db
+            .local
+            .execute(
+                "UPDATE projects SET repo_path = ?1 WHERE id = 'p'",
+                params![cp.as_str()],
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET worktree_path = ?1, branch = 'main' WHERE id = 'j'",
+                params![cp.as_str()],
+            )
+            .await
+            .unwrap();
+    }
+
+    fn node_terminal_resource(slug: &str) -> CairnResource {
+        CairnResource::NodeTerminal {
+            project: "P".into(),
+            number: 7,
+            exec_seq: 2,
+            node_id: "builder".into(),
+            slug: slug.into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn create_job_terminal_acquires_refreshes_then_starts_in_order() {
+        let db = crate::storage::migrated_test_db("term_create_order.db").await;
+        let orch = test_orchestrator(db);
+        let checkout = tempdir().unwrap();
+        seed_managed_job_terminal_checkout(&orch, checkout.path()).await;
+        let resource = node_terminal_resource("direct");
+        let target = resolve_terminal_resource_target(&orch.db.local, &resource)
+            .await
+            .unwrap();
+        let (_, _, request) = terminal_lease_acquisition(&orch, &target).await.unwrap();
+        let cell = terminal_slot_for_declaration(request.declaration.clone(), checkout.path());
+        let (executor, _releases, ops, start_process) =
+            attach_fake_terminal_executor_with_cell(&orch, cell, FakeTerminalStart::ImmediateExit);
+
+        create_interactive_terminal_from_resource(
+            &orch,
+            resource,
+            None,
+            "t".into(),
+            None,
+            LifetimePtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await
+        .expect("creating a job terminal at a current head should succeed");
+
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.len() >= 3,
+            "expected acquire, refresh, and start: {recorded:?}"
+        );
+        assert_eq!(
+            &recorded[..3],
+            &[
+                "Acquire".to_string(),
+                "RefreshCheckout".to_string(),
+                "StartProcess".to_string()
+            ],
+            "the shell must not spawn until the checkout is refreshed to the tip"
+        );
+        // The managed cell is a detached-HEAD checkout, so the spawned shell must
+        // carry the job's branch via CAIRN_WORKTREE_BRANCH for branch-keyed
+        // tooling (bun dev:instance, bun run changelog) to resolve without
+        // --branch. Pinned at the executor boundary, mirroring the run path.
+        let env = start_process
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("StartProcess must carry a process specification")
+            .env;
+        // The env block appends over an inherited base (like PATH), so the last
+        // occurrence is the effective value the executor applies.
+        let branch = env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "CAIRN_WORKTREE_BRANCH")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            branch,
+            Some("main"),
+            "a job terminal's shell env must export the job's branch"
+        );
+        executor.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn create_job_terminal_fails_closed_without_spawning_on_refresh_failure() {
+        let db = crate::storage::migrated_test_db("term_create_fail_closed.db").await;
+        let orch = test_orchestrator(db);
+        let checkout = tempdir().unwrap();
+        seed_managed_job_terminal_checkout(&orch, checkout.path()).await;
+        let resource = node_terminal_resource("direct");
+        let target = resolve_terminal_resource_target(&orch.db.local, &resource)
+            .await
+            .unwrap();
+        let (_, _, request) = terminal_lease_acquisition(&orch, &target).await.unwrap();
+        let cell = terminal_slot_for_declaration(request.declaration.clone(), checkout.path());
+        let (executor, _releases, ops, _) =
+            attach_fake_terminal_executor_with_cell(&orch, cell, FakeTerminalStart::FailRefresh);
+
+        let result = create_interactive_terminal_from_resource(
+            &orch,
+            resource,
+            None,
+            "t".into(),
+            None,
+            LifetimePtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a stale-head refresh failure must fail creation"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            !recorded.contains(&"StartProcess".to_string()),
+            "no shell may spawn when the residency refresh fails: {recorded:?}"
+        );
+        assert_eq!(
+            recorded,
+            vec![
+                "Acquire".to_string(),
+                "RefreshCheckout".to_string(),
+                "Release".to_string()
+            ],
+            "a failed refresh acquires, refreshes, then releases the lease"
+        );
+        assert_eq!(
+            terminal_row_count(&orch.db.local, "direct").await,
+            0,
+            "no running terminal row may be inserted when creation fails closed"
+        );
+        executor.abort();
     }
 
     #[test]
@@ -2607,29 +4371,109 @@ mod terminal_finalize_tests {
         );
     }
 
-    #[test]
-    fn build_terminal_detail_uri_matches_node_builder() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_c.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-
-        let uri = block_on(build_terminal_detail_uri(&orch, Some("j"), None, "run-1"));
-        assert_eq!(uri, node_uri());
+    /// Give job `j` a live agent session + run + active turn so a routed wake has
+    /// a delivery target (mirrors the integration `seed_node`).
+    async fn seed_live_turn(db: &LocalDb) {
+        db.execute_script(
+            "
+            INSERT INTO sessions(id, job_id, status, created_at, updated_at) VALUES('sess-live','j','active',1,1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode) VALUES('run-live','p','j','live','sess-live',1,1,'resume');
+            INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at) VALUES('turn-live','sess-live','run-live','j',1,'running',1,1);
+            UPDATE jobs SET current_session_id='sess-live', current_turn_id='turn-live' WHERE id='j';
+            ",
+        )
+        .await
+        .unwrap();
     }
 
+    /// The output-wake subscribe must recover an exit that finalize already routed
+    /// (and dropped) before the subscription existed. The caller's pre-persist
+    /// `row` snapshot is stale (`None` here), so ONLY the post-persist status
+    /// re-read can observe the exit. Removing that re-read makes this fail: the
+    /// subscribe would register a watcher on the dead session and return
+    /// `OutputPersisted`, leaving the one-shot subscription unconsumed.
     #[test]
-    fn build_terminal_detail_uri_matches_task_builder() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_task.db"));
+    fn output_wake_reroutes_exit_observed_only_after_persist() {
+        let db = block_on(crate::storage::migrated_test_db("term_output_reread.db"));
         let orch = test_orchestrator(db);
         block_on(seed(&orch.db.local));
+        block_on(seed_live_turn(&orch.db.local));
+        block_on(orch.db.local.execute(
+            "UPDATE job_terminals SET status='exited', exit_code=3, exited_at=50, output_tail='boom' WHERE session_id='s1'",
+            (),
+        ))
+        .unwrap();
 
-        let uri = block_on(build_terminal_detail_uri(
+        let uri = node_uri();
+        let outcome = block_on(subscribe_terminal_output_wake_once(
             &orch,
-            Some("task-j"),
-            None,
+            "j",
             "run-1",
-        ));
-        assert_eq!(uri, task_uri());
+            &uri,
+            "ready",
+            None,
+            Some("s1"),
+            "agent",
+        ))
+        .unwrap();
+        assert!(
+            matches!(outcome, TerminalWakeSubscriptionOutcome::ExitAlreadyQueued),
+            "post-persist re-read must observe the already-exited terminal and route its exit"
+        );
+
+        let subs = block_on(crate::orchestrator::wakes::list_subscriptions_for_job(
+            &orch.db.local,
+            "j",
+        ))
+        .unwrap();
+        assert!(
+            !subs
+                .iter()
+                .any(|s| s.match_phrase.as_deref() == Some("ready")),
+            "the routed exit must consume the newly persisted one-shot output subscription"
+        );
+    }
+
+    /// The exit-only subscribe has the same recovery obligation: a fast exit that
+    /// was routed-and-dropped before the subscription persisted must be recovered
+    /// by the post-persist re-read, not left as a live `ExitSubscribed`.
+    #[test]
+    fn exit_wake_reroutes_exit_observed_only_after_persist() {
+        let db = block_on(crate::storage::migrated_test_db("term_exit_reread.db"));
+        let orch = test_orchestrator(db);
+        block_on(seed(&orch.db.local));
+        block_on(seed_live_turn(&orch.db.local));
+        block_on(orch.db.local.execute(
+            "UPDATE job_terminals SET status='exited', exit_code=3, exited_at=50, output_tail='boom' WHERE session_id='s1'",
+            (),
+        ))
+        .unwrap();
+
+        let uri = node_uri();
+        let outcome = block_on(subscribe_terminal_exit_wake_once(
+            &orch,
+            "j",
+            "run-1",
+            &uri,
+            None,
+            Some("s1"),
+            "agent",
+        ))
+        .unwrap();
+        assert!(
+            matches!(outcome, TerminalWakeSubscriptionOutcome::ExitAlreadyQueued),
+            "post-persist re-read must observe the already-exited terminal and route its exit"
+        );
+
+        let subs = block_on(crate::orchestrator::wakes::list_subscriptions_for_job(
+            &orch.db.local,
+            "j",
+        ))
+        .unwrap();
+        assert!(
+            !subs.iter().any(|s| s.source_kind == "process"),
+            "the routed exit must consume the newly persisted one-shot exit subscription"
+        );
     }
 
     #[test]
@@ -2668,27 +4512,6 @@ mod terminal_finalize_tests {
             &parent_target
         ))
         .is_ok());
-    }
-
-    #[test]
-    fn finalize_by_session_records_honest_kill_code_and_retains_row() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_d.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-
-        // No live session in the PTY map: finalize-by-session records the SIGKILL
-        // convention (never success) and retains the row, not deletes it.
-        finalize_terminal_by_session_id(&orch, "s1").unwrap();
-
-        let (status, code, _) = block_on(read_terminal(&orch.db.local, "s1"));
-        assert_eq!(status, "exited");
-        assert_eq!(code, Some(KILLED_EXIT_CODE));
-
-        // Idempotent: a second stop no-ops because the row is no longer running.
-        finalize_terminal_by_session_id(&orch, "s1").unwrap();
-        let (status2, code2, _) = block_on(read_terminal(&orch.db.local, "s1"));
-        assert_eq!(status2, "exited");
-        assert_eq!(code2, Some(KILLED_EXIT_CODE));
     }
 
     /// Regression: synthetic Cairn messages (fence denials, restart notices) are

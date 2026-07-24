@@ -55,22 +55,22 @@ const MAX_TARGET_LEN: usize = 300;
 /// One extracted tool invocation, ready to upsert into `tool_invocations`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolInvocation {
-    pub event_id: String,
-    pub tool_use_id: String,
-    pub run_id: String,
-    pub ts: i64,
-    pub verb: String,
-    pub tool_name: String,
-    pub target_scheme: String,
-    pub target_kind: String,
-    pub target_path: Option<String>,
-    pub is_error: bool,
-    pub result_ts: Option<i64>,
+    pub(crate) event_id: String,
+    pub(crate) tool_use_id: String,
+    pub(crate) run_id: String,
+    pub(crate) ts: i64,
+    pub(crate) verb: String,
+    pub(crate) tool_name: String,
+    pub(crate) target_scheme: String,
+    pub(crate) target_kind: String,
+    pub(crate) target_path: Option<String>,
+    pub(crate) is_error: bool,
+    pub(crate) result_ts: Option<i64>,
 }
 
 impl ToolInvocation {
     /// Stable upsert key: one row per (event, tool use).
-    pub fn id(&self) -> String {
+    pub(crate) fn id(&self) -> String {
         format!("{}:{}", self.event_id, self.tool_use_id)
     }
 }
@@ -83,7 +83,7 @@ impl ToolInvocation {
 /// tool-use-id -> (is_error, result timestamp) map, then
 /// [`extract_event_invocations`] over every assistant event yields the rows
 /// (result fields linked from the map).
-pub fn extract_run_invocations(events: &[Event]) -> Vec<ToolInvocation> {
+pub(crate) fn extract_run_invocations(events: &[Event]) -> Vec<ToolInvocation> {
     let mut results: HashMap<String, (bool, i64)> = HashMap::new();
     for event in events {
         if event.event_type != "tool_result" {
@@ -117,7 +117,7 @@ pub fn extract_run_invocations(events: &[Event]) -> Vec<ToolInvocation> {
 /// later event). The per-event counterpart of [`extract_run_invocations`]'s
 /// second pass, used by the live insert-time Tier B maintenance so a streamed
 /// assistant event's tool uses are indexed without reconstructing the whole run.
-pub fn extract_event_invocations(
+pub(crate) fn extract_event_invocations(
     event_id: &str,
     run_id: &str,
     created_at: i64,
@@ -154,7 +154,7 @@ pub fn extract_event_invocations(
 /// The `(tool_use_id, is_error)` a SINGLE `tool_result` event links, or `None`
 /// when its data carries no tool-use id. Used both by the run-level error map
 /// and by the per-event Tier B maintenance (which updates the matching row).
-pub fn tool_result_error(data: &str) -> Option<(String, bool)> {
+pub(crate) fn tool_result_error(data: &str) -> Option<(String, bool)> {
     let parsed = serde_json::from_str::<TranscriptEvent>(data).ok()?;
     let id = parsed.tool_use_id?;
     Some((id, parsed.is_error))

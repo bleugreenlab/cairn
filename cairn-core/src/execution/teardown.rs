@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 /// fs-only sweep — leaves its `.git/worktrees/<name>` registration behind, and
 /// those accumulate until they slow down and collide with future
 /// `git worktree add` calls.
-pub(crate) fn remove_worktree_robust(
+fn remove_worktree_robust(
     orch: &Orchestrator,
     repo_path: &str,
     wt_path: &Path,
@@ -285,7 +285,7 @@ pub(crate) async fn execute_target_cleanup(
     // something the other cannot: detached grandchildren vs. DB rows and the
     // browser channel.
     kill_terminals_for_jobs(orch, db, &target.job_ids).await;
-    kill_repls_for_jobs(orch, &target.job_ids);
+    kill_repls_for_jobs(orch, &target.job_ids).await;
 
     // Archive the execution's at-risk events to git coordinates (with a zstd
     // backstop) before the worktree and branch disappear, the immutability
@@ -376,7 +376,7 @@ pub(crate) async fn execute_target_cleanup(
 }
 
 /// Which jobs a teardown pass considers.
-pub enum TeardownScope {
+pub(crate) enum TeardownScope {
     /// All jobs across an issue (PR merge/close, issue close/delete).
     Issue(String),
     /// Exactly one job's worktree. Used to reclaim an ambient parent's ephemeral
@@ -408,10 +408,10 @@ pub enum TeardownReason {
 /// that references it (captures inheritance fan-out).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeardownTarget {
-    pub worktree_path: String,
-    pub branch: Option<String>,
-    pub repo_path: String,
-    pub job_ids: Vec<String>,
+    pub(crate) worktree_path: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) repo_path: String,
+    pub(crate) job_ids: Vec<String>,
 }
 
 /// Compute the set of worktree paths to tear down in `scope`.
@@ -423,10 +423,7 @@ pub struct TeardownTarget {
 ///
 /// Takes `&LocalDb` rather than `&Orchestrator`: the decision is pure DB work and
 /// is the testable heart of the owner.
-pub async fn plan_teardown(
-    db: &LocalDb,
-    scope: &TeardownScope,
-) -> Result<Vec<TeardownTarget>, String> {
+async fn plan_teardown(db: &LocalDb, scope: &TeardownScope) -> Result<Vec<TeardownTarget>, String> {
     let (scope_col, scope_id) = match scope {
         TeardownScope::Issue(id) => ("issue_id", id.clone()),
         TeardownScope::Job(id) => ("id", id.clone()),
@@ -499,7 +496,7 @@ pub(crate) fn group_into_targets(
 /// Reached only at issue/PR-terminal transitions (PR merge/close, issue
 /// close/merge, issue delete). Issue-wide and unconditional — the work is done
 /// by the time any of these fire.
-pub async fn teardown_worktrees(
+pub(crate) async fn teardown_worktrees(
     orch: &Orchestrator,
     scope: TeardownScope,
     reason: TeardownReason,
@@ -835,7 +832,7 @@ pub async fn teardown_removed_node_worktrees(
             .await
             .unwrap_or_else(|_| orch.db.local.clone());
         kill_terminals_for_jobs(orch, &db, cancelled_job_ids).await;
-        kill_repls_for_jobs(orch, cancelled_job_ids);
+        kill_repls_for_jobs(orch, cancelled_job_ids).await;
     }
     if targets.is_empty() {
         return;
@@ -874,58 +871,76 @@ pub async fn teardown_removed_node_worktrees(
 /// DB-free registry is the single source of truth, so this is the whole story:
 /// drain the matching entries and SIGKILL each eval-server. The orphan-prevention
 /// guarantee for stateful REPLs.
-fn kill_repls_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
-    for session in orch.repl_state.remove_for_jobs(job_ids) {
-        session.kill();
+async fn kill_repls_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
+    for (job_id, slug, session) in orch.repl_state.remove_for_jobs(job_ids) {
+        let interpreter = session.interpreter;
+        session.stop_and_release(orch).await;
+        crate::mcp::handlers::repl::emit_repl_state(orch, &job_id, &slug, interpreter, "exited");
     }
 }
 
 /// Kill running PTY sessions for the given jobs and delete their terminal rows.
 ///
-/// Uses `orch.pty_state`, which both hosts share. On cairn-server (no live PTY
-/// sessions) this naturally no-ops the kill while still clearing terminal rows.
+/// Uses the runner's terminal bindings to issue fenced executor stop/release
+/// operations before clearing durable rows.
 async fn kill_terminals_for_jobs(orch: &Orchestrator, db: &LocalDb, job_ids: &[String]) {
     if job_ids.is_empty() {
         return;
     }
 
-    // Kill live PTY sessions for running terminals first.
+    // Stop live executor-hosted PTYs before releasing their lease authority.
     match load_running_terminals_for_jobs(db, job_ids).await {
         Ok(running) => {
             for (terminal_id, session_id) in &running {
-                let removed = match orch.pty_state.sessions.lock() {
-                    Ok(mut sessions) => sessions.remove(session_id),
-                    Err(e) => {
-                        log::warn!("Teardown: failed to lock PTY sessions: {}", e);
-                        continue;
-                    }
-                };
-                if let Some(session_arc) = removed {
-                    let terminal_id = terminal_id.clone();
-                    let session_id = session_id.clone();
-                    let killed = tokio::task::spawn_blocking(move || {
-                        if let Ok(mut session) = session_arc.lock() {
-                            let _ = session.child.kill();
-                            let _ = session.child.wait(); // avoid zombies
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .await
-                    .unwrap_or(false);
-                    if killed {
-                        log::info!(
-                            "Teardown: killed terminal {} (session {})",
-                            terminal_id,
-                            session_id
-                        );
-                    }
+                if let Err(error) =
+                    crate::mcp::handlers::terminal::stop_terminal_by_session(orch, session_id).await
+                {
+                    log::warn!("Teardown: failed to stop terminal {terminal_id}: {error}");
+                } else {
+                    log::info!("Teardown: stopped terminal {terminal_id} (session {session_id})");
                 }
             }
         }
         Err(e) => {
             log::warn!("Teardown: failed to load running terminals: {}", e);
+        }
+    }
+
+    // The terminal process, working directory, and retained admission reservation
+    // are executor-owned. Release that authority only at
+    // owner teardown; ordinary terminal exit deliberately keeps it resident.
+    let job_ids_for_query = job_ids.to_vec();
+    let leases = db.read(|conn| Box::pin(async move {
+        let placeholders = std::iter::repeat_n("?", job_ids_for_query.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT DISTINCT lease_id, lease_incarnation_id, lease_epoch, job_id FROM job_terminals WHERE lease_id IS NOT NULL AND job_id IN ({placeholders})");
+        let values = job_ids_for_query.iter().cloned().map(cairn_db::turso::Value::Text).collect::<Vec<_>>();
+        let mut rows = conn.query(&sql, values).await?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push((row.text(0)?, row.text(1)?, row.get::<i64>(2)? as u64, row.text(3)?));
+        }
+        Ok(result)
+    })).await;
+    if let Ok(leases) = leases {
+        for (lease_id, incarnation_id, lease_epoch, job_id) in leases {
+            let result = orch.fleet.operate_lifetime_lease(orch,
+                cairn_common::executor_protocol::LifetimeLeaseOperation::Release {
+                    fence: cairn_common::executor_protocol::LifetimeLeaseFence {
+                        lease_id: lease_id.clone(),
+                        owner: cairn_common::executor_protocol::LifetimeLeaseOwner {
+                            kind: cairn_common::executor_protocol::LifetimeLeaseOwnerKind::Terminal,
+                            owner_id: job_id,
+                        },
+                        incarnation_id,
+                        lease_epoch,
+                    },
+                }).await;
+            if let cairn_common::executor_protocol::LifetimeLeaseResult::Failed {
+                diagnostic, ..
+            } = result
+            {
+                log::warn!("Teardown: failed to release terminal lease {lease_id}: {diagnostic}");
+            }
         }
     }
 

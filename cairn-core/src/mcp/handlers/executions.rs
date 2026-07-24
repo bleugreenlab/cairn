@@ -49,7 +49,7 @@ async fn resolve_project_and_issue(
 }
 
 /// Start a new execution for an issue from an append to its executions collection.
-pub async fn start_execution_from_collection(
+pub(crate) async fn start_execution_from_collection(
     orch: &Orchestrator,
     project_key: &str,
     number: i32,
@@ -93,7 +93,7 @@ pub async fn start_execution_from_collection(
 /// exact pipeline the UI command uses, so a URI edit and a UI edit are
 /// byte-for-byte the same operation.
 #[allow(clippy::too_many_arguments)]
-pub async fn edit_execution_agent(
+pub(crate) async fn edit_execution_agent(
     orch: &Orchestrator,
     request: &CallbackRequest,
     project_key: &str,

@@ -35,17 +35,17 @@ pub(crate) const BRIDGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// which now measures only post-ready bridge responsiveness. A slow first
 /// compile (Vite dep-optimization, 5–15s) should read as "still loading" and be
 /// re-read, not be masked by an inflated bridge timeout.
-pub(crate) const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a read waits for the host to ack an `OpenForRead` before proceeding.
 /// Best-effort: on timeout the read continues (degrading to the pre-fix sampling
 /// behavior, still protected by the readiness wait + post-failure retry), so a
 /// wedged main thread can never hang a read indefinitely.
-pub(crate) const OPEN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const OPEN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve a browser resource URI to its owning scope plus slug. Node/task
 /// browsers resolve to the backing job; project browsers to the project row.
-pub(crate) async fn resolve_browser_scope(
+async fn resolve_browser_scope(
     db: &LocalDb,
     resource: &CairnResource,
 ) -> Result<(BrowserScope, String), String> {
@@ -372,7 +372,7 @@ struct CaptureReply {
 /// `about:blank` and pages where the content script is blocked. Returns the
 /// base64 PNG on success. Same headless fallback: errors cleanly when no webview
 /// layer is wired.
-pub(crate) async fn browser_capture_roundtrip(
+async fn browser_capture_roundtrip(
     orch: &Orchestrator,
     browser_id: &str,
     timeout: Duration,

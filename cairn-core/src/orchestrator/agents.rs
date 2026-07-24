@@ -84,6 +84,14 @@ impl ConfigResource for AgentResource {
         file.is_project_scoped
     }
 
+    fn file_bundles(file: &Self::File) -> &[String] {
+        &file.bundles
+    }
+
+    fn package_kind() -> crate::config::contextual_packages::ContextualPackageKind {
+        crate::config::contextual_packages::ContextualPackageKind::Agent
+    }
+
     fn to_config(
         file: Self::File,
         workspace_id: Option<String>,
@@ -133,6 +141,7 @@ impl ConfigResource for AgentResource {
             skills: input.skills,
             hooks: None,
             icon: input.icon,
+            bundles: Vec::new(),
             is_project_scoped,
             file_path: PathBuf::new(),
         }
@@ -181,6 +190,7 @@ impl ConfigResource for AgentResource {
             skills: merge_optional(&existing.skills, &input.skills),
             hooks: existing.hooks.clone(),
             icon: merge_optional(&existing.icon, &input.icon),
+            bundles: existing.bundles.clone(),
             is_project_scoped: new_is_project_scoped,
             file_path: if scope_changing {
                 PathBuf::new()
@@ -230,6 +240,7 @@ impl ConfigResource for AgentResource {
             skills: source.skills.clone(),
             hooks: source.hooks.clone(),
             icon: source.icon.clone(),
+            bundles: source.bundles.clone(),
             is_project_scoped,
             file_path: PathBuf::new(),
         }
@@ -457,8 +468,17 @@ mod tests {
             .iter()
             .any(|a| a.id == "planner"));
 
-        crate::config_disables::disable_config(&orch.db.local, "p1", "agent", "planner")
-            .await
+        let package_ref = crate::config::contextual_packages::ContextualPackageRef {
+            kind: crate::config::contextual_packages::ContextualPackageKind::Agent,
+            id: "planner".to_string(),
+        };
+        let mut settings =
+            crate::config::project_settings::load_project_settings(project_dir.path());
+        settings
+            .contextual_packages
+            .get_or_insert_default()
+            .disable(package_ref.clone());
+        crate::config::project_settings::save_project_settings(project_dir.path(), &settings)
             .unwrap();
         assert!(!orch
             .list_agents_for_context("p1")
@@ -466,8 +486,13 @@ mod tests {
             .iter()
             .any(|a| a.id == "planner"));
 
-        crate::config_disables::enable_config(&orch.db.local, "p1", "agent", "planner")
-            .await
+        let mut settings =
+            crate::config::project_settings::load_project_settings(project_dir.path());
+        settings
+            .contextual_packages
+            .get_or_insert_default()
+            .remove_disabled(&package_ref);
+        crate::config::project_settings::save_project_settings(project_dir.path(), &settings)
             .unwrap();
         assert!(orch
             .list_agents_for_context("p1")

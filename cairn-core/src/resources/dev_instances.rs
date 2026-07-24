@@ -122,7 +122,7 @@ fn instances_from(home_root: &Path, registry: &BTreeMap<String, u32>) -> Vec<Dev
 /// slug key. The home-exists filter drops dead registry entries (a branch whose
 /// `~/.cairn-dev-<key>` was deleted) so they never appear in listings or count
 /// toward ambiguity.
-pub(crate) fn discover_instances() -> Vec<DevInstance> {
+fn discover_instances() -> Vec<DevInstance> {
     let Some(home_root) = paths::os_home_dir() else {
         return Vec::new();
     };
@@ -229,7 +229,7 @@ fn build_db_uri(sql: &str, offset: usize, limit: usize) -> String {
 /// SQL rows are escaped to single lines, so the first blank line marks the start
 /// of the appended affordance. Everything between the frame header and that blank
 /// line is the rows body (or the producer's single-line error message).
-pub(crate) fn extract_db_body(text: &str) -> String {
+fn extract_db_body(text: &str) -> String {
     let after_header = match text.split_once('\n') {
         Some((first, rest)) if first.starts_with("=== ") && first.ends_with(" ===") => rest,
         // Single-line body (bare header / short error) or no frame: keep as-is.
@@ -325,7 +325,7 @@ pub(crate) async fn query_db(
 /// daemon's unrelated pid — no `lsof`, and the callback proves liveness in the
 /// same round trip the db relay uses.
 /// Errors are short fragments composed into a `pid_line`.
-pub(crate) async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
+async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
     let token = cairn_common::auth::load_mcp_token_from(&instance.home).ok_or_else(|| {
         format!(
             "MCP secret unreadable at {}",

@@ -172,10 +172,7 @@ pub(crate) async fn issue_settled(db: &LocalDb, issue_id: &str) -> Result<bool, 
     .map_err(|e| e.to_string())
 }
 
-pub(crate) async fn issue_settled_conn(
-    conn: &cairn_db::turso::Connection,
-    issue_id: &str,
-) -> DbResult<bool> {
+async fn issue_settled_conn(conn: &cairn_db::turso::Connection, issue_id: &str) -> DbResult<bool> {
     // A transient action_run (the pr action opening the PR, or any other action
     // node mid-run) is imminent work. `blocked` (open-PR human gate), `complete`,
     // and `failed` are settled.

@@ -35,11 +35,14 @@ ast-grep-outline = { path = "../ast-grep-outline" }
 # fine), frecency/history LMDB stores are disabled at runtime (None paths), and
 # the process-wide SIGSEGV handler only installs via fff::log::init_tracing,
 # which this crate never calls. The exact-version pin is also load-bearing for
-# crash-safety: 0.9.6 memory-maps any grepped file at/above FRESH_MMAP_THRESHOLD
-# (256 KiB Unix / 1 MiB macOS), and a file truncated while mapped raises an
-# uncatchable SIGBUS that kills the runner (CAIRN-2574). worktree_search caps
-# max_file_size below that threshold to keep fff off mmap; if a future bump
-# changes those thresholds, MMAP_SAFE_MAX_FILE_SIZE must move with them.
+# crash-safety: 0.9.6 can lazily persist an mmap from get_cached_content at
+# MMAP_THRESHOLD (16 KiB on aarch64), or freshly mmap a grep input at/above
+# FRESH_MMAP_THRESHOLD (256 KiB Unix / 1 MiB macOS). A concurrent truncation
+# then raises an uncatchable SIGBUS that kills the runner (CAIRN-2574,
+# CAIRN-3074). worktree_search relies on get_cached_content's zero-budget check
+# to close the lazy path and caps max_file_size below the fresh threshold. A
+# future bump must preserve those budget semantics and thresholds, or update
+# ContentCacheBudget and MMAP_SAFE_MAX_FILE_SIZE with them.
 fff-search = { version = "=0.9.6", default-features = false }
 
 [dev-dependencies]

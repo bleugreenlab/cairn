@@ -137,8 +137,7 @@ pub fn render_commit_diff(store: &ObjectStore, commit_hex: &str) -> Result<Strin
         .parent_ids()
         .next();
 
-    let new_tree = read_tree(store, &tree_id)
-        .ok_or_else(|| format!("missing or non-tree object {tree_id}"))?;
+    let new_tree = read_tree(store, &tree_id)?;
     let old_tree = match parent_id {
         Some(parent) => {
             let (pk, pbytes) = store
@@ -150,14 +149,13 @@ pub fn render_commit_diff(store: &ObjectStore, commit_hex: &str) -> Result<Strin
             let parent_tree = CommitRefIter::from_bytes(&pbytes, HASH_KIND)
                 .tree_id()
                 .map_err(|e| format!("decoding parent tree id: {e}"))?;
-            read_tree(store, &parent_tree)
-                .ok_or_else(|| format!("missing or non-tree object {parent_tree}"))?
+            read_tree(store, &parent_tree)?
         }
         None => BTreeMap::new(),
     };
 
     let mut changes: Vec<FileChange> = Vec::new();
-    diff_trees(store, &old_tree, &new_tree, "", &mut changes);
+    diff_trees(store, &old_tree, &new_tree, "", &mut changes)?;
     changes.sort_by(|a, b| a.path.cmp(&b.path));
 
     let mut out = String::new();
@@ -197,7 +195,7 @@ fn resolve_commit_tree(
     let tree_id = CommitRefIter::from_bytes(&commit, HASH_KIND)
         .tree_id()
         .map_err(|e| format!("decoding commit tree id: {e}"))?;
-    read_tree(store, &tree_id).ok_or_else(|| format!("missing or non-tree object {tree_id}"))
+    read_tree(store, &tree_id)
 }
 
 /// Collect the sorted set of file changes between two commit trees.
@@ -209,7 +207,7 @@ fn range_changes(
     let old_tree = resolve_commit_tree(store, base_oid)?;
     let new_tree = resolve_commit_tree(store, tip_oid)?;
     let mut changes: Vec<FileChange> = Vec::new();
-    diff_trees(store, &old_tree, &new_tree, "", &mut changes);
+    diff_trees(store, &old_tree, &new_tree, "", &mut changes)?;
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(changes)
 }
@@ -331,13 +329,16 @@ fn count_changes(patch: &str) -> (u32, u32) {
     (additions, deletions)
 }
 
-fn read_tree(store: &ObjectStore, tree: &oid) -> Option<BTreeMap<Vec<u8>, TreeEntry>> {
-    let (kind, bytes) = store.resolve_object(tree)?;
+fn read_tree(store: &ObjectStore, tree: &oid) -> Result<BTreeMap<Vec<u8>, TreeEntry>, String> {
+    let (kind, bytes) = store
+        .resolve_object(tree)
+        .ok_or_else(|| format!("missing tree {tree}"))?;
     if kind != ObjectKind::Tree {
-        return None;
+        return Err(format!("object {tree} is not a tree"));
     }
     let mut map = BTreeMap::new();
-    for entry in TreeRefIter::from_bytes(&bytes, HASH_KIND).filter_map(Result::ok) {
+    for entry in TreeRefIter::from_bytes(&bytes, HASH_KIND) {
+        let entry = entry.map_err(|error| format!("decoding tree {tree}: {error}"))?;
         map.insert(
             entry.filename.to_vec(),
             TreeEntry {
@@ -347,7 +348,7 @@ fn read_tree(store: &ObjectStore, tree: &oid) -> Option<BTreeMap<Vec<u8>, TreeEn
             },
         );
     }
-    Some(map)
+    Ok(map)
 }
 
 fn diff_trees(
@@ -356,7 +357,7 @@ fn diff_trees(
     new: &BTreeMap<Vec<u8>, TreeEntry>,
     prefix: &str,
     out: &mut Vec<FileChange>,
-) {
+) -> Result<(), String> {
     let names: BTreeSet<&Vec<u8>> = old.keys().chain(new.keys()).collect();
     for name in names {
         let name_str = String::from_utf8_lossy(name);
@@ -369,15 +370,15 @@ fn diff_trees(
             (Some(o), Some(n)) if o.oid == n.oid && o.mode == n.mode => {}
             (Some(o), Some(n)) => {
                 if o.is_tree && n.is_tree {
-                    let os = read_tree(store, &o.oid).unwrap_or_default();
-                    let ns = read_tree(store, &n.oid).unwrap_or_default();
-                    diff_trees(store, &os, &ns, &path, out);
+                    let os = read_tree(store, &o.oid)?;
+                    let ns = read_tree(store, &n.oid)?;
+                    diff_trees(store, &os, &ns, &path, out)?;
                 } else if o.is_tree {
-                    collect_subtree(store, &o.oid, &path, ChangeKind::Delete, out);
+                    collect_subtree(store, &o.oid, &path, ChangeKind::Delete, out)?;
                     out.push(added(&path, n));
                 } else if n.is_tree {
                     out.push(deleted(&path, o));
-                    collect_subtree(store, &n.oid, &path, ChangeKind::Add, out);
+                    collect_subtree(store, &n.oid, &path, ChangeKind::Add, out)?;
                 } else {
                     out.push(FileChange {
                         path,
@@ -389,14 +390,14 @@ fn diff_trees(
             }
             (Some(o), None) => {
                 if o.is_tree {
-                    collect_subtree(store, &o.oid, &path, ChangeKind::Delete, out);
+                    collect_subtree(store, &o.oid, &path, ChangeKind::Delete, out)?;
                 } else {
                     out.push(deleted(&path, o));
                 }
             }
             (None, Some(n)) => {
                 if n.is_tree {
-                    collect_subtree(store, &n.oid, &path, ChangeKind::Add, out);
+                    collect_subtree(store, &n.oid, &path, ChangeKind::Add, out)?;
                 } else {
                     out.push(added(&path, n));
                 }
@@ -404,6 +405,7 @@ fn diff_trees(
             (None, None) => {}
         }
     }
+    Ok(())
 }
 
 fn collect_subtree(
@@ -412,10 +414,8 @@ fn collect_subtree(
     prefix: &str,
     kind: ChangeKind,
     out: &mut Vec<FileChange>,
-) {
-    let Some(entries) = read_tree(store, tree) else {
-        return;
-    };
+) -> Result<(), String> {
+    let entries = read_tree(store, tree)?;
     for (name, entry) in entries {
         let name_str = String::from_utf8_lossy(&name);
         let path = format!("{prefix}/{name_str}");
@@ -424,7 +424,7 @@ fn collect_subtree(
                 ChangeKind::Add => ChangeKind::Add,
                 _ => ChangeKind::Delete,
             };
-            collect_subtree(store, &entry.oid, &path, next_kind, out);
+            collect_subtree(store, &entry.oid, &path, next_kind, out)?;
         } else {
             match kind {
                 ChangeKind::Add => out.push(added(&path, &entry)),
@@ -432,6 +432,7 @@ fn collect_subtree(
             }
         }
     }
+    Ok(())
 }
 
 fn added(path: &str, entry: &TreeEntry) -> FileChange {

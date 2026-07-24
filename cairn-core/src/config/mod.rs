@@ -35,6 +35,7 @@
 pub mod agents;
 pub mod build_services;
 pub mod check_exemption;
+pub mod contextual_packages;
 pub mod dev_commands;
 pub mod keybinds;
 pub mod mcp_import;
@@ -48,6 +49,7 @@ pub mod provider_options;
 pub mod recipes;
 pub mod secrets;
 pub mod settings;
+pub mod skill_archive;
 pub mod skill_fetch;
 pub mod skills;
 pub mod snapshot_migrate;
@@ -111,7 +113,7 @@ pub async fn get_project_path(db: &LocalDb, project_id: &str) -> Result<PathBuf,
 /// `project_path` is not inside a git work tree (e.g. a workspace `~/.cairn`
 /// directory), when there was nothing to commit, or when staging/committing
 /// failed.
-pub(crate) fn commit_project_config_change(project_path: &Path, msg: &str) -> Option<String> {
+fn commit_project_config_change(project_path: &Path, msg: &str) -> Option<String> {
     // Only operate inside a real git work tree. Workspace config lives in
     // ~/.cairn, which is not a repo, so this guard makes the helper a safe no-op
     // for workspace-scoped writes.
@@ -313,7 +315,7 @@ pub(crate) fn commit_and_maybe_push(paths: &[PathBuf], msg: &str, push_root: Opt
 /// Standalone and synchronous so it is unit-testable directly against a temp
 /// repo with a bare origin; production reaches it through the detached thread
 /// spawned by [`commit_and_maybe_push`].
-pub(crate) fn push_workspace_repo_best_effort(repo_root: &Path) {
+fn push_workspace_repo_best_effort(repo_root: &Path) {
     // No origin configured -> nothing to push.
     match crate::env::git()
         .args(["remote", "get-url", "origin"])
@@ -372,7 +374,7 @@ fn git_work_tree_root(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Ensure config directories exist
-pub(crate) fn config_root_subdirs(
+fn config_root_subdirs(
     config_dir: &Path,
     project_path: Option<&Path>,
     subdir: &str,
@@ -414,13 +416,7 @@ pub(crate) const BUNDLE_RESOURCE_DIRS: [&str; 4] = ["agents", "recipes", "skills
 /// is user-authorable and copy-when-missing everywhere else, so a wholesale
 /// reset must not delete `<CAIRN_HOME>/workflows`. A deleted built-in workflow
 /// is re-seeded non-destructively by the next startup sync instead.
-pub(crate) const MIRROR_RESET_DIRS: [&str; 3] = ["agents", "recipes", "skills"];
-
-/// Recursively mirror `source_dir` into `dest_dir`, replacing any existing destination tree.
-pub fn mirror_dir(source_dir: &Path, dest_dir: &Path) -> Result<(), String> {
-    let fs = crate::services::RealFileSystem;
-    mirror_dir_with_fs(&fs, source_dir, dest_dir)
-}
+const MIRROR_RESET_DIRS: [&str; 3] = ["agents", "recipes", "skills"];
 
 /// Mirror bundled agents, recipes, and skills into `target_dir`, resetting them
 /// to their shipped defaults.
@@ -435,7 +431,7 @@ pub fn mirror_bundle_resources(resource_dir: &Path, target_dir: &Path) -> Result
     mirror_bundle_resources_with_fs(&fs, resource_dir, target_dir)
 }
 
-pub(crate) fn mirror_bundle_resources_with_fs(
+fn mirror_bundle_resources_with_fs(
     fs: &dyn crate::services::FileSystem,
     resource_dir: &Path,
     target_dir: &Path,
@@ -461,7 +457,7 @@ pub(crate) fn mirror_bundle_resources_with_fs(
     Ok(())
 }
 
-pub(crate) fn mirror_dir_with_fs(
+fn mirror_dir_with_fs(
     fs: &dyn crate::services::FileSystem,
     source_dir: &Path,
     dest_dir: &Path,
@@ -512,66 +508,6 @@ pub fn bundled_resource_ids(resource_dir: &Path, dir_name: &str) -> Result<Vec<S
     Ok(ids)
 }
 
-/// Restore one bundled config artifact (agent | recipe | skill) over its
-/// workspace copy and commit the change. The per-artifact analog of
-/// [`mirror_bundle_resources`], for resetting a single diverged workspace
-/// artifact back to its shipped default. Errors if the id has no bundled
-/// counterpart (a user-created artifact has no default to restore).
-///
-/// `entity_type` is the singular form used across the config commands
-/// (`agent` | `recipe` | `skill`). `resource_dir` is the app bundle's resource
-/// directory; `target_dir` is the workspace config dir (`~/.cairn`).
-pub fn restore_bundled_config_entry(
-    resource_dir: &Path,
-    target_dir: &Path,
-    entity_type: &str,
-    id: &str,
-) -> Result<(), String> {
-    let subdir = match entity_type {
-        "agent" => "agents",
-        "recipe" => "recipes",
-        "skill" => "skills",
-        other => return Err(format!("No bundled defaults for entity type '{other}'")),
-    };
-
-    let dest = if subdir == "skills" {
-        let source = resource_dir.join(subdir).join(id);
-        if !source.join("SKILL.md").exists() {
-            return Err(format!("No bundled default for skill '{id}'"));
-        }
-        let dest = target_dir.join(subdir).join(id);
-        let fs = crate::services::RealFileSystem;
-        mirror_dir_with_fs(&fs, &source, &dest)?;
-        dest
-    } else {
-        let extensions: &[&str] = if subdir == "agents" {
-            &["md"]
-        } else {
-            &["yaml", "yml"]
-        };
-        let source = extensions
-            .iter()
-            .map(|ext| resource_dir.join(subdir).join(format!("{id}.{ext}")))
-            .find(|path| path.exists())
-            .ok_or_else(|| format!("No bundled default for {entity_type} '{id}'"))?;
-        let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let dest = target_dir.join(subdir).join(format!("{id}.{ext}"));
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create {subdir} directory: {e}"))?;
-        }
-        std::fs::copy(&source, &dest)
-            .map_err(|e| format!("Failed to copy bundled {entity_type} '{id}': {e}"))?;
-        dest
-    };
-
-    commit_config_paths(
-        std::slice::from_ref(&dest),
-        &format!("cairn: reset {entity_type} {id}"),
-    );
-    Ok(())
-}
-
 /// Result type for config file loading - includes both successful loads and parse errors
 #[derive(Debug, Clone)]
 pub enum ConfigResult<T> {
@@ -582,7 +518,7 @@ pub enum ConfigResult<T> {
 }
 
 /// Extract ID from a file path (filename without extension)
-pub fn id_from_path(path: &std::path::Path) -> Option<String> {
+pub(crate) fn id_from_path(path: &std::path::Path) -> Option<String> {
     path.file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
@@ -592,7 +528,7 @@ pub fn id_from_path(path: &std::path::Path) -> Option<String> {
 ///
 /// Unicode-aware: preserves letters and digits from any script. Used for agent,
 /// skill, and recipe identifiers where names may be non-ASCII.
-pub fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     name.to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -608,7 +544,7 @@ pub fn slugify(name: &str) -> String {
 /// Mirrors `slugifyResourceSegment` in `packages/ui/src/uri.ts` exactly so that
 /// URIs emitted by the backend and the browser are byte-identical for any
 /// given input.
-pub fn slugify_resource_segment(value: &str) -> String {
+pub(crate) fn slugify_resource_segment(value: &str) -> String {
     value
         .to_lowercase()
         .chars()
@@ -638,7 +574,7 @@ pub fn slugify_resource_segment(value: &str) -> String {
 ///
 /// The reserved set must be prepopulated with the already-assigned slugs
 /// (normalized through `slugify_resource_segment`) for sibling task jobs.
-pub fn derive_unique_task_slug(description: &str, reserved: &HashSet<String>) -> String {
+pub(crate) fn derive_unique_task_slug(description: &str, reserved: &HashSet<String>) -> String {
     let slugged = slugify_resource_segment(description);
     let words: Vec<&str> = slugged.split('-').filter(|s| !s.is_empty()).collect();
 
@@ -671,96 +607,6 @@ fn next_available(base: &str, reserved: &HashSet<String>) -> String {
     }
 }
 
-/// Copy files from source to dest directory, skipping files that already exist.
-pub fn copy_dir_contents(
-    source_dir: &Path,
-    dest_dir: &Path,
-    extension: &str,
-) -> Result<(), String> {
-    let entries = std::fs::read_dir(source_dir)
-        .map_err(|e| format!("Failed to read directory {:?}: {}", source_dir, e))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let path = entry.path();
-
-        // Skip directories and files with wrong extension
-        if path.is_dir() {
-            continue;
-        }
-
-        let file_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if file_ext != extension && !(extension == "yaml" && file_ext == "yml") {
-            continue;
-        }
-
-        // Get filename and determine destination
-        let filename = match path.file_name() {
-            Some(name) => name,
-            None => continue,
-        };
-
-        let dest_path = dest_dir.join(filename);
-
-        // Only copy if destination doesn't exist
-        if !dest_path.exists() {
-            std::fs::copy(&path, &dest_path)
-                .map_err(|e| format!("Failed to copy {:?} to {:?}: {}", path, dest_path, e))?;
-            log::info!("Copied bundled default: {:?}", dest_path);
-        }
-    }
-
-    Ok(())
-}
-
-/// Copy files from source to dest directory, always overwriting.
-/// Collects restored filenames into the provided list.
-pub fn force_copy_dir_contents(
-    source_dir: &Path,
-    dest_dir: &Path,
-    extension: &str,
-    restored: &mut Vec<String>,
-) -> Result<(), String> {
-    let entries = std::fs::read_dir(source_dir)
-        .map_err(|e| format!("Failed to read directory {:?}: {}", source_dir, e))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let path = entry.path();
-
-        // Skip directories and files with wrong extension
-        if path.is_dir() {
-            continue;
-        }
-
-        let file_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if file_ext != extension && !(extension == "yaml" && file_ext == "yml") {
-            continue;
-        }
-
-        // Get filename and determine destination
-        let filename = match path.file_name() {
-            Some(name) => name,
-            None => continue,
-        };
-
-        let dest_path = dest_dir.join(filename);
-
-        // Always copy (overwrite if exists)
-        std::fs::copy(&path, &dest_path)
-            .map_err(|e| format!("Failed to copy {:?} to {:?}: {}", path, dest_path, e))?;
-
-        // Track the restored file (without extension)
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            restored.push(stem.to_string());
-        }
-
-        log::info!("Restored bundled default: {:?}", dest_path);
-    }
-
-    Ok(())
-}
-
 /// Result of restoring bundled defaults
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -774,7 +620,7 @@ pub struct RestoreResult {
 ///
 /// This loads recipes from YAML files rather than the database, since files
 /// are the source of truth for recipe configuration.
-pub fn get_recipe_from_files(
+pub(crate) fn get_recipe_from_files(
     config_dir: &std::path::Path,
     project_path: Option<&std::path::Path>,
     recipe_id: &str,
@@ -813,7 +659,7 @@ pub fn get_recipe_from_files(
 }
 
 /// Convert a FileRecipe to a Recipe with scope metadata
-pub fn file_recipe_to_recipe(
+fn file_recipe_to_recipe(
     file_recipe: recipes::FileRecipe,
     workspace_id: Option<String>,
     project_id: Option<String>,

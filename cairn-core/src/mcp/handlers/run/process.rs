@@ -3,16 +3,13 @@
 
 use super::output::{strip_streamable_tail, OutputTail};
 use super::sandbox_policy::build_run_sandbox_policy;
-use super::types::{
-    ItemOutcome, McpCallSpec, PromotedTerminal, RunCompletePayload, RunOutputPayload, RunSpec,
-};
-use crate::mcp::handlers::{normalize_command, terminal, RunContext};
+use super::types::{ItemOutcome, McpCallSpec, RunCompletePayload, RunOutputPayload, RunSpec};
+use crate::mcp::handlers::{normalize_command, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 use crate::services::{sandbox, SpawnConfig};
 use crate::storage::{LocalDb, RowExt};
-use portable_pty::CommandBuilder;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
@@ -21,17 +18,13 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 /// Raw process result before body formatting.
-pub(super) struct ExecOutput {
-    pub(super) stdout: String,
-    pub(super) stderr: String,
-    pub(super) exit_code: Option<i32>,
-    pub(super) timed_out: bool,
+struct ExecOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
     /// A kernel sandbox denial detected after execution (drives the fence).
-    pub(super) denial: Option<sandbox::SandboxDenial>,
-    /// Set when a timed-out item with a run context was detached to a terminal
-    /// instead of killed. Carries the partial output (in `stdout`/`stderr`) plus
-    /// where the still-running process can be reached.
-    pub(super) promoted: Option<PromotedTerminal>,
+    denial: Option<sandbox::SandboxDenial>,
 }
 
 /// Maximum output buffer size (64KB)
@@ -46,14 +39,11 @@ pub(crate) const MAX_BUFFER_SIZE: usize = 64 * 1024;
 /// overrides the env itself (for example `PAGER=less git log`).
 const NON_INTERACTIVE_PAGER: &str = "cat";
 
+pub(crate) const READ_ONLY_CHECKOUT_DENIAL: &str = "This command tried to write the project's live checkout, which is read-only for agents — the write was blocked by the kernel sandbox. Changes can only be made in a worktree; nothing was left in the checkout. Re-run inside a worktree to make changes that persist.";
+
 fn apply_non_interactive_pager_env(mut config: SpawnConfig) -> SpawnConfig {
     config = config.env("GIT_PAGER", NON_INTERACTIVE_PAGER);
     config.env("PAGER", NON_INTERACTIVE_PAGER)
-}
-
-pub(crate) fn apply_non_interactive_pager_env_to_pty(cmd: &mut CommandBuilder) {
-    cmd.env("GIT_PAGER", NON_INTERACTIVE_PAGER);
-    cmd.env("PAGER", NON_INTERACTIVE_PAGER);
 }
 
 /// Strip the dev-instance build-target routing env from a worktree command's
@@ -73,16 +63,6 @@ fn strip_dev_instance_routing_env(mut config: SpawnConfig) -> SpawnConfig {
         config = config.env_remove(key);
     }
     config
-}
-
-/// PTY-spawn counterpart of [`strip_dev_instance_routing_env`]: removes the same
-/// dev-instance build-target routing keys from a `CommandBuilder` (whose base
-/// env is seeded from the host process) so a worktree terminal builds into its
-/// own target dir (CAIRN-2533).
-pub(crate) fn scrub_dev_instance_routing_pty(cmd: &mut CommandBuilder) {
-    for key in crate::env::DEV_INSTANCE_ROUTING_ENV {
-        cmd.env_remove(key);
-    }
 }
 
 /// Run a single resolved item: execute it, format its body, and (for shell
@@ -198,15 +178,12 @@ pub(crate) async fn run_one(
         // chat would otherwise surface.
         if !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
             let _ = denial;
-            return ItemOutcome::failed(
-                header,
-                "This command tried to write the project's live checkout, which is read-only for agents — the write was blocked by the kernel sandbox. Changes can only be made in a worktree; nothing was left in the checkout. Re-run inside a worktree to make changes that persist.",
-            );
+            return ItemOutcome::failed(header, READ_ONLY_CHECKOUT_DENIAL);
         }
         if let Some((run_id, fence_mode)) = fence::resolve_run_fence(orch, request).await {
             let crossing = match &denial {
-                sandbox::SandboxDenial::Path(p) => {
-                    fence::Crossing::shell_path(p.as_path(), &p.display().to_string())
+                sandbox::SandboxDenial::Path { path, .. } => {
+                    fence::Crossing::shell_path(path.as_path(), &path.display().to_string())
                 }
                 sandbox::SandboxDenial::Command => fence::Crossing::shell_command(
                     format!("command blocked by the worktree sandbox: {header}"),
@@ -249,6 +226,8 @@ pub(crate) async fn run_one(
                         succeeded: false,
                         suspended: true,
                         images: Vec::new(),
+                        promoted_terminal: None,
+                        tracked_modifications: None,
                     }
                 }
             }
@@ -269,43 +248,6 @@ pub(crate) async fn run_one(
         }
     }
 
-    // A timed-out item with a run context was detached to a terminal rather than
-    // killed. Its outcome is unknown, so it does NOT count as succeeded (a
-    // sequential batch with stop_on_error halts after it), and the shell-keyed
-    // side effects below (checkpoint cache, git auto-push) are skipped entirely.
-    if let Some(promoted) = exec.promoted.take() {
-        let mut body = String::new();
-        if !exec.stdout.is_empty() {
-            body.push_str(&exec.stdout);
-        }
-        if !exec.stderr.is_empty() {
-            if !body.is_empty() {
-                body.push_str("\n\n");
-            }
-            body.push_str("stderr:\n");
-            body.push_str(&exec.stderr);
-        }
-        if !body.is_empty() {
-            body.push_str("\n\n");
-        }
-        if promoted.wake_subscribed {
-            body.push_str(&format!(
-                "Command still running; detached to {0} — readable and killable there. \
-                 You will be notified when the command exits.",
-                promoted.uri
-            ));
-        } else {
-            body.push_str(&format!(
-                "Command still running; detached to {0} — readable and killable there. \
-                 Automatic exit notification could not be registered; if you need to wait for it, \
-                 subscribe via cairn:~/wakes: \
-                 {{subscribe:{{kind:\"terminal\", ref:\"{0}\", on:\"exit\"}}}}.",
-                promoted.uri
-            ));
-        }
-        return ItemOutcome::failed(header, body);
-    }
-
     let succeeded = !exec.timed_out && exec.exit_code.is_none_or(|code| code == 0);
 
     // Shell-only side effects keyed on the command string.
@@ -324,6 +266,8 @@ pub(crate) async fn run_one(
         succeeded,
         suspended: false,
         images: Vec::new(),
+        promoted_terminal: None,
+        tracked_modifications: None,
     }
 }
 
@@ -363,6 +307,8 @@ async fn run_mcp_call(
             succeeded: true,
             suspended: false,
             images: result.images,
+            promoted_terminal: None,
+            tracked_modifications: None,
         },
         Err(e) => ItemOutcome::failed(header, e),
     }
@@ -381,7 +327,7 @@ async fn run_repl_send(
     timeout: Option<u32>,
     lang: crate::mcp::handlers::repl::ReplLang,
 ) -> ItemOutcome {
-    use crate::mcp::handlers::repl::{self, ReplSendResult};
+    use crate::mcp::handlers::repl::{self, ReplExchangeStatus, ReplOrigin};
 
     let Some(ctx) = run_context else {
         return ItemOutcome::failed(
@@ -389,81 +335,69 @@ async fn run_repl_send(
             "A REPL send needs a node context and cannot run without an execution run context.",
         );
     };
-    let Some(session) = orch.repl_state.get(&ctx.job_id, &slug) else {
-        return ItemOutcome::failed(
-            header,
-            format!(
-                "No REPL named '{slug}' for this node. Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"|\"typescript\"}}"
-            ),
-        );
-    };
-    if session.interpreter != lang {
-        return ItemOutcome::failed(
-            header,
-            format!(
-                "REPL '{slug}' is a {} session; this send used interpreter '{}'. Match the REPL's language.",
-                session.interpreter.label(),
-                lang.label()
-            ),
-        );
-    }
 
     let timeout_ms = timeout.unwrap_or(120_000).min(600_000);
-    match repl::send(&session, &code, Duration::from_millis(timeout_ms as u64)).await {
-        ReplSendResult::Response(response) => {
-            let mut body = String::new();
-            let mut push = |section: &str| {
-                if section.is_empty() {
-                    return;
+    match repl::send_recorded(
+        orch,
+        &ctx.job_id,
+        &slug,
+        &code,
+        Duration::from_millis(timeout_ms as u64),
+        ReplOrigin::Agent,
+        Some(lang),
+    )
+    .await
+    {
+        // Fail-closed precondition (unknown slug, language mismatch) that predates
+        // any recorded exchange.
+        Err(message) => ItemOutcome::failed(header, message),
+        Ok(exchange) => match exchange.status {
+            ReplExchangeStatus::Success | ReplExchangeStatus::Error => {
+                let mut body = String::new();
+                let mut push = |section: &str| {
+                    if section.is_empty() {
+                        return;
+                    }
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(section);
+                };
+                if let Some(value) = exchange.value.as_deref() {
+                    push(value);
                 }
-                if !body.is_empty() {
-                    body.push('\n');
+                if let Some(stdout) = exchange.stdout.as_deref() {
+                    push(stdout);
                 }
-                body.push_str(section);
-            };
-            if let Some(value) = response.value.as_deref() {
-                push(value);
+                if let Some(stderr) = exchange.stderr.as_deref() {
+                    push(&format!("stderr:\n{stderr}"));
+                }
+                if let Some(note) = exchange.note.as_deref() {
+                    push(&format!("note: {note}"));
+                }
+                if let Some(error) = exchange.error.as_deref() {
+                    push(error);
+                }
+                ItemOutcome {
+                    header,
+                    body,
+                    succeeded: matches!(exchange.status, ReplExchangeStatus::Success),
+                    suspended: false,
+                    images: Vec::new(),
+                    promoted_terminal: None,
+                    tracked_modifications: None,
+                }
             }
-            push(response.stdout.trim_end_matches('\n'));
-            if !response.stderr.is_empty() {
-                push(&format!(
-                    "stderr:\n{}",
-                    response.stderr.trim_end_matches('\n')
-                ));
-            }
-            if let Some(note) = response.note.as_deref() {
-                push(&format!("note: {}", note.trim()));
-            }
-            if let Some(error) = response.error.as_deref() {
-                push(error.trim_end_matches('\n'));
-            }
-            ItemOutcome {
+            // Died / Timeout / Protocol (and the impossible lingering Pending) all
+            // carry their agent-facing hint in `error`; the funnel already killed
+            // and unregistered a session-ending outcome.
+            _ => ItemOutcome::failed(
                 header,
-                body,
-                succeeded: response.succeeded(),
-                suspended: false,
-                images: Vec::new(),
-            }
-        }
-        ReplSendResult::Dead => {
-            orch.repl_state.remove(&ctx.job_id, &slug);
-            ItemOutcome::failed(
-                header,
-                format!("REPL '{slug}' died — state lost; recreate it."),
-            )
-        }
-        ReplSendResult::Timeout => {
-            if let Some(session) = orch.repl_state.remove(&ctx.job_id, &slug) {
-                session.kill();
-            }
-            ItemOutcome::failed(
-                header,
-                format!(
-                    "REPL '{slug}' send timed out after {timeout_ms}ms; the REPL was killed and its state lost. Recreate it and break long-running work into smaller sends."
-                ),
-            )
-        }
-        ReplSendResult::Protocol(message) => ItemOutcome::failed(header, message),
+                exchange
+                    .error
+                    .unwrap_or_else(|| format!("REPL '{slug}' send failed.")),
+            ),
+        },
     }
 }
 
@@ -575,30 +509,8 @@ pub(crate) async fn build_agent_spawn_config(
                 .env("GIT_COMMITTER_EMAIL", &email);
         }
         // `cairn:~` shorthand resolution and the readable per-node scratch name
-        // both use the job's canonical home URI. For a top-level node that's
-        // `.../{seq}/{segment}`; for a sub-task it nests under its parent as
-        // `.../{seq}/{parent}/task/{segment}`.
-        let home_uri = if let (Some(num), Some(seq)) = (ctx.issue_number, ctx.exec_seq) {
-            if let Some(segment) =
-                crate::jobs::queries::node_uri_segment_for_job(&orch.db.local, &ctx.job_id).await
-            {
-                let parent_segment =
-                    crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, &ctx.job_id)
-                        .await;
-                Some(cairn_common::uri::build_job_base_uri(
-                    &ctx.project_key,
-                    num,
-                    seq,
-                    &segment,
-                    parent_segment.as_deref(),
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
+        // both use the job's canonical home URI.
+        let home_uri = job_home_uri(orch, ctx).await;
         // Point the command's temp-file handling at a per-job scratch dir so
         // default tooling (mktemp, cargo, compilers, harness logs) writes there
         // with no agent awareness. TMP/TEMP cover tools that ignore TMPDIR.
@@ -613,6 +525,25 @@ pub(crate) async fn build_agent_spawn_config(
         }
     }
     spawn_config
+}
+
+/// The job's canonical home URI (e.g. `cairn://p/CAIRN/1/1/builder`; a sub-task
+/// nests under its parent as `.../{seq}/{parent}/task/{segment}`), used both for
+/// `cairn:~` shorthand and the readable per-node scratch dir name. `None` when
+/// the run lacks issue/exec coordinates or the node segment can't resolve.
+pub(crate) async fn job_home_uri(orch: &Orchestrator, ctx: &RunContext) -> Option<String> {
+    let (num, seq) = (ctx.issue_number?, ctx.exec_seq?);
+    let segment =
+        crate::jobs::queries::node_uri_segment_for_job(&orch.db.local, &ctx.job_id).await?;
+    let parent_segment =
+        crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, &ctx.job_id).await;
+    Some(cairn_common::uri::build_job_base_uri(
+        &ctx.project_key,
+        num,
+        seq,
+        &segment,
+        parent_segment.as_deref(),
+    ))
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -762,7 +693,7 @@ fn shell_candidate_tokens(command: &str) -> Vec<String> {
 
 /// Spawn a process, stream its stdout/stderr, and wait with a timeout.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn execute_process(
+async fn execute_process(
     orch: &Orchestrator,
     cwd: &str,
     tool_use_id: &str,
@@ -773,12 +704,10 @@ pub(super) async fn execute_process(
     shell_command: Option<&str>,
     stdin: Option<&str>,
     sandbox_enabled: bool,
-    // When true (agent `run` items), a timed-out process with a run context is
-    // DETACHED to a durable terminal instead of killed, so its work continues.
-    // Project checks pass false: a check that blows its budget must be KILLED at
-    // that budget (the contract is "killed at its budget"), never left running to
-    // dirty the shared worktree or outlive its disposable clone.
-    promote_on_timeout: bool,
+    // Placement decides promotion before this host fallback is reached. Retained
+    // in the internal call shape so check callers continue to state their kill
+    // contract explicitly; host execution always kills at the budget.
+    _promote_on_timeout: bool,
 ) -> Result<ExecOutput, String> {
     let services = &orch.services;
     let tool_use_id = tool_use_id.to_string();
@@ -820,8 +749,13 @@ pub(super) async fn execute_process(
 
     let mut spawn_config =
         build_agent_spawn_config(orch, cwd, run_context, program, args, sandbox_policy).await;
+    // A managed job's command runs against an executor materialization at its
+    // logical coordinate. Never redirect rg/grep back to the stale legacy
+    // worktree index. Keep the shim only for remaining non-managed host runs.
     if let (Some(ctx), Some(command)) = (run_context, shell_command) {
-        spawn_config = apply_warm_search_shim(orch, spawn_config, ctx, command);
+        if ctx.worktree_path.is_none() {
+            spawn_config = apply_warm_search_shim(orch, spawn_config, ctx, command);
+        }
     }
 
     // Capture stdin only when the spec carries a payload to feed (today only
@@ -1009,20 +943,10 @@ pub(super) async fn execute_process(
     }
 
     if timed_out {
-        // Timed out with the process still alive. When promotion is allowed (an
-        // agent `run` item) and there is a run context and no sandbox denial, we
-        // PROMOTE it to a durable terminal instead of killing it; otherwise we
-        // kill the group. Project checks pass `promote_on_timeout = false`, so a
-        // timed-out check is always KILLED at its budget — never detached to a
-        // terminal where it would keep running, dirty the shared worktree after
-        // the check flow moved on, or outlive its disposable COW clone.
-        let mut promoted: Option<PromotedTerminal> = None;
-        let mut denial: Option<sandbox::SandboxDenial> = None;
-
-        if let Some(ctx) = run_context {
-            // Denial-before-promote: a command blocked by the kernel sandbox must
-            // be adjudicated through the worktree fence, not detached. Detect on
-            // the partial output captured so far.
+        // Host-routed invocations have no tree-bound promotion authority. All
+        // promotable run batches are executor-routed; checks and the remaining
+        // host-only classes retain the killed-at-budget contract.
+        let denial = if let Some(_ctx) = run_context {
             if sandboxed {
                 let partial = {
                     let o = stdout_content.lock().unwrap().clone();
@@ -1034,59 +958,28 @@ pub(super) async fn execute_process(
                         (true, true) => String::new(),
                     }
                 };
-                denial = sandbox::detect_denial(
+                sandbox::detect_denial(
                     None,
                     &partial,
                     child_pid,
                     spawn_started,
                     command_scoped_fallback,
-                );
-            }
-
-            if should_promote_timed_out(promote_on_timeout, denial.is_none()) {
-                let output_buffer = combined_buffer
-                    .clone()
-                    .expect("combined buffer is created whenever run_context is set");
-                let display_cmd = shell_command.unwrap_or(program);
-                match terminal::promote_to_terminal(
-                    orch,
-                    ctx,
-                    cwd,
-                    display_cmd,
-                    child.clone(),
-                    output_buffer,
-                    last_output_at.clone(),
-                    &inline_command_id,
                 )
-                .await
-                {
-                    Ok(p) => promoted = Some(p),
-                    Err(e) => {
-                        log::warn!("run promotion to terminal failed; killing instead: {e}")
-                    }
-                }
+            } else {
+                None
             }
-        }
-
-        if promoted.is_some() {
-            // Ownership has moved to the terminal session (which already
-            // unregistered the inline command and owns the later reaping path).
-            // The reader threads keep appending to the now-terminal buffer, so we
-            // deliberately do NOT join them here.
-            guard.disarm();
         } else {
-            // Kill fallback: SIGKILL the group, then bound the reader reaping so a
-            // setsid escapee holding a pipe open cannot hang the call forever.
-            if let Ok(mut g) = child.lock() {
-                let _ = g.kill();
-            }
-            guard.disarm();
-            if let Some(ctx) = run_context {
-                orch.pty_state
-                    .unregister_inline_command(&ctx.run_id, &inline_command_id);
-            }
-            reap_readers_bounded(stdout_handle, stderr_handle, stdin_writer_handle).await;
+            None
+        };
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
         }
+        guard.disarm();
+        if let Some(ctx) = run_context {
+            orch.pty_state
+                .unregister_inline_command(&ctx.run_id, &inline_command_id);
+        }
+        reap_readers_bounded(stdout_handle, stderr_handle, stdin_writer_handle).await;
 
         if let Some(ctx) = run_context {
             let _ = orch.services.emitter.emit(
@@ -1109,7 +1002,6 @@ pub(super) async fn execute_process(
             exit_code: None,
             timed_out: true,
             denial,
-            promoted,
         });
     }
 
@@ -1142,12 +1034,20 @@ pub(super) async fn execute_process(
 
     // Detect a kernel sandbox denial so the caller can drive the worktree fence.
     let denial = if sandboxed {
-        let combined = match (stdout_str.is_empty(), stderr_str.is_empty()) {
+        let mut combined = match (stdout_str.is_empty(), stderr_str.is_empty()) {
             (false, false) => format!("{stdout_str}\n{stderr_str}"),
             (false, true) => stdout_str.clone(),
             (true, false) => stderr_str.clone(),
             (true, true) => String::new(),
         };
+        let ssh_crossing = command_scoped_fallback
+            && (shell_command.is_some_and(|command| command.trim_start().starts_with("ssh "))
+                || std::path::Path::new(program)
+                    .file_name()
+                    .is_some_and(|name| name == "ssh"));
+        if ssh_crossing && exit_code != Some(0) {
+            combined.push_str("\nPermission denied while reading SSH credentials");
+        }
         sandbox::detect_denial(
             exit_code,
             &combined,
@@ -1165,24 +1065,9 @@ pub(super) async fn execute_process(
         exit_code,
         timed_out: false,
         denial,
-        promoted: None,
     })
 }
 
-/// Whether a timed-out process should be DETACHED to a durable terminal rather
-/// than killed. Only agent `run` items opt in (`promote_on_timeout`), and only
-/// when the kernel sandbox did not deny the command (a denial routes through the
-/// worktree fence instead). Project checks pass `promote_on_timeout = false`, so
-/// a timed-out check is ALWAYS killed at its budget — never left running to
-/// dirty the shared worktree or outlive its disposable clone (CAIRN-2623). Pure,
-/// so the gate is unit-tested.
-fn should_promote_timed_out(promote_on_timeout: bool, no_denial: bool) -> bool {
-    promote_on_timeout && no_denial
-}
-
-/// Append a captured line (plus newline) to the optional combined byte buffer,
-/// keeping it bounded. Both reader threads call this so a promoted terminal's
-/// buffer reflects interleaved stdout/stderr.
 fn record_combined_output(
     combined: &Option<Arc<Mutex<VecDeque<u8>>>>,
     last_output_at: &Option<Arc<Mutex<SystemTime>>>,
@@ -1433,16 +1318,6 @@ mod tests {
     }
 
     #[test]
-    fn scrub_dev_instance_routing_pty_removes_both_keys() {
-        let mut cmd = CommandBuilder::new("bash");
-        cmd.env("CAIRN_INSTANCE", "1");
-        cmd.env("CARGO_TARGET_DIR", "/shared/target");
-        scrub_dev_instance_routing_pty(&mut cmd);
-        assert!(cmd.get_env("CAIRN_INSTANCE").is_none());
-        assert!(cmd.get_env("CARGO_TARGET_DIR").is_none());
-    }
-
-    #[test]
     fn non_interactive_pager_env_defaults_to_cat() {
         let config = apply_non_interactive_pager_env(SpawnConfig::new("bash"));
 
@@ -1460,57 +1335,5 @@ mod tests {
 
         assert_eq!(config.env.get("GIT_PAGER").map(String::as_str), Some("cat"));
         assert_eq!(config.env.get("PAGER").map(String::as_str), Some("cat"));
-    }
-    #[test]
-    fn terminal_denial_detection_requires_macos_sandbox_and_policy() {
-        let denied = "bash: /Users/me/probe: Operation not permitted";
-        assert_eq!(
-            terminal::should_handle_terminal_denial(true, Some(Fence::Ask), denied),
-            cfg!(target_os = "macos")
-        );
-        assert_eq!(
-            terminal::should_handle_terminal_denial(true, Some(Fence::Deny), denied),
-            cfg!(target_os = "macos")
-        );
-        assert!(!terminal::should_handle_terminal_denial(
-            false,
-            Some(Fence::Ask),
-            denied
-        ));
-        assert!(!terminal::should_handle_terminal_denial(
-            true,
-            Some(Fence::Allow),
-            denied
-        ));
-        assert!(!terminal::should_handle_terminal_denial(
-            true,
-            Some(Fence::Ask),
-            "ordinary failure"
-        ));
-    }
-
-    #[test]
-    fn terminal_denial_crossing_falls_back_to_command_scope() {
-        let crossing =
-            terminal::terminal_denial_crossing(None, SystemTime::now(), "echo hi > $HOME/probe");
-        assert_eq!(crossing.verb, "run");
-        assert!(crossing.summary.contains("terminal command blocked"));
-        assert_eq!(
-            crossing.descriptor,
-            normalize_command("echo hi > $HOME/probe")
-        );
-    }
-
-    #[test]
-    fn timed_out_promotion_gated_on_flag_and_no_denial() {
-        // Agent `run` items (promote=true) detach to a terminal only when there
-        // was no sandbox denial.
-        assert!(should_promote_timed_out(true, true));
-        assert!(!should_promote_timed_out(true, false));
-        // Project checks (promote=false) are ALWAYS killed at their budget, never
-        // detached — regardless of denial. This is the review fix that keeps a
-        // timed-out check from leaking a running process into the worktree/clone.
-        assert!(!should_promote_timed_out(false, true));
-        assert!(!should_promote_timed_out(false, false));
     }
 }

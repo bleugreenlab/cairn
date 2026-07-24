@@ -4,6 +4,10 @@
 //! These files can be version-controlled with the project.
 
 use serde::{Deserialize, Serialize};
+
+pub use super::contextual_packages::{
+    ContextualPackageKind, ContextualPackageRef, ContextualPackagesConfig,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +20,7 @@ use crate::references::ProjectReference;
 pub struct WorktreeSettings {
     /// Legacy field — deserialized for migration but not re-serialized.
     #[serde(default, skip_serializing)]
-    pub seed_ignored: Option<bool>,
+    seed_ignored: Option<bool>,
     /// Rules for populating gitignored paths into new worktrees, grouped by strategy.
     #[serde(default, skip_serializing_if = "PopulateConfig::is_empty")]
     pub populate: PopulateConfig,
@@ -39,21 +43,23 @@ pub struct ProjectSettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<HashMap<String, CheckCommand>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_branch: Option<String>,
+    pub(crate) default_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<Vec<ProjectReference>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSettings>,
     /// Project-level override for active backend
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_backend: Option<String>,
+    pub(crate) active_backend: Option<String>,
     /// Project-level preset overrides (deep-merged with workspace)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    pub(crate) backends: Option<HashMap<String, HashMap<String, Preset>>>,
     /// Project-level external MCP servers (overlay workspace set; project wins
     /// on key collision).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
+    pub(crate) mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contextual_packages: Option<ContextualPackagesConfig>,
 }
 
 impl ProjectSettingsFile {
@@ -95,6 +101,8 @@ struct LegacyProjectSettingsFile {
     backends: Option<HashMap<String, HashMap<String, Preset>>>,
     #[serde(default)]
     mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
+    #[serde(default)]
+    contextual_packages: Option<ContextualPackagesConfig>,
 }
 
 /// Legacy terminal command with persistent field
@@ -112,7 +120,7 @@ struct LegacyTerminalCommand {
 }
 
 /// Get the path to the project config file (\[project\]/.cairn/config.yaml)
-pub fn get_project_config_path(project_path: &Path) -> PathBuf {
+pub(crate) fn get_project_config_path(project_path: &Path) -> PathBuf {
     project_path.join(".cairn").join("config.yaml")
 }
 
@@ -203,7 +211,7 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
         has_ci_commands || has_copy_files || has_persistent || has_legacy_seed_ignored;
 
     // Convert to current format (dropping deprecated fields)
-    let settings = ProjectSettingsFile {
+    let mut settings = ProjectSettingsFile {
         setup_commands: legacy.setup_commands,
         terminal_commands: legacy.terminal_commands.map(|cmds| {
             cmds.into_iter()
@@ -221,7 +229,12 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
         active_backend: legacy.active_backend,
         backends: legacy.backends,
         mcp_servers: legacy.mcp_servers,
+        contextual_packages: legacy.contextual_packages,
     };
+
+    if let Some(policy) = &mut settings.contextual_packages {
+        policy.normalize()?;
+    }
 
     Ok((settings, needs_migration))
 }
@@ -232,10 +245,34 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
 /// rewrite that `load_project_settings` performs, so it is safe on the hot
 /// worktree-fence policy-build path (it reads each terminal command's `write`
 /// carveout). Returns an empty list when the file is absent or invalid.
-pub fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::TerminalCommand> {
+pub(crate) fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::TerminalCommand> {
     load_project_settings_file(project_path)
         .map(|(file, _)| file.terminal_commands.unwrap_or_default())
         .unwrap_or_default()
+}
+
+/// Load the project's canonical worktree setup commands without rewriting config.
+///
+/// Build-slot submission uses this against the live primary checkout. Unlike
+/// [`load_project_settings`], errors remain visible so an unreadable or invalid
+/// setup policy fails as infrastructure before any command reaches an executor.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExecutionProjectPolicy {
+    pub(crate) setup_commands: Vec<String>,
+    pub(crate) populate: PopulateConfig,
+}
+
+pub(crate) fn load_execution_project_policy(
+    project_path: &Path,
+) -> Result<ExecutionProjectPolicy, String> {
+    load_project_settings_file(project_path).map(|(file, _)| ExecutionProjectPolicy {
+        setup_commands: file.setup_commands.unwrap_or_default(),
+        populate: file.worktree.unwrap_or_default().populate,
+    })
+}
+
+pub fn load_setup_commands(project_path: &Path) -> Result<Vec<String>, String> {
+    load_execution_project_policy(project_path).map(|policy| policy.setup_commands)
 }
 
 /// Load just the `checks` contract from a project's `.cairn/config.yaml`.
@@ -247,7 +284,7 @@ pub fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::Termina
 /// must stay side-effect free — a migration commit fired from inside an agent
 /// run would be surprising. Returns `None` when the file is absent, invalid, or
 /// declares no checks.
-pub fn load_checks(project_path: &Path) -> Option<HashMap<String, CheckCommand>> {
+pub(crate) fn load_checks(project_path: &Path) -> Option<HashMap<String, CheckCommand>> {
     load_project_settings_file(project_path)
         .ok()
         .and_then(|(file, _)| file.checks)
@@ -266,6 +303,7 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "activeBackend",
     "backends",
     "mcpServers",
+    "contextualPackages",
     // Legacy keys the load-path migration strips.
     "ciCommands",
     "copyFiles",
@@ -338,7 +376,7 @@ fn render_settings_yaml(path: &Path, settings: &ProjectSettingsFile) -> Result<S
 }
 
 /// Create a default project config file with commented template
-pub fn create_default_project_config(project_path: &Path) -> Result<(), String> {
+pub(crate) fn create_default_project_config(project_path: &Path) -> Result<(), String> {
     let path = get_project_config_path(project_path);
 
     // Don't overwrite existing config
@@ -1244,6 +1282,38 @@ activeBackend: codex
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn execution_policy_loads_setup_and_populate_without_rewriting() {
+        let temp = TempDir::new().unwrap();
+        let config_path = get_project_config_path(temp.path());
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let content = "ciCommands:\n  - old\nsetupCommands:\n  - bun install\nworktree:\n  populate:\n    copy: [.env]\n    symlink: [cache/]\n";
+        std::fs::write(&config_path, content).unwrap();
+
+        let policy = load_execution_project_policy(temp.path()).unwrap();
+        assert_eq!(policy.setup_commands, vec!["bun install"]);
+        assert_eq!(policy.populate.copy, vec![".env"]);
+        assert_eq!(policy.populate.symlink, vec!["cache/"]);
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), content);
+    }
+
+    #[test]
+    fn setup_command_hot_path_is_fallible_and_side_effect_free() {
+        let temp = TempDir::new().unwrap();
+        let config_path = get_project_config_path(temp.path());
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "setupCommands: [unterminated").unwrap();
+        assert!(load_setup_commands(temp.path()).is_err());
+
+        let legacy = "ciCommands:\n  - npm test\nsetupCommands:\n  - npm install\n";
+        std::fs::write(&config_path, legacy).unwrap();
+        assert_eq!(
+            load_setup_commands(temp.path()).unwrap(),
+            vec!["npm install".to_string()]
+        );
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), legacy);
     }
 
     #[test]

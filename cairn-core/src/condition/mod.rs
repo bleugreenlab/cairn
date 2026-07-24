@@ -155,7 +155,7 @@ fn json_to_evalexpr_value(value: &Value) -> evalexpr::Value {
 ///
 /// Uses a one-shot completion to get the model to answer with exactly one of the port names.
 /// Dispatches to the appropriate backend (Claude/Codex) based on the model.
-pub fn evaluate_ai_condition(
+pub(crate) fn evaluate_ai_condition(
     completion: &dyn crate::services::CompletionService,
     question: &str,
     ports: &[String],
@@ -201,7 +201,7 @@ pub fn evaluate_ai_condition(
 }
 
 /// Gather context from upstream artifacts for condition evaluation.
-pub fn serialize_context_for_ai(artifact_data: &Value) -> String {
+pub(crate) fn serialize_context_for_ai(artifact_data: &Value) -> String {
     serde_json::to_string_pretty(artifact_data).unwrap_or_else(|_| "{}".to_string())
 }
 

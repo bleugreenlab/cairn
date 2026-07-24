@@ -4,7 +4,7 @@
 use crate::contract::ResourceKind;
 use crate::query::{encode_query_params, QueryParam};
 
-pub const PROJECT_SCOPE: &str = "p";
+pub(crate) const PROJECT_SCOPE: &str = "p";
 
 /// Default browser slug when a browser URI omits an explicit `/SLUG` (e.g. the
 /// agent's `cairn:~/browser`). Keeps the shared browser a single canonical
@@ -16,7 +16,7 @@ pub const DEFAULT_BROWSER_SLUG: &str = "default";
 /// interpreted as a type-named artifact (`.../{node}/plan`). This is the single
 /// source of truth shared by the URI parser and cairn-cmd's `cairn:~/<name>`
 /// resolution so e.g. `cairn:~/chat` can never be misread as an artifact write.
-pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
+const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "chat",
     "artifact",
     "changed",
@@ -40,14 +40,14 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
 
 /// True when `segment` is a reserved node/task sub-resource keyword (see
 /// [`RESERVED_NODE_SEGMENTS`]) and therefore not a valid artifact type-name.
-pub fn is_reserved_node_segment(segment: &str) -> bool {
+pub(crate) fn is_reserved_node_segment(segment: &str) -> bool {
     RESERVED_NODE_SEGMENTS.contains(&segment)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CairnResourceUri {
-    pub resource: CairnResource,
-    pub params: Vec<QueryParam>,
+    pub(crate) resource: CairnResource,
+    pub(crate) params: Vec<QueryParam>,
 }
 
 impl CairnResourceUri {
@@ -273,6 +273,14 @@ pub enum CairnResource {
         number: i32,
         exec_seq: i32,
         node_id: String,
+    },
+    /// Turn-end project check results owned by a sub-agent task job (collection).
+    TaskChecks {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
     },
     /// User questions asked by a node job (collection).
     NodeQuestions {
@@ -622,6 +630,7 @@ impl CairnResource {
             Self::NodeCalls { .. } => ResourceKind::NodeCalls,
             Self::NodeWakes { .. } => ResourceKind::NodeWakes,
             Self::NodeChecks { .. } => ResourceKind::NodeChecks,
+            Self::TaskChecks { .. } => ResourceKind::TaskChecks,
             Self::NodeQuestions { .. } => ResourceKind::NodeQuestions,
             Self::NodeQuestion { .. } => ResourceKind::NodeQuestion,
             Self::NodePermissions { .. } => ResourceKind::NodePermissions,

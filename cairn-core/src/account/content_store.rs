@@ -34,7 +34,7 @@ pub struct BrokeredContentStore {
 }
 
 impl BrokeredContentStore {
-    pub fn new(
+    fn new(
         team_id: TeamId,
         api: ApiConfig,
         minter: Arc<dyn TeamTokenMinter>,

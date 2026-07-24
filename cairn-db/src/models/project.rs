@@ -106,27 +106,7 @@ pub struct MoveProject {
     pub team_id: String,
 }
 
-/// Configuration for how gitignored paths are populated into new worktrees.
-///
-/// Paths matching `copy` patterns are copied from the main repo (isolated per worktree).
-/// Paths matching `symlink` patterns are symlinked to the main repo.
-/// Unmatched paths are skipped — new worktrees start clean by default.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PopulateConfig {
-    /// Patterns whose matching paths are copied into the worktree.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub copy: Vec<String>,
-    /// Patterns whose matching paths are symlinked to the main repo.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub symlink: Vec<String>,
-}
-
-impl PopulateConfig {
-    pub fn is_empty(&self) -> bool {
-        self.copy.is_empty() && self.symlink.is_empty()
-    }
-}
+pub use cairn_worktree::PopulateConfig;
 
 /// One project check: a single command run at one cadence. Selectivity is
 /// expressed by a `{changedFiles}` or `{targets}` placeholder inside the

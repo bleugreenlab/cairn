@@ -31,14 +31,15 @@ pub(super) async fn apply(
                     Some((pack, idx)) => {
                         conn.execute(
                             "INSERT OR REPLACE INTO execution_history
-                             (execution_id, base_sha, tip_sha, pack, pack_idx)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                             (execution_id, base_sha, tip_sha, pack, pack_idx, repository_id)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             (
                                 history.execution_id.as_str(),
                                 history.base_sha.as_str(),
                                 history.tip_sha.as_str(),
                                 pack,
                                 idx,
+                                history.repository_id.as_str(),
                             ),
                         )
                         .await?;
@@ -46,12 +47,13 @@ pub(super) async fn apply(
                     None => {
                         conn.execute(
                             "INSERT OR REPLACE INTO execution_history
-                             (execution_id, base_sha, tip_sha, pack, pack_idx)
-                             VALUES (?1, ?2, ?3, NULL, NULL)",
+                             (execution_id, base_sha, tip_sha, pack, pack_idx, repository_id)
+                             VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
                             (
                                 history.execution_id.as_str(),
                                 history.base_sha.as_str(),
                                 history.tip_sha.as_str(),
+                                history.repository_id.as_str(),
                             ),
                         )
                         .await?;
@@ -149,15 +151,25 @@ pub(super) async fn apply_offloaded(
     // The pack (when the range was non-empty) becomes one framed store object
     // keyed by the sha256 of its framed bytes — `pack_hash` addresses exactly
     // what is stored, so a fetch can verify integrity.
-    let pack_hash = match history.as_ref().and_then(|h| h.pack.as_ref()) {
+    let catalog = match history.as_ref().and_then(|h| h.pack.as_ref()) {
         Some((pack, idx)) => {
-            let framed = frame_pack(pack, idx);
+            let validated = crate::orchestrator::object_plane::validate_pack_bytes(pack.clone())
+                .map_err(|e| format!("validating execution pack before publication: {e}"))?;
+            if validated.index != *idx {
+                return Err("execution pack index disagrees with independent validation".into());
+            }
+            let framed = validated.framed;
             let hash = content_hash(&framed);
             store
                 .put(&hash, &framed)
                 .await
                 .map_err(|e| format!("offloading execution pack {hash}: {e}"))?;
-            Some(hash)
+            Some((
+                hash,
+                framed.len() as i64,
+                validated.pack_checksum,
+                validated.object_count as i64,
+            ))
         }
         None => None,
     };
@@ -167,21 +179,70 @@ pub(super) async fn apply_offloaded(
     db.write(move |conn| {
         let updates = updates.clone();
         let history = history.clone();
-        let pack_hash = pack_hash.clone();
+        let catalog = catalog.clone();
         Box::pin(async move {
             if let Some(history) = history {
                 conn.execute(
                     "INSERT OR REPLACE INTO execution_history
-                     (execution_id, base_sha, tip_sha, pack, pack_idx, pack_hash)
-                     VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+                     (execution_id, base_sha, tip_sha, pack, pack_idx, pack_hash, repository_id)
+                     VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5)",
                     (
                         history.execution_id.as_str(),
                         history.base_sha.as_str(),
                         history.tip_sha.as_str(),
-                        pack_hash.as_deref(),
+                        catalog.as_ref().map(|entry| entry.0.as_str()),
+                        history.repository_id.as_str(),
                     ),
                 )
                 .await?;
+                if let Some((hash, byte_count, checksum, object_count)) = &catalog {
+                    conn.execute(
+                        "INSERT INTO pack_catalog
+                         (content_hash, project_id, repository_id, object_format,
+                          byte_count, pack_checksum, object_count, kind, base_commit,
+                          tip_commit, created_at, publication_state)
+                         VALUES (?1, ?2, ?3, 'sha1', ?4, ?5, ?6,
+                                 'execution_range', ?7, ?8, unixepoch(), 'published')
+                         ON CONFLICT(project_id, repository_id, object_format, content_hash)
+                         DO NOTHING",
+                        (
+                            hash.as_str(),
+                            history.project_id.as_str(),
+                            history.repository_id.as_str(),
+                            *byte_count,
+                            checksum.as_str(),
+                            *object_count,
+                            history.base_sha.as_str(),
+                            history.tip_sha.as_str(),
+                        ),
+                    )
+                    .await?;
+                    conn.execute(
+                        "DELETE FROM pack_catalog_references
+                         WHERE owner_kind = 'execution_history' AND owner_id = ?1",
+                        (history.execution_id.as_str(),),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO pack_catalog_references
+                         (content_hash, project_id, repository_id, object_format,
+                          owner_kind, owner_id, created_at)
+                         VALUES (?1, ?2, ?3, 'sha1', 'execution_history', ?4, unixepoch())
+                         ON CONFLICT(owner_kind, owner_id, project_id, repository_id) DO UPDATE SET
+                           content_hash = excluded.content_hash,
+                           project_id = excluded.project_id,
+                           repository_id = excluded.repository_id,
+                           object_format = excluded.object_format,
+                           created_at = excluded.created_at",
+                        (
+                            hash.as_str(),
+                            history.project_id.as_str(),
+                            history.repository_id.as_str(),
+                            history.execution_id.as_str(),
+                        ),
+                    )
+                    .await?;
+                }
             }
             write_event_updates(conn, &updates).await?;
             Ok(())

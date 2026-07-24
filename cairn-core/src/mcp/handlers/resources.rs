@@ -16,7 +16,7 @@ use cairn_db::turso::params;
 
 /// Type alias for read cursor state: session_id -> bytes_read
 /// Uses per-terminal cursor so reads "consume" output regardless of which run is reading.
-pub type ReadCursorState = Mutex<HashMap<String, usize>>;
+pub(crate) type ReadCursorState = Mutex<HashMap<String, usize>>;
 
 /// Terminal read result for read_resource response.
 ///
@@ -27,22 +27,22 @@ pub type ReadCursorState = Mutex<HashMap<String, usize>>;
 pub struct TerminalReadResult {
     /// Status banner plus rendered terminal output (the full buffer by default,
     /// or only the bytes appended since the cursor when read with `?new=true`).
-    pub output: String,
+    output: String,
     /// Terminal status: "running", "exited", or "error".
-    pub status: String,
+    status: String,
     /// Exit code if the terminal has exited.
-    pub exit_code: Option<i32>,
+    exit_code: Option<i32>,
     /// Bytes returned in this read.
-    pub new_bytes: usize,
+    new_bytes: usize,
     /// Total bytes in the terminal buffer.
-    pub total_bytes: usize,
+    total_bytes: usize,
     /// Seconds the terminal has been (or was) running, measured from spawn time.
     #[serde(default)]
-    pub runtime_secs: Option<i64>,
+    runtime_secs: Option<i64>,
     /// Seconds since the most recent output byte; `None` when there has been no
     /// output (or the live session is gone).
     #[serde(default)]
-    pub idle_secs: Option<i64>,
+    idle_secs: Option<i64>,
 }
 
 /// Payload for read_resource request. Terminal-specific params (`new`, `full`,
@@ -50,7 +50,7 @@ pub struct TerminalReadResult {
 /// JSON fields are ignored, so an older client sending `full` still deserializes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReadResourcePayload {
-    pub uri: String,
+    uri: String,
 }
 
 async fn find_terminal_target_job_id(
@@ -161,7 +161,7 @@ async fn find_task_terminal_target_job_id(
 /// does NOT advance the per-terminal cursor, so repeated reads are stable.
 /// `?new=true` switches to incremental mode, returning only the bytes appended
 /// since the last `new=true` read and advancing the cursor.
-pub async fn handle_read_resource(
+pub(crate) async fn handle_read_resource(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     read_cursors: &ReadCursorState,

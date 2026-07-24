@@ -32,7 +32,7 @@ pub struct AnonDeviceManager {
 }
 
 impl AnonDeviceManager {
-    pub fn new(db: Arc<DbState>, api_config: ApiConfig) -> Self {
+    pub(crate) fn new(db: Arc<DbState>, api_config: ApiConfig) -> Self {
         Self {
             db,
             api_config,
@@ -87,7 +87,7 @@ impl AnonDeviceManager {
     /// (or re-registers near expiry) an anonymous token via the API.
     /// Best-effort: failures are logged and swallowed so embedding simply stays
     /// neutral until the next attempt.
-    pub async fn ensure_registered(&self) {
+    pub(crate) async fn ensure_registered(&self) {
         if let Err(e) = self.ensure_registered_inner().await {
             log::warn!("anon device registration failed: {e}");
         }
@@ -160,7 +160,7 @@ impl AnonDeviceManager {
     ///
     /// Sync, mirroring `AccountManager::get_jwt`. Returns `None` when no token
     /// is stored or it has expired (callers fall back to neutral coloring).
-    pub fn get_anon_jwt(&self) -> Result<Option<String>, String> {
+    pub(crate) fn get_anon_jwt(&self) -> Result<Option<String>, String> {
         let db = self.db.clone();
         block_on_anon_db(async move {
             let Some(row) = get_anon_device(&db).await? else {

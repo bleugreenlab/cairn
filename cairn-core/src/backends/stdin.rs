@@ -36,7 +36,7 @@ where
 }
 
 /// Send a user message to a running agent process.
-pub fn send_user_message(
+pub(crate) fn send_user_message(
     process_state: &AgentProcessState,
     run_id: &str,
     content: &str,
@@ -50,14 +50,17 @@ pub fn send_user_message(
 }
 
 /// Send an interrupt to a running agent process.
-pub fn send_interrupt(process_state: &AgentProcessState, run_id: &str) -> Result<(), String> {
+pub(crate) fn send_interrupt(
+    process_state: &AgentProcessState,
+    run_id: &str,
+) -> Result<(), String> {
     with_backend_stdin(process_state, run_id, |backend, stdin| {
         backend.send_interrupt(stdin)
     })
 }
 
 /// Send a model change to a running agent process.
-pub fn send_set_model(
+pub(crate) fn send_set_model(
     process_state: &AgentProcessState,
     run_id: &str,
     model: &str,
@@ -68,7 +71,7 @@ pub fn send_set_model(
 }
 
 /// Send a permission mode change to a running agent process.
-pub fn send_set_permission_mode(
+pub(crate) fn send_set_permission_mode(
     process_state: &AgentProcessState,
     run_id: &str,
     mode: &str,

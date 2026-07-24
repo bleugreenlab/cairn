@@ -80,7 +80,7 @@ pub const RUNNER_DB_FILENAME: &str = "cairn.db";
 
 /// The Tauri desktop bundle identifier — the subdirectory name under the OS
 /// app-data dir where the pre-runner desktop stored its database.
-pub const DESKTOP_BUNDLE_IDENTIFIER: &str = "com.cairn.desktop";
+const DESKTOP_BUNDLE_IDENTIFIER: &str = "com.cairn.desktop";
 
 /// Path to the database the pre-runner desktop stored in the OS app-data dir.
 ///
@@ -161,10 +161,6 @@ fn env_port(name: &str) -> Option<u16> {
 /// Mirrors `RUNNER_PORT_BASE` in scripts/dev-instance-slots.ts.
 pub const DEV_INSTANCE_RUNNER_PORT_BASE: u16 = DEFAULT_RUNNER_PORT;
 
-/// Base MCP callback port for `dev:instance` slots: slot `s` binds `BASE + s`.
-/// Mirrors `CALLBACK_PORT_BASE` in scripts/dev-instance-slots.ts.
-pub const DEV_INSTANCE_CALLBACK_PORT_BASE: u16 = 3860;
-
 /// Prefix marking a `dev:instance` home directory. The trailing hyphen keeps
 /// instance homes (`~/.cairn-dev-<key>`) distinct from the base `tauri dev`
 /// (slot 0) home `~/.cairn-dev`.
@@ -174,7 +170,7 @@ pub const DEV_INSTANCE_HOME_PREFIX: &str = ".cairn-dev-";
 pub const DEV_INSTANCE_DB_FILENAME: &str = RUNNER_DB_FILENAME;
 
 /// Filename of the `dev:instance` branch->slot registry under the OS home.
-pub const DEV_INSTANCE_REGISTRY_FILENAME: &str = ".cairn-dev-instances.json";
+const DEV_INSTANCE_REGISTRY_FILENAME: &str = ".cairn-dev-instances.json";
 
 /// The OS user home directory (`~`), independent of any `CAIRN_HOME` override.
 pub fn os_home_dir() -> Option<PathBuf> {
@@ -209,11 +205,6 @@ pub fn dev_instance_slug(branch: &str) -> Option<String> {
 /// The `dev:instance` registry path (`~/.cairn-dev-instances.json`).
 pub fn dev_instance_registry_path() -> Option<PathBuf> {
     os_home_dir().map(|home| home.join(DEV_INSTANCE_REGISTRY_FILENAME))
-}
-
-/// The `dev:instance` home directory for a slug key (`~/.cairn-dev-<key>`).
-pub fn dev_instance_home(key: &str) -> Option<PathBuf> {
-    os_home_dir().map(|home| home.join(format!("{DEV_INSTANCE_HOME_PREFIX}{key}")))
 }
 
 #[cfg(test)]

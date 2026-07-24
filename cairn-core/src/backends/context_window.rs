@@ -15,7 +15,7 @@ pub enum ClaudeContextOptIn {
 /// beta switches billing to API pricing and is not wired in Cairn, so Sonnet
 /// stays at its 200k subscription window. Opus and Fable offer 1M. Haiku is a
 /// confirmed 200k model. Unknown aliases use the conservative 200k default.
-pub fn claude_context_window(model: &str, opt_in: ClaudeContextOptIn) -> i64 {
+pub(crate) fn claude_context_window(model: &str, opt_in: ClaudeContextOptIn) -> i64 {
     match (model, opt_in) {
         ("opus", _) => 1_000_000,
         ("fable", _) => 1_000_000,

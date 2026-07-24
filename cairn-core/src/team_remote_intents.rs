@@ -56,26 +56,6 @@ struct CommentPayload {
     content: String,
 }
 
-pub async fn sweep_remote_intents_all_open_teams(
-    orch: &Orchestrator,
-    device_id: &str,
-) -> SweepResult {
-    let team_ids = orch.db.open_team_ids().await;
-    if team_ids.is_empty() {
-        return SweepResult::default();
-    }
-    let mut total = SweepResult::default();
-    for team_id in team_ids {
-        if let Some(db) = orch.db.team_db(&team_id).await {
-            let result = sweep_remote_intents_for_team(orch, &db, device_id).await;
-            total.claimed += result.claimed;
-            total.succeeded += result.succeeded;
-            total.failed += result.failed;
-        }
-    }
-    total
-}
-
 pub async fn sweep_remote_intents_for_team(
     orch: &Orchestrator,
     team_db: &LocalDb,

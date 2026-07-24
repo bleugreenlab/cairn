@@ -40,7 +40,7 @@ impl DbError {
         Self::Internal(message.into())
     }
 
-    pub fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Self::Turso(turso::Error::Busy(_)) | Self::Turso(turso::Error::BusySnapshot(_)) => true,
             Self::Turso(turso::Error::Error(message))

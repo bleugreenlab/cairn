@@ -12,28 +12,28 @@ use std::path::PathBuf;
 pub struct ClaudeArgsConfig {
     /// The `--mcp-config` value: a self-contained JSON string (Claude CLI accepts
     /// the config inline, not just a file path).
-    pub mcp_config: String,
-    pub skip_permissions: bool,
-    pub model: Option<Model>,
-    pub session_start: SessionStart,
-    pub prompt: String,
-    pub effort: Option<String>, // Reasoning effort: low|medium|high|xhigh|max (None = CLI default)
-    pub allowed_tools: Vec<String>,
-    pub disallowed_tools: Vec<String>,
-    pub system_prompt_file: Option<PathBuf>, // Path to file replacing Claude's default system prompt via --system-prompt-file
-    pub settings_path: Option<PathBuf>,      // Path to additional settings JSON via --settings
-    pub bidirectional: bool, // Enable stdin streaming with --input-format stream-json
+    pub(crate) mcp_config: String,
+    pub(crate) skip_permissions: bool,
+    pub(crate) model: Option<Model>,
+    pub(crate) session_start: SessionStart,
+    pub(crate) prompt: String,
+    pub(crate) effort: Option<String>, // Reasoning effort: low|medium|high|xhigh|max (None = CLI default)
+    pub(crate) allowed_tools: Vec<String>,
+    pub(crate) disallowed_tools: Vec<String>,
+    pub(crate) system_prompt_file: Option<PathBuf>, // Path to file replacing Claude's default system prompt via --system-prompt-file
+    pub(crate) settings_path: Option<PathBuf>, // Path to additional settings JSON via --settings
+    pub(crate) bidirectional: bool, // Enable stdin streaming with --input-format stream-json
     /// Resolved JSON Schema to constrain output via the CLI's built-in
     /// StructuredOutput tool (`--json-schema`). `Some` only for schema-
     /// constrained ephemeral calls; the structured result rides the terminal
     /// `result` event's `structured_output` (CAIRN-2505). `None` leaves output
     /// unconstrained (every non-call session).
-    pub json_schema: Option<serde_json::Value>,
+    pub(crate) json_schema: Option<serde_json::Value>,
 }
 
 /// Build Claude CLI arguments from configuration.
 /// Returns a vector of owned Strings for flexibility.
-pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
+pub(crate) fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
     let mut args = vec![
         "--output-format".to_string(),
         "stream-json".to_string(),
@@ -182,6 +182,44 @@ mod tests {
             bidirectional: false,
             json_schema: None,
         }
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|argument| argument == flag)
+            .and_then(|index| args.get(index + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn new_and_resume_use_identical_strict_mcp_policy() {
+        let mut new_config = base_config();
+        new_config.mcp_config = r#"{"mcpServers":{"cairn":{"command":"cairn-cmd"}}}"#.to_string();
+        new_config.allowed_tools = vec![
+            "mcp__cairn__read".to_string(),
+            "mcp__cairn__write".to_string(),
+            "mcp__cairn__run".to_string(),
+        ];
+        let mut resume_config = new_config.clone();
+        resume_config.session_start = SessionStart::Resume {
+            backend_id: "claude-thread".to_string(),
+            session_id: "cairn-uuid".to_string(),
+        };
+
+        let new_args = build_claude_args(&new_config);
+        let resume_args = build_claude_args(&resume_config);
+        assert_eq!(
+            flag_value(&new_args, "--mcp-config"),
+            flag_value(&resume_args, "--mcp-config")
+        );
+        assert_eq!(
+            new_args.contains(&"--strict-mcp-config".to_string()),
+            resume_args.contains(&"--strict-mcp-config".to_string())
+        );
+        assert_eq!(
+            flag_value(&new_args, "--allowedTools"),
+            flag_value(&resume_args, "--allowedTools")
+        );
     }
 
     #[test]

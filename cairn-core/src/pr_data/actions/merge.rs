@@ -186,6 +186,30 @@ pub async fn reconcile_after_merge(
         target_branch
     );
 
+    // 1. Reconcile the user's project checkout FIRST, before the network file
+    //    capture below, so the detach window is bounded by store work rather than
+    //    stretched behind a GitHub round-trip. With the export wrapper repairing
+    //    HEAD synchronously at each export this is belt-and-braces, but it also
+    //    bounds any export path the wrapper's pre/post attribution cannot cover.
+    //    Only a real default-branch advance detaches or moves the main checkout;
+    //    a child→integration merge never does, and resetting there only races
+    //    unrelated work.
+    if should_reconcile_main_checkout_after_merge(&target_branch, &resolved_default_branch) {
+        let git = &*orch.services.git;
+        let pull = force_checkout_pull || (pr_number.is_some() && pull_on_merge_setting());
+        if let Err(e) =
+            reconcile_main_checkout_after_merge(git, &repo_path, &resolved_default_branch, pull)
+        {
+            log::warn!("Failed to reconcile main checkout after merge: {}", e);
+        }
+    } else {
+        log::debug!(
+            "Skipping main checkout reconcile after merge into non-default target '{}' (resolved default '{}')",
+            target_branch,
+            resolved_default_branch
+        );
+    }
+
     let file_change_job_id = match resolve_file_change_job_id(&db, &owner_id).await {
         Ok(job_id) => job_id,
         Err(e) => {
@@ -204,7 +228,7 @@ pub async fn reconcile_after_merge(
         );
     }
 
-    // 1. Capture file changes for issue history.
+    // 2. Capture file changes for issue history.
     if let Some(pr_number) = pr_number {
         match get_owner_repo(&repo_path) {
             Ok((owner, repo)) => match get_credentials_for_owner(&orch.db.local, &owner).await {
@@ -259,25 +283,6 @@ pub async fn reconcile_after_merge(
             }
             Err(e) => log::warn!("Failed to capture local file changes: {}", e),
         }
-    }
-
-    // 2. Reconcile the user's project checkout only for a real default-branch
-    //    advance. Child→integration merges never detach or move the main checkout;
-    //    resetting it there only creates races on unrelated work.
-    if should_reconcile_main_checkout_after_merge(&target_branch, &resolved_default_branch) {
-        let git = &*orch.services.git;
-        let pull = force_checkout_pull || (pr_number.is_some() && pull_on_merge_setting());
-        if let Err(e) =
-            reconcile_main_checkout_after_merge(git, &repo_path, &resolved_default_branch, pull)
-        {
-            log::warn!("Failed to reconcile main checkout after merge: {}", e);
-        }
-    } else {
-        log::debug!(
-            "Skipping main checkout reconcile after merge into non-default target '{}' (resolved default '{}')",
-            target_branch,
-            resolved_default_branch
-        );
     }
 
     // 3. Downstream-workspace reconciliation is spawned (not awaited) inside
@@ -664,7 +669,7 @@ pub async fn merge_pr_for_job(
                 &prospective.tree_entries,
                 &prospective.changed_files,
                 job_id,
-                crate::build_slots::BuildSlotPriority::ReviewCheck,
+                crate::fleet::CellPriority::ReviewCheck,
             )
             .await
             {

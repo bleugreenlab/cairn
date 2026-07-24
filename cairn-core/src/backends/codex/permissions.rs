@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-pub(super) fn codex_mcp_elicitation_accept_payload() -> Value {
+fn codex_mcp_elicitation_accept_payload() -> Value {
     serde_json::json!({
         "action": "accept",
         "content": Value::Null,
@@ -44,7 +44,7 @@ pub fn extract_codex_mcp_elicitation_cairn_tool_name(params: &Value) -> Option<S
     Some(format!("mcp__cairn__{tool_name}"))
 }
 
-pub(super) fn extract_codex_mcp_tool_name_from_message(message: &str) -> Option<&str> {
+fn extract_codex_mcp_tool_name_from_message(message: &str) -> Option<&str> {
     let marker = "run tool \"";
     let start = message.find(marker)? + marker.len();
     let tail = &message[start..];
@@ -52,7 +52,7 @@ pub(super) fn extract_codex_mcp_tool_name_from_message(message: &str) -> Option<
     Some(&tail[..end])
 }
 
-pub(super) fn codex_mcp_elicitation_preflight_response(
+fn codex_mcp_elicitation_preflight_response(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     run_id: &str,
@@ -77,7 +77,7 @@ pub(super) fn codex_mcp_elicitation_preflight_response(
     Ok(Some(response))
 }
 
-pub(super) fn codex_mcp_tool_is_allowed(
+fn codex_mcp_tool_is_allowed(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     run_id: &str,
@@ -92,7 +92,7 @@ pub(super) fn codex_mcp_tool_is_allowed(
     Ok(load_codex_allowed_tools_for_run(orch, run_db, run_id)?.contains(tool_name))
 }
 
-pub(super) fn load_codex_allowed_tools_for_run(
+fn load_codex_allowed_tools_for_run(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     run_id: &str,
@@ -211,7 +211,7 @@ pub(super) fn load_codex_allowed_tools_for_run(
 
 type CodexToolConfig = (Vec<String>, Vec<String>);
 
-pub(super) fn load_codex_tool_config_from_snapshot(
+fn load_codex_tool_config_from_snapshot(
     snapshot_json: &str,
     agent_config_id: &str,
 ) -> Result<Option<CodexToolConfig>, String> {
@@ -295,18 +295,18 @@ pub(super) fn decline_codex_native_file_change(
     client.respond(id_value, native_file_change_decline_payload())
 }
 
-pub(super) fn native_edit_decline_message() -> &'static str {
+fn native_edit_decline_message() -> &'static str {
     "Native Codex file edits and apply_patch are disabled in Cairn. Use mcp__cairn__write instead."
 }
 
-pub(super) fn native_file_change_decline_payload() -> Value {
+fn native_file_change_decline_payload() -> Value {
     serde_json::json!({
         "decision": "decline",
         "message": native_edit_decline_message()
     })
 }
 
-pub(super) fn is_empty_object_schema(value: &Value) -> bool {
+fn is_empty_object_schema(value: &Value) -> bool {
     value.as_object().is_some_and(|schema| {
         schema.get("type").and_then(|v| v.as_str()) == Some("object")
             && schema
@@ -316,7 +316,7 @@ pub(super) fn is_empty_object_schema(value: &Value) -> bool {
     })
 }
 
-pub(super) fn is_codex_mcp_tool_approval_elicitation(params: &Value) -> bool {
+fn is_codex_mcp_tool_approval_elicitation(params: &Value) -> bool {
     if params.get("mode").and_then(|v| v.as_str()) != Some("form") {
         return false;
     }
@@ -338,7 +338,7 @@ pub(super) fn is_codex_mcp_tool_approval_elicitation(params: &Value) -> bool {
     }
 }
 
-pub(super) fn codex_mcp_elicitation_decline_payload() -> Value {
+fn codex_mcp_elicitation_decline_payload() -> Value {
     serde_json::json!({
         "action": "decline",
         "content": Value::Null,
@@ -346,7 +346,7 @@ pub(super) fn codex_mcp_elicitation_decline_payload() -> Value {
     })
 }
 
-pub(super) fn codex_mcp_elicitation_tool_use_id(id_value: &Value) -> String {
+fn codex_mcp_elicitation_tool_use_id(id_value: &Value) -> String {
     let request_id = match id_value {
         Value::String(value) => value.clone(),
         Value::Number(value) => value.to_string(),
@@ -358,7 +358,7 @@ pub(super) fn codex_mcp_elicitation_tool_use_id(id_value: &Value) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn request_codex_permission(
+fn request_codex_permission(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     run_id: &str,

@@ -13,6 +13,7 @@ pub mod issue_resources;
 pub mod issues;
 pub mod mcp_resources;
 pub mod messages;
+pub(crate) mod owned_wait;
 pub mod pdf;
 pub mod permission;
 pub mod planning;
@@ -28,6 +29,7 @@ pub mod skills_resources;
 pub mod slug;
 pub(crate) mod target;
 pub mod terminal;
+pub(crate) mod tool_use_correlation;
 pub mod warm_search;
 pub mod watch;
 pub mod web;
@@ -35,20 +37,20 @@ pub mod workflows;
 pub mod write;
 
 /// Payload for `agent-attention` events.
-pub struct AttentionEvent<'a> {
-    pub attention_type: &'a str,
-    pub project_key: &'a str,
-    pub issue_number: Option<i32>,
-    pub issue_title: Option<&'a str>,
-    pub node_name: Option<&'a str>,
-    pub exec_seq: Option<i32>,
-    pub tool_name: Option<&'a str>,
+pub(crate) struct AttentionEvent<'a> {
+    pub(crate) attention_type: &'a str,
+    pub(crate) project_key: &'a str,
+    pub(crate) issue_number: Option<i32>,
+    pub(crate) issue_title: Option<&'a str>,
+    pub(crate) node_name: Option<&'a str>,
+    pub(crate) exec_seq: Option<i32>,
+    pub(crate) tool_name: Option<&'a str>,
 }
 
 /// Emit an `agent-attention` event to notify the frontend that user attention is needed.
 ///
 /// Used for: ask_user prompts, permission requests, job completed/failed.
-pub fn emit_attention(emitter: &dyn crate::services::EventEmitter, event: &AttentionEvent) {
+pub(crate) fn emit_attention(emitter: &dyn crate::services::EventEmitter, event: &AttentionEvent) {
     let _ = emitter.emit(
         "agent-attention",
         serde_json::json!({
@@ -89,52 +91,19 @@ impl RunContext {
 /// Minimal project context for external tools (no active run required)
 #[derive(Debug)]
 pub struct ProjectContext {
-    pub project_id: String,
-    pub project_key: String,
+    project_id: String,
+    project_key: String,
 }
 
-pub fn parse_payload<T>(request: &crate::mcp::types::McpCallbackRequest) -> Result<T, String>
+fn parse_payload<T>(request: &crate::mcp::types::McpCallbackRequest) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned,
 {
     serde_json::from_value(request.payload.clone()).map_err(|e| format!("Invalid payload: {e}"))
 }
 
-/// Parse issue identifier into optional project key and issue number.
-/// Returns (project_key, issue_number) - project_key is None if not specified.
-///
-/// Supported formats:
-/// - "37" -> (None, 37)
-/// - "#37" -> (None, 37)
-/// - "CAIRN-37" -> (Some("CAIRN"), 37)
-pub fn parse_issue_identifier(input: &str) -> Option<(Option<String>, i32)> {
-    let trimmed = input.trim();
-
-    // Try direct parse first (e.g., "37")
-    if let Ok(n) = trimmed.parse::<i32>() {
-        return Some((None, n));
-    }
-
-    // Handle "#37" format
-    if let Some(stripped) = trimmed.strip_prefix('#') {
-        if let Ok(n) = stripped.parse::<i32>() {
-            return Some((None, n));
-        }
-    }
-
-    // Handle "PREFIX-37" format (case-insensitive)
-    if let Some(pos) = trimmed.rfind('-') {
-        let prefix = &trimmed[..pos];
-        if let Ok(n) = trimmed[pos + 1..].parse::<i32>() {
-            return Some((Some(prefix.to_uppercase()), n));
-        }
-    }
-
-    None
-}
-
 /// Strip a shell launcher wrapper and return the semantic inner command when possible.
-pub fn unwrap_shell_launcher(cmd: &str) -> String {
+pub(crate) fn unwrap_shell_launcher(cmd: &str) -> String {
     let trimmed = cmd.trim();
     let prefixes = [
         "/bin/zsh -lc ",
@@ -202,7 +171,7 @@ pub fn unwrap_shell_launcher(cmd: &str) -> String {
 }
 
 /// Normalize command for matching: strip shell launchers, trim, collapse whitespace.
-pub fn normalize_command(cmd: &str) -> String {
+pub(crate) fn normalize_command(cmd: &str) -> String {
     unwrap_shell_launcher(cmd)
         .split_whitespace()
         .collect::<Vec<_>>()

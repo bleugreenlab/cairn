@@ -83,6 +83,7 @@ mod tests {
             background: None,
             interpreter: None,
             repl: None,
+            wait_for: None,
         }
     }
 
@@ -97,6 +98,7 @@ mod tests {
             background: None,
             interpreter: Some(interpreter.to_string()),
             repl: None,
+            wait_for: None,
         }
     }
 
@@ -111,6 +113,7 @@ mod tests {
             background: None,
             interpreter: None,
             repl: None,
+            wait_for: None,
         }
     }
 

@@ -10,7 +10,7 @@
 /// self-hosted deployments.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
-    pub base_url: String,
+    pub(crate) base_url: String,
 }
 
 impl Default for ApiConfig {
@@ -23,25 +23,25 @@ impl Default for ApiConfig {
 
 impl ApiConfig {
     /// Device JWT refresh endpoint.
-    pub fn device_refresh_url(&self) -> String {
+    pub(crate) fn device_refresh_url(&self) -> String {
         format!("{}/tokens/device/refresh", self.base_url)
     }
 
     /// Device token status endpoint.
-    pub fn device_url(&self, device_id: &str) -> String {
+    pub(crate) fn device_url(&self, device_id: &str) -> String {
         format!("{}/tokens/device/{}", self.base_url, device_id)
     }
 
     /// Read-only device org-memberships endpoint (GET, device-JWT-authed). Mints
     /// no token, so the account-refresh loop can poll membership each tick to
     /// discover newly-joined teams without minting a JWT every time.
-    pub fn device_orgs_url(&self) -> String {
+    pub(crate) fn device_orgs_url(&self) -> String {
         format!("{}/tokens/device/orgs", self.base_url)
     }
 
     /// Anonymous (account-less) device registration endpoint.
     /// Returns a long-lived, user-less device JWT usable only on `/embed`.
-    pub fn anon_device_url(&self) -> String {
+    pub(crate) fn anon_device_url(&self) -> String {
         format!("{}/tokens/device/anonymous", self.base_url)
     }
 
@@ -51,36 +51,41 @@ impl ApiConfig {
     }
 
     /// Bug report submission endpoint.
-    pub fn bug_report_url(&self) -> String {
+    pub(crate) fn bug_report_url(&self) -> String {
         format!("{}/bugs/reports", self.base_url)
     }
 
     /// Embedding gateway endpoint (Bedrock Cohere Embed v4).
-    pub fn embed_url(&self) -> String {
+    pub(crate) fn embed_url(&self) -> String {
         format!("{}/embed", self.base_url)
     }
 
     /// Team sync-config endpoint (GET, member-authed). Returns the broker
     /// `syncUrl` plus bootstrap metadata, or 404/503 when not yet provisioned.
-    pub fn team_sync_config_url(&self, team_id: &str) -> String {
+    pub(crate) fn team_sync_config_url(&self, team_id: &str) -> String {
         format!("{}/teams/{}/sync-config", self.base_url, team_id)
     }
 
     /// Team sync-token endpoint (POST, member-authed). Mints a short-lived,
     /// member- and team-scoped token the desktop presents to the sync broker.
-    pub fn team_sync_token_url(&self, team_id: &str) -> String {
+    pub(crate) fn team_sync_token_url(&self, team_id: &str) -> String {
         format!("{}/teams/{}/sync-token", self.base_url, team_id)
     }
 
+    /// Device-JWT-authenticated exact-object S3 grant endpoint.
+    pub(crate) fn team_object_grants_url(&self, team_id: &str) -> String {
+        format!("{}/teams/{}/object-grants", self.base_url, team_id)
+    }
+
     /// Device-JWT-authenticated team attention push endpoint.
-    pub fn push_notify_url(&self) -> String {
+    pub(crate) fn push_notify_url(&self) -> String {
         format!("{}/push/notify", self.base_url)
     }
 
     /// Per-team content-addressed store endpoint (PUT/GET, sync-token-authed).
     /// The broker proxies `hash`-keyed archival bytes to/from per-team object
     /// storage on the same auth boundary as team sync.
-    pub fn team_cas_url(&self, team_id: &str, hash: &str) -> String {
+    pub(crate) fn team_cas_url(&self, team_id: &str, hash: &str) -> String {
         format!("{}/teams/{}/cas/{}", self.base_url, team_id, hash)
     }
 }
@@ -125,6 +130,10 @@ mod tests {
         assert_eq!(
             config.team_sync_token_url("team-1"),
             "https://api.cairn.computer/teams/team-1/sync-token"
+        );
+        assert_eq!(
+            config.team_object_grants_url("team-1"),
+            "https://api.cairn.computer/teams/team-1/object-grants"
         );
         assert_eq!(
             config.push_notify_url(),

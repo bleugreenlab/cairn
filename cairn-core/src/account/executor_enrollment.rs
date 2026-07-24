@@ -9,8 +9,8 @@ use cairn_db::turso::params;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-pub const CREDENTIAL_LIFETIME_SECONDS: i64 = 7 * 24 * 60 * 60;
-pub const CREDENTIAL_ROTATE_BEFORE_SECONDS: i64 = 24 * 60 * 60;
+const CREDENTIAL_LIFETIME_SECONDS: i64 = 7 * 24 * 60 * 60;
+const CREDENTIAL_ROTATE_BEFORE_SECONDS: i64 = 24 * 60 * 60;
 
 // Only hashes cross the persistence boundary; raw bearer material is returned once.
 fn hash(value: &str) -> String {

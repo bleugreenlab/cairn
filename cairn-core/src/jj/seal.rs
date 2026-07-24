@@ -14,8 +14,32 @@ pub fn is_working_copy_dirty(jj: &JjEnv, ws: &Path) -> Result<bool, String> {
         .is_empty())
 }
 
+#[cfg(test)]
+pub(crate) fn sealed_commit_is_lost(
+    jj: &JjEnv,
+    ws: &Path,
+    pre_dirty: bool,
+) -> Result<bool, String> {
+    sealed_commit_probe(jj, ws, pre_dirty).map(|(_, lost)| lost)
+}
+
+pub(crate) const SYSTEM_PROTECTION_BOOKMARK: &str = "cairn-system-fix-protection";
+const SYSTEM_FIX_COMMIT_MESSAGE: &str = "fix: apply write-check changes";
+
+pub(crate) fn retire_system_protection(jj: &JjEnv, ws: &Path) {
+    if let Err(error) = jj.run(
+        ws,
+        &["bookmark", "delete", SYSTEM_PROTECTION_BOOKMARK],
+        "retire system fix protection",
+    ) {
+        if !error.contains("No matching bookmarks") {
+            log::warn!("failed to retire system fix protection bookmark: {error}");
+        }
+    }
+}
+
 /// The change id of `@` (stable across the working copy's content amendments).
-pub fn snapshot_change_id(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+pub(crate) fn snapshot_change_id(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     jj.run(
         ws,
         &["log", "-r", "@", "--no-graph", "-T", "change_id.short()"],
@@ -57,29 +81,22 @@ pub(crate) fn scoped_dirty(jj: &JjEnv, ws: &Path, paths: &[&str]) -> Result<bool
 ///   rewrites are kept.
 ///
 /// Two cheap `jj log` reads on the just-sealed commit; runs only on the seal path.
-pub(crate) fn sealed_commit_is_lost(
-    jj: &JjEnv,
-    ws: &Path,
-    pre_dirty: bool,
-) -> Result<bool, String> {
-    let empty = jj
-        .run(
-            ws,
-            &["log", "-r", "@-", "--no-graph", "-T", "empty"],
-            "jj seal empty check",
-        )?
-        .contains("true");
-    if pre_dirty && empty {
-        return Ok(true);
-    }
-    let cid = jj.run(
+fn sealed_commit_probe(jj: &JjEnv, ws: &Path, pre_dirty: bool) -> Result<(String, bool), String> {
+    let probe = jj.run(
         ws,
-        &["log", "-r", "@-", "--no-graph", "-T", "change_id.short()"],
-        "jj seal change id",
+        &[
+            "log",
+            "-r",
+            "@-",
+            "--no-graph",
+            "-T",
+            "commit_id.short() ++ \"|\" ++ if(empty, \"true\", \"false\") ++ \"|\" ++ change_id.short()",
+        ],
+        "jj sealed commit probe",
     )?;
-    let cid = cid.trim();
-    if cid.is_empty() {
-        return Ok(false);
+    let (sha, empty, cid) = parse_sealed_commit_probe(&probe)?;
+    if pre_dirty && empty {
+        return Ok((sha, true));
     }
     let twins = jj.run(
         ws,
@@ -93,7 +110,54 @@ pub(crate) fn sealed_commit_is_lost(
         ],
         "jj seal divergence check",
     )?;
-    Ok(twins.lines().filter(|l| !l.trim().is_empty()).count() > 1)
+    Ok((
+        sha,
+        twins.lines().filter(|l| !l.trim().is_empty()).count() > 1,
+    ))
+}
+
+fn parse_sealed_commit_probe(probe: &str) -> Result<(String, bool, String), String> {
+    let mut fields = probe.trim().split('|');
+    let sha = fields.next().unwrap_or_default().trim();
+    let empty = match fields.next().map(str::trim) {
+        Some("true") => true,
+        Some("false") => false,
+        other => {
+            return Err(format!(
+                "malformed jj sealed commit probe: invalid empty field {other:?}"
+            ))
+        }
+    };
+    let cid = fields.next().unwrap_or_default().trim();
+    if sha.is_empty() || cid.is_empty() || fields.next().is_some() {
+        return Err(format!("malformed jj sealed commit probe: {probe:?}"));
+    }
+    Ok((sha.to_string(), empty, cid.to_string()))
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::parse_sealed_commit_probe;
+
+    #[test]
+    fn malformed_sealed_commit_probe_is_rejected() {
+        for malformed in [
+            "",
+            "sha|maybe|change",
+            "sha|true|",
+            "|false|change",
+            "sha|false|change|extra",
+        ] {
+            assert!(
+                parse_sealed_commit_probe(malformed).is_err(),
+                "accepted {malformed:?}"
+            );
+        }
+        assert_eq!(
+            parse_sealed_commit_probe("abc|false|def").unwrap(),
+            ("abc".into(), false, "def".into())
+        );
+    }
 }
 
 /// Seal the whole `@` into one addressable commit (the run-path seal: seals the
@@ -115,7 +179,7 @@ pub fn seal(
 /// `^` folds the scoped paths into the prior sealed commit (git `--amend`
 /// equivalent). Advances the workspace's git bookmark to the sealed commit and
 /// exports it to the project's git (best-effort). Returns the sealed commit id.
-pub fn seal_paths(
+pub(crate) fn seal_paths(
     jj: &JjEnv,
     ws: &Path,
     msg: &str,
@@ -215,7 +279,7 @@ pub fn seal_paths(
             //   advanced onto a clean tip and `@` is a stale shell. The existing
             //   "behind its branch tip" message and its stale-family recovery
             //   (discard, self-healing via update-stale) stay unchanged.
-            if branch_has_conflict(jj, ws, branch).unwrap_or(false) {
+            if branch_has_conflict(jj, ws, branch)? {
                 return Err(CONFLICTED_BRANCH_SEAL_MSG.to_string());
             }
             return Err(format!(
@@ -235,15 +299,28 @@ pub fn seal_paths(
     let pre_dirty = if msg == "^" {
         false
     } else {
-        scoped_dirty(jj, ws, paths).unwrap_or(false)
+        scoped_dirty(jj, ws, paths)?
     };
 
+    // A post-commit integrity probe is necessarily fallible after mutation.
+    // Snapshot the operation first so any command/parsing failure can restore the
+    // exact pre-seal graph (including amend/squash), not merely report an error
+    // while leaving a hidden commit behind.
+    let pre_seal_operation = operation_id(jj, ws)?;
     jj.run(ws, &argref, "jj commit")?;
-    let sha = jj.run(
-        ws,
-        &["log", "-r", "@-", "--no-graph", "-T", "commit_id.short()"],
-        "jj log -r @-",
-    )?;
+    let (sha, lost) = match sealed_commit_probe(jj, ws, pre_dirty) {
+        Ok(probe) => probe,
+        Err(error) => {
+            restore_operation(jj, ws, &pre_seal_operation).map_err(|restore_error| {
+                format!(
+                    "sealed commit integrity probe failed ({error}); restoring the pre-seal operation also failed ({restore_error})"
+                )
+            })?;
+            return Err(format!(
+                "sealed commit integrity probe failed; the pre-seal operation was restored: {error}"
+            ));
+        }
+    };
 
     // Detection backstop: a concurrent store advance can reset `@` out from under
     // the commit so `jj commit` succeeds but seals an EMPTY or DIVERGENT commit —
@@ -254,7 +331,7 @@ pub fn seal_paths(
     // bookmark has NOT moved yet (that runs only on the clean path below), so
     // `jj abandon @-` reparents `@` onto the original parent and drops the commit
     // without stranding the bookmark on a twin.
-    if msg != "^" && sealed_commit_is_lost(jj, ws, pre_dirty).unwrap_or(false) {
+    if msg != "^" && lost {
         if let Err(e) = jj.run(ws, &["abandon", "@-"], "jj abandon lost seal") {
             log::warn!("failed to back out lost-seal commit (still reporting the loss): {e}");
         }
@@ -273,7 +350,10 @@ pub fn seal_paths(
         ) {
             log::warn!("jj bookmark set after seal (best-effort, continuing): {e}");
         }
-        let _ = jj.run(ws, &["git", "export"], "jj git export");
+        let _ = export_git_preserving_checkout(jj, ws, false, "jj git export");
+        if msg != SYSTEM_FIX_COMMIT_MESSAGE {
+            retire_system_protection(jj, ws);
+        }
     }
     Ok(CommitResult {
         sha,
@@ -302,7 +382,7 @@ pub fn seal_paths(
 /// edit commits into `@` and the bookmark advances), so it must not be refused.
 /// A genuinely-ahead bookmark on a divergent line (the Coordinator-fold case) is
 /// still rejected, because it is not an ancestor of `@`.
-pub fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, String> {
+fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, String> {
     let Some(bookmark) = bookmark_commit(jj, ws, branch) else {
         return Ok(true);
     };
@@ -327,7 +407,7 @@ pub fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool,
 /// when there was nothing to fold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldOutcome {
-    pub folded_files: Vec<String>,
+    pub(crate) folded_files: Vec<String>,
 }
 
 /// Fold a `when:write` check's tracked working-copy changes into the just-sealed
@@ -379,7 +459,7 @@ pub fn fold_worktree_into_seal(jj: &JjEnv, ws: &Path) -> Result<Option<FoldOutco
         ) {
             log::warn!("fold: bookmark set after squash (best-effort): {e}");
         }
-        let _ = jj.run(ws, &["git", "export"], "jj git export (fold)");
+        let _ = export_git_preserving_checkout(jj, ws, false, "jj git export (fold)");
         if let Err(e) = push_to_origin(jj, ws, &branch) {
             log::warn!("jj push failed (fold succeeded locally): {e}");
         }
@@ -400,7 +480,7 @@ pub fn fold_worktree_into_seal(jj: &JjEnv, ws: &Path) -> Result<Option<FoldOutco
 /// `restore` reports staleness, recover through `update-stale` instead of
 /// failing, and the rollback no longer shares the seal's single point of
 /// failure. See [`is_stale_error`].
-pub fn discard(jj: &JjEnv, ws: &Path) -> Result<(), String> {
+pub(crate) fn discard(jj: &JjEnv, ws: &Path) -> Result<(), String> {
     match jj.run(ws, &["restore"], "jj restore") {
         Ok(_) => Ok(()),
         Err(e) if is_stale_error(&e) => {

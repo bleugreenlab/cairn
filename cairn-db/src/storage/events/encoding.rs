@@ -67,9 +67,9 @@ pub fn init_placeholder(tag: &str) -> String {
 }
 
 /// `storage_mode` column markers.
-pub const MODE_FULL: &str = "full";
-pub const MODE_ZSTD: &str = "zstd";
-pub const MODE_GITCOORD: &str = "gitcoord";
+const MODE_FULL: &str = "full";
+const MODE_ZSTD: &str = "zstd";
+const MODE_GITCOORD: &str = "gitcoord";
 
 /// One archived event's logical form: the shapes the storage contract admits.
 /// Each carries exactly the fields its columns encode.
@@ -202,7 +202,7 @@ impl ArchivedShape {
 
 /// A column combination that matches no archived shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodeError(pub String);
+pub struct DecodeError(String);
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -213,7 +213,7 @@ impl std::fmt::Display for DecodeError {
 /// Classify a row's columns into its [`ArchivedShape`], rejecting combinations no
 /// shape produces (a `gitcoord` row with no commit, a compressed row whose codec
 /// disagrees with its blob, a `full` row carrying a blob, an unknown mode).
-pub fn decode(cols: &EventColumns) -> Result<ArchivedShape, DecodeError> {
+pub(crate) fn decode(cols: &EventColumns) -> Result<ArchivedShape, DecodeError> {
     // Global blob/codec invariant: a blob is always zstd_v1, its absence is always
     // uncompressed. This holds across every mode, so check it once up front.
     match (cols.data_blob.is_some(), cols.codec.as_deref()) {

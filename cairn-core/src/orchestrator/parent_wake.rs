@@ -2,7 +2,7 @@ use cairn_db::turso::params;
 
 use crate::messages::{db as msg_db, queued::DeliveryUrgency};
 use crate::models::ChannelType;
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{attention_push, Orchestrator};
 use crate::storage::{run_db_blocking, DbResult, LocalDb, RowExt};
 
 fn persist_system_direct(
@@ -95,6 +95,38 @@ pub(crate) fn load_parent_job(
         .await
         .map_err(|e| e.to_string())
     })
+}
+
+/// Queue a durable operator signal on the canonical spawning parent/coordinator
+/// without resuming it. Returns `true` only when a new distinct state was queued.
+pub(crate) async fn queue_passive_parent_push(
+    db: &LocalDb,
+    child_issue_id: &str,
+    content_ref: &str,
+    key: &str,
+    fingerprint: &str,
+) -> Result<bool, String> {
+    let Some(parent_job_id) = load_parent_job(db, child_issue_id)? else {
+        return Ok(false);
+    };
+    let latest = attention_push::latest_push_fingerprint(db, &parent_job_id, key)
+        .await
+        .map_err(|error| error.to_string())?;
+    if latest.as_ref().and_then(|value| value.as_deref()) == Some(fingerprint) {
+        return Ok(false);
+    }
+    attention_push::push_with_fingerprint(
+        db,
+        &parent_job_id,
+        content_ref,
+        attention_push::Wake::Passive,
+        attention_push::Boundary::Event,
+        key,
+        Some(fingerprint),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 /// Return `job_id` if it is a resumable wake target (exists, not failed, has a
@@ -248,6 +280,52 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn passive_parent_push_is_fingerprinted_and_never_rousing() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "complete").await;
+
+        assert!(queue_passive_parent_push(
+            &db,
+            "child",
+            "cairn://p/PROJ/2/1/builder/checks",
+            "turn-checks-infrastructure:child",
+            "state-a",
+        )
+        .await
+        .unwrap());
+        assert!(!queue_passive_parent_push(
+            &db,
+            "child",
+            "cairn://p/PROJ/2/1/builder/checks",
+            "turn-checks-infrastructure:child",
+            "state-a",
+        )
+        .await
+        .unwrap());
+        assert!(queue_passive_parent_push(
+            &db,
+            "child",
+            "cairn://p/PROJ/2/1/builder/checks",
+            "turn-checks-infrastructure:child",
+            "state-b",
+        )
+        .await
+        .unwrap());
+
+        let row = db
+            .query_one(
+                "SELECT wake, fingerprint, COUNT(*) OVER () FROM attention_pushes
+                 WHERE recipient = 'parent-job' AND key = 'turn-checks-infrastructure:child'
+                 ORDER BY created_at DESC LIMIT 1",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row, ("passive".to_string(), "state-b".to_string(), 1));
     }
 
     #[tokio::test]

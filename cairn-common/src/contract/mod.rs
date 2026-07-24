@@ -40,27 +40,6 @@ pub fn mutation_spec(kind: ResourceKind, mode: ChangeMode) -> Option<&'static Mu
     contract_for(kind).and_then(|contract| contract.mutation(mode))
 }
 
-/// Cross-cutting flows a per-resource schema can't express. Surfaced by the
-/// trimmed `write` tool description and on-read help.
-pub const GLOBAL_CONTRACT_NOTES: &[(&str, &str)] = &[
-    (
-        "cairn:~ expansion",
-        "Home-relative URIs (cairn:~/...) resolve against the running job's node.",
-    ),
-    (
-        "preview -> apply",
-        "preview:true (and a bare mode=rename) writes nothing and needs no commit_msg; it returns an apply_uri. Land it by re-submitting one item with mode=apply, that URI, and the commit_msg that commits the edits.",
-    ),
-    (
-        "commit_msg amend",
-        "commit_msg:\"^\" amends the previous commit; applies to the file-target subset only.",
-    ),
-    (
-        "task session",
-        "tasks accept session:new|fork and are created only under your own node (cairn:~/tasks).",
-    ),
-];
-
 // ============================================================================
 // The table
 // ============================================================================
@@ -115,6 +94,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     tasks::TASK_ARTIFACT_CONTRACT,
     jobs::JOB_TODOS_CONTRACT,
     jobs::NODE_CHECKS_CONTRACT,
+    jobs::TASK_CHECKS_CONTRACT,
     jobs::NODE_WAKES_CONTRACT,
     jobs::NODE_TASKS_CONTRACT,
     jobs::NODE_CALLS_CONTRACT,

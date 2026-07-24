@@ -59,7 +59,7 @@ pub fn set_archived_file_renderer(renderer: &'static dyn ArchivedFileRenderer) {
 
 /// The registered archived-file renderer, or `None` when none has been
 /// registered (reconstruction then degrades archived reads to stubs).
-pub fn archived_file_renderer() -> Option<&'static dyn ArchivedFileRenderer> {
+pub(crate) fn archived_file_renderer() -> Option<&'static dyn ArchivedFileRenderer> {
     ARCHIVED_FILE_RENDERER.get().copied()
 }
 
@@ -72,7 +72,7 @@ pub fn archived_file_renderer() -> Option<&'static dyn ArchivedFileRenderer> {
 pub const READ_BATCH_CHAR_BUDGET: usize = 45_000;
 
 /// Resolve a possibly-negative offset against a total count (negative = tail).
-pub fn resolve_offset(offset: Option<i64>, total: usize) -> usize {
+fn resolve_offset(offset: Option<i64>, total: usize) -> usize {
     match offset.unwrap_or(0) {
         raw if raw < 0 => total.saturating_sub(raw.unsigned_abs() as usize),
         raw => (raw as usize).min(total),
@@ -122,7 +122,7 @@ pub fn window_text_lines(raw: &str, offset: Option<i64>, limit: Option<usize>) -
 
 /// Water-filling fair share of `total_budget` across segment lengths: short
 /// segments take exactly what they need and donate the remainder to longer ones.
-pub fn fair_share_budgets(lengths: &[usize], total_budget: usize) -> Vec<usize> {
+fn fair_share_budgets(lengths: &[usize], total_budget: usize) -> Vec<usize> {
     if lengths.is_empty() {
         return Vec::new();
     }
@@ -353,9 +353,9 @@ fn header(meta: &SegmentMeta, shown: usize, truncated: bool) -> String {
 /// A segment rendered to its final composed text block plus finalized metadata.
 pub struct RenderedSegment {
     pub text: String,
-    pub meta: SegmentMeta,
-    pub images: Vec<ImageBlock>,
-    pub affordance: Option<Affordance>,
+    meta: SegmentMeta,
+    images: Vec<ImageBlock>,
+    affordance: Option<Affordance>,
 }
 
 fn safe_char_boundary(text: &str, mut byte: usize) -> usize {
@@ -624,7 +624,7 @@ fn render_record_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
 
 /// Estimated untruncated length of a segment's text block, for fair-share
 /// budgeting: header (with suffix slack), body, a footer allowance, and history.
-pub(crate) fn estimate_len(segment: &ReadSegment) -> usize {
+fn estimate_len(segment: &ReadSegment) -> usize {
     let header = format!("=== {} ===", segment.meta.uri).len() + 28;
     let footer = 220;
     let history = segment.history.as_ref().map(|h| h.len() + 2).unwrap_or(0);

@@ -48,10 +48,17 @@ pub struct FetchedFile {
     pub is_binary: bool,
 }
 
+/// Provenance for an imported skill package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchedSkillSource {
+    Url(String),
+    LocalFile(String),
+}
+
 /// Complete fetched skill ready for preview/install.
 #[derive(Debug, Clone)]
 pub struct FetchedSkill {
-    pub source_url: String,
+    pub source: FetchedSkillSource,
     pub skill_id: String,
     pub name: String,
     pub description: String,
@@ -72,7 +79,7 @@ pub struct FetchedSkill {
 /// - `https://github.com/{owner}/{repo}/blob/{branch}/{path}` (SKILL.md link → parent dir)
 /// - `owner/repo/path` shorthand (assumes GitHub, main branch)
 /// - Generic git URL (contains `.git` or known git hosts)
-pub fn parse_skill_url(url: &str) -> Result<SkillSource, String> {
+pub(crate) fn parse_skill_url(url: &str) -> Result<SkillSource, String> {
     let url = url.trim();
 
     // Try GitHub URL first
@@ -455,7 +462,10 @@ fn collect_files_recursive(dir: &Path, base: &Path) -> Result<Vec<FetchedFile>, 
 // Public API
 // ---------------------------------------------------------------------------
 
-fn build_fetched_skill(files: Vec<FetchedFile>, source_url: &str) -> Result<FetchedSkill, String> {
+pub(crate) fn build_fetched_skill(
+    files: Vec<FetchedFile>,
+    source: FetchedSkillSource,
+) -> Result<FetchedSkill, String> {
     let skill_md = files
         .iter()
         .find(|f| f.relative_path == "SKILL.md")
@@ -471,7 +481,7 @@ fn build_fetched_skill(files: Vec<FetchedFile>, source_url: &str) -> Result<Fetc
         .any(|f| f.relative_path.starts_with("scripts/"));
 
     Ok(FetchedSkill {
-        source_url: source_url.to_string(),
+        source,
         skill_id: parsed.id,
         name: parsed.name,
         description: parsed.description,
@@ -483,7 +493,7 @@ fn build_fetched_skill(files: Vec<FetchedFile>, source_url: &str) -> Result<Fetc
 }
 
 /// Fetch a skill from a URL, returning all files and parsed metadata.
-pub fn fetch_skill(source: &SkillSource, source_url: &str) -> Result<FetchedSkill, String> {
+pub(crate) fn fetch_skill(source: &SkillSource, source_url: &str) -> Result<FetchedSkill, String> {
     let files = match source {
         SkillSource::GitHub {
             owner,
@@ -501,13 +511,13 @@ pub fn fetch_skill(source: &SkillSource, source_url: &str) -> Result<FetchedSkil
         SkillSource::Git { url, path } => fetch_from_git(url, path.as_deref())?,
     };
 
-    build_fetched_skill(files, source_url)
+    build_fetched_skill(files, FetchedSkillSource::Url(source_url.to_string()))
 }
 
 /// Install fetched skill files to the target directory.
 ///
 /// Returns the path to the installed skill directory.
-pub fn install_fetched_skill(
+pub(crate) fn install_fetched_skill(
     skill: &FetchedSkill,
     config_dir: &Path,
     project_path: Option<&Path>,
@@ -526,11 +536,16 @@ pub fn install_fetched_skill(
         counter += 1;
     }
 
+    // Validate the complete package before creating or writing anything.
+    for file in &skill.files {
+        super::skill_archive::validate_portable_relative_path(&file.relative_path)?;
+    }
+
     let target_dir = skills_dir.join(&final_id);
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| format!("Failed to create skill directory: {}", e))?;
 
-    // Write all files preserving directory structure
+    // Write all files preserving directory structure.
     for file in &skill.files {
         let dest = target_dir.join(&file.relative_path);
         if let Some(parent) = dest.parent() {
@@ -541,12 +556,17 @@ pub fn install_fetched_skill(
             .map_err(|e| format!("Failed to write {}: {}", file.relative_path, e))?;
     }
 
-    // Write .meta.json with source_url
+    // Record transport provenance without conflating local files with URLs.
     let now = chrono::Utc::now().to_rfc3339();
+    let (source_url, source_file) = match &skill.source {
+        FetchedSkillSource::Url(url) => (Some(url.clone()), None),
+        FetchedSkillSource::LocalFile(filename) => (None, Some(filename.clone())),
+    };
     let meta = SkillMeta {
         created_at: Some(now.clone()),
         updated_at: Some(now),
-        source_url: Some(skill.source_url.clone()),
+        source_url,
+        source_file,
         ..Default::default()
     };
     let meta_json = serde_json::to_string_pretty(&meta)
@@ -612,7 +632,7 @@ mod tests {
             .iter()
             .any(|file| file.relative_path.starts_with("scripts/"));
         FetchedSkill {
-            source_url: source_url.to_string(),
+            source: FetchedSkillSource::Url(source_url.to_string()),
             skill_id: skill_id.to_string(),
             name: name.to_string(),
             description: description.to_string(),
@@ -921,14 +941,16 @@ mod tests {
     #[test]
     fn test_fetch_skill_no_skill_md() {
         let files = vec![fetched_file("README.md", b"# Hello")];
-        let err = build_fetched_skill(files, "https://example.com").unwrap_err();
+        let err = build_fetched_skill(files, FetchedSkillSource::Url("https://example.com".into()))
+            .unwrap_err();
         assert!(err.contains("No SKILL.md found"));
     }
 
     #[test]
     fn test_fetch_skill_invalid_utf8() {
         let files = vec![fetched_file("SKILL.md", vec![0xFF, 0xFE, 0x00, 0x01])];
-        let err = build_fetched_skill(files, "https://example.com").unwrap_err();
+        let err = build_fetched_skill(files, FetchedSkillSource::Url("https://example.com".into()))
+            .unwrap_err();
         assert!(err.contains("not valid UTF-8"));
     }
 
@@ -939,7 +961,7 @@ mod tests {
 
         // No scripts directory
         let files = vec![fetched_file("SKILL.md", skill_md_content.clone())];
-        let result = build_fetched_skill(files, "url").unwrap();
+        let result = build_fetched_skill(files, FetchedSkillSource::Url("url".into())).unwrap();
         assert!(!result.has_scripts);
 
         // With scripts directory
@@ -947,7 +969,7 @@ mod tests {
             fetched_file("SKILL.md", skill_md_content),
             fetched_file("scripts/run.sh", b"#!/bin/bash"),
         ];
-        let result = build_fetched_skill(files, "url").unwrap();
+        let result = build_fetched_skill(files, FetchedSkillSource::Url("url".into())).unwrap();
         assert!(result.has_scripts);
     }
 

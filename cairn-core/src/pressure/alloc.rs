@@ -61,14 +61,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
 /// A point-in-time read of the allocation counters.
 #[derive(Debug, Clone, Copy)]
 pub struct AllocSnapshot {
-    pub total_allocated_bytes: u64,
-    pub total_deallocated_bytes: u64,
-    pub alloc_count: u64,
+    pub(crate) total_allocated_bytes: u64,
+    pub(crate) total_deallocated_bytes: u64,
+    pub(crate) alloc_count: u64,
 }
 
 impl AllocSnapshot {
     /// Read the current counters.
-    pub fn read() -> Self {
+    pub(crate) fn read() -> Self {
         Self {
             total_allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
             total_deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
@@ -80,13 +80,13 @@ impl AllocSnapshot {
     /// the two counters are independent atomics read without a lock, so a
     /// concurrent dealloc can momentarily make deallocated exceed the allocated
     /// value we read.
-    pub fn live_bytes(&self) -> u64 {
+    pub(crate) fn live_bytes(&self) -> u64 {
         self.total_allocated_bytes
             .saturating_sub(self.total_deallocated_bytes)
     }
 
     /// Bytes allocated since an earlier snapshot.
-    pub fn allocated_since(&self, prev: &AllocSnapshot) -> u64 {
+    pub(crate) fn allocated_since(&self, prev: &AllocSnapshot) -> u64 {
         self.total_allocated_bytes
             .saturating_sub(prev.total_allocated_bytes)
     }

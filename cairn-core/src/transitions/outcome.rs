@@ -11,7 +11,7 @@ use crate::models::{IssueAttention, IssueProgress};
 use crate::storage::{DbError, DbResult, RowExt};
 use cairn_db::turso::params;
 
-pub async fn recompute_execution_status_conn(
+pub(crate) async fn recompute_execution_status_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<()> {

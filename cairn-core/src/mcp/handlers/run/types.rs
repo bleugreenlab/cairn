@@ -12,27 +12,27 @@ use serde::{Deserialize, Serialize};
 /// Items run in parallel by default; `sequential` opts into ordered execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunPayload {
-    pub commands: Vec<RunItem>,
+    pub(crate) commands: Vec<RunItem>,
     /// Run items in input order instead of concurrently. Default false.
     #[serde(default)]
-    pub sequential: Option<bool>,
+    pub(crate) sequential: Option<bool>,
     /// In sequential mode, abort remaining items after a failure. Default true.
     #[serde(default)]
-    pub stop_on_error: Option<bool>,
+    pub(crate) stop_on_error: Option<bool>,
     /// Commit all worktree changes once after the whole batch succeeds. Required
     /// when a successful worktree-bound run dirties the worktree; `^` amends.
     /// Without it, a run that dirties the worktree is restored to HEAD (see
     /// `run_commit_barrier`).
     #[serde(default)]
-    pub commit_msg: Option<String>,
+    pub(crate) commit_msg: Option<String>,
     /// Resolve this branch/ref to its head commit and run the batch in a leased
     /// verdict-only build slot. Cannot be combined with commit_msg.
     #[serde(default)]
-    pub branch: Option<String>,
+    pub(crate) branch: Option<String>,
     /// Hard executor placement requirements for the entire batch. Omitted batches
     /// retain the colocated-executor compatibility path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constraints: Option<PlacementConstraints>,
+    pub(crate) constraints: Option<PlacementConstraints>,
 }
 
 /// A single run invocation: exactly one of three kinds — a shell `command`, a
@@ -42,39 +42,80 @@ pub struct RunPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunItem {
     #[serde(default)]
-    pub command: Option<String>,
+    pub(crate) command: Option<String>,
     #[serde(default)]
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     #[serde(default)]
-    pub timeout: Option<u32>,
+    pub(crate) timeout: Option<u32>,
     #[serde(default)]
-    pub target: Option<String>,
+    pub(crate) target: Option<String>,
     #[serde(default)]
-    pub payload: Option<RunItemPayload>,
+    pub(crate) payload: Option<RunItemPayload>,
     /// Inline source code to execute. Mutually exclusive with `command`/`target`;
     /// requires `interpreter`. Resolved to `bun -e <code>` (typescript/javascript),
     /// or python via `uv run -` (the script arrives on stdin so uv honors PEP 723
     /// inline deps and project deps), falling back to `python3 -c <code>` when uv
     /// is absent — a direct argv/stdin exec, no shell, no temp file.
     #[serde(default)]
-    pub code: Option<String>,
+    pub(crate) code: Option<String>,
     /// Fire-and-forget flag for a workflow run target (CAIRN-2487): `true`
     /// returns the workflow URI immediately and wakes the caller on completion
     /// instead of suspending it inline. Ignored for non-workflow items.
     #[serde(default)]
-    pub background: Option<bool>,
+    pub(crate) background: Option<bool>,
     /// Language for an inline `code` item: `typescript`/`ts`, `javascript`/`js`
     /// (both via `bun`), or `python`/`py` (via `uv run -` when uv resolves, else
     /// `python3`). Required iff `code` is present; forbidden otherwise.
     #[serde(default)]
-    pub interpreter: Option<String>,
+    pub(crate) interpreter: Option<String>,
     /// Route this item's inline `code` into a stateful REPL session (by slug)
     /// instead of a fresh process, so variables/imports/defs persist across
     /// `run` calls. Requires `code` + `interpreter` (which must match the REPL's
     /// language); rejects `command`/`target`/`payload`. An item without `repl`
     /// is unchanged.
     #[serde(default)]
-    pub repl: Option<String>,
+    pub(crate) repl: Option<String>,
+    /// Suspend the owning turn until the condition fires. A wait item must be
+    /// the sole item in its batch and cannot carry batch execution options.
+    #[serde(default, rename = "waitFor")]
+    pub(crate) wait_for: Option<WaitFor>,
+}
+
+/// Ad-hoc, one-shot wait condition owned by the originating `run` tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum WaitFor {
+    Duration {
+        duration: WaitDuration,
+    },
+    Terminal {
+        kind: TerminalWaitKind,
+        #[serde(rename = "ref")]
+        reference: String,
+        on: TerminalWaitEvent,
+        #[serde(default)]
+        phrase: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum WaitDuration {
+    Human(String),
+    Milliseconds(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalWaitKind {
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalWaitEvent {
+    Exit,
+    Output,
 }
 
 /// Structured args for a run item's target.
@@ -85,9 +126,9 @@ pub struct RunItem {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunItemPayload {
     #[serde(default)]
-    pub args: Vec<String>,
+    pub(crate) args: Vec<String>,
     #[serde(default)]
-    pub args_json: Option<serde_json::Value>,
+    pub(crate) args_json: Option<serde_json::Value>,
 }
 
 /// A resolved, ready-to-execute run item.
@@ -151,6 +192,11 @@ pub(crate) struct ItemOutcome {
     /// returns them today; collected across the batch into the run envelope so the
     /// transport edge delivers them as real image content blocks (read-path mirror).
     pub(crate) images: Vec<ImageBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) promoted_terminal: Option<cairn_common::executor_protocol::PromotedTerminalProcess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tracked_modifications:
+        Option<cairn_common::executor_protocol::TrackedModificationEvidence>,
 }
 
 impl ItemOutcome {
@@ -163,41 +209,30 @@ impl ItemOutcome {
             succeeded: false,
             suspended: false,
             images: Vec::new(),
+            promoted_terminal: None,
+            tracked_modifications: None,
         }
     }
-}
-
-/// A timed-out `run` item that was promoted to a durable terminal session.
-pub(crate) struct PromotedTerminal {
-    /// The terminal's auto-allocated slug (`run-<n>`).
-    #[allow(dead_code)]
-    pub(crate) slug: String,
-    /// Canonical terminal URI the agent can read and kill.
-    pub(crate) uri: String,
-    /// Whether the current job was subscribed to the terminal exit wake during
-    /// promotion. Kept separate from promotion success so a wake persistence
-    /// failure never strands the still-running process behind an unreported URI.
-    pub(crate) wake_subscribed: bool,
 }
 
 /// Event payload for real-time run output streaming.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunOutputPayload {
-    pub run_id: String,
-    pub tool_use_id: String,
-    pub chunk: String,
-    pub stream: String, // "stdout" or "stderr"
+    pub(crate) run_id: String,
+    pub(crate) tool_use_id: String,
+    pub(crate) chunk: String,
+    pub(crate) stream: String, // "stdout" or "stderr"
 }
 
 /// Event payload for run command completion.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunCompletePayload {
-    pub run_id: String,
-    pub tool_use_id: String,
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
+    pub(crate) run_id: String,
+    pub(crate) tool_use_id: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) timed_out: bool,
 }
 
 /// Event payload for the live `when:write` check status line: a full snapshot of
@@ -207,11 +242,15 @@ pub struct RunCompletePayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckStatusPayload {
-    pub run_id: String,
+    pub(crate) run_id: String,
     /// The committing call id (base, no `:check-` suffix). The frontend derives
     /// each check's live-tail stream key as `"{toolUseId}:check-{index}"`.
-    pub tool_use_id: String,
-    pub checks: Vec<CheckStatusEntry>,
+    pub(crate) tool_use_id: String,
+    pub(crate) checks: Vec<CheckStatusEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) phase_detail: Option<String>,
 }
 
 /// One check's live status within a [`CheckStatusPayload`] snapshot.
@@ -220,14 +259,14 @@ pub struct CheckStatusPayload {
 pub struct CheckStatusEntry {
     /// Stable index; the frontend derives `"{toolUseId}:check-{index}"` from it to
     /// find this check's live output tail.
-    pub index: usize,
-    pub name: String,
+    pub(crate) index: usize,
+    pub(crate) name: String,
     /// `"pending"` | `"running"` | `"passed"` | `"failed"`.
-    pub state: String,
+    pub(crate) state: String,
     /// The same annotation vocabulary as the final tool-result summary
     /// (`summary_annotation`): `"12 tests"` | `"4.1s"` | `"cached"` |
     /// `"2 of 40 failed, exit 101"` … `None` while pending or running.
-    pub annotation: Option<String>,
+    pub(crate) annotation: Option<String>,
 }
 
 #[cfg(test)]

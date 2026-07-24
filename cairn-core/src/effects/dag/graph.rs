@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn make_edge(
+fn make_edge(
     source_id: &str,
     source_handle: &str,
     target_id: &str,

@@ -36,7 +36,7 @@ pub fn split_target_query(target: &str) -> Result<SplitTargetQuery, String> {
 /// folds into the preceding value, which fails visibly (a bad pattern or an
 /// "unsupported parameter" error) rather than silently. The escape for a literal
 /// `&` that immediately precedes a recognized key token is `%26`.
-pub const KNOWN_QUERY_KEYS: &[&str] = &[
+const KNOWN_QUERY_KEYS: &[&str] = &[
     "view",
     "file",
     "grep",
@@ -106,7 +106,7 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
 /// step is skipped. These keys are unique to `cairn://db` / `cairn://dev/db`
 /// (`sql`) and `cairn://websearch` (`q`), so treating them as raw wherever they
 /// appear is unambiguous.
-pub const RAW_VALUE_KEYS: &[&str] = &["sql", "q"];
+const RAW_VALUE_KEYS: &[&str] = &["sql", "q"];
 
 /// Return true when the start of `rest` (the text immediately after a `&`) is a
 /// recognized query key — i.e. the chars up to the next `=`, `&`, or end form a

@@ -34,6 +34,8 @@ pub struct FileAgent {
     /// Optional lucide icon name (kebab-case) for the agent's visual identity.
     #[serde(default)]
     pub icon: Option<String>,
+    #[serde(default)]
+    pub bundles: Vec<String>,
     /// Whether this agent is project-scoped (vs workspace-scoped)
     pub is_project_scoped: bool,
     /// Path to the source file
@@ -137,6 +139,7 @@ pub fn save_agent(
         hooks: agent.hooks.as_ref(),
         backend_preference: agent.backend_preference.as_deref(),
         icon: agent.icon.as_deref(),
+        bundles: &agent.bundles,
     });
 
     // Write file
@@ -264,6 +267,7 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
                 hooks: parsed.hooks,
                 backend_preference: parsed.backend_preference,
                 icon: parsed.icon,
+                bundles: parsed.bundles,
                 is_project_scoped,
                 file_path: path.to_path_buf(),
             })

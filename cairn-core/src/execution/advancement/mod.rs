@@ -39,9 +39,9 @@ pub use actions::{
     mark_job_failed, rearm_blocked_checkpoints, rerun_checkpoint_job,
     wake_upstream_after_checkpoint_failure,
 };
-pub use core::advance_execution_impl;
-pub use dependents::release_dependent_executions;
-pub use inputs::{format_resolved_inputs, ResolvedInput};
+pub(crate) use core::advance_execution_impl;
+pub(crate) use dependents::release_dependent_executions;
+pub(crate) use inputs::{format_resolved_inputs, ResolvedInput};
 pub use job_creation::create_jobs_for_new_nodes;
 pub(crate) use readiness::issue_settled;
 pub use readiness::{find_ready_action_nodes, find_ready_condition_nodes, is_action_node_ready};
@@ -51,7 +51,7 @@ pub use recompute::{
 };
 pub use restart::{restart_node, RestartNodeOutcome};
 pub use snapshot_edit::{reconcile_removed_nodes, RemovedNodesReconcile};
-pub use snapshots::load_nodes_from_execution;
+pub(crate) use snapshots::load_nodes_from_execution;
 
 pub(crate) use job_creation::{create_jobs_for_execution, create_jobs_for_new_nodes_conn};
 pub(crate) use persistence::{load_job, load_project_repo_path, run_advancement_db};

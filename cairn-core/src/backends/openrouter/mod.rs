@@ -29,8 +29,8 @@ use crate::identity::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
 use std::sync::atomic::Ordering;
 
-pub const OPENROUTER_BACKEND_NAME: &str = "OpenRouter";
-pub const OPENROUTER_BACKEND_KEY: &str = "openrouter";
+pub(crate) const OPENROUTER_BACKEND_NAME: &str = "OpenRouter";
+pub(crate) const OPENROUTER_BACKEND_KEY: &str = "openrouter";
 
 #[derive(Debug, Clone, Copy)]
 pub struct OpenRouterBackend;

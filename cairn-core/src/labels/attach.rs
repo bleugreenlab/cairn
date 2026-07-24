@@ -8,7 +8,7 @@ use crate::labels::crud::{
 use crate::models::Label;
 use crate::storage::{DbResult, RowExt};
 
-pub async fn resolve_label_ref(
+async fn resolve_label_ref(
     conn: &cairn_db::turso::Connection,
     workspace_id: &str,
     label_ref: &str,
@@ -49,7 +49,7 @@ pub async fn resolve_label_ref(
     ))
 }
 
-pub async fn list_labels_for_issue(
+pub(crate) async fn list_labels_for_issue(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Vec<Label>> {
@@ -103,7 +103,7 @@ pub(crate) async fn list_labels_for_issues(
     Ok(labels)
 }
 
-pub async fn replace_issue_labels(
+pub(crate) async fn replace_issue_labels(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
     refs: &[String],
@@ -152,14 +152,6 @@ pub async fn list_issue_ids_for_label(
         issue_ids.push(row.text(0).map_err(|error| error.to_string())?);
     }
     Ok(issue_ids)
-}
-
-pub async fn hydrate_labels(
-    conn: &cairn_db::turso::Connection,
-    issue: &mut crate::models::Issue,
-) -> DbResult<()> {
-    issue.labels = list_labels_for_issue(conn, &issue.id).await?;
-    Ok(())
 }
 
 #[cfg(test)]

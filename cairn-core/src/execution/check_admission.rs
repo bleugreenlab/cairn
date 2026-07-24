@@ -15,9 +15,9 @@ use crate::config::project_settings::CheckResourceClass;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckAdmissionSnapshot {
-    pub capacity: usize,
-    pub active_permits: usize,
-    pub queued_requests: usize,
+    capacity: usize,
+    active_permits: usize,
+    pub(crate) queued_requests: usize,
 }
 
 pub struct CheckAdmissionController {
@@ -34,13 +34,13 @@ impl Default for CheckAdmissionController {
 }
 
 impl CheckAdmissionController {
-    pub fn capacity_for_host() -> usize {
+    pub(crate) fn capacity_for_host() -> usize {
         std::thread::available_parallelism()
             .map(|n| (n.get() / 4).clamp(2, 4))
             .unwrap_or(2)
     }
 
-    pub fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
             semaphore: Arc::new(Semaphore::new(capacity)),
@@ -54,7 +54,7 @@ impl CheckAdmissionController {
         self.capacity
     }
 
-    pub fn snapshot(&self) -> CheckAdmissionSnapshot {
+    pub(crate) fn snapshot(&self) -> CheckAdmissionSnapshot {
         CheckAdmissionSnapshot {
             capacity: self.capacity,
             active_permits: self.active_permits.load(Ordering::Acquire),
@@ -62,7 +62,7 @@ impl CheckAdmissionController {
         }
     }
 
-    pub async fn acquire(
+    pub(crate) async fn acquire(
         &self,
         resource_class: CheckResourceClass,
     ) -> Result<CheckAdmissionPermit, tokio::sync::AcquireError> {
@@ -113,7 +113,7 @@ pub struct CheckAdmissionPermit {
 }
 
 impl CheckAdmissionPermit {
-    pub fn waited(&self) -> Duration {
+    pub(crate) fn waited(&self) -> Duration {
         self.waited
     }
 }

@@ -212,7 +212,7 @@ pub struct RecordingReaper {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl RecordingReaper {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 

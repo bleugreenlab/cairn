@@ -250,7 +250,7 @@ pub fn tool_result(id: &str, result: &str) -> String {
 }
 
 /// The short change-report a committed `write` returns as its `toolResult`.
-pub fn change_report(sha: &str) -> String {
+fn change_report(sha: &str) -> String {
     json!({
         "applied": [{ "index": 0, "target": "file:a.txt", "mode": "patch",
             "kind": "file", "summary": "patched a.txt" }],
@@ -267,7 +267,7 @@ pub fn write_result(id: &str, sha: &str) -> String {
 /// The archived gitcoord-read stub stored in `data`: the heavy `toolResult` is
 /// dropped and `toolInput.paths` is pinned — the contract reconstruction
 /// dispatches on. Mirrors what the writer's `read_stub` persists.
-pub fn read_stub(id: &str, paths: &[&str]) -> String {
+pub(crate) fn read_stub(id: &str, paths: &[&str]) -> String {
     json!({
         "eventType": "tool_result",
         "toolUseId": id,

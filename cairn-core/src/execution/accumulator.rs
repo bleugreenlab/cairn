@@ -38,7 +38,7 @@ fn default_group_by(trigger: &crate::models::RecipeTrigger) -> &'static str {
 }
 
 /// Extract accumulation policy from recipe. Returns None if every <= 1 (immediate fire).
-pub fn get_accumulation_policy(recipe: &Recipe) -> Option<AccumulationPolicy> {
+pub(crate) fn get_accumulation_policy(recipe: &Recipe) -> Option<AccumulationPolicy> {
     let trigger_node = recipe
         .nodes
         .iter()
@@ -69,7 +69,7 @@ pub fn get_accumulation_policy(recipe: &Recipe) -> Option<AccumulationPolicy> {
 }
 
 /// Extract group key value from event payload by field name.
-pub fn extract_group_key(payload: &Value, group_by: &str) -> Option<String> {
+fn extract_group_key(payload: &Value, group_by: &str) -> Option<String> {
     // Try camelCase first (JSON serialized form), then snake_case
     payload
         .get(group_by)
@@ -84,11 +84,7 @@ pub fn extract_group_key(payload: &Value, group_by: &str) -> Option<String> {
 }
 
 /// Build scope key for DB lookup.
-pub fn build_scope_key(
-    scope: &AccumulationScope,
-    project_id: &str,
-    issue_id: Option<&str>,
-) -> String {
+fn build_scope_key(scope: &AccumulationScope, project_id: &str, issue_id: Option<&str>) -> String {
     match scope {
         AccumulationScope::Global => "global".to_string(),
         AccumulationScope::Project => format!("proj:{}", project_id),

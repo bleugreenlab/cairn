@@ -5,6 +5,8 @@ pub mod contract;
 pub mod executor_protocol;
 pub mod ids;
 pub mod logging;
+pub mod maintenance;
+pub mod memory;
 pub mod paths;
 pub mod protocol;
 pub mod query;

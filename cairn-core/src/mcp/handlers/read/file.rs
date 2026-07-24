@@ -15,6 +15,229 @@ use serde::Serialize;
 /// Size threshold for eliding glob content previews (250KB)
 const LARGE_FILE_THRESHOLD: u64 = 250_000;
 
+const MAT_LEVEL5_MAGIC: &[u8] = b"MATLAB 5.0 MAT-file";
+const HDF5_MAGIC: &[u8] = b"\x89HDF\r\n\x1a\n";
+
+fn render_mat_file_summary(path: &std::path::Path, bytes: &[u8]) -> Option<Result<String, String>> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mat"))
+    {
+        return None;
+    }
+
+    if bytes.starts_with(MAT_LEVEL5_MAGIC) {
+        return Some(render_level5_mat_summary(bytes));
+    }
+
+    let hdf5_offset = bytes
+        .windows(HDF5_MAGIC.len())
+        .take(513)
+        .position(|window| window == HDF5_MAGIC);
+    if let Some(offset) = hdf5_offset {
+        let creation_info = String::from_utf8_lossy(&bytes[..offset.min(128)])
+            .trim_matches(['\0', ' '])
+            .to_string();
+        let mut summary = "MAT-file format: MATLAB v7.3 (HDF5)".to_string();
+        if !creation_info.is_empty() {
+            summary.push_str("\nHeader: ");
+            summary.push_str(&creation_info);
+        }
+        summary.push_str(
+            "\n\nFull variable inspection requires the bundled reader:\n\
+             `run {target:\"cairn://skills/matlab/scripts/inspect-mat.py\", payload:{args:[\"<path>\"]}}`",
+        );
+        return Some(Ok(summary));
+    }
+
+    None
+}
+
+fn render_level5_mat_summary(bytes: &[u8]) -> Result<String, String> {
+    let mat = matfile::MatFile::parse(std::io::Cursor::new(bytes))
+        .map_err(|error| format!("{error:?}"))?;
+    let mut lines = vec!["MAT-file format: MATLAB Level 5 (v7.2 or earlier)".to_string()];
+    if mat.arrays().is_empty() {
+        lines.push("Variables: (no supported numeric arrays)".to_string());
+    } else {
+        lines.push("Variables:".to_string());
+        for array in mat.arrays() {
+            let (class, preview, complex) = numeric_preview(array.data());
+            let dimensions = array
+                .size()
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(" × ");
+            let complex_suffix = if complex { ", complex" } else { "" };
+            lines.push(format!(
+                "- `{}`: {} [{}]{}; preview: [{}]",
+                array.name(),
+                class,
+                dimensions,
+                complex_suffix,
+                preview
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn numeric_preview(data: &matfile::NumericData) -> (&'static str, String, bool) {
+    macro_rules! preview {
+        ($class:literal, $real:expr, $imag:expr) => {{
+            let values = $real
+                .iter()
+                .take(8)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let omitted = $real.len().saturating_sub(values.len());
+            let mut rendered = values.join(", ");
+            if omitted > 0 {
+                rendered.push_str(&format!(", … (+{omitted})"));
+            }
+            ($class, rendered, $imag.is_some())
+        }};
+    }
+    match data {
+        matfile::NumericData::Int8 { real, imag } => preview!("int8", real, imag),
+        matfile::NumericData::UInt8 { real, imag } => preview!("uint8", real, imag),
+        matfile::NumericData::Int16 { real, imag } => preview!("int16", real, imag),
+        matfile::NumericData::UInt16 { real, imag } => preview!("uint16", real, imag),
+        matfile::NumericData::Int32 { real, imag } => preview!("int32", real, imag),
+        matfile::NumericData::UInt32 { real, imag } => preview!("uint32", real, imag),
+        matfile::NumericData::Int64 { real, imag } => preview!("int64", real, imag),
+        matfile::NumericData::UInt64 { real, imag } => preview!("uint64", real, imag),
+        matfile::NumericData::Single { real, imag } => preview!("single", real, imag),
+        matfile::NumericData::Double { real, imag } => preview!("double", real, imag),
+    }
+}
+
+struct BranchReadContext {
+    service: super::object_read::ObjectReadService,
+    repo_path: String,
+    project_id: String,
+    repository_path: std::path::PathBuf,
+    default_commit_id: String,
+}
+
+fn overlay_entries(
+    orch: &Orchestrator,
+    context: &BranchReadContext,
+) -> Result<Vec<super::object_read::ContentEntry>, String> {
+    orch.project_overlays
+        .entries(
+            &context.project_id,
+            &context.repository_path,
+            &context.default_commit_id,
+            context.service.commit_id(),
+            context.service.prefix(),
+            context.service.limits(),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn load_overlay_entries(
+    orch: &Orchestrator,
+    context: &BranchReadContext,
+    entries: &[super::object_read::ContentEntry],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    orch.project_overlays
+        .load_entries(
+            &context.project_id,
+            &context.repository_path,
+            entries,
+            context.service.limits(),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn run_overlay_glob_projection(
+    files: Vec<super::object_read::ContentEntry>,
+    prefix: &str,
+    pattern: &str,
+    offset: Option<i64>,
+    limit: Option<usize>,
+    output_mode: Option<&str>,
+    load: impl FnOnce(&[super::object_read::ContentEntry]) -> Result<Vec<(String, Vec<u8>)>, String>,
+) -> Result<String, String> {
+    let matcher = cairn_symbols::search_util::build_glob_matcher(pattern)?;
+    let mut files: Vec<_> = files
+        .into_iter()
+        .filter(|entry| {
+            matcher.is_match(&entry.path)
+                || std::path::Path::new(&entry.path)
+                    .file_name()
+                    .is_some_and(|name| matcher.is_match(name))
+        })
+        .collect();
+    files.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    if files.is_empty() {
+        return Ok(format!(
+            "No files matched pattern '{}' in {}",
+            pattern, prefix
+        ));
+    }
+
+    let start = resolve_offset(offset, files.len());
+    let files: Vec<_> = files
+        .into_iter()
+        .skip(start)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    Ok(match output_mode.unwrap_or("files_with_matches") {
+        "files_with_matches" => files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "count" => files
+            .iter()
+            .map(|entry| format!("{}:1", entry.path))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "content" => load(&files)?
+            .into_iter()
+            .map(|(path, bytes)| {
+                let body = if bytes.len() as u64 > LARGE_FILE_THRESHOLD {
+                    format!(
+                        "(file is large: {} bytes — read it directly with offset/limit to view)",
+                        bytes.len()
+                    )
+                } else {
+                    String::from_utf8(bytes)
+                        .unwrap_or_else(|error| format!("(failed to read: {error})"))
+                };
+                format!("=== {path} ===\n{body}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        other => {
+            return Err(format!(
+                "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
+                other
+            ))
+        }
+    })
+}
+
+fn overlay_files(
+    orch: &Orchestrator,
+    context: &BranchReadContext,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    orch.project_overlays
+        .files(
+            &context.project_id,
+            &context.repository_path,
+            &context.default_commit_id,
+            context.service.commit_id(),
+            context.service.prefix(),
+            context.service.limits(),
+        )
+        .map_err(|error| error.to_string())
+}
+
 /// Returns MIME type if path has a known image extension supported by the Claude API
 fn get_image_mime_type(path: &std::path::Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_lowercase().as_str() {
@@ -24,6 +247,154 @@ fn get_image_mime_type(path: &std::path::Path) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         _ => None,
     }
+}
+
+fn object_text_files(
+    service: &super::object_read::ObjectReadService,
+) -> Result<Vec<(String, String)>, String> {
+    Ok(service
+        .files()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|(path, bytes)| String::from_utf8(bytes).ok().map(|text| (path, text)))
+        .collect())
+}
+
+fn run_object_ast(
+    service: &super::object_read::ObjectReadService,
+    repo_path: &str,
+    pattern: &str,
+    glob: Option<&str>,
+) -> Result<(crate::symbols::render::Rendered, bool), String> {
+    if service.entries().is_ok() {
+        Ok((
+            crate::symbols::search::search_texts(&object_text_files(service)?, pattern, glob),
+            true,
+        ))
+    } else {
+        let source = String::from_utf8(service.bytes().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            crate::symbols::search::search_text(
+                repo_path,
+                &source,
+                crate::symbols::engine::lang_for_path(std::path::Path::new(repo_path)),
+                pattern,
+            ),
+            false,
+        ))
+    }
+}
+
+fn run_object_outline(
+    service: &super::object_read::ObjectReadService,
+    repo_path: &str,
+    glob: Option<&str>,
+) -> Result<(String, bool), String> {
+    if service.entries().is_ok() {
+        Ok((
+            crate::symbols::outline::outline_texts(&object_text_files(service)?, glob).body,
+            true,
+        ))
+    } else {
+        let source = String::from_utf8(service.bytes().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            crate::symbols::outline::outline_text(
+                &source,
+                crate::symbols::engine::lang_for_path(std::path::Path::new(repo_path)),
+            ),
+            false,
+        ))
+    }
+}
+
+fn format_virtual_directory_listing(
+    display_path: &std::path::Path,
+    entries: Vec<(String, bool, u64)>,
+) -> String {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for (name, is_dir, size) in entries {
+        if is_dir {
+            dirs.push(name);
+        } else {
+            files.push((name, size));
+        }
+    }
+    dirs.sort_by_key(|name| name.to_lowercase());
+    files.sort_by_key(|(name, _)| name.to_lowercase());
+    let mut output = format!("{}/\n", display_path.display());
+    for name in dirs {
+        output.push_str(&format!("  {name}/\n"));
+    }
+    for (name, size) in files {
+        output.push_str(&format!("  {:<40} {}\n", name, format_file_size(size)));
+    }
+    output
+}
+
+#[cfg(test)]
+fn run_object_glob_projection(
+    service: &super::object_read::ObjectReadService,
+    pattern: &str,
+    offset: Option<i64>,
+    limit: Option<usize>,
+    output_mode: Option<&str>,
+) -> Result<String, String> {
+    let matcher = cairn_symbols::search_util::build_glob_matcher(pattern)?;
+    let mut files: Vec<_> = service
+        .files()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|(path, _)| {
+            matcher.is_match(path)
+                || std::path::Path::new(path)
+                    .file_name()
+                    .is_some_and(|name| matcher.is_match(name))
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    if files.is_empty() {
+        return Ok(format!(
+            "No files matched pattern '{}' in {}",
+            pattern,
+            service.prefix()
+        ));
+    }
+    let start = resolve_offset(offset, files.len());
+    let files = files
+        .into_iter()
+        .skip(start)
+        .take(limit.unwrap_or(usize::MAX));
+    Ok(match output_mode.unwrap_or("files_with_matches") {
+        "files_with_matches" => files.map(|(path, _)| path).collect::<Vec<_>>().join("\n"),
+        "count" => files
+            .map(|(path, _)| format!("{path}:1"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "content" => files
+            .map(|(path, bytes)| {
+                let body = if bytes.len() as u64 > LARGE_FILE_THRESHOLD {
+                    format!(
+                        "(file is large: {} bytes — read it directly with offset/limit to view)",
+                        bytes.len()
+                    )
+                } else {
+                    String::from_utf8(bytes)
+                        .unwrap_or_else(|error| format!("(failed to read: {error})"))
+                };
+                format!("=== {path} ===\n{body}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        other => {
+            return Err(format!(
+                "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
+                other
+            ))
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +436,7 @@ enum BranchTargetKind {
     Directory,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct TextFileResponse {
     kind: &'static str,
     content: String,
@@ -124,70 +495,23 @@ fn branch_repo_path(relative_path: &str) -> Result<&str, String> {
     Ok(relative_path)
 }
 
-fn branch_target_kind(
-    jj: &crate::jj::JjEnv,
-    command_dir: &std::path::Path,
+fn object_target_kind(
+    service: &super::object_read::ObjectReadService,
     rev: &str,
     repo_path: &str,
 ) -> Result<BranchTargetKind, String> {
     if repo_path.is_empty() {
         return Ok(BranchTargetKind::Directory);
     }
-    let files = crate::jj::file_list(jj, command_dir, rev, repo_path)?;
-    if files.iter().any(|file| file == repo_path) {
-        return Ok(BranchTargetKind::File);
-    }
-    let prefix = format!("{repo_path}/");
-    if files.iter().any(|file| file.starts_with(&prefix)) {
-        return Ok(BranchTargetKind::Directory);
-    }
-    Err(format!(
-        "Entered path does not exist at branch/rev '{rev}': file:{repo_path}"
-    ))
-}
-
-fn branch_file_bytes(
-    jj: &crate::jj::JjEnv,
-    command_dir: &std::path::Path,
-    rev: &str,
-    repo_path: &str,
-) -> Result<Vec<u8>, String> {
-    crate::jj::file_show(jj, command_dir, rev, repo_path)
-        .map_err(|error| format!("Failed to read file at branch/rev '{rev}': {error}"))
-}
-
-fn materialize_branch_tree(
-    jj: &crate::jj::JjEnv,
-    command_dir: &std::path::Path,
-    rev: &str,
-    repo_path: &str,
-) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
-    let temp = tempfile::Builder::new()
-        .prefix("cairn-branch-read-")
-        .tempdir()
-        .map_err(|error| format!("Failed to create branch-read scratch tree: {error}"))?;
-    let files = crate::jj::file_list(jj, command_dir, rev, repo_path)?;
-    if files.is_empty() {
-        return Err(format!(
-            "Entered path does not exist at branch/rev '{rev}': file:{repo_path}"
-        ));
-    }
-    for file in files {
-        let bytes = branch_file_bytes(jj, command_dir, rev, &file)?;
-        let out = temp.path().join(&file);
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("Failed to create branch-read scratch dir: {error}"))?;
-        }
-        std::fs::write(&out, bytes)
-            .map_err(|error| format!("Failed to write branch-read scratch file: {error}"))?;
-    }
-    let target = if repo_path.is_empty() {
-        temp.path().to_path_buf()
+    if service.entries().is_ok() {
+        Ok(BranchTargetKind::Directory)
+    } else if service.bytes().is_ok() {
+        Ok(BranchTargetKind::File)
     } else {
-        temp.path().join(repo_path)
-    };
-    Ok((temp, target))
+        Err(format!(
+            "Entered path does not exist at branch/rev '{rev}': file:{repo_path}"
+        ))
+    }
 }
 
 fn resolve_offset(offset: Option<i64>, total_lines: usize) -> usize {
@@ -432,6 +756,13 @@ pub(crate) fn produce_archived_file_segment(
                     data,
                 });
                 Ok(segment)
+            } else if let Some(summary) = render_mat_file_summary(path, bytes) {
+                let body =
+                    summary.map_err(|error| format!("Failed to render MAT file: {error}"))?;
+                Ok(ReadSegment::text(
+                    body,
+                    SegmentMeta::new(uri, SegmentKind::File, NaturalUnit::Line),
+                ))
             } else {
                 let response = render_text_from_bytes(bytes, offset, limit, char_offset)
                     .map_err(|error| format!("Failed to render archived read: {error}"))?;
@@ -453,7 +784,7 @@ pub(crate) fn produce_archived_file_segment(
     }
 }
 
-pub(crate) fn slice_lines(output: String, offset: Option<i64>, limit: Option<usize>) -> String {
+fn slice_lines(output: String, offset: Option<i64>, limit: Option<usize>) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let start = resolve_offset(offset, lines.len());
     let iter = lines.iter().skip(start);
@@ -809,14 +1140,14 @@ pub(crate) async fn produce_file_segment(
     let (projection, issue_history, offset, limit, _annotations_suppressed, branch) =
         match parse_file_projection(&split.params, payload) {
             Ok(parsed) => parsed,
-            Err(error) => return Produced::Segment(error_segment(uri, error)),
+            Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
         };
     let char_offset = match parse_optional_usize(
         find_query_value(&split.params, "char_offset"),
         "char_offset",
     ) {
         Ok(value) => value,
-        Err(error) => return Produced::Segment(error_segment(uri, error)),
+        Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
     };
 
     let worktree = std::path::Path::new(&request.cwd);
@@ -855,7 +1186,13 @@ pub(crate) async fn produce_file_segment(
         }
     }
 
-    let resolved_target = match if branch.is_some() {
+    let logical_project_target =
+        crate::mcp::file_targets::resolve_file_path_lenient(worktree, &split.identity)
+            .is_ok_and(|path| !crate::mcp::file_targets::path_escapes_worktree(worktree, &path))
+            && super::super::run_context::lookup_run(&orch.db.local, request)
+                .await
+                .is_ok();
+    let resolved_target = match if branch.is_some() || logical_project_target {
         crate::mcp::file_targets::resolve_read_target_lenient(worktree, &split.identity)
     } else {
         validate_read_path(worktree, &split.identity)
@@ -866,19 +1203,35 @@ pub(crate) async fn produce_file_segment(
         }
     };
 
-    let branch_context = if let Some(branch) = branch.as_deref() {
+    let branch_context = if branch.is_some() || logical_project_target {
         let repo_path = match branch_repo_path(&resolved_target.relative_path) {
             Ok(path) => path.to_string(),
-            Err(error) => return Produced::Segment(error_segment(uri, error)),
+            Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
         };
-        let resolution =
-            match crate::mcp::handlers::branch::resolve_for_read(orch, request, branch).await {
-                Ok(resolution) => resolution,
-                Err(error) => return Produced::Segment(error_segment(uri, error)),
-            };
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        let command_dir = crate::mcp::handlers::branch::jj_command_dir(&resolution, &request.cwd);
-        Some((jj, command_dir, resolution.rev, repo_path))
+        let resolution = match if let Some(branch) = branch.as_deref() {
+            crate::mcp::handlers::branch::resolve_for_read(orch, request, branch).await
+        } else {
+            crate::mcp::handlers::branch::resolve_current_for_read(orch, request).await
+        } {
+            Ok(resolution) => resolution,
+            Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+        };
+        let repository_path = resolution.object_repository_path;
+        let service = match super::object_read::ObjectReadService::new(
+            repository_path.clone(),
+            resolution.commit_id,
+            repo_path.clone(),
+        ) {
+            Ok(service) => service,
+            Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+        };
+        Some(BranchReadContext {
+            service,
+            repo_path,
+            project_id: resolution.project_id,
+            repository_path,
+            default_commit_id: resolution.default_commit_id,
+        })
     } else {
         None
     };
@@ -890,62 +1243,67 @@ pub(crate) async fn produce_file_segment(
             limit,
             output_mode,
         } => {
-            let (_branch_temp, projection_path) =
-                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                    match materialize_branch_tree(jj, command_dir, rev, repo_path) {
-                        Ok((temp, path)) => (Some(temp), path),
-                        Err(error) => return Produced::Segment(error_segment(uri, error)),
-                    }
-                } else {
-                    (None, resolved_target.full_path.clone())
+            if let Some(context) = branch_context.as_ref() {
+                let body = match overlay_entries(orch, context).and_then(|files| {
+                    run_overlay_glob_projection(
+                        files,
+                        context.service.prefix(),
+                        &pattern,
+                        offset,
+                        limit,
+                        output_mode.as_deref(),
+                        |entries| load_overlay_entries(orch, context, entries),
+                    )
+                }) {
+                    Ok(body) => body,
+                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
                 };
-            let glob_request = McpCallbackRequest {
-                thread_id: None,
-                cwd: request.cwd.clone(),
-                run_id: request.run_id.clone(),
-                tool: "read".to_string(),
-                payload: serde_json::json!({
-                    "pattern": pattern,
-                    "path": projection_path,
-                }),
-                tool_use_id: request.tool_use_id.clone(),
-            };
-            let body =
-                run_glob_projection(orch, &glob_request, offset, limit, output_mode.as_deref())
-                    .await;
-            let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
-            if output_mode.as_deref().unwrap_or("files_with_matches") == "files_with_matches" {
-                meta.file_count = Some(body.lines().filter(|l| !l.is_empty()).count());
+                let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
+                if output_mode.as_deref().unwrap_or("files_with_matches") == "files_with_matches" {
+                    meta.file_count = Some(body.lines().filter(|line| !line.is_empty()).count());
+                }
+                Produced::Segment(ReadSegment::text(body, meta))
+            } else {
+                let glob_request = McpCallbackRequest {
+                    thread_id: None,
+                    cwd: request.cwd.clone(),
+                    run_id: request.run_id.clone(),
+                    tool: "read".to_string(),
+                    payload: serde_json::json!({
+                        "pattern": pattern,
+                        "path": resolved_target.full_path,
+                    }),
+                    tool_use_id: request.tool_use_id.clone(),
+                };
+                let body =
+                    run_glob_projection(orch, &glob_request, offset, limit, output_mode.as_deref())
+                        .await;
+                let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
+                if output_mode.as_deref().unwrap_or("files_with_matches") == "files_with_matches" {
+                    meta.file_count = Some(body.lines().filter(|line| !line.is_empty()).count());
+                }
+                Produced::Segment(ReadSegment::text(body, meta))
             }
-            Produced::Segment(ReadSegment::text(body, meta))
         }
         ReadProjection::Grep(mut grep_payload) => {
-            let branch_kind =
-                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                    match branch_target_kind(jj, command_dir, rev, repo_path) {
-                        Ok(kind) => Some(kind),
-                        Err(error) => return Produced::Segment(error_segment(uri, error)),
-                    }
-                } else {
-                    None
-                };
             let full_path = &resolved_target.full_path;
+            let branch_kind = if let Some(context) = branch_context.as_ref() {
+                match object_target_kind(
+                    &context.service,
+                    context.service.commit_id(),
+                    &context.repo_path,
+                ) {
+                    Ok(kind) => Some(kind),
+                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+                }
+            } else {
+                None
+            };
             let single_file = branch_kind
                 .map(|kind| kind == BranchTargetKind::File)
                 .unwrap_or_else(|| full_path.is_file())
                 && grep_payload.glob.is_none()
                 && grep_payload.file_type.is_none();
-
-            // Resolve the effective output mode once, here, and pin it onto the
-            // payload as an explicit value. The body renderer
-            // (`handle_grep` / `render_single_file_grep`) and the segment
-            // metadata below then read the same resolved mode, so they can never
-            // diverge: an explicit output_mode wins; otherwise context flags
-            // (`-C`/`-A`/`-B`/`context`) force `content` (context lines are
-            // meaningless with `files_with_matches`); otherwise the target-aware
-            // default applies (single file -> content, directory ->
-            // files_with_matches). Pinning it explicit makes the downstream
-            // resolution a pass-through, so the inference lives in one place.
             let requested_context = grep_payload.context.is_some()
                 || grep_payload.context_alias.is_some()
                 || grep_payload.after_context.is_some()
@@ -958,40 +1316,56 @@ pub(crate) async fn produce_file_segment(
             .to_string();
             grep_payload.output_mode = Some(effective_mode.clone());
 
-            let body = if single_file {
-                let bytes = if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref()
-                {
-                    match branch_file_bytes(jj, command_dir, rev, repo_path) {
-                        Ok(bytes) => bytes,
-                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+            let body = if let Some(context) = branch_context.as_ref() {
+                if single_file {
+                    match context.service.bytes() {
+                        Ok(bytes) => {
+                            let label = full_path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            crate::mcp::handlers::search::render_single_file_grep(
+                                &bytes,
+                                &label,
+                                &grep_payload,
+                            )
+                        }
+                        Err(error) => {
+                            return Produced::Segment(error_segment(uri, error.to_string()))
+                        }
                     }
                 } else {
-                    match std::fs::read(full_path) {
-                        Ok(bytes) => bytes,
+                    match overlay_files(orch, context) {
+                        Ok(files) => {
+                            crate::mcp::handlers::search::render_tree_grep(&files, &grep_payload)
+                        }
                         Err(error) => {
-                            return Produced::Segment(error_segment(
-                                uri,
-                                format!("Failed to read file: {error}"),
-                            ))
+                            return Produced::Segment(error_segment(uri, error.to_string()))
                         }
                     }
-                };
-                let label = full_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                crate::mcp::handlers::search::render_single_file_grep(&bytes, &label, &grep_payload)
+                }
+            } else if single_file {
+                match std::fs::read(full_path) {
+                    Ok(bytes) => {
+                        let label = full_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        crate::mcp::handlers::search::render_single_file_grep(
+                            &bytes,
+                            &label,
+                            &grep_payload,
+                        )
+                    }
+                    Err(error) => {
+                        return Produced::Segment(error_segment(
+                            uri,
+                            format!("Failed to read file: {error}"),
+                        ))
+                    }
+                }
             } else {
-                let (_branch_temp, grep_path) =
-                    if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                        match materialize_branch_tree(jj, command_dir, rev, repo_path) {
-                            Ok((temp, path)) => (Some(temp), path),
-                            Err(error) => return Produced::Segment(error_segment(uri, error)),
-                        }
-                    } else {
-                        (None, full_path.clone())
-                    };
-                grep_payload.path = Some(grep_path.display().to_string());
+                grep_payload.path = Some(full_path.display().to_string());
                 let grep_request = McpCallbackRequest {
                     thread_id: None,
                     cwd: request.cwd.clone(),
@@ -1013,86 +1387,113 @@ pub(crate) async fn produce_file_segment(
             Produced::Segment(ReadSegment::text(body, meta))
         }
         ReadProjection::Ast { pattern, glob } => {
-            let (_branch_temp, branch_root, target) =
-                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                    match materialize_branch_tree(jj, command_dir, rev, repo_path) {
-                        Ok((temp, path)) => {
-                            let root = temp.path().to_path_buf();
-                            (Some(temp), root, path)
-                        }
-                        Err(error) => return Produced::Segment(error_segment(uri, error)),
-                    }
+            let (rendered, is_directory) = if let Some(context) = branch_context.as_ref() {
+                let result = if context.service.entries().is_ok() {
+                    overlay_files(orch, context).map(|files| {
+                        let texts = files
+                            .into_iter()
+                            .filter_map(|(path, bytes)| {
+                                String::from_utf8(bytes).ok().map(|text| (path, text))
+                            })
+                            .collect::<Vec<_>>();
+                        (
+                            crate::symbols::search::search_texts(&texts, &pattern, glob.as_deref()),
+                            true,
+                        )
+                    })
                 } else {
-                    (
-                        None,
-                        worktree.to_path_buf(),
-                        resolved_target.full_path.clone(),
+                    run_object_ast(
+                        &context.service,
+                        &context.repo_path,
+                        &pattern,
+                        glob.as_deref(),
                     )
                 };
-            let rendered =
-                crate::symbols::search::search(&branch_root, &target, &pattern, glob.as_deref());
+                match result {
+                    Ok(value) => value,
+                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+                }
+            } else {
+                let target = &resolved_target.full_path;
+                (
+                    crate::symbols::search::search(worktree, target, &pattern, glob.as_deref()),
+                    target.is_dir(),
+                )
+            };
             let (matches, files) = grep_counts(&rendered.body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(matches);
-            if target.is_dir() {
+            if is_directory {
                 meta.file_count = Some(files);
             }
             Produced::Segment(ReadSegment::text(rendered.body, meta))
         }
         ReadProjection::Outline { glob } => {
-            let (_branch_temp, branch_root, target) =
-                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                    match materialize_branch_tree(jj, command_dir, rev, repo_path) {
-                        Ok((temp, path)) => {
-                            let root = temp.path().to_path_buf();
-                            (Some(temp), root, path)
-                        }
-                        Err(error) => return Produced::Segment(error_segment(uri, error)),
-                    }
+            let (body, is_directory) = if let Some(context) = branch_context.as_ref() {
+                let result = if context.service.entries().is_ok() {
+                    overlay_files(orch, context).map(|files| {
+                        let texts = files
+                            .into_iter()
+                            .filter_map(|(path, bytes)| {
+                                String::from_utf8(bytes).ok().map(|text| (path, text))
+                            })
+                            .collect::<Vec<_>>();
+                        (
+                            crate::symbols::outline::outline_texts(&texts, glob.as_deref()).body,
+                            true,
+                        )
+                    })
                 } else {
-                    (
-                        None,
-                        worktree.to_path_buf(),
-                        resolved_target.full_path.clone(),
-                    )
+                    run_object_outline(&context.service, &context.repo_path, glob.as_deref())
                 };
-            let rendered = crate::symbols::outline::outline(&branch_root, &target, glob.as_deref());
-            let (matches, _files) = grep_counts(&rendered.body);
+                match result {
+                    Ok(value) => value,
+                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+                }
+            } else {
+                let target = &resolved_target.full_path;
+                (
+                    crate::symbols::outline::outline(worktree, target, glob.as_deref()).body,
+                    target.is_dir(),
+                )
+            };
+            let (matches, _files) = grep_counts(&body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(matches);
-            if target.is_dir() {
-                // Rows are path-less; files are grouped under header lines, so the
-                // file count comes from the headers, not grep's path prefix.
-                meta.file_count = Some(crate::symbols::outline::file_count(&rendered.body));
+            if is_directory {
+                meta.file_count = Some(crate::symbols::outline::file_count(&body));
             }
-            Produced::Segment(ReadSegment::text(rendered.body, meta))
+            Produced::Segment(ReadSegment::text(body, meta))
         }
         ReadProjection::None => {
             let full_path = &resolved_target.full_path;
-            let branch_kind =
-                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                    match branch_target_kind(jj, command_dir, rev, repo_path) {
-                        Ok(kind) => Some(kind),
-                        Err(error) => return Produced::Segment(error_segment(uri, error)),
-                    }
-                } else {
-                    None
-                };
+            let branch_kind = if let Some(context) = branch_context.as_ref() {
+                match object_target_kind(
+                    &context.service,
+                    context.service.commit_id(),
+                    &context.repo_path,
+                ) {
+                    Ok(kind) => Some(kind),
+                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+                }
+            } else {
+                None
+            };
 
             if branch_kind
                 .map(|kind| kind == BranchTargetKind::Directory)
                 .unwrap_or_else(|| full_path.is_dir())
             {
-                let (_branch_temp, listing_path) =
-                    if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                        match materialize_branch_tree(jj, command_dir, rev, repo_path) {
-                            Ok((temp, path)) => (Some(temp), path),
-                            Err(error) => return Produced::Segment(error_segment(uri, error)),
+                let body = if let Some(context) = branch_context.as_ref() {
+                    match context.service.listing() {
+                        Ok(entries) => format_virtual_directory_listing(full_path, entries),
+                        Err(error) => {
+                            return Produced::Segment(error_segment(uri, error.to_string()))
                         }
-                    } else {
-                        (None, full_path.clone())
-                    };
-                let body = format_directory_listing(&listing_path);
+                    }
+                } else {
+                    format_directory_listing(full_path)
+                };
                 return Produced::Segment(ReadSegment::text(
                     body,
                     SegmentMeta::new(uri, SegmentKind::Directory, NaturalUnit::Line),
@@ -1100,11 +1501,12 @@ pub(crate) async fn produce_file_segment(
             }
 
             if let Some(mime_type) = get_image_mime_type(full_path) {
-                let bytes = if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref()
-                {
-                    match branch_file_bytes(jj, command_dir, rev, repo_path) {
+                let bytes = if let Some(context) = branch_context.as_ref() {
+                    match context.service.bytes() {
                         Ok(bytes) => bytes,
-                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                        Err(error) => {
+                            return Produced::Segment(error_segment(uri, error.to_string()))
+                        }
                     }
                 } else {
                     match std::fs::read(full_path) {
@@ -1130,10 +1532,10 @@ pub(crate) async fn produce_file_segment(
                 return Produced::Segment(segment);
             }
 
-            let bytes = if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
-                match branch_file_bytes(jj, command_dir, rev, repo_path) {
+            let bytes = if let Some(context) = branch_context.as_ref() {
+                match context.service.bytes() {
                     Ok(bytes) => bytes,
-                    Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
                 }
             } else {
                 match std::fs::read(full_path) {
@@ -1146,6 +1548,18 @@ pub(crate) async fn produce_file_segment(
                     }
                 }
             };
+            if let Some(summary) = render_mat_file_summary(full_path, &bytes) {
+                return match summary {
+                    Ok(body) => Produced::Segment(ReadSegment::text(
+                        body,
+                        SegmentMeta::new(uri, SegmentKind::File, NaturalUnit::Line),
+                    )),
+                    Err(error) => Produced::Segment(error_segment(
+                        uri,
+                        format!("Failed to render MAT file: {error}"),
+                    )),
+                };
+            }
             let response = match render_text_from_bytes(&bytes, offset, limit, char_offset) {
                 Ok(response) => response,
                 Err(error) => {
@@ -1347,7 +1761,364 @@ fn format_file_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_codec::testutil::{commit_all, git, init_repo, write_file};
     use cairn_common::query::parse_query_params;
+
+    #[test]
+    fn level5_mat_file_summary_lists_numeric_variables_and_values() {
+        let bytes = include_bytes!("../../../../tests/fixtures/matlab/level5.mat");
+        let summary = render_mat_file_summary(std::path::Path::new("data.mat"), bytes)
+            .expect("recognized MAT file")
+            .expect("rendered summary");
+        assert!(summary.contains("MATLAB Level 5"), "{summary}");
+        // Fixture: matfile's MIT-licensed tests/two_arrays.mat. Keeping a known
+        // parser fixture here distinguishes our summary contract from generator quirks.
+        assert!(summary.contains("`A`: double [2 × 2]"), "{summary}");
+        assert!(summary.contains("preview: [1, 3, 2, 4]"), "{summary}");
+        assert!(summary.contains("`B`: double [2 × 3]"), "{summary}");
+    }
+
+    #[test]
+    fn v73_mat_file_summary_identifies_hdf5_and_guides_deep_inspection() {
+        let bytes = include_bytes!("../../../../tests/fixtures/matlab/v73.mat");
+        let summary = render_mat_file_summary(std::path::Path::new("data.mat"), bytes)
+            .expect("recognized MAT file")
+            .expect("rendered summary");
+        assert!(summary.contains("MATLAB v7.3 (HDF5)"), "{summary}");
+        assert!(summary.contains("Created on:"), "{summary}");
+        assert!(
+            summary.contains("cairn://skills/matlab/scripts/inspect-mat.py"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn mat_extension_without_mat_magic_is_not_claimed() {
+        assert!(
+            render_mat_file_summary(std::path::Path::new("notes.mat"), b"plain text").is_none()
+        );
+    }
+
+    fn legacy_glob_projection(
+        root: &std::path::Path,
+        pattern: &str,
+        offset: Option<i64>,
+        limit: Option<usize>,
+        output_mode: Option<&str>,
+    ) -> String {
+        let matcher = cairn_symbols::search_util::build_glob_matcher(pattern).unwrap();
+        let mut files: Vec<_> = ignore::WalkBuilder::new(root)
+            .hidden(false)
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .filter_map(|entry| {
+                let relative = entry.path().strip_prefix(root).ok()?.to_path_buf();
+                (matcher.is_match(&relative)
+                    || relative
+                        .file_name()
+                        .is_some_and(|name| matcher.is_match(name)))
+                .then_some(relative)
+            })
+            .collect();
+        files.sort();
+        let start = resolve_offset(offset, files.len());
+        let files = files
+            .into_iter()
+            .skip(start)
+            .take(limit.unwrap_or(usize::MAX));
+        match output_mode.unwrap_or("files_with_matches") {
+            "files_with_matches" => files
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "count" => files
+                .map(|path| format!("{}:1", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "content" => files
+                .map(|path| {
+                    let bytes = std::fs::read(root.join(&path)).unwrap();
+                    let body = if bytes.len() as u64 > LARGE_FILE_THRESHOLD {
+                        format!(
+                            "(file is large: {} bytes — read it directly with offset/limit to view)",
+                            bytes.len()
+                        )
+                    } else {
+                        String::from_utf8(bytes)
+                            .unwrap_or_else(|error| format!("(failed to read: {error})"))
+                    };
+                    format!("=== {} ===\n{body}", path.display())
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            other => panic!("unexpected mode {other}"),
+        }
+    }
+
+    fn projection_fixture() -> (
+        tempfile::TempDir,
+        super::super::object_read::ObjectReadService,
+        String,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        write_file(repo, "fixture/base-only.txt", b"removed before head\n");
+        let base = commit_all(repo, "overlay base");
+        std::fs::remove_file(repo.join("fixture/base-only.txt")).unwrap();
+        write_file(repo, "fixture/.gitignore", b"ignored/*\n!ignored/keep.rs\n");
+        write_file(
+            repo,
+            "fixture/src/lib.rs",
+            b"pub fn visible() {\n    println!(\"needle\");\n}\n",
+        );
+        write_file(
+            repo,
+            "fixture/src/app.ts",
+            b"export function app() { return 'needle' }\n",
+        );
+        write_file(repo, "fixture/ignored/drop.rs", b"fn dropped() {}\n");
+        write_file(repo, "fixture/ignored/keep.rs", b"fn kept() {}\n");
+        write_file(repo, "fixture/notes.txt", b"before\nneedle\nafter\n");
+        write_file(repo, "fixture/binary.bin", b"needle\0binary\n");
+        write_file(repo, "fixture/image.png", b"\x89PNG\r\n\x1a\nfixture");
+        write_file(
+            repo,
+            "fixture/large.txt",
+            &vec![b'x'; LARGE_FILE_THRESHOLD as usize + 1],
+        );
+        git(repo, &["add", "-f", "."]);
+        let commit = commit_all(repo, "projection parity");
+        let service = super::super::object_read::ObjectReadService::new(
+            repo.to_path_buf(),
+            commit,
+            "fixture".to_string(),
+        )
+        .unwrap();
+        (dir, service, base)
+    }
+
+    #[test]
+    fn store_native_branch_projections_match_materialized_filesystem() {
+        let (dir, service, base) = projection_fixture();
+        let root = dir.path().join("fixture");
+        let registry = super::super::overlay::ProjectOverlayRegistry::default();
+        let overlay_entries = registry
+            .entries(
+                "project",
+                dir.path(),
+                &base,
+                service.commit_id(),
+                "fixture",
+                service.limits(),
+            )
+            .unwrap();
+        let overlay_files = registry
+            .load_entries("project", dir.path(), &overlay_entries, service.limits())
+            .unwrap();
+        assert_eq!(overlay_files, service.files().unwrap());
+
+        for path in [
+            "fixture/notes.txt",
+            "fixture/binary.bin",
+            "fixture/image.png",
+        ] {
+            let object = super::super::object_read::ObjectReadService::new(
+                dir.path().to_path_buf(),
+                service.commit_id().to_string(),
+                path.to_string(),
+            )
+            .unwrap()
+            .bytes()
+            .unwrap();
+            assert_eq!(
+                object,
+                std::fs::read(dir.path().join(path)).unwrap(),
+                "{path}"
+            );
+        }
+        let notes = super::super::object_read::ObjectReadService::new(
+            dir.path().to_path_buf(),
+            service.commit_id().to_string(),
+            "fixture/notes.txt".to_string(),
+        )
+        .unwrap()
+        .bytes()
+        .unwrap();
+        assert_eq!(
+            render_text_from_bytes(&notes, Some(1), Some(1), None).unwrap(),
+            render_text_from_bytes(
+                &std::fs::read(root.join("notes.txt")).unwrap(),
+                Some(1),
+                Some(1),
+                None,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            render_text_from_bytes(&notes, None, Some(4), Some(2)).unwrap(),
+            render_text_from_bytes(
+                &std::fs::read(root.join("notes.txt")).unwrap(),
+                None,
+                Some(4),
+                Some(2),
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            format_virtual_directory_listing(&root, service.listing().unwrap()),
+            format_directory_listing(&root)
+        );
+        for mode in ["files_with_matches", "count", "content"] {
+            let overlay = run_overlay_glob_projection(
+                overlay_entries.clone(),
+                service.prefix(),
+                "*.txt",
+                Some(0),
+                Some(8),
+                Some(mode),
+                |entries| {
+                    registry
+                        .load_entries("project", dir.path(), entries, service.limits())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                overlay,
+                run_object_glob_projection(&service, "*.txt", Some(0), Some(8), Some(mode))
+                    .unwrap(),
+                "overlay glob mode {mode}"
+            );
+            assert_eq!(
+                overlay,
+                legacy_glob_projection(&root, "*.txt", Some(0), Some(8), Some(mode)),
+                "glob mode {mode}"
+            );
+        }
+
+        let grep = crate::mcp::handlers::search::GrepPayload {
+            pattern: "needle".to_string(),
+            path: None,
+            glob: Some("*.txt".to_string()),
+            file_type: None,
+            output_mode: Some("content".to_string()),
+            context: None,
+            after_context: None,
+            before_context: None,
+            context_alias: Some(1),
+            case_insensitive: None,
+            line_numbers: Some(true),
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        };
+        let files = service.files().unwrap();
+        let object_grep = crate::mcp::handlers::search::render_tree_grep(&overlay_files, &grep);
+        assert_eq!(
+            object_grep,
+            crate::mcp::handlers::search::render_tree_grep(&files, &grep)
+        );
+        let filesystem_grep = crate::mcp::handlers::search::grep_search(
+            grep.clone(),
+            &root,
+            "content",
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(object_grep, filesystem_grep);
+
+        let mut binary_grep = grep.clone();
+        binary_grep.glob = None;
+        assert_eq!(
+            crate::mcp::handlers::search::render_tree_grep(&overlay_files, &binary_grep),
+            crate::mcp::handlers::search::render_tree_grep(&files, &binary_grep)
+        );
+
+        let object_ast = run_object_ast(&service, "fixture", "fn $NAME() { $$$ }", Some("*.rs"))
+            .unwrap()
+            .0;
+        let filesystem_ast =
+            crate::symbols::search::search(&root, &root, "fn $NAME() { $$$ }", Some("*.rs"));
+        assert_eq!(object_ast, filesystem_ast);
+        let overlay_texts = overlay_files
+            .iter()
+            .filter_map(|(path, bytes)| {
+                String::from_utf8(bytes.clone())
+                    .ok()
+                    .map(|text| (path.clone(), text))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crate::symbols::search::search_texts(
+                &overlay_texts,
+                "fn $NAME() { $$$ }",
+                Some("*.rs")
+            ),
+            object_ast
+        );
+
+        let object_outline = run_object_outline(&service, "fixture", Some("*.rs"))
+            .unwrap()
+            .0;
+        let filesystem_outline = crate::symbols::outline::outline(&root, &root, Some("*.rs")).body;
+        assert_eq!(object_outline, filesystem_outline);
+        assert_eq!(
+            crate::symbols::outline::outline_texts(&overlay_texts, Some("*.rs")).body,
+            object_outline
+        );
+    }
+
+    #[test]
+    fn ordinary_managed_projection_dispatch_is_object_backed() {
+        let whole_source = include_str!("file.rs");
+        assert!(whole_source.contains("branch.is_some() || logical_project_target"));
+        let context = whole_source.find("let branch_context =").unwrap();
+        let dispatch = whole_source[context..]
+            .find("\n    match projection {")
+            .map(|offset| context + offset)
+            .unwrap();
+        let source = &whole_source[dispatch..];
+        for (start, end, object_marker) in [
+            (
+                "ReadProjection::Glob",
+                "ReadProjection::Grep",
+                "run_overlay_glob_projection",
+            ),
+            (
+                "ReadProjection::Grep",
+                "ReadProjection::Ast",
+                "context.service.bytes()",
+            ),
+            (
+                "ReadProjection::Ast",
+                "ReadProjection::Outline",
+                "search_texts",
+            ),
+            (
+                "ReadProjection::Outline",
+                "ReadProjection::None",
+                "outline_texts",
+            ),
+            (
+                "ReadProjection::None",
+                "struct FileIssueHistoryRow",
+                "context.service.bytes()",
+            ),
+        ] {
+            let start = source.find(start).unwrap();
+            let end = source[start..]
+                .find(end)
+                .map(|offset| start + offset)
+                .unwrap();
+            let arm = &source[start..end];
+            assert!(arm.contains("branch_context.as_ref()"), "{start}");
+            assert!(arm.contains(object_marker), "{start}: {object_marker}");
+        }
+    }
 
     fn payload() -> ReadFilePayload {
         ReadFilePayload {

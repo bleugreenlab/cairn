@@ -14,7 +14,7 @@ use ignore::WalkBuilder;
 use super::engine::lang_for_path;
 
 /// Compile a single `?glob=` pattern into a matcher, with a friendly error.
-pub fn build_globset(glob: &str) -> Result<GlobSet, String> {
+pub(crate) fn build_globset(glob: &str) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     builder.add(Glob::new(glob).map_err(|err| format!("invalid glob '{glob}': {err}"))?);
     builder
@@ -23,14 +23,14 @@ pub fn build_globset(glob: &str) -> Result<GlobSet, String> {
 }
 
 /// Relativize `path` against `root`, falling back to the full path.
-pub fn relative<'a>(root: &Path, path: &'a Path) -> &'a Path {
+pub(crate) fn relative<'a>(root: &Path, path: &'a Path) -> &'a Path {
     path.strip_prefix(root).unwrap_or(path)
 }
 
 /// Walk `dir` for source files with a bundled grammar, honoring gitignore and an
 /// optional glob (matched against the path relative to `root` and the bare file
 /// name). Results are sorted for deterministic output.
-pub fn source_files(
+pub(crate) fn source_files(
     root: &Path,
     dir: &Path,
     globset: Option<&GlobSet>,

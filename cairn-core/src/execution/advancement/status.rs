@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) async fn execution_issue_id_conn(
+async fn execution_issue_id_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<Option<String>> {

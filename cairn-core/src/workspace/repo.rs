@@ -2,9 +2,9 @@ use std::path::Path;
 
 use crate::services::{FileSystem, GitClient};
 
-pub const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
+pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/workflows/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
 
-pub fn ensure_workspace_repo(
+pub(crate) fn ensure_workspace_repo(
     git: &dyn GitClient,
     fs: &dyn FileSystem,
     config_dir: &Path,

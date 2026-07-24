@@ -47,7 +47,7 @@ async fn latest_run_for_job_async(db: &LocalDb, job_id: &str) -> Result<Option<S
 /// Does this job currently have a pending or running turn? Shared between
 /// the message handler's active-turn check and the queue-on-active fallback
 /// path in conflict resolution (CAIRN-1196).
-pub async fn head_turn_active(db: &LocalDb, job_id: &str) -> Result<bool, String> {
+pub(crate) async fn head_turn_active(db: &LocalDb, job_id: &str) -> Result<bool, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();
@@ -72,7 +72,7 @@ pub async fn head_turn_active(db: &LocalDb, job_id: &str) -> Result<bool, String
 
 /// Sync wrapper for [`head_turn_active`] for use from non-async callers
 /// (e.g. PR conflict resolution).
-pub fn head_turn_active_sync(db: &LocalDb, job_id: &str) -> bool {
+pub(crate) fn head_turn_active_sync(db: &LocalDb, job_id: &str) -> bool {
     let job_id = job_id.to_string();
     run_db_blocking(move || async move { head_turn_active(db, &job_id).await }).unwrap_or(false)
 }
@@ -86,7 +86,32 @@ pub fn head_turn_active_sync(db: &LocalDb, job_id: &str) -> bool {
 /// (`mcp/handlers/planning.rs`, `mcp/handlers/permission.rs`,
 /// `execution/delegation/runtime/resume.rs`) before extending.
 fn is_self_suspend_reason(reason: &str) -> bool {
-    matches!(reason, "user_input" | "permission" | "dependency_wait")
+    matches!(
+        reason,
+        "user_input" | "permission" | "dependency_wait" | "wait"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectQueueDisposition {
+    QueuedOrPresent,
+    Undeliverable,
+}
+
+pub(crate) fn queue_system_direct_once_confirmed(
+    orch: &Orchestrator,
+    recipient_run_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    idempotency_key: &str,
+) -> Result<DirectQueueDisposition, String> {
+    queue_system_direct_impl(
+        orch,
+        recipient_run_id,
+        content,
+        urgency,
+        Some(idempotency_key),
+    )
 }
 
 /// Is this job's agent **self-suspended** — its head turn `yielded` waiting on
@@ -108,7 +133,7 @@ fn is_self_suspend_reason(reason: &str) -> bool {
 /// head-turn query in `jobs::queries::node_status_indicators`. The fallback is
 /// only for legacy rows without the pointer; turn sequence is session-local and
 /// restarts after cold-resume reseed rotation.
-pub async fn head_turn_self_suspended(db: &LocalDb, job_id: &str) -> Result<bool, String> {
+async fn head_turn_self_suspended(db: &LocalDb, job_id: &str) -> Result<bool, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();
@@ -150,7 +175,7 @@ pub async fn head_turn_self_suspended(db: &LocalDb, job_id: &str) -> Result<bool
 
 /// Sync wrapper for [`head_turn_self_suspended`] for use from the non-async
 /// flush-on-idle resume gate.
-pub fn head_turn_self_suspended_sync(db: &LocalDb, job_id: &str) -> bool {
+fn head_turn_self_suspended_sync(db: &LocalDb, job_id: &str) -> bool {
     let job_id = job_id.to_string();
     run_db_blocking(move || async move { head_turn_self_suspended(db, &job_id).await })
         .unwrap_or(false)
@@ -158,36 +183,13 @@ pub fn head_turn_self_suspended_sync(db: &LocalDb, job_id: &str) -> bool {
 
 /// The recipient job's node URI, used as a `direct:` push's wake-card link. The
 /// message body resolves from the messages row at drain, so this is only the UI
-/// link; `None` when the job can't be resolved (the caller falls back).
+/// link; `None` when the job can't be resolved (the caller falls back). The
+/// query itself lives in [`crate::jobs::queries::home_uri_for_job`].
 pub(crate) async fn node_uri_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT p.key, i.number, COALESCE(e.seq, 1), j.uri_segment
-                     FROM jobs j
-                     JOIN issues i ON i.id = j.issue_id
-                     JOIN projects p ON p.id = i.project_id
-                     LEFT JOIN executions e ON e.id = j.execution_id
-                     WHERE j.id = ?1 LIMIT 1",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            let Some(row) = rows.next().await? else {
-                return Ok(None);
-            };
-            let key = row.text(0)?;
-            let number = row.i64(1)? as i32;
-            let seq = row.i64(2)? as i32;
-            let segment = row.opt_text(3)?;
-            Ok(segment.map(|seg| cairn_common::uri::build_node_uri(&key, number, seq, &seg)))
-        })
-    })
-    .await
-    .ok()
-    .flatten()
+    crate::jobs::queries::home_uri_for_job(db, job_id)
+        .await
+        .ok()
+        .flatten()
 }
 
 fn direct_wake_for_urgency(urgency: DeliveryUrgency) -> crate::orchestrator::attention_push::Wake {
@@ -205,25 +207,7 @@ async fn node_uri_for_job_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> Result<Option<String>, DbError> {
-    let mut rows = conn
-        .query(
-            "SELECT p.key, i.number, COALESCE(e.seq, 1), j.uri_segment
-             FROM jobs j
-             JOIN issues i ON i.id = j.issue_id
-             JOIN projects p ON p.id = i.project_id
-             LEFT JOIN executions e ON e.id = j.execution_id
-             WHERE j.id = ?1 LIMIT 1",
-            params![job_id],
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-    let key = row.text(0)?;
-    let number = row.i64(1)? as i32;
-    let seq = row.i64(2)? as i32;
-    let segment = row.opt_text(3)?;
-    Ok(segment.map(|seg| cairn_common::uri::build_node_uri(&key, number, seq, &seg)))
+    crate::jobs::queries::home_uri_for_job_conn(conn, job_id).await
 }
 
 /// Insert a system direct message and its `direct:{message_id}` attention push in
@@ -273,6 +257,53 @@ pub(crate) async fn insert_system_direct_push_conn(
     .await?;
 
     Ok((message_id, wake))
+}
+
+async fn insert_system_direct_push_once_conn(
+    conn: &cairn_db::turso::Connection,
+    recipient_job_id: &str,
+    recipient_run_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    idempotency_key: &str,
+) -> Result<(String, crate::orchestrator::attention_push::Wake, bool), DbError> {
+    use crate::orchestrator::attention_push::Boundary;
+    let now = chrono::Utc::now().timestamp();
+    let message_id = format!("reconcile:{idempotency_key}");
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO messages (
+            id, channel_type, channel_id, sender_run_id, sender_name,
+            recipient_run_id, content, created_at
+         ) VALUES (?1, 'direct', NULL, NULL, 'system', ?2, ?3, ?4)",
+            params![message_id.as_str(), recipient_run_id, content, now],
+        )
+        .await?;
+    let wake = direct_wake_for_urgency(urgency);
+    if inserted == 0 {
+        return Ok((message_id, wake, false));
+    }
+    let content_ref = node_uri_for_job_conn(conn, recipient_job_id)
+        .await?
+        .unwrap_or_else(|| recipient_job_id.to_string());
+    let push_id = uuid::Uuid::new_v4().to_string();
+    let key = format!("direct:{message_id}");
+    conn.execute(
+        "INSERT INTO attention_pushes
+           (id, recipient, content_ref, wake, boundary, key, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            push_id.as_str(),
+            recipient_job_id,
+            content_ref.as_str(),
+            wake.as_str(),
+            Boundary::Event.as_str(),
+            key.as_str(),
+            now
+        ],
+    )
+    .await?;
+    Ok((message_id, wake, true))
 }
 
 /// Create a `direct:{message_id}` attention push so a system-originated direct
@@ -336,12 +367,39 @@ pub(crate) fn enqueue_direct_push(
 /// mid-turn drains the push at its next event boundary regardless of wake level,
 /// so a passive note rides along inline on the active turn while never having
 /// woken an idle agent.
-pub fn queue_system_direct(
+pub(crate) fn queue_system_direct(
     orch: &Orchestrator,
     recipient_run_id: &str,
     content: &str,
     urgency: DeliveryUrgency,
 ) -> Result<(), String> {
+    queue_system_direct_impl(orch, recipient_run_id, content, urgency, None).map(|_| ())
+}
+
+pub(crate) fn queue_system_direct_once(
+    orch: &Orchestrator,
+    recipient_run_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    idempotency_key: &str,
+) -> Result<(), String> {
+    queue_system_direct_impl(
+        orch,
+        recipient_run_id,
+        content,
+        urgency,
+        Some(idempotency_key),
+    )
+    .map(|_| ())
+}
+
+fn queue_system_direct_impl(
+    orch: &Orchestrator,
+    recipient_run_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    idempotency_key: Option<&str>,
+) -> Result<DirectQueueDisposition, String> {
     let db = match run_db_blocking({
         let dbs = orch.db.clone();
         let run = recipient_run_id.to_string();
@@ -356,7 +414,7 @@ pub fn queue_system_direct(
             log::warn!(
                 "queue_system_direct: failed to route recipient run {recipient_run_id}: {error}; direct message undeliverable"
             );
-            return Ok(());
+            return Ok(DirectQueueDisposition::Undeliverable);
         }
     };
     let run = recipient_run_id.to_string();
@@ -372,21 +430,32 @@ pub fn queue_system_direct(
         log::warn!(
             "queue_system_direct: no job for run {recipient_run_id}; direct message undeliverable"
         );
-        return Ok(());
+        return Ok(DirectQueueDisposition::Undeliverable);
     };
 
-    let (message_id, effective) = run_db_blocking({
+    let (message_id, effective, inserted) = run_db_blocking({
         let db = db.clone();
         let job_id = job_id.clone();
         let run_id = recipient_run_id.to_string();
         let content = content.to_string();
+        let idempotency_key = idempotency_key.map(str::to_string);
         move || async move {
             db.write(|conn| {
                 let job_id = job_id.clone();
                 let run_id = run_id.clone();
                 let content = content.clone();
+                let idempotency_key = idempotency_key.clone();
                 Box::pin(async move {
-                    insert_system_direct_push_conn(conn, &job_id, &run_id, &content, urgency).await
+                    if let Some(key) = idempotency_key.as_deref() {
+                        insert_system_direct_push_once_conn(
+                            conn, &job_id, &run_id, &content, urgency, key,
+                        )
+                        .await
+                    } else {
+                        insert_system_direct_push_conn(conn, &job_id, &run_id, &content, urgency)
+                            .await
+                            .map(|(id, wake)| (id, wake, true))
+                    }
                 })
             })
             .await
@@ -394,6 +463,10 @@ pub fn queue_system_direct(
         }
     })?;
 
+    if !inserted {
+        log::debug!("System direct {message_id} was already queued; skipping duplicate delivery");
+        return Ok(DirectQueueDisposition::QueuedOrPresent);
+    }
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "messages", "action": "insert"}),
@@ -406,7 +479,7 @@ pub fn queue_system_direct(
     }
 
     log::debug!("Queued system direct message {} for delivery", message_id);
-    Ok(())
+    Ok(DirectQueueDisposition::QueuedOrPresent)
 }
 
 /// Everything still queued for an idle run that justifies a single resume.

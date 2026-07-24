@@ -53,8 +53,25 @@ fn get_home_dir() -> String {
     }
 }
 
+#[cfg(not(windows))]
+fn compose_unix_path(home: &str, shell_path: Option<&str>, inherited_path: &str) -> String {
+    let user_paths = format!(
+        "{home}/.claude/local/bin:{home}/.bun/bin:{home}/.local/bin:{home}/.npm/bin:{home}/.yarn/bin:{home}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin"
+    );
+    let mut paths = vec![user_paths];
+    if let Some(shell_path) = shell_path.filter(|path| !path.is_empty()) {
+        paths.push(shell_path.to_string());
+    }
+    if !inherited_path.is_empty() {
+        paths.push(inherited_path.to_string());
+    }
+    paths.push("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    paths.join(":")
+}
+
 /// Get a reasonable PATH for finding CLI tools.
-/// Includes common installation locations and the user's shell PATH.
+/// Includes common installation locations, the user's shell PATH, the inherited
+/// process PATH, and the standard system directories.
 /// Result is cached for subsequent calls.
 pub fn get_user_path() -> &'static str {
     USER_PATH.get_or_init(|| {
@@ -86,24 +103,11 @@ pub fn get_user_path() -> &'static str {
 
         #[cfg(not(windows))]
         {
-            // Unix common paths where CLI tools are installed
-            let common_paths = format!(
-                "{}/.claude/local/bin:{}/.bun/bin:{}/.local/bin:{}/.npm/bin:{}/.yarn/bin:{}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin",
-                home, home, home, home, home, home
-            );
-
-            // Start with the process's actual PATH (includes Docker ENV, etc.)
-            let env_path = std::env::var("PATH").unwrap_or_default();
-
-            if let Some(shell_path) = resolve_user_shell_path() {
-                return format!("{}:{}:{}", common_paths, shell_path, env_path);
-            }
-
-            if env_path.is_empty() {
-                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", common_paths)
-            } else {
-                format!("{}:{}", common_paths, env_path)
-            }
+            compose_unix_path(
+                &home,
+                resolve_user_shell_path().as_deref(),
+                &std::env::var("PATH").unwrap_or_default(),
+            )
         }
     })
 }
@@ -125,7 +129,7 @@ pub fn get_user_path() -> &'static str {
 /// shim pointing at the bundled `cairn-cmd`. Keyed off the resolved Cairn home,
 /// so a dev instance's separate `~/.cairn-dev*` home gets its own shim dir and
 /// tracks its own dev rebuild automatically.
-pub fn cairn_bin_dir() -> PathBuf {
+fn cairn_bin_dir() -> PathBuf {
     cairn_common::paths::cairn_home().join("bin")
 }
 
@@ -133,7 +137,7 @@ pub fn cairn_bin_dir() -> PathBuf {
 /// Unlike [`cairn_bin_dir`], this directory is never present in every agent
 /// shell; individual eligible shell items prepend it after resolving native
 /// fallback binaries against the unmodified agent PATH.
-pub fn warm_search_bin_dir() -> PathBuf {
+fn warm_search_bin_dir() -> PathBuf {
     cairn_common::paths::cairn_home().join("warm-search-bin")
 }
 
@@ -153,12 +157,12 @@ pub fn agent_shell_path() -> String {
 
 /// Agent PATH with the opt-in warm-search shim directory ahead of the ordinary
 /// Cairn tools and user binaries.
-pub fn warm_search_shell_path() -> String {
+pub(crate) fn warm_search_shell_path() -> String {
     prepend_cairn_bin(&warm_search_bin_dir(), &agent_shell_path())
 }
 
-/// Environment variables that route a dev-instance's cargo builds into the one
-/// shared dev target dir (`~/.cairn-dev-target/target`).
+/// Environment variables that route a dev-instance's cargo builds into its
+/// branch target dir (`~/.cairn-dev-target/branches/<key>/target`).
 ///
 /// A host orchestrator launched by `bun dev:instance` carries BOTH: it sets
 /// `CAIRN_INSTANCE=1`, and `scripts/rust-cache-env.ts` derives
@@ -166,14 +170,14 @@ pub fn warm_search_shell_path() -> String {
 /// instance's own build (its app binary must survive worktree teardown), but it
 /// must never leak into a spawned worktree command: command spawns inherit the
 /// orchestrator's env wholesale, so an un-stripped child routes its cargo checks
-/// into the single shared dir and concurrent worktrees corrupt each other's
+/// into the branch's persistent dir and concurrent worktrees corrupt each other's
 /// build-script `OUT_DIR` (the tree-sitter `stdlib-symbols.txt` ENOENT race —
 /// CAIRN-2533). Every agent-facing spawn seam strips both keys so each worktree
 /// builds into its own per-worktree `src-tauri/target`. Both are required:
 /// dropping only `CARGO_TARGET_DIR` lets the child's own `rustCacheEnv`
 /// re-derive the shared dir from `CAIRN_INSTANCE=1`; dropping only
 /// `CAIRN_INSTANCE` leaves the directly-inherited `CARGO_TARGET_DIR` in place.
-pub const DEV_INSTANCE_ROUTING_ENV: [&str; 2] = ["CAIRN_INSTANCE", "CARGO_TARGET_DIR"];
+pub(crate) const DEV_INSTANCE_ROUTING_ENV: [&str; 2] = ["CAIRN_INSTANCE", "CARGO_TARGET_DIR"];
 
 /// Maintain the full set of agent tool shims in `<cairn_home>/bin` — `cairn`
 /// (→ `cairn-cmd`), `jj`, `bun`, and `uv` — so every agent-spawned shell
@@ -210,14 +214,31 @@ pub fn ensure_agent_tool_shims(
     }
 }
 
-/// The shared, per-home uv package cache dir (`<cairn_home>/uv-cache`), injected
-/// as `UV_CACHE_DIR` into every agent-spawned process (inline `run` commands,
-/// terminals, skill scripts). Placed under the Cairn home rather than uv's
-/// default `~/.cache/uv` so all agents share one warm cache AND writes land in a
-/// fence-permitted, Cairn-owned location — the sandbox writable set includes it
-/// via [`crate::services::sandbox::default_writable_extra`].
-pub fn uv_cache_dir() -> PathBuf {
-    cairn_common::paths::cairn_home().join("uv-cache")
+/// The uv package cache injected into every agent-spawned process (inline `run`
+/// commands, terminals, and skill scripts). Production hosts always use the
+/// Cairn-owned `<cairn_home>/uv-cache`. Test builds may supply an absolute
+/// scratch path so fixtures nested inside a build-slot sandbox cannot escape the
+/// outer sandbox's writable roots.
+pub(crate) fn uv_cache_dir() -> PathBuf {
+    let default = cairn_common::paths::cairn_home().join("uv-cache");
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        uv_cache_dir_with_test_override(default, std::env::var_os("CAIRN_TEST_UV_CACHE_DIR"))
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    default
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn uv_cache_dir_with_test_override(
+    default: PathBuf,
+    test_override: Option<std::ffi::OsString>,
+) -> PathBuf {
+    test_override
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or(default)
 }
 
 /// Best-effort creation of [`uv_cache_dir`] at host startup, so the sandbox
@@ -545,7 +566,7 @@ pub fn find_binary(name: &str) -> Result<String, String> {
 /// the resolved user PATH). A tool installed into the cairn bin dir resolves
 /// here but not through [`find_binary`], which consults only [`get_user_path`].
 /// Used to probe for `uv` before routing inline python through `uv run -`.
-pub fn find_binary_on_agent_path(name: &str) -> Result<String, String> {
+pub(crate) fn find_binary_on_agent_path(name: &str) -> Result<String, String> {
     find_binary_in(name, &agent_shell_path())
 }
 
@@ -611,12 +632,12 @@ pub fn command(program: &str) -> Command {
 }
 
 /// Create a Command for git with the user's PATH set.
-pub fn git() -> Command {
+pub(crate) fn git() -> Command {
     command("git")
 }
 
 /// Create a Command for gh (GitHub CLI) with the user's PATH set.
-pub fn gh() -> Command {
+pub(crate) fn gh() -> Command {
     command("gh")
 }
 
@@ -624,11 +645,11 @@ pub fn gh() -> Command {
 #[cfg(not(windows))]
 mod tests {
     use super::{
-        ensure_forwarder_shim_in, ensure_jj_shim_in, is_legacy_cairn_forwarder,
+        compose_unix_path, ensure_forwarder_shim_in, ensure_jj_shim_in, is_legacy_cairn_forwarder,
         jj_shim_script_unix, jj_shim_script_windows, parse_path_from_env_output, prepend_cairn_bin,
-        write_shim_file_if_ours, CAIRN_SHIM_MARKER,
+        uv_cache_dir_with_test_override, write_shim_file_if_ours, CAIRN_SHIM_MARKER,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn prepend_cairn_bin_places_bin_dir_first() {
@@ -693,6 +714,35 @@ mod tests {
         let bin = dir.path().join("bin");
         ensure_forwarder_shim_in(&bin, "cairn", "/nonexistent/cairn-cmd");
         assert!(!bin.join("cairn").exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_path_keeps_standard_dirs_with_restricted_inherited_path() {
+        let path = compose_unix_path("/home/dev", None, "/restricted/gui/bin");
+        assert!(path.starts_with("/home/dev/.claude/local/bin:"));
+        assert!(path.contains(":/restricted/gui/bin:"));
+        assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_path_includes_standard_dirs_when_inherited_path_is_empty() {
+        let path = compose_unix_path("/home/dev", None, "");
+        assert!(path.starts_with("/home/dev/.claude/local/bin:"));
+        assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_path_keeps_resolved_shell_and_inherited_entries() {
+        let path = compose_unix_path(
+            "/home/dev",
+            Some("/shell/bin:/shell/sbin"),
+            "/inherited/bin",
+        );
+        assert!(path.contains(":/shell/bin:/shell/sbin:/inherited/bin:"));
+        assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
     }
 
     #[test]
@@ -771,6 +821,27 @@ mod tests {
         let bin = dir.path().join("bin");
         ensure_forwarder_shim_in(&bin, "bun", "/nonexistent/bun");
         assert!(!bin.join("bun").exists());
+    }
+
+    #[test]
+    fn uv_cache_test_override_requires_a_nonempty_absolute_path() {
+        let default = PathBuf::from("/cairn/uv-cache");
+        assert_eq!(
+            uv_cache_dir_with_test_override(default.clone(), None),
+            default
+        );
+        assert_eq!(
+            uv_cache_dir_with_test_override(default.clone(), Some("".into())),
+            default
+        );
+        assert_eq!(
+            uv_cache_dir_with_test_override(default.clone(), Some("relative/cache".into())),
+            default
+        );
+        assert_eq!(
+            uv_cache_dir_with_test_override(default, Some("/slot/scratch/uv-cache".into())),
+            PathBuf::from("/slot/scratch/uv-cache")
+        );
     }
 
     #[test]

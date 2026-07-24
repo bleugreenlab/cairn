@@ -158,7 +158,7 @@ pub enum ProviderAuth {
 
 impl ProviderAuth {
     /// Get the raw credential value, if any.
-    pub fn credential_value(&self) -> Option<&str> {
+    fn credential_value(&self) -> Option<&str> {
         match self {
             ProviderAuth::ApiKey { value } | ProviderAuth::OAuthToken { value } => Some(value),
             ProviderAuth::LocalCli => None,
@@ -166,7 +166,7 @@ impl ProviderAuth {
     }
 
     /// Short description of auth type for UI display.
-    pub fn auth_type_label(&self) -> &'static str {
+    fn auth_type_label(&self) -> &'static str {
         match self {
             ProviderAuth::ApiKey { .. } => "api_key",
             ProviderAuth::OAuthToken { .. } => "oauth_token",
@@ -179,23 +179,23 @@ impl ProviderAuth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAccount {
-    pub id: String,
-    pub label: String,
-    pub api_provider: ApiProvider,
-    pub source: AccountSource,
-    pub auth: ProviderAuth,
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) api_provider: ApiProvider,
+    pub(crate) source: AccountSource,
+    pub(crate) auth: ProviderAuth,
     /// None = shared account; Some(project_id) = private to that project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    pub(crate) project_id: Option<String>,
     /// Position = priority (lower = higher priority)
-    pub sort_order: i32,
-    pub created_at: i64,
-    pub last_used_at: Option<i64>,
+    pub(crate) sort_order: i32,
+    pub(crate) created_at: i64,
+    pub(crate) last_used_at: Option<i64>,
 }
 
 impl ProviderAccount {
     /// Which agent backends can consume this credential.
-    pub fn compatible_backends(&self) -> Vec<&'static str> {
+    pub(crate) fn compatible_backends(&self) -> Vec<&'static str> {
         match (&self.api_provider, &self.auth) {
             // API keys work with both CLI and Native
             (ApiProvider::Anthropic, ProviderAuth::ApiKey { .. }) => vec!["claude", "native"],
@@ -224,26 +224,26 @@ impl ProviderAccount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitIdentity {
-    pub id: String,
-    pub label: String,
+    pub(crate) id: String,
+    pub(crate) label: String,
     pub name: String,
-    pub email: String,
+    pub(crate) email: String,
     /// First = default
-    pub sort_order: i32,
+    pub(crate) sort_order: i32,
 }
 
 /// The full identity store — multi-account model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityStore {
-    pub user_id: String,
+    user_id: String,
     /// Sorted by (api_provider, sort_order)
-    pub accounts: Vec<ProviderAccount>,
+    pub(crate) accounts: Vec<ProviderAccount>,
     /// Sorted by sort_order
-    pub git_identities: Vec<GitIdentity>,
+    pub(crate) git_identities: Vec<GitIdentity>,
     /// Per-project account overrides, keyed by project ID.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub project_overrides: std::collections::HashMap<String, AccountOverrides>,
+    pub(crate) project_overrides: std::collections::HashMap<String, AccountOverrides>,
 }
 
 impl IdentityStore {
@@ -320,7 +320,7 @@ impl IdentityStore {
     }
 
     /// Get accounts for a specific provider, sorted by priority.
-    pub fn accounts_for_provider(
+    pub(crate) fn accounts_for_provider(
         &self,
         provider: ApiProvider,
         project_id: Option<&str>,
@@ -373,7 +373,7 @@ impl IdentityStore {
     }
 
     /// Get the default git identity (first by sort order).
-    pub fn default_git_identity(&self) -> Option<&GitIdentity> {
+    fn default_git_identity(&self) -> Option<&GitIdentity> {
         self.git_identities.iter().min_by_key(|g| g.sort_order)
     }
 
@@ -381,7 +381,7 @@ impl IdentityStore {
     ///
     /// This finds the highest-priority compatible account per provider/backend
     /// and maps them to the fields `UserIdentity` expects.
-    pub fn resolve(
+    pub(crate) fn resolve(
         &self,
         project_id: Option<&str>,
         overrides: Option<&AccountOverrides>,
@@ -463,7 +463,7 @@ impl IdentityStore {
     }
 
     /// Check if any Anthropic account has local CLI auth.
-    pub fn has_local_cli(&self, provider: ApiProvider) -> bool {
+    pub(crate) fn has_local_cli(&self, provider: ApiProvider) -> bool {
         self.accounts
             .iter()
             .any(|a| a.api_provider == provider && matches!(a.auth, ProviderAuth::LocalCli))
@@ -475,32 +475,32 @@ impl IdentityStore {
 #[serde(rename_all = "camelCase")]
 pub struct AccountOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anthropic_account_id: Option<String>,
+    pub(crate) anthropic_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openai_account_id: Option<String>,
+    pub(crate) openai_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github_account_id: Option<String>,
+    pub(crate) github_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_identity_id: Option<String>,
+    pub(crate) git_identity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_name: Option<String>,
+    pub(crate) git_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_email: Option<String>,
+    pub(crate) git_email: Option<String>,
 }
 
 /// Frontend-safe account info (no credential values exposed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountInfo {
-    pub id: String,
-    pub label: String,
-    pub api_provider: ApiProvider,
-    pub source: AccountSource,
-    pub auth_type: String,
-    pub compatible_backends: Vec<String>,
-    pub project_id: Option<String>,
-    pub sort_order: i32,
-    pub last_used_at: Option<i64>,
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) api_provider: ApiProvider,
+    pub(crate) source: AccountSource,
+    pub(crate) auth_type: String,
+    compatible_backends: Vec<String>,
+    project_id: Option<String>,
+    sort_order: i32,
+    last_used_at: Option<i64>,
 }
 
 impl From<&ProviderAccount> for AccountInfo {

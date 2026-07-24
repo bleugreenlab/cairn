@@ -24,7 +24,9 @@ mod conflict;
 mod diff;
 mod env;
 mod errors;
+mod export;
 mod merge;
+mod publish;
 mod reconcile;
 mod seal;
 mod workspace;
@@ -38,7 +40,9 @@ pub use conflict::*;
 pub use diff::*;
 pub use env::*;
 pub use errors::*;
+pub use export::*;
 pub use merge::*;
+pub use publish::*;
 pub use reconcile::*;
 pub use seal::*;
 pub use workspace::*;
@@ -50,7 +54,6 @@ pub(crate) use conflict::revset_descends_from;
 pub(crate) use diff::parse_git_diff;
 pub(crate) use env::quote_fileset;
 pub(crate) use errors::{CONFLICTED_BRANCH_SEAL_MSG, LOST_SEAL_MSG};
-pub(crate) use seal::scoped_dirty;
 pub(crate) use worktree::sealed_tree_hash_via_git;
 
 // Referenced only by the jj test suite (unused in non-test builds).

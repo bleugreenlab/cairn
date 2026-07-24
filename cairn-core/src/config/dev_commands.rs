@@ -42,12 +42,12 @@ use crate::models::TerminalCommand;
 #[derive(Debug, Default, PartialEq)]
 pub struct ResolvedCarveouts {
     /// Expanded writable glob strings to add to the spawn's writable set.
-    pub write_globs: Vec<String>,
+    pub(crate) write_globs: Vec<String>,
     /// An accepted command with no declared `write` scopes — run it unconfined.
-    pub unconfined: bool,
+    pub(crate) unconfined: bool,
     /// Declared scopes that could not be granted because they touch a secret
     /// store. Surfaced so the human sees the crossing fell back to the Ask flow.
-    pub dropped_sensitive: Vec<String>,
+    pub(crate) dropped_sensitive: Vec<String>,
 }
 
 impl ResolvedCarveouts {
@@ -65,7 +65,7 @@ impl ResolvedCarveouts {
 /// scopes is confined to them (never intersecting `deny_read`); an accepted
 /// command with no scopes is `unconfined`. Pure and side-effect free so it is
 /// unit-testable without an orchestrator.
-pub fn resolve_carveouts(
+pub(crate) fn resolve_carveouts(
     command: &str,
     project_terminals: &[TerminalCommand],
     accepted: &[String],

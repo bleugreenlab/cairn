@@ -27,6 +27,36 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
+    let orch = orchestrator_without_executor(temp, db);
+    common::attach_test_executor(&orch);
+    orch
+}
+
+#[tokio::test]
+async fn managed_search_commands_require_executor_placement() {
+    let (_temp, _db, orch, cwd) = setup_without_executor("run-search-placement").await;
+    let index = orch.worktree_search.get_or_create(Path::new(&cwd)).unwrap();
+    let served_before = index.served_grep_query_count();
+
+    for command in ["rg needle .", "grep -rn needle ."] {
+        let result = handle_run(
+            &orch,
+            &request(
+                &cwd,
+                Some("run-search-placement"),
+                json!({ "commands": [{ "command": command }] }),
+            ),
+        )
+        .await;
+        assert!(
+            run_text(&result).contains("ExecutorUnavailable"),
+            "{result}"
+        );
+    }
+    assert_eq!(index.served_grep_query_count(), served_before);
+}
+
+fn orchestrator_without_executor(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
     let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db, search_index));
     let services = Arc::new(
@@ -34,9 +64,7 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
             .with_process(RealProcessSpawner)
             .build(),
     );
-    let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
-    common::attach_test_executor(&orch);
-    orch
+    Orchestrator::builder(db_state, services, temp.path().join("config")).build()
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> std::process::Output {
@@ -177,6 +205,17 @@ async fn seed_run(
 }
 
 async fn setup(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
+    setup_with_executor(run_id, true).await
+}
+
+async fn setup_without_executor(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
+    setup_with_executor(run_id, false).await
+}
+
+async fn setup_with_executor(
+    run_id: &str,
+    attach_executor: bool,
+) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
     let (temp, db) = common::migrated_db().await;
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
@@ -186,7 +225,11 @@ async fn setup(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
     let branch = "agent/RHG-1-builder-0";
     let base_commit = common::head_sha(&project_repo);
     seed_run(&db, &project_id, &worktree, branch, &base_commit, run_id).await;
-    let orch = orchestrator(&temp, db.clone());
+    let orch = if attach_executor {
+        orchestrator(&temp, db.clone())
+    } else {
+        orchestrator_without_executor(&temp, db.clone())
+    };
     common::provision_jj_workspace(
         &temp.path().join("config"),
         &project_repo,
@@ -236,6 +279,13 @@ async fn count(db: &LocalDb, sql: &'static str) -> i64 {
     common::query_i64(db, sql).await.unwrap()
 }
 
+fn run_text(result: &str) -> String {
+    serde_json::from_str::<Value>(result).unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 // Each item waits for a marker written by the other. Concurrent execution lets
 // both succeed; serialization makes the first item fail before the second starts.
 // This proves overlap without relying on wall-clock timing under a loaded suite.
@@ -267,7 +317,7 @@ async fn process_batch_uses_one_slot_and_preserves_parallel_execution() {
 const PARTIAL_OUTPUT_TIMEOUT_MS: u32 = 3000;
 
 #[tokio::test]
-async fn timed_out_slot_item_is_killed_without_terminal_promotion() {
+async fn timed_out_slot_item_promotes_through_executor_lifetime_authority() {
     let (_temp, db, orch, cwd) = setup("run-promote").await;
     let payload = json!({
         "commands": [{ "command": "echo started; sleep 30", "timeout": PARTIAL_OUTPUT_TIMEOUT_MS }],
@@ -282,19 +332,16 @@ async fn timed_out_slot_item_is_killed_without_terminal_promotion() {
         result.contains("timed out"),
         "missing timeout result: {result}"
     );
-    assert!(
-        !result.contains("terminal/run-1"),
-        "slot execution must not detach its leased process: {result}"
-    );
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM job_terminals").await, 0);
-    assert!(orch.pty_state.sessions.lock().unwrap().is_empty());
+    assert!(result.contains("timed out"), "missing timeout: {result}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM job_terminals").await, 1);
+    assert_eq!(orch.pty_state.sessions.lock().unwrap().len(), 1);
+    kill_all_sessions(&orch);
 }
 
-/// Sub-task jobs promote on timeout to a canonical task terminal URI. This keeps
-/// the process readable and killable while preserving the task address instead
-/// of incorrectly attaching the terminal to the parent node.
+/// A timed-out sub-task run retains the local terminal registration created by
+/// the runner callback even though the executor reports the timeout.
 #[tokio::test]
-async fn timed_out_item_in_subtask_job_kills_instead_of_promoting() {
+async fn timed_out_item_in_subtask_job_registers_its_terminal() {
     // Depends on a real long-running subprocess hitting the timeout-kill path;
     // the agent fence disrupts that subprocess lifecycle. Skip in a fence;
     // unfenced CI exercises the real timeout.
@@ -329,29 +376,21 @@ async fn timed_out_item_in_subtask_job_kills_instead_of_promoting() {
     });
     let result = handle_run(&orch, &request(&cwd, Some("run-subtask-sub"), payload)).await;
 
-    assert!(
-        result.contains("Command still running; detached"),
-        "expected promoted terminal result: {result}"
-    );
+    assert!(result.contains("timed out"), "expected timeout: {result}");
     assert!(
         result.contains("started"),
         "missing partial output: {result}"
     );
-    assert!(
-        result.contains("/task/map-things/terminal/run-1"),
-        "sub-task timeout must return the canonical task terminal URI: {result}"
-    );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM job_terminals").await,
         1,
-        "a terminal row should be created for the promoted sub-task timeout"
+        "the runner callback should register the timed-out sub-task terminal"
     );
     assert_eq!(
         orch.pty_state.sessions.lock().unwrap().len(),
         1,
-        "a promoted session should exist for the sub-task timeout"
+        "the timed-out sub-task should remain in the PTY registry"
     );
-
     kill_all_sessions(&orch);
 }
 
@@ -380,7 +419,7 @@ async fn sequential_stop_on_error_halts_after_timed_out_slot_item() {
 }
 
 #[tokio::test]
-async fn timed_out_item_without_run_context_kills_and_returns() {
+async fn tree_bound_item_without_resolvable_context_fails_before_execution() {
     // Depends on the same real subprocess timeout-kill lifecycle as the sub-task
     // timeout case. Under the agent worktree fence, an inherited sandbox denial
     // can win before the timeout path this test is meant to exercise.
@@ -389,8 +428,8 @@ async fn timed_out_item_without_run_context_kills_and_returns() {
     }
     let (_temp, db, orch, _cwd) = setup("run-nokill").await;
     // A cwd that maps to no job (and run_id None) yields no run context, so the
-    // timeout falls back to a kill rather than promotion. The seeded repo is a
-    // worktree, so use an independent throwaway repo instead.
+    // request cannot establish executor repository authority. The seeded repo
+    // is a worktree, so use an independent throwaway repo instead.
     let loose = tempfile::tempdir().unwrap();
     init_git_repo(loose.path());
     let cwd = loose.path().display().to_string();
@@ -402,21 +441,21 @@ async fn timed_out_item_without_run_context_kills_and_returns() {
     let elapsed = start.elapsed();
 
     assert!(
-        result.contains("timed out"),
-        "expected timed-out result: {result}"
+        result.contains("could not be resolved to an executor repository target"),
+        "expected fail-closed placement error: {result}"
     );
     assert!(
         elapsed < Duration::from_secs(5),
-        "kill path should return promptly, took {elapsed:?}"
+        "placement failure should return promptly, took {elapsed:?}"
     );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM job_terminals").await,
         0,
-        "no terminal row without a run context"
+        "no terminal row without executor repository authority"
     );
     assert!(
         orch.pty_state.sessions.lock().unwrap().is_empty(),
-        "no promoted session without a run context"
+        "no promoted session without executor repository authority"
     );
 }
 
@@ -655,7 +694,7 @@ async fn code_item_nonzero_exit_is_reported_as_failure() {
 /// promote-to-terminal path as a shell timeout — the timeout machinery is
 /// per-spawn and kind-agnostic, so inline code inherits it unchanged.
 #[tokio::test]
-async fn timed_out_code_item_is_killed_with_partial_output() {
+async fn timed_out_code_item_promotes_with_partial_output() {
     if !binary_available("python3") {
         eprintln!(
             "skipping timed_out_code_item_is_killed_with_partial_output: python3 not resolvable"
@@ -679,12 +718,10 @@ async fn timed_out_code_item_is_killed_with_partial_output() {
         result.contains("timed out"),
         "missing timeout result: {result}"
     );
-    assert!(
-        !result.contains("terminal/run-1"),
-        "slot code execution must not detach: {result}"
-    );
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM job_terminals").await, 0);
-    assert!(orch.pty_state.sessions.lock().unwrap().is_empty());
+    assert!(result.contains("timed out"), "missing timeout: {result}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM job_terminals").await, 1);
+    assert_eq!(orch.pty_state.sessions.lock().unwrap().len(), 1);
+    kill_all_sessions(&orch);
 }
 
 #[tokio::test]
@@ -696,7 +733,7 @@ async fn chained_commands_surface_all_segments() {
         &request(
             &cwd,
             Some("run-chain"),
-            json!({ "commands": [{ "command": "grep zzzNoMatch README.md || grep initial README.md || echo none" }] }),
+            json!({ "commands": [{ "command": "false || grep initial README.md || echo none" }] }),
         ),
     )
     .await;
@@ -763,8 +800,17 @@ async fn repl_state_persists_across_handle_run_calls() {
         worktree_path: Some(cwd.clone()),
     };
 
-    let Ok(session) =
-        repl::spawn_session(&orch, &ctx, &cwd, ReplLang::Python, "analysis", &[]).await
+    let Ok(session) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "analysis",
+        &[],
+    )
+    .await
     else {
         eprintln!("skipping repl_state_persists: no python/uv available to spawn the eval-server");
         return;
@@ -805,7 +851,7 @@ async fn repl_state_persists_across_handle_run_calls() {
     );
 
     if let Some(session) = orch.repl_state.remove(&ctx.job_id, "analysis") {
-        session.kill();
+        session.stop_and_release(&orch).await;
     }
 }
 
@@ -832,8 +878,10 @@ async fn repl_typescript_rejects_deps() {
     };
     let result = repl::spawn_session(
         &orch,
-        &ctx,
+        &ctx.job_id,
+        &ctx.project_id,
         &cwd,
+        Some(&ctx),
         ReplLang::Typescript,
         "ts",
         &["react".to_string()],
@@ -841,7 +889,7 @@ async fn repl_typescript_rejects_deps() {
     .await;
     let err = match result {
         Ok(session) => {
-            session.kill();
+            session.stop_and_release(&orch).await;
             panic!("typescript deps must be rejected");
         }
         Err(err) => err,
@@ -871,7 +919,17 @@ async fn repl_typescript_state_persists_across_handle_run_calls() {
         worktree_path: Some(cwd.clone()),
     };
 
-    let Ok(session) = repl::spawn_session(&orch, &ctx, &cwd, ReplLang::Typescript, "ts", &[]).await
+    let Ok(session) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Typescript,
+        "ts",
+        &[],
+    )
+    .await
     else {
         eprintln!(
             "skipping repl_typescript_state_persists: no bun available to spawn the eval-server"
@@ -930,6 +988,332 @@ async fn repl_typescript_state_persists_across_handle_run_calls() {
     );
 
     if let Some(session) = orch.repl_state.remove(&ctx.job_id, "ts") {
-        session.kill();
+        session.stop_and_release(&orch).await;
     }
+}
+
+// Build a REPL run context matching a job seeded by `seed_run`.
+fn repl_ctx(run_id: &str, cwd: &str) -> cairn_core::internal::mcp::handlers::RunContext {
+    cairn_core::internal::mcp::handlers::RunContext {
+        run_id: run_id.to_string(),
+        job_id: format!("job-{run_id}"),
+        exec_seq: Some(1),
+        issue_id: Some(format!("issue-{run_id}")),
+        issue_number: Some(1),
+        project_id: String::new(),
+        project_key: "RHG".to_string(),
+        job_name: Some("builder".to_string()),
+        worktree_path: Some(cwd.to_string()),
+    }
+}
+
+// Mirror `setup_without_executor` but inject a retained `CapturingEmitter` so a
+// test can assert on the `repl-exchange` / `repl-state` events the funnel emits.
+async fn setup_with_emitter(
+    run_id: &str,
+    emitter: Arc<cairn_core::internal::services::testing::CapturingEmitter>,
+) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
+    use cairn_core::internal::services::Services;
+
+    let (temp, db) = common::migrated_db().await;
+    let project_repo = temp.path().join("project");
+    init_git_repo(&project_repo);
+    let db = Arc::new(db);
+    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
+    let worktree = temp.path().join("worktree");
+    let branch = "agent/RHG-1-builder-0";
+    let base_commit = common::head_sha(&project_repo);
+    seed_run(&db, &project_id, &worktree, branch, &base_commit, run_id).await;
+
+    let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(db.clone(), search_index));
+    // build() wraps its emitter in a fresh Arc, so swap in ours via struct update
+    // to keep a handle for event assertions.
+    let base = TestServicesBuilder::new()
+        .with_process(RealProcessSpawner)
+        .build();
+    let services = Arc::new(Services {
+        emitter: emitter.clone(),
+        ..base
+    });
+    let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+
+    common::provision_jj_workspace(
+        &temp.path().join("config"),
+        &project_repo,
+        &worktree,
+        branch,
+    );
+    let job_id = format!("job-{run_id}");
+    let identity = jj::WorkspaceIdentity::new(
+        job_id.clone(),
+        job_id,
+        &project_id,
+        project_repo,
+        worktree.clone(),
+        branch,
+        jj::workspace_name_for_branch(branch),
+        base_commit,
+    );
+    jj::write_workspace_identity(&worktree, &identity).unwrap();
+    let cwd = worktree.display().to_string();
+    (temp, db, orch, cwd)
+}
+
+// The send funnel records each exchange in the session's history ring and emits
+// `repl-exchange` events (phase `started` then `settled`) with no session-ending
+// `repl-state`. A language-mismatched send fails closed before any exchange is
+// recorded. Guarded to skip if no python interpreter is available.
+#[tokio::test]
+async fn repl_funnel_records_history_and_emits_events() {
+    use cairn_core::internal::mcp::handlers::repl::{
+        self, ReplExchangeStatus, ReplLang, ReplOrigin,
+    };
+    use cairn_core::internal::repl_host;
+    use cairn_core::internal::services::testing::CapturingEmitter;
+
+    let run_id = "run-repl-funnel";
+    let emitter = Arc::new(CapturingEmitter::new());
+    let (_temp, _db, orch, cwd) = setup_with_emitter(run_id, emitter.clone()).await;
+    let ctx = repl_ctx(run_id, &cwd);
+
+    let Ok(session) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "fn",
+        &[],
+    )
+    .await
+    else {
+        eprintln!("skipping repl_funnel: no python/uv available to spawn the eval-server");
+        return;
+    };
+    orch.repl_state
+        .insert(ctx.job_id.clone(), "fn".to_string(), session);
+
+    let exchange = repl::send_recorded(
+        &orch,
+        &ctx.job_id,
+        "fn",
+        "z = 7\nz + 1",
+        Duration::from_secs(30),
+        ReplOrigin::User,
+        Some(ReplLang::Python),
+    )
+    .await
+    .expect("a live session send should record an exchange");
+    assert_eq!(exchange.status, ReplExchangeStatus::Success);
+    assert_eq!(exchange.value.as_deref(), Some("8"));
+    assert_eq!(exchange.origin, ReplOrigin::User);
+    assert!(exchange.duration_ms.is_some());
+
+    let events = emitter.events_named("repl-exchange");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["phase"] == "started" && e["seq"] == exchange.seq),
+        "expected a started phase event: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["phase"] == "settled" && e["status"] == "success"),
+        "expected a settled success event: {events:?}"
+    );
+    // A successful send is not session-ending, so no repl-state was emitted.
+    assert!(
+        emitter.events_named("repl-state").is_empty(),
+        "a successful send must not emit repl-state"
+    );
+
+    let history = repl_host::get_repl_history(&orch, ctx.job_id.clone(), "fn".to_string());
+    assert_eq!(history.len(), 1, "one settled exchange in history");
+    assert_eq!(history[0].seq, exchange.seq);
+    assert_eq!(history[0].status, ReplExchangeStatus::Success);
+
+    // A language mismatch fails closed without recording a phantom exchange.
+    let mismatch = repl::send_recorded(
+        &orch,
+        &ctx.job_id,
+        "fn",
+        "1",
+        Duration::from_secs(5),
+        ReplOrigin::Agent,
+        Some(ReplLang::Typescript),
+    )
+    .await;
+    assert!(mismatch.is_err(), "mismatched language must fail closed");
+    assert_eq!(
+        repl_host::get_repl_history(&orch, ctx.job_id.clone(), "fn".to_string()).len(),
+        1,
+        "a rejected mismatch must not append to history"
+    );
+
+    if let Some(session) = orch.repl_state.remove(&ctx.job_id, "fn") {
+        session.stop_and_release(&orch).await;
+    }
+}
+
+// The registry's identity-guarded ops keep a close+recreate-during-a-send safe:
+// an obsolete operation holding the old session must not evict or clobber the
+// replacement generation installed under the same slug. Guarded to skip if no
+// python interpreter is available.
+#[tokio::test]
+async fn repl_registry_guards_close_recreate_during_inflight() {
+    use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
+    use std::sync::Arc;
+
+    let run_id = "run-repl-recreate";
+    let (_temp, _db, orch, cwd) = setup_without_executor(run_id).await;
+    let ctx = repl_ctx(run_id, &cwd);
+
+    let Ok(a) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "fn",
+        &[],
+    )
+    .await
+    else {
+        eprintln!("skipping repl_registry_guards: no python/uv available");
+        return;
+    };
+    orch.repl_state
+        .insert(ctx.job_id.clone(), "fn".to_string(), a.clone());
+
+    // User stops the busy REPL and recreates the same slug while A's send is
+    // still notionally in flight: close (remove + stop/release A), then install B.
+    orch.repl_state.remove(&ctx.job_id, "fn");
+    a.stop_and_release(&orch).await;
+    let Ok(b) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "fn",
+        &[],
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(orch
+        .repl_state
+        .insert_if_absent(ctx.job_id.clone(), "fn".to_string(), b.clone()));
+
+    // A's obsolete Dead/Timeout cleanup (remove_if with the OLD Arc) must not
+    // evict the replacement B.
+    assert!(
+        !orch.repl_state.remove_if(&ctx.job_id, "fn", &a),
+        "an obsolete outcome must not evict the replacement generation"
+    );
+    let current = orch
+        .repl_state
+        .get(&ctx.job_id, "fn")
+        .expect("B still registered");
+    assert!(
+        Arc::ptr_eq(&current, &b),
+        "the replacement generation must survive"
+    );
+
+    // A concurrent create racing B must not clobber it either.
+    let Ok(c) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "fn",
+        &[],
+    )
+    .await
+    else {
+        b.stop_and_release(&orch).await;
+        return;
+    };
+    assert!(
+        !orch
+            .repl_state
+            .insert_if_absent(ctx.job_id.clone(), "fn".to_string(), c.clone()),
+        "insert must refuse an occupied slot"
+    );
+    let current = orch
+        .repl_state
+        .get(&ctx.job_id, "fn")
+        .expect("B still registered");
+    assert!(Arc::ptr_eq(&current, &b));
+    c.stop_and_release(&orch).await;
+
+    // The live session's own close (remove_if with the current Arc) still works.
+    assert!(orch.repl_state.remove_if(&ctx.job_id, "fn", &b));
+    b.stop_and_release(&orch).await;
+}
+
+// A send into a session whose child already exited settles as `Died`,
+// unregisters the session, and emits a session-ending `repl-state` `exited`.
+// Guarded to skip if no python interpreter is available.
+#[tokio::test]
+async fn repl_funnel_dead_session_unregisters_and_emits_exited() {
+    use cairn_core::internal::mcp::handlers::repl::{
+        self, ReplExchangeStatus, ReplLang, ReplOrigin,
+    };
+    use cairn_core::internal::services::testing::CapturingEmitter;
+
+    let run_id = "run-repl-dead";
+    let emitter = Arc::new(CapturingEmitter::new());
+    let (_temp, _db, orch, cwd) = setup_with_emitter(run_id, emitter.clone()).await;
+    let ctx = repl_ctx(run_id, &cwd);
+
+    let Ok(session) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "dead",
+        &[],
+    )
+    .await
+    else {
+        eprintln!("skipping repl_funnel_dead: no python/uv available");
+        return;
+    };
+    // Stop and release the executor lease out from under the registry, then send.
+    session.stop_and_release(&orch).await;
+    orch.repl_state
+        .insert(ctx.job_id.clone(), "dead".to_string(), session);
+
+    let exchange = repl::send_recorded(
+        &orch,
+        &ctx.job_id,
+        "dead",
+        "1 + 1",
+        Duration::from_secs(10),
+        ReplOrigin::User,
+        Some(ReplLang::Python),
+    )
+    .await
+    .expect("a dead send still records an exchange");
+    assert_eq!(exchange.status, ReplExchangeStatus::Died);
+    assert!(
+        !orch.repl_state.contains(&ctx.job_id, "dead"),
+        "a dead session must be unregistered"
+    );
+    let states = emitter.events_named("repl-state");
+    assert!(
+        states.iter().any(|e| e["status"] == "exited"),
+        "a dead send must emit repl-state exited: {states:?}"
+    );
 }

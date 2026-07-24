@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Generate the SBPL profile string for a policy.
-pub fn sbpl_profile(policy: &SandboxPolicy) -> String {
+fn sbpl_profile(policy: &SandboxPolicy) -> String {
     let mut out = String::new();
     out.push_str("(version 1)\n");
     out.push_str("(allow default)\n");
@@ -84,7 +84,11 @@ fn regex_rules(patterns: &[String]) -> String {
 }
 
 /// Rewrite argv to run under `sandbox-exec` with the generated profile.
-pub fn wrap_argv(program: &str, args: &[String], policy: &SandboxPolicy) -> (String, Vec<String>) {
+pub(crate) fn wrap_argv(
+    program: &str,
+    args: &[String],
+    policy: &SandboxPolicy,
+) -> (String, Vec<String>) {
     let profile = sbpl_profile(policy);
     let mut wrapped = vec!["-p".to_string(), profile, program.to_string()];
     wrapped.extend(args.iter().cloned());
@@ -124,33 +128,29 @@ fn escape_sbpl(s: &str) -> String {
 /// Recover the denied path for a sandbox violation by `pid` from the unified
 /// log. Best-effort: returns `None` if the log query fails or no violation is
 /// found (the caller then falls back to a command-scoped denial).
-pub fn detect_violation(pid: u32, since: SystemTime) -> Option<PathBuf> {
-    // Query a small window starting a couple seconds before the spawn to absorb
-    // clock skew. `log show` wants a local "YYYY-MM-DD HH:MM:SS" start string.
-    let start = since
-        .checked_sub(std::time::Duration::from_secs(2))
-        .unwrap_or(since);
-    let start_str = format_log_start(start)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxViolation {
+    pub(crate) operation: String,
+    pub(crate) path: PathBuf,
+}
 
-    // The unified log has ingestion lag, so the violation record is often not
-    // queryable immediately after the child exits. Retry a few times within a
-    // small budget. This is only reached on an actual denial (signature present
-    // + non-zero exit), so the cost is not on the hot path.
+pub(crate) fn detect_violation(pid: u32, since: SystemTime) -> Option<SandboxViolation> {
+    let start = format_log_start(since)?;
     const ATTEMPTS: usize = 3;
     const DELAY: std::time::Duration = std::time::Duration::from_millis(150);
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(DELAY);
         }
-        if let Some(path) = query_violation(pid, &start_str) {
-            return Some(path);
+        if let Some(violation) = query_violation(pid, &start) {
+            return Some(violation);
         }
     }
     None
 }
 
-/// One `log show` query + parse for a sandbox-deny path by `pid`.
-fn query_violation(pid: u32, start_str: &str) -> Option<PathBuf> {
+/// One `log show` query + parse for a sandbox-deny operation and path by `pid`.
+fn query_violation(pid: u32, start_str: &str) -> Option<SandboxViolation> {
     let output = std::process::Command::new("/usr/bin/log")
         .args([
             "show",
@@ -167,7 +167,7 @@ fn query_violation(pid: u32, start_str: &str) -> Option<PathBuf> {
         return None;
     }
     let ndjson = String::from_utf8_lossy(&output.stdout);
-    parse_violation_path(&ndjson, pid)
+    parse_violation(&ndjson, pid)
 }
 
 /// Format a `SystemTime` as a local `YYYY-MM-DD HH:MM:SS` string for
@@ -185,8 +185,8 @@ fn format_log_start(t: SystemTime) -> Option<String> {
 /// Sandbox violation messages look like:
 ///   `Sandbox: bash(1234) deny(1) file-write-create /Users/x/escape.txt`
 /// We extract the path that follows the `deny(N) <operation>` prefix.
-fn parse_violation_path(ndjson: &str, pid: u32) -> Option<PathBuf> {
-    let re = regex::Regex::new(r"deny\(\d+\)\s+\S+\s+(/.+)$").ok()?;
+fn parse_violation(ndjson: &str, pid: u32) -> Option<SandboxViolation> {
+    let re = regex::Regex::new(r"deny\(\d+\)\s+(\S+)\s+(/.+)$").ok()?;
     for line in ndjson.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -205,8 +205,11 @@ fn parse_violation_path(ndjson: &str, pid: u32) -> Option<PathBuf> {
             None => continue,
         };
         if let Some(caps) = re.captures(msg.trim()) {
-            if let Some(path) = caps.get(1) {
-                return Some(PathBuf::from(path.as_str().trim()));
+            if let (Some(operation), Some(path)) = (caps.get(1), caps.get(2)) {
+                return Some(SandboxViolation {
+                    operation: operation.as_str().to_string(),
+                    path: PathBuf::from(path.as_str().trim()),
+                });
             }
         }
     }
@@ -266,15 +269,21 @@ mod tests {
     fn parse_violation_path_extracts_denied_path() {
         let ndjson = r#"{"processID":1234,"eventMessage":"Sandbox: bash(1234) deny(1) file-write-create /Users/x/escape.txt"}
 {"processID":1234,"eventMessage":"some unrelated log line"}"#;
-        let path = super::parse_violation_path(ndjson, 1234);
-        assert_eq!(path, Some(PathBuf::from("/Users/x/escape.txt")));
+        let violation = super::parse_violation(ndjson, 1234);
+        assert_eq!(
+            violation,
+            Some(SandboxViolation {
+                operation: "file-write-create".into(),
+                path: PathBuf::from("/Users/x/escape.txt"),
+            })
+        );
     }
 
     #[test]
     fn parse_violation_path_ignores_other_pids_and_non_deny() {
         let ndjson = r#"{"processID":9999,"eventMessage":"deny(1) file-read-data /Users/x/.aws/credentials"}
 {"processID":1234,"eventMessage":"allow file-read-data /Users/x/ok"}"#;
-        assert_eq!(super::parse_violation_path(ndjson, 1234), None);
+        assert_eq!(super::parse_violation(ndjson, 1234), None);
     }
 
     #[test]
@@ -282,8 +291,11 @@ mod tests {
         let ndjson =
             r#"{"processID":42,"eventMessage":"deny(1) file-read-data /home/u/.ssh/id_rsa"}"#;
         assert_eq!(
-            super::parse_violation_path(ndjson, 42),
-            Some(PathBuf::from("/home/u/.ssh/id_rsa"))
+            super::parse_violation(ndjson, 42),
+            Some(SandboxViolation {
+                operation: "file-read-data".into(),
+                path: PathBuf::from("/home/u/.ssh/id_rsa"),
+            })
         );
     }
 

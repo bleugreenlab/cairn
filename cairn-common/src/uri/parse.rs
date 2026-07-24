@@ -575,6 +575,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 event_seq: parse_non_negative_i32(event_seq)?,
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "checks"] => {
+            Some(CairnResource::TaskChecks {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "artifact"] => {
             Some(CairnResource::TaskArtifact {
                 project: canonical_project(project),

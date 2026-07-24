@@ -7,12 +7,37 @@
 
 pub mod batch;
 pub mod file;
+mod object_read;
+pub(crate) mod overlay;
 
 use cairn_common::read::ReadSegment;
 
-pub use batch::handle_read_batch;
+pub(crate) use batch::handle_read_batch;
 pub use file::handle_read_file;
 pub(crate) use file::produce_file_segment;
+
+pub(crate) fn files_at_commit(
+    repository_path: std::path::PathBuf,
+    commit_id: String,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    object_read::ObjectReadService::new(repository_path, commit_id, String::new())?
+        .files()
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn file_at_commit(
+    repository_path: std::path::PathBuf,
+    commit_id: String,
+    path: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let service =
+        object_read::ObjectReadService::new(repository_path, commit_id, path.to_string())?;
+    match service.bytes() {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(cairn_codec::objects::ObjectReadError::PathNotFound(_)) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
 
 // The shared view/render layer moved down into `storage::render` so `storage`
 // carries no upward `crate::mcp` edge. Re-export it under the original `view`
@@ -31,7 +56,7 @@ mod archived_reconstruct_tests;
 /// outcome that is `Segment` on every successful read, so boxing the common
 /// variant would add an allocation on the hot path to satisfy a size heuristic.
 #[allow(clippy::large_enum_variant)]
-pub enum Produced {
+pub(crate) enum Produced {
     Segment(ReadSegment),
     Suspended(String),
 }
@@ -76,7 +101,7 @@ pub fn register_archived_file_renderer() {
 /// `(match_count, file_count)` over the (already match-windowed) output;
 /// path-less bodies have no file dimension and do not contribute to the file
 /// count.
-pub fn grep_counts(body: &str) -> (usize, usize) {
+pub(crate) fn grep_counts(body: &str) -> (usize, usize) {
     use std::collections::HashSet;
     use std::sync::LazyLock;
 

@@ -31,6 +31,8 @@ const PREF_KEYS: &[&str] = &[
     "transcriptDensity",
     "logLevel",
     "memoryReviewEnabled",
+    "memoryTriageEnabled",
+    "maxOpenTriageIssuesPerScope",
     "pendingMemoryThreshold",
     "externalReplies",
     "subscriptionFees",

@@ -121,6 +121,7 @@ fn validate_roundtrip(agent: &FileAgent) -> Result<(), String> {
         hooks: agent.hooks.as_ref(),
         backend_preference: agent.backend_preference.as_deref(),
         icon: agent.icon.as_deref(),
+        bundles: &agent.bundles,
     });
     parse_agent_markdown(&markdown).map(|_| ())
 }
@@ -177,6 +178,7 @@ pub(super) async fn apply_agent_create(
         hooks: None,
         backend_preference: None,
         icon: None,
+        bundles: Vec::new(),
         is_project_scoped,
         file_path: PathBuf::new(),
     };

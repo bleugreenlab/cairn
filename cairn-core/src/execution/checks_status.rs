@@ -20,23 +20,23 @@ use crate::orchestrator::Orchestrator;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeCheckStatus {
-    pub name: String,
-    pub state: NodeCheckState,
-    pub policy: String,
-    pub when: String,
-    pub cached: Option<bool>,
-    pub duration_ms: Option<i64>,
-    pub ran_at: Option<i64>,
-    pub passed: Option<usize>,
-    pub failed: Option<usize>,
-    pub skipped: Option<usize>,
-    pub failure_names: Vec<String>,
-    pub output_tail: Option<String>,
+    pub(crate) name: String,
+    pub(crate) state: NodeCheckState,
+    pub(crate) policy: String,
+    pub(crate) when: String,
+    pub(crate) cached: Option<bool>,
+    pub(crate) duration_ms: Option<i64>,
+    pub(crate) ran_at: Option<i64>,
+    pub(crate) passed: Option<usize>,
+    pub(crate) failed: Option<usize>,
+    pub(crate) skipped: Option<usize>,
+    pub(crate) failure_names: Vec<String>,
+    pub(crate) output_tail: Option<String>,
     /// Terminal classification of a FAILING check — `"timed_out"`,
     /// `"spawn_error"`, or `"killed"` — so a surface renders the real death, not
     /// an opaque red. `None` for a pass, an ordinary non-zero exit, and legacy
     /// rows.
-    pub failure_kind: Option<String>,
+    pub(crate) failure_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -75,7 +75,9 @@ pub async fn node_check_statuses(
     // bridge. Routing and config loading above stay async; the complete status
     // snapshot below belongs on the blocking pool so rendering `/checks` cannot
     // park a runtime worker.
-    let in_flight = orch.turn_end_checks_in_flight(job_id);
+    let review_in_flight = orch.turn_end_checks_in_flight(job_id);
+    let write_in_flight = orch.write_checks_in_flight(job_id);
+    let in_flight = review_in_flight || write_in_flight;
     let runtime_status = orch.turn_end_check_runtime_status(job_id);
     let status_db = db.clone();
     let status_job_id = job_id.to_string();
@@ -172,10 +174,10 @@ pub async fn node_check_statuses(
                 // once, while a not-yet-started (or fallback-queued) check has no
                 // file yet and stays pending. The tail is read separately and is
                 // None while a running check has yet to emit.
-                let started = in_flight
-                    && check.when == CheckWhen::Review
+                let started = (review_in_flight && check.when == CheckWhen::Review
+                    || write_in_flight && check.when == CheckWhen::Write)
                     && !not_applicable
-                    && turn_end_check_started(orch, job_id, &name);
+                    && (write_in_flight || turn_end_check_started(orch, job_id, &name));
 
                 let state = if not_applicable {
                     NodeCheckState::NotApplicable
@@ -268,7 +270,7 @@ fn status_from_row(
     }
 }
 
-pub fn format_status_annotation(status: &NodeCheckStatus) -> Option<String> {
+pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<String> {
     let mut parts = Vec::new();
     match status.state {
         NodeCheckState::Passed => {
@@ -341,7 +343,7 @@ fn join_running(names: &[String]) -> String {
     }
 }
 
-pub fn format_check_duration(ms: i64) -> String {
+fn format_check_duration(ms: i64) -> String {
     if ms >= 1000 {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
@@ -349,7 +351,7 @@ pub fn format_check_duration(ms: i64) -> String {
     }
 }
 
-pub fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String> {
+pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String> {
     let parsed = ParsedCheckResult {
         parser: "node-status".to_string(),
         passed: status.passed.unwrap_or(0),

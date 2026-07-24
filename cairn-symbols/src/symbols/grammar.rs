@@ -9,7 +9,7 @@
 use ast_grep_language::SupportLang;
 
 /// The structural node-kind tables for one language.
-pub struct LangSpec {
+pub(crate) struct LangSpec {
     /// Declaration node kinds that carry a `name` field (functions, types, etc.).
     decls: &'static [&'static str],
     /// Call-expression node kinds.
@@ -20,17 +20,17 @@ pub struct LangSpec {
 
 impl LangSpec {
     /// Whether `kind` declares a named symbol.
-    pub fn is_decl(&self, kind: &str) -> bool {
+    pub(crate) fn is_decl(&self, kind: &str) -> bool {
         self.decls.contains(&kind)
     }
 
     /// Whether `kind` is a call expression.
-    pub fn is_call(&self, kind: &str) -> bool {
+    pub(crate) fn is_call(&self, kind: &str) -> bool {
         self.calls.contains(&kind)
     }
 
     /// Fields to probe, in order, for a call node's callee.
-    pub fn callee_fields(&self) -> &'static [&'static str] {
+    pub(crate) fn callee_fields(&self) -> &'static [&'static str] {
         self.callee_fields
     }
 }
@@ -101,7 +101,7 @@ const EMPTY: LangSpec = LangSpec {
 
 /// The structural spec for a language. Languages without a first-cut spec fall
 /// back to [`EMPTY`] — references still work, declarations/callers return empty.
-pub fn spec(lang: SupportLang) -> &'static LangSpec {
+pub(crate) fn spec(lang: SupportLang) -> &'static LangSpec {
     match lang {
         SupportLang::Rust => &RUST,
         SupportLang::TypeScript | SupportLang::Tsx => &TS,

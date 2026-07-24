@@ -6,7 +6,7 @@
 pub mod runtime;
 
 pub(crate) use runtime::lookup_caller_job_id;
-pub use runtime::{
+pub(crate) use runtime::{
     is_call_child, resume_suspended_parent_after_task_completion, spawn_call_packets,
     spawn_task_packets, spawn_workflow_packets,
 };
@@ -36,16 +36,16 @@ impl From<DelegatedTaskSessionMode> for DelegatedSessionStrategy {
 
 #[derive(Debug, Clone)]
 pub struct DelegatedTaskPayload {
-    pub description: String,
-    pub prompt: String,
-    pub subagent_type: String,
-    pub tier: Option<String>,
-    pub backend_preference: Option<String>,
-    pub session: DelegatedTaskSessionMode,
-    pub task_index: Option<i32>,
+    pub(crate) description: String,
+    pub(crate) prompt: String,
+    pub(crate) subagent_type: String,
+    pub(crate) tier: Option<String>,
+    pub(crate) backend_preference: Option<String>,
+    pub(crate) session: DelegatedTaskSessionMode,
+    pub(crate) task_index: Option<i32>,
     /// Optional per-task output schema: a preset name or an inline custom JSON
     /// Schema. `None` preserves the default `return` contract.
-    pub output_schema: Option<OutputSchema>,
+    pub(crate) output_schema: Option<OutputSchema>,
 }
 
 /// Build a delegated task's output contract from an optional caller-supplied
@@ -88,93 +88,93 @@ pub(crate) fn resolve_delegated_output_contract(
 /// run as a node-less job.
 #[derive(Debug, Clone)]
 pub struct DelegatedCallPayload {
-    pub description: String,
-    pub prompt: String,
-    pub subagent_type: String,
-    pub tier: Option<String>,
-    pub backend_preference: Option<String>,
+    pub(crate) description: String,
+    pub(crate) prompt: String,
+    pub(crate) subagent_type: String,
+    pub(crate) tier: Option<String>,
+    pub(crate) backend_preference: Option<String>,
     /// Optional per-call output schema: a preset name or an inline custom JSON
     /// Schema. `None` preserves the default `return` contract.
-    pub output_schema: Option<OutputSchema>,
-    pub worktree: crate::execution::jobs::CallWorktree,
-    pub label: Option<String>,
-    pub phase: Option<String>,
-    pub task_index: Option<i32>,
+    pub(crate) output_schema: Option<OutputSchema>,
+    pub(crate) worktree: crate::execution::jobs::CallWorktree,
+    pub(crate) label: Option<String>,
+    pub(crate) phase: Option<String>,
+    pub(crate) task_index: Option<i32>,
     /// The harness dispatch ordinal (CAIRN-2498), threaded from `agent()` so a
     /// workflow-parented call can be journaled and replayed. `None` for an
     /// ordinary call.
-    pub ordinal: Option<i64>,
+    pub(crate) ordinal: Option<i64>,
 }
 
-pub struct SpawnCallPacketsInput<'a> {
-    pub run_id: Option<&'a str>,
-    pub cwd: &'a str,
-    pub payloads: &'a [DelegatedCallPayload],
+pub(crate) struct SpawnCallPacketsInput<'a> {
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) cwd: &'a str,
+    pub(crate) payloads: &'a [DelegatedCallPayload],
     /// Synthetic batch id, the resume-group fallback when no tool-use id is
     /// available.
-    pub group_id: &'a str,
-    pub parent_tool_use_id: Option<&'a str>,
-    pub background: bool,
+    pub(crate) group_id: &'a str,
+    pub(crate) parent_tool_use_id: Option<&'a str>,
+    pub(crate) background: bool,
 }
 
 /// A resolved workflow invocation (CAIRN-2487): a `run` item whose target is a
 /// workflow URI. Unlike a call it has no agent/prompt — its process is a
 /// supervised `bun <script>` — but it reuses the call-packet suspend/resume tail
 /// to wake the caller with the workflow's output artifact.
-pub struct SpawnWorkflowPacketsInput<'a> {
-    pub run_id: Option<&'a str>,
-    pub cwd: &'a str,
-    pub workflow_id: &'a str,
+pub(crate) struct SpawnWorkflowPacketsInput<'a> {
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) cwd: &'a str,
+    pub(crate) workflow_id: &'a str,
     /// Absolute path to the workflow's resolved script entry.
-    pub script_path: std::path::PathBuf,
+    pub(crate) script_path: std::path::PathBuf,
     /// The workflow's declared output schema (preset or inline), or `None` for
     /// the default `return` contract.
-    pub output_schema: Option<OutputSchema>,
+    pub(crate) output_schema: Option<OutputSchema>,
     /// The validated named args, forwarded to the script as `CAIRN_WORKFLOW_ARGS`.
-    pub args_json: String,
-    pub worktree: crate::execution::jobs::CallWorktree,
-    pub group_id: &'a str,
-    pub parent_tool_use_id: Option<&'a str>,
-    pub background: bool,
+    pub(crate) args_json: String,
+    pub(crate) worktree: crate::execution::jobs::CallWorktree,
+    pub(crate) group_id: &'a str,
+    pub(crate) parent_tool_use_id: Option<&'a str>,
+    pub(crate) background: bool,
 }
 
-pub struct SpawnTaskPacketsInput<'a> {
-    pub run_id: Option<&'a str>,
-    pub cwd: &'a str,
-    pub payloads: &'a [DelegatedTaskPayload],
+pub(crate) struct SpawnTaskPacketsInput<'a> {
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) cwd: &'a str,
+    pub(crate) payloads: &'a [DelegatedTaskPayload],
     /// Synthetic batch id, used as the resume-group fallback when the originating
     /// tool-use id is unavailable.
-    pub group_id: &'a str,
+    pub(crate) group_id: &'a str,
     /// The originating `write` tool-use id. When present it is persisted as each
     /// packet's (and child job's) `parent_tool_use_id`, which the transcript uses
     /// to locate the spawned child jobs. Falls back to `group_id` when absent.
-    pub parent_tool_use_id: Option<&'a str>,
-    pub background: bool,
+    pub(crate) parent_tool_use_id: Option<&'a str>,
+    pub(crate) background: bool,
 }
 
-pub struct CreateDelegatedPacketInput<'a> {
-    pub parent_job_id: &'a str,
-    pub parent_turn_id: Option<&'a str>,
-    pub parent_tool_use_id: Option<&'a str>,
-    pub title: &'a str,
-    pub problem_statement: &'a str,
-    pub agent_config_id: &'a str,
-    pub cwd: &'a str,
-    pub fence: Option<crate::models::Fence>,
-    pub acceptance: Vec<String>,
-    pub output_contract: DelegatedOutputContract,
-    pub session: DelegatedSessionStrategy,
-    pub task_index: Option<i32>,
-    pub tier_override: Option<&'a str>,
+pub(crate) struct CreateDelegatedPacketInput<'a> {
+    parent_job_id: &'a str,
+    parent_turn_id: Option<&'a str>,
+    parent_tool_use_id: Option<&'a str>,
+    title: &'a str,
+    problem_statement: &'a str,
+    agent_config_id: &'a str,
+    cwd: &'a str,
+    fence: Option<crate::models::Fence>,
+    acceptance: Vec<String>,
+    output_contract: DelegatedOutputContract,
+    session: DelegatedSessionStrategy,
+    task_index: Option<i32>,
+    tier_override: Option<&'a str>,
     #[allow(dead_code)]
     pub backend_preference: Option<&'a str>,
     /// Fire-and-forget request: the spawning parent does not block or suspend on
     /// this packet. Persisted so the completion-resume handler notifies the
     /// spawner via a push instead of looking for a (nonexistent) successor turn.
-    pub background: bool,
+    background: bool,
 }
 
-pub fn create_or_reuse_task_packet(
+pub(crate) fn create_or_reuse_task_packet(
     snapshot: &mut ExecutionSnapshot,
     input: CreateDelegatedPacketInput<'_>,
 ) -> DelegatedWorkPacket {
@@ -229,21 +229,21 @@ pub fn create_or_reuse_task_packet(
     packet
 }
 
-pub struct CreateCallPacketInput<'a> {
-    pub parent_job_id: &'a str,
-    pub parent_turn_id: Option<&'a str>,
-    pub parent_tool_use_id: Option<&'a str>,
-    pub title: &'a str,
-    pub problem_statement: &'a str,
-    pub agent_config_id: &'a str,
-    pub cwd: &'a str,
-    pub output_contract: DelegatedOutputContract,
+pub(crate) struct CreateCallPacketInput<'a> {
+    pub(crate) parent_job_id: &'a str,
+    pub(crate) parent_turn_id: Option<&'a str>,
+    pub(crate) parent_tool_use_id: Option<&'a str>,
+    pub(crate) title: &'a str,
+    pub(crate) problem_statement: &'a str,
+    pub(crate) agent_config_id: &'a str,
+    pub(crate) cwd: &'a str,
+    pub(crate) output_contract: DelegatedOutputContract,
     /// The call's own job id: the completion-resume path finds this packet by it.
-    pub result_artifact_job_id: &'a str,
-    pub task_index: Option<i32>,
-    pub tier_override: Option<&'a str>,
-    pub backend_preference: Option<&'a str>,
-    pub background: bool,
+    pub(crate) result_artifact_job_id: &'a str,
+    pub(crate) task_index: Option<i32>,
+    pub(crate) tier_override: Option<&'a str>,
+    pub(crate) backend_preference: Option<&'a str>,
+    pub(crate) background: bool,
 }
 
 /// Persist a pre-materialized call packet (CAIRN-2481).
@@ -253,7 +253,7 @@ pub struct CreateCallPacketInput<'a> {
 /// only expands `Pending` packets) skips it — the call never becomes a recipe
 /// node and never advances the DAG — while the completion-resume path finds it by
 /// `result_artifact_job_id` and drives the parent exactly as it does for a task.
-pub fn create_call_packet(
+pub(crate) fn create_call_packet(
     snapshot: &mut ExecutionSnapshot,
     input: CreateCallPacketInput<'_>,
 ) -> DelegatedWorkPacket {

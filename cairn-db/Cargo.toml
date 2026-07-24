@@ -37,6 +37,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 # into cross-crate test-utils builds where dev-deps are absent (mirrors cairn-codec).
 tempfile = "3"
 cairn-common = { path = "../cairn-common" }
+cairn-worktree = { path = "../cairn-worktree" }
 # The gix + zstd event-codec/object substrate; storage/events re-exports it.
 cairn-codec = { path = "../cairn-codec" }
 

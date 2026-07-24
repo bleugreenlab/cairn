@@ -10,9 +10,29 @@ pub enum ManagedWorkspaceReconcileOutcome {
     PreservedDirty,
 }
 
+/// Read-only optimistic probe used before entering the project-wide store lock.
+/// The full reconciler revalidates after acquisition, so a concurrent advance can
+/// only cause a harmless false negative that seal-time stale recovery catches.
+pub(crate) fn managed_workspace_needs_reconcile(
+    jj: &JjEnv,
+    store: &Path,
+    workspace_path: &Path,
+    branch: &str,
+) -> Result<bool, String> {
+    if branch_has_conflict(jj, store, branch).unwrap_or(true) {
+        return Ok(false);
+    }
+    let Some(tip) = bookmark_commit(jj, store, branch) else {
+        return Ok(false);
+    };
+    let source = format!("{}@", workspace_name_for_branch(branch));
+    let _ = workspace_path;
+    Ok(!revset_descends_from(jj, store, &source, &tip))
+}
+
 /// Bring one managed workspace's working copy into agreement with its bookmark.
 /// The caller must hold the project's owner-tagged jj store lock.
-pub fn reconcile_managed_workspace(
+pub(crate) fn reconcile_managed_workspace(
     jj: &JjEnv,
     store: &Path,
     workspace_path: &Path,
@@ -121,7 +141,7 @@ fn branch_footprint(
 /// The full description of a bookmark's tip over the store, trimmed, or empty when
 /// the bookmark does not resolve. A reconcile-time flatten preserves the branch's
 /// own seal message (not a PR title) by passing this as the squash description.
-pub fn branch_description(jj: &JjEnv, store: &Path, branch: &str) -> String {
+pub(crate) fn branch_description(jj: &JjEnv, store: &Path, branch: &str) -> String {
     jj.run(
         store,
         &[
@@ -164,11 +184,7 @@ pub(crate) fn restore_bookmark(
         ],
         "flatten: restore bookmark after guard failure",
     )?;
-    let _ = jj.run(
-        store,
-        &["git", "export", "--ignore-working-copy"],
-        "flatten: git export after restore",
-    );
+    let _ = export_git_preserving_checkout(jj, store, true, "flatten: git export after restore");
     Ok(())
 }
 
@@ -181,7 +197,7 @@ pub(crate) fn restore_bookmark(
 /// caller MUST hold the per-store lock (as the merge fold and every Cairn jj
 /// writer do via `resolve_store_lock`), under which every op between snapshot and
 /// restore is the caller's own.
-pub fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
+pub(crate) fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
     jj.run(
         store,
         &[
@@ -210,18 +226,13 @@ pub fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
 /// snapshot and this restore would also be undone. The caller MUST hold the
 /// per-store lock; under it every op since the snapshot is the caller's own and
 /// the restore is precise.
-pub fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), String> {
+pub(crate) fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), String> {
     jj.run(
         store,
         &["op", "restore", op_id, "--ignore-working-copy"],
         "jj op restore",
     )?;
-    jj.run(
-        store,
-        &["git", "export", "--ignore-working-copy"],
-        "jj git export (after op restore)",
-    )
-    .map(|_| ())
+    export_git_preserving_checkout(jj, store, true, "jj git export (after op restore)")
 }
 
 /// Local bookmarks that ride a commit inside `range_revset`, excluding `exclude`.
@@ -266,17 +277,17 @@ fn local_bookmarks_in_range(
 pub struct FlattenReport {
     /// The single commit the branch now points at: its tree equals the clean
     /// rebased tip and its parent is `dest_commit`.
-    pub flattened_commit: String,
+    pub(crate) flattened_commit: String,
     /// How many conflicted intermediate commits the flatten collapsed away
     /// (advisory count).
-    pub collapsed_conflicted_commits: usize,
+    pub(crate) collapsed_conflicted_commits: usize,
     /// Orphaned twins of the PRE-flatten change-id that were abandoned in the
     /// twin-cleanup pass.
-    pub abandoned_twins: Vec<String>,
+    pub(crate) abandoned_twins: Vec<String>,
     /// Sibling bookmarks that rode a flattened-away intermediate commit and were
     /// re-pointed onto the flattened commit (so a later `reconcile_siblings` does
     /// not resurrect the orphaned lineage).
-    pub repointed_bookmarks: Vec<String>,
+    pub(crate) repointed_bookmarks: Vec<String>,
 }
 
 /// Guarded flatten recovery for a clean-tip / conflicted-intermediate branch.
@@ -306,7 +317,7 @@ pub struct FlattenReport {
 /// so the flatten cannot itself fork the op log. `message` becomes the flattened
 /// commit's description (a PR title at a default landing, the branch's own seal
 /// message at a reconcile).
-pub fn flatten_branch_recovery(
+pub(crate) fn flatten_branch_recovery(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
@@ -421,9 +432,10 @@ pub fn flatten_branch_recovery(
             "flatten: re-point rider bookmark",
         ) {
             Ok(_) => {
-                let _ = jj.run(
+                let _ = export_git_preserving_checkout(
+                    jj,
                     store,
-                    &["git", "export", "--ignore-working-copy"],
+                    true,
                     "flatten: git export after rider re-point",
                 );
                 repointed_bookmarks.push(rider);
@@ -495,30 +507,56 @@ pub fn flatten_branch_recovery(
     })
 }
 
-/// Publish a reconciled bookmark when this project has an `origin` remote. Local-only
-/// projects have nothing to publish, so absence of `origin` is success rather than a
-/// blocking reconcile failure. If remote discovery itself fails, attempt the push:
-/// preserving the existing configured-origin failure signal is safer than silently
-/// treating an unreadable remote configuration as local-only.
-fn publish_reconciled_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
-    let has_origin = jj
-        .run(
-            store,
-            &["git", "remote", "list"],
-            "jj git remote list (reconcile publish)",
-        )
-        .map(|remotes| {
-            remotes.lines().any(|line| {
+/// Whether this project has an `origin` remote. Publication sites use absence as a
+/// successful nothing-to-publish result. If discovery fails, callers preserve the
+/// configured-origin failure signal rather than silently treating unreadable remote
+/// configuration as local-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginPresence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+pub(crate) fn discover_origin_presence(jj: &JjEnv, repo: &Path) -> OriginPresence {
+    match jj.run(
+        repo,
+        &["git", "remote", "list", "--ignore-working-copy"],
+        "jj git remote list",
+    ) {
+        Ok(remotes)
+            if remotes.lines().any(|line| {
                 line.split_whitespace()
                     .next()
                     .is_some_and(|name| name == "origin")
-            })
-        })
-        .unwrap_or(true);
-    if !has_origin {
+            }) =>
+        {
+            OriginPresence::Present
+        }
+        Ok(_) => OriginPresence::Absent,
+        Err(error) => {
+            log::warn!("jj reconcile: origin discovery failed; attempting publication conservatively: {error}");
+            OriginPresence::Unknown
+        }
+    }
+}
+
+pub(crate) fn publish_reconciled_bookmark(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    origin: OriginPresence,
+) -> Result<(), String> {
+    if origin == OriginPresence::Absent {
         return Ok(());
     }
     push_store_bookmark(jj, store, branch)
+}
+
+#[derive(Clone, Copy)]
+struct ReconcilePublication {
+    clean: bool,
+    flattened: bool,
 }
 
 /// Classify one sibling that is already positioned on `dest_commit` (either it was
@@ -526,8 +564,8 @@ fn publish_reconciled_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result
 /// applying proactive flatten recovery for the clean-tip / conflicted-intermediate
 /// case. `dest_commit` is `None` only when the reconcile dest was unresolvable, in
 /// which case this falls back to the bare tip-conflict check (liveness over
-/// strictness). `push_clean` advances a cleanly-rebased sibling's PR head when an
-/// `origin` remote is configured. A local-only project has nothing to publish and
+/// strictness). `publication.clean` advances a cleanly-rebased sibling's PR head
+/// when an `origin` remote is configured. A local-only project has nothing to publish and
 /// remains clean; failure to reach a configured origin is reported as blocking so
 /// the PR head cannot silently remain stale. A FLATTENED sibling always attempts
 /// publication because its commit id changed. The caller holds the per-store lock,
@@ -538,7 +576,7 @@ fn classify_reconciled_sibling(
     branch: &str,
     ws_path: &Path,
     dest_commit: Option<&str>,
-    push_clean: bool,
+    publication: ReconcilePublication,
     report: &mut ReconcileReport,
 ) {
     let state = dest_commit.and_then(|dest| flatten_state(jj, store, dest, branch).ok());
@@ -547,8 +585,13 @@ fn classify_reconciled_sibling(
         None => match branch_has_conflict(jj, store, branch) {
             Ok(true) => report.conflicted.push(branch.to_string()),
             Ok(false) => {
-                if push_clean {
-                    if let Err(e) = publish_reconciled_bookmark(jj, store, branch) {
+                if publication.clean {
+                    if let Err(e) = publish_reconciled_bookmark(
+                        jj,
+                        store,
+                        branch,
+                        discover_origin_presence(jj, store),
+                    ) {
                         log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
                         record_failure(report, branch, ws_path, e);
                         return;
@@ -562,8 +605,13 @@ fn classify_reconciled_sibling(
             }
         },
         Some(FlattenState::Clean) => {
-            if push_clean {
-                if let Err(e) = publish_reconciled_bookmark(jj, store, branch) {
+            if publication.clean {
+                if let Err(e) = publish_reconciled_bookmark(
+                    jj,
+                    store,
+                    branch,
+                    discover_origin_presence(jj, store),
+                ) {
                     log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
                     record_failure(report, branch, ws_path, e);
                     return;
@@ -605,10 +653,17 @@ fn classify_reconciled_sibling(
                     }
                     // The flatten rewrote the commit id, so the PR head must move
                     // even when a plain clean rebase would have been skipped.
-                    if let Err(e) = publish_reconciled_bookmark(jj, store, branch) {
-                        log::warn!("jj reconcile: push flattened sibling {branch} failed: {e}");
-                        record_failure(report, branch, ws_path, e);
-                        return;
+                    if publication.flattened {
+                        if let Err(e) = publish_reconciled_bookmark(
+                            jj,
+                            store,
+                            branch,
+                            discover_origin_presence(jj, store),
+                        ) {
+                            log::warn!("jj reconcile: push flattened sibling {branch} failed: {e}");
+                            record_failure(report, branch, ws_path, e);
+                            return;
+                        }
                     }
                     log::info!(
                         "jj reconcile: flattened {branch} ({} conflicted intermediate(s) collapsed, {} twin(s) abandoned)",
@@ -631,6 +686,37 @@ fn classify_reconciled_sibling(
     }
 }
 
+/// Stable failure classification consumed by durable reconcile progress. String
+/// matching is quarantined here at the jj adapter boundary; orchestration stores
+/// only this closed vocabulary.
+pub(crate) fn reconcile_failure_is_permanent(kind: &str) -> bool {
+    matches!(
+        kind,
+        "immutable_commit" | "conflicted_bookmark" | "ambiguous_divergence" | "missing_bookmark"
+    )
+}
+
+pub(crate) fn reconcile_failure_kind(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("immutable") {
+        "immutable_commit"
+    } else if error.contains("name") && error.contains("conflicted") {
+        "conflicted_bookmark"
+    } else if error.contains("ambiguous") || error.contains("divergent") {
+        "ambiguous_divergence"
+    } else if error.contains("bookmark")
+        && (error.contains("missing") || error.contains("not found"))
+    {
+        "missing_bookmark"
+    } else if error.contains("durable base") || error.contains("persist") {
+        "persistence"
+    } else if error.contains("notify") || error.contains("message") {
+        "notification"
+    } else {
+        "transient_process"
+    }
+}
+
 /// Reconcile in-flight siblings onto the locally-advanced integration tip: the
 /// store already owns the merge (the child's commit was folded into the
 /// integration bookmark by `merge_into_bookmark`), so there is no fetch or origin
@@ -650,6 +736,25 @@ pub fn reconcile_siblings(
     store: &Path,
     integration_branch: &str,
     siblings: &[(String, PathBuf)],
+) -> Result<ReconcileReport, String> {
+    reconcile_siblings_with_publication(jj, store, integration_branch, siblings, true)
+}
+
+pub(crate) fn reconcile_siblings_without_publication(
+    jj: &JjEnv,
+    store: &Path,
+    integration_branch: &str,
+    siblings: &[(String, PathBuf)],
+) -> Result<ReconcileReport, String> {
+    reconcile_siblings_with_publication(jj, store, integration_branch, siblings, false)
+}
+
+fn reconcile_siblings_with_publication(
+    jj: &JjEnv,
+    store: &Path,
+    integration_branch: &str,
+    siblings: &[(String, PathBuf)],
+    publish: bool,
 ) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
     // Resolve the rebase dest to a concrete commit id ONCE up front: it may be a
@@ -761,7 +866,10 @@ pub fn reconcile_siblings(
             branch,
             ws_path,
             dest_commit.as_deref(),
-            push_clean,
+            ReconcilePublication {
+                clean: push_clean && publish,
+                flattened: publish,
+            },
             &mut report,
         );
         if workspace_outcome == ManagedWorkspaceReconcileOutcome::PreservedDirty
@@ -801,7 +909,7 @@ pub fn reconcile_siblings(
 /// empty/idle, so re-parenting it never conflicts in practice; the signal exists
 /// so a caller can wake a workspace that somehow lands on a conflicted `@` rather
 /// than leaving it idle there.
-pub fn advance_workspace_onto(
+pub(crate) fn advance_workspace_onto(
     jj: &JjEnv,
     store: &Path,
     ws_path: &Path,

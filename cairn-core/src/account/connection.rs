@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 pub struct AccountConnection {
     pub user_id: String,
     pub email: String,
-    pub name: String,
-    pub device_id: String,
+    pub(crate) name: String,
+    pub(crate) device_id: String,
     pub plan: String, // "team" | "free"
     pub org_memberships: Vec<OrgMembership>,
-    pub connected_at: i64,
+    pub(crate) connected_at: i64,
 }
 
 /// An organization the user belongs to.
@@ -32,8 +32,8 @@ pub struct OrgMembership {
     #[serde(alias = "org_id")]
     pub org_id: String,
     #[serde(alias = "org_name")]
-    pub org_name: String,
-    pub role: String,
+    pub(crate) org_name: String,
+    pub(crate) role: String,
 }
 
 #[derive(Debug, Clone)]

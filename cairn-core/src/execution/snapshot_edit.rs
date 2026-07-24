@@ -63,6 +63,7 @@ pub async fn update_execution_agent(
                 hooks: None,
                 backend_preference: agent_snapshot.backend_preference.clone(),
                 icon: None,
+                bundles: Vec::new(),
                 is_project_scoped: project_path.is_some(),
                 file_path: PathBuf::new(),
             },

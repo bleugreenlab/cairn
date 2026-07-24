@@ -15,8 +15,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Choice {
-    pub value: String,
-    pub label: String,
+    pub(crate) value: String,
+    label: String,
 }
 
 /// The control type for a provider option, driving how the settings UI renders
@@ -42,14 +42,14 @@ pub enum OptionControl {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderOption {
-    pub key: String,
-    pub label: String,
-    pub control: OptionControl,
+    pub(crate) key: String,
+    label: String,
+    pub(crate) control: OptionControl,
 }
 
 impl ProviderOption {
     /// A single-choice dropdown option.
-    pub fn select(key: &str, label: &str, choices: &[(&str, &str)], default: &str) -> Self {
+    pub(crate) fn select(key: &str, label: &str, choices: &[(&str, &str)], default: &str) -> Self {
         ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
@@ -67,7 +67,7 @@ impl ProviderOption {
     }
 
     /// A bounded numeric option.
-    pub fn number(key: &str, label: &str, min: f64, max: f64, default: f64) -> Self {
+    pub(crate) fn number(key: &str, label: &str, min: f64, max: f64, default: f64) -> Self {
         ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
@@ -76,7 +76,7 @@ impl ProviderOption {
     }
 
     /// A boolean toggle option.
-    pub fn bool(key: &str, label: &str, default: bool) -> Self {
+    pub(crate) fn bool(key: &str, label: &str, default: bool) -> Self {
         ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
@@ -89,7 +89,7 @@ impl ProviderOption {
 /// type/range/choice mismatches are rejected so only well-formed options reach
 /// `settings.yaml`. `context` names the service in error messages (e.g.
 /// "Jina web fetch").
-pub fn validate_options(
+pub(crate) fn validate_options(
     descriptors: &[ProviderOption],
     options: &HashMap<String, serde_yaml::Value>,
     context: &str,

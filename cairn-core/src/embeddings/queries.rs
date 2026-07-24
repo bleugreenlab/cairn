@@ -7,8 +7,6 @@
 //!   transient — computed by the async worker, used to assign a color, discarded.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::sync::Arc;
 
 use crate::config::slugify_resource_segment;
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -38,24 +36,6 @@ pub struct EventVibeRecord {
 
 // ===== resource_embeddings =====
 
-/// Insert or replace the embedding for a corpus resource (sync wrapper).
-pub fn upsert_resource_embedding(
-    db: Arc<LocalDb>,
-    uri: &str,
-    embedding_bytes: &[u8],
-    model: &str,
-    dims: i32,
-) -> Result<(), String> {
-    let uri = uri.to_string();
-    let embedding_bytes = embedding_bytes.to_vec();
-    let model = model.to_string();
-    block_on_embedding_db(async move {
-        upsert_resource_embedding_async(&db, &uri, &embedding_bytes, &model, dims)
-            .await
-            .map_err(|e| format!("Failed to upsert resource embedding: {}", e))
-    })
-}
-
 pub async fn upsert_resource_embedding_async(
     db: &LocalDb,
     uri: &str,
@@ -74,7 +54,29 @@ pub async fn upsert_resource_embedding_async(
     .await
 }
 
-pub async fn upsert_resource_embedding_conn(
+/// Get persisted vibe records for an ordered session rotation lineage.
+///
+/// The caller supplies lineage ids from oldest to newest. Each parameterized
+/// query is bounded to one session, and concatenating its event-ordered rows
+/// preserves deterministic lineage event order without loading transient
+/// semantic vectors or broadening the single-session query's contract.
+pub async fn get_event_vibes_for_session_lineage_async(
+    db: &LocalDb,
+    session_ids: &[String],
+) -> DbResult<Vec<EventVibeRecord>> {
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut vibes = Vec::new();
+    for session_id in session_ids {
+        let mut session_vibes = get_event_vibes_for_session_async(db, session_id).await?;
+        vibes.append(&mut session_vibes);
+    }
+    Ok(vibes)
+}
+
+async fn upsert_resource_embedding_conn(
     conn: &Connection,
     uri: &str,
     embedding_bytes: &[u8],
@@ -130,35 +132,6 @@ pub async fn count_resource_embeddings_async(db: &LocalDb) -> DbResult<i64> {
 
 // ===== event_vibes =====
 
-/// Insert or replace the persisted vibe color for an event (sync wrapper).
-pub fn upsert_event_vibe(
-    db: Arc<LocalDb>,
-    event_id: &str,
-    session_id: Option<&str>,
-    css_color: &str,
-    phase: f32,
-    friction: f32,
-    model: &str,
-) -> Result<(), String> {
-    let event_id = event_id.to_string();
-    let session_id = session_id.map(ToString::to_string);
-    let css_color = css_color.to_string();
-    let model = model.to_string();
-    block_on_embedding_db(async move {
-        upsert_event_vibe_async(
-            &db,
-            &event_id,
-            session_id.as_deref(),
-            &css_color,
-            phase,
-            friction,
-            &model,
-        )
-        .await
-        .map_err(|e| format!("Failed to upsert event vibe: {}", e))
-    })
-}
-
 pub async fn upsert_event_vibe_async(
     db: &LocalDb,
     event_id: &str,
@@ -189,7 +162,7 @@ pub async fn upsert_event_vibe_async(
     .await
 }
 
-pub async fn upsert_event_vibe_conn(
+async fn upsert_event_vibe_conn(
     conn: &Connection,
     event_id: &str,
     session_id: Option<&str>,
@@ -218,7 +191,10 @@ pub async fn upsert_event_vibe_conn(
     Ok(())
 }
 
-pub async fn issue_id_for_event_async(db: &LocalDb, event_id: &str) -> DbResult<Option<String>> {
+pub(crate) async fn issue_id_for_event_async(
+    db: &LocalDb,
+    event_id: &str,
+) -> DbResult<Option<String>> {
     let event_id = event_id.to_string();
     db.query_opt_text(
         "SELECT r.issue_id
@@ -229,32 +205,6 @@ pub async fn issue_id_for_event_async(db: &LocalDb, event_id: &str) -> DbResult<
         params![event_id.as_str()],
     )
     .await
-}
-
-/// Get persisted vibe records for a session, ordered by event creation order.
-pub fn get_event_vibes_for_session(
-    db: Arc<LocalDb>,
-    session_id: &str,
-) -> Result<Vec<EventVibeRecord>, String> {
-    let session_id = session_id.to_string();
-    block_on_embedding_db(async move {
-        get_event_vibes_for_session_async(&db, &session_id)
-            .await
-            .map_err(|e| format!("Failed to get session vibes: {}", e))
-    })
-}
-
-/// Get persisted vibe records for a bounded set of event IDs.
-pub fn get_event_vibes_for_events(
-    db: Arc<LocalDb>,
-    event_ids: &[String],
-) -> Result<Vec<EventVibeRecord>, String> {
-    let event_ids = event_ids.to_vec();
-    block_on_embedding_db(async move {
-        get_event_vibes_for_events_async(&db, &event_ids)
-            .await
-            .map_err(|e| format!("Failed to get event vibes: {}", e))
-    })
 }
 
 pub async fn get_event_vibes_for_session_async(
@@ -330,7 +280,7 @@ pub async fn get_event_vibes_for_events_async(
 /// Persist a session's live position vector (little-endian f32 bytes).
 /// A no-op UPDATE (session row absent) is harmless — the position is
 /// best-effort continuity state.
-pub async fn set_session_current_pos_async(
+pub(crate) async fn set_session_current_pos_async(
     db: &LocalDb,
     session_id: &str,
     bytes: &[u8],
@@ -344,7 +294,7 @@ pub async fn set_session_current_pos_async(
 }
 
 /// Read a session's persisted live position vector, if any.
-pub async fn get_session_current_pos_async(
+pub(crate) async fn get_session_current_pos_async(
     db: &LocalDb,
     session_id: &str,
 ) -> DbResult<Option<Vec<u8>>> {
@@ -363,7 +313,7 @@ pub async fn get_session_current_pos_async(
 /// Job sessions resolve to `cairn://p/PROJECT/NUMBER/EXEC/NODE`. Returns `None`
 /// when the session is unknown or its components can't be assembled (the live
 /// position still works without an owner URI — only the summary is skipped).
-pub async fn resolve_session_owner_uri_async(
+pub(crate) async fn resolve_session_owner_uri_async(
     db: &LocalDb,
     session_id: &str,
 ) -> DbResult<Option<String>> {
@@ -428,30 +378,6 @@ fn event_vibe_from_row(row: &Row) -> DbResult<EventVibeRecord> {
         model: row.text(4)?,
         created_at: row.i64(5)?,
     })
-}
-
-fn block_on_embedding_db<T, Fut>(future: Fut) -> Result<T, String>
-where
-    T: Send + 'static,
-    Fut: Future<Output = Result<T, String>> + Send + 'static,
-{
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_embedding_db_future(future))
-            .join()
-            .map_err(|_| "Embedding database task panicked".to_string())?
-    } else {
-        run_embedding_db_future(future)
-    }
-}
-
-fn run_embedding_db_future<T>(
-    future: impl Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Failed to create embedding database runtime: {error}"))?
-        .block_on(future)
 }
 
 #[cfg(test)]

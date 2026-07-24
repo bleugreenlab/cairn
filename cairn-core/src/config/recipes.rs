@@ -18,6 +18,8 @@ pub struct FileRecipe {
     /// The loaded recipe in internal format
     #[serde(flatten)]
     pub recipe: Recipe,
+    #[serde(default)]
+    pub bundles: Vec<String>,
     /// Whether this recipe is project-scoped (vs workspace-scoped)
     pub is_project_scoped: bool,
     /// Path to the source file
@@ -115,7 +117,8 @@ pub fn save_recipe(
     };
 
     // Convert to RecipeFile for serialization
-    let recipe_file: RecipeFile = file_recipe.recipe.clone().into();
+    let mut recipe_file: RecipeFile = file_recipe.recipe.clone().into();
+    recipe_file.bundles = file_recipe.bundles.clone();
     let yaml = recipe_file.to_yaml()?;
 
     // Write file
@@ -182,7 +185,15 @@ fn load_recipe_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileRe
     };
 
     match RecipeFile::from_yaml(&content) {
-        Ok(recipe_file) => {
+        Ok(mut recipe_file) => {
+            if let Err(error) =
+                super::contextual_packages::normalize_bundles(&mut recipe_file.bundles)
+            {
+                return ConfigResult::Err {
+                    path: path.to_path_buf(),
+                    error,
+                };
+            }
             // Validate the recipe
             let validation = recipe_file.validate();
             if !validation.valid {
@@ -193,12 +204,14 @@ fn load_recipe_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileRe
             }
 
             // Convert to internal Recipe format
+            let bundles = recipe_file.bundles.clone();
             let mut recipe = recipe_file.into_recipe(None, None);
             // Override the generated ID with the filename-based ID
             recipe.id = id;
 
             ConfigResult::Ok(FileRecipe {
                 recipe,
+                bundles,
                 is_project_scoped,
                 file_path: path.to_path_buf(),
             })
@@ -298,6 +311,7 @@ edges: []
         let recipe = minimal_recipe("custom-id", "My Fancy Recipe Name");
         let file_recipe = FileRecipe {
             recipe,
+            bundles: Vec::new(),
             is_project_scoped: false,
             file_path: PathBuf::new(), // empty → should derive from id
         };
@@ -327,6 +341,7 @@ edges: []
         let recipe = minimal_recipe("some-id", "Some Recipe");
         let file_recipe = FileRecipe {
             recipe,
+            bundles: Vec::new(),
             is_project_scoped: false,
             file_path: explicit_path.clone(),
         };
@@ -351,6 +366,7 @@ edges: []
 
         let file_recipe = FileRecipe {
             recipe,
+            bundles: Vec::new(),
             is_project_scoped: true,
             file_path: PathBuf::new(),
         };
@@ -383,6 +399,7 @@ edges: []
         let ws_recipe = minimal_recipe("shared", "Workspace Version");
         let ws_file = FileRecipe {
             recipe: ws_recipe,
+            bundles: Vec::new(),
             is_project_scoped: false,
             file_path: PathBuf::new(),
         };
@@ -394,6 +411,7 @@ edges: []
         proj_recipe.project_id = Some("p1".to_string());
         let proj_file = FileRecipe {
             recipe: proj_recipe,
+            bundles: Vec::new(),
             is_project_scoped: true,
             file_path: PathBuf::new(),
         };

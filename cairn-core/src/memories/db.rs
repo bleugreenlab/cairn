@@ -128,7 +128,7 @@ pub async fn pending_memories_for_scope(
     .await
 }
 
-pub async fn count_pending_memories_for_scope(
+pub(crate) async fn count_pending_memories_for_scope(
     db: &LocalDb,
     scope: &str,
     scope_value: &str,
@@ -143,7 +143,7 @@ pub async fn count_pending_memories_for_scope(
     .await
 }
 
-pub async fn claim_pending_memories_for_scope(
+pub(crate) async fn claim_pending_memories_for_scope(
     db: &LocalDb,
     scope: &str,
     scope_value: &str,
@@ -193,7 +193,11 @@ pub async fn claim_pending_memories_for_scope(
     .await
 }
 
-pub async fn set_memories_status(db: &LocalDb, ids: &[String], status: &str) -> DbResult<()> {
+pub(crate) async fn set_memories_status(
+    db: &LocalDb,
+    ids: &[String],
+    status: &str,
+) -> DbResult<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -231,7 +235,7 @@ pub async fn load_draft_memories_for_job(db: &LocalDb, job_id: &str) -> DbResult
     .await
 }
 
-pub async fn load_memories_for_job(db: &LocalDb, job_id: &str) -> DbResult<Vec<Memory>> {
+pub(crate) async fn load_memories_for_job(db: &LocalDb, job_id: &str) -> DbResult<Vec<Memory>> {
     let job_id = job_id.to_string();
     db.query_all(
         format!(
@@ -260,7 +264,7 @@ pub async fn next_node_memory_seq(db: &LocalDb, job_id: &str) -> DbResult<i64> {
 /// This is the correct value for a `role`-scoped memory's `scope_value`: the
 /// recipe node name (e.g. `agent-1`) is a layout label, while the role
 /// (e.g. `builder`) is what canon promotion and the role memory pool key on.
-pub async fn role_for_job(db: &LocalDb, job_id: &str) -> DbResult<Option<String>> {
+pub(crate) async fn role_for_job(db: &LocalDb, job_id: &str) -> DbResult<Option<String>> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();
@@ -330,7 +334,7 @@ pub async fn confirm_draft_memories_for_job(db: &LocalDb, job_id: &str) -> DbRes
     .await
 }
 
-pub async fn record_triage_issue_batch(
+pub(crate) async fn record_triage_issue_batch(
     db: &LocalDb,
     issue_id: &str,
     memory_ids: &[String],
@@ -358,7 +362,7 @@ pub async fn record_triage_issue_batch(
     .await
 }
 
-pub async fn triage_batch_memories_for_issue(
+pub(crate) async fn triage_batch_memories_for_issue(
     db: &LocalDb,
     issue_id: &str,
 ) -> DbResult<Vec<Memory>> {
@@ -376,7 +380,7 @@ pub async fn triage_batch_memories_for_issue(
     .await
 }
 
-pub async fn record_triage_decision(
+pub(crate) async fn record_triage_decision(
     db: &LocalDb,
     id: &str,
     decision: MemoryTriageDecision,
@@ -418,7 +422,7 @@ pub async fn record_triage_decision(
     .await
 }
 
-pub async fn clear_triage_decisions(db: &LocalDb, ids: &[String]) -> DbResult<()> {
+pub(crate) async fn clear_triage_decisions(db: &LocalDb, ids: &[String]) -> DbResult<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -443,7 +447,7 @@ pub async fn clear_triage_decisions(db: &LocalDb, ids: &[String]) -> DbResult<()
     .await
 }
 
-pub async fn set_memories_promoted_commit_sha(
+pub(crate) async fn set_memories_promoted_commit_sha(
     db: &LocalDb,
     ids: &[String],
     sha: &str,
@@ -471,7 +475,10 @@ pub async fn set_memories_promoted_commit_sha(
     .await
 }
 
-pub async fn resolve_triage_batch_on_merge(db: &LocalDb, issue_id: &str) -> DbResult<Vec<String>> {
+pub(crate) async fn resolve_triage_batch_on_merge(
+    db: &LocalDb,
+    issue_id: &str,
+) -> DbResult<Vec<String>> {
     let memories = triage_batch_memories_for_issue(db, issue_id).await?;
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
@@ -540,7 +547,10 @@ pub async fn resolve_triage_batch_on_merge(db: &LocalDb, issue_id: &str) -> DbRe
     .await
 }
 
-pub async fn draft_memory_job_ids_for_issue(db: &LocalDb, issue_id: &str) -> DbResult<Vec<String>> {
+pub(crate) async fn draft_memory_job_ids_for_issue(
+    db: &LocalDb,
+    issue_id: &str,
+) -> DbResult<Vec<String>> {
     let issue_id = issue_id.to_string();
     db.query_all(
         "SELECT DISTINCT m.job_id
@@ -554,7 +564,7 @@ pub async fn draft_memory_job_ids_for_issue(db: &LocalDb, issue_id: &str) -> DbR
     .await
 }
 
-pub async fn discard_draft_memories_for_closed_issue(
+pub(crate) async fn discard_draft_memories_for_closed_issue(
     db: &LocalDb,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
@@ -594,7 +604,9 @@ pub async fn discard_draft_memories_for_closed_issue(
     .await
 }
 
-pub async fn discard_draft_memories_for_closed_issues(db: &LocalDb) -> DbResult<Vec<String>> {
+pub(crate) async fn discard_draft_memories_for_closed_issues(
+    db: &LocalDb,
+) -> DbResult<Vec<String>> {
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
         Box::pin(async move {
@@ -630,7 +642,10 @@ pub async fn discard_draft_memories_for_closed_issues(db: &LocalDb) -> DbResult<
     .await
 }
 
-pub async fn revert_triage_batch_on_close(db: &LocalDb, issue_id: &str) -> DbResult<Vec<String>> {
+pub(crate) async fn revert_triage_batch_on_close(
+    db: &LocalDb,
+    issue_id: &str,
+) -> DbResult<Vec<String>> {
     let memories = triage_batch_memories_for_issue(db, issue_id).await?;
     let ids: Vec<String> = memories.into_iter().map(|memory| memory.id).collect();
     if ids.is_empty() {
@@ -661,7 +676,7 @@ pub async fn revert_triage_batch_on_close(db: &LocalDb, issue_id: &str) -> DbRes
 /// Distinct `(scope, scope_value)` pools among `pending` memories. Drives the
 /// reconciliation sweep's scope discovery directly from DB state rather than
 /// from a caller-supplied confirmed list.
-pub async fn distinct_pending_scopes(db: &LocalDb) -> DbResult<Vec<(String, String)>> {
+pub(crate) async fn distinct_pending_scopes(db: &LocalDb) -> DbResult<Vec<(String, String)>> {
     db.query_all(
         "SELECT DISTINCT scope, scope_value FROM memories WHERE status = 'pending' \
          ORDER BY scope ASC, scope_value ASC",
@@ -674,7 +689,7 @@ pub async fn distinct_pending_scopes(db: &LocalDb) -> DbResult<Vec<(String, Stri
 /// Terminal jobs (`complete`/`failed`) that still carry `draft` memories, paired
 /// with each job's `memory_review_state`. The caller excludes jobs whose review
 /// is still in flight before confirming the surviving drafts.
-pub async fn terminal_jobs_with_draft_memories(
+pub(crate) async fn terminal_jobs_with_draft_memories(
     db: &LocalDb,
 ) -> DbResult<Vec<(String, Option<String>)>> {
     db.query_all(
@@ -689,11 +704,30 @@ pub async fn terminal_jobs_with_draft_memories(
     .await
 }
 
+/// Count open memory-triage issues that own a batch for this exact scope.
+/// Open issues are not merged, closed, or failed.
+pub(crate) async fn count_open_triage_issues_for_scope(
+    db: &LocalDb,
+    scope: &str,
+    scope_value: &str,
+) -> DbResult<i64> {
+    db.query_one(
+        "SELECT COUNT(DISTINCT i.id) FROM issues i \
+         JOIN memory_triage_issue_memories tm ON tm.issue_id = i.id \
+         JOIN memories m ON m.id = tm.memory_id \
+         WHERE m.scope = ?1 AND m.scope_value = ?2 \
+           AND i.merged_at IS NULL AND i.closed_at IS NULL AND i.status != 'failed'",
+        params![scope, scope_value],
+        |row| row.i64(0),
+    )
+    .await
+}
+
 /// Revert to `pending` every `claimed` memory with no row in
 /// `memory_triage_issue_memories` — claimed but never linked to a triage issue
 /// (the clean "no issue to begin with" signal, since the link is only written
 /// after the triage issue is successfully created). Returns the reverted ids.
-pub async fn revert_orphaned_claimed_memories(db: &LocalDb) -> DbResult<Vec<String>> {
+pub(crate) async fn revert_orphaned_claimed_memories(db: &LocalDb) -> DbResult<Vec<String>> {
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
         Box::pin(async move {
@@ -734,7 +768,7 @@ pub async fn revert_orphaned_claimed_memories(db: &LocalDb) -> DbResult<Vec<Stri
 /// Revert those still-`claimed` memories to `pending`, clearing any decision
 /// recorded before the failure, so the batch re-enters its pool. Returns the
 /// reverted ids.
-pub async fn revert_claimed_for_failed_triage_issues(db: &LocalDb) -> DbResult<Vec<String>> {
+pub(crate) async fn revert_claimed_for_failed_triage_issues(db: &LocalDb) -> DbResult<Vec<String>> {
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
         Box::pin(async move {
@@ -775,7 +809,9 @@ pub async fn revert_claimed_for_failed_triage_issues(db: &LocalDb) -> DbResult<V
 /// batches whose merge never applied the recorded triage decisions (e.g. the
 /// merge path bypassed the canon gate, or the resolve hook errored). The
 /// reconcile sweep finalizes each by calling `resolve_triage_batch_on_merge`.
-pub async fn merged_triage_issues_with_claimed_memories(db: &LocalDb) -> DbResult<Vec<String>> {
+pub(crate) async fn merged_triage_issues_with_claimed_memories(
+    db: &LocalDb,
+) -> DbResult<Vec<String>> {
     db.read(|conn| {
         Box::pin(async move {
             let mut rows = conn
@@ -802,7 +838,7 @@ pub async fn merged_triage_issues_with_claimed_memories(db: &LocalDb) -> DbResul
 pub struct MemoryTriageNeighbor {
     pub memory: Memory,
     pub uri: String,
-    pub similarity: f32,
+    pub(crate) similarity: f32,
     pub triage_issue_uri: Option<String>,
 }
 
@@ -960,7 +996,7 @@ async fn triage_issue_uri_for_memory(db: &LocalDb, memory_id: &str) -> DbResult<
     .map(Option::flatten)
 }
 
-pub async fn project_key_by_id(db: &LocalDb, project_id: &str) -> DbResult<String> {
+pub(crate) async fn project_key_by_id(db: &LocalDb, project_id: &str) -> DbResult<String> {
     let project_id = project_id.to_string();
     db.query_one(
         "SELECT key FROM projects \
@@ -972,7 +1008,7 @@ pub async fn project_key_by_id(db: &LocalDb, project_id: &str) -> DbResult<Strin
     .await
 }
 
-pub async fn project_name_by_id(db: &LocalDb, project_id: &str) -> DbResult<String> {
+pub(crate) async fn project_name_by_id(db: &LocalDb, project_id: &str) -> DbResult<String> {
     let project_id = project_id.to_string();
     db.query_one(
         "SELECT name FROM projects \
@@ -984,7 +1020,7 @@ pub async fn project_name_by_id(db: &LocalDb, project_id: &str) -> DbResult<Stri
     .await
 }
 
-pub async fn backfill_workspace_project_id(db: &LocalDb) -> DbResult<u64> {
+pub(crate) async fn backfill_workspace_project_id(db: &LocalDb) -> DbResult<u64> {
     db.execute(
         "UPDATE memories SET project_id = 'workspace' WHERE project_id IS NULL",
         (),

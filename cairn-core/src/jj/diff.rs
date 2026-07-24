@@ -11,24 +11,45 @@ use std::path::Path;
 /// the decoupled async cache insert could lag or drop it (CAIRN-2101).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphFileChange {
-    pub path: String,
-    pub previous_path: Option<String>,
+    pub(crate) path: String,
+    pub(crate) previous_path: Option<String>,
     /// `added` | `modified` | `deleted` | `renamed` — the same vocabulary the
     /// `file_changes` cache records, so the rendered table reads identically
     /// whichever source produced it.
-    pub status: String,
-    pub additions: i32,
-    pub deletions: i32,
+    pub(crate) status: String,
+    pub(crate) additions: i32,
+    pub(crate) deletions: i32,
+}
+
+/// Changed files between two immutable logical coordinates. Unlike
+/// [`node_changed_files`], this never consults the workspace `@` commit.
+pub(crate) fn logical_changed_files(
+    jj: &JjEnv,
+    repository: &Path,
+    base: &str,
+    head: &str,
+) -> Option<Vec<GraphFileChange>> {
+    if !is_jj_dir(repository) {
+        return None;
+    }
+    let revset = format!("{base}..{head}");
+    jj.run(
+        repository,
+        &["diff", "--ignore-working-copy", "--git", "-r", &revset],
+        "jj diff --git (logical range)",
+    )
+    .ok()
+    .map(|patch| parse_git_diff(&patch))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCommit {
-    pub commit_id: String,
-    pub change_id: String,
-    pub description: String,
-    pub author: String,
-    pub timestamp: String,
-    pub working_copy: bool,
+    pub(crate) commit_id: String,
+    pub(crate) change_id: String,
+    pub(crate) description: String,
+    pub(crate) author: String,
+    pub(crate) timestamp: String,
+    pub(crate) working_copy: bool,
 }
 
 /// Cumulative changed files of a workspace against its recorded base, read from
@@ -54,7 +75,7 @@ pub struct RangeCommit {
 /// Returns `None` when `ws` is not a jj workspace or neither base anchor
 /// resolves, so the caller falls back to the recorded cache (e.g. a torn-down
 /// workspace whose only surviving record is the DB).
-pub fn node_changed_files(
+pub(crate) fn node_changed_files(
     jj: &JjEnv,
     ws: &Path,
     base_branch: Option<&str>,
@@ -67,7 +88,7 @@ pub fn node_changed_files(
 }
 
 /// Git-format cumulative patch for the node's effective `fork..@` range.
-pub fn node_range_patch(
+pub(crate) fn node_range_patch(
     jj: &JjEnv,
     ws: &Path,
     base_branch: Option<&str>,
@@ -89,7 +110,7 @@ pub fn node_range_patch(
 const RANGE_COMMIT_TEMPLATE: &str = "commit_id.short() ++ \"\\x1f\" ++ change_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\x1f\" ++ author.name() ++ \" <\" ++ author.email() ++ \">\" ++ \"\\x1f\" ++ author.timestamp() ++ \"\\x1f\" ++ if(empty, \"1\", \"0\") ++ \"\\n\"";
 
 /// Commits in `fork..@`, including a non-empty working-copy commit.
-pub fn range_commits(jj: &JjEnv, ws: &Path, fork: &str) -> Result<Vec<RangeCommit>, String> {
+pub(crate) fn range_commits(jj: &JjEnv, ws: &Path, fork: &str) -> Result<Vec<RangeCommit>, String> {
     let working_copy_id = jj
         .run(
             ws,
@@ -162,7 +183,7 @@ fn parse_range_commits(output: &str, working_copy_id: &str) -> Vec<RangeCommit> 
 /// cache or anchor fallback rather than diffing against an empty revset, which
 /// would dump the workspace's entire history. Lock-free via
 /// `--ignore-working-copy`.
-pub fn resolve_node_fork_point(
+pub(crate) fn resolve_node_fork_point(
     jj: &JjEnv,
     ws: &Path,
     base_branch: Option<&str>,
@@ -300,7 +321,7 @@ pub(crate) fn parse_git_diff(diff: &str) -> Vec<GraphFileChange> {
 /// (the run-path commit barrier) record a just-sealed commit's file changes from
 /// the working-copy patch captured before the seal, feeding the same
 /// `file_changes` cache the write path records into.
-pub fn parse_git_patch(diff: &str) -> Vec<GraphFileChange> {
+pub(crate) fn parse_git_patch(diff: &str) -> Vec<GraphFileChange> {
     parse_git_diff(diff)
 }
 

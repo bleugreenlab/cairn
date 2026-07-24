@@ -21,7 +21,7 @@ pub(super) struct EventRow {
 }
 
 impl EventRow {
-    pub(super) fn to_transcript_row(&self) -> crate::transcripts::TranscriptRow {
+    fn to_transcript_row(&self) -> crate::transcripts::TranscriptRow {
         (
             self.run_id.clone(),
             self.sequence,
@@ -1445,7 +1445,7 @@ pub(super) struct DigestOptions {
 /// assert the no-fidelity-flags output is byte-identical. Production reads call
 /// [`format_transcript_digest_with`] directly with parsed options.
 #[cfg(test)]
-pub(super) fn format_transcript_digest(
+fn format_transcript_digest(
     events: &[EventRow],
     base_uri: &str,
     meta: &DigestMeta,

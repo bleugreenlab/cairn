@@ -144,7 +144,7 @@ pub(crate) async fn bmd_fetch(orch: &Orchestrator, source: &str) -> Result<Strin
 
 /// The gateway call for bmd's `fetch` tool, split out so it is unit-testable
 /// against a mock gateway.
-pub(crate) async fn bmd_fetch_via(
+async fn bmd_fetch_via(
     gateway: &dyn McpGateway,
     config: &McpServerConfig,
     credential_key: &str,
@@ -186,10 +186,7 @@ fn missing_key_message(id: FetchProviderId) -> String {
 
 /// Read a reqwest response into markdown: non-2xx becomes a guidance error,
 /// `text/html` is converted, everything else passes through.
-pub(crate) async fn read_markdown_response(
-    resp: reqwest::Response,
-    what: &str,
-) -> Result<String, String> {
+async fn read_markdown_response(resp: reqwest::Response, what: &str) -> Result<String, String> {
     let status = resp.status();
     let content_type = resp
         .headers()

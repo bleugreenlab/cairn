@@ -398,8 +398,10 @@ pub async fn push_with_fingerprint(
 }
 
 /// The `fingerprint` of the most recent push (delivered OR undelivered) for
-/// `(recipient, key)`, newest by `created_at`. Outer `None` = no such push
-/// exists; `Some(None)` = a push with a NULL fingerprint. Content-state creators
+/// `(recipient, key)`, newest by insertion order. `created_at` is only second
+/// precision, so SQLite's monotonic rowid is the deterministic tie-breaker rather
+/// than the random UUID primary key. Outer `None` = no such push exists;
+/// `Some(None)` = a push with a NULL fingerprint. Content-state creators
 /// use this to skip re-firing unchanged review and terminal-resolution pushes,
 /// including after the prior row has already been delivered.
 pub async fn latest_push_fingerprint(
@@ -417,7 +419,7 @@ pub async fn latest_push_fingerprint(
                 .query(
                     "SELECT fingerprint FROM attention_pushes
                      WHERE recipient=?1 AND key=?2
-                     ORDER BY created_at DESC, id DESC
+                     ORDER BY created_at DESC, rowid DESC
                      LIMIT 1",
                     params![recipient.as_str(), key.as_str()],
                 )
@@ -1312,6 +1314,31 @@ mod tests {
                 .await
                 .unwrap(),
             Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_fingerprint_uses_insertion_order_for_same_second_delivered_states() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "
+            INSERT INTO attention_pushes
+              (id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id, fingerprint)
+            VALUES
+              ('z-old-random-order', 'watcher', 'ref', 'wake', 'event', 'turn-checks:k', 42, 'event-a', 'red-a'),
+              ('m-middle-random-order', 'watcher', 'ref', 'passive', 'event', 'turn-checks:k', 42, 'event-green', 'green'),
+              ('a-new-random-order', 'watcher', 'ref', 'wake', 'event', 'turn-checks:k', 42, 'event-b', 'red-b');
+            ",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            latest_push_fingerprint(&db, "watcher", "turn-checks:k")
+                .await
+                .unwrap(),
+            Some(Some("red-b".to_string()))
         );
     }
 

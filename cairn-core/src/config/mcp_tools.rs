@@ -130,7 +130,7 @@ pub fn remove_server(config_dir: &Path, scope: ToolScope<'_>, server: &str) -> R
 /// [`crate::config::mcp_servers::resolve_mcp_servers`]: workspace tools overlaid
 /// by the project's, with the project entry winning on a name collision. The
 /// prompt builder passes the result straight to the affordance renderer.
-pub fn resolve_tools(
+pub(crate) fn resolve_tools(
     config_dir: &Path,
     project_path: Option<&Path>,
 ) -> HashMap<String, Vec<McpToolDef>> {

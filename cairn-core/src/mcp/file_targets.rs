@@ -3,7 +3,7 @@
 use std::path::{Component, Path, PathBuf};
 
 /// The `file:` URI scheme prefix for worktree and global filesystem targets.
-pub const FILE_URI_SCHEME: &str = "file:";
+const FILE_URI_SCHEME: &str = "file:";
 
 /// Cap on "did you mean" path suggestions surfaced for a missing `file:` target.
 const MAX_PATH_SUGGESTIONS: usize = 5;
@@ -17,9 +17,9 @@ const SUGGEST_WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFileTarget {
-    pub uri: String,
-    pub relative_path: String,
-    pub full_path: PathBuf,
+    uri: String,
+    pub(crate) relative_path: String,
+    pub(crate) full_path: PathBuf,
 }
 
 /// Classification of a `file:` target under shell-style path rules.
@@ -198,7 +198,7 @@ fn resolve_file_target_internal(
 /// handlers use, so heavy build dirs (`target/`, `node_modules/`) are skipped.
 /// Returns empty on any error, when the basename can't be determined, or when
 /// nothing matches.
-pub fn suggest_similar_paths(worktree_path: &Path, missing_uri: &str) -> Vec<String> {
+fn suggest_similar_paths(worktree_path: &Path, missing_uri: &str) -> Vec<String> {
     let entered = missing_uri
         .strip_prefix(FILE_URI_SCHEME)
         .unwrap_or(missing_uri);
@@ -258,7 +258,7 @@ pub fn suggest_similar_paths(worktree_path: &Path, missing_uri: &str) -> Vec<Str
 /// Format a "Did you mean:" block (leading newline included) for a missing
 /// `file:` target, or an empty string when there are no close matches. Callers
 /// append it directly to a "does not exist" error message.
-pub fn did_you_mean_block(worktree_path: &Path, missing_uri: &str) -> String {
+pub(crate) fn did_you_mean_block(worktree_path: &Path, missing_uri: &str) -> String {
     let suggestions = suggest_similar_paths(worktree_path, missing_uri);
     if suggestions.is_empty() {
         return String::new();
@@ -279,18 +279,8 @@ pub fn validate_file_path(
     resolve_file_target_internal(worktree_path, file_uri, true, false, false)
 }
 
-/// Validate that a file path stays within the worktree WITHOUT creating directories.
-///
-/// Like `validate_file_path` but non-mutating: for new files in missing directories,
-/// walks up to find the nearest existing ancestor and verifies it's inside the worktree.
-/// Used by write Phase 1 validation to avoid side effects before all changes are validated.
-pub fn validate_file_path_dry(worktree_path: &Path, file_uri: &str) -> Result<PathBuf, String> {
-    resolve_file_target_internal(worktree_path, file_uri, false, false, false)
-        .map(|target| target.full_path)
-}
-
 /// Validate file URI for read operations.
-pub fn validate_read_path(
+pub(crate) fn validate_read_path(
     worktree_path: &Path,
     file_uri: &str,
 ) -> Result<ResolvedFileTarget, String> {
@@ -303,7 +293,7 @@ pub fn validate_read_path(
 /// working tree, so the current checkout cannot be the existence oracle. This
 /// keeps the same URI normalization and absolute-path rules as `validate_read_path`
 /// while deferring existence/type checks to the requested ref.
-pub fn resolve_read_target_lenient(
+pub(crate) fn resolve_read_target_lenient(
     worktree_path: &Path,
     file_uri: &str,
 ) -> Result<ResolvedFileTarget, String> {
@@ -317,7 +307,7 @@ pub fn resolve_read_target_lenient(
 ///
 /// This is the single prefix-comparison the worktree fence uses for reads and
 /// writes, so the escape rule lives in one place.
-pub fn path_escapes_worktree(worktree_path: &Path, full_path: &Path) -> bool {
+pub(crate) fn path_escapes_worktree(worktree_path: &Path, full_path: &Path) -> bool {
     let Ok(worktree_canonical) = worktree_path.canonicalize() else {
         return false;
     };
@@ -346,14 +336,17 @@ pub use cairn_symbols::search_util::path_within_any;
 /// exist. Lets the read denylist gate run before existence validation, so a
 /// denylisted path is denied uniformly whether or not it exists (no
 /// deny-vs-"does not exist" existence enumeration).
-pub fn resolve_file_path_lenient(worktree_path: &Path, target: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_file_path_lenient(
+    worktree_path: &Path,
+    target: &str,
+) -> Result<PathBuf, String> {
     resolve_file_target_internal(worktree_path, target, false, false, true).map(|t| t.full_path)
 }
 
 /// Normalize a `file:` change target, permitting absolute paths when
 /// `allow_escape` (the worktree fence adjudicates the crossing). With
 /// `allow_escape` false this is exactly [`normalize_file_uri`] (worktree-only).
-pub fn normalize_change_target(target: &str, allow_escape: bool) -> Result<String, String> {
+pub(crate) fn normalize_change_target(target: &str, allow_escape: bool) -> Result<String, String> {
     match classify_file_target(target)? {
         FileTargetKind::Root => Ok(FILE_URI_SCHEME.to_string()),
         FileTargetKind::Relative(rel) => Ok(format!("{FILE_URI_SCHEME}{rel}")),
@@ -372,7 +365,7 @@ pub fn normalize_change_target(target: &str, allow_escape: bool) -> Result<Strin
 /// can adjudicate an out-of-worktree write instead of the resolver hard-
 /// rejecting it. Never creates directories or requires existence (the caller
 /// checks existence per mutation mode).
-pub fn resolve_change_target(
+pub(crate) fn resolve_change_target(
     worktree_path: &Path,
     file_uri: &str,
     allow_escape: bool,

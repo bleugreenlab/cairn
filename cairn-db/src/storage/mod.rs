@@ -8,6 +8,7 @@ mod search_index;
 
 pub mod content_store;
 pub mod events;
+pub mod pack_catalog;
 pub mod render;
 
 /// Normalized team identifier. Defined here (rather than reaching up into

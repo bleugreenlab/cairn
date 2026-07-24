@@ -30,6 +30,63 @@ macro_rules! shared_tail {
     };
 }
 
+macro_rules! shared_tail_jj_reconcile_quarantines {
+    () => {
+        Migration::new(
+            "0116",
+            "add_jj_reconcile_quarantines",
+            include_str!("../../../../turso_migrations/0116_add_jj_reconcile_quarantines.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_agent_waits {
+    () => {
+        Migration::new(
+            "0115",
+            "add_agent_waits",
+            include_str!("../../../../turso_migrations/0115_add_agent_waits.sql"),
+        )
+    };
+}
+
+/// Canonical, synced pack metadata and durable references. This is deliberately
+/// shared between lineages: the team replica is the authority consumed by the
+/// API-owned mark-and-sweep, while local projects retain the same data model.
+macro_rules! shared_tail_pack_catalog {
+    () => {
+        Migration::new(
+            "0112",
+            "pack_catalog",
+            include_str!("../../../../turso_migrations/0112_pack_catalog.sql"),
+        )
+    };
+}
+
+/// Terminal rows persist the lifetime lease fence and process generation used by
+/// the executor-hosted PTY transport.
+macro_rules! shared_tail_terminal_lifetime_lease {
+    () => {
+        Migration::new(
+            "0113",
+            "bind_agent_terminals_to_lifetime_leases",
+            include_str!(
+                "../../../../turso_migrations/0113_bind_agent_terminals_to_lifetime_leases.sql"
+            ),
+        )
+    };
+}
+
+macro_rules! shared_tail_jj_reconcile_intents {
+    () => {
+        Migration::new(
+            "0114",
+            "add_jj_reconcile_intents",
+            include_str!("../../../../turso_migrations/0114_add_jj_reconcile_intents.sql"),
+        )
+    };
+}
+
 /// CAIRN-2270: re-grain token_rollup from the UTC-day floor to the UTC-hour floor
 /// (the `day` column becomes `bucket_start`). token_rollup is a project-scoped
 /// SHARED table — present in both lineages, with `team_schema_matches_private`
@@ -282,6 +339,11 @@ macro_rules! team_lineage {
             shared_tail_add_turn_end_reason!(),
             shared_tail_index_hot_gui_status_queries!(),
             shared_tail_check_result_cache_provenance!(),
+            shared_tail_pack_catalog!(),
+            shared_tail_terminal_lifetime_lease!(),
+            shared_tail_jj_reconcile_intents!(),
+            shared_tail_agent_waits!(),
+            shared_tail_jj_reconcile_quarantines!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -412,6 +474,25 @@ macro_rules! private_lineage {
                 "0110",
                 "executor_enrollment_expiry",
                 include_str!("../../../../turso_migrations/0110_executor_enrollment_expiry.sql"),
+            ),
+            // Machine-local resource learning contains executor observations and
+            // must never replicate into a team database.
+            Migration::new(
+                "0111",
+                "command_resource_profiles",
+                include_str!("../../../../turso_migrations/0111_command_resource_profiles.sql"),
+            ),
+            shared_tail_pack_catalog!(),
+            shared_tail_terminal_lifetime_lease!(),
+            shared_tail_jj_reconcile_intents!(),
+            shared_tail_agent_waits!(),
+            shared_tail_jj_reconcile_quarantines!(),
+            // Workflow restart records are runner-local state, so their executor
+            // anchor migration belongs to the private lineage with workflow_run.
+            Migration::new(
+                "0117",
+                "workflow_executor_anchor",
+                include_str!("../../../../turso_migrations/0117_workflow_executor_anchor.sql"),
             ),
         ]
     };
@@ -904,6 +985,12 @@ pub const TEAM_MIGRATIONS: &[Migration] = team_lineage![
         "executor_registry",
         include_str!("../../../../turso_migrations_team/0005_executor_registry.sql"),
     ),
+    // CAIRN-2870: inventory is emergent executor health, not advertised capacity.
+    Migration::new(
+        "0006",
+        "elastic_executor_inventory",
+        include_str!("../../../../turso_migrations_team/0006_elastic_executor_inventory.sql"),
+    ),
 ];
 
 // ── Table scope: the single source of truth (CAIRN-2210) ────────────────────
@@ -1001,6 +1088,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // ── ProjectScoped: the durable shared collaboration surface ──────────────
     ("action_configs", TableScope::ProjectScoped),
     ("action_runs", TableScope::ProjectScoped),
+    ("agent_waits", TableScope::ProjectScoped),
     ("artifact_content", TableScope::ProjectScoped),
     ("artifacts", TableScope::ProjectScoped),
     ("attention_pushes", TableScope::ProjectScoped),
@@ -1023,6 +1111,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("issues", TableScope::ProjectScoped),
     ("job_browsers", TableScope::ProjectScoped),
     ("job_terminals", TableScope::ProjectScoped),
+    ("jj_reconcile_intents", TableScope::ProjectScoped),
+    ("jj_reconcile_items", TableScope::ProjectScoped),
+    ("jj_reconcile_quarantines", TableScope::ProjectScoped),
     ("jobs", TableScope::ProjectScoped),
     ("labels", TableScope::ProjectScoped),
     ("memories", TableScope::ProjectScoped),
@@ -1032,6 +1123,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("message_streams", TableScope::ProjectScoped),
     ("messages", TableScope::ProjectScoped),
     ("permission_requests", TableScope::ProjectScoped),
+    ("pack_catalog", TableScope::ProjectScoped),
+    ("pack_catalog_backfill_attempts", TableScope::ProjectScoped),
+    ("pack_catalog_references", TableScope::ProjectScoped),
     ("pr_node_port_fires", TableScope::ProjectScoped),
     ("projects", TableScope::ProjectScoped),
     ("prompts", TableScope::ProjectScoped),
@@ -1065,6 +1159,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::SharedContent {
             current: Lineage::Team,
         },
+    ),
+    // Learned command resource profiles are machine-local, safely rebuildable
+    // aggregates over executor observations.
+    (
+        "command_resource_profiles",
+        TableScope::Private(PrivateReason::RebuildableCache),
     ),
     // ── Private: identity & credentials ──────────────────────────────────────
     (
@@ -1200,6 +1300,17 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         ],
     },
     RekeyTableManifest {
+        table: "agent_waits",
+        id_columns: &[
+            "id",
+            "job_id",
+            "run_id",
+            "session_id",
+            "predecessor_turn_id",
+            "successor_turn_id",
+        ],
+    },
+    RekeyTableManifest {
         table: "artifact_content",
         id_columns: &["id", "execution_id", "job_id"],
     },
@@ -1284,6 +1395,18 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "project_id", "parent_issue_id", "parent_job_id"],
     },
     RekeyTableManifest {
+        table: "jj_reconcile_intents",
+        id_columns: &["id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "jj_reconcile_items",
+        id_columns: &["intent_id"],
+    },
+    RekeyTableManifest {
+        table: "jj_reconcile_quarantines",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
         table: "job_browsers",
         id_columns: &["id", "job_id", "project_id"],
     },
@@ -1330,6 +1453,18 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "messages",
         id_columns: &["id", "channel_id", "sender_run_id", "recipient_run_id"],
+    },
+    RekeyTableManifest {
+        table: "pack_catalog",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "pack_catalog_backfill_attempts",
+        id_columns: &["execution_id"],
+    },
+    RekeyTableManifest {
+        table: "pack_catalog_references",
+        id_columns: &["project_id", "owner_id"],
     },
     RekeyTableManifest {
         table: "permission_requests",
@@ -1570,6 +1705,13 @@ mod tests {
                 "0108_executor_enrollment".to_string(),
                 "0109_check_result_cache_provenance".to_string(),
                 "0110_executor_enrollment_expiry".to_string(),
+                "0111_command_resource_profiles".to_string(),
+                "0112_pack_catalog".to_string(),
+                "0113_bind_agent_terminals_to_lifetime_leases".to_string(),
+                "0114_add_jj_reconcile_intents".to_string(),
+                "0115_add_agent_waits".to_string(),
+                "0116_add_jj_reconcile_quarantines".to_string(),
+                "0117_workflow_executor_anchor".to_string(),
             ]
         );
         Ok(db)
@@ -2928,6 +3070,7 @@ mod tests {
                 // Non-secret fleet advertisements are team-visible; enrollment
                 // credentials and grant consumption remain private.
                 "0005_executor_registry".to_string(),
+                "0006_elastic_executor_inventory".to_string(),
                 // Shared-tail migrations land in the team lineage after the team
                 // head, preserving one shared SQL source for project-scoped tables.
                 "0084_archival_pack_hash".to_string(),
@@ -2950,6 +3093,11 @@ mod tests {
                 "0105_add_turn_end_reason".to_string(),
                 "0106_index_hot_gui_status_queries".to_string(),
                 "0109_check_result_cache_provenance".to_string(),
+                "0112_pack_catalog".to_string(),
+                "0113_bind_agent_terminals_to_lifetime_leases".to_string(),
+                "0114_add_jj_reconcile_intents".to_string(),
+                "0115_add_agent_waits".to_string(),
+                "0116_add_jj_reconcile_quarantines".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

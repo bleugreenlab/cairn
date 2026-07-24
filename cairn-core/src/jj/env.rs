@@ -17,6 +17,46 @@ const JJ_DEFAULT_USER_NAME: &str = "Cairn Agent";
 const JJ_DEFAULT_USER_EMAIL: &str = "agent@cairn.local";
 pub(crate) const JJ_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const JJ_NETWORK_TIMEOUT: Duration = Duration::from_secs(600);
+const PIPE_READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut reader: R,
+) -> (
+    std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    thread::JoinHandle<()>,
+) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = reader.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = tx.send(result);
+    });
+    (rx, handle)
+}
+
+fn finish_pipe_reader(
+    receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    handle: thread::JoinHandle<()>,
+    ctx: &str,
+    stream: &str,
+) -> Result<Vec<u8>, String> {
+    match receiver.recv_timeout(PIPE_READER_JOIN_TIMEOUT) {
+        Ok(result) => {
+            handle
+                .join()
+                .map_err(|_| format!("{ctx}: {stream} reader panicked"))?;
+            result.map_err(|error| format!("{ctx}: read {stream}: {error}"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "{ctx}: {stream} pipe remained open more than {}s after child exit; reader detached",
+            PIPE_READER_JOIN_TIMEOUT.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            Err(format!("{ctx}: {stream} reader disconnected"))
+        }
+    }
+}
 
 /// Run a subprocess with drained output pipes and a hard deadline. The child is
 /// placed in its own process group on Unix so timeout cleanup also reaches git,
@@ -43,16 +83,8 @@ pub(crate) fn bounded_command_output(
     let mut child = command.spawn().map_err(|e| format!("{ctx}: {e}"))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut reader = stdout;
-        reader.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut reader = stderr;
-        reader.read_to_end(&mut bytes).map(|_| bytes)
-    });
+    let (stdout_rx, stdout_reader) = spawn_pipe_reader(stdout);
+    let (stderr_rx, stderr_reader) = spawn_pipe_reader(stderr);
 
     let deadline = Instant::now() + timeout;
     let (status, timed_out) = loop {
@@ -70,14 +102,8 @@ pub(crate) fn bounded_command_output(
             None => thread::sleep(Duration::from_millis(50)),
         }
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| format!("{ctx}: stdout reader panicked"))?
-        .map_err(|e| format!("{ctx}: read stdout: {e}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| format!("{ctx}: stderr reader panicked"))?
-        .map_err(|e| format!("{ctx}: read stderr: {e}"))?;
+    let stdout = finish_pipe_reader(stdout_rx, stdout_reader, ctx, "stdout")?;
+    let stderr = finish_pipe_reader(stderr_rx, stderr_reader, ctx, "stderr")?;
     if timed_out {
         return Err(format!(
             "{ctx} timed out after {}s and was killed",
@@ -105,6 +131,14 @@ fn jj_subprocess_lock() -> &'static Mutex<()> {
 }
 
 impl JjEnv {
+    #[cfg(test)]
+    pub(crate) fn with_binary(bin: impl Into<String>, config_dir: &Path) -> Self {
+        Self {
+            bin: bin.into(),
+            config_path: config_dir.join("jj").join("config.toml"),
+        }
+    }
+
     /// Resolve the jj binary and the managed config path. Binary precedence:
     /// `CAIRN_JJ_BIN` (test/override) → the bundled sidecar path → PATH `jj`.
     pub fn resolve(bundled_bin: &str, config_dir: &Path) -> Self {
@@ -185,7 +219,7 @@ impl JjEnv {
     /// fallback identity, same non-interactive editor) instead of writing
     /// unpushable empty-committer commits. Ensures the managed config file exists
     /// first, mirroring `cmd`, so `JJ_CONFIG` never points at a missing file.
-    pub fn shell_env(&self) -> Vec<(String, String)> {
+    pub(crate) fn shell_env(&self) -> Vec<(String, String)> {
         self.ensure_config();
         vec![
             (
@@ -223,16 +257,11 @@ impl JjEnv {
     }
 
     /// Run a jj command, returning raw stdout bytes or a contextual error.
-    pub(crate) fn run_bytes(
-        &self,
-        cwd: &Path,
-        args: &[&str],
-        ctx: &str,
-    ) -> Result<Vec<u8>, String> {
+    fn run_bytes(&self, cwd: &Path, args: &[&str], ctx: &str) -> Result<Vec<u8>, String> {
         self.run_bytes_with_timeout(cwd, args, ctx, JJ_DEFAULT_TIMEOUT)
     }
 
-    pub(crate) fn run_bytes_with_timeout(
+    fn run_bytes_with_timeout(
         &self,
         cwd: &Path,
         args: &[&str],
@@ -356,7 +385,7 @@ pub fn ensure_project_store(
 
 /// Import the backing git repo's refs and commits into the shared store, so a
 /// base ref that advanced since the store was created resolves.
-pub fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
+fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
     jj.run(store_dir, &["git", "import"], "jj git import")
         .map(|_| ())
 }
@@ -366,7 +395,7 @@ pub fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
 /// externally-advanced default branch into the store independent of the project
 /// checkout's branch, so a sibling can rebase onto `<default>@origin`. Mirrors
 /// `import_git`: a one-liner over the store's backing git.
-pub fn fetch_remote(jj: &JjEnv, store_dir: &Path, remote: &str) -> Result<(), String> {
+pub(crate) fn fetch_remote(jj: &JjEnv, store_dir: &Path, remote: &str) -> Result<(), String> {
     jj.run_with_timeout(
         store_dir,
         &["git", "fetch", "--remote", remote],
@@ -442,7 +471,7 @@ pub(crate) fn populate_auto_track_expr(
 /// jj auto-tracks a new file on the first snapshot after it appears, and a later
 /// rule cannot un-track it. `extra_paths` lets the backstop extend the exclusion
 /// with exact leaked paths. No-op when there is nothing to exclude.
-pub fn set_populate_auto_track(
+pub(crate) fn set_populate_auto_track(
     jj: &JjEnv,
     store_dir: &Path,
     config: &crate::config::project_settings::PopulateConfig,
@@ -500,6 +529,29 @@ mod tests {
             -1,
             "timed-out child is still alive"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(jj)]
+    fn managed_command_bounds_pipe_reader_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TempDir::new().unwrap();
+        let script = home.path().join("leaky-jj");
+        std::fs::write(&script, "#!/bin/sh\n(sleep 30) &\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let jj = JjEnv {
+            bin: script.to_string_lossy().into_owned(),
+            config_path: home.path().join("config.toml"),
+        };
+
+        let started = Instant::now();
+        let error = jj
+            .run_bytes_with_timeout(home.path(), &[], "leaky jj", Duration::from_millis(500))
+            .unwrap_err();
+        assert!(error.contains("pipe remained open"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]

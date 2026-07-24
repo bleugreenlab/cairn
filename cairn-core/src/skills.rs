@@ -14,8 +14,8 @@ use std::collections::HashMap;
 #[serde(rename_all = "kebab-case")]
 pub struct SkillFrontmatter {
     /// Spec: lowercase slug matching directory name. Legacy: display name.
-    pub name: String,
-    pub description: String,
+    name: String,
+    description: String,
     /// Spec: space-delimited string. Legacy: comma-separated string or YAML array.
     #[serde(
         default,
@@ -23,29 +23,31 @@ pub struct SkillFrontmatter {
         deserialize_with = "deserialize_allowed_tools",
         skip_serializing_if = "Option::is_none"
     )]
-    pub allowed_tools: Option<AllowedToolsValue>,
+    allowed_tools: Option<AllowedToolsValue>,
     /// Spec optional fields
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub license: Option<String>,
+    license: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compatibility: Option<String>,
+    compatibility: Option<String>,
     /// Spec: metadata map for extensions (display-name, etc.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, String>>,
+    metadata: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bundles: Vec<String>,
     // Legacy fields (read but not written in spec mode):
     /// Legacy: explicit id field
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    id: Option<String>,
     /// Legacy: top-level model field (tolerated on read, omitted on rewrite)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    model: Option<String>,
 }
 
 /// Wrapper for allowed tools that handles multiple input formats.
 /// Normalizes to a `Vec<String>` internally.
 /// Serializes as a space-delimited string (spec format).
 #[derive(Debug, Clone)]
-pub struct AllowedToolsValue(pub Vec<String>);
+pub struct AllowedToolsValue(Vec<String>);
 
 impl Serialize for AllowedToolsValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -155,6 +157,7 @@ pub struct ParsedSkill {
     pub description: String,
     pub prompt: String,
     pub allowed_tools: Option<Vec<String>>,
+    pub bundles: Vec<String>,
 }
 
 /// Generate a slug from a name (for ID generation)
@@ -172,7 +175,7 @@ fn slugify(name: &str) -> String {
 /// Validate a skill name against the Agent Skills spec rules.
 ///
 /// Rules: 1-64 chars, lowercase `[a-z0-9-]` only, no leading/trailing/consecutive hyphens.
-pub fn validate_skill_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Skill name cannot be empty".to_string());
     }
@@ -215,8 +218,9 @@ pub fn parse_skill_markdown(content: &str) -> Result<ParsedSkill, String> {
     let (frontmatter_str, prompt) = crate::markdown_frontmatter::split_yaml_frontmatter(content)?;
 
     // Parse YAML frontmatter
-    let frontmatter: SkillFrontmatter = serde_yaml::from_str(frontmatter_str)
+    let mut frontmatter: SkillFrontmatter = serde_yaml::from_str(frontmatter_str)
         .map_err(|e| format!("Failed to parse frontmatter: {}", e))?;
+    crate::config::contextual_packages::normalize_bundles(&mut frontmatter.bundles)?;
 
     // Validate required fields
     if frontmatter.name.is_empty() {
@@ -256,6 +260,7 @@ pub fn parse_skill_markdown(content: &str) -> Result<ParsedSkill, String> {
         description: frontmatter.description,
         prompt,
         allowed_tools,
+        bundles: frontmatter.bundles,
     })
 }
 
@@ -304,23 +309,25 @@ pub fn skill_to_markdown(data: SkillExportData) -> String {
 }
 
 /// Parameters for spec-compliant export with slug ID separate from display name.
-pub struct SkillExportDataSpec<'a> {
+pub(crate) struct SkillExportDataSpec<'a> {
     /// Lowercase slug (directory/id name)
-    pub slug: &'a str,
+    pub(crate) slug: &'a str,
     /// Display name
-    pub display_name: &'a str,
-    pub description: &'a str,
-    pub allowed_tools: Option<&'a [String]>,
-    pub prompt: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) description: &'a str,
+    pub(crate) allowed_tools: Option<&'a [String]>,
+    pub(crate) bundles: &'a [String],
+    pub(crate) prompt: &'a str,
 }
 
 /// Convert skill to spec-compliant markdown with explicit slug.
-pub fn skill_to_markdown_spec(data: SkillExportDataSpec) -> String {
+pub(crate) fn skill_to_markdown_spec(data: SkillExportDataSpec) -> String {
     let SkillExportDataSpec {
         slug,
         display_name,
         description,
         allowed_tools,
+        bundles,
         prompt,
     } = data;
 
@@ -330,6 +337,10 @@ pub fn skill_to_markdown_spec(data: SkillExportDataSpec) -> String {
         if !tools.is_empty() {
             frontmatter.push_str(&format!("allowed-tools: {}\n", tools.join(" ")));
         }
+    }
+
+    if !bundles.is_empty() {
+        frontmatter.push_str(&format!("bundles: [{}]\n", bundles.join(", ")));
     }
 
     let needs_display_name = display_name != slug && titlecase(slug) != display_name;
@@ -348,7 +359,7 @@ pub fn skill_to_markdown_spec(data: SkillExportDataSpec) -> String {
 }
 
 /// Titlecase a slug: "my-skill" → "My Skill"
-pub fn titlecase_slug(slug: &str) -> String {
+pub(crate) fn titlecase_slug(slug: &str) -> String {
     titlecase(slug)
 }
 
@@ -372,7 +383,7 @@ fn titlecase(slug: &str) -> String {
 /// Replace a markdown section by heading, returning the new prompt.
 ///
 /// Finds the heading line, replaces content until the next same-level heading or EOF.
-pub fn replace_section_in_prompt(
+pub(crate) fn replace_section_in_prompt(
     prompt: &str,
     heading: &str,
     new_content: &str,
@@ -611,6 +622,7 @@ Do something simple.
             display_name: "Testing",
             description: "A test skill",
             allowed_tools: Some(&tools),
+            bundles: &["coding".into()],
             prompt: "# Test Prompt\n\nThis is the prompt.",
         });
 
@@ -628,6 +640,7 @@ Do something simple.
             display_name: "Code Review Pro",
             description: "Reviews code",
             allowed_tools: None,
+            bundles: &[],
             prompt: "Prompt.",
         });
 

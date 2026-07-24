@@ -362,12 +362,13 @@ pub async fn get_todo_progress(db: &LocalDb, job_id: &str) -> Option<String> {
 /// an append/replace item is mis-keyed (e.g. `title` instead of `content`) so
 /// the agent learns the real shape without a discovery round-trip. Keep in sync
 /// with the struct fields below.
-pub const TODO_WRITE_ITEM_KEYS: &str =
+pub(crate) const TODO_WRITE_ITEM_KEYS: &str =
     "content (required), status (required), id, priority, activeForm";
 
 /// Accepted keys for one `TodoUpdateItem` (a partial update matched by `id`).
 /// Keep in sync with the struct fields below.
-pub const TODO_UPDATE_ITEM_KEYS: &str = "id (required), content, status, priority, activeForm";
+pub(crate) const TODO_UPDATE_ITEM_KEYS: &str =
+    "id (required), content, status, priority, activeForm";
 
 /// Input item for replace/append (before DB insertion).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

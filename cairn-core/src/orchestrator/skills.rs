@@ -74,6 +74,14 @@ impl ConfigResource for SkillResource {
         file.is_project_scoped
     }
 
+    fn file_bundles(file: &Self::File) -> &[String] {
+        &file.bundles
+    }
+
+    fn package_kind() -> crate::config::contextual_packages::ContextualPackageKind {
+        crate::config::contextual_packages::ContextualPackageKind::Skill
+    }
+
     fn to_config(
         file: Self::File,
         workspace_id: Option<String>,
@@ -111,6 +119,7 @@ impl ConfigResource for SkillResource {
             description: input.description,
             prompt: input.prompt,
             allowed_tools: input.allowed_tools,
+            bundles: Vec::new(),
             is_project_scoped,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),
@@ -154,6 +163,7 @@ impl ConfigResource for SkillResource {
                 .unwrap_or_else(|| existing.description.clone()),
             prompt: input.prompt.unwrap_or_else(|| existing.prompt.clone()),
             allowed_tools: merge_optional(&existing.allowed_tools, &input.allowed_tools),
+            bundles: existing.bundles.clone(),
             is_project_scoped: new_is_project_scoped,
             file_path: if scope_changing {
                 PathBuf::new()
@@ -212,6 +222,7 @@ impl ConfigResource for SkillResource {
             description: source.description.clone(),
             prompt: source.prompt.clone(),
             allowed_tools: source.allowed_tools.clone(),
+            bundles: source.bundles.clone(),
             is_project_scoped,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),
@@ -303,6 +314,59 @@ impl Orchestrator {
         crate::config::skill_fetch::fetch_skill(&source, url)
     }
 
+    /// Preview a local portable `.skill` archive.
+    pub fn preview_skill_archive(
+        &self,
+        path: &Path,
+    ) -> Result<crate::config::skill_fetch::FetchedSkill, String> {
+        validate_skill_archive_file(path)?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("Failed to read selected .skill file: {e}"))?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("import.skill");
+        crate::config::skill_archive::parse_skill_archive(&bytes, filename)
+    }
+
+    /// Install a local portable `.skill` archive to the selected scope.
+    pub fn install_skill_archive(
+        &self,
+        path: &Path,
+        project_id: Option<&str>,
+    ) -> Result<SkillConfig, String> {
+        let fetched = self.preview_skill_archive(path)?;
+        self.install_fetched_skill_package(fetched, project_id)
+    }
+
+    /// Export the resolved installed package to an exact user-selected `.skill` path.
+    pub fn export_skill_archive(
+        &self,
+        id: &str,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+        destination: &Path,
+    ) -> Result<(), String> {
+        if destination
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("skill"))
+            != Some(true)
+        {
+            return Err("Export destination must use the .skill extension".into());
+        }
+        let config_root = match workspace_id {
+            Some(workspace_id) => self.workspace_write_root(workspace_id)?,
+            None => self.config_dir.clone(),
+        };
+        let project_path = project_id.map(|pid| self.project_path(pid)).transpose()?;
+        let skill = config_skills::get_skill(&config_root, id, project_path.as_deref())?
+            .ok_or_else(|| format!("Skill '{id}' was not found in the selected scope"))?;
+        let bytes = crate::config::skill_archive::build_skill_archive(&skill.id, &skill.dir_path)?;
+        std::fs::write(destination, bytes)
+            .map_err(|e| format!("Failed to write .skill archive: {e}"))
+    }
+
     /// Install a previously fetched skill to the target scope.
     pub fn install_skill_from_url(
         &self,
@@ -311,7 +375,14 @@ impl Orchestrator {
     ) -> Result<SkillConfig, String> {
         let source = crate::config::skill_fetch::parse_skill_url(url)?;
         let fetched = crate::config::skill_fetch::fetch_skill(&source, url)?;
+        self.install_fetched_skill_package(fetched, project_id)
+    }
 
+    fn install_fetched_skill_package(
+        &self,
+        fetched: crate::config::skill_fetch::FetchedSkill,
+        project_id: Option<&str>,
+    ) -> Result<SkillConfig, String> {
         let project_path: Option<std::path::PathBuf> = if let Some(pid) = project_id {
             Some(self.project_path(pid)?)
         } else {
@@ -381,4 +452,24 @@ impl Orchestrator {
     pub fn list_skills_for_context(&self, project_id: &str) -> Result<Vec<SkillConfig>, String> {
         config_resource::list_for_context::<SkillResource>(self, project_id)
     }
+}
+
+fn validate_skill_archive_file(path: &Path) -> Result<(), String> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("skill"))
+        != Some(true)
+    {
+        return Err("Selected file must use the .skill extension".into());
+    }
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("Selected .skill file is unavailable: {e}"))?;
+    if !metadata.is_file() {
+        return Err("Selected .skill path is not a regular file".into());
+    }
+    if metadata.len() > crate::config::skill_archive::MAX_COMPRESSED_BYTES {
+        return Err("Selected .skill file exceeds the 50 MB compressed limit".into());
+    }
+    Ok(())
 }

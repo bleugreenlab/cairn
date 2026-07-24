@@ -54,6 +54,34 @@ pub fn outline(root: &Path, target: &Path, glob: Option<&str>) -> Rendered {
     Rendered::message(blocks.join("\n\n"))
 }
 
+pub fn outline_texts(files: &[(String, String)], glob: Option<&str>) -> Rendered {
+    let globset = match glob {
+        Some(raw) => match build_globset(raw) {
+            Ok(set) => Some(set),
+            Err(error) => return Rendered::message(error),
+        },
+        None => None,
+    };
+    let mut blocks = Vec::new();
+    for (path, src) in files {
+        let path_ref = Path::new(path);
+        if globset.as_ref().is_some_and(|set| {
+            !set.is_match(path_ref) && !path_ref.file_name().is_some_and(|name| set.is_match(name))
+        }) {
+            continue;
+        }
+        let rendered = outline_text(src, lang_for_path(path_ref));
+        if !rendered.is_empty() {
+            blocks.push(format!("{path}\n{rendered}"));
+        }
+    }
+    if blocks.is_empty() {
+        Rendered::message("no outline entries")
+    } else {
+        Rendered::message(blocks.join("\n\n"))
+    }
+}
+
 fn outline_file(path: &Path) -> Option<String> {
     let lang = lang_for_path(path)?;
     let src = std::fs::read_to_string(path).ok()?;
@@ -87,7 +115,7 @@ fn is_row(line: &str) -> bool {
 }
 
 /// Extract top-level items with their direct members from a source string.
-pub fn extract_items(src: &str, lang: SupportLang) -> Vec<OutlineItem<'static>> {
+fn extract_items(src: &str, lang: SupportLang) -> Vec<OutlineItem<'static>> {
     let ast = parse(src, lang);
     let root = ast.root();
     let mut items = Vec::new();

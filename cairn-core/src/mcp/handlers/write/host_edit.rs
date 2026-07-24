@@ -17,7 +17,9 @@ use std::path::{Component, Path, PathBuf};
 use cairn_db::turso::params;
 
 use super::file_mutations::{changed_line_counts, emit_worktree_changed, record_file_change_async};
+#[cfg(test)]
 use crate::mcp::git::GitAuthor;
+#[cfg(test)]
 use crate::mcp::vcs::WorktreeVcs;
 use crate::messages::queued::DeliveryUrgency;
 use crate::orchestrator::Orchestrator;
@@ -52,9 +54,11 @@ fn validate_relative(file_path: &str) -> Result<PathBuf, String> {
 /// empty/absent default branch maps to `None`). Drives the per-store jj lock, the
 /// git author, and the default-branch gate.
 struct WorktreeProject {
+    job_id: String,
     project_id: String,
     repo_path: String,
     default_branch: Option<String>,
+    branch: String,
 }
 
 async fn project_for_worktree(orch: &Orchestrator, worktree: &str) -> Option<WorktreeProject> {
@@ -66,7 +70,7 @@ async fn project_for_worktree(orch: &Orchestrator, worktree: &str) -> Option<Wor
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT j.project_id, p.repo_path, p.default_branch
+                        "SELECT j.id, j.project_id, p.repo_path, p.default_branch, j.branch
                          FROM jobs j
                          JOIN projects p ON j.project_id = p.id
                          WHERE j.worktree_path = ?1
@@ -79,9 +83,14 @@ async fn project_for_worktree(orch: &Orchestrator, worktree: &str) -> Option<Wor
                     return Ok(None);
                 };
                 Ok(Some(WorktreeProject {
-                    project_id: row.text(0)?,
-                    repo_path: row.text(1)?,
-                    default_branch: row.opt_text(2)?.filter(|s| !s.is_empty()),
+                    job_id: row.text(0)?,
+                    project_id: row.text(1)?,
+                    repo_path: row.text(2)?,
+                    default_branch: row.opt_text(3)?.filter(|s| !s.is_empty()),
+                    branch: row
+                        .opt_text(4)?
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "main".to_string()),
                 }))
             })
         })
@@ -202,6 +211,7 @@ fn notify_agents(orch: &Orchestrator, job_ids: &[String], file_path: &str, diff:
 /// Build the user-facing error for a seal that failed and was rolled back. The
 /// claim matches the post-call state: a stale/lost-seal failure restored the
 /// workspace, a generic failure did too, and a failed restore is named.
+#[cfg(test)]
 fn seal_failure_message(seal_error: &str, restored: Result<(), String>) -> String {
     if let Err(re) = restored {
         return format!("Save failed and the workspace couldn't be restored: {re}");
@@ -241,6 +251,7 @@ fn seal_failure_message(seal_error: &str, restored: Result<(), String>) -> Strin
 ///
 /// Takes `&dyn WorktreeVcs` so the discard-on-failure safety property stays
 /// unit-testable with a fake backend.
+#[cfg(test)]
 fn finish_commit(
     vcs: &dyn WorktreeVcs,
     worktree: &Path,
@@ -330,94 +341,23 @@ pub async fn commit_user_file_edit(
     commit_msg: &str,
 ) -> Result<String, String> {
     let worktree = Path::new(worktree_path);
-
-    // (1) jj-only. Keep direct editing off the project's live checkout.
     if !crate::jj::is_jj_dir(worktree) {
         return Err(NON_JJ_WORKTREE_ERROR.to_string());
     }
-    // (2) A descriptive commit message is required, mirroring the agent path.
     if commit_msg.trim().is_empty() {
         return Err("A commit message is required to save this edit.".to_string());
     }
-
-    // Resolve the owning project once (id, repo path, default branch) for the
-    // store lock, git author, and the default-branch gate below.
-    let project = project_for_worktree(orch, worktree_path).await;
-
-    // Default-branch gate. Reject committing to the project's default branch from
-    // the file tab. The feature targets agent feature-branch worktrees; sealing a
-    // worktree whose branch marker IS the default branch would advance the default
-    // branch locally, which the periodic base-advance sweep then sees as a local
-    // default advance and reconciles — rebasing and waking in-flight siblings with
-    // a spurious "base advanced" note. Editing the default branch directly is out
-    // of scope for this convenience feature.
-    if let (Some(default_branch), Some(marker)) = (
-        project.as_ref().and_then(|p| p.default_branch.as_deref()),
-        crate::jj::read_branch_marker(worktree).as_deref(),
-    ) {
-        if marker == default_branch {
-            return Err(format!(
-                "Direct editing is not available on the default branch (`{default_branch}`). \
-                 This worktree is on the project's default branch; edit from a feature-branch \
-                 worktree instead."
-            ));
-        }
+    let project = project_for_worktree(orch, worktree_path)
+        .await
+        .ok_or_else(|| "Direct edit worktree has no owning project job.".to_string())?;
+    if project.default_branch.as_deref() == Some(project.branch.as_str()) {
+        return Err(format!(
+            "Direct editing is not available on the default branch (`{}`). Edit from a feature-branch worktree instead.",
+            project.branch
+        ));
     }
-
     let relative = validate_relative(file_path)?;
-    let full_path = worktree.join(&relative);
-
-    // Enforce the same canonical boundary the reader does, and reject symlink or
-    // non-regular targets. Editing a symlink would write through to its target
-    // while sealing the symlink path (committing a path that did not change), and
-    // a symlink can point outside the worktree. The file must exist (this feature
-    // edits tracked files), so canonicalization resolves; `repo_rel` is the
-    // canonical path relative to the canonical worktree — the real repo path we
-    // write AND seal, so the bytes changed and the committed path always agree.
-    let meta = std::fs::symlink_metadata(&full_path)
-        .map_err(|e| format!("Cannot edit {file_path}: {e}"))?;
-    if meta.file_type().is_symlink() {
-        return Err("Direct editing is not available for symlinks.".to_string());
-    }
-    if !meta.file_type().is_file() {
-        return Err("Direct editing is only available for regular files.".to_string());
-    }
-    let canonical_worktree = worktree
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve worktree path: {e}"))?;
-    let canonical_file = full_path
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve file path: {e}"))?;
-    let repo_rel = canonical_file
-        .strip_prefix(&canonical_worktree)
-        .map_err(|_| "Invalid path: path escapes the worktree.".to_string())?
-        .to_string_lossy()
-        .replace('\\', "/");
-
-    // (3) Acquire the per-store jj lock and hold it across the gate, write, and
-    // seal so this user seal serializes on the SAME lock instance base-advance
-    // reconcile and concurrent agent seals hold. `None` only where there is no
-    // shared store to protect (no owning job), matching the agent path's
-    // best-effort fallback.
-    let store = project
-        .as_ref()
-        .map(|p| crate::jj::project_store_dir(&orch.config_dir, Path::new(&p.repo_path)));
-    let _guard = match store.as_deref() {
-        Some(store) => Some(
-            orch.acquire_jj_store_lock(store, "host file edit seal")
-                .await,
-        ),
-        None => None,
-    };
-    log::info!(
-        "host file edit: worktree={worktree_path} file=`{repo_rel}` store_lock_held={} branch_marker={:?}",
-        store.is_some(),
-        crate::jj::read_branch_marker(worktree)
-    );
-
-    // (4) Concurrency gate. Refuse while any agent on this worktree is mid-turn:
-    // two interleaved apply->seal sequences on one working copy would corrupt
-    // each other. A warm-but-idle agent (live run, no active turn) is safe.
+    let repo_rel = relative.to_string_lossy().replace('\\', "/");
     let jobs = live_jobs_on_worktree(orch, worktree_path).await?;
     for job_id in &jobs {
         if crate::messages::delivery::head_turn_active(&orch.db.local, job_id)
@@ -425,51 +365,87 @@ pub async fn commit_user_file_edit(
             .unwrap_or(false)
         {
             return Err(
-                "An agent is currently working in this worktree; wait until it \
-                 finishes, then try again."
+                "An agent is currently working in this worktree; wait until it finishes, then try again."
                     .to_string(),
             );
         }
     }
 
-    // (5) Resolve the VCS BEFORE writing so a failed/partial write (e.g. disk
-    // full after `std::fs::write` truncates the file) can be discarded back to
-    // HEAD — the write phase gets the same fail-closed cleanup as the seal phase.
-    let author = orch
-        .resolve_git_identity_for_project(project.as_ref().map(|p| p.project_id.as_str()))
-        .map(|(name, email)| GitAuthor::new(name, email));
-    let recovery_request = cairn_common::protocol::CallbackRequest {
-        thread_id: None,
-        cwd: worktree_path.to_string(),
-        run_id: None,
-        tool: "host_edit".to_string(),
-        payload: serde_json::Value::Null,
-        tool_use_id: None,
+    let managed_store =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&project.repo_path));
+    // Pre-store workspaces can still exist during migration and in imported
+    // fixtures. They remain a valid jj repository coordinate; once the managed
+    // store exists it is always authoritative.
+    let store = if crate::jj::is_jj_dir(&managed_store) {
+        managed_store
+    } else {
+        worktree.to_path_buf()
     };
-    let managed_context =
-        crate::mcp::vcs::prepare_managed_workspace(orch, &recovery_request).await?;
-    let vcs =
-        crate::mcp::vcs::resolve_managed_worktree_vcs(orch, worktree, managed_context.as_ref());
-    vcs.reconcile_workspace(worktree)?;
+    let guard = orch
+        .acquire_jj_store_lock(&store, "host logical file edit")
+        .await;
+    let expected = cairn_vcs::resolve_coordinate(&store, &project.branch)
+        .await
+        .map_err(|error| error.to_string())?;
+    let before = super::super::read::file_at_commit(
+        PathBuf::from(&project.repo_path),
+        expected.clone(),
+        &repo_rel,
+    )?
+    .ok_or_else(|| format!("Cannot edit {file_path}: file does not exist at the logical head"))
+    .and_then(|bytes| {
+        String::from_utf8(bytes)
+            .map_err(|_| "Direct editing is only available for UTF-8 regular files.".to_string())
+    })?;
+    let author = orch
+        .resolve_git_identity_for_project(Some(project.project_id.as_str()))
+        .map(|(name, email)| cairn_vcs::PublicationAuthor { name, email });
+    let publication_store = store.clone();
+    let publication_branch = project.branch.clone();
+    let publication_expected = expected.clone();
+    let publication_path = repo_rel.clone();
+    let publication_content = content.as_bytes().to_vec();
+    let publication_message = commit_msg.to_string();
+    let publication = tokio::task::spawn_blocking(move || {
+        cairn_vcs::publish_logical_mutations(
+            &publication_store,
+            &publication_branch,
+            &publication_expected,
+            vec![cairn_vcs::LogicalTreeMutation {
+                path: publication_path,
+                content: Some(publication_content),
+            }],
+            cairn_vcs::PublicationMode::Child {
+                description: publication_message,
+                author,
+            },
+        )
+    })
+    .await
+    .map_err(|error| format!("Host edit publication worker failed: {error}"))??;
+    let (additions, deletions) = changed_line_counts(Some(&before), Some(content));
+    let trace = guard.trace();
+    drop(guard);
 
-    // (6) Compute additions/deletions against the old on-disk content for the
-    // file_changes record.
-    let before = std::fs::read_to_string(&canonical_file).ok();
-    let (additions, deletions) = changed_line_counts(before.as_deref(), Some(content));
-
-    // (7) Write the new content to disk. `std::fs::write` truncates then writes,
-    // so a mid-write failure can leave the file truncated or partially rewritten;
-    // discard to HEAD and refresh the UI before returning, so a failed save never
-    // leaves the worktree dirty.
-    if let Err(e) = std::fs::write(&canonical_file, content) {
-        let _ = vcs.discard(worktree);
-        emit_worktree_changed(orch, worktree_path);
-        return Err(format!("Failed to write file: {e}"));
+    if crate::merge_requests::queries::publication_requirement_for_managed_branch(
+        &orch.db.local,
+        &project.job_id,
+        &project.project_id,
+        &project.branch,
+    )
+    .await
+        == crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr
+    {
+        let _phase = trace.phase("origin push");
+        let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, worktree);
+        crate::mcp::vcs::publish_required_origin(vcs.as_ref(), worktree).map_err(|error| {
+            format!(
+                "Host edit commit {} landed locally but remains unpublished because the required open-PR origin push failed: {error}",
+                publication.head
+            )
+        })?;
     }
-
-    // (8) Record the file change (best-effort, like the agent path). The
-    // `changed`/diff view self-heals on the next op if this fails.
-    if let Err(e) = record_file_change_async(
+    if let Err(error) = record_file_change_async(
         orch,
         worktree_path,
         &repo_rel,
@@ -480,33 +456,12 @@ pub async fn commit_user_file_edit(
     )
     .await
     {
-        log::warn!("Failed to record user file change for {repo_rel}: {e}");
+        log::warn!("Failed to record user file change for {repo_rel}: {error}");
     }
-
-    // (9) Seal via the VCS seam. The user message is used verbatim with NO agent
-    // commit prefix (this is a user edit, not an agent commit). A stale workspace
-    // is recovered once, and any unrecoverable failure discards to HEAD inside
-    // `finish_commit`.
-    let result = finish_commit(
-        vcs.as_ref(),
-        worktree,
-        &canonical_file,
-        &repo_rel,
-        content,
-        commit_msg,
-        author.as_ref(),
-    );
-
-    // Refresh the UI on both paths (the worktree changed either way: a new commit
-    // on success, a restore-to-HEAD on failure).
     emit_worktree_changed(orch, worktree_path);
-    let sha = result?;
-
-    // (10) Post-commit, best-effort: notify co-located agents with a compact diff
-    // of the user's change (before -> the saved content).
-    let edit_diff = render_change_diff(before.as_deref().unwrap_or(""), content, 60);
+    let edit_diff = render_change_diff(&before, content, 60);
     notify_agents(orch, &jobs, &repo_rel, &edit_diff);
-    Ok(sha)
+    Ok(publication.head)
 }
 
 #[cfg(test)]
@@ -965,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn user_edit_commits_and_leaves_worktree_clean() {
+    async fn user_edit_commits_logical_head_without_moving_worktree() {
         let Some(bin) = jj_bin() else {
             eprintln!("skipping user_edit_commits_and_leaves_worktree_clean: jj not resolvable");
             return;
@@ -987,8 +942,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(ws.join("shared.rs")).unwrap(),
-            "edited by user\n",
-            "the edited content must persist on disk"
+            "base\n",
+            "logical publication must not materialize the retained worktree"
         );
     }
 
@@ -1062,8 +1017,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("symlink"),
-            "a symlink target must be rejected: {err}"
+            err.contains("does not exist"),
+            "checkout-only path must be rejected: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("shared.rs")).unwrap(),
+            "base\n"
         );
     }
 

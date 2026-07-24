@@ -14,13 +14,13 @@ use tokio::runtime::RuntimeMetrics;
 /// A point-in-time read of the stable tokio runtime metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeSnapshot {
-    pub num_workers: usize,
+    pub(crate) num_workers: usize,
     pub num_alive_tasks: usize,
     pub global_queue_depth: usize,
     /// Sum of every worker's cumulative busy duration, in nanoseconds. `None`
     /// on targets without 64-bit atomics, where the underlying metric does not
     /// exist (every Cairn target has them, so this is `Some` in practice).
-    pub total_worker_busy_nanos: Option<u128>,
+    pub(crate) total_worker_busy_nanos: Option<u128>,
 }
 
 impl RuntimeSnapshot {

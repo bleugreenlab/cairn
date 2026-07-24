@@ -39,7 +39,7 @@ pub fn sample_ps_rows() -> Result<Vec<ProcessRow>, String> {
 
 /// Parse `ps -axo pid=,ppid=,pcpu=,rss=,comm=` output into rows. The command
 /// column may contain spaces, so it is rejoined from the trailing fields.
-pub fn parse_ps_rows(output: &str) -> Vec<ProcessRow> {
+fn parse_ps_rows(output: &str) -> Vec<ProcessRow> {
     output
         .lines()
         .filter_map(|line| {

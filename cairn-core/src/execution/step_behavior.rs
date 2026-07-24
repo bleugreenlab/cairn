@@ -9,13 +9,13 @@ use crate::models::{AgentGitConfig, WorktreeMode};
 #[derive(Debug, Clone)]
 pub struct StepBehavior {
     /// Whether this node needs its own worktree created
-    pub needs_worktree: bool,
+    pub(crate) needs_worktree: bool,
     /// Whether this node inherits worktree from upstream agent
-    pub inherits_worktree: bool,
+    pub(crate) inherits_worktree: bool,
 }
 
 /// Resolve behavior for a recipe node (DAG-based execution).
-pub fn resolve_node_behavior(node: &DbRecipeNode) -> StepBehavior {
+pub(crate) fn resolve_node_behavior(node: &DbRecipeNode) -> StepBehavior {
     match node.node_type.as_str() {
         // Agent nodes run backend sessions - worktree behavior depends on git_config
         "agent" => {

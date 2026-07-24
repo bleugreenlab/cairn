@@ -63,7 +63,7 @@ impl PdfProviderId {
 }
 
 /// The configured `activePdf` provider name, if any.
-pub fn active_pdf_name(config_dir: &Path) -> Option<String> {
+pub(crate) fn active_pdf_name(config_dir: &Path) -> Option<String> {
     super::settings::load_settings_file(config_dir)
         .ok()
         .and_then(|f| f.active_pdf)
@@ -98,7 +98,7 @@ pub fn resolve_active_pdf(config_dir: &Path) -> PdfProviderId {
 }
 
 /// Validate a provider's submitted options against its descriptor.
-pub fn validate_pdf_options(
+fn validate_pdf_options(
     id: PdfProviderId,
     options: &HashMap<String, serde_yaml::Value>,
 ) -> Result<(), String> {

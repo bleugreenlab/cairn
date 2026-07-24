@@ -21,15 +21,15 @@ pub enum Modifier {
 #[serde(rename_all = "camelCase")]
 pub struct KeybindCustomization {
     /// Action ID to customize (e.g., "issue.create")
-    pub action: String,
+    pub(crate) action: String,
     /// New key (empty string to disable)
-    pub key: String,
+    pub(crate) key: String,
     /// New modifiers
     #[serde(default)]
-    pub modifiers: Vec<Modifier>,
+    pub(crate) modifiers: Vec<Modifier>,
     /// Optional description of why this was changed
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    description: Option<String>,
 }
 
 /// Full keybinds file format
@@ -38,10 +38,10 @@ pub struct KeybindCustomization {
 pub struct KeybindsFile {
     /// Schema version for future migrations
     #[serde(default = "default_version")]
-    pub version: i32,
+    version: i32,
     /// User customizations
     #[serde(default)]
-    pub keybinds: Vec<KeybindCustomization>,
+    pub(crate) keybinds: Vec<KeybindCustomization>,
 }
 
 fn default_version() -> i32 {
@@ -50,7 +50,7 @@ fn default_version() -> i32 {
 
 impl KeybindsFile {
     /// Add or update a customization
-    pub fn set_keybind(&mut self, action: &str, key: String, modifiers: Vec<Modifier>) {
+    pub(crate) fn set_keybind(&mut self, action: &str, key: String, modifiers: Vec<Modifier>) {
         // Remove existing customization if present
         self.keybinds.retain(|k| k.action != action);
 
@@ -64,23 +64,23 @@ impl KeybindsFile {
     }
 
     /// Remove a customization (revert to default)
-    pub fn remove_keybind(&mut self, action: &str) {
+    pub(crate) fn remove_keybind(&mut self, action: &str) {
         self.keybinds.retain(|k| k.action != action);
     }
 
     /// Clear all customizations
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.keybinds.clear();
     }
 }
 
 /// Get the path to the keybinds file
-pub fn get_keybinds_path(config_dir: &Path) -> PathBuf {
+fn get_keybinds_path(config_dir: &Path) -> PathBuf {
     config_dir.join("keybinds.json")
 }
 
 /// Load keybinds from file. Returns empty file if doesn't exist or is invalid.
-pub fn load_keybinds(config_dir: &Path) -> KeybindsFile {
+pub(crate) fn load_keybinds(config_dir: &Path) -> KeybindsFile {
     match load_keybinds_file(config_dir) {
         Ok(file) => file,
         Err(e) => {
@@ -105,7 +105,7 @@ fn load_keybinds_file(config_dir: &Path) -> Result<KeybindsFile, String> {
 }
 
 /// Save keybinds to file
-pub fn save_keybinds(config_dir: &Path, file: &KeybindsFile) -> Result<(), String> {
+pub(crate) fn save_keybinds(config_dir: &Path, file: &KeybindsFile) -> Result<(), String> {
     let path = get_keybinds_path(config_dir);
 
     // Ensure directory exists

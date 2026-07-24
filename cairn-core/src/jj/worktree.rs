@@ -8,7 +8,7 @@ use std::path::Path;
 /// `<status> <path>` (e.g. `A src/new.rs`); the status letter is dropped. Used
 /// by populate's security backstop to enumerate any populated path that leaked
 /// into the snapshot.
-pub fn working_copy_dirty_paths(jj: &JjEnv, ws: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn working_copy_dirty_paths(jj: &JjEnv, ws: &Path) -> Result<Vec<String>, String> {
     let out = jj.run(ws, &["diff", "--summary"], "jj diff --summary")?;
     Ok(out
         .lines()
@@ -26,7 +26,7 @@ pub fn working_copy_dirty_paths(jj: &JjEnv, ws: &Path) -> Result<Vec<String>, St
 /// edits to scratch — making "recoverable" true from the agent's seat, not just
 /// the jj operation log. Best-effort by contract: the caller treats any error as
 /// "nothing to preserve". Empty string when `@` is clean.
-pub fn working_copy_diff(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+pub(crate) fn working_copy_diff(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     jj.run(ws, &["diff", "--git"], "jj diff --git")
 }
 
@@ -34,7 +34,7 @@ pub fn working_copy_diff(jj: &JjEnv, ws: &Path) -> Result<String, String> {
 /// (`jj file untrack`). Used by populate's backstop to un-track a path a
 /// conservative glob translation failed to keep out of the snapshot, after the
 /// path has been added to `snapshot.auto-track`. No-op for an empty slice.
-pub fn untrack_paths(jj: &JjEnv, ws: &Path, paths: &[String]) -> Result<(), String> {
+pub(crate) fn untrack_paths(jj: &JjEnv, ws: &Path, paths: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -88,7 +88,7 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     )
 }
 
-pub fn working_copy_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+pub(crate) fn working_copy_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     jj.run(
         ws,
         &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
@@ -99,7 +99,12 @@ pub fn working_copy_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
 /// Graph proof used only after database/path/marker ownership coordinates agree.
 /// It proves the physical workspace's sealed head descends from the job's
 /// recorded base; it never establishes lineage on its own.
-pub fn revision_descends_from(jj: &JjEnv, store: &Path, revision: &str, ancestor: &str) -> bool {
+pub(crate) fn revision_descends_from(
+    jj: &JjEnv,
+    store: &Path,
+    revision: &str,
+    ancestor: &str,
+) -> bool {
     let revset = format!("{ancestor}::{revision} & {revision}");
     jj.run(
         store,
@@ -124,7 +129,7 @@ pub fn revision_descends_from(jj: &JjEnv, store: &Path, revision: &str, ancestor
 /// workspace off the store. This is the bridge that lets Cairn read genuine git
 /// objects (e.g. a sealed commit's tree) for content jj's template layer cannot
 /// expose.
-pub fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     jj.run(ws, &["git", "root"], "jj git root")
 }
 
@@ -148,14 +153,23 @@ pub fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
 /// being skipped on a transient git hiccup.
 pub fn sealed_tree_hash(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     let commit = head_commit(jj, ws)?;
-    match sealed_tree_hash_via_git(jj, ws, &commit) {
+    logical_tree_hash(jj, ws, &commit)
+}
+
+/// Stable tree identity for an explicit logical commit.
+pub(crate) fn logical_tree_hash(
+    jj: &JjEnv,
+    repository: &Path,
+    commit: &str,
+) -> Result<String, String> {
+    match sealed_tree_hash_via_git(jj, repository, commit) {
         Ok(tree) => Ok(tree),
         Err(e) => {
             log::warn!(
                 "sealed_tree_hash: git tree resolution failed ({e}); falling back to \
                  the sealed commit id (cross-equivalent-tree cache reuse disabled)"
             );
-            Ok(commit)
+            Ok(commit.to_string())
         }
     }
 }
@@ -201,7 +215,7 @@ pub(crate) fn sealed_tree_hash_via_git(
 /// can be keyed by just its own inputs rather than the whole tree. Entries are
 /// sorted by path. Errs (so callers fall back to whole-tree keying) when the git
 /// backend can't be resolved or `git ls-tree` fails.
-pub fn sealed_tree_entries(jj: &JjEnv, ws: &Path) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn sealed_tree_entries(jj: &JjEnv, ws: &Path) -> Result<Vec<(String, String)>, String> {
     let commit = head_commit(jj, ws)?;
     tree_entries(jj, ws, &commit)
 }
@@ -210,7 +224,11 @@ pub fn sealed_tree_entries(jj: &JjEnv, ws: &Path) -> Result<Vec<(String, String)
 /// jj workspace's git backend. This is intentionally treeish-based so check-cache
 /// consumers can compare the current sealed tree with a previously cached baseline
 /// tree even when that baseline was re-stamped by another branch or node.
-pub fn tree_entries(jj: &JjEnv, ws: &Path, treeish: &str) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn tree_entries(
+    jj: &JjEnv,
+    ws: &Path,
+    treeish: &str,
+) -> Result<Vec<(String, String)>, String> {
     let git_dir = git_backend_root(jj, ws)?;
     let out = bounded_command_output(
         crate::env::git().args(["--git-dir", &git_dir, "ls-tree", "-r", "-z", treeish]),

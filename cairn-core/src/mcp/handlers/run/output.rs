@@ -604,6 +604,8 @@ mod tests {
             succeeded,
             suspended: false,
             images: Vec::new(),
+            promoted_terminal: None,
+            tracked_modifications: None,
         }
     }
 
@@ -639,6 +641,8 @@ mod tests {
                 succeeded: true,
                 suspended: false,
                 images: vec![img_a.clone()],
+                promoted_terminal: None,
+                tracked_modifications: None,
             },
             // A text-only item contributes no images and is skipped.
             ItemOutcome::failed("echo".to_string(), "out"),
@@ -648,6 +652,8 @@ mod tests {
                 succeeded: true,
                 suspended: false,
                 images: vec![img_b.clone()],
+                promoted_terminal: None,
+                tracked_modifications: None,
             },
         ];
         assert_eq!(collect_run_images(outcomes), vec![img_a, img_b]);

@@ -26,7 +26,7 @@ use cairn_db::turso::params;
 /// backstop: once this many command runs have been recorded for a checkpoint
 /// job, the auto-loop stops waking the upstream agent and the gate stays Blocked
 /// for manual resolution (Confirm override or the manual Re-run button).
-pub const CHECKPOINT_MAX_ATTEMPTS: i64 = 5;
+pub(crate) const CHECKPOINT_MAX_ATTEMPTS: i64 = 5;
 
 /// Max bytes of stdout/stderr retained per run (tail). Keeps the wake message
 /// and stored history bounded while preserving the actionable end of the output.
@@ -36,14 +36,14 @@ const OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointRunRow {
-    pub attempt: i64,
-    pub command: Option<String>,
-    pub commit_sha: Option<String>,
-    pub exit_code: i32,
-    pub passed: bool,
-    pub stdout_tail: Option<String>,
-    pub stderr_tail: Option<String>,
-    pub ran_at: i64,
+    attempt: i64,
+    pub(crate) command: Option<String>,
+    pub(crate) commit_sha: Option<String>,
+    pub(crate) exit_code: i32,
+    passed: bool,
+    pub(crate) stdout_tail: Option<String>,
+    pub(crate) stderr_tail: Option<String>,
+    ran_at: i64,
 }
 
 /// Keep the last `max_bytes` of `s`, on a char boundary, prefixing an ellipsis
@@ -62,7 +62,7 @@ fn tail(s: &str, max_bytes: usize) -> String {
 /// Record one checkpoint command run. Returns the 1-based attempt number for
 /// this job (existing row count + 1). Both passes and failures are recorded so
 /// the attempt count reflects every command execution.
-pub fn record_checkpoint_run(
+pub(crate) fn record_checkpoint_run(
     orch: &Orchestrator,
     job_id: &str,
     command: &str,
@@ -138,7 +138,7 @@ pub fn record_checkpoint_run(
 }
 
 /// Number of recorded runs (= attempts) for a checkpoint job.
-pub fn checkpoint_attempt_count(orch: &Orchestrator, job_id: &str) -> Result<i64, String> {
+pub(crate) fn checkpoint_attempt_count(orch: &Orchestrator, job_id: &str) -> Result<i64, String> {
     let db = run_advancement_db({
         let dbs = orch.db.clone();
         let job_id = job_id.to_string();
@@ -226,7 +226,7 @@ pub fn latest_checkpoint_run(
 
 /// Delete all recorded runs for a checkpoint job. Used by the manual Re-run
 /// button to start a fresh attempt cycle (resets the cap).
-pub fn reset_checkpoint_runs(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+pub(crate) fn reset_checkpoint_runs(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
     let db = run_advancement_db({
         let dbs = orch.db.clone();
         let job_id = job_id.to_string();
@@ -261,7 +261,7 @@ pub fn reset_checkpoint_runs(orch: &Orchestrator, job_id: &str) -> Result<(), St
 /// Blocked. The upstream must not currently be running (let its turn finish),
 /// and the attempt cap must not be exhausted. Missing SHAs (can't determine
 /// progress) are treated as not eligible.
-pub fn is_rearm_eligible(
+pub(crate) fn is_rearm_eligible(
     head_sha: Option<&str>,
     last_run_sha: Option<&str>,
     upstream_running: bool,
@@ -281,7 +281,7 @@ pub fn is_rearm_eligible(
 /// checkpoint. States the checkpoint name and command, the exit code, the output
 /// tail, and that the checkpoint re-runs automatically once the agent commits a
 /// fix and goes idle.
-pub fn build_checkpoint_failure_message(
+pub(crate) fn build_checkpoint_failure_message(
     node_name: &str,
     command: &str,
     exit_code: i32,

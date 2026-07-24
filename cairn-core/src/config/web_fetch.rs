@@ -177,7 +177,7 @@ pub fn load_web_fetch_options(
 /// Resolve which provider backs fetch. Absent / empty / `regular` ⇒ the built-in
 /// regular fetch. An unknown name warns and falls back to regular (matching the
 /// former registry's no-fail behaviour).
-pub fn resolve_active_fetch(config_dir: &Path) -> ActiveFetch {
+pub(crate) fn resolve_active_fetch(config_dir: &Path) -> ActiveFetch {
     let name = match active_web_fetch_name(config_dir) {
         Some(n) if !n.trim().is_empty() && n != REGULAR => n,
         _ => return ActiveFetch::Regular,
@@ -195,7 +195,7 @@ pub fn resolve_active_fetch(config_dir: &Path) -> ActiveFetch {
 }
 
 /// Validate a provider's submitted options against its descriptor.
-pub fn validate_fetch_options(
+fn validate_fetch_options(
     id: FetchProviderId,
     options: &HashMap<String, serde_yaml::Value>,
 ) -> Result<(), String> {

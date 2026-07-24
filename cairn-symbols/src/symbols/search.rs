@@ -27,6 +27,57 @@ pub fn search(root: &Path, target: &Path, pattern: &str, glob: Option<&str>) -> 
     search_dir(root, target, pattern, glob)
 }
 
+pub fn search_texts(files: &[(String, String)], pattern: &str, glob: Option<&str>) -> Rendered {
+    let globset = match glob {
+        Some(raw) => match build_globset(raw) {
+            Ok(set) => Some(set),
+            Err(err) => return Rendered::message(err),
+        },
+        None => None,
+    };
+    let mut compiled: HashMap<SupportLang, Option<Pattern>> = HashMap::new();
+    let mut compile_err = None;
+    let mut any_lang_ok = false;
+    let mut hits = Vec::new();
+    for (path, src) in files {
+        let path_ref = Path::new(path);
+        if globset.as_ref().is_some_and(|set| {
+            !set.is_match(path_ref) && !path_ref.file_name().is_some_and(|name| set.is_match(name))
+        }) {
+            continue;
+        }
+        let Some(lang) = lang_for_path(path_ref) else {
+            continue;
+        };
+        let compiled =
+            compiled
+                .entry(lang)
+                .or_insert_with(|| match compile_pattern(pattern, lang) {
+                    Ok(compiled) => Some(compiled),
+                    Err(error) => {
+                        compile_err.get_or_insert(error);
+                        None
+                    }
+                });
+        let Some(compiled) = compiled else {
+            continue;
+        };
+        any_lang_ok = true;
+        hits.extend(collect_hits(path, src, lang, compiled));
+    }
+    if !any_lang_ok {
+        if let Some(error) = compile_err {
+            return Rendered::message(error);
+        }
+    }
+    hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    if hits.is_empty() {
+        empty_ast_result()
+    } else {
+        render_locations(&hits)
+    }
+}
+
 /// Parse `src` under `lang`, run `compiled`, and label rows with `display_path`.
 ///
 /// The row snippet is the full source line containing the match start (trimmed),
