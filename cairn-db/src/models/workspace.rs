@@ -36,6 +36,57 @@ where
     Ok(Some(value))
 }
 
+/// Workspace-owned delivery policy for external message channels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub imessage: IMessageChannelConfig,
+}
+
+/// iMessage delivery configuration. Empty addresses keep the provider
+/// unconfigured even when `enabled` is true.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IMessageChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub route: ChannelRouteConfig,
+}
+
+/// The human-blocking gate kinds delivered through a channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelRouteConfig {
+    #[serde(default = "default_true")]
+    pub question: bool,
+    #[serde(default = "default_true")]
+    pub permission: bool,
+    #[serde(default = "default_true")]
+    pub review: bool,
+}
+
+impl Default for ChannelRouteConfig {
+    fn default() -> Self {
+        Self {
+            question: true,
+            permission: true,
+            review: true,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Workspace {
@@ -129,6 +180,9 @@ pub struct Settings {
     /// call pinned to a concrete native model stays native.
     #[serde(default, rename = "routeCallsViaOpenRouter")]
     pub route_calls_via_openrouter: bool,
+    /// Workspace-owned external delivery policy.
+    #[serde(default)]
+    pub channels: ChannelsConfig,
 }
 
 /// DTO for updating settings.
@@ -187,4 +241,6 @@ pub struct UpdateSettings {
     /// loop instead of the native backend. Default false.
     #[serde(rename = "routeCallsViaOpenRouter")]
     pub route_calls_via_openrouter: Option<bool>,
+    /// Replace the workspace external delivery policy.
+    pub channels: Option<ChannelsConfig>,
 }

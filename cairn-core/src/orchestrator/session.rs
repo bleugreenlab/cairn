@@ -613,8 +613,12 @@ fn build_project_checks_section(
          passing results ride along passively into your next turn.\n\n\
          Trust the cadence: a green verdict with a test count covers the diff, so the per-suite \
          commands exist for iterating on a failure a check surfaced, not for re-verifying a \
-         finished diff. What checks do NOT cover: live UI/feature verification and cross-system \
-         integration still need a browser or a dev instance.\n\n",
+         finished diff. When a suite verdict on another revision is genuinely the question — is \
+         this red already on the base, is there a baseline for whoever comes next — \
+         `cairn check run <suite> [branch]` answers it and records the observation through the \
+         same trusted path; a suite you run in a shell answers only for that shell. What checks \
+         do NOT cover: live UI/feature verification and cross-system integration still need a \
+         browser or a dev instance.\n\n",
     );
     for (name, check) in entries {
         out.push_str(&format!(

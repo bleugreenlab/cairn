@@ -120,6 +120,30 @@ async fn queued_rows(db: &LocalDb, job_id: &str) -> Vec<(String, String)> {
     .unwrap()
 }
 
+/// (content, delivered) of every queued_messages row for the job, oldest first.
+async fn recorded_rows(db: &LocalDb, job_id: &str) -> Vec<(String, bool)> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT content, delivered_at FROM queued_messages
+                     WHERE job_id = ?1 ORDER BY created_at ASC, rowid ASC",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push((row.text(0)?, row.opt_i64(1)?.is_some()));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
+}
+
 /// (key, wake) of every catch-up push addressed to `recipient`.
 async fn catchup_pushes(db: &LocalDb, recipient: &str) -> Vec<(String, String)> {
     let recipient = recipient.to_string();
@@ -240,6 +264,48 @@ async fn continue_job_or_enqueue_queues_when_head_turn_pending() {
         queued_rows(&orch.db.local, "job-1").await,
         vec![("ping".to_string(), "queue".to_string())],
         "a pending head turn must queue the same as a running one"
+    );
+}
+
+/// CAIRN-3390: an idle child takes the operator's text straight into the resume,
+/// so the queue never sees it and the only trace left behind is a `user`
+/// transcript event — the same slot the job's launch prompt and every
+/// machinery-delivered payload land in. The send is recorded here regardless,
+/// stamped delivered on arrival, so the record of what the operator said to this
+/// job stays complete for the watchers' catch-up digest. Being already delivered
+/// is what keeps it inert: no claim path, and no pending surface, can see it.
+#[tokio::test(flavor = "current_thread")]
+async fn an_idle_child_send_is_recorded_delivered_and_never_claimed() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    seed_job(&orch.db.local, "completed").await;
+    seed_coordinating_parent(&orch.db.local).await;
+    let before_turns = turn_count(&orch.db.local, "job-1").await;
+
+    // The resume itself fails for lack of a real worktree/process; the record is
+    // written before it, and must survive that.
+    let _ = continue_job_or_enqueue(&orch, "job-1", Some("^"), None);
+
+    assert_eq!(
+        recorded_rows(&orch.db.local, "job-1").await,
+        vec![("^".to_string(), true)],
+        "the operator's send is recorded, already delivered"
+    );
+    assert!(
+        cairn_core::messages::queued::list_pending_for_job(&orch.db.local, "job-1")
+            .unwrap()
+            .is_empty(),
+        "a delivered-on-arrival row is not pending work: the composer strip, the \
+         claim paths, and edit/delete all pass over it"
+    );
+    assert_eq!(
+        turn_count(&orch.db.local, "job-1").await,
+        before_turns,
+        "recording the send must not create a turn of its own"
+    );
+    assert_eq!(
+        catchup_pushes(&orch.db.local, "coordinator").await,
+        vec![("catchup:job-1".to_string(), "passive".to_string())],
+        "the coordinator still hears about an operator message to an idle child"
     );
 }
 

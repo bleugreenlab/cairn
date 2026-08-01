@@ -82,6 +82,105 @@ struct RemoteConfig {
     display_name: String,
 }
 
+/// What starting an enrollment answers with. The SSH bootstrap behind it takes
+/// minutes, so the runner hands back the operation to watch rather than holding
+/// the request open.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollmentStarted {
+    operation_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EnrollmentOperation {
+    id: String,
+    name: String,
+    uri: String,
+    phase: String,
+    #[serde(default)]
+    diagnostic: Option<String>,
+    cleanup: String,
+}
+
+impl EnrollmentOperation {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.phase.as_str(),
+            "ready" | "failed" | "retryRemoveRequired"
+        )
+    }
+}
+
+/// Follow an enrollment to its end, printing each phase the runner actually
+/// reaches. This is the same operation record the app renders; the CLI is one
+/// more reader of it, not a second implementation of waiting.
+async fn follow_enrollment(
+    client: &InvokeClient,
+    started: &EnrollmentStarted,
+) -> Result<String, String> {
+    let mut last_phase = String::new();
+    loop {
+        let operations: Vec<EnrollmentOperation> = client
+            .invoke("executor_enrollment_operations", json!({}))
+            .await?;
+        let Some(operation) = operations
+            .into_iter()
+            .find(|operation| operation.id == started.operation_id)
+        else {
+            return Err(format!(
+                "the runner stopped reporting enrollment {} for {}",
+                started.operation_id, started.name
+            ));
+        };
+        if operation.phase != last_phase {
+            eprintln!("{}: {}", operation.name, phase_label(&operation.phase));
+            last_phase = operation.phase.clone();
+        }
+        if operation.is_terminal() {
+            return match operation.phase.as_str() {
+                "ready" => Ok(format!(
+                    "Enrolled {}: ready ({})",
+                    operation.name, operation.uri
+                )),
+                _ => Err(format!(
+                    "{}{}",
+                    operation
+                        .diagnostic
+                        .unwrap_or_else(|| "enrollment failed".into()),
+                    if operation.cleanup == "incomplete" {
+                        format!(
+                            " Run `cairn executor remove {}` to clear what the rollback could not.",
+                            operation.name
+                        )
+                    } else {
+                        String::new()
+                    }
+                )),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn phase_label(phase: &str) -> &str {
+    match phase {
+        "validating" => "validating the request",
+        "probingHost" => "probing the host and its platform",
+        "resolvingArtifact" => "resolving an executor build for it",
+        "installingBinary" => "installing the executor binary",
+        "persistingConfiguration" => "persisting the enrollment configuration",
+        "grantingEnrollment" => "granting the enrollment",
+        "startingSupervision" => "starting supervision",
+        "awaitingReady" => "waiting for the executor to report Ready",
+        "ready" => "ready",
+        "cleaningUp" => "rolling back after a failure",
+        "retryRemoveRequired" => "failed; rollback incomplete",
+        _ => "failed",
+    }
+}
+
 struct InvokeClient {
     base_url: String,
     token: Option<String>,
@@ -178,15 +277,18 @@ pub(crate) async fn run(command: ExecutorCommand) -> bool {
                 Ok(request) => request,
                 Err(error) => return emit_error("add", &error),
             };
-            eprintln!("Preflighting and attaching remote executor…");
-            client
-                .invoke::<MutationResult>(
+            match client
+                .invoke::<EnrollmentStarted>(
                     "add_remote_executor",
                     serde_json::to_value(request).unwrap(),
                 )
                 .await
-                .map(|result| format_mutation("Added", &result))
-                .map_err(|error| ("add", error))
+            {
+                Ok(started) => follow_enrollment(&client, &started)
+                    .await
+                    .map_err(|error| ("add", error)),
+                Err(error) => Err(("add", error)),
+            }
         }
         ExecutorCommand::Remove { name } => {
             eprintln!("Stopping remote executor, verifying cleanup, and revoking enrollment…");

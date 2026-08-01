@@ -44,7 +44,8 @@ pub use common::{
 
 // Workspace and settings
 pub use workspace::{
-    ExternalReplyMode, OpenRouterRouting, OpenRouterSort, Settings, UpdateSettings,
+    ChannelRouteConfig, ChannelsConfig, ExternalReplyMode, IMessageChannelConfig,
+    OpenRouterRouting, OpenRouterSort, Settings, UpdateSettings,
 };
 
 // Project types
@@ -66,8 +67,8 @@ pub use provider_usage::{
 
 // Issue types
 pub use issue::{
-    Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress,
-    IssueStatus, UpdateIssue,
+    Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueKind,
+    IssueProgress, IssueStatus, UpdateIssue,
 };
 pub use label::{CreateLabel, Label, UpdateLabel};
 

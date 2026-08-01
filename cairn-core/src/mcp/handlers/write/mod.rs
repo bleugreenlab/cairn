@@ -180,6 +180,24 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         Err(error) => return error,
     };
 
+    // A thread writes no tracked files. Asked ahead of the apply round-trip, the
+    // preview path, and any mutation, because a thread runs ON the base branch:
+    // the commit this batch would seal publishes to the project's default branch
+    // with no PR behind it. The same refusal answers the `run` verb. Only a batch
+    // that actually carries a `commit_msg` pays the lookup, so a resource-only
+    // write and an unauthenticated (user) write are untouched.
+    if payload.commit_msg.is_some() {
+        if let Ok((context, db)) =
+            crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await
+        {
+            if let Some(refusal) =
+                crate::threads::commit_refusal_for_job(&db, &context.job_id).await
+            {
+                return refusal;
+            }
+        }
+    }
+
     // Resolve home-relative (`cairn:~/...`) targets to canonical up front, so
     // blocking-append classification — which runs on the raw target before the
     // dispatch that would otherwise resolve it — sees the real resource. SDK

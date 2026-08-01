@@ -1473,6 +1473,33 @@ fn format_transcript_digest(
     )
 }
 
+/// One rendered turn of a transcript: the events sharing a `turn_id`, with any
+/// turn-less events folded into the block they follow.
+///
+/// This grouping is the job's single chronological turn sequence, and a block's
+/// index in it is the coordinate the `/chat?offset=&limit=` re-read address
+/// pages by. Thread compaction addresses its dropped chapters that way, so the
+/// grouping has exactly one definition rather than one per consumer.
+pub(super) struct TurnBlock<'a> {
+    pub turn_id: Option<&'a str>,
+    pub events: Vec<&'a EventRow>,
+}
+
+pub(super) fn group_turn_blocks(events: &[EventRow]) -> Vec<TurnBlock<'_>> {
+    let mut blocks: Vec<TurnBlock> = Vec::new();
+    for event in events {
+        let key = event.turn_id.as_deref();
+        match blocks.last_mut() {
+            Some(block) if key.is_none() || block.turn_id == key => block.events.push(event),
+            _ => blocks.push(TurnBlock {
+                turn_id: key,
+                events: vec![event],
+            }),
+        }
+    }
+    blocks
+}
+
 pub(super) fn format_transcript_digest_with(
     events: &[EventRow],
     base_uri: &str,
@@ -1486,21 +1513,7 @@ pub(super) fn format_transcript_digest_with(
 
     let results = collect_results(events);
 
-    struct Block<'a> {
-        turn_id: Option<&'a str>,
-        events: Vec<&'a EventRow>,
-    }
-    let mut blocks: Vec<Block> = Vec::new();
-    for event in events {
-        let key = event.turn_id.as_deref();
-        match blocks.last_mut() {
-            Some(block) if key.is_none() || block.turn_id == key => block.events.push(event),
-            _ => blocks.push(Block {
-                turn_id: key,
-                events: vec![event],
-            }),
-        }
-    }
+    let blocks = group_turn_blocks(events);
 
     let run_count = {
         let mut seen: Vec<&str> = Vec::new();
@@ -1655,11 +1668,13 @@ fn render_block(
                 }
             }
             "user:seed" => {
-                // A cold-resume seed marker (CAIRN-2534): collapse to one line
-                // regardless of `opts.unabridged`, so `messages=full` never
-                // re-expands the embedded prior digest and a chain of hourly
-                // reseeds stays bounded.
-                out.push_str("· [reseeded from prior session digest]\n");
+                // A seed marker (CAIRN-2534): collapse to one line regardless of
+                // `opts.unabridged`, so `messages=full` never re-expands the
+                // embedded prior context and a chain of reseeds stays bounded.
+                // The label is deliberately neutral about what produced the
+                // seed — a stale session's digest, or a thread compaction that
+                // may have fired while the session was still warm.
+                out.push_str("· [prior context compacted]\n");
             }
             crate::transcripts::CONTINUATION_EVENT_TYPE => {
                 // Cairn's own resume nudge (CAIRN-3175). It renders as a marker
@@ -2409,7 +2424,7 @@ mod tests {
                 },
             );
             assert!(
-                out.contains("[reseeded from prior session digest]"),
+                out.contains("[prior context compacted]"),
                 "seed marker missing (unabridged={unabridged}): {out}"
             );
             assert!(
@@ -2421,7 +2436,7 @@ mod tests {
                 "trigger not verbatim (unabridged={unabridged}): {out}"
             );
             assert_eq!(
-                out.matches("[reseeded from prior session digest]").count(),
+                out.matches("[prior context compacted]").count(),
                 1,
                 "seed should collapse to exactly one line (unabridged={unabridged}): {out}"
             );

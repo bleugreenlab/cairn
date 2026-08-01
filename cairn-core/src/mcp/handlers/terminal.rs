@@ -1188,6 +1188,7 @@ async fn terminal_residency_acquisition(
         1024 * 1024 * 1024
     };
     Ok(ResidencyAcquireRequest {
+        executor: None,
         holder: ResidencyHolder::ProjectTerminals {
             project_id: owner_id.clone(),
         },

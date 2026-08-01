@@ -8,7 +8,7 @@ use super::ProjectContext;
 use crate::issues::relations;
 use crate::labels::attach;
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{Issue, IssueAttention, IssueProgress, IssueStatus, Label};
+use crate::models::{Issue, IssueAttention, IssueKind, IssueProgress, IssueStatus, Label};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 // ============================================================================
@@ -37,6 +37,7 @@ async fn insert_issue_with_context(
     description: Option<String>,
     parent_uri: Option<String>,
     labels: Option<Vec<String>>,
+    kind: IssueKind,
 ) -> Result<Issue, String> {
     let services = &orch.services;
     let embed_text = description.clone().unwrap_or_default();
@@ -51,6 +52,7 @@ async fn insert_issue_with_context(
         description,
         parent_uri,
         labels,
+        kind,
     )
     .await
     .map_err(|e| format!("Failed to create issue: {}", e))?;
@@ -102,8 +104,8 @@ fn emit_labels_created(orch: &Orchestrator, created: &[Label]) {
 
 fn created_issue_summary(ctx: &ProjectContext, issue: &Issue) -> String {
     format!(
-        "Created issue {}-{}: \"{}\"",
-        ctx.project_key, issue.number, issue.title
+        "Created {} {}-{}: \"{}\"",
+        issue.kind, ctx.project_key, issue.number, issue.title
     )
 }
 
@@ -128,6 +130,7 @@ pub async fn create_issue_in_project(
     labels: Option<Vec<String>>,
     execution: Option<CreateExecutionSpec>,
     parent_uri: Option<String>,
+    kind: IssueKind,
 ) -> Result<CreatedIssueOutcome, String> {
     let owning_db = orch.db.for_project(project_key).await;
     let ctx = lookup_project_by_key(&owning_db, project_key).await?;
@@ -139,6 +142,7 @@ pub async fn create_issue_in_project(
         description,
         parent_uri,
         labels,
+        kind,
     )
     .await?;
     let summary = created_issue_summary(&ctx, &issue);
@@ -252,6 +256,7 @@ async fn lookup_project_context(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_issue_row(
     db: &LocalDb,
     project_id: &str,
@@ -259,6 +264,7 @@ async fn create_issue_row(
     description: Option<String>,
     parent_uri: Option<String>,
     labels: Option<Vec<String>>,
+    kind: IssueKind,
 ) -> DbResult<(Issue, Vec<Label>)> {
     let project_id = project_id.to_string();
     db.write(|conn| {
@@ -317,9 +323,9 @@ async fn create_issue_row(
                 "
                 INSERT INTO issues (
                     id, project_id, number, title, description, status, progress,
-                    attention, priority, created_at, updated_at, model, parent_issue_id
+                    attention, priority, created_at, updated_at, model, parent_issue_id, kind
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, NULL, ?7)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, NULL, ?7, ?8)
                 ",
                 params![
                     id.as_str(),
@@ -328,7 +334,8 @@ async fn create_issue_row(
                     title.as_str(),
                     description.as_deref(),
                     now,
-                    parent_issue_id.as_deref()
+                    parent_issue_id.as_deref(),
+                    kind.to_string()
                 ],
             )
             .await?;
@@ -364,6 +371,7 @@ async fn create_issue_row(
                     depends_on: Vec::new(),
                     unmet_depends_on: Vec::new(),
                     labels: Vec::new(),
+                    kind,
                 });
             Ok((issue, created_labels))
         })
@@ -803,6 +811,7 @@ mod tests {
             None,
             None,
             None,
+            IssueKind::Issue,
         )
         .await
         .unwrap();

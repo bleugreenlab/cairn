@@ -1701,6 +1701,27 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         );
     }
 
+    let commit_present = payload.commit_msg.is_some();
+
+    // A thread writes no tracked files, and a thread runs ON the base branch: a
+    // seal from this batch publishes to the project's default branch with no PR
+    // behind it. Asked FIRST, ahead of every branch below that can act — the
+    // waitFor arm's host control flow and, critically, the workflow arm, which
+    // starts a workflow node and durably suspends the caller. A refusal placed
+    // after item-specific dispatch is not fail-closed, however early it looks in
+    // the executing path. Only a batch that actually carries a `commit_msg` pays
+    // the lookup, and an unresolvable run is treated as ordinary — the same
+    // shape, and the same safe direction, as the `write` verb's door.
+    if commit_present {
+        if let Ok((context, db)) = super::run_context::lookup_run_routed(&orch.db, request).await {
+            if let Some(refusal) =
+                crate::threads::commit_refusal_for_job(&db, &context.job_id).await
+            {
+                return run_envelope(refusal, Vec::new());
+            }
+        }
+    }
+
     if let Some(item) = payload.commands.iter().find(|item| item.wait_for.is_some()) {
         if payload.commands.len() != 1 {
             return run_envelope(
@@ -1767,7 +1788,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         .tool_use_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let commit_present = payload.commit_msg.is_some();
 
     // Advisory nudge: if any shell item wraps an interpreter one-liner
     // (`python3 -c`, `bun -e`, a `python <<EOF` heredoc, …), surface a one-line
@@ -2038,7 +2058,8 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     }
                 }),
                 cwd: relative_cwd,
-                env: detached_route_env(
+                env: placed_batch_env(
+                    run_context.as_ref().map(|ctx| ctx.run_id.as_str()),
                     branch_target.as_ref().map(|target| target.rev.as_str()),
                     logical_resolution
                         .as_ref()
@@ -3412,14 +3433,43 @@ async fn settle_run_batch(
     }
 }
 
-fn detached_route_env(
+/// The Cairn environment a placed batch carries to whatever machine runs it.
+///
+/// A run batch is dispatched to a build cell, and that cell may be on this
+/// machine or on an enrolled remote, so only facts that stay true wherever it
+/// lands belong here. Two do.
+///
+/// `CAIRN_RUN_ID` is the run whose authority the batch's commands act with. An
+/// agent shell is expected to reach `cairn read|write|check run …` with no
+/// setup, and the runner authenticates those calls against this run; without it
+/// every in-batch CLI invocation is anonymous and every run-scoped tool refuses
+/// it. [`process::build_agent_spawn_config`] states the same fact for a batch
+/// the host spawns itself — placement must not be what decides whether an agent
+/// shell knows who it is.
+///
+/// `CAIRN_WORKTREE_BRANCH` is the branch a detached cell checkout cannot name
+/// for itself, which branch-keyed tooling (`scripts/resolve-branch.ts`) reads.
+///
+/// Transport is deliberately absent. The callback URL and the MCP secret
+/// describe the machine the runner runs on, not the batch, and the CLI resolves
+/// both from the environment it actually executes in. On a colocated executor
+/// that resolves to this runner and the shell authenticates with nothing
+/// plumbed through; on a remote executor nothing resolves and the CLI reports an
+/// unreachable runner, which is true, rather than a loopback address naming a
+/// different machine's runner.
+fn placed_batch_env(
+    run_id: Option<&str>,
     branch_target_rev: Option<&str>,
     managed_workspace_branch: Option<&str>,
 ) -> Vec<(String, String)> {
-    branch_target_rev
-        .or(managed_workspace_branch)
-        .map(|branch| vec![("CAIRN_WORKTREE_BRANCH".to_string(), branch.to_string())])
-        .unwrap_or_default()
+    let mut env = Vec::new();
+    if let Some(run_id) = run_id.filter(|run_id| !run_id.is_empty()) {
+        env.push(("CAIRN_RUN_ID".to_string(), run_id.to_string()));
+    }
+    if let Some(branch) = branch_target_rev.or(managed_workspace_branch) {
+        env.push(("CAIRN_WORKTREE_BRANCH".to_string(), branch.to_string()));
+    }
+    env
 }
 
 #[cfg(test)]
@@ -3972,21 +4022,65 @@ mod tests {
     }
 
     #[test]
-    fn detached_route_env_covers_managed_and_explicit_branch_routes() {
+    fn placed_batch_env_covers_managed_and_explicit_branch_routes() {
         assert_eq!(
-            detached_route_env(None, Some("agent/CAIRN-2929-builder-0")),
+            placed_batch_env(None, None, Some("agent/CAIRN-2929-builder-0")),
             [(
                 "CAIRN_WORKTREE_BRANCH".into(),
                 "agent/CAIRN-2929-builder-0".into()
             )]
         );
         assert_eq!(
-            detached_route_env(Some("feature/dev-instance"), None),
+            placed_batch_env(None, Some("feature/dev-instance"), None),
             [(
                 "CAIRN_WORKTREE_BRANCH".into(),
                 "feature/dev-instance".into()
             )]
         );
+    }
+
+    /// An authenticated batch states its run wherever it is placed.
+    ///
+    /// A `cairn` invocation inside a batch shell authenticates against this and
+    /// nothing else, so dropping it does not degrade the shell — it anonymizes
+    /// it, and every run-scoped tool refuses an anonymous caller. That is how
+    /// `cairn check run <suite>` came to answer "authenticated check_run request
+    /// is missing its run ID" from a shell whose run was never in doubt
+    /// (CAIRN-3381). The branch route travelling while the identity did not is
+    /// the exact shape of the regression, so assert both together.
+    #[test]
+    fn a_placed_batch_carries_the_run_its_commands_act_with() {
+        assert_eq!(
+            placed_batch_env(Some("run-7"), None, Some("agent/CAIRN-3381-builder-0")),
+            [
+                ("CAIRN_RUN_ID".into(), "run-7".into()),
+                (
+                    "CAIRN_WORKTREE_BRANCH".into(),
+                    "agent/CAIRN-3381-builder-0".into()
+                )
+            ]
+        );
+        // An attribution run (`cairn check run rust-tests main`) reads another
+        // revision but is still the caller's own run acting on it.
+        assert_eq!(
+            placed_batch_env(Some("run-7"), Some("main"), None),
+            [
+                ("CAIRN_RUN_ID".into(), "run-7".into()),
+                ("CAIRN_WORKTREE_BRANCH".into(), "main".into())
+            ]
+        );
+    }
+
+    /// An unauthenticated batch claims no run rather than an empty one.
+    ///
+    /// `CAIRN_RUN_ID=""` would authenticate as far as the variable's presence
+    /// and then fail deeper, where the diagnosis is worse; the CLI's own
+    /// `run_id` is `Option`, so absence is representable and is the honest
+    /// answer for a batch nobody owns.
+    #[test]
+    fn an_unowned_batch_states_no_run_at_all() {
+        assert!(placed_batch_env(None, None, None).is_empty());
+        assert!(placed_batch_env(Some(""), None, None).is_empty());
     }
 
     fn identity_request(project_id: &str, repository_id: &str) -> CellRequest {

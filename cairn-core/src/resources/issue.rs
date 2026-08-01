@@ -9,7 +9,7 @@ use super::common::{
 };
 
 use crate::issues::relations;
-use crate::models::{ExecutionSnapshot, RecipeNodeType};
+use crate::models::{ExecutionSnapshot, IssueKind, RecipeNodeType};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
 
@@ -166,7 +166,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     let mut issue_rows = match conn
         .query(
             "
-            SELECT id, title, status, description, created_at, parent_issue_id
+            SELECT id, title, status, description, created_at, parent_issue_id, kind
             FROM issues
             WHERE project_id = ?1 AND number = ?2
             LIMIT 1
@@ -179,7 +179,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         Err(error) => return storage_error("Failed to load issue", error.into()),
     };
 
-    let (issue_id, title, status, description, created_at, parent_issue_id) =
+    let (issue_id, title, status, description, created_at, parent_issue_id, kind) =
         match issue_rows.next().await {
             Ok(Some(row)) => {
                 let parsed: DbResult<_> = (|| {
@@ -190,6 +190,9 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
                         row.opt_text(3)?,
                         row.i64(4)? as i32,
                         row.opt_text(5)?,
+                        row.opt_text(6)?
+                            .and_then(|kind| kind.parse::<IssueKind>().ok())
+                            .unwrap_or_default(),
                     ))
                 })();
                 match parsed {
@@ -211,8 +214,18 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         .map(|dt| dt.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
+    // The kind is stated only when it is not the default, so an ordinary issue
+    // reads exactly as it always did and a thread announces itself. Absence of
+    // the segment is therefore as informative as its presence.
+    let kind_segment = match kind {
+        IssueKind::Issue => String::new(),
+        IssueKind::Thread => format!("Kind: {kind} | "),
+    };
     let mut output = format!("# {}-{}: {}\n\n", project_key, number, title);
-    output.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
+    output.push_str(&format!(
+        "{}Status: {} | Created: {}\n",
+        kind_segment, status, created_date
+    ));
     if !labels.is_empty() {
         output.push_str(&format!(
             "Labels: {}\n",

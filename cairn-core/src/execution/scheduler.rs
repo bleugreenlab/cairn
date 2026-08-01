@@ -489,6 +489,7 @@ async fn fire_scheduled_recipe(
         None,
         None,
         None,
+        crate::models::IssueKind::Issue,
     )
     .await?;
 

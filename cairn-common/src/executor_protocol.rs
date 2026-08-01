@@ -212,7 +212,7 @@ pub struct LearnedResourceEstimate {
 /// message, and — worse — a runner that could not decode the reply would have no
 /// way to distinguish "markers were written" from "nothing happened", which is
 /// precisely the claim the wake is forbidden to make without confirmation.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 29;
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 30;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -576,6 +576,10 @@ pub struct RepositoryIdentity {
     rename_all_fields = "camelCase"
 )]
 pub enum RepositoryLocator {
+    ScratchOnly {
+        #[serde(alias = "owner_id")]
+        owner_id: String,
+    },
     ColocatedPath {
         #[serde(alias = "project_id")]
         project_id: String,
@@ -605,6 +609,11 @@ pub enum RepositoryLocator {
 impl RepositoryLocator {
     pub fn identity(&self) -> RepositoryIdentity {
         match self {
+            Self::ScratchOnly { owner_id } => RepositoryIdentity {
+                project_id: owner_id.clone(),
+                repository_id: owner_id.clone(),
+                object_format: GitObjectFormat::Sha1,
+            },
             Self::ColocatedPath {
                 project_id,
                 repository_id,
@@ -633,6 +642,7 @@ impl RepositoryLocator {
 
     pub fn project_id(&self) -> &str {
         match self {
+            Self::ScratchOnly { owner_id } => owner_id,
             Self::ColocatedPath { project_id, .. }
             | Self::ExistingCheckout { project_id, .. }
             | Self::ManagedObjects { project_id, .. } => project_id,
@@ -641,6 +651,7 @@ impl RepositoryLocator {
 
     pub fn repository_id(&self) -> &str {
         match self {
+            Self::ScratchOnly { owner_id } => owner_id,
             Self::ColocatedPath { repository_id, .. }
             | Self::ExistingCheckout { repository_id, .. }
             | Self::ManagedObjects { repository_id, .. } => repository_id,
@@ -651,7 +662,7 @@ impl RepositoryLocator {
         match self {
             Self::ColocatedPath { absolute_path, .. }
             | Self::ExistingCheckout { absolute_path, .. } => Some(absolute_path),
-            Self::ManagedObjects { .. } => None,
+            Self::ScratchOnly { .. } | Self::ManagedObjects { .. } => None,
         }
     }
 }
@@ -1276,6 +1287,7 @@ fn default_subscriber_count() -> usize {
     rename_all_fields = "camelCase"
 )]
 pub enum ResidencyHolder {
+    Service { service_id: String },
     Job { job_id: String },
     DevInstance { instance_id: String },
     ProjectTerminals { project_id: String },
@@ -1289,7 +1301,10 @@ impl ResidencyHolder {
     /// scheduled work and waits its turn.
     pub fn is_interactive(&self) -> bool {
         match self {
-            Self::Job { .. } | Self::DevInstance { .. } | Self::ProjectTerminals { .. } => true,
+            Self::Service { .. }
+            | Self::Job { .. }
+            | Self::DevInstance { .. }
+            | Self::ProjectTerminals { .. } => true,
             Self::Workflow { .. } => false,
         }
     }
@@ -1298,6 +1313,7 @@ impl ResidencyHolder {
     /// and log lines. Round-trips through `parse_storage_key`.
     pub fn storage_key(&self) -> String {
         match self {
+            Self::Service { service_id } => format!("service:{service_id}"),
             Self::Job { job_id } => format!("job:{job_id}"),
             Self::DevInstance { instance_id } => format!("devInstance:{instance_id}"),
             Self::ProjectTerminals { project_id } => format!("projectTerminals:{project_id}"),
@@ -1311,6 +1327,9 @@ impl ResidencyHolder {
             return None;
         }
         Some(match class {
+            "service" => Self::Service {
+                service_id: id.to_string(),
+            },
             "job" => Self::Job {
                 job_id: id.to_string(),
             },
@@ -1494,6 +1513,7 @@ pub enum ResidentProcessStatus {
     rename_all_fields = "camelCase"
 )]
 pub enum ResidentProcessKind {
+    Service { service: String },
     Terminal { slug: String },
     Repl { slug: String },
     DevInstance,
@@ -2695,6 +2715,8 @@ pub struct ExecutorSubstrateReport {
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorHealthSnapshot {
     pub identity: ExecutorIdentity,
+    /// Canonical public address used by fleet resources and inspection lookup.
+    pub public_name: String,
     /// True for the executor the runner supervises inside its own process tree.
     /// Everything else attached to this fleet is an enrolled executor, so work
     /// placed there is attributed to it rather than read as ambient local work.
@@ -3420,6 +3442,8 @@ pub struct SubstrateHealthSnapshot {
 pub struct ResidencyAcquireRequest {
     pub holder: ResidencyHolder,
     pub repository: RepositoryLocator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<ExecutorSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_ref: Option<CellOwnerRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4377,8 +4401,25 @@ mod tests {
     }
 
     #[test]
+    fn scratch_only_repository_uses_its_owner_as_its_stable_identity() {
+        let repository = RepositoryLocator::ScratchOnly {
+            owner_id: "channel-imessage".into(),
+        };
+        assert_eq!(repository.project_id(), "channel-imessage");
+        assert_eq!(repository.repository_id(), "channel-imessage");
+        assert_eq!(repository.identity().project_id, "channel-imessage");
+        assert_eq!(
+            serde_json::to_value(repository).unwrap(),
+            serde_json::json!({"kind": "scratchOnly", "ownerId": "channel-imessage"})
+        );
+    }
+
+    #[test]
     fn holder_storage_keys_round_trip_for_every_class() {
         for holder in [
+            ResidencyHolder::Service {
+                service_id: "channel-imessage".into(),
+            },
             ResidencyHolder::Job {
                 job_id: "job".into(),
             },
@@ -4690,6 +4731,10 @@ mod tests {
         ResidencyAcquireRequest {
             holder: sample_holder(),
             repository: sample_request().repository,
+            executor: Some(ExecutorSelector {
+                name: Some("executor-a".into()),
+                ..ExecutorSelector::default()
+            }),
             owner_ref: Some(CellOwnerRef {
                 project_id: "project".into(),
                 project_key: Some("CAIRN".into()),
@@ -5409,6 +5454,7 @@ mod tests {
             ],
             executors: vec![ExecutorHealthSnapshot {
                 identity: sample_advertisement().identity,
+                public_name: "local".into(),
                 colocated: true,
                 status: ExecutorHealthStatus::Online,
                 heartbeat_age_ms: 21,

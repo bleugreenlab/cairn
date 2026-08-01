@@ -576,7 +576,15 @@ fn format_exec_body(exec: &ExecOutput, timeout_ms: u32) -> String {
 /// stateful REPL eval-server: identical env injection (MCP callback, PATH shim,
 /// uv cache, worktree VCS env, git identity, per-job scratch `TMPDIR`, the
 /// `cairn:~` home URI) plus the optional OS sandbox. The one canonical
-/// env-injection site so the two spawn paths cannot drift.
+/// env-injection site for work the host spawns itself, so those two paths
+/// cannot drift.
+///
+/// A batch placed onto a build cell does NOT pass through here: the executor
+/// composes that machine's own PATH, scratch, and toolchain env, and cairn-core
+/// states only what stays true wherever the batch lands. That seam is
+/// [`super::placed_batch_env`], and the run identity below is the one thing both
+/// paths must agree on — an agent shell knows who it is regardless of which
+/// machine it got.
 ///
 /// Callers layer only their own extras on top: `execute_process` adds `.stdin`
 /// for the `uv run -` payload; the REPL spawner always captures stdin (its

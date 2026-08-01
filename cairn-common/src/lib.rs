@@ -15,5 +15,6 @@ pub mod query;
 pub mod read;
 pub mod run_contract;
 pub mod scratch;
+pub mod toolchain_path;
 pub mod uri;
 pub mod write_contract;

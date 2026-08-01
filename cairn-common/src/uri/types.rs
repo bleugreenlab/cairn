@@ -119,6 +119,21 @@ pub enum CairnResource {
         project: String,
         number: i32,
     },
+    /// A thread addressed by name: `cairn://p/{PROJECT}/t/{name}`.
+    ///
+    /// An alias, never an identity. The number is what a thread IS — numbers
+    /// are stable precisely because they are meaningless, so a name that moved
+    /// with a retitle would break every reference that had ever been written
+    /// down. This variant therefore exists only to be resolved into
+    /// [`Self::Issue`] on the way in: it is accepted on input, and nothing —
+    /// no rendered link, wake ref, or parent field — ever emits it.
+    ///
+    /// `name` is the segment exactly as written; the reader normalizes it (and
+    /// the candidate titles) into a slug when it resolves.
+    ThreadAlias {
+        project: String,
+        name: String,
+    },
     Node {
         project: String,
         number: i32,
@@ -662,6 +677,7 @@ impl CairnResource {
             Self::ProjectBrowser { .. } => ResourceKind::ProjectBrowser,
             Self::ProjectBrowserNetworkRequest { .. } => ResourceKind::ProjectBrowserNetworkRequest,
             Self::Issue { .. } => ResourceKind::Issue,
+            Self::ThreadAlias { .. } => ResourceKind::ThreadAlias,
             Self::Changed { .. } => ResourceKind::Changed,
             Self::IssueExecutions { .. } => ResourceKind::IssueExecutions,
             Self::IssueExecution { .. } => ResourceKind::IssueExecution,

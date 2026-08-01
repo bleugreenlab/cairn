@@ -534,25 +534,12 @@ pub fn read_pty_loop<R: Read, FData, FExit>(
 }
 
 /// Get the default shell path based on environment and platform.
+///
+/// Resolved by [`cairn_common::toolchain_path`], which also probes this shell
+/// for the login PATH, so a terminal and a PATH composition never disagree
+/// about which shell this user has.
 pub fn get_default_shell() -> String {
-    std::env::var("SHELL")
-        .or_else(|_| std::env::var("COMSPEC")) // Windows shell env var
-        .unwrap_or_else(|_| {
-            if cfg!(windows) {
-                // Prefer PowerShell if available, fall back to cmd
-                if std::path::Path::new(
-                    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-                )
-                .exists()
-                {
-                    "powershell.exe".to_string()
-                } else {
-                    "cmd.exe".to_string()
-                }
-            } else {
-                "/bin/bash".to_string()
-            }
-        })
+    cairn_common::toolchain_path::default_shell()
 }
 
 #[cfg(test)]

@@ -972,6 +972,172 @@ async fn an_unsatisfiable_executor_selector_still_refuses_instead_of_queueing() 
     );
 }
 
+/// The tracked-writes half of the thread posture, at the `run` door.
+///
+/// A thread owns no branch, so its job runs ON the base branch: the seal this
+/// batch would take at the commit barrier publishes to the project's default
+/// branch with no pull request and no review surface. The same batch runs
+/// against both fixtures, so the issue's kind is the only variable — an ordinary
+/// issue's `commit_msg` lands a real commit carrying the file, and the thread's
+/// is refused before the batch's items resolve, so the command never runs.
+///
+/// The third assertion is the one that keeps this a single mechanism rather than
+/// two: a thread's operational dirt without a `commit_msg` is handled by the
+/// restore path that already exists, not by anything added here.
+#[tokio::test]
+async fn a_thread_cannot_commit_from_a_run_and_an_ordinary_issue_still_can() {
+    if common::skip_if_fenced("a_thread_cannot_commit_from_a_run_and_an_ordinary_issue_still_can") {
+        return;
+    }
+    let batch = json!({
+        "commands": [{ "command": "printf posture > posture.txt" }],
+        "commit_msg": "land the marker",
+    });
+
+    let (issue_temp, _issue_db, issue_orch, issue_cwd) = setup("run-posture-issue").await;
+    let landed = run_text(
+        &handle_run(
+            &issue_orch,
+            &request(&issue_cwd, Some("run-posture-issue"), batch.clone()),
+        )
+        .await,
+    );
+    assert!(
+        landed.contains("Committed changes"),
+        "an ordinary issue's run must still commit: {landed}"
+    );
+    let landed_files = git_stdout(
+        &issue_temp.path().join("project"),
+        &["show", "--stat", "--format=", &committed_sha(&landed)],
+    );
+    assert!(
+        landed_files.contains("posture.txt"),
+        "the commit must actually carry the batch's file: {landed_files}"
+    );
+
+    let (_thread_temp, thread_db, thread_orch, thread_cwd) = setup("run-posture-thread").await;
+    thread_db
+        .execute(
+            "UPDATE issues SET kind = 'thread' WHERE id = 'issue-run-posture-thread'",
+            params![],
+        )
+        .await
+        .unwrap();
+
+    let refusal = run_text(
+        &handle_run(
+            &thread_orch,
+            &request(&thread_cwd, Some("run-posture-thread"), batch),
+        )
+        .await,
+    );
+    assert!(
+        refusal.contains("it is a thread") && refusal.contains("child issue"),
+        "the thread must be told the posture and where the work belongs: {refusal}"
+    );
+    assert!(
+        !refusal.contains("Committed changes"),
+        "nothing may have been sealed: {refusal}"
+    );
+    assert!(
+        !Path::new(&thread_cwd).join("posture.txt").exists(),
+        "a fail-closed refusal is taken before the batch executes: {refusal}"
+    );
+
+    let scratch = run_text(
+        &handle_run(
+            &thread_orch,
+            &request(
+                &thread_cwd,
+                Some("run-posture-thread"),
+                json!({ "commands": [{ "command": "printf scratch > scratch.txt" }] }),
+            ),
+        )
+        .await,
+    );
+    assert!(
+        !Path::new(&thread_cwd).join("scratch.txt").exists(),
+        "a thread's uncommitted dirt is returned to HEAD by the restore path that \
+         already exists, with nothing added for threads: {scratch}"
+    );
+    assert!(
+        scratch.contains("no commit_msg"),
+        "and the thread is told why its dirt did not survive: {scratch}"
+    );
+}
+
+/// Fail-closed means ahead of every branch that can act, not merely early in
+/// the executing path.
+///
+/// A workflow target is the shape that proves the difference. It is a
+/// DELEGATION, not a subprocess: `handle_run` dispatches it before the batch's
+/// items are ever resolved, starting a workflow node and durably suspending the
+/// caller. A thread refusal placed after that dispatch reads as early and is not
+/// fail-closed — the thread's `commit_msg` would be silently ignored while the
+/// side effect happened anyway.
+///
+/// The ordinary-issue arm is what gives this teeth. The identical batch
+/// demonstrably reaches workflow dispatch, since only that branch can answer
+/// about a workflow at all, so the thread's refusal is the guard firing first
+/// rather than a target that was never recognized as a workflow.
+#[tokio::test]
+async fn a_thread_is_refused_before_a_workflow_target_can_suspend_the_caller() {
+    let batch = json!({
+        "commands": [{ "target": "cairn://workflows/deep-research" }],
+        "commit_msg": "should never land",
+    });
+
+    let (_issue_temp, _issue_db, issue_orch, issue_cwd) =
+        setup_without_executor("run-workflow-issue").await;
+    let reached = run_text(
+        &handle_run(
+            &issue_orch,
+            &request(&issue_cwd, Some("run-workflow-issue"), batch.clone()),
+        )
+        .await,
+    );
+    assert!(
+        reached.contains("deep-research"),
+        "an ordinary issue's batch must reach workflow dispatch, or this test proves nothing: {reached}"
+    );
+
+    let (_thread_temp, thread_db, thread_orch, thread_cwd) =
+        setup_without_executor("run-workflow-thread").await;
+    thread_db
+        .execute(
+            "UPDATE issues SET kind = 'thread' WHERE id = 'issue-run-workflow-thread'",
+            params![],
+        )
+        .await
+        .unwrap();
+
+    let refusal = run_text(
+        &handle_run(
+            &thread_orch,
+            &request(&thread_cwd, Some("run-workflow-thread"), batch),
+        )
+        .await,
+    );
+    assert!(
+        refusal.contains("it is a thread"),
+        "the thread must be refused: {refusal}"
+    );
+    assert!(
+        !refusal.contains("deep-research"),
+        "the batch must never have reached workflow dispatch: {refusal}"
+    );
+    assert_eq!(
+        count(&thread_db, "SELECT COUNT(*) FROM agent_waits").await,
+        0,
+        "a refused batch must not have suspended its caller: {refusal}"
+    );
+    assert_eq!(
+        count(&thread_db, "SELECT COUNT(*) FROM jobs").await,
+        1,
+        "a refused batch must not have created a workflow node: {refusal}"
+    );
+}
+
 /// The headline contract. The same batch carrying the same `commit_msg`
 /// publishes the same commit whether it settled inside the grace window or
 /// suspended past it, the suspended call returns a marker rather than a partial

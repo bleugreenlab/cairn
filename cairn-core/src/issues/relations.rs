@@ -4,7 +4,7 @@ use cairn_common::uri::{build_issue_uri, parse_uri, CairnResource};
 use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
 
-use crate::models::IssueStatus;
+use crate::models::{IssueKind, IssueStatus};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,6 +320,105 @@ pub(crate) async fn issue_id_for_project_number(
     .await
 }
 
+/// Every thread in `project_key` whose title slugifies to `slug`, by issue
+/// number ascending.
+///
+/// The slug is computed here rather than in SQL because
+/// [`slugify_resource_segment`] is the single normalization rule shared with
+/// every other cairn:// segment, and a second spelling of it in SQL would be a
+/// second rule. Only rows whose kind is `thread` are candidates, so an ordinary
+/// issue whose title slugifies identically is neither addressable by name nor
+/// able to make one ambiguous. Status is not a filter: a resolved thread is
+/// still a thread, and hiding it would turn a refusal into a wrong answer.
+async fn thread_numbers_for_slug(
+    db: &LocalDb,
+    project_key: &str,
+    slug: &str,
+) -> DbResult<Vec<i32>> {
+    let project_key = project_key.to_uppercase();
+    let slug = slug.to_string();
+    db.read(|conn| {
+        let project_key = project_key.clone();
+        let slug = slug.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT i.number, i.title
+                     FROM issues i
+                     JOIN projects p ON p.id = i.project_id
+                     WHERE p.key = ?1 AND LOWER(i.kind) = 'thread'
+                     ORDER BY i.number ASC",
+                    params![project_key.as_str()],
+                )
+                .await?;
+            let mut numbers = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let title_slug = crate::config::slugify_resource_segment(&row.text(1)?);
+                if !title_slug.is_empty() && title_slug == slug {
+                    numbers.push(row.i64(0)? as i32);
+                }
+            }
+            Ok(numbers)
+        })
+    })
+    .await
+}
+
+/// Resolve a thread alias (`cairn://p/PROJECT/t/NAME`) to the canonical numbered
+/// issue URI it addresses.
+///
+/// A thread's name is its title slugified, by the same ASCII rule that names
+/// every other cairn:// segment, so `Design Review` answers to `design-review`
+/// and the name follows the title through a retitle while the number — the
+/// identity — never moves. The requested name is normalized the same way, so a
+/// caller may write it either as typed or as a slug.
+///
+/// The rule keeps only `a-z0-9`, which has two consequences worth stating in
+/// the refusal rather than leaving a caller to discover: a non-ASCII character
+/// is a separator rather than a letter (`Café Sync` is named `caf-sync`, the
+/// same name `Caf Sync` carries), and a title with no ASCII letters or digits
+/// has no name at all and is reachable only by number.
+///
+/// A name no thread answers to, or one several answer to, is refused. Choosing
+/// among several would make an address a coin flip; the refusal lists the
+/// numbered URIs instead, which are the identities that cannot be ambiguous.
+pub(crate) async fn resolve_thread_alias(
+    db: &LocalDb,
+    project_key: &str,
+    name: &str,
+) -> Result<String, String> {
+    let project_key = project_key.to_uppercase();
+    let slug = crate::config::slugify_resource_segment(name);
+    let numbers = thread_numbers_for_slug(db, &project_key, &slug)
+        .await
+        .map_err(|error| format!("Failed to resolve thread name '{name}': {error}"))?;
+
+    match numbers.as_slice() {
+        [number] => Ok(build_issue_uri(&project_key, *number)),
+        [] => Err(format!(
+            "No thread in {project_key} is named '{name}'. A thread's name is its title \
+             slugified: lowercased, with every run of characters outside a-z0-9 collapsed to a \
+             single '-' — so 'Café Sync' is named 'caf-sync', and a title with no ASCII letters \
+             or digits has no name and is reachable only by its number. Only threads are \
+             addressable by name. List this project's threads with \
+             cairn://p/{project_key}/issues?kind=thread."
+        )),
+        several => {
+            let uris = several
+                .iter()
+                .map(|number| build_issue_uri(&project_key, *number))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "'{name}' names {} threads in {project_key}: {uris}. A name is an alias, not an \
+                 identity, so Cairn will not pick one — read the thread you mean by its number, \
+                 or retitle one so the name is unique.",
+                several.len()
+            ))
+        }
+    }
+}
+
 pub async fn issue_key_for_messages(db: &LocalDb, issue_id: &str) -> DbResult<String> {
     let uri = issue_uri_for_id_db(db, issue_id).await?;
     Ok(uri.trim_start_matches("cairn://p/").to_string())
@@ -327,17 +426,46 @@ pub async fn issue_key_for_messages(db: &LocalDb, issue_id: &str) -> DbResult<St
 
 /// The durable integration branch a child issue should inherit from its parent.
 ///
-/// The exact spawning job wins when it belongs to the declared parent issue,
-/// regardless of terminal state. Otherwise the newest live branch-bearing job on
-/// the parent issue is used. A missing branch falls back to the project default
-/// at the caller; filesystem residence is never part of branch authority.
+/// `issues.parent_issue_id` carries two independent meanings, and only one of
+/// them is this function's business. It routes attention (a child wakes its
+/// parent) AND it derives branches (a child branches from, and merges into, its
+/// parent's integration branch). A thread parent takes the routing meaning and
+/// refuses the derivation one: a thread owns no branch and never terminates via a
+/// pull request, so a child of a thread derives exactly as if it had no parent —
+/// `None` here is what makes the caller stamp the project default, which is in
+/// turn the base ref the child's own pull request targets.
+///
+/// Keyed on the IMMEDIATE parent's kind, and it stops there: derivation never
+/// walks up, so a thread that itself has a parent does not pass a grandparent's
+/// branch through to its children. Symmetrically the refusal does not spread
+/// downward — an ordinary issue living under a thread still confers its own
+/// integration branch to its own children.
+///
+/// This is keyed on the kind rather than left to the fact that a thread cannot
+/// currently run an execution (the guard in [`crate::execution::recipe`]). That
+/// guard makes the right branch fall out by accident today; when threads gain
+/// sessions of their own the accident stops holding, and the invariant has to be
+/// written down where derivation happens rather than inferred from the absence of
+/// jobs elsewhere.
+///
+/// For an ordinary parent: the exact spawning job wins when it belongs to the
+/// declared parent issue, regardless of terminal state. Otherwise the newest live
+/// branch-bearing job on the parent issue is used. A missing branch falls back to
+/// the project default at the caller; filesystem residence is never part of
+/// branch authority.
 pub(crate) async fn resolve_parent_branch(
     conn: &cairn_db::turso::Connection,
     child_issue_id: &str,
 ) -> DbResult<Option<String>> {
     let mut parent_rows = conn
         .query(
-            "SELECT parent_issue_id, parent_job_id FROM issues WHERE id = ?1 LIMIT 1",
+            "
+            SELECT child.parent_issue_id, child.parent_job_id, parent.kind
+            FROM issues child
+            LEFT JOIN issues parent ON parent.id = child.parent_issue_id
+            WHERE child.id = ?1
+            LIMIT 1
+            ",
             params![child_issue_id],
         )
         .await?;
@@ -348,6 +476,21 @@ pub(crate) async fn resolve_parent_branch(
         return Ok(None);
     };
     let parent_job_id = parent_row.opt_text(1)?;
+
+    // An unrecognized or absent kind reads as an ordinary issue, matching how
+    // `crud` classifies a row it cannot parse: the column is a discriminator, and
+    // failing to read it must not silently strip a real parent's branch.
+    let parent_kind: IssueKind = parent_row
+        .opt_text(2)?
+        .and_then(|kind| kind.parse().ok())
+        .unwrap_or_default();
+    match parent_kind {
+        // Exhaustive on purpose: a future kind is a compile error here, where the
+        // question "does this kind confer a branch?" has to be answered, rather
+        // than a silent fallthrough into an ordinary issue's derivation.
+        IssueKind::Thread => return Ok(None),
+        IssueKind::Issue => {}
+    }
 
     // 1. Prefer the exact spawning coordinator job. Its durable branch remains
     // authoritative regardless of the job's current status.
@@ -714,6 +857,144 @@ mod parent_tests {
         assert_eq!(branch.as_deref(), Some("agent/coord"));
     }
 
+    /// A thread confers attention, never a branch. The parent edge carries two
+    /// independent meanings and a thread parent takes only the routing one, so a
+    /// child of a thread derives exactly as if it had no parent — `None` here is
+    /// what makes the caller stamp the project default.
+    ///
+    /// The thread is seeded WITH a live branch-bearing job on purpose. A thread
+    /// cannot run an execution today (the guard in `execution::recipe`), so
+    /// without this seeding the assertion would pass on the accident of a thread
+    /// having no jobs rather than on the kind. This is the state a later slice
+    /// makes reachable, and the invariant has to already hold there.
+    #[tokio::test]
+    async fn resolve_parent_branch_returns_none_for_a_thread_parent() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, kind)
+            VALUES('thread', 'p', 1, 'Thread', 'backlog', 'backlog', 'none', 1, 1, 'thread');
+            INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+            VALUES('thread-job', 'p', 'thread', 'blocked', 'agent/thread', 10, 10);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id)
+            VALUES('child', 'p', 2, 'Child', 'backlog', 'backlog', 'none', 2, 2, 'thread');
+            ",
+        )
+        .await
+        .unwrap();
+
+        let branch = db
+            .read(|conn| Box::pin(async move { resolve_parent_branch(conn, "child").await }))
+            .await
+            .unwrap();
+        assert!(
+            branch.is_none(),
+            "a child of a thread must derive from the project default, not the thread's branch: {branch:?}"
+        );
+    }
+
+    /// The exact-spawning-job fast path is keyed on the kind too. A job on the
+    /// thread itself, named by `parent_job_id`, is the one coordinate that
+    /// bypasses the live-job fallback — so a thread has to be refused before that
+    /// lookup runs, not after it.
+    #[tokio::test]
+    async fn resolve_parent_branch_ignores_a_thread_parents_spawning_job() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, kind)
+            VALUES('thread', 'p', 1, 'Thread', 'backlog', 'backlog', 'none', 1, 1, 'thread');
+            INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+            VALUES('thread-job', 'p', 'thread', 'complete', 'agent/thread', 10, 10);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id, parent_job_id)
+            VALUES('child', 'p', 2, 'Child', 'backlog', 'backlog', 'none', 2, 2, 'thread', 'thread-job');
+            ",
+        )
+        .await
+        .unwrap();
+
+        let branch = db
+            .read(|conn| Box::pin(async move { resolve_parent_branch(conn, "child").await }))
+            .await
+            .unwrap();
+        assert!(
+            branch.is_none(),
+            "the spawning-job fast path must not hand a thread's branch to its child: {branch:?}"
+        );
+    }
+
+    /// Nothing forbids a thread row from having a parent of its own. Derivation
+    /// reads the IMMEDIATE parent's kind and stops — it never walks through a
+    /// thread to reach a grandparent's integration branch.
+    #[tokio::test]
+    async fn resolve_parent_branch_does_not_walk_past_a_thread_to_its_own_parent() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('grandparent', 'p', 1, 'Grandparent', 'backlog', 'backlog', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+            VALUES('grandparent-job', 'p', 'grandparent', 'blocked', 'agent/grandparent', 10, 10);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id, kind)
+            VALUES('thread', 'p', 2, 'Thread', 'backlog', 'backlog', 'none', 2, 2, 'grandparent', 'thread');
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id)
+            VALUES('child', 'p', 3, 'Child', 'backlog', 'backlog', 'none', 3, 3, 'thread');
+            ",
+        )
+        .await
+        .unwrap();
+
+        let branch = db
+            .read(|conn| Box::pin(async move { resolve_parent_branch(conn, "child").await }))
+            .await
+            .unwrap();
+        assert!(
+            branch.is_none(),
+            "derivation must stop at the thread, not inherit its parent's branch: {branch:?}"
+        );
+    }
+
+    /// The rule is scoped to the immediate parent and does not spread down the
+    /// chain. An ordinary issue that happens to live under a thread still confers
+    /// its own integration branch to its own children — being a thread's child is
+    /// not contagious.
+    #[tokio::test]
+    async fn resolve_parent_branch_still_inherits_from_an_ordinary_child_of_a_thread() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, kind)
+            VALUES('thread', 'p', 1, 'Thread', 'backlog', 'backlog', 'none', 1, 1, 'thread');
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id)
+            VALUES('coordinator', 'p', 2, 'Coordinator', 'backlog', 'backlog', 'none', 2, 2, 'thread');
+            INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+            VALUES('coordinator-job', 'p', 'coordinator', 'blocked', 'agent/coordinator', 10, 10);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id)
+            VALUES('grandchild', 'p', 3, 'Grandchild', 'backlog', 'backlog', 'none', 3, 3, 'coordinator');
+            ",
+        )
+        .await
+        .unwrap();
+
+        let branch = db
+            .read(|conn| Box::pin(async move { resolve_parent_branch(conn, "grandchild").await }))
+            .await
+            .unwrap();
+        assert_eq!(branch.as_deref(), Some("agent/coordinator"));
+    }
+
     #[tokio::test]
     async fn list_children_returns_children_for_parent() {
         let db = migrated_db().await;
@@ -797,6 +1078,230 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    async fn seed_thread(
+        conn: &cairn_db::turso::Connection,
+        project_id: &str,
+        id: &str,
+        number: i32,
+        title: &str,
+    ) {
+        seed_issue(conn, project_id, id, number, title, "backlog").await;
+        conn.execute(
+            "UPDATE issues SET kind = 'thread' WHERE id = ?1",
+            params![id],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn thread_fixture() -> LocalDb {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn, "p-cairn", "CAIRN").await;
+                seed_thread(conn, "p-cairn", "t-design", 12, "Design Review").await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        db
+    }
+
+    /// The name is the title slugified, so both the slug and the title as typed
+    /// reach the same thread — and what comes back is the numbered URI, which is
+    /// the only identity the rest of the system ever sees.
+    #[tokio::test]
+    async fn thread_alias_resolves_to_the_numbered_issue_uri() {
+        let db = thread_fixture().await;
+        assert_eq!(
+            resolve_thread_alias(&db, "CAIRN", "design-review")
+                .await
+                .unwrap(),
+            "cairn://p/CAIRN/12"
+        );
+        assert_eq!(
+            resolve_thread_alias(&db, "cairn", "Design Review")
+                .await
+                .unwrap(),
+            "cairn://p/CAIRN/12"
+        );
+    }
+
+    /// A name nothing answers to names the project and the attempt, explains how
+    /// a name is derived, and points at the collection that lists the threads.
+    #[tokio::test]
+    async fn thread_alias_refuses_an_unknown_name_and_points_at_the_thread_list() {
+        let db = thread_fixture().await;
+        let error = resolve_thread_alias(&db, "CAIRN", "standup")
+            .await
+            .unwrap_err();
+        assert!(error.contains("CAIRN"), "{error}");
+        assert!(error.contains("'standup'"), "{error}");
+        assert!(error.contains("slugified"), "{error}");
+        // The refusal teaches the rule the resolver actually applies, including
+        // its ASCII-only edges — a caller told "non-alphanumeric" would derive a
+        // name for a title that in fact has none.
+        assert!(error.contains("a-z0-9"), "{error}");
+        assert!(error.contains("caf-sync"), "{error}");
+        assert!(
+            error.contains("cairn://p/CAIRN/issues?kind=thread"),
+            "{error}"
+        );
+    }
+
+    /// Two threads answering to one name is a question, not a coin flip: the
+    /// refusal hands back every numbered URI rather than picking.
+    #[tokio::test]
+    async fn thread_alias_refuses_an_ambiguous_name_listing_every_match() {
+        let db = thread_fixture().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_thread(conn, "p-cairn", "t-design-2", 40, "design review").await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let error = resolve_thread_alias(&db, "CAIRN", "design-review")
+            .await
+            .unwrap_err();
+        assert!(error.contains("cairn://p/CAIRN/12"), "{error}");
+        assert!(error.contains("cairn://p/CAIRN/40"), "{error}");
+        assert!(error.contains("2 threads"), "{error}");
+    }
+
+    /// Only threads live in the name space. An ordinary issue with the very same
+    /// title is not addressable by name and does not make the name ambiguous.
+    #[tokio::test]
+    async fn an_ordinary_issue_is_not_addressable_by_name() {
+        let db = thread_fixture().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_issue(conn, "p-cairn", "i-design", 41, "Design Review", "backlog").await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resolve_thread_alias(&db, "CAIRN", "design-review")
+                .await
+                .unwrap(),
+            "cairn://p/CAIRN/12"
+        );
+
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_issue(conn, "p-cairn", "i-standup", 42, "Standup", "backlog").await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert!(resolve_thread_alias(&db, "CAIRN", "standup").await.is_err());
+    }
+
+    /// The slug rule keeps only `a-z0-9`, so a non-ASCII character is a
+    /// separator rather than a letter: `Café Sync` is named `caf-sync`. Both
+    /// sides go through the same normalizer, so the accented spelling a caller
+    /// might reach for lands on the same thread — but a title that merely drops
+    /// the accented character carries the identical name and becomes ambiguous
+    /// with it, which is why the refusal states the rule rather than calling it
+    /// "non-alphanumeric".
+    #[tokio::test]
+    async fn a_non_ascii_title_is_named_by_its_ascii_slug() {
+        let db = thread_fixture().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_thread(conn, "p-cairn", "t-cafe", 20, "Caf\u{e9} Sync").await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        for written in ["caf-sync", "Caf\u{e9} Sync", "caf\u{e9}-sync"] {
+            assert_eq!(
+                resolve_thread_alias(&db, "CAIRN", written).await.unwrap(),
+                "cairn://p/CAIRN/20",
+                "{written}"
+            );
+        }
+
+        // The accented character is a separator, so a title that simply omits
+        // it carries the very same name and the two become ambiguous.
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_thread(conn, "p-cairn", "t-caf-sync", 21, "Caf Sync").await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let error = resolve_thread_alias(&db, "CAIRN", "Caf\u{e9} Sync")
+            .await
+            .unwrap_err();
+        assert!(error.contains("cairn://p/CAIRN/20"), "{error}");
+        assert!(error.contains("cairn://p/CAIRN/21"), "{error}");
+    }
+
+    /// A title with no ASCII letters or digits slugifies to nothing, so it has no
+    /// name. The empty slug must not become a wildcard that every such thread
+    /// answers to — the thread stays reachable by its number alone.
+    #[tokio::test]
+    async fn a_title_with_no_ascii_characters_has_no_name() {
+        let db = thread_fixture().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_thread(conn, "p-cairn", "t-jp", 30, "\u{65e5}\u{672c}\u{8a9e}").await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        for written in ["\u{65e5}\u{672c}\u{8a9e}", "", "---"] {
+            let error = resolve_thread_alias(&db, "CAIRN", written)
+                .await
+                .unwrap_err();
+            assert!(error.contains("reachable only by its number"), "{error}");
+        }
+    }
+
+    /// The name follows the title, because it IS the title. A retitle retires the
+    /// old name and mints the new one; the number the alias resolves to is the
+    /// same number before and after, which is the whole reason the number is the
+    /// identity.
+    #[tokio::test]
+    async fn a_retitled_thread_answers_to_its_new_name_only() {
+        let db = thread_fixture().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE issues SET title = 'Architecture Review' WHERE id = 't-design'",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert!(resolve_thread_alias(&db, "CAIRN", "design-review")
+            .await
+            .is_err());
+        assert_eq!(
+            resolve_thread_alias(&db, "CAIRN", "architecture-review")
+                .await
+                .unwrap(),
+            "cairn://p/CAIRN/12"
+        );
     }
 
     #[test]

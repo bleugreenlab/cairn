@@ -535,6 +535,46 @@ macro_rules! shared_tail_conflict_resolution_sessions {
     };
 }
 
+/// The discriminator that says what a row in `issues` is: an ordinary issue or a
+/// thread. `issues` is a project-scoped table both lineages carry, so the column
+/// is written once and composed into both.
+macro_rules! shared_tail_issue_kind {
+    () => {
+        Migration::new(
+            "0138",
+            "issue_kind",
+            include_str!("../../../../turso_migrations/0138_issue_kind.sql"),
+        )
+    };
+}
+
+/// External channel delivery state is tied to this runner's provider process and
+/// personal messaging account. It must not replicate into a team database.
+macro_rules! private_channel_persistence {
+    () => {
+        Migration::new(
+            "0137",
+            "channel_persistence",
+            include_str!("../../../../turso_migrations/0137_channel_persistence.sql"),
+        )
+    };
+}
+
+/// Rolling compaction state for thread sessions. A thread's compaction is a
+/// property of how THIS runner reseeds its local agent session -- the marks are a
+/// work queue, and the generations and entries are derivable again from the
+/// append-only transcript that stays in the shared tables. None of it is
+/// collaboration data a teammate's replica needs.
+macro_rules! private_thread_compaction {
+    () => {
+        Migration::new(
+            "0139",
+            "thread_compaction",
+            include_str!("../../../../turso_migrations/0139_thread_compaction.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -576,6 +616,7 @@ macro_rules! team_lineage {
             shared_tail_check_result_observations!(),
             shared_tail_check_definition_provenance!(),
             shared_tail_conflict_resolution_sessions!(),
+            shared_tail_issue_kind!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -767,6 +808,13 @@ macro_rules! private_lineage {
             shared_tail_check_result_observations!(),
             shared_tail_check_definition_provenance!(),
             shared_tail_conflict_resolution_sessions!(),
+            // Composition order, not file number, is what applies (see the
+            // PRIVATE_TAIL note above). Thread compaction only creates new
+            // tables of its own, so its position among the unrelated tail
+            // entries around it carries no dependency.
+            private_thread_compaction!(),
+            private_channel_persistence!(),
+            shared_tail_issue_kind!(),
         ]
     };
 }
@@ -1552,9 +1600,40 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "write_replay_ledger",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    (
+        "channel_outbound",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "channel_cursor",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "channel_inbound",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // A terminal child makes parent turns compactable; the mark sits in this
+    // queue until an expiry or ratio trigger applies it. Local to the runner
+    // that owns the thread's agent session.
+    (
+        "thread_compaction_marks",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // ── Private: rebuildable / refetchable caches ────────────────────────────
     (
         "cas_cache",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // An applied compaction and its table of contents are a projection of the
+    // job's append-only transcript, which stays in the shared tables. Losing
+    // them costs entry stability across generations, never content: the next
+    // composition rebuilds the same chapters from the same events.
+    (
+        "thread_compactions",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
+        "thread_compaction_entries",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
     (
@@ -2072,9 +2151,70 @@ mod tests {
                 "0134_check_result_observations".to_string(),
                 "0135_check_definition_provenance".to_string(),
                 "0136_conflict_resolution_sessions".to_string(),
+                "0139_thread_compaction".to_string(),
+                "0137_channel_persistence".to_string(),
+                "0138_issue_kind".to_string(),
             ]
         );
         Ok(db)
+    }
+
+    /// CAIRN-3387: the kind discriminator arrives with zero behavior change for
+    /// rows that predate it. A row written before the migration reads as an
+    /// ordinary issue afterwards, and the column default carries that without a
+    /// backfill statement of its own — which is what lets a synced replica table
+    /// take the column via a plain ADD COLUMN instead of a rebuild.
+    #[tokio::test]
+    async fn issue_kind_defaults_existing_rows_to_issue() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("issue-kind.turso.db"))
+            .await
+            .unwrap();
+        // Everything composed BEFORE the migration under test; composition order
+        // is not file-number order, so this selects by version rather than
+        // slicing positionally.
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0138")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+             VALUES ('legacy', 'project', 1, 'Written before kind existed', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('issues') WHERE name = 'kind'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "the column must not exist before the migration under test"
+        );
+
+        let applied = MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        assert_eq!(applied, vec!["0138_issue_kind".to_string()]);
+
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM issues WHERE id = 'legacy' AND kind = 'issue'"
+            )
+            .await
+            .unwrap(),
+            1,
+            "a row predating the discriminator reads as an ordinary issue"
+        );
     }
 
     /// CAIRN-3293: the retirement removes every seeded child-attention default
@@ -3751,6 +3891,7 @@ mod tests {
                 "0134_check_result_observations".to_string(),
                 "0135_check_definition_provenance".to_string(),
                 "0136_conflict_resolution_sessions".to_string(),
+                "0138_issue_kind".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

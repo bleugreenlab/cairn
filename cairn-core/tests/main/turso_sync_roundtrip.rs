@@ -937,6 +937,7 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
         None,
         None,
         None,
+        cairn_core::models::IssueKind::Issue,
     )
     .await
     .expect("create issue must succeed (no `project not found`)");

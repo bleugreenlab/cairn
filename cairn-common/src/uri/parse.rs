@@ -269,6 +269,13 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             project: canonical_project(project),
             slug: DEFAULT_BROWSER_SLUG.to_string(),
         }),
+        // A thread addressed by name. Kept next to the issue arm because it
+        // names the same resource by an alias rather than by its number; the
+        // reader resolves the name to that number before anything else runs.
+        [PROJECT_SCOPE, project, "t", name] => Some(CairnResource::ThreadAlias {
+            project: canonical_project(project),
+            name: (*name).to_string(),
+        }),
         [PROJECT_SCOPE, project, number] => Some(CairnResource::Issue {
             project: canonical_project(project),
             number: parse_positive_i32(number)?,

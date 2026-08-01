@@ -681,6 +681,7 @@ pub async fn run_launch_session(
                     holder: holder.clone(),
                     owner_ref: resolution.owner_ref.clone(),
                     selector: Some(resolution.selector.clone()),
+                    executor: None,
                     repository: RepositoryLocator::ColocatedPath {
                         project_id: resolution.project_id.clone(),
                         repository_id: resolution.project_id.clone(),
@@ -1978,6 +1979,7 @@ mod tests {
             holder: ResidencyHolder::DevInstance {
                 instance_id: "p:main".into(),
             },
+            executor: None,
             owner_ref: None,
             selector: Some("main".into()),
             repository: RepositoryLocator::ColocatedPath {

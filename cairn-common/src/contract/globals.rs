@@ -87,11 +87,28 @@ pub(crate) const EXECUTORS_CONTRACT: ResourceContract =
         kind: ResourceKind::Executors,
         uri_template: "cairn://executors",
         name: "Fleet",
-        description: "Every machine enrolled with this runner, listed by the public name that addresses it. One row per executor: name, platform, toolchains, link state, and how loaded it is right now. These names are exactly what a placement request accepts — run({executor:{name:\"bglab-ub\"}}) or a check's `executor:` block — so what you can target is what you can read here. Read cairn://executors/<name> for one machine in full. This serves the runner's cached fleet state and never provokes a fresh probe.",
+        description: "Every machine enrolled with this runner, listed by the public name that addresses it. One row per executor: name, platform, toolchains, link state, and how loaded it is right now. These names are exactly what a placement request accepts — run({executor:{name:\"bglab-ub\"}}) or a check's `executor:` block — so what you can target is what you can read here. Read cairn://executors/<name> for one machine in full. This serves the runner's cached fleet state and never provokes a fresh probe. write cairn://executors enrolls a machine over SSH: host and sshUser are the only required keys and everything else is derived. The write returns an enrollment operation id immediately instead of blocking on the SSH bootstrap; the operation's real phases are listed here and on the machine's own URI until it reports Ready.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
-        mutations: NO_MUTATIONS,
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Create,
+                required: &[EXECUTOR_HOST, EXECUTOR_SSH_USER],
+                optional: &[
+                    EXECUTOR_PROJECT_KEYS,
+                    EXECUTOR_BINARY_PATH,
+                    EXECUTOR_CAIRN_HOME,
+                    EXECUTOR_ID,
+                    EXECUTOR_DEVICE_ID,
+                    EXECUTOR_DISPLAY_NAME,
+                    EXECUTOR_TUNNEL_PORT,
+                    EXECUTOR_EXTRA_SSH_ARGS,
+                ],
+                label: "enroll a machine",
+                example: r#"write({changes:[{target:"cairn://executors",mode:"create",payload:{host:"bglab-ub.local",sshUser:"mitch"}}]})"#,
+            },
+        ],
     };
 
 pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
@@ -99,11 +116,31 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
         kind: ResourceKind::Executor,
         uri_template: "cairn://executors/{name}",
         name: "Executor",
-        description: "One enrolled machine in full: identity and platform, link/build/protocol state, advertised toolchains, the placement telemetry it last measured (each reading with its own collection time, or a named gap where there is none), admission and queue state, and the cells and work resident on it. This is what to read before deciding a batch belongs somewhere specific, and what makes a placement refusal legible afterwards. Read-only: an operator renames a machine with `cairn executor rename <current-name> <new-name>`, which is a runner-side lifecycle operation rather than a resource mutation.",
+        description: "One enrolled machine in full: identity and platform, link/build/protocol state, advertised toolchains, the placement telemetry it last measured (each reading with its own collection time, or a named gap where there is none), admission and queue state, and the cells and work resident on it. This is what to read before deciding a batch belongs somewhere specific, and what makes a placement refusal legible afterwards. write patches this machine: newName moves its public address (configuration, enrollment claim, and supervision together), runtimePolicy and draining are live generation-fenced controls that need the expectedGeneration you read here. Draining is what disabling a machine means — it refuses new admissions and leaves resident work alone. delete removes the machine and revokes its enrollment; it is refused while any work or residency remains, so drain first and remove once the counts reach zero.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
-        mutations: NO_MUTATIONS,
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[],
+                optional: &[
+                    EXECUTOR_NEW_NAME,
+                    EXECUTOR_RUNTIME_POLICY,
+                    EXECUTOR_DRAINING,
+                    EXECUTOR_EXPECTED_GENERATION,
+                ],
+                label: "configure an enrolled machine",
+                example: r#"write({changes:[{target:"cairn://executors/bglab-ub",mode:"patch",payload:{draining:true,expectedGeneration:7}}]})"#,
+            },
+            MutationSpec {
+                mode: ChangeMode::Delete,
+                required: &[],
+                optional: &[],
+                label: "remove a machine and revoke its enrollment",
+                example: r#"write({changes:[{target:"cairn://executors/bglab-ub",mode:"delete"}]})"#,
+            },
+        ],
     };
 
 pub(crate) const MCP_CONTRACT: ResourceContract =

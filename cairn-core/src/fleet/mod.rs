@@ -4,9 +4,11 @@
 //! the cached UI snapshot. Scheduling, workspaces, processes, cancellation, and
 //! mutation sealing exist only in the executor process.
 
+pub mod management;
 pub(crate) mod placement;
 pub(crate) mod residency;
 mod resource_profiles;
+pub(crate) mod service_placement;
 
 use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
@@ -671,6 +673,10 @@ pub struct Fleet {
     /// kept whether or not the machine is attached. Always locked AFTER
     /// `connections` where both are needed, so the two orders cannot deadlock.
     enrolled_remotes: Arc<Mutex<HashMap<String, EnrolledRemoteRecord>>>,
+    /// Who manages this fleet and what enrollments are in flight. Held here
+    /// because management is fleet state: the same projection that answers what
+    /// machines exist has to answer what is currently becoming one.
+    management: Arc<management::ExecutorManagementState>,
 }
 
 /// A live acquisition flight for one execution environment. Dropping it hands
@@ -1189,6 +1195,20 @@ impl Fleet {
         generation
     }
 
+    pub(crate) async fn wait_for_named_executor(&self, executor_name: &str) {
+        loop {
+            let notified = self.connection_ready.notified();
+            let connected = self.connections.lock().unwrap().values().any(|entry| {
+                !entry.sender.is_closed()
+                    && executor_names_match(&executor_public_name(entry), executor_name)
+            });
+            if connected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn disconnect_advertised_executor(&self, executor_id: &str, generation: u64) -> bool {
         self.disconnect_advertised_executor_with_origin(
             executor_id,
@@ -1289,6 +1309,12 @@ impl Fleet {
 
     /// Drop an enrollment, so a removed machine stops being a fleet member
     /// rather than becoming a permanently failing one.
+    /// Fleet management: the installed lifecycle implementation, enrollment
+    /// operations in flight, and whether machine-local callers may manage it.
+    pub fn management(&self) -> &management::ExecutorManagementState {
+        &self.management
+    }
+
     pub fn forget_enrolled_remote(&self, executor_id: &str) {
         self.enrolled_remotes.lock().unwrap().remove(executor_id);
     }
@@ -2362,6 +2388,7 @@ impl Fleet {
                     ResidencyHolder::ProjectTerminals { .. } => 1,
                     ResidencyHolder::Workflow { .. } => 2,
                     ResidencyHolder::DevInstance { .. } => 3,
+                    ResidencyHolder::Service { .. } => 4,
                 };
                 let owner_ref_matches = residency.owner_ref.as_ref().is_some_and(|owner| {
                     owner.project_id == project_id && owner.job_id.as_deref() == Some(job_id)
@@ -2371,6 +2398,7 @@ impl Fleet {
                     ResidencyHolder::DevInstance { instance_id } => instance_id.clone(),
                     ResidencyHolder::ProjectTerminals { project_id } => project_id.clone(),
                     ResidencyHolder::Workflow { run_id } => run_id.clone(),
+                    ResidencyHolder::Service { service_id } => service_id.clone(),
                 };
                 let holder_id_matches =
                     residency.owner_ref.is_none() && (holder_id == job_id || holder_id == run_id);
@@ -3048,7 +3076,12 @@ impl Fleet {
                             )
                         }
                     };
-                    if !selected.colocated {
+                    if !selected.colocated
+                        && !matches!(
+                            acquisition.repository,
+                            RepositoryLocator::ScratchOnly { .. }
+                        )
+                    {
                         let identity = acquisition.repository.identity();
                         acquisition.repository = RepositoryLocator::ManagedObjects {
                             project_id: identity.project_id,
@@ -4197,6 +4230,21 @@ impl Fleet {
             })?
             .fleet
             .unwrap_or_default();
+        if matches!(request.repository, RepositoryLocator::ScratchOnly { .. }) {
+            return Ok(PreparedExecution {
+                cell_client_env: Vec::new(),
+                executor_config: ExecutorConfig {
+                    project_id: request.project_id.clone(),
+                    project_key: request.project_id.clone(),
+                    default_timeout_seconds: config.default_timeout_seconds,
+                    setup_commands: Vec::new(),
+                    populate: cairn_worktree::PopulateConfig::default(),
+                    population_source_root: None,
+                },
+                object_plane: orch.object_plane.clone(),
+                db: orch.db.local.clone(),
+            });
+        }
         let (local_repo_path, project_key) =
             crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, &request.project_id)
                 .await
@@ -4209,7 +4257,9 @@ impl Fleet {
             | RepositoryLocator::ExistingCheckout { absolute_path, .. } => {
                 Some(absolute_path.as_str())
             }
-            RepositoryLocator::ManagedObjects { .. } => None,
+            RepositoryLocator::ManagedObjects { .. } | RepositoryLocator::ScratchOnly { .. } => {
+                None
+            }
         });
         let project_path = project_path.ok_or_else(|| CellOutcome::Unavailable {
             reason: CellUnavailableReason::Preparation,
@@ -4789,7 +4839,7 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         mutation_policy: MutationPolicy::PureVerdict,
         requesting_job_id: None,
         affinity_key: Some(format!("residency:{}", acquisition.holder.storage_key())),
-        executor: None,
+        executor: acquisition.executor.clone(),
         // A dev instance serves the operator's own machine: its ports, its
         // browser, its localhost. It has to run where they are.
         pinned_executor_id: matches!(acquisition.holder, ResidencyHolder::DevInstance { .. })
@@ -4812,6 +4862,7 @@ fn residency_refresh_request(
     let mut request = residency_placement_request(&ResidencyAcquireRequest {
         holder: residency.holder.clone(),
         repository: residency.repository.clone(),
+        executor: None,
         owner_ref: residency.owner_ref.clone(),
         selector: residency.selector.clone(),
         initial_base_commit: residency.current_base_commit.clone(),
@@ -4919,7 +4970,7 @@ fn require_colocated_population(
     if config.populate.is_empty()
         || matches!(
             request.repository,
-            RepositoryLocator::ExistingCheckout { .. }
+            RepositoryLocator::ExistingCheckout { .. } | RepositoryLocator::ScratchOnly { .. }
         )
     {
         return Ok(());
@@ -5407,6 +5458,7 @@ fn repository_locator_name(repository: &RepositoryLocator) -> &'static str {
         RepositoryLocator::ColocatedPath { .. } => "a colocated checkout",
         RepositoryLocator::ExistingCheckout { .. } => "an existing checkout",
         RepositoryLocator::ManagedObjects { .. } => "managed objects",
+        RepositoryLocator::ScratchOnly { .. } => "scratch-only storage",
     }
 }
 
@@ -5819,6 +5871,7 @@ fn executor_health_snapshot(
         liveness_age_ms.is_some_and(|age| age > EXECUTOR_TELEMETRY_STALE_AFTER_MS);
     ExecutorHealthSnapshot {
         identity: entry.identity.clone(),
+        public_name: executor_public_name(entry),
         colocated: entry.colocated,
         status: if heartbeat_age_ms > EXECUTOR_LINK_STALE_AFTER_MS {
             ExecutorHealthStatus::Stale
@@ -6266,6 +6319,63 @@ mod tests {
             stdin: None,
             timeout_ms: 1_000,
             command_resource_identity: None,
+        }
+    }
+
+    /// The request's env reaches every command in the batch.
+    ///
+    /// This is the second half of the run-identity seam: `placed_batch_env`
+    /// composes what a batch carries, and this is where that vector becomes the
+    /// env of each process the executor spawns. A composer that states the run
+    /// and a serializer that drops it would leave every agent shell anonymous
+    /// while both halves looked correct in isolation (CAIRN-3381), so assert the
+    /// crossing rather than either side of it.
+    #[test]
+    fn a_placed_batch_hands_its_env_to_every_command_it_carries() {
+        let env = vec![
+            ("CAIRN_RUN_ID".to_string(), "run-7".to_string()),
+            (
+                "CAIRN_WORKTREE_BRANCH".to_string(),
+                "agent/CAIRN-3381-builder-0".to_string(),
+            ),
+        ];
+        let batch = serialize_process_batch(
+            ResolvedRunBatch {
+                request: Default::default(),
+                run_context: None,
+                resolved: vec![
+                    (
+                        "cairn check run rust-fmt".to_string(),
+                        Ok(RunSpec::Shell {
+                            command: "cairn check run rust-fmt".to_string(),
+                            timeout: None,
+                        }),
+                    ),
+                    (
+                        "cairn read cairn:~/plan".to_string(),
+                        Ok(RunSpec::Shell {
+                            command: "cairn read cairn:~/plan".to_string(),
+                            timeout: None,
+                        }),
+                    ),
+                ],
+                tool_use_id: "tool-use".to_string(),
+                stop_on_error: true,
+                originally_sequential: true,
+                execution_residency: None,
+            },
+            &env,
+            "runner-context".to_string(),
+            ProcessSandboxMode::Unconfined,
+        )
+        .expect("a shell batch serializes");
+
+        assert_eq!(batch.items.len(), 2);
+        for item in &batch.items {
+            assert_eq!(
+                item.env, env,
+                "every command in a placed batch runs with the batch's env"
+            );
         }
     }
 
@@ -9412,6 +9522,7 @@ mod tests {
     fn fleet_residency_request(holder: ResidencyHolder) -> ResidencyAcquireRequest {
         ResidencyAcquireRequest {
             holder,
+            executor: None,
             owner_ref: None,
             selector: None,
             repository: RepositoryLocator::ColocatedPath {

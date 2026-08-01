@@ -220,3 +220,77 @@ fn gate_allows_payloadless_mutations() {
     );
     assert!(gate(&it).is_ok());
 }
+
+/// The fleet's management surface is the resource graph, so the gate has to let
+/// exactly the three advertised operations through — and no more, because a
+/// mode that reaches dispatch without a contract entry is an undocumented
+/// capability.
+#[test]
+fn gate_accepts_enrollment_configuration_and_removal_only() {
+    let enroll = item(
+        "cairn://executors",
+        ChangeMode::Create,
+        Some(serde_json::json!({ "host": "bglab-ub.local", "sshUser": "mitch" })),
+    );
+    assert_eq!(gate(&enroll).unwrap().label, "enroll a machine");
+
+    let configure = item(
+        "cairn://executors/bglab-ub",
+        ChangeMode::Patch,
+        Some(serde_json::json!({ "draining": true, "expectedGeneration": 7 })),
+    );
+    assert_eq!(
+        gate(&configure).unwrap().label,
+        "configure an enrolled machine"
+    );
+
+    let remove = item("cairn://executors/bglab-ub", ChangeMode::Delete, None);
+    assert!(gate(&remove).is_ok());
+
+    for mode in [ChangeMode::Append, ChangeMode::Replace, ChangeMode::Patch] {
+        let it = item("cairn://executors", mode, Some(serde_json::json!({})));
+        let failure = gate(&it).unwrap_err();
+        assert!(
+            failure.error.contains("Unsupported resource mutation"),
+            "{mode:?}: {}",
+            failure.error
+        );
+        assert!(
+            failure.error.contains("enroll a machine"),
+            "a rejection enumerates what the fleet does accept: {}",
+            failure.error
+        );
+    }
+}
+
+/// Enrollment asks for the two facts a person actually has. Everything else —
+/// identity, paths, tunnel port, project membership — is derived, so requiring
+/// any of it would be asking an operator to invent runner internals.
+#[test]
+fn enrollment_requires_only_the_host_and_the_ssh_user() {
+    let missing = item(
+        "cairn://executors",
+        ChangeMode::Create,
+        Some(serde_json::json!({ "host": "bglab-ub.local" })),
+    );
+    let failure = gate(&missing).unwrap_err();
+    assert!(failure.error.contains("Missing required payload key"));
+    assert!(failure.error.contains("sshUser"));
+
+    // A snake_case alias satisfies the gate, matching the advertised aliases.
+    let aliased = item(
+        "cairn://executors",
+        ChangeMode::Create,
+        Some(serde_json::json!({ "host": "bglab-ub.local", "ssh_user": "mitch" })),
+    );
+    assert!(gate(&aliased).is_ok());
+
+    // No project selection at all is a complete request: omitted means every
+    // project, which is eligibility rather than an unanswered question.
+    let all_projects = item(
+        "cairn://executors",
+        ChangeMode::Create,
+        Some(serde_json::json!({ "host": "bglab-ub.local", "sshUser": "mitch" })),
+    );
+    assert!(gate(&all_projects).is_ok());
+}

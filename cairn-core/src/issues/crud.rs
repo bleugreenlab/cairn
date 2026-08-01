@@ -3,7 +3,9 @@
 use crate::error::CairnError;
 use crate::issues::relations;
 use crate::labels::attach;
-use crate::models::{CreateIssue, Issue, IssueAttention, IssueProgress, IssueStatus, UpdateIssue};
+use crate::models::{
+    CreateIssue, Issue, IssueAttention, IssueKind, IssueProgress, IssueStatus, UpdateIssue,
+};
 use crate::services::Clock;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::transitions::Resolution;
@@ -13,7 +15,7 @@ use std::sync::Arc;
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, progress,
     attention, priority, completed_at, dismissed_at, created_at, updated_at, model,
-    merged_at, closed_at, parent_issue_id";
+    merged_at, closed_at, parent_issue_id, kind";
 
 fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
@@ -104,7 +106,58 @@ fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
         depends_on: Vec::new(),
         unmet_depends_on: Vec::new(),
         labels: Vec::new(),
+        // An unrecognized kind reads as an ordinary issue rather than failing
+        // the whole row: the column is the discriminator, not the record, and a
+        // row Cairn cannot classify is still a row it must be able to show.
+        kind: row
+            .opt_text(17)?
+            .and_then(|kind| kind.parse().ok())
+            .unwrap_or_default(),
     })
+}
+
+/// What an issue is, together with the identity a message names it by. One
+/// query so a caller deciding on the kind can also speak about the issue — the
+/// thread refusal in [`crate::issues::status::check_resolution`] needs both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueIdentity {
+    pub kind: IssueKind,
+    pub project_key: String,
+    pub number: i32,
+}
+
+/// Resolve an issue id to its kind and project-scoped identity. `None` when no
+/// such issue exists.
+pub async fn identity(db: &LocalDb, id: &str) -> Result<Option<IssueIdentity>, CairnError> {
+    let id = id.to_string();
+    db.read(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT i.kind, p.key, i.number
+                     FROM issues i
+                     JOIN projects p ON p.id = i.project_id
+                     WHERE i.id = ?1
+                     LIMIT 1",
+                    params![id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(IssueIdentity {
+                    kind: row
+                        .opt_text(0)?
+                        .and_then(|kind| kind.parse().ok())
+                        .unwrap_or_default(),
+                    project_key: row.text(1)?,
+                    number: row.i64(2)? as i32,
+                })),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(CairnError::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +246,7 @@ pub async fn create(
         description,
         backend_override,
         label_ids,
+        kind,
     } = input;
     let id = ids::mint_child(&project_id);
     let now = clock.now();
@@ -225,9 +279,9 @@ pub async fn create(
             conn.execute(
                 "INSERT INTO issues (
                     id, project_id, number, title, description, status, progress, attention,
-                    priority, created_at, updated_at, model
+                    priority, created_at, updated_at, model, kind
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7, ?8)",
                 params![
                     id.as_str(),
                     project_id.as_str(),
@@ -235,7 +289,8 @@ pub async fn create(
                     title.as_str(),
                     description.as_deref(),
                     now,
-                    backend_override.as_deref()
+                    backend_override.as_deref(),
+                    kind.to_string()
                 ],
             )
             .await?;
@@ -268,6 +323,7 @@ pub async fn create(
                 depends_on: Vec::new(),
                 unmet_depends_on: Vec::new(),
                 labels: Vec::new(),
+                kind,
             };
             hydrate_issue_relations(conn, std::slice::from_mut(&mut issue)).await?;
             Ok(issue)
@@ -626,6 +682,24 @@ pub async fn delete_db(db: &LocalDb, issue_id: &str) -> Result<(), CairnError> {
                 params![issue_id.as_str()],
             )
             .await?;
+            // Thread compaction state hangs off jobs. Turso does not cascade on
+            // DELETE at runtime, so declaring the cascade is not the same as
+            // getting one: sweep it explicitly, child rows before the jobs they
+            // name.
+            for table in [
+                "thread_compaction_entries",
+                "thread_compactions",
+                "thread_compaction_marks",
+            ] {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table}
+                         WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)"
+                    ),
+                    params![issue_id.as_str()],
+                )
+                .await?;
+            }
             conn.execute(
                 "DELETE FROM jobs WHERE issue_id = ?1",
                 params![issue_id.as_str()],

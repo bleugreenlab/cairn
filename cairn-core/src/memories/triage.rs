@@ -335,6 +335,7 @@ async fn spawn_triage_for_scope_inner(
             None,
             None,
             None,
+            crate::models::IssueKind::Issue,
         )
         .await?;
 

@@ -901,6 +901,7 @@ pub async fn launch_standalone_workflow(
             description: Some(format!("Standalone run of the `{workflow_id}` workflow.")),
             backend_override: None,
             label_ids: None,
+            kind: crate::models::IssueKind::Issue,
         },
     )
     .await

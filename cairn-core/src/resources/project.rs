@@ -7,6 +7,7 @@ use super::common::{
     parse_optional_i64_param, parse_optional_usize_param, storage_error,
 };
 
+use crate::models::IssueKind;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
@@ -102,6 +103,7 @@ struct ProjectIssueSummary {
     title: String,
     status: String,
     labels: Vec<String>,
+    kind: IssueKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,13 +128,14 @@ struct ProjectIssuesQuery {
     ready: Option<bool>,
     label: Option<String>,
     labels: Option<Vec<String>>,
+    kind: Option<IssueKind>,
 }
 
 const PROJECT_ISSUES_SUPPORTED_PARAMS: &[&str] = &[
-    "status", "limit", "offset", "sort", "ready", "label", "labels",
+    "status", "limit", "offset", "sort", "ready", "label", "labels", "kind",
 ];
 const PROJECT_ISSUES_SUPPORTED_PARAMS_TEXT: &str =
-    "status, limit, offset, sort, ready, label, labels";
+    "status, limit, offset, sort, ready, label, labels, kind";
 const PROJECT_ISSUES_ALLOWED_STATUSES: &[&str] = &[
     "backlog", "active", "waiting", "merged", "closed", "failed", "complete",
 ];
@@ -148,6 +151,7 @@ impl Default for ProjectIssuesQuery {
             ready: None,
             label: None,
             labels: None,
+            kind: None,
         }
     }
 }
@@ -202,6 +206,14 @@ impl ProjectIssuesQuery {
             }
             query.labels = Some(labels);
         }
+        if let Some(value) = find_query_value(params, "kind") {
+            query.kind = Some(
+                value
+                    .trim()
+                    .parse::<IssueKind>()
+                    .map_err(|error| format!("Invalid kind query parameter: {error}"))?,
+            );
+        }
         Ok(query)
     }
 
@@ -210,6 +222,7 @@ impl ProjectIssuesQuery {
             || self.ready.is_some()
             || self.label.is_some()
             || self.labels.is_some()
+            || self.kind.is_some()
     }
 }
 
@@ -320,6 +333,10 @@ fn issue_filter_clause(query: &ProjectIssuesQuery) -> String {
         clause.push(' ');
         clause.push_str(ready_sql_condition(ready));
     }
+    if let Some(kind) = query.kind {
+        let kind = quoted_sql_literal(&kind.to_string());
+        clause.push_str(&format!(" AND LOWER(i.kind) = {kind}"));
+    }
     let label_filters = query
         .label
         .iter()
@@ -369,7 +386,7 @@ async fn load_project_issue_summaries(
     };
     let sql = format!(
         "
-        SELECT i.number, i.title, i.status, GROUP_CONCAT(l.name, char(31))
+        SELECT i.number, i.title, i.status, GROUP_CONCAT(l.name, char(31)), i.kind
         FROM issues i
         LEFT JOIN issue_labels il ON il.issue_id = i.id
         LEFT JOIN labels l ON l.id = il.label_id
@@ -394,6 +411,12 @@ async fn load_project_issue_summaries(
         else {
             continue;
         };
+        let kind = row
+            .opt_text(4)
+            .ok()
+            .flatten()
+            .and_then(|kind| kind.parse::<IssueKind>().ok())
+            .unwrap_or_default();
         let labels = labels
             .unwrap_or_default()
             .split('\u{1f}')
@@ -405,6 +428,7 @@ async fn load_project_issue_summaries(
             title,
             status,
             labels,
+            kind,
         });
     }
 
@@ -441,13 +465,20 @@ fn render_project_issue_entries(
                     .join(" ")
             )
         };
+        // Only a thread is tagged: an untagged entry is an ordinary issue, so
+        // the common case stays quiet and the exception is legible.
+        let kind_tag = match issue.kind {
+            IssueKind::Issue => String::new(),
+            IssueKind::Thread => format!(" [{}]", issue.kind),
+        };
         output.push_str(&format!(
-            "- [{}-{}]({}) [{}] {}{}\n",
+            "- [{}-{}]({}) [{}] {}{}{}\n",
             project_key.to_uppercase(),
             issue.number,
             build_issue_uri(project_key, issue.number),
             status_indicator,
             issue.title,
+            kind_tag,
             labels
         ));
     }
@@ -1275,8 +1306,71 @@ mod project_issues_query_tests {
     fn rejects_unknown_params_with_supported_list() {
         let error = ProjectIssuesQuery::parse(&[param("foo", "bar")]).unwrap_err();
         assert!(error.contains("Unsupported query parameter 'foo' for project issues"));
-        assert!(error
-            .contains("Supported parameters: status, limit, offset, sort, ready, label, labels"));
+        assert!(error.contains(
+            "Supported parameters: status, limit, offset, sort, ready, label, labels, kind"
+        ));
+    }
+
+    #[test]
+    fn parses_kind_and_rejects_an_unknown_one() {
+        assert_eq!(
+            ProjectIssuesQuery::parse(&[param("kind", "thread")])
+                .unwrap()
+                .kind,
+            Some(IssueKind::Thread)
+        );
+        assert_eq!(ProjectIssuesQuery::default().kind, None);
+        let error = ProjectIssuesQuery::parse(&[param("kind", "discussion")]).unwrap_err();
+        assert!(error.contains("Invalid kind query parameter"), "{error}");
+        assert!(error.contains("issue, thread"), "{error}");
+    }
+
+    /// The filter reaches the SQL, not just the parsed query: a `kind` filter
+    /// windows the page and its total together, the way every other filter does.
+    #[tokio::test]
+    async fn filters_by_kind() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn).await;
+                seed_issue(conn, "i-work", 1, "Ordinary work").await;
+                seed_issue(conn, "i-thread", 2, "Long thread").await;
+                conn.execute(
+                    "UPDATE issues SET kind = 'thread' WHERE id = 'i-thread'",
+                    (),
+                )
+                .await
+                .unwrap();
+
+                let query = ProjectIssuesQuery::parse(&[param("kind", "thread")]).unwrap();
+                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
+                    .await
+                    .unwrap();
+                assert_eq!(total, 1);
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].title, "Long thread");
+                assert_eq!(issues[0].kind, IssueKind::Thread);
+
+                let query = ProjectIssuesQuery::parse(&[param("kind", "issue")]).unwrap();
+                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
+                    .await
+                    .unwrap();
+                assert_eq!(total, 1);
+                assert_eq!(issues[0].title, "Ordinary work");
+                assert_eq!(issues[0].kind, IssueKind::Issue);
+
+                // Unfiltered, both are present and each carries its own kind.
+                let query = ProjectIssuesQuery::default();
+                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
+                    .await
+                    .unwrap();
+                assert_eq!(total, 2);
+                assert_eq!(issues.len(), 2);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 
     async fn test_db() -> LocalDb {

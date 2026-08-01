@@ -313,14 +313,17 @@ mod tests {
     }
 
     /// A capability only exists for an agent that can find it at the moment it
-    /// needs it. `branch` is reached for while asking "is this failure mine, or
-    /// already on the base?", so the prompt carries the worked call for that
-    /// question rather than leaving it to the tool schema.
+    /// needs it. "Is this failure mine, or already on the base?" has two answers
+    /// — the canonical producer for a configured suite, `branch` for anything
+    /// else — so the prompt carries both rather than leaving them to the tool
+    /// schema. Asserted by shape, not by the example's wording, which is
+    /// copy-edited freely.
     #[test]
     fn every_tier_shows_how_to_run_a_check_against_another_branch() {
         for ambient in [false, true] {
             let prompt = cairn_system_prompt(ambient);
-            assert!(prompt.contains(r#"run({commands:[{command:"bun run test"}], branch:"main"})"#));
+            assert!(prompt.contains(r#"], branch:"main"})"#));
+            assert!(prompt.contains("cairn check run <suite> [branch]"));
             assert!(prompt.contains(r#"read({paths:["file:src/lib.rs?branch=main"]})"#));
             assert!(prompt.contains("cannot be combined with `commit_msg`"));
             // `run` presents shell, inline code, MCP tools, and REPL sends as

@@ -50,6 +50,47 @@ pub async fn token_is_known(db: &LocalDb, raw: &str) -> bool {
     })}).await.unwrap_or(false)
 }
 
+/// Mint a recovery grant only while the exact runner-owned machine remains
+/// actively enrolled. The authority check and grant insertion share one write
+/// transaction; `revoke` invalidates any grant inserted before its own write, so
+/// revocation wins regardless of which operation reaches the database first.
+pub async fn create_recovery_grant(
+    db: &LocalDb,
+    runner_device_id: &str,
+    executor_id: &str,
+    device_id: &str,
+    ttl_seconds: i64,
+) -> Result<Option<String>, String> {
+    let raw = token();
+    let token_hash = hash(&raw);
+    let runner = runner_device_id.to_string();
+    let executor = executor_id.to_string();
+    let device = device_id.to_string();
+    let now = chrono::Utc::now().timestamp();
+    let created = db.write(|conn| {
+        let token_hash = token_hash.clone();
+        let runner = runner.clone();
+        let executor = executor.clone();
+        let device = device.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(
+                "SELECT 1 FROM executor_enrollments WHERE runner_device_id=?1 AND executor_id=?2 AND device_id=?3 AND revoked_at IS NULL LIMIT 1",
+                params![runner.clone(), executor.clone(), device.clone()],
+            ).await?;
+            if rows.next().await?.is_none() {
+                return Ok(false);
+            }
+            drop(rows);
+            conn.execute(
+                "INSERT INTO executor_enrollment_grants (token_hash,runner_device_id,expected_executor_id,expected_device_id,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![token_hash, runner, executor, device, now + ttl_seconds, now],
+            ).await?;
+            Ok(true)
+        })
+    }).await.map_err(|error| error.to_string())?;
+    Ok(created.then_some(raw))
+}
+
 pub async fn accept(
     db: &LocalDb,
     bearer: &str,
@@ -346,7 +387,13 @@ pub async fn revoke(
         let device = device.clone();
         let runner = runner.clone();
         Box::pin(async move {
-            let changed = conn.execute("UPDATE executor_enrollments SET revoked_at=?1,updated_at=?1 WHERE executor_id=?2 AND device_id=?3 AND runner_device_id=?4 AND revoked_at IS NULL", params![now,executor,device,runner]).await?;
+            let changed = conn.execute("UPDATE executor_enrollments SET revoked_at=?1,updated_at=?1 WHERE executor_id=?2 AND device_id=?3 AND runner_device_id=?4 AND revoked_at IS NULL", params![now,executor.clone(),device.clone(),runner.clone()]).await?;
+            if changed == 1 {
+                conn.execute(
+                    "DELETE FROM executor_enrollment_grants WHERE runner_device_id=?1 AND expected_executor_id=?2 AND expected_device_id=?3 AND consumed_at IS NULL",
+                    params![runner, executor, device],
+                ).await?;
+            }
             Ok(changed == 1)
         })
     }).await.map_err(|error| error.to_string())
@@ -727,6 +774,37 @@ mod tests {
         assert_eq!(
             claimed_name(&db, "remote-a").await.as_deref(),
             Some("bglab-ubuntu")
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_wins_over_an_outstanding_recovery_grant() {
+        let db = db().await;
+        enroll(&db, "remote-a", "bglab-ub").await.unwrap();
+
+        assert!(
+            create_recovery_grant(&db, "other-runner", "remote-a", "remote-a-device", 60,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let recovery = create_recovery_grant(&db, "runner", "remote-a", "remote-a-device", 60)
+            .await
+            .unwrap()
+            .expect("the active bound enrollment authorizes recovery");
+
+        revoke(&db, "remote-a", "remote-a-device", "runner")
+            .await
+            .unwrap();
+        assert!(
+            !token_is_known(&db, &recovery).await,
+            "revocation invalidates a recovery grant that has not been consumed"
+        );
+        assert!(
+            create_recovery_grant(&db, "runner", "remote-a", "remote-a-device", 60,)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

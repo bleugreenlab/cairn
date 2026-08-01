@@ -11,11 +11,28 @@
 use std::collections::HashSet;
 
 use crate::models::{
-    AgentGitConfig, AgentNodeConfig, BranchMode, BranchTarget, ExecutionSnapshot, RecipeNodeType,
+    AgentGitConfig, AgentNodeConfig, BranchMode, BranchTarget, ExecutionSnapshot, Recipe,
+    RecipeNode, RecipeNodeType,
 };
 
-/// Transform `snapshot` in place for `target`, which must be one the recipe
-/// declares (`branchTargets` in the recipe file).
+/// The target an execution takes when its launch named none: the recipe's FIRST
+/// declared target.
+///
+/// `branchTargets` is ordered by intent — a recipe's first entry is the posture
+/// it is written for — so a recipe that declares only `base` (a thread, which
+/// owns no branch and ships no PR) is launchable through every path that omits
+/// the target: the scheduler, an `executions` append with no `branch` key, a
+/// trigger. Reading the default off the recipe rather than off the global
+/// [`BranchTarget::default`] changes nothing for the recipes that keep the
+/// implicit `[new]`, which is every recipe whose file omits `branchTargets`.
+fn default_target(declared: &[BranchTarget]) -> BranchTarget {
+    declared.first().cloned().unwrap_or_default()
+}
+
+/// Transform `snapshot` in place for `requested`, which must be one the recipe
+/// declares (`branchTargets` in the recipe file). `None` — a launch that named no
+/// target — resolves to [`default_target`] here rather than at the call site, so
+/// no launch path can answer "which target" differently from any other.
 ///
 /// `New` is the identity: agent nodes keep their authored branch mode and the
 /// terminal PR node ships the branch they mint. `Base` rewrites every agent node
@@ -24,9 +41,10 @@ use crate::models::{
 /// is control-terminal (enforced by `RecipeFile::validate`).
 pub fn apply_branch_target(
     snapshot: &mut ExecutionSnapshot,
-    target: BranchTarget,
+    requested: Option<BranchTarget>,
     declared: &[BranchTarget],
 ) -> Result<(), String> {
+    let target = requested.unwrap_or_else(|| default_target(declared));
     if !declared.contains(&target) {
         let supported = declared
             .iter()
@@ -39,40 +57,97 @@ pub fn apply_branch_target(
         ));
     }
 
-    if target == BranchTarget::Base {
-        for node in &mut snapshot.recipe.nodes {
-            if node.node_type != RecipeNodeType::Agent {
-                continue;
-            }
-            let agent_config = node.agent_config.get_or_insert(AgentNodeConfig {
-                agent_config_id: None,
-                output_schema: None,
-                git_config: None,
-            });
-            agent_config
-                .git_config
-                .get_or_insert_with(AgentGitConfig::default)
-                .branch_mode = BranchMode::None;
-        }
-
-        let pruned: HashSet<String> = snapshot
-            .recipe
-            .nodes
-            .iter()
-            .filter(|node| node.node_type == RecipeNodeType::Pr)
-            .map(|node| node.id.clone())
-            .collect();
-        snapshot
-            .recipe
-            .nodes
-            .retain(|node| !pruned.contains(&node.id));
-        snapshot.recipe.edges.retain(|edge| {
-            !pruned.contains(&edge.source_node_id) && !pruned.contains(&edge.target_node_id)
-        });
-    }
-
+    transform_for_target(
+        &mut snapshot.recipe.nodes,
+        &mut snapshot.recipe.edges,
+        target,
+    );
     snapshot.branch_target = target;
     Ok(())
+}
+
+/// The graph rewrite itself, over bare nodes and edges so the same transform
+/// serves a snapshot being launched and a recipe being inspected before one
+/// exists. `New` is the identity; `Base` is described on [`apply_branch_target`].
+fn transform_for_target(
+    nodes: &mut Vec<RecipeNode>,
+    edges: &mut Vec<crate::models::RecipeEdge>,
+    target: BranchTarget,
+) {
+    if target != BranchTarget::Base {
+        return;
+    }
+    for node in nodes.iter_mut() {
+        if node.node_type != RecipeNodeType::Agent {
+            continue;
+        }
+        let agent_config = node.agent_config.get_or_insert(AgentNodeConfig {
+            agent_config_id: None,
+            output_schema: None,
+            git_config: None,
+        });
+        agent_config
+            .git_config
+            .get_or_insert_with(AgentGitConfig::default)
+            .branch_mode = BranchMode::None;
+    }
+
+    let pruned: HashSet<String> = nodes
+        .iter()
+        .filter(|node| node.node_type == RecipeNodeType::Pr)
+        .map(|node| node.id.clone())
+        .collect();
+    nodes.retain(|node| !pruned.contains(&node.id));
+    edges.retain(|edge| {
+        !pruned.contains(&edge.source_node_id) && !pruned.contains(&edge.target_node_id)
+    });
+}
+
+/// Why a graph that has already been resolved for its branch target cannot run
+/// on a thread, or `None` when it can.
+///
+/// A thread owns no branch and never opens a pull request — that is the whole
+/// content of the kind. So the question is not "is this issue a thread" but
+/// "would this execution produce the state the kind forbids", asked of the
+/// topology that will actually run. Both are true of a graph resolved to `base`
+/// (every agent node lands on [`BranchMode::None`] and every `pr` node is
+/// pruned), which is why a thread can run a base-target recipe at all.
+pub fn thread_incompatibility(nodes: &[RecipeNode]) -> Option<&'static str> {
+    if nodes
+        .iter()
+        .any(|node| node.node_type == RecipeNodeType::Pr)
+    {
+        return Some("it would open a pull request");
+    }
+    if nodes.iter().any(|node| {
+        node.node_type == RecipeNodeType::Agent
+            && node
+                .agent_config
+                .as_ref()
+                .and_then(|config| config.git_config.as_ref())
+                .map(|git| git.branch_mode.clone())
+                .unwrap_or_default()
+                != BranchMode::None
+    }) {
+        return Some("it would mint a branch");
+    }
+    None
+}
+
+/// [`thread_incompatibility`] for a recipe that has not been snapshotted yet:
+/// resolve the target an unnamed launch would take, apply the same transform,
+/// and ask the same question. The create-and-start door refuses before its
+/// insert and the execution door refuses after the snapshot exists, but there is
+/// one rule between them rather than one per door.
+pub fn recipe_thread_incompatibility(recipe: &Recipe) -> Option<&'static str> {
+    let mut nodes = recipe.nodes.clone();
+    let mut edges = recipe.edges.clone();
+    transform_for_target(
+        &mut nodes,
+        &mut edges,
+        default_target(&recipe.branch_targets),
+    );
+    thread_incompatibility(&nodes)
 }
 
 #[cfg(test)]
@@ -84,6 +159,8 @@ mod tests {
     use std::collections::HashMap;
 
     const COORDINATOR_YAML: &str = include_str!("../../../../recipes/coordinator.yaml");
+    const THREAD_YAML: &str = include_str!("../../../../recipes/thread.yaml");
+    const BUILD_YAML: &str = include_str!("../../../../recipes/build.yaml");
 
     fn snapshot_from_yaml(yaml: &str) -> (ExecutionSnapshot, Vec<BranchTarget>) {
         let recipe = RecipeFile::from_yaml(yaml)
@@ -134,7 +211,7 @@ mod tests {
     fn new_target_is_the_identity_transform() {
         let (mut snapshot, declared) = snapshot_from_yaml(COORDINATOR_YAML);
         let before = snapshot.recipe.clone();
-        apply_branch_target(&mut snapshot, BranchTarget::New, &declared).unwrap();
+        apply_branch_target(&mut snapshot, Some(BranchTarget::New), &declared).unwrap();
 
         assert_eq!(snapshot.branch_target, BranchTarget::New);
         assert_eq!(
@@ -152,7 +229,7 @@ mod tests {
     #[test]
     fn base_target_drops_branches_and_prunes_the_pr_node() {
         let (mut snapshot, declared) = snapshot_from_yaml(COORDINATOR_YAML);
-        apply_branch_target(&mut snapshot, BranchTarget::Base, &declared).unwrap();
+        apply_branch_target(&mut snapshot, Some(BranchTarget::Base), &declared).unwrap();
 
         assert_eq!(snapshot.branch_target, BranchTarget::Base);
         assert!(
@@ -209,11 +286,139 @@ mod tests {
             .any(|node| node.node_type == RecipeNodeType::Artifact));
     }
 
+    /// A launch that names no target takes the recipe's OWN first declared one,
+    /// resolved inside the transform so every launch path — the composer, the
+    /// scheduler, a trigger, an `executions` append with no `branch` key —
+    /// answers it identically. Both directions are pinned: the recipes that keep
+    /// the implicit `[new]` are unaffected, which is what makes the change safe,
+    /// and a recipe written for one posture gets that posture instead of being
+    /// refused.
+    #[test]
+    fn an_unnamed_launch_takes_the_recipes_own_default() {
+        assert_eq!(default_target(&[]), BranchTarget::New);
+        assert_eq!(
+            default_target(&[BranchTarget::New, BranchTarget::Base]),
+            BranchTarget::New
+        );
+
+        // A recipe whose file omits `branchTargets` is untouched: unnamed still
+        // means `new`, and `new` is still the identity transform.
+        let (mut build, build_declared) = snapshot_from_yaml(BUILD_YAML);
+        assert_eq!(build_declared, crate::models::default_branch_targets());
+        apply_branch_target(&mut build, None, &build_declared).unwrap();
+        assert_eq!(build.branch_target, BranchTarget::New);
+        assert!(
+            build
+                .recipe
+                .nodes
+                .iter()
+                .any(|node| node.node_type == RecipeNodeType::Pr),
+            "the identity transform leaves build's PR node in place"
+        );
+
+        // A base-only recipe resolves to `base` instead of being refused.
+        let (mut thread, thread_declared) = snapshot_from_yaml(THREAD_YAML);
+        apply_branch_target(&mut thread, None, &thread_declared).unwrap();
+        assert_eq!(thread.branch_target, BranchTarget::Base);
+    }
+
+    /// A thread owns no branch, and its recipe says so by declaring `base`
+    /// alone: the default resolution lands there, and `new` — which would mint a
+    /// branch and hand the thread an ending — is refused.
+    #[test]
+    fn the_thread_recipe_is_base_only() {
+        let (mut snapshot, declared) = snapshot_from_yaml(THREAD_YAML);
+        assert_eq!(declared, vec![BranchTarget::Base]);
+
+        apply_branch_target(&mut snapshot, Some(BranchTarget::New), &declared)
+            .expect_err("a thread may not mint a branch");
+        apply_branch_target(&mut snapshot, None, &declared).unwrap();
+        assert_eq!(snapshot.branch_target, BranchTarget::Base);
+
+        let thread = snapshot
+            .recipe
+            .nodes
+            .iter()
+            .find(|node| node.node_type == RecipeNodeType::Agent)
+            .expect("the thread agent node");
+        assert_eq!(
+            thread
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.git_config.as_ref())
+                .map(|g| g.branch_mode.clone()),
+            Some(BranchMode::None)
+        );
+        // The arc survives the transform: context-self edges are never touched.
+        assert!(snapshot
+            .recipe
+            .nodes
+            .iter()
+            .any(|node| node.node_type == RecipeNodeType::Artifact));
+    }
+
+    /// The thread rule, asked of the graph rather than of the issue. Pinned over
+    /// the recipes Cairn ships so a recipe edit that would quietly let a thread
+    /// mint a branch fails here, and so the two doors that ask it (the execution
+    /// start and the create-and-start dispatch) keep answering identically.
+    #[test]
+    fn only_a_branchless_graph_may_run_on_a_thread() {
+        let recipe = |yaml| {
+            RecipeFile::from_yaml(yaml)
+                .expect("bundled recipe parses")
+                .into_recipe(Some("default".to_string()), None)
+        };
+
+        // The thread recipe resolves to `base`, so it mints nothing and ships
+        // nothing: the one bundled recipe a thread may run.
+        assert_eq!(recipe_thread_incompatibility(&recipe(THREAD_YAML)), None);
+
+        // Every shipping recipe is refused, naming what it would produce rather
+        // than restating the kind.
+        assert_eq!(
+            recipe_thread_incompatibility(&recipe(BUILD_YAML)),
+            Some("it would open a pull request")
+        );
+        assert_eq!(
+            recipe_thread_incompatibility(&recipe(COORDINATOR_YAML)),
+            Some("it would open a pull request"),
+            "the coordinator declares [new, base] and an unnamed launch takes `new`"
+        );
+
+        // A graph with no PR node but an authored branch is refused for the
+        // other reason — the branch alone is disqualifying, since owning one is
+        // what makes a thing terminal.
+        let mut branching = recipe(THREAD_YAML);
+        for node in &mut branching.nodes {
+            if node.node_type == RecipeNodeType::Agent {
+                node.agent_config.as_mut().unwrap().git_config = Some(AgentGitConfig {
+                    branch_mode: BranchMode::Isolate,
+                    require_parent_head: false,
+                });
+            }
+        }
+        assert_eq!(
+            thread_incompatibility(&branching.nodes),
+            Some("it would mint a branch")
+        );
+
+        // And the transform is what makes a shipping recipe eligible: the same
+        // coordinator, resolved to `base`, passes the same rule.
+        let (mut standing, declared) = snapshot_from_yaml(COORDINATOR_YAML);
+        assert!(thread_incompatibility(&standing.recipe.nodes).is_some());
+        apply_branch_target(&mut standing, Some(BranchTarget::Base), &declared).unwrap();
+        assert_eq!(thread_incompatibility(&standing.recipe.nodes), None);
+    }
+
     #[test]
     fn an_undeclared_target_is_rejected() {
         let (mut snapshot, _) = snapshot_from_yaml(COORDINATOR_YAML);
-        let error = apply_branch_target(&mut snapshot, BranchTarget::Base, &[BranchTarget::New])
-            .expect_err("a recipe that declares only `new` refuses `base`");
+        let error = apply_branch_target(
+            &mut snapshot,
+            Some(BranchTarget::Base),
+            &[BranchTarget::New],
+        )
+        .expect_err("a recipe that declares only `new` refuses `base`");
         assert!(
             error.contains("does not support branch target 'base'"),
             "{error}"

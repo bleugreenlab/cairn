@@ -1862,6 +1862,16 @@ impl Orchestrator {
         crate::mcp::handlers::mcp_continuation::spawn_scheduler(self.clone());
     }
 
+    /// Spawn external human-gate delivery. Runtime owners choose and construct
+    /// the provider so channel processes remain outside the orchestrator.
+    pub fn spawn_channel_router(
+        &self,
+        provider: std::sync::Arc<dyn crate::channels::ChannelProvider>,
+        config: crate::models::IMessageChannelConfig,
+    ) {
+        crate::channels::router::spawn(self.clone(), provider, config);
+    }
+
     /// Re-dispatch workflow runs that were in flight when the process died
     /// (CAIRN-2498): re-spawn each crashed workflow's `bun <script>` for the
     /// SAME run_id so its journal replays already-completed `agent()` calls
@@ -2690,6 +2700,7 @@ mod tests {
         };
         ExecutorHealthSnapshot {
             identity: identity.clone(),
+            public_name: "bglab-win".into(),
             colocated: false,
             status: ExecutorHealthStatus::Online,
             heartbeat_age_ms: 0,

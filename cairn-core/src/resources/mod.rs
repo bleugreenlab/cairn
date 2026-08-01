@@ -25,6 +25,7 @@ mod rebase;
 mod recipes;
 mod settings;
 pub(crate) mod symbols;
+mod thread_seed;
 mod transcript;
 mod workflows;
 
@@ -33,3 +34,4 @@ pub(crate) use common::{connect_and_find_node_job, node_branch};
 pub(crate) use common::{pointer_affordance_block, resolve_home_relative_resource_uri};
 pub(crate) use node::{render_reseed_digest, resolve_todos_job_id};
 pub(crate) use read::{produce_cairn_resource, read_cairn_resource};
+pub(crate) use thread_seed::{compose_thread_seed, ThreadSeed};

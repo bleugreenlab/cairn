@@ -15,6 +15,7 @@ mod artifacts;
 mod browsers;
 mod bug;
 mod executions;
+mod executors;
 mod issues;
 mod labels;
 mod mcp;
@@ -268,6 +269,10 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         mcp::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        executors::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else {

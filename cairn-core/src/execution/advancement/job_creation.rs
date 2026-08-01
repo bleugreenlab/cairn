@@ -537,6 +537,57 @@ mod tests {
         .unwrap();
     }
 
+    /// A child of a thread is stamped with the project default branch, the same
+    /// coordinate a parentless issue gets. This column is also what the PR node
+    /// reads for its base ref (`find_implementation_context` →
+    /// `resolve_effective_pr_base`), so stamping the default here is what makes
+    /// the child's pull request target the project default branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_branch_for_a_thread_child_is_the_project_default() {
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'trunk', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, kind, created_at, updated_at)
+                     VALUES ('thread', 'proj-1', 1, 'Thread', 'thread', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, parent_issue_id, created_at, updated_at)
+                     VALUES ('child', 'proj-1', 2, 'Child', 'thread', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-1', 'recipe-default', 'thread', 'proj-1', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                // A branch-bearing job on the thread, so the assertion rests on the
+                // kind rather than on a thread happening to own no branch.
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, created_at, updated_at)
+                     VALUES ('job-thread', 'exec-1', 'node', 'thread', 'proj-1', 'running', 'agent/thread', 1, 1)",
+                    (),
+                )
+                .await?;
+                let branch = base_branch_for_issue_job(conn, "proj-1", "child").await?;
+                assert_eq!(branch.as_deref(), Some("trunk"));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn base_branch_uses_default_when_parent_is_ambient() {
         let db = migrated_db().await;

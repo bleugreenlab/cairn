@@ -47,6 +47,88 @@ pub struct Issue {
     /// Workspace labels attached to this issue.
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// What this row IS: an ordinary issue or a thread. Defaulted so a payload
+    /// written before the discriminator existed reads as an ordinary issue
+    /// rather than failing to deserialize.
+    #[serde(default)]
+    pub kind: IssueKind,
+}
+
+/// What a row in `issues` is.
+///
+/// An `Issue` is a unit of work: it branches, produces a pull request, and
+/// terminates by merging. A `Thread` is a durable, objective-free session
+/// anchor: it owns no branch, its children merge to the project base branch,
+/// and it never terminates via a PR — so it refuses a `merged` resolution.
+/// Both share identity (the project-scoped issue number), children, comments,
+/// and executions; this is what tells them apart.
+///
+/// An enum rather than a raw string on purpose: branch derivation, attention
+/// projection, and the issue table all key on this, and an exhaustive match is
+/// what makes a future kind a compile error at every one of those sites instead
+/// of a silent fallthrough.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueKind {
+    #[default]
+    Issue,
+    Thread,
+}
+
+impl IssueKind {
+    /// The accepted values, for a refusal message that tells the caller what it
+    /// may write instead. Derived from the same variants `FromStr` parses.
+    pub const ACCEPTED_VALUES: &'static str = "issue, thread";
+
+    /// Whether an agent session resting Idle on a row of this kind is an
+    /// attention-worthy fact.
+    ///
+    /// For an issue it is: an issue is a unit of work driving toward a merge, so
+    /// a session that stopped short of one is stalled and asking for eyes. For a
+    /// thread rest is the normal state — a thread is a durable session anchor
+    /// that can sit resumable for weeks with nothing wrong — so rest is not
+    /// attention. A resting thread projects [`IssueAttention::None`] and reads
+    /// `active`: alive and resumable, not stalled.
+    ///
+    /// This gates only the *resting* presentation. A thread that genuinely needs
+    /// a human — a pending question, a permission request, a blocked job or open
+    /// merge request — reaches `NeedsInput` / `NeedsAuthorization` /
+    /// `NeedsApproval` through exactly the projection an issue uses, and
+    /// surfaces with the same urgency. There is no thread-specific attention
+    /// channel.
+    ///
+    /// Exhaustive on purpose: a future kind must answer this question
+    /// explicitly rather than inherit an answer.
+    pub fn idle_session_needs_attention(self) -> bool {
+        match self {
+            IssueKind::Issue => true,
+            IssueKind::Thread => false,
+        }
+    }
+}
+
+impl std::fmt::Display for IssueKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IssueKind::Issue => write!(f, "issue"),
+            IssueKind::Thread => write!(f, "thread"),
+        }
+    }
+}
+
+impl std::str::FromStr for IssueKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "issue" => Ok(IssueKind::Issue),
+            "thread" => Ok(IssueKind::Thread),
+            _ => Err(format!(
+                "Unknown issue kind: {s}. Accepted values: {}",
+                IssueKind::ACCEPTED_VALUES
+            )),
+        }
+    }
 }
 
 /// Issue lifecycle status.
@@ -118,6 +200,10 @@ pub enum IssueAttention {
     /// A long-running agent node is resting Idle: non-terminal, resumable, and
     /// awaiting a wake. Blocks the status projection (the issue reads `waiting`)
     /// but is distinct from the human-decision attentions above.
+    ///
+    /// Only ever projected for [`IssueKind::Issue`]. A thread at rest is not
+    /// stalled work asking for eyes — see
+    /// [`IssueKind::idle_session_needs_attention`].
     Idle,
 }
 
@@ -214,6 +300,9 @@ pub struct CreateIssue {
     pub backend_override: Option<String>,
     #[serde(default)]
     pub label_ids: Option<Vec<String>>,
+    /// What to create. Omitted means an ordinary issue.
+    #[serde(default)]
+    pub kind: IssueKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +417,73 @@ mod tests {
     #[test]
     fn issue_attention_fromstr_rejects_unknown() {
         assert!("garbage".parse::<IssueAttention>().is_err());
+    }
+
+    #[test]
+    fn issue_kind_display_fromstr_round_trip() {
+        for v in &[IssueKind::Issue, IssueKind::Thread] {
+            let s = v.to_string();
+            let parsed: IssueKind = s.parse().unwrap();
+            assert_eq!(&parsed, v, "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn issue_kind_fromstr_rejects_unknown_and_names_the_accepted_values() {
+        let error = "discussion".parse::<IssueKind>().unwrap_err();
+        assert!(error.contains("issue, thread"), "{error}");
+    }
+
+    #[test]
+    fn issue_kind_defaults_to_issue() {
+        assert_eq!(IssueKind::default(), IssueKind::Issue);
+    }
+
+    /// A serialized issue written before the discriminator existed carries no
+    /// `kind` at all. It must read as an ordinary issue, not fail to parse —
+    /// this is the same guarantee the column default gives a pre-migration row.
+    #[test]
+    fn issue_without_kind_deserializes_as_an_ordinary_issue() {
+        let issue: Issue = serde_json::from_value(serde_json::json!({
+            "id": "i-1",
+            "projectId": "p-1",
+            "number": 7,
+            "title": "Legacy",
+            "description": "",
+            "status": "backlog",
+            "progress": "backlog",
+            "attention": "none",
+            "priority": 0,
+            "completedAt": null,
+            "dismissedAt": null,
+            "createdAt": 1,
+            "updatedAt": 1,
+            "backendOverride": null,
+            "mergedAt": null,
+            "closedAt": null,
+        }))
+        .expect("a payload predating `kind` must still deserialize");
+        assert_eq!(issue.kind, IssueKind::Issue);
+    }
+
+    #[test]
+    fn issue_kind_round_trips_through_serde_as_a_lowercase_string() {
+        assert_eq!(
+            serde_json::to_value(IssueKind::Thread).unwrap(),
+            serde_json::json!("thread")
+        );
+        assert_eq!(
+            serde_json::from_value::<IssueKind>(serde_json::json!("thread")).unwrap(),
+            IssueKind::Thread
+        );
+    }
+
+    /// Rest is stalled work for an issue and the normal state for a thread. The
+    /// projection in `transitions::outcome` keys on exactly this.
+    #[test]
+    fn only_an_issue_treats_a_resting_session_as_attention() {
+        assert!(IssueKind::Issue.idle_session_needs_attention());
+        assert!(!IssueKind::Thread.idle_session_needs_attention());
     }
 
     #[test]

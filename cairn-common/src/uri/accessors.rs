@@ -19,6 +19,7 @@ impl CairnResource {
             | ProjectIssues { project, .. }
             | ProjectCheckResults { project, .. }
             | Issue { project, .. }
+            | ThreadAlias { project, .. }
             | Node { project, .. }
             | NodeChat { project, .. }
             | NodeChatRaw { project, .. }
@@ -96,6 +97,9 @@ impl CairnResource {
             Self::Settings | Self::Projects | Self::ProjectSettings { .. } => None,
             Self::Project { .. } => Some(format!("/p/{}/issues", project)),
             Self::Issue { number, .. } => Some(format!("/p/{}/i/{}", project, number)),
+            // A thread alias has no route of its own: it resolves to a numbered
+            // issue before anything navigates, and the issue owns the route.
+            Self::ThreadAlias { .. } => None,
             Self::Node {
                 number,
                 exec_seq,
@@ -309,6 +313,7 @@ impl CairnResource {
             | Self::ProjectIssues { project }
             | Self::ProjectCheckResults { project, .. }
             | Self::Issue { project, .. }
+            | Self::ThreadAlias { project, .. }
             | Self::Node { project, .. }
             | Self::NodeChat { project, .. }
             | Self::NodeChatRaw { project, .. }
@@ -446,7 +451,10 @@ impl CairnResource {
             | Self::NodeMemories { number, .. }
             | Self::NodeMemory { number, .. }
             | Self::NodeSymbols { number, .. } => Some(*number),
-            Self::Project { .. }
+            // The number an alias stands for is not in the URI: only a lookup
+            // knows it, so reporting one here would be an invention.
+            Self::ThreadAlias { .. }
+            | Self::Project { .. }
             | Self::ProjectIssues { .. }
             | Self::ProjectCheckResults { .. }
             | Self::ProjectMessages { .. }

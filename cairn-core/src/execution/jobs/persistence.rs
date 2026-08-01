@@ -1058,6 +1058,59 @@ mod pack_anchor_tests {
         assert_eq!(pack_anchor.as_deref(), Some(ROOT_SHA));
     }
 
+    /// A thread's child anchors on its OWN base commit.
+    ///
+    /// The pack anchor asks the same question branch derivation does — is my base
+    /// ephemeral, so must I inherit a durable anchor from my parent? — and reads
+    /// the same resolver to answer it. A thread confers no branch, so its child is
+    /// based on the project default, that base commit is reachable from the
+    /// default branch and therefore already durable, and the child anchors on
+    /// itself rather than borrowing the thread's anchor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn thread_child_job_anchors_on_its_own_base_commit() {
+        let db = Arc::new(migrated_test_db("pack-anchor-thread-child.db").await);
+        db.execute_script(
+            "
+            INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
+            INSERT INTO issues (id, project_id, number, title, status, kind, created_at, updated_at)
+             VALUES ('thread', 'proj', 1, 'Thread', 'active', 'thread', 1, 1);
+            INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
+             VALUES ('child', 'proj', 2, 'Child', 'active', 'thread', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, status, branch, created_at, updated_at)
+             VALUES ('job-thread', 'proj', 'thread', 'running', 'agent/thread-int', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, status, base_branch, created_at, updated_at)
+             VALUES ('job-child', 'proj', 'child', 'pending', 'main', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE jobs SET base_commit = ?1, pack_anchor = ?1 WHERE id = 'job-thread'",
+            params![ROOT_SHA],
+        )
+        .await
+        .unwrap();
+
+        update_job_coordinate(
+            db.clone(),
+            "job-child".to_string(),
+            Some("agent/child-int".to_string()),
+            Some(CHILD_SHA.to_string()),
+            2,
+        )
+        .await
+        .unwrap();
+
+        let (base_commit, pack_anchor) = job_anchors(&db, "job-child").await;
+        assert_eq!(base_commit.as_deref(), Some(CHILD_SHA));
+        assert_eq!(
+            pack_anchor.as_deref(),
+            Some(CHILD_SHA),
+            "a thread's child must not borrow the thread's anchor"
+        );
+    }
+
     /// A sub-agent task whose parent recorded no base still spawns.
     ///
     /// `create_child_task` and the ephemeral-call path both used to resolve the

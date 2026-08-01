@@ -23,6 +23,7 @@ Cairn resources use canonical project-scoped URIs under `cairn://p/{PROJECT}`. H
 - `cairn://p/{project}` — project overview; projections include full-text search.
 - `cairn://p/{project}/issues`, `/messages`, `/terminal/{slug}`, `/chat/{name}` — project collections and project-scoped streams.
 - `cairn://p/{project}/{number}` — issue overview.
+- `cairn://p/{project}/t/{name}` — a thread by name (its title slugified); a read-only alias resolving to that thread's numbered issue URI.
 - `cairn://p/{project}/{number}/changed`, `/executions`, `/messages` — issue collections.
 - `cairn://p/{project}/{number}/{exec}/{node}` — node summary.
 - `cairn://p/{project}/{number}/{exec}/{node}/chat`, `/diff`, `/terminal/{slug}`, `/todos`, `/tasks`, `/questions`, `/permissions` — node collections.
@@ -174,9 +175,9 @@ A `run` whose command changes tracked files must carry `commit_msg` on the call;
       commit_msg:"changelog: add user roles",
     })
 
-When the suite you are landing into is not already green, a failure is only yours if it isn't already failing on the base. `branch` answers that in one call, running the batch against another revision instead of your own branch:
+When the suite you are landing into is not already green, a failure is only yours if it isn't already failing on the base. For a configured project check, `cairn check run <suite> [branch]` answers that and records the baseline. For anything else — one focused test, a one-off script — `branch` answers it in one call, running the batch against another revision instead of your own branch:
 
-    run({commands:[{command:"bun run test"}], branch:"main"})
+    run({commands:[{command:"bun run test src/parser.test.ts"}], branch:"main"})
 
 It takes the same refs `read`'s `?branch=` does, and is verdict-only: tracked files the batch writes are discarded, it cannot be combined with `commit_msg`, and an MCP-tool or REPL batch executes on the host and is rejected.
 

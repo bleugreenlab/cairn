@@ -2,7 +2,9 @@ use super::*;
 use crate::db::DbState;
 use crate::issues::comments;
 use crate::issues::crud as issue_crud;
-use crate::models::{CommentSource, CreateComment, CreateIssue, CreateProject, IssueStatus};
+use crate::models::{
+    CommentSource, CreateComment, CreateIssue, CreateProject, IssueKind, IssueStatus,
+};
 use crate::orchestrator::OrchestratorBuilder;
 use crate::projects::crud as project_crud;
 use crate::services::testing::TestServicesBuilder;
@@ -59,6 +61,7 @@ async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
             description: Some("body".to_string()),
             backend_override: None,
             label_ids: None,
+            kind: IssueKind::Issue,
         },
     )
     .await
@@ -332,6 +335,7 @@ async fn add_issue(orch: &Orchestrator, project_id: &str, title: &str) -> (Strin
             description: None,
             backend_override: None,
             label_ids: None,
+            kind: IssueKind::Issue,
         },
     )
     .await
@@ -1162,6 +1166,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectActions => "cairn://p/CAIRN/actions",
         K::ProjectAction => "cairn://p/CAIRN/actions/example",
         K::NodeCalls => "cairn://p/CAIRN/1/1/builder/calls",
+        K::Executors => "cairn://executors",
+        K::Executor => "cairn://executors/bglab-ub",
         other => {
             panic!("sample_resource: {other:?} carries a mutation but has no sample URI; add one")
         }

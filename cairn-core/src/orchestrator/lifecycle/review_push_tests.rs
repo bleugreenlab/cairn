@@ -1205,6 +1205,68 @@ async fn every_settled_status_is_a_rearm_candidate() {
     }
 }
 
+/// The re-arm now runs as a detached task after the transport is already serving
+/// (CAIRN-3382), which is safe for exactly one reason: it is idempotent across
+/// boots. This pins both halves of that claim — a task-spawned re-arm reaches the
+/// same outcome the blocking one did, and running it a second time (the next boot
+/// after one that was interrupted or never finished) neither duplicates the
+/// watcher's wake nor changes what it points at.
+#[tokio::test]
+async fn a_detached_rearm_converges_and_stays_convergent_across_boots() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Planner).await;
+    db.execute_script(
+        "UPDATE jobs SET status='blocked', branch=NULL WHERE id='j-prod';
+         INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
+                               output_name, created_at, updated_at)
+           VALUES('a-plan','j-prod','plan',0,'{}',1,'plan',1,1);",
+    )
+    .await
+    .unwrap();
+    let orch = std::sync::Arc::new(test_orchestrator(db));
+
+    async fn review_wakes(orch: &Orchestrator) -> Vec<String> {
+        list_pending(&orch.db.local, "j-watch")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|push| push.key == REVIEW_KEY)
+            .map(|push| push.content_ref)
+            .collect()
+    }
+
+    // Boot one, spawned rather than awaited inline — what the runtime now does.
+    let first_waves = {
+        let orch = orch.clone();
+        tokio::spawn(async move { super::rearm_review_checks_on_startup(&orch).await })
+    }
+    .await
+    .expect("the background re-arm task runs to completion");
+    assert!(
+        first_waves >= 1,
+        "the settled candidate must be counted for the boot log"
+    );
+    let after_first = review_wakes(&orch).await;
+    assert_eq!(
+        after_first.len(),
+        1,
+        "a detached re-arm must reach the watcher exactly as a blocking one did"
+    );
+
+    // Boot two, over state boot one already re-armed.
+    let second_waves = super::rearm_review_checks_on_startup(&orch).await;
+    assert_eq!(
+        second_waves, first_waves,
+        "the candidate set is a function of stored state, not of how many boots ran"
+    );
+    assert_eq!(
+        review_wakes(&orch).await,
+        after_first,
+        "re-running the re-arm must not duplicate or move the watcher's wake"
+    );
+}
+
 /// The launchability guard, at the moment it is cheapest to honour: a wave for
 /// a resolved issue or a cancelled job is never armed at all, so it claims no
 /// single-flight slot and spends no minutes planning against a tree nobody will

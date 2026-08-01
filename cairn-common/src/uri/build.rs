@@ -54,6 +54,16 @@ pub fn build_project_check_results_uri(project: &str, revision: &str) -> String 
     format!("{}/check-results/{}", build_project_uri(project), revision)
 }
 
+/// The name-addressed alias for a thread (`cairn://p/PROJECT/t/NAME`).
+///
+/// Nothing in Cairn emits this form — the alias is accepted on input and
+/// resolved to the numbered issue URI, which is what every rendered link, wake
+/// ref, and parent field keeps using. It exists so the one parser can round-trip
+/// the shape and so a refusal can name it.
+pub fn build_thread_alias_uri(project: &str, name: &str) -> String {
+    format!("{}/t/{}", build_project_uri(project), name)
+}
+
 pub fn build_project_issues_uri(project: &str) -> String {
     format!("{}/issues", build_project_uri(project))
 }
@@ -645,6 +655,7 @@ impl CairnResource {
                 build_project_image_uri(project, reference)
             }
             Self::Issue { project, number } => build_issue_uri(project, *number),
+            Self::ThreadAlias { project, name } => build_thread_alias_uri(project, name),
             Self::Node {
                 project,
                 number,

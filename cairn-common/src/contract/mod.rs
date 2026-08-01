@@ -68,6 +68,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     projects::PROJECT_BROWSER_CONTRACT,
     projects::PROJECT_BROWSER_NETWORK_REQUEST_CONTRACT,
     issues::ISSUE_CONTRACT,
+    issues::THREAD_ALIAS_CONTRACT,
     issues::CHANGED_CONTRACT,
     issues::ISSUE_EXECUTIONS_CONTRACT,
     issues::ISSUE_EXECUTION_CONTRACT,
@@ -146,29 +147,74 @@ mod tests {
     use super::specs::SUBAGENT_TYPE;
     use super::*;
 
-    /// The fleet is inspected, never mutated through the resource graph. A
-    /// machine is renamed by an operator command that also moves the enrollment
-    /// claim and restarts supervision, which no resource write could do, so the
-    /// contract advertises no mutation and the affordance points at the command.
+    /// The fleet's management surface IS the resource graph: enrollment on the
+    /// collection, configuration and removal on the machine. Exactly these
+    /// three, because what is absent is absent for a reason — no safe reconnect
+    /// lifecycle exists behind an edit to a machine's host, identity, paths,
+    /// tunnel, or project membership, and a forced removal would cross work that
+    /// is still resident.
     #[test]
-    fn the_executor_family_is_read_only_and_names_the_rename_command() {
-        for kind in [ResourceKind::Executors, ResourceKind::Executor] {
-            let contract = contract_for(kind).expect("the executor family is registered");
-            assert!(
-                contract.mutations.is_empty(),
-                "{kind:?} must advertise no resource mutation"
-            );
-            for mode in ChangeMode::ALL {
+    fn the_executor_family_advertises_exactly_enroll_configure_and_remove() {
+        let collection =
+            contract_for(ResourceKind::Executors).expect("the fleet collection is registered");
+        assert_eq!(collection.mutations.len(), 1);
+        let enroll = mutation_spec(ResourceKind::Executors, ChangeMode::Create)
+            .expect("enrollment is a collection create");
+        assert_eq!(
+            enroll
+                .required
+                .iter()
+                .map(|key| key.key)
+                .collect::<Vec<_>>(),
+            ["host", "sshUser"],
+            "only the two facts a person actually has are required; the rest is derived"
+        );
+        assert!(
+            enroll.optional.iter().any(|key| key.key == "projectKeys"),
+            "project restriction is optional, so an omitted list means every project"
+        );
+
+        let machine = contract_for(ResourceKind::Executor).expect("the machine is registered");
+        assert_eq!(machine.mutations.len(), 2);
+        let configure = mutation_spec(ResourceKind::Executor, ChangeMode::Patch)
+            .expect("configuration is a patch");
+        assert!(
+            configure.required.is_empty(),
+            "a patch carries whichever control it is changing"
+        );
+        let configurable: Vec<_> = configure.optional.iter().map(|key| key.key).collect();
+        assert_eq!(
+            configurable,
+            ["newName", "runtimePolicy", "draining", "expectedGeneration"],
+            "host, identity, paths, tunnel, and project membership stay unwritable"
+        );
+        assert!(mutation_spec(ResourceKind::Executor, ChangeMode::Delete).is_some());
+
+        for mode in ChangeMode::ALL {
+            if !matches!(mode, ChangeMode::Create) {
                 assert!(
-                    mutation_spec(kind, *mode).is_none(),
-                    "{kind:?} must reject {mode:?}"
+                    mutation_spec(ResourceKind::Executors, *mode).is_none(),
+                    "the fleet collection must reject {mode:?}"
+                );
+            }
+            if !matches!(mode, ChangeMode::Patch | ChangeMode::Delete) {
+                assert!(
+                    mutation_spec(ResourceKind::Executor, *mode).is_none(),
+                    "a machine must reject {mode:?}"
                 );
             }
         }
-        assert!(contract_for(ResourceKind::Executor)
-            .expect("registered")
-            .description
-            .contains("cairn executor rename"));
+    }
+
+    /// Removal has no force key and the description says why: an operator drains
+    /// first and removes an empty machine, so the flow is discoverable from the
+    /// affordance alone.
+    #[test]
+    fn removal_advertises_drain_first_rather_than_a_force_option() {
+        let machine = contract_for(ResourceKind::Executor).expect("registered");
+        assert!(machine.description.contains("drain first"));
+        let remove = mutation_spec(ResourceKind::Executor, ChangeMode::Delete).expect("registered");
+        assert!(remove.required.is_empty() && remove.optional.is_empty());
     }
 
     #[test]

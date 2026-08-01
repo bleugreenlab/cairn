@@ -45,6 +45,7 @@ pub(crate) fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) 
         Wake::Passive
     };
     let fingerprint = format!("status:{final_status}:{}", event.updated_at);
+    let status_text = final_status.to_string();
     let dbs = orch.db.clone();
     let issue_id = event.issue_id.clone();
     let issue_uri = event.issue_uri.clone();
@@ -59,6 +60,12 @@ pub(crate) fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) 
             if job_belongs_to_issue(&db, &recipient, &issue_id).await? {
                 continue;
             }
+            // This is the canonical moment a child becomes terminal for its
+            // watchers, so it is where a thread learns that the turns which
+            // discussed that child may now stand behind one chapter line. The
+            // mark is eligibility only — nothing is rewritten here — and it is
+            // idempotent, so re-delivery of the same terminal fact is a no-op.
+            mark_thread_chapter(&db, &recipient, &issue_id, &issue_uri, &status_text).await;
             if let Some(Some(previous)) =
                 super::attention_push::latest_push_fingerprint(&db, &recipient, &key)
                     .await
@@ -103,6 +110,53 @@ pub(crate) fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) 
             }
         }
         Err(e) => log::warn!("resolved push creation failed: {}", e),
+    }
+}
+
+/// Record that a terminal child makes a watching thread's turns compactable.
+///
+/// Best-effort by construction: compaction bookkeeping must never be able to
+/// break attention delivery, so a failure is logged and the push proceeds. The
+/// cost of a missed mark is one chapter's worth of turns staying verbatim until
+/// the child is finalized again or the thread compacts on expiry.
+async fn mark_thread_chapter(
+    db: &LocalDb,
+    recipient: &str,
+    child_issue_id: &str,
+    child_issue_uri: &str,
+    final_status: &str,
+) {
+    if !crate::threads::compaction_capability_for_job(db, recipient)
+        .await
+        .is_enabled()
+    {
+        return;
+    }
+    let title = match db
+        .query_opt_text(
+            "SELECT title FROM issues WHERE id = ?1",
+            params![child_issue_id.to_string()],
+        )
+        .await
+    {
+        Ok(Some(title)) => title,
+        // A chapter with no overview is exactly the bare address the design
+        // rejects, so fall back to the URI's own text rather than an empty line.
+        _ => child_issue_uri.to_string(),
+    };
+    let mark = crate::threads::compaction::ChildMark {
+        child_issue_id: child_issue_id.to_string(),
+        child_issue_uri: child_issue_uri.to_string(),
+        child_title: title,
+        final_status: final_status.to_string(),
+        marked_at: chrono::Utc::now().timestamp(),
+    };
+    if let Err(error) = crate::threads::compaction::mark_child_terminal(db, recipient, &mark).await
+    {
+        log::warn!(
+            "thread chapter mark for {} on {child_issue_uri} failed: {error}",
+            &recipient[..recipient.len().min(8)]
+        );
     }
 }
 
@@ -446,34 +500,32 @@ const CATCHUP_DIGEST_CHARS: usize = 240;
 /// window so the load-bearing fact survives the cap, and the window follows as
 /// context.
 ///
-/// The digest reads **two** durable sources, because an operator message is not
-/// in the child's transcript the moment it is sent. Text typed at a busy child is
-/// a `queued_messages` row until the child reaches a tool boundary or turn end and
-/// claims it — which can be a whole builder turn later. A coordinator that runs
-/// inside that gap would otherwise render an empty digest over a stale window,
-/// stamp the push delivered, advance its read cursor past the child's current
-/// tail, and retire the row; nothing re-fires when the child finally records the
-/// message, so that operator intervention would be lost for good. Reading the
-/// pending queue alongside the transcript makes the digest independent of that
-/// ordering, and tells the coordinator sooner besides: it learns the operator
-/// changed the child's scope before the child has even read it.
+/// The one source is `queued_messages`, because it is the one durable record
+/// whose every row is text a human typed at this job: the composer's queued
+/// follow-up, and the idle-child send that goes straight into a resume (recorded
+/// delivered on arrival). The child's own transcript cannot serve here. A `user`
+/// event is a *role*, not an author — the job's launch prompt, a delegated
+/// artifact payload delivered to a review node, and every machinery resume land
+/// in the same slot as the operator's typed `^`, distinguishable only by reading
+/// their content. Scanning that role told coordinators "the operator sent" over
+/// issue bodies they had written themselves (CAIRN-3390), which is both noise a
+/// long-lived thread pays for forever and a false claim about who spoke. What
+/// cannot be established as operator-authored is therefore left out rather than
+/// guessed at; the chat window that follows still carries it as context.
 ///
-/// Both sources obey one rule — *operator text for this job that the recipient
-/// has not already caught up on* — anchored on its read cursor `updated_at`,
-/// which is stamped in the same transaction that delivered its last catch-up. For
-/// the transcript that means `user` events at or after the anchor. For the queue
-/// it means rows still pending **or claimed at or after the anchor**, because the
-/// claim is not the moment the text appears in the transcript: `claim_for_job_inner`
-/// commits the `delivered_at` stamp and its caller inserts the transcript event
-/// afterwards, so a row selected only on `delivered_at IS NULL` would fall out of
-/// both sources for the width of that gap. Keeping recently claimed rows closes
-/// it; the content dedupe collapses the overlap once the event lands, keeping the
-/// transcript copy since it is the one the node has actually read.
+/// A row is named while it is still **pending** — the node has not read it, so it
+/// stays live information for as long as that holds — or when it was sent at or
+/// after the recipient's read cursor `updated_at`, which is stamped in the same
+/// transaction that delivered its last catch-up. Reading the queue rather than
+/// waiting for the transcript also tells the coordinator sooner: text typed at a
+/// busy child sits in the queue until the child reaches a tool boundary or turn
+/// end, which can be a whole builder turn later, and a coordinator running inside
+/// that gap would otherwise render an empty digest, retire the push, and advance
+/// its cursor past the child's tail with nothing left to re-fire.
 ///
 /// With no cursor yet (a first catch-up), the newest [`CATCHUP_DIGEST_MESSAGES`]
-/// stand in — an unanchored scan would otherwise open with the issue body the
-/// coordinator wrote itself. Both sources are read at delivery, so an edited or
-/// deleted queued message reports its current state rather than a stale copy.
+/// stand in. Rows are read at delivery, so an edited or deleted queued message
+/// reports its current state rather than a stale copy.
 async fn catchup_operator_digest(
     db: &LocalDb,
     recipient: &str,
@@ -485,64 +537,41 @@ async fn catchup_operator_digest(
         .flatten()
         .unwrap_or(0);
     let child_job_id = child_job_id.to_string();
-    let (recorded, queued): (Vec<OperatorMessage>, Vec<OperatorMessage>) = db
+    let messages: Vec<OperatorMessage> = db
         .read(|conn| {
             let child_job_id = child_job_id.clone();
             Box::pin(async move {
-                let limit = CATCHUP_DIGEST_MESSAGES as i64;
-                let mut recorded = Vec::new();
-                let mut rows = conn
-                    .query(
-                        "SELECT e.timestamp, e.data FROM events e
-                         JOIN runs r ON r.id = e.run_id
-                         WHERE r.job_id = ?1 AND e.event_type = 'user' AND e.timestamp >= ?2
-                         ORDER BY e.timestamp DESC, e.sequence DESC
-                         LIMIT ?3",
-                        params![child_job_id.as_str(), anchor, limit],
-                    )
-                    .await?;
-                while let Some(row) = rows.next().await? {
-                    // An archived event stores its body out of line; there is
-                    // nothing to excerpt, so leave it to the chat window.
-                    if let Some(content) = user_event_content(&row.text(1)?) {
-                        recorded.push(OperatorMessage {
-                            timestamp: row.i64(0)?,
-                            content,
-                            read_by_node: true,
-                        });
-                    }
-                }
-                let mut queued = Vec::new();
+                let mut messages = Vec::new();
                 let mut rows = conn
                     .query(
                         "SELECT created_at, content, delivered_at FROM queued_messages
                          WHERE job_id = ?1
-                           AND (delivered_at IS NULL OR delivered_at >= ?2)
+                           AND (delivered_at IS NULL OR created_at >= ?2)
                          ORDER BY created_at DESC
                          LIMIT ?3",
-                        params![child_job_id.as_str(), anchor, limit],
+                        params![
+                            child_job_id.as_str(),
+                            anchor,
+                            CATCHUP_DIGEST_MESSAGES as i64
+                        ],
                     )
                     .await?;
                 while let Some(row) = rows.next().await? {
                     let content = row.text(1)?;
                     if !content.trim().is_empty() {
-                        queued.push(OperatorMessage {
+                        messages.push(OperatorMessage {
                             timestamp: row.i64(0)?,
                             content,
                             read_by_node: row.opt_i64(2)?.is_some(),
                         });
                     }
                 }
-                Ok((recorded, queued))
+                Ok(messages)
             })
         })
         .await
         .ok()?;
 
-    let mut messages = reconcile_operator_messages(recorded, queued);
-    // Newest first, so the cap keeps the newest.
-    messages.sort_by_key(|message| std::cmp::Reverse(message.timestamp));
-    messages.truncate(CATCHUP_DIGEST_MESSAGES);
     if messages.is_empty() {
         return None;
     }
@@ -569,64 +598,13 @@ async fn catchup_operator_digest(
     ))
 }
 
-/// Combine the two sources into one message per operator send.
-///
-/// A message in flight is represented twice — once as the queue row it was typed
-/// into and once as the transcript event the node recorded — and the digest must
-/// show it once. Matching is by content, since the two representations share no
-/// identifier, but it is a **multiset** reconciliation rather than content
-/// uniqueness: the operator genuinely does repeat short messages (`^`, `looks
-/// good!`, `please stop`), and collapsing those to one line would hide the
-/// emphasis that made them worth repeating. Each recorded copy therefore cancels
-/// at most one queue row, and only a **claimed** row is eligible — a row the node
-/// has not yet read cannot already be in its transcript, so it always stands on
-/// its own.
-fn reconcile_operator_messages(
-    recorded: Vec<OperatorMessage>,
-    queued: Vec<OperatorMessage>,
-) -> Vec<OperatorMessage> {
-    let mut unmatched: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for message in &recorded {
-        *unmatched.entry(message.content.as_str()).or_default() += 1;
-    }
-    let mut messages: Vec<OperatorMessage> = queued
-        .iter()
-        .filter(|message| {
-            if !message.read_by_node {
-                return true;
-            }
-            match unmatched.get_mut(message.content.as_str()) {
-                Some(remaining) if *remaining > 0 => {
-                    *remaining -= 1;
-                    false
-                }
-                _ => true,
-            }
-        })
-        .cloned()
-        .collect();
-    messages.extend(recorded);
-    messages
-}
-
-/// One operator message bound for a child node, from either durable source.
-#[derive(Clone)]
+/// One operator message bound for a child node.
 struct OperatorMessage {
     timestamp: i64,
     content: String,
     /// `false` while the text is still a pending `queued_messages` row the child
     /// has not claimed — sent by the operator, not yet seen by the node.
     read_by_node: bool,
-}
-
-/// The text of a `user` transcript event, or `None` when it carries none.
-fn user_event_content(data: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(data)
-        .ok()?
-        .get("content")?
-        .as_str()
-        .map(str::to_string)
-        .filter(|content| !content.trim().is_empty())
 }
 
 /// Collapse a message to one line of at most [`CATCHUP_DIGEST_CHARS`].
@@ -1518,10 +1496,48 @@ mod tests {
 
     // ---- Derived watchers + operator digest (CAIRN-3342) ---------------------
 
-    /// Insert an operator message event on the child job's run.
-    async fn add_user_message(db: &LocalDb, id: &str, seq: i64, timestamp: i64, content: &str) {
+    /// The child job's own launch prompt: the issue description its coordinator
+    /// wrote, stored as the job's first `user` event by `prepare_job`. Verbatim
+    /// head of the CAIRN-3386 builder's launch event.
+    const LAUNCH_PROMPT: &str = "# Check cells fail preparation: `bun i` exits 127, bun not on the PATH the executor gives setup commands\n\nEvery rust-lint/rust-tests review check since the 2026-08-01 05:17 UTC rebuild reports 'Cairn could not prepare a working environment for this check.'";
+
+    /// A delegated artifact payload delivered into a review node's user slot by
+    /// the delegation runtime. Verbatim head of the CAIRN-3381 review node's
+    /// delivery event; hundreds of rows in the live database share the shape.
+    const ARTIFACT_PAYLOAD: &str = "**create-pr**\n\n```json\n{\n  \"body\": \"## What was wrong\\n\\n`cairn check run <suite>` refused from an agent shell before doing anything.\",\n  \"title\": \"check: pass CAIRN_RUN_ID into agent shells\"\n}\n```";
+
+    /// A machinery resume: Cairn's own note to a node, carried into the same
+    /// user slot by `continue_job_impl` (`wake_upstream_after_checkpoint_failure`).
+    const MACHINERY_RESUME: &str =
+        "Checkpoint `checks` failed (exit 1) running `bun run check:rust`.";
+
+    /// Insert a `user` transcript event on the child job's run, in the shape
+    /// production stores it — serialized from the same struct the storage path
+    /// builds, so the fixture cannot drift from what actually lands in `data`.
+    async fn add_transcript_user_event(
+        db: &LocalDb,
+        id: &str,
+        seq: i64,
+        timestamp: i64,
+        content: &str,
+    ) {
         let id = id.to_string();
-        let data = serde_json::json!({ "eventType": "user", "content": content }).to_string();
+        let data = serde_json::to_string(&crate::agent_process::stream::TranscriptEvent {
+            event_type: "user".to_string(),
+            session_id: Some("sess2".to_string()),
+            parent_tool_use_id: None,
+            content: Some(content.to_string()),
+            thinking: None,
+            tool_name: None,
+            tool_input: None,
+            tool_uses: None,
+            tool_use_id: None,
+            tool_result: None,
+            is_error: false,
+            thinking_ms: None,
+            raw: None,
+        })
+        .unwrap();
         db.write(move |conn| {
             let id = id.clone();
             let data = data.clone();
@@ -1542,6 +1558,22 @@ mod tests {
     /// Queue operator text at the child job without recording it in the
     /// transcript — the state a busy child sits in until it claims the queue.
     async fn queue_operator_message(db: &LocalDb, id: &str, created_at: i64, content: &str) {
+        insert_operator_message(db, id, created_at, None, content).await;
+    }
+
+    /// Operator text that reached an idle child directly: recorded delivered on
+    /// arrival, because the resume it triggered carried it to the agent itself.
+    async fn record_operator_send(db: &LocalDb, id: &str, created_at: i64, content: &str) {
+        insert_operator_message(db, id, created_at, Some(created_at), content).await;
+    }
+
+    async fn insert_operator_message(
+        db: &LocalDb,
+        id: &str,
+        created_at: i64,
+        delivered_at: Option<i64>,
+        content: &str,
+    ) {
         let id = id.to_string();
         let content = content.to_string();
         db.write(move |conn| {
@@ -1550,8 +1582,8 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO queued_messages(id, job_id, content, delivery, created_at, delivered_at)
-                     VALUES(?1,'child-job',?2,'queue',?3,NULL)",
-                    params![id.as_str(), content.as_str(), created_at],
+                     VALUES(?1,'child-job',?2,'queue',?3,?4)",
+                    params![id.as_str(), content.as_str(), created_at, delivered_at],
                 )
                 .await?;
                 Ok::<(), crate::storage::DbError>(())
@@ -1665,8 +1697,8 @@ mod tests {
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
         add_chat_turn(&db, "t1", 1).await;
-        add_user_message(&db, "u-old", 10, 100, "this one was already caught up on").await;
-        add_user_message(&db, "u-new", 11, 300, "queue drained for days, good to go").await;
+        record_operator_send(&db, "q-old", 100, "this one was already caught up on").await;
+        record_operator_send(&db, "q-new", 300, "queue drained for days, good to go").await;
         db.execute(
             "INSERT INTO attention_read_cursors(recipient, source, position, updated_at)
              VALUES('watcher','child-job',1,200)",
@@ -1733,14 +1765,11 @@ mod tests {
         );
     }
 
-    /// The narrower window inside the claim itself. `claim_for_job_inner` commits
-    /// the `delivered_at` stamp, and its caller inserts the transcript event
-    /// afterwards — so between those two writes the text sits in neither a pending
-    /// queue row nor the transcript. Selecting the queue on `delivered_at IS NULL`
-    /// alone would blind the digest for exactly that gap, and a coordinator
-    /// delivering inside it would again retire the only catch-up. Driven through
-    /// the real claim rather than a hand-built state, since the ordering under test
-    /// is the claim's own.
+    /// The claim is the node reading the message, not the watcher hearing about
+    /// it: a claimed row stays in the digest until the watcher's own read cursor
+    /// passes it, and stops being labelled as unread. Driven through the real
+    /// claim rather than a hand-built state, since the transition under test is
+    /// the claim's own.
     #[tokio::test]
     async fn a_message_claimed_but_not_yet_recorded_is_still_named() {
         let db = migrated_db().await;
@@ -1792,10 +1821,10 @@ mod tests {
         assert_eq!(digest.matches("please stop").count(), 2, "{digest}");
     }
 
-    /// The same repetition once one copy has been claimed and recorded: the
-    /// recorded copy cancels exactly one queue row, leaving the other send intact.
+    /// The same repetition once one copy has been read: two sends are two
+    /// messages, and only the one the node has not reached is labelled unread.
     #[tokio::test]
-    async fn a_repeated_message_cancels_one_copy_not_both() {
+    async fn a_repeated_message_is_named_once_per_send() {
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
         add_chat_turn(&db, "t1", 1).await;
@@ -1803,7 +1832,6 @@ mod tests {
         crate::messages::queued::claim_all_for_job_async(&db, "child-job")
             .await
             .unwrap();
-        add_user_message(&db, "u-1", 10, 305, "please stop").await;
         // A second send of the same text, still sitting in the queue.
         queue_operator_message(&db, "q-2", 310, "please stop").await;
 
@@ -1820,32 +1848,63 @@ mod tests {
         );
     }
 
-    /// Once the caller records the event, the same text is in both sources. It is
-    /// one operator message and must read as one — and the two copies need not be
-    /// adjacent in time, since a queued row carries the moment the operator typed
-    /// it and its event the moment the node read it.
+    /// The CAIRN-3390 specimen set. Everything Cairn delivers to a node lands in
+    /// the same `user` slot the operator's own typing does — the job's launch
+    /// prompt (the issue description its coordinator wrote), a delegated artifact
+    /// payload handed to a review node, a machinery resume note — so a digest
+    /// built from that slot told each coordinator "the operator sent" over its own
+    /// words. Authorship, not role, decides: only the send recorded in the
+    /// operator-message record is named.
     #[tokio::test]
-    async fn a_message_in_both_sources_is_named_once_not_twice() {
+    async fn machinery_user_events_are_never_attributed_to_the_operator() {
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
         add_chat_turn(&db, "t1", 1).await;
-        queue_operator_message(&db, "q-1", 300, "also ship the trusted producer").await;
-        crate::messages::queued::claim_all_for_job_async(&db, "child-job")
-            .await
-            .unwrap();
-        // A later, unrelated operator message lands between the two copies in time.
-        add_user_message(&db, "u-mid", 10, 310, "and rerun the suite").await;
-        add_user_message(&db, "u-1", 11, 320, "also ship the trusted producer").await;
+        add_transcript_user_event(&db, "u-launch", 10, 300, LAUNCH_PROMPT).await;
+        add_transcript_user_event(&db, "u-payload", 11, 310, ARTIFACT_PAYLOAD).await;
+        add_transcript_user_event(&db, "u-machinery", 12, 320, MACHINERY_RESUME).await;
+        // The operator resumes the child past its session limit. The transcript
+        // event this stores is indistinguishable from the three above; the record
+        // of who typed it is the row.
+        add_transcript_user_event(&db, "u-operator", 13, 330, "^").await;
+        record_operator_send(&db, "q-1", 330, "^").await;
 
         let digest = catchup_operator_digest(&db, "watcher", "child-job")
             .await
-            .unwrap();
+            .expect("the operator's own message is still named");
 
-        assert!(digest.contains("2 messages"), "{digest}");
-        assert_eq!(
-            digest.matches("also ship the trusted producer").count(),
-            1,
-            "non-adjacent duplicates still collapse: {digest}"
+        assert!(digest.contains("1 message"), "{digest}");
+        assert!(digest.ends_with("— ^"), "{digest}");
+        assert!(
+            !digest.contains("Check cells fail preparation"),
+            "a coordinator must not be told it sent the issue body it wrote: {digest}"
+        );
+        assert!(
+            !digest.contains("create-pr"),
+            "a delegated artifact payload is not an operator message: {digest}"
+        );
+        assert!(
+            !digest.contains("Checkpoint"),
+            "a machinery resume note is not an operator message: {digest}"
+        );
+    }
+
+    /// The attribution half of the same rule: with nothing operator-authored to
+    /// report, the digest is absent rather than a header over machinery text. The
+    /// chat window that follows still carries those turns as context.
+    #[tokio::test]
+    async fn a_child_with_only_machinery_user_events_has_no_digest() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        add_chat_turn(&db, "t1", 1).await;
+        add_transcript_user_event(&db, "u-launch", 10, 300, LAUNCH_PROMPT).await;
+        add_transcript_user_event(&db, "u-payload", 11, 310, ARTIFACT_PAYLOAD).await;
+
+        assert!(
+            catchup_operator_digest(&db, "watcher", "child-job")
+                .await
+                .is_none(),
+            "nothing the operator authored means no operator digest"
         );
     }
 
@@ -1855,10 +1914,9 @@ mod tests {
         seed(&db, "active", None, None).await;
         add_chat_turn(&db, "t1", 1).await;
         for seq in 0..8i64 {
-            add_user_message(
+            queue_operator_message(
                 &db,
-                &format!("u-{seq}"),
-                10 + seq,
+                &format!("q-{seq}"),
                 100 + seq,
                 &format!("message {seq} {}", "x ".repeat(500)),
             )
@@ -1876,9 +1934,12 @@ mod tests {
             "the newest messages are the ones kept: {digest}"
         );
         for line in lines {
+            let (_, excerpt) = line
+                .split_once(" — ")
+                .expect("a digest line has an excerpt");
             assert!(
-                line.chars().count() <= CATCHUP_DIGEST_CHARS + 32,
-                "digest line is not bounded: {line}"
+                excerpt.chars().count() <= CATCHUP_DIGEST_CHARS + 1,
+                "digest excerpt is not bounded: {excerpt}"
             );
         }
     }
@@ -1892,7 +1953,7 @@ mod tests {
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
         add_chat_turn(&db, "t1", 1).await;
-        add_user_message(&db, "u-1", 10, 300, "scope change: also ship the producer").await;
+        record_operator_send(&db, "q-1", 300, "scope change: also ship the producer").await;
         let content_ref = format!("{}/chat?offset=0", child_node_uri());
         let orch = test_orchestrator(db);
         let push = crate::orchestrator::attention_push::Push {

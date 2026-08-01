@@ -709,6 +709,47 @@ fn parses_issue_executions_collection() {
     );
 }
 
+/// The `/t/` segment names a thread by name. The parser only recognizes the
+/// shape; which thread it names (or that none does) is a lookup the reader
+/// performs, so the parsed name is the raw segment and the alias reports no
+/// issue number of its own.
+#[test]
+fn parses_thread_alias_by_name() {
+    let alias = parse_uri("cairn://p/cairn/t/design-review").unwrap();
+    assert_eq!(
+        alias,
+        CairnResource::ThreadAlias {
+            project: "CAIRN".to_string(),
+            name: "design-review".to_string(),
+        }
+    );
+    assert_eq!(alias.kind(), ResourceKind::ThreadAlias);
+    assert_eq!(alias.project(), Some("CAIRN"));
+    assert_eq!(alias.project_key(), Some("CAIRN"));
+    assert_eq!(alias.issue_number(), None);
+    // No frontend route: the alias resolves to a number before anything
+    // navigates, and the issue owns that route.
+    assert_eq!(alias.to_route(), None);
+    assert_eq!(alias.to_uri(), "cairn://p/CAIRN/t/design-review");
+    assert_eq!(
+        build_thread_alias_uri("cairn", "design-review"),
+        "cairn://p/CAIRN/t/design-review"
+    );
+
+    // The alias occupies exactly one shape. A numbered issue URI is untouched
+    // by it, and neither a bare `/t` nor a sub-resource under a name parses.
+    assert_eq!(
+        parse_uri("cairn://p/CAIRN/12"),
+        Some(CairnResource::Issue {
+            project: "CAIRN".to_string(),
+            number: 12,
+        })
+    );
+    assert_eq!(parse_uri("cairn://p/CAIRN/t"), None);
+    assert_eq!(parse_uri("cairn://p/CAIRN/t/"), None);
+    assert_eq!(parse_uri("cairn://p/CAIRN/t/design-review/messages"), None);
+}
+
 #[test]
 fn parses_issue_comments_collection_and_member() {
     assert_eq!(
@@ -838,6 +879,10 @@ fn round_trips_every_resource_family() {
         CairnResource::Issue {
             project: "CAIRN".to_string(),
             number: 1,
+        },
+        CairnResource::ThreadAlias {
+            project: "CAIRN".to_string(),
+            name: "design-review".to_string(),
         },
         CairnResource::ProjectMessages {
             project: "CAIRN".to_string(),

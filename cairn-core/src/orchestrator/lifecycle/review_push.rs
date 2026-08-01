@@ -433,8 +433,20 @@ async fn resolve_producing_job_for_issue(
 /// through the cadence is exactly the coupling that let plan gates strand
 /// (CAIRN-3347). The turn-end checks are then re-spawned for their own sake — the
 /// in-memory single-flight marker is lost on restart, and the input-hash cache
-/// makes an unchanged re-run cheap. Called once at startup after outbox replay.
-pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) {
+/// makes an unchanged re-run cheap. Called once per boot, as post-readiness
+/// background maintenance rather than as blocking recovery (CAIRN-3382).
+///
+/// Returns the number of turn-end check waves re-spawned, so the caller can log
+/// what this boot actually put on the executor.
+///
+/// IDEMPOTENT ACROSS BOOTS, and that is load-bearing now that it runs in the
+/// background: an interrupted re-arm leaves the work partially done until the
+/// next boot re-runs it, which is harmless precisely because every step here —
+/// clearing infrastructure suppression, re-deriving a review wake, re-spawning a
+/// fingerprint-deduplicated check wave — converges on the same state when
+/// repeated. An edit that makes any of it order- or once-dependent breaks that
+/// contract and must move it back onto the blocking path.
+pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) -> usize {
     // The un-suppression edge (CAIRN-3245). A check bounded off after repeated
     // infrastructure failures stays bounded off for as long as its inputs are
     // unchanged, which is correct while the substrate is still broken and wrong
@@ -454,11 +466,11 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) {
         Ok(jobs) => jobs,
         Err(e) => {
             log::warn!("review-checks startup re-arm: candidate lookup failed: {e}");
-            return;
+            return 0;
         }
     };
     if candidates.is_empty() {
-        return;
+        return 0;
     }
     log::info!(
         "review-checks startup re-arm: re-deriving the review wake and re-spawning turn-end \
@@ -472,6 +484,7 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) {
         }
         spawn_turn_end_checks(orch, job_id);
     }
+    candidates.len()
 }
 
 /// Jobs eligible for the startup review-checks re-arm, as `(job_id, issue_id)`:

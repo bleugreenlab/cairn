@@ -41,6 +41,7 @@ const PREF_KEYS: &[&str] = &[
     "backends",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
+    "channels",
 ];
 
 /// Section objects that route to dedicated stores.

@@ -65,6 +65,21 @@ pub(crate) const ISSUE_CONTRACT: ResourceContract =
         ],
     };
 
+pub(crate) const THREAD_ALIAS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ThreadAlias,
+    uri_template: "cairn://p/{project}/t/{name}",
+    name: "Thread by name",
+    description: "Read a thread by name instead of by number. The name is the thread's title slugified: lowercased, with every run of characters outside a-z0-9 collapsed to a single '-' (the rule is ASCII-only, so 'Café Sync' is named 'caf-sync', and a title with no ASCII letters or digits has no name and is reachable only by its number). It resolves to the thread's issue resource and returns exactly what the numbered read returns, so a retitle moves the name while the number stays. Only threads answer here — an ordinary issue with the same slug is not addressable by name — and a name that matches no thread, or more than one, is refused rather than guessed. The alias is accepted on input only: every link Cairn emits, and every write, uses the numbered URI cairn://p/{project}/{number}. List the threads with cairn://p/{project}/issues?kind=thread.",
+    read_projections: NO_PROJECTIONS,
+    related: &[RelatedSpec {
+        label: "thread issue",
+        kind: ResourceKind::Issue,
+        actions: false,
+    }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const CHANGED_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Changed,
     uri_template: "cairn://p/{project}/{number}/changed",

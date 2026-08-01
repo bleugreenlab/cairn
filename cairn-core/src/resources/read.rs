@@ -6,6 +6,7 @@
 use super::check_results::read_project_check_results;
 use super::common::{
     affordance_for_kind, find_query_value, reject_query_params, resolve_home_relative_resource_uri,
+    resolve_thread_alias_resource_uri,
 };
 use super::diff::read_node_diff;
 use super::files::{read_issue_changed, read_issue_changed_projection};
@@ -993,6 +994,15 @@ pub(crate) async fn produce_cairn_resource(
             Err(error) => return RenderedResource::line(error, None, None, None),
         };
 
+    // A `/t/NAME` thread alias becomes its numbered issue URI here, before
+    // anything else parses or renders it: past this point a named read is
+    // indistinguishable from the numbered read it stands for. A name that names
+    // no thread, or more than one, refuses rather than resolving.
+    let identity = match resolve_thread_alias_resource_uri(&orch.db, &identity).await {
+        Ok(identity) => identity,
+        Err(error) => return RenderedResource::line(error, None, None, None),
+    };
+
     let resource = match parse_uri(&identity) {
         Some(r) => r,
         None => {
@@ -1394,6 +1404,7 @@ async fn render_resource_body(
                 crate::resources::executors::render_executors(
                     &orch.fleet.inspect_executors(captured_at),
                     &orch.fleet.unattached_enrolled_remotes(),
+                    &orch.fleet.management().operations().in_flight(),
                     captured_at,
                 )
             }
@@ -1414,9 +1425,19 @@ async fn render_resource_body(
                         Some(remote) => {
                             crate::resources::executors::render_enrolled_remote(remote, captured_at)
                         }
-                        None => crate::resources::executors::unknown_executor(
-                            &name, &executors, &enrolled,
-                        ),
+                        // An enrollment in flight has reserved this name and is
+                        // minutes from holding a machine. Answering "unknown"
+                        // for that window would make a working enrollment look
+                        // like a typo.
+                        None => match orch.fleet.management().operations().latest_for(&name) {
+                            Some(operation) => crate::resources::executors::render_enrollment(
+                                &operation,
+                                captured_at,
+                            ),
+                            None => crate::resources::executors::unknown_executor(
+                                &name, &executors, &enrolled,
+                            ),
+                        },
                     },
                 }
             }
@@ -1445,6 +1466,12 @@ async fn render_resource_body(
             } else {
                 crate::resources::project::read_project_images(db, &project, issue).await
             }
+        }
+        // The single entry point into this renderer resolves a thread alias to
+        // its numbered issue URI before parsing, so by here the alias is always
+        // an `Issue`. Nothing addressable reaches this arm.
+        CairnResource::ThreadAlias { .. } => {
+            unreachable!("thread aliases are resolved to their issue URI before rendering")
         }
         CairnResource::Issue { project, number } => {
             if let Some(error) = reject_query_params("issue", &params) {
@@ -2282,6 +2309,108 @@ mod tests {
         assert_eq!(
             apply_line_char_offset(body, 1, 11),
             "{\"payload\":{\"content\":\"abcdef\"}}\n{\"content\":\"next\"}}"
+        );
+    }
+
+    /// An orchestrator over a migrated database holding one project, one thread
+    /// (`Design Review`, issue 12), and one ordinary issue that happens to carry
+    /// the same title.
+    async fn thread_alias_orch() -> (Orchestrator, tempfile::TempDir) {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let local = LocalDb::open(db_dir.path().join("threads.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute_batch(
+                        "
+                        INSERT INTO workspaces (id, name, created_at, updated_at)
+                        VALUES ('w-1', 'Workspace', 1, 1);
+                        INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                        VALUES ('p-1', 'w-1', 'Threads', 'THREADS', '/tmp/threads', 1, 1);
+                        INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at, kind)
+                        VALUES ('t-1', 'p-1', 12, 'Design Review', 'the thread body', 'backlog', 'backlog', 'none', 0, 1, 1, 'thread');
+                        INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at, kind)
+                        VALUES ('i-1', 'p-1', 13, 'Design Review', 'an ordinary issue', 'backlog', 'backlog', 'none', 0, 1, 1, 'issue');
+                        ",
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        let worktree = tempfile::tempdir().unwrap();
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            worktree.path().to_path_buf(),
+        )
+        .build();
+        (orch, db_dir)
+    }
+
+    async fn read_body(orch: &Orchestrator, uri: &str) -> String {
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        };
+        produce_cairn_resource(orch, &request, uri).await.content
+    }
+
+    /// Reading a thread by name is reading the thread: byte-for-byte what the
+    /// numbered URI returns, with the numbered URI still the one the body names.
+    #[tokio::test]
+    async fn thread_alias_read_returns_the_numbered_issue_resource() {
+        let (orch, _dir) = thread_alias_orch().await;
+        let by_name = read_body(&orch, "cairn://p/THREADS/t/design-review").await;
+        let by_number = read_body(&orch, "cairn://p/THREADS/12").await;
+
+        assert_eq!(by_name, by_number);
+        assert!(by_name.contains("THREADS-12"), "{by_name}");
+        // The title as typed is normalized the same way the stored titles are,
+        // so a caller need not know the slug rule to use the name.
+        assert_eq!(
+            read_body(&orch, "cairn://p/THREADS/t/Design Review").await,
+            by_number
+        );
+        // The alias is accepted on input and never emitted: nothing the read
+        // renders addresses the thread by its name.
+        assert!(!by_name.contains("/t/design-review"), "{by_name}");
+    }
+
+    /// A name no thread answers to comes back as the read's body — naming the
+    /// project and the attempt, and pointing at the collection that lists the
+    /// threads — rather than as a bare unknown-URI error.
+    #[tokio::test]
+    async fn thread_alias_read_refuses_an_unknown_name() {
+        let (orch, _dir) = thread_alias_orch().await;
+        let body = read_body(&orch, "cairn://p/THREADS/t/standup").await;
+        assert!(
+            body.contains("No thread in THREADS is named 'standup'"),
+            "{body}"
+        );
+        assert!(
+            body.contains("cairn://p/THREADS/issues?kind=thread"),
+            "{body}"
         );
     }
 

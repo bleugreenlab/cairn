@@ -1287,7 +1287,11 @@ pub(crate) async fn execute_job_verdict(
             },
             affinity_key: Some(job_id.to_string()),
             priority: CellPriority::ReviewCheck,
-            env: vec![("PATH".to_string(), crate::env::get_user_path().to_string())],
+            // No PATH: a check resolves its tools against the PATH the executor
+            // composed on the machine that runs it, the same as every other
+            // check batch. Stating this host's PATH here would name directories
+            // that exist on the runner and nowhere else.
+            env: Vec::new(),
             items: vec![PlannedCheckBatchItem {
                 index: 0,
                 name: name.to_string(),
@@ -4356,29 +4360,28 @@ where
                     substrate_failure.as_ref(),
                 );
                 log::warn!(
-                    "check infrastructure failure: {}",
-                    serde_json::json!({
-                        "check": plan.name,
-                        "jobId": job_id,
-                        "suiteId": tool_use_id,
-                        "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
-                        "resourceClass": plan.resource_class.as_str(),
-                        "declaredConcurrencyUnits": declared_check_reservation(plan.resource_class).concurrency_units,
-                        "durationMs": duration_ms,
-                        "exitCode": exit_code,
-                        "timedOut": timed_out,
-                        // The half the agent never sees: outcome variants, slot
-                        // paths, queue evidence. Correlated to the agent's
-                        // verdict by the check, job, and suite ids above.
-                        "substrateDiagnostic": substrate_failure.as_ref().map(SubstrateFailure::diagnostic),
-                        "runnerRssBytes": resources.rss_bytes,
-                        "runnerPhysicalFootprintBytes": resources.phys_footprint_bytes,
-                        "hostTotalMemoryBytes": host.total_memory_bytes,
-                        "hostAvailableMemoryBytes": host.available_memory_bytes,
-                        "hostLoadAverage": host.load_average,
-                        "processTree": process_tree,
-                        "buildService": build_service,
-                    })
+                    "{}",
+                    infrastructure_failure_log_line(
+                        &plan.name,
+                        substrate_failure.as_ref().map(SubstrateFailure::diagnostic),
+                        serde_json::json!({
+                            "jobId": job_id,
+                            "suiteId": tool_use_id,
+                            "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
+                            "resourceClass": plan.resource_class.as_str(),
+                            "declaredConcurrencyUnits": declared_check_reservation(plan.resource_class).concurrency_units,
+                            "durationMs": duration_ms,
+                            "exitCode": exit_code,
+                            "timedOut": timed_out,
+                            "runnerRssBytes": resources.rss_bytes,
+                            "runnerPhysicalFootprintBytes": resources.phys_footprint_bytes,
+                            "hostTotalMemoryBytes": host.total_memory_bytes,
+                            "hostAvailableMemoryBytes": host.available_memory_bytes,
+                            "hostLoadAverage": host.load_average,
+                            "processTree": process_tree,
+                            "buildService": build_service,
+                        })
+                    )
                 );
             }
 
@@ -4906,6 +4909,30 @@ async fn submit_review_check(
 /// cause that is not one, however sick the daemon happens to be at that moment.
 /// The snapshot itself is operator vocabulary and rides the log record
 /// regardless.
+/// What the log says when an infrastructure failure carried no substrate
+/// evidence at all — itself the finding, rather than a silently absent key.
+const NO_SUBSTRATE_DIAGNOSTIC: &str = "no substrate diagnostic recorded";
+
+/// The operator-facing line for a check that failed on infrastructure.
+///
+/// The cause leads and the environment follows, because the reader's first
+/// question is always "what broke" and only their second is "what else was
+/// true at the time". Sorted into the environment object, the diagnostic
+/// trailed kilobytes of build-service fingerprint and process table — present,
+/// unreadable, and so unread: a `bun: command not found` that would have been
+/// diagnosed at a glance instead went unnoticed across an evening of failed
+/// review checks.
+fn infrastructure_failure_log_line(
+    check: &str,
+    substrate_diagnostic: Option<&str>,
+    environment: serde_json::Value,
+) -> String {
+    format!(
+        "check infrastructure failure: {check}: {}\nenvironment: {environment}",
+        substrate_diagnostic.unwrap_or(NO_SUBSTRATE_DIAGNOSTIC)
+    )
+}
+
 fn with_build_service_advisory(
     output_tail: String,
     build_service: Option<&crate::orchestrator::build_services::BuildServiceDiagnosticSnapshot>,
@@ -5333,6 +5360,51 @@ fn unix_time_ms_for_checks() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// An operator reading the log finds the cause in the first line, ahead of
+    /// an environment dump that can run to kilobytes. This ordering is the whole
+    /// point: the same failure, with its diagnostic sorted into the dump, went
+    /// undiagnosed while every review check on the host failed.
+    #[test]
+    fn infrastructure_failure_log_leads_with_the_cause() {
+        use super::infrastructure_failure_log_line;
+
+        let line = infrastructure_failure_log_line(
+            "rust-lint",
+            Some(
+                "Preparation: cell preparation command failed: bun i\nstderr:\n/bin/sh: bun: command not found\n\nExit code: 127",
+            ),
+            serde_json::json!({
+                "buildService": { "configFingerprint": "x".repeat(4_096) },
+                "processTree": ["a", "b"],
+            }),
+        );
+
+        let first = line.lines().next().unwrap();
+        assert!(first.contains("rust-lint"), "first line: {first}");
+        assert!(
+            first.contains("cell preparation command failed: bun i"),
+            "first line: {first}"
+        );
+        assert!(
+            line.find("buildService") > line.find("bun: command not found"),
+            "the environment dump must follow the cause, not bury it"
+        );
+    }
+
+    /// A missing diagnostic is a finding, not an absence to be silently skipped:
+    /// it says the failure reached the log with no substrate evidence attached.
+    #[test]
+    fn infrastructure_failure_log_names_a_missing_diagnostic() {
+        use super::{infrastructure_failure_log_line, NO_SUBSTRATE_DIAGNOSTIC};
+
+        let line = infrastructure_failure_log_line("lint", None, serde_json::json!({}));
+        assert!(line
+            .lines()
+            .next()
+            .unwrap()
+            .contains(NO_SUBSTRATE_DIAGNOSTIC));
+    }
+
     /// Eligibility is a property of what the work does, not of what it asked
     /// for. Both a constrained and an unconstrained pure-verdict group are free
     /// to move; a mutating group never is, whatever it stated.

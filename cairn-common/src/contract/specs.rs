@@ -185,6 +185,11 @@ pub(crate) const EXECUTION: KeySpec = KeySpec::new(
     KeyType::Object,
     "{recipe, backend?} to also start an execution once the issue is created (recipe required); omit to create only",
 );
+pub(crate) const ISSUE_KIND: KeySpec = KeySpec::new(
+    "kind",
+    KeyType::Str,
+    "issue (default) | thread; a thread is a durable session anchor that owns no branch and never merges",
+);
 pub(crate) const PARENT: KeySpec = KeySpec::new(
     "parent",
     KeyType::Str,
@@ -402,6 +407,90 @@ pub(crate) const MCP_SCOPE: KeySpec = KeySpec::new(
     "scope",
     KeyType::Str,
     "workspace (default; ~/.cairn/settings.yaml, gated by the worktree fence) | project (the run's .cairn/config.yaml)",
+);
+
+// --- fleet management (cairn://executors write) ---
+pub(crate) const EXECUTOR_HOST: KeySpec = KeySpec::new(
+    "host",
+    KeyType::Str,
+    "hostname or address ssh reaches the machine at",
+);
+pub(crate) const EXECUTOR_SSH_USER: KeySpec = KeySpec::with_aliases(
+    "sshUser",
+    &["ssh_user"],
+    KeyType::Str,
+    "the user ssh authenticates as",
+);
+pub(crate) const EXECUTOR_PROJECT_KEYS: KeySpec = KeySpec::with_aliases(
+    "projectKeys",
+    &["project_keys"],
+    KeyType::Array,
+    "project keys this machine serves; omitted or empty means every project",
+);
+pub(crate) const EXECUTOR_BINARY_PATH: KeySpec = KeySpec::with_aliases(
+    "binaryPath",
+    &["binary_path"],
+    KeyType::Str,
+    "absolute remote path for the executor binary; derived per platform when omitted",
+);
+pub(crate) const EXECUTOR_CAIRN_HOME: KeySpec = KeySpec::with_aliases(
+    "cairnHome",
+    &["cairn_home"],
+    KeyType::Str,
+    "absolute remote CAIRN_HOME; derived per platform when omitted",
+);
+pub(crate) const EXECUTOR_ID: KeySpec = KeySpec::with_aliases(
+    "executorId",
+    &["executor_id"],
+    KeyType::Str,
+    "stable internal identity; derived from the host when omitted",
+);
+pub(crate) const EXECUTOR_DEVICE_ID: KeySpec = KeySpec::with_aliases(
+    "deviceId",
+    &["device_id"],
+    KeyType::Str,
+    "enrollment device identity; derived from the executor identity when omitted",
+);
+pub(crate) const EXECUTOR_DISPLAY_NAME: KeySpec = KeySpec::with_aliases(
+    "displayName",
+    &["display_name"],
+    KeyType::Str,
+    "the public name placement requests address this machine by; derived from the host when omitted",
+);
+pub(crate) const EXECUTOR_TUNNEL_PORT: KeySpec = KeySpec::with_aliases(
+    "tunnelPort",
+    &["tunnel_port"],
+    KeyType::Int,
+    "loopback port for the reverse tunnel; first unused port from 43849 when omitted",
+);
+pub(crate) const EXECUTOR_EXTRA_SSH_ARGS: KeySpec = KeySpec::with_aliases(
+    "extraSshArgs",
+    &["extra_ssh_args"],
+    KeyType::Array,
+    "transport-only ssh arguments; -4 or -6",
+);
+pub(crate) const EXECUTOR_NEW_NAME: KeySpec = KeySpec::with_aliases(
+    "newName",
+    &["new_name"],
+    KeyType::Str,
+    "new public name; configuration, enrollment claim, and supervision move together",
+);
+pub(crate) const EXECUTOR_RUNTIME_POLICY: KeySpec = KeySpec::with_aliases(
+    "runtimePolicy",
+    &["runtime_policy"],
+    KeyType::Object,
+    "{memoryBudgetBytes, diskGrowthBudgetBytes, freeDiskWatermarkBytes, concurrencyUnits, maximumQueueDepth}",
+);
+pub(crate) const EXECUTOR_DRAINING: KeySpec = KeySpec::new(
+    "draining",
+    KeyType::Bool,
+    "true refuses new admissions without terminating resident work; live and lost on reconnect",
+);
+pub(crate) const EXECUTOR_EXPECTED_GENERATION: KeySpec = KeySpec::with_aliases(
+    "expectedGeneration",
+    &["expected_generation"],
+    KeyType::Int,
+    "the connection generation you read; required with runtimePolicy or draining",
 );
 
 // Empty mutation set, named for readability.

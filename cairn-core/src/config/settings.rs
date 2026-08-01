@@ -13,8 +13,8 @@ use cairn_common::logging::LogLevel;
 
 use crate::config::presets::{default_presets_config, PresetsConfig};
 use crate::models::{
-    ExternalReplyMode, MergeType, Model, OpenRouterRouting, Preset, Settings, ThinkingDisplayMode,
-    TranscriptDensity, TranscriptTextSize, UpdateSettings,
+    ChannelsConfig, ExternalReplyMode, MergeType, Model, OpenRouterRouting, Preset, Settings,
+    ThinkingDisplayMode, TranscriptDensity, TranscriptTextSize, UpdateSettings,
 };
 
 /// Custom deserializer for max_thinking_tokens to distinguish between:
@@ -202,6 +202,9 @@ pub struct SettingsFile {
         skip_serializing_if = "Option::is_none"
     )]
     route_calls_via_openrouter: Option<bool>,
+    /// Workspace-owned external delivery policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channels: Option<ChannelsConfig>,
     /// Exact per-project terminal commands the user has accepted to run outside
     /// the worktree fence (`projectId -> [command, ...]`). Acceptance is
     /// user-owned, so a cloned repository can declare a shortcut but cannot grant
@@ -359,6 +362,7 @@ impl SettingsFile {
             subscription_fees: self.subscription_fees.clone().unwrap_or_default(),
             openrouter_routing: self.openrouter_routing.clone().unwrap_or_default(),
             route_calls_via_openrouter: self.route_calls_via_openrouter.unwrap_or(false),
+            channels: self.channels.clone().unwrap_or_default(),
         }
     }
 
@@ -402,6 +406,8 @@ impl SettingsFile {
             },
             // Omit when false so an all-default settings file stays clean.
             route_calls_via_openrouter: settings.route_calls_via_openrouter.then_some(true),
+            channels: (settings.channels != ChannelsConfig::default())
+                .then(|| settings.channels.clone()),
             // Config-only (YAML, not in the DTO); preserved across saves.
             sandbox_deny_read: None,
             browser_network_sensitive_names: None,
@@ -742,6 +748,7 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "subscriptionFees",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
+    "channels",
     // Legacy DTO-owned fields are removed once their values have migrated.
     "defaultModel",
     "preferredModels",
@@ -858,6 +865,9 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.route_calls_via_openrouter {
         current.route_calls_via_openrouter = value;
+    }
+    if let Some(value) = input.channels {
+        current.channels = value;
     }
     if let Some(value) = input.subscription_fees {
         current.subscription_fees = value
@@ -1121,6 +1131,45 @@ externalReplies: disabled
         );
         assert_eq!(restored.transcript_text_size, TranscriptTextSize::Large);
         assert_eq!(restored.transcript_density, TranscriptDensity::Relaxed);
+    }
+
+    #[test]
+    fn channel_settings_yaml_roundtrip_and_defaults() {
+        use crate::models::{ChannelRouteConfig, ChannelsConfig, IMessageChannelConfig};
+
+        let defaults: SettingsFile = serde_yaml::from_str("channels:\n  imessage: {}\n").unwrap();
+        let default_channel = defaults.to_settings().channels.imessage;
+        assert!(!default_channel.enabled);
+        assert_eq!(default_channel.route, ChannelRouteConfig::default());
+
+        let channels = ChannelsConfig {
+            imessage: IMessageChannelConfig {
+                enabled: true,
+                executor: Some("bglab-mac".to_string()),
+                to: "+15551234567".to_string(),
+                allow_from: vec!["+15551234567".to_string()],
+                route: ChannelRouteConfig {
+                    question: true,
+                    permission: false,
+                    review: true,
+                },
+            },
+        };
+        let settings = Settings {
+            channels: channels.clone(),
+            ..test_settings()
+        };
+        let file = SettingsFile::from_settings(&settings);
+        let yaml = serde_yaml::to_string(&file).unwrap();
+        assert!(yaml.contains("allowFrom"));
+        assert_eq!(file.to_settings().channels, channels);
+        assert_eq!(
+            serde_yaml::from_str::<SettingsFile>(&yaml)
+                .unwrap()
+                .to_settings()
+                .channels,
+            channels
+        );
     }
 
     #[test]

@@ -136,8 +136,9 @@ pub(crate) fn start_recipe_execution_and_advance(
 /// default user start). Display/audit only.
 ///
 /// `branch_target` says where this execution's work lands (`None` = the recipe's
-/// default, `new`). It is resolved into node topology once, here, so every
-/// downstream derivation reads a snapshot that already has the right shape.
+/// first declared target, which is `new` for every recipe that doesn't say
+/// otherwise). It is resolved into node topology once, here, so every downstream
+/// derivation reads a snapshot that already has the right shape.
 #[allow(clippy::too_many_arguments)]
 pub fn start_recipe_execution_impl(
     orch: &Orchestrator,
@@ -165,6 +166,25 @@ pub fn start_recipe_execution_impl(
     // there, not in the private DB. The id-keyed resolvers cannot be used yet —
     // the execution row does not exist — so resolve by project id.
     let db = resolve_owning_db_for_project(orch, project_id)?;
+
+    // A thread owns no branch and never opens a pull request. Whether an
+    // execution would violate that is a property of the graph that runs, not of
+    // the issue, so the kind is resolved here while the refusal waits until the
+    // branch target has been applied below — a recipe resolved to `base` mints no
+    // branch and has had its `pr` nodes pruned, which is exactly a thread's
+    // posture. This is the one door every start comes through (the desktop
+    // command, an executions-collection append, create-and-start, and the
+    // scheduler), so refusing here holds for all of them, and it refuses before
+    // any execution row is written.
+    let issue_identity = {
+        let db = db.clone();
+        let issue_id = issue_id.to_string();
+        run_recipe_db(async move {
+            crate::issues::crud::identity(&db, &issue_id)
+                .await
+                .map_err(|error| format!("Failed to resolve issue kind: {error}"))
+        })?
+    };
 
     // CAIRN-2629: if a PEER device was chosen as the runner, enforce that it has a
     // local clone of this project before stamping ownership on it — otherwise its
@@ -292,9 +312,24 @@ pub fn start_recipe_execution_impl(
     // composer is transformed too rather than bypassing it.
     crate::execution::branch_target::apply_branch_target(
         &mut snapshot,
-        branch_target.unwrap_or_default(),
+        branch_target,
         &recipe.branch_targets,
     )?;
+
+    // Now that the graph is resolved, a thread can be asked the only question
+    // that matters: would THIS execution mint a branch or open a pull request?
+    if let Some(identity) = issue_identity {
+        if identity.kind == crate::models::IssueKind::Thread {
+            if let Some(reason) =
+                crate::execution::branch_target::thread_incompatibility(&snapshot.recipe.nodes)
+            {
+                return Err(format!(
+                    "Refusing to start an execution on {}-{}: it is a thread and {reason}. A thread owns no branch and never opens a pull request. Start it with a recipe that runs on the base branch and ships no PR, or put branch-bearing work in a child issue of this thread — the child carries its own execution and merges to the project's base branch.",
+                    identity.project_key, identity.number
+                ));
+            }
+        }
+    }
 
     let snapshot_json = snapshot.to_json()?;
 
@@ -336,6 +371,76 @@ pub fn start_recipe_execution_impl(
     })
 }
 
+/// Why the recipe a create-and-start names could not run on a thread, or `None`
+/// when it could.
+///
+/// The create door has to answer BEFORE the issue row exists, so a create that
+/// cannot start leaves no half-made thread behind. It resolves the recipe
+/// through the same lookup the start itself uses and then asks the shared rule,
+/// so the two doors cannot drift apart.
+///
+/// It answers fail-closed: `Some(reason)` — a refusal — unless it can positively
+/// show the execution would be branchless. A recipe that is not named, a project
+/// that does not resolve, and a recipe that does not resolve are all refusals,
+/// because create-and-start is not one transaction and a start that fails after
+/// the insert strands the thread. A resolution failure still carries the
+/// resolver's own error text, so an unknown recipe id reads as an unknown recipe
+/// id rather than as something about threads.
+pub async fn thread_recipe_refusal(
+    orch: &Orchestrator,
+    project_key: &str,
+    recipe_id: Option<&str>,
+) -> Option<String> {
+    // FAIL CLOSED. Create-and-start is "create then start", not one
+    // transaction: once the insert happens, a start that fails leaves the thread
+    // behind. So this door refuses unless it can positively show the execution
+    // would be branchless — "we could not tell" is a refusal, not permission.
+    // Each unprovable case says which one it was, so the caller is not sent
+    // after the wrong bug.
+    let Some(recipe_id) = recipe_id else {
+        return Some(
+            "it names no recipe, so the execution that would run cannot be shown to be branchless"
+                .to_string(),
+        );
+    };
+    let db = orch.db.for_project(project_key).await;
+    let key = project_key.to_uppercase();
+    let project_id = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT id FROM projects WHERE key = ?1 LIMIT 1", (key,))
+                    .await?;
+                Ok(match rows.next().await? {
+                    Some(row) => row.get::<String>(0).ok(),
+                    None => None,
+                })
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+    let Some(project_id) = project_id else {
+        return Some(format!("project {project_key} could not be resolved"));
+    };
+    let Ok(Some(repo_path)) = project_repo_path(&db, &project_id).await else {
+        return Some(format!("project {project_key} has no resolvable checkout"));
+    };
+    // The recipe's own resolution error is carried verbatim rather than being
+    // flattened into a thread refusal: an unknown recipe id is an unknown recipe
+    // id whatever kind of issue named it.
+    let recipe = match get_selected_recipe(
+        &orch.config_dir,
+        std::path::Path::new(&repo_path),
+        &project_id,
+        recipe_id,
+    ) {
+        Ok(recipe) => recipe,
+        Err(error) => return Some(format!("its recipe could not be resolved — {error}")),
+    };
+    crate::execution::branch_target::recipe_thread_incompatibility(&recipe).map(ToString::to_string)
+}
+
 /// Start executing a recipe manually (no issue, just project).
 ///
 /// Creates an execution record for a manual trigger. Caller is responsible for
@@ -370,7 +475,7 @@ pub fn start_manual_execution_impl(
     )?;
     crate::execution::branch_target::apply_branch_target(
         &mut snapshot,
-        branch_target.unwrap_or_default(),
+        branch_target,
         &recipe.branch_targets,
     )?;
     let snapshot_json = snapshot.to_json()?;

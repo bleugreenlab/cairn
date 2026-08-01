@@ -89,6 +89,7 @@ pub(crate) async fn job_residency_request(
             node_kind: node_name,
         }),
         selector: None,
+        executor: None,
         repository: RepositoryLocator::ColocatedPath {
             project_id: project_id.clone(),
             repository_id: project_id,

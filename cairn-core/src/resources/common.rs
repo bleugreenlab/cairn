@@ -95,6 +95,27 @@ pub(crate) async fn resolve_home_relative_resource_uri(
     }
 }
 
+/// Resolve a thread alias target (`cairn://p/PROJECT/t/NAME`) to the canonical
+/// numbered issue URI it names. Every other URI passes through untouched.
+///
+/// Applied on the read path immediately after home-relative expansion, so
+/// everything downstream — the parsed resource, its affordance, the links its
+/// body renders — sees the numbered issue. That is what makes a named read
+/// return exactly what a numbered read returns, and what keeps the alias off
+/// every surface Cairn emits.
+pub(crate) async fn resolve_thread_alias_resource_uri(
+    dbs: &crate::db::DbState,
+    uri: &str,
+) -> Result<String, String> {
+    let Some(cairn_common::uri::CairnResource::ThreadAlias { project, name }) =
+        cairn_common::uri::parse_uri(uri)
+    else {
+        return Ok(uri.to_string());
+    };
+    let db = dbs.for_project(&project).await;
+    crate::issues::relations::resolve_thread_alias(&db, &project, &name).await
+}
+
 /// Home-relative suffixes that a delegated task resolves against its OWNING
 /// NODE rather than itself.
 ///

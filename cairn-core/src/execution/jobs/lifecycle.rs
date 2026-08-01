@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::threads::compaction::CompactionTrigger;
+use crate::threads::ThreadCompaction;
+
 // ============================================================================
 // on_job_complete_impl
 // ============================================================================
@@ -965,7 +968,8 @@ pub fn continue_job_or_enqueue(
             // frontend ignores the value. `list_runs_for_job` orders newest-first,
             // matching the frontend's `runs[0]` "latest" convention. Fall through to
             // the resume only in the pathological case where an active turn has no
-            // run row at all.
+            // run row at all — the message is already recorded, so the fall-through
+            // must not record it a second time.
             if let Some(run) = crate::runs::queries::list_runs_for_job(owning_db.clone(), job_id)
                 .map_err(|e| e.to_string())?
                 .into_iter()
@@ -973,25 +977,19 @@ pub fn continue_job_or_enqueue(
             {
                 return Ok(run);
             }
-        }
-        // An idle child takes the operator's text straight into a resume, so there
-        // is no queued row for the watchers' catch-up copy to hang off. Fire it
-        // here, so an operator message reaches a child's watchers whichever branch
-        // it took (CAIRN-3342). If both branches ran — an active turn with no run
-        // row — supersede-by-key collapses the two identical rows into one.
-        let dbs = orch.db.clone();
-        let watched_job_id = job_id.to_string();
-        if let Err(error) = run_db(async move {
-            let db = crate::execution::routing::owning_db_for_job(&dbs, &watched_job_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(
-                &db,
-                &watched_job_id,
-            )
-            .await
-        }) {
-            log::warn!("catch-up push creation for an operator message failed: {error}");
+        } else if let Err(error) =
+            crate::messages::queued::record_direct_delivery(&owning_db, job_id, text)
+        {
+            // An idle child takes the operator's text straight into the resume
+            // below, so the queue never sees it. Recording it delivered-on-arrival
+            // is what keeps the operator-message record complete: the watchers'
+            // catch-up digest reads that record, and the `user` transcript event
+            // this resume is about to store is indistinguishable from a launch
+            // prompt or a machinery-delivered payload (CAIRN-3390). It also carries
+            // the watchers' catch-up push, so an operator message reaches them
+            // whichever branch it took (CAIRN-3342). Best-effort: bookkeeping that
+            // fails must not cost the operator the resume itself.
+            log::warn!("recording an operator message for job {job_id} failed: {error}");
         }
     }
     continue_job_impl(
@@ -2284,6 +2282,12 @@ fn assemble_resume_prompt(
 /// cache and reseeding would buy nothing.
 const SESSION_STALENESS_THRESHOLD_SECS: i64 = 60 * 60;
 
+/// Header that leads a compacted THREAD seed, framing the three sections that
+/// follow. A thread is never finished, so the framing points at what keeps it
+/// cheap rather than apologizing for a reconstruction: the arc is the only part
+/// of this context nothing can regenerate.
+const THREAD_SEED_HEADER: &str = "This thread's session was rebuilt so it stays cheap to run indefinitely. Below: the arc you authored, a table of contents for history that has been compacted away, and the most recent turns verbatim. Every compacted chapter names what it was and where to read it in full — read one only when it bears on what you are doing now, because re-reading costs more than it saves unless the range is genuinely load-bearing. Re-read any file whose content still matters, and keep `cairn:~/arc` current: decisions, the paths you rejected and why, and the open questions are the only things here that cannot be rebuilt from the transcript.";
+
 /// Header that leads the reseed seed prompt, framing the digest that follows.
 const RESEED_SEED_HEADER: &str = "The prior events in this session are summarized below because the underlying agent session was reconstructed after a period of inactivity (tool-result bodies were elided). Re-read any files whose content is still relevant, and re-read your working documents (todos/plan/board) for the current plan state before acting.";
 
@@ -2381,6 +2385,59 @@ fn build_reseed_seed_content(digest: &str) -> String {
     format!("{RESEED_SEED_HEADER}\n\n{digest}")
 }
 
+/// The seed content delivered and stored when a thread compacts. Same shape as
+/// [`build_reseed_seed_content`] — header then body, trigger appended later —
+/// so a compacted thread seed remains an ordinary `user:seed` everywhere
+/// downstream.
+fn build_thread_seed_content(composed: &str) -> String {
+    format!("{THREAD_SEED_HEADER}\n\n{composed}")
+}
+
+// ── Thread compaction triggers (CAIRN-3388) ───────────────────────────────────
+
+/// What a thread compaction decision is made from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThreadCompactionInputs {
+    /// The session's last event is older than the staleness threshold.
+    stale: bool,
+    /// Terminal children this composition actually folded into chapters. A mark
+    /// with nothing to compact does not arm the trigger.
+    folded_marks: usize,
+    /// `P` — what the compactable prefix weighs verbatim.
+    source_bytes: i64,
+    /// `p` — what that same prefix weighs as a table of contents.
+    candidate_bytes: i64,
+}
+
+/// Decide whether a thread session compacts now.
+///
+/// Two triggers, both grounded in prompt-cache economics. A 1h cache write costs
+/// 2× base input and a read 0.1×, so rewriting history mid-conversation is
+/// expensive rather than free:
+///
+/// - **expiry**: the session is stale, so the next turn pays a cache write
+///   whatever happens and compacting there is marginally free. Thread wakes are
+///   bursty, so expiry also tends to land at a natural narrative boundary.
+/// - **ratio**: the live prefix exceeds three times its table-of-contents form,
+///   which is where the break-even `N > 20p/(P−p)` pays back inside ~10 turns.
+///
+/// A child reaching terminal status never triggers anything by itself: it marks
+/// what became compactable, and one of these two decides when to apply it.
+///
+/// Sizes are measured in bytes of the exact strings the composer and renderer
+/// would send, not provider token counters. The counters describe requests
+/// already made and cannot price a seed that has never been sent; bytes are
+/// model-independent, deterministic, and testable.
+fn decide_thread_compaction(inputs: ThreadCompactionInputs) -> Option<CompactionTrigger> {
+    if inputs.stale {
+        return Some(CompactionTrigger::Expiry);
+    }
+    if inputs.folded_marks > 0 && inputs.source_bytes > inputs.candidate_bytes.saturating_mul(3) {
+        return Some(CompactionTrigger::Ratio);
+    }
+    None
+}
+
 /// Prepend the reseed seed to the trigger prompt when this resume reseeded;
 /// identity otherwise. Keeps the seed-before-trigger ordering in one place.
 fn apply_reseed_seed(prompt: String, reseed: Option<&ReseedOutcome>) -> String {
@@ -2420,7 +2477,16 @@ fn attempt_session_reseed(
     ))
     .ok()
     .flatten()?;
-    if !is_session_stale(now, last_event_at, staleness_threshold_secs()) {
+    let stale = is_session_stale(now, last_event_at, staleness_threshold_secs());
+
+    // A thread is never finished, so it does not reseed from its whole
+    // transcript: it compacts. That path also runs while the session is warm,
+    // because the size ratio can fire between wakes.
+    if thread_compaction_capability(owning_db, &job.id).is_enabled() {
+        return attempt_thread_compaction(orch, owning_db, job, session, stale);
+    }
+
+    if !stale {
         return None;
     }
 
@@ -2456,6 +2522,20 @@ fn force_session_reseed(
     job: &DbJob,
     session: &Session,
 ) -> Result<ReseedOutcome, String> {
+    // An operator forcing a digest resume on a thread gets the thread's own seed
+    // shape; there is only one way to reconstruct a thread's context.
+    if thread_compaction_capability(owning_db, &job.id).is_enabled() {
+        let seed = compose_thread_seed_blocking(owning_db, job)?;
+        return apply_thread_compaction(
+            orch,
+            owning_db,
+            job,
+            session,
+            seed,
+            CompactionTrigger::Manual,
+        );
+    }
+
     // Construct the complete seed before any process or session mutation.
     let digest = {
         let db = owning_db.clone();
@@ -2469,8 +2549,28 @@ fn force_session_reseed(
             "Cannot resume from digest because this job has no resumable transcript.".to_string(),
         );
     }
-    let seed_content = build_reseed_seed_content(&digest);
 
+    rotate_with_seed(
+        orch,
+        owning_db,
+        job,
+        session,
+        build_reseed_seed_content(&digest),
+    )
+}
+
+/// Stop the live process and rotate to a fresh session carrying `seed_content`.
+///
+/// The one mutating half of every reseed, thread or not. Rotation is the last
+/// and only persisted step, so any failure before it leaves session state
+/// exactly as a native resume would have.
+fn rotate_with_seed(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    session: &Session,
+    seed_content: String,
+) -> Result<ReseedOutcome, String> {
     if let Some(old_run) = orch.process_state.find_process_by_session(&session.id) {
         orch.process_state.stop_and_remove(&old_run);
     }
@@ -2496,6 +2596,133 @@ fn force_session_reseed(
         new_session_id: new_session.id,
         seed_content,
     })
+}
+
+/// Whether this job's session compacts as a thread. One resolution point, in
+/// `crate::threads`; a failure to resolve reads as "not a thread", which keeps
+/// the ordinary path.
+fn thread_compaction_capability(owning_db: &Arc<LocalDb>, job_id: &str) -> ThreadCompaction {
+    let db = owning_db.clone();
+    let job_id = job_id.to_string();
+    run_db(async move {
+        Ok::<_, String>(crate::threads::compaction_capability_for_job(&db, &job_id).await)
+    })
+    .unwrap_or(ThreadCompaction::Disabled)
+}
+
+fn compose_thread_seed_blocking(
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+) -> Result<crate::resources::ThreadSeed, String> {
+    let db = owning_db.clone();
+    let job_id = job.id.clone();
+    run_db(async move { crate::resources::compose_thread_seed(&db, &job_id).await })
+}
+
+/// Compose a thread's seed, decide whether this continuation compacts, and apply
+/// it if so.
+///
+/// Composition runs on every thread continuation because its result is also what
+/// prices the decision. It is read-only: nothing is persisted and no session
+/// moves unless a trigger fires, so the common case is a composed seed that is
+/// thrown away and a native resume.
+fn attempt_thread_compaction(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    session: &Session,
+    stale: bool,
+) -> Option<ReseedOutcome> {
+    let seed = match compose_thread_seed_blocking(owning_db, job) {
+        Ok(seed) => seed,
+        Err(error) => {
+            // Fail open, exactly as the ordinary reseed attempt does: the old
+            // session and its current pointer stay usable.
+            log::warn!(
+                "Thread seed composition failed for job {}; resuming natively: {error}",
+                &job.id[..job.id.len().min(8)]
+            );
+            return None;
+        }
+    };
+
+    let trigger = decide_thread_compaction(ThreadCompactionInputs {
+        stale,
+        folded_marks: seed.consumed_child_issue_ids.len(),
+        source_bytes: seed.source_bytes,
+        candidate_bytes: seed.candidate_bytes,
+    })?;
+
+    match apply_thread_compaction(orch, owning_db, job, session, seed, trigger) {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            log::warn!(
+                "Thread compaction failed for job {}; resuming natively: {error}",
+                &job.id[..job.id.len().min(8)]
+            );
+            None
+        }
+    }
+}
+
+/// Persist the generation, then rotate.
+///
+/// Order matters: the marks a seed folded into chapters are consumed in the same
+/// transaction that records the chapters, before any session moves, because the
+/// seed must be on record by the time it can reach an agent. The generation
+/// records the session it was composed from, and rotation is what makes it
+/// applied — so a rotation that fails leaves it pending, its marks still
+/// eligible and its chapters still unclaimed, and the next continuation decides
+/// exactly as it would have if this attempt had never happened.
+fn apply_thread_compaction(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    session: &Session,
+    seed: crate::resources::ThreadSeed,
+    trigger: CompactionTrigger,
+) -> Result<ReseedOutcome, String> {
+    let applied = crate::threads::compaction::AppliedCompaction {
+        trigger,
+        source_session_id: seed.source_session_id,
+        entries: seed.entries,
+        source_bytes: seed.source_bytes,
+        candidate_bytes: seed.candidate_bytes,
+        compacted_through_block: seed.compacted_through_block,
+        recency_start_block: seed.recency_start_block,
+        consumed_child_issue_ids: seed.consumed_child_issue_ids,
+    };
+    let now = orch.services.clock.now();
+    run_db({
+        let db = owning_db.clone();
+        let job_id = job.id.clone();
+        async move {
+            crate::threads::compaction::persist_generation(&db, &job_id, &applied, now)
+                .await
+                .map_err(|error| format!("Failed to persist a thread compaction: {error}"))
+        }
+    })?;
+
+    let outcome = rotate_with_seed(
+        orch,
+        owning_db,
+        job,
+        session,
+        build_thread_seed_content(&seed.content),
+    )?;
+
+    log::info!(
+        "Thread compaction ({}) for job {}: {} chapters, {} bytes -> {} bytes, session {} -> {}",
+        trigger.as_db(),
+        &job.id[..job.id.len().min(8)],
+        seed.new_entries,
+        seed.source_bytes,
+        seed.candidate_bytes,
+        &session.id[..session.id.len().min(8)],
+        &outcome.new_session_id[..outcome.new_session_id.len().min(8)],
+    );
+
+    Ok(outcome)
 }
 
 /// Outcome of reconciling a reusable process against the job's requested model.
@@ -3053,6 +3280,102 @@ mod tests {
         let digest_at = delivered.find("DIGEST_BODY").unwrap();
         let trigger_at = delivered.find("TRIGGER").unwrap();
         assert!(header_at < digest_at && digest_at < trigger_at);
+    }
+
+    #[test]
+    fn thread_compaction_fires_only_on_expiry_or_a_three_times_prefix() {
+        use super::{decide_thread_compaction, ThreadCompactionInputs};
+        use crate::threads::compaction::CompactionTrigger;
+
+        // (what the case is, stale, folded marks, P, p, expected trigger)
+        let cases = [
+            (
+                "a warm session with nothing marked holds, however big it is",
+                false,
+                0,
+                99_999,
+                10,
+                None,
+            ),
+            (
+                "a stale session compacts even with nothing to fold: the next turn \
+                 pays a cache write regardless",
+                true,
+                0,
+                0,
+                0,
+                Some(CompactionTrigger::Expiry),
+            ),
+            (
+                "a terminal child alone never rotates a warm session",
+                false,
+                2,
+                100,
+                100,
+                None,
+            ),
+            (
+                "exactly three times the table of contents is not yet worth the \
+                 cache write",
+                false,
+                1,
+                300,
+                100,
+                None,
+            ),
+            (
+                "past three times, the rewrite pays back inside ~10 turns",
+                false,
+                1,
+                301,
+                100,
+                Some(CompactionTrigger::Ratio),
+            ),
+            (
+                "cutting hard is what makes compaction worth it",
+                false,
+                3,
+                40_000,
+                400,
+                Some(CompactionTrigger::Ratio),
+            ),
+        ];
+
+        for (case, stale, folded_marks, source_bytes, candidate_bytes, expected) in cases {
+            assert_eq!(
+                decide_thread_compaction(ThreadCompactionInputs {
+                    stale,
+                    folded_marks,
+                    source_bytes,
+                    candidate_bytes,
+                }),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thread_seed_carries_its_own_header_and_stays_a_seed() {
+        // The thread seed is framed for a session that never ends, but it is the
+        // same header-then-body shape, so it remains an ordinary `user:seed`
+        // everywhere downstream.
+        let content = super::build_thread_seed_content("## Arc\n\nCOMPOSED_BODY");
+        assert!(content.starts_with(super::THREAD_SEED_HEADER));
+        assert!(content.contains("COMPOSED_BODY"));
+        assert!(
+            !content.starts_with(RESEED_SEED_HEADER),
+            "a thread must not be told its session was reconstructed after inactivity"
+        );
+
+        let outcome = ReseedOutcome {
+            new_session_id: "sess-new".to_string(),
+            seed_content: content.clone(),
+        };
+        assert_eq!(
+            apply_reseed_seed("TRIGGER".to_string(), Some(&outcome)),
+            format!("{content}\n\nTRIGGER")
+        );
     }
 
     #[test]

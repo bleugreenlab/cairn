@@ -83,6 +83,7 @@ pub(crate) async fn spawn_workflow_process(
             },
             owner_ref: None,
             selector: None,
+            executor: None,
             repository: RepositoryLocator::ColocatedPath {
                 project_id: params.project_id.clone(),
                 repository_id: params.project_id.clone(),

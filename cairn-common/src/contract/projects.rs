@@ -219,13 +219,17 @@ pub(crate) const PROJECT_ISSUES_CONTRACT: ResourceContract =
                 key: "labels",
                 values: "a,b (AND)",
             },
+            ProjectionSpec {
+                key: "kind",
+                values: "issue|thread",
+            },
         ],
         related: PROJECT_CHILD_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
             required: &[TITLE],
-            optional: &[DESCRIPTION, EXECUTION, PARENT, LABELS],
+            optional: &[DESCRIPTION, EXECUTION, PARENT, LABELS, ISSUE_KIND],
             label: "create issue",
             example: "write({changes:[{target:\"cairn://p/PROJECT/issues\",mode:\"append\",payload:{title:\"...\"}}]})",
         }],

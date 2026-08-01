@@ -7,6 +7,7 @@ use super::super::{
 use super::append_payload;
 use crate::mcp::handlers::{comments_artifacts, issues};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
+use crate::models::IssueKind;
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::CairnResource;
 
@@ -56,16 +57,38 @@ pub(super) async fn dispatch(
             };
             let execution = parse_create_execution_spec(index, item, payload)?;
             let labels = parse_string_array_field(index, item, payload, "labels", &[])?;
+            let kind = parse_create_kind(index, item, payload)?;
+            // Asked here rather than at the execution door, so a create-and-start
+            // that cannot start leaves no thread behind: the same rule the
+            // malformed-execution check follows. What is refused is the branch or
+            // the pull request the named recipe would produce, not the pairing of
+            // a thread with an execution — a thread's whole life is executions,
+            // they just have to be branchless ones.
+            if let (IssueKind::Thread, Some(spec)) = (kind, execution.as_ref()) {
+                if let Some(reason) = crate::execution::recipe::thread_recipe_refusal(
+                    orch,
+                    project,
+                    spec.recipe.as_deref(),
+                )
+                .await
+                {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        format!("A thread cannot start this execution: {reason}. A thread owns no branch and never opens a pull request. Start it with a recipe that runs on the base branch and ships no PR, or create an ordinary issue for work that needs a branch."),
+                    ));
+                }
+            }
             if dry_run {
                 match &execution {
                     Some(spec) => format!(
-                        "Would create issue in project {project}: {title} and start an execution{}",
+                        "Would create {kind} in project {project}: {title} and start an execution{}",
                         spec.recipe
                             .as_deref()
                             .map(|r| format!(" (recipe '{r}')"))
                             .unwrap_or_default()
                     ),
-                    None => format!("Would create issue in project {project}: {title}"),
+                    None => format!("Would create {kind} in project {project}: {title}"),
                 }
             } else {
                 let description = match payload_str(payload, "description", &[]) {
@@ -84,6 +107,7 @@ pub(super) async fn dispatch(
                     labels,
                     execution,
                     parent,
+                    kind,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -394,6 +418,36 @@ async fn resolve_issue_comment_id(
                 format!("Comment {comment_seq} not found on issue {project}-{number}"),
             )
         })
+}
+
+/// Parse the optional `kind` on an issue-create payload. Absent or null means an
+/// ordinary issue, so every caller that predates threads keeps creating exactly
+/// what it created before. An unrecognized value is refused by name rather than
+/// silently defaulted — a caller that asked for a thread and got an issue would
+/// only find out much later, when the branch it never wanted appeared.
+fn parse_create_kind(
+    index: usize,
+    item: &ChangeItem,
+    payload: &serde_json::Value,
+) -> ResourceMutationResult<IssueKind> {
+    match payload.get("kind") {
+        None | Some(serde_json::Value::Null) => Ok(IssueKind::Issue),
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                build_failure(
+                    index,
+                    item,
+                    format!(
+                        "payload.kind must be a string. Accepted values: {}",
+                        IssueKind::ACCEPTED_VALUES
+                    ),
+                )
+            })?;
+            raw.trim()
+                .parse::<IssueKind>()
+                .map_err(|error| build_failure(index, item, error))
+        }
+    }
 }
 
 /// Parse the optional `execution` object on an issue-create payload into a

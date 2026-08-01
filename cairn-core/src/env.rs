@@ -8,12 +8,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
-
-#[cfg(not(windows))]
-use std::process::{Output, Stdio};
-#[cfg(not(windows))]
-use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -21,95 +15,15 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Cached user PATH - resolved once on first use
-static USER_PATH: OnceLock<String> = OnceLock::new();
-
-/// Get the PATH separator for the current platform
-#[cfg(windows)]
-const PATH_SEP: char = ';';
-#[cfg(not(windows))]
-const PATH_SEP: char = ':';
-
-/// Get the user's home directory
-fn get_home_dir() -> String {
-    // Try platform-specific env vars first, then fall back to dirs crate
-    #[cfg(windows)]
-    {
-        std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "C:\\Users".to_string())
-            })
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("HOME").unwrap_or_else(|_| {
-            dirs::home_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "/Users".to_string())
-        })
-    }
-}
-
-#[cfg(not(windows))]
-fn compose_unix_path(home: &str, shell_path: Option<&str>, inherited_path: &str) -> String {
-    let user_paths = format!(
-        "{home}/.claude/local/bin:{home}/.bun/bin:{home}/.local/bin:{home}/.npm/bin:{home}/.yarn/bin:{home}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin"
-    );
-    let mut paths = vec![user_paths];
-    if let Some(shell_path) = shell_path.filter(|path| !path.is_empty()) {
-        paths.push(shell_path.to_string());
-    }
-    if !inherited_path.is_empty() {
-        paths.push(inherited_path.to_string());
-    }
-    paths.push("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
-    paths.join(":")
-}
-
-/// Get a reasonable PATH for finding CLI tools.
-/// Includes common installation locations, the user's shell PATH, the inherited
-/// process PATH, and the standard system directories.
-/// Result is cached for subsequent calls.
+/// A PATH for finding CLI tools on this machine: common install locations, the
+/// user's shell PATH, the inherited process PATH, and the standard system
+/// directories.
+///
+/// Composed by [`cairn_common::toolchain_path`], which is where every Cairn
+/// process — this host, and each executor on its own machine — gets the same
+/// answer from.
 pub fn get_user_path() -> &'static str {
-    USER_PATH.get_or_init(|| {
-        let home = get_home_dir();
-
-        #[cfg(windows)]
-        {
-            // Windows common paths where CLI tools are installed
-            let common_paths = [
-                format!("{}\\.bun\\bin", home),
-                format!("{}\\AppData\\Local\\Programs\\bun", home),
-                format!("{}\\.cargo\\bin", home),
-                format!("{}\\AppData\\Roaming\\npm", home),
-                format!("{}\\AppData\\Local\\Yarn\\bin", home),
-                format!("{}\\scoop\\shims", home),
-                "C:\\Program Files\\nodejs".to_string(),
-                "C:\\Program Files\\Git\\cmd".to_string(),
-            ];
-
-            // Get existing PATH and prepend common paths
-            let existing_path = std::env::var("PATH").unwrap_or_default();
-            let mut all_paths: Vec<&str> = common_paths.iter().map(|s| s.as_str()).collect();
-            if !existing_path.is_empty() {
-                all_paths.push(&existing_path);
-            }
-
-            all_paths.join(&PATH_SEP.to_string())
-        }
-
-        #[cfg(not(windows))]
-        {
-            compose_unix_path(
-                &home,
-                resolve_user_shell_path().as_deref(),
-                &std::env::var("PATH").unwrap_or_default(),
-            )
-        }
-    })
+    cairn_common::toolchain_path::user_path()
 }
 
 // ---------------------------------------------------------------------------
@@ -130,12 +44,7 @@ pub fn get_user_path() -> &'static str {
 /// so a dev instance's separate `~/.cairn-dev*` home gets its own shim dir and
 /// tracks its own dev rebuild automatically.
 fn cairn_bin_dir() -> PathBuf {
-    cairn_common::paths::cairn_home().join("bin")
-}
-
-/// Compose an agent-shell PATH by placing `bin_dir` ahead of `user_path`.
-fn prepend_cairn_bin(bin_dir: &Path, user_path: &str) -> String {
-    format!("{}{}{}", bin_dir.display(), PATH_SEP, user_path)
+    cairn_common::toolchain_path::cairn_bin_dir()
 }
 
 /// PATH for agent-spawned shells: the host-owned cairn bin dir (holding the
@@ -144,7 +53,7 @@ fn prepend_cairn_bin(bin_dir: &Path, user_path: &str) -> String {
 /// agent-facing spawn site (inline `run` commands, background + PTY terminals)
 /// sets `PATH` to this instead of bare [`get_user_path`].
 pub fn agent_shell_path() -> String {
-    prepend_cairn_bin(&cairn_bin_dir(), get_user_path())
+    cairn_common::toolchain_path::agent_shell_path()
 }
 
 /// Environment variables that route a dev-instance's cargo builds into its
@@ -575,60 +484,6 @@ fn executable_candidates(base: PathBuf, windows: bool) -> std::vec::IntoIter<Pat
     candidates.into_iter()
 }
 
-#[cfg(not(windows))]
-fn resolve_user_shell_path() -> Option<String> {
-    let user_shell = crate::services::get_default_shell();
-    let mut user_shell_command = Command::new(&user_shell);
-    user_shell_command.args(["-ilc", "command env"]);
-    shell_path_from_command(&mut user_shell_command).or_else(|| {
-        let mut fallback_command = Command::new("sh");
-        fallback_command.args(["-lc", "command env"]);
-        shell_path_from_command(&mut fallback_command)
-    })
-}
-
-#[cfg(not(windows))]
-fn shell_path_from_command(command: &mut Command) -> Option<String> {
-    let output = command_output_with_timeout(command, Duration::from_secs(3)).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_path_from_env_output(&String::from_utf8_lossy(&output.stdout))
-}
-
-#[cfg(not(windows))]
-fn command_output_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-) -> std::io::Result<Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            return child.wait_with_output();
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[cfg(not(windows))]
-pub(crate) fn parse_path_from_env_output(output: &str) -> Option<String> {
-    output
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("PATH=").filter(|path| !path.is_empty()))
-        .map(ToOwned::to_owned)
-}
-
 /// Find a binary by name using the user's PATH.
 /// Returns the full path to the binary if found.
 pub fn find_binary(name: &str) -> Result<String, String> {
@@ -719,20 +574,12 @@ pub(crate) fn gh() -> Command {
 #[cfg(not(windows))]
 mod tests {
     use super::{
-        cairn_jj_shim_target, compose_unix_path, ensure_forwarder_shim_in, ensure_jj_shim_in,
-        executable_candidates, is_legacy_cairn_forwarder, jj_shim_script_unix,
-        jj_shim_script_windows, parse_path_from_env_output, prepend_cairn_bin, real_jj_behind_shim,
-        uv_cache_dir_with_test_override, write_shim_file_if_ours, CAIRN_SHIM_MARKER,
+        cairn_jj_shim_target, ensure_forwarder_shim_in, ensure_jj_shim_in, executable_candidates,
+        is_legacy_cairn_forwarder, jj_shim_script_unix, jj_shim_script_windows,
+        real_jj_behind_shim, uv_cache_dir_with_test_override, write_shim_file_if_ours,
+        CAIRN_SHIM_MARKER,
     };
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn prepend_cairn_bin_places_bin_dir_first() {
-        assert_eq!(
-            prepend_cairn_bin(Path::new("/home/u/.cairn/bin"), "/usr/local/bin:/usr/bin"),
-            "/home/u/.cairn/bin:/usr/local/bin:/usr/bin"
-        );
-    }
+    use std::path::PathBuf;
 
     #[test]
     fn agent_cli_shim_creates_and_is_idempotent() {
@@ -789,64 +636,6 @@ mod tests {
         let bin = dir.path().join("bin");
         ensure_forwarder_shim_in(&bin, "cairn", "/nonexistent/cairn-cmd");
         assert!(!bin.join("cairn").exists());
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_path_keeps_standard_dirs_with_restricted_inherited_path() {
-        let path = compose_unix_path("/home/dev", None, "/restricted/gui/bin");
-        assert!(path.starts_with("/home/dev/.claude/local/bin:"));
-        assert!(path.contains(":/restricted/gui/bin:"));
-        assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_path_includes_standard_dirs_when_inherited_path_is_empty() {
-        let path = compose_unix_path("/home/dev", None, "");
-        assert!(path.starts_with("/home/dev/.claude/local/bin:"));
-        assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn unix_path_keeps_resolved_shell_and_inherited_entries() {
-        let path = compose_unix_path(
-            "/home/dev",
-            Some("/shell/bin:/shell/sbin"),
-            "/inherited/bin",
-        );
-        assert!(path.contains(":/shell/bin:/shell/sbin:/inherited/bin:"));
-        assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
-    }
-
-    #[test]
-    fn parse_path_from_env_output_picks_path_line() {
-        let output = "SHELL=/bin/zsh\nPATH=/usr/local/bin:/usr/bin\nHOME=/Users/example\n";
-        assert_eq!(
-            parse_path_from_env_output(output).as_deref(),
-            Some("/usr/local/bin:/usr/bin")
-        );
-    }
-
-    #[test]
-    fn parse_path_from_env_output_ignores_non_path_lines() {
-        let output = "SHELL=/bin/zsh\nCAIRN_PATH_HINT=/tmp/bin\nHOME=/Users/example\n";
-        assert_eq!(parse_path_from_env_output(output), None);
-    }
-
-    #[test]
-    fn parse_path_from_env_output_uses_last_path_line() {
-        let output = "PATH=/minimal\nnoise from shell rc\nPATH=/shell/configured:/usr/bin\n";
-        assert_eq!(
-            parse_path_from_env_output(output).as_deref(),
-            Some("/shell/configured:/usr/bin")
-        );
-    }
-
-    #[test]
-    fn parse_path_from_env_output_rejects_empty_path() {
-        assert_eq!(parse_path_from_env_output("PATH=\n"), None);
     }
 
     #[test]

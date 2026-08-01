@@ -1908,7 +1908,7 @@ mod artifact_present_tests {
             snapshot_from_yaml(include_str!("../../../../../recipes/coordinator.yaml"));
         crate::execution::branch_target::apply_branch_target(
             &mut standing,
-            crate::models::BranchTarget::Base,
+            Some(crate::models::BranchTarget::Base),
             &[
                 crate::models::BranchTarget::New,
                 crate::models::BranchTarget::Base,
@@ -1916,6 +1916,17 @@ mod artifact_present_tests {
         )
         .unwrap();
         assert_recipe_derivation(&db, "coordinator (base)", standing, Some("coordinator")).await;
+
+        // The thread recipe is that same standing shape without needing the
+        // transform: it ships no `pr` node at all, so its agent derives
+        // long-running under either branch target.
+        assert_recipe_derivation(
+            &db,
+            "thread",
+            snapshot_from_yaml(include_str!("../../../../../recipes/thread.yaml")),
+            Some("thread"),
+        )
+        .await;
     }
 
     #[tokio::test]

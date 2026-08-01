@@ -465,6 +465,7 @@ mod tests {
             depends_on: Vec::new(),
             unmet_depends_on: Vec::new(),
             labels: Vec::new(),
+            kind: models::IssueKind::Issue,
         }
     }
 

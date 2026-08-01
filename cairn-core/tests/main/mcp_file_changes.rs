@@ -372,6 +372,109 @@ impl ChangeTestRepo {
     async fn preview_report(&self, payload: serde_json::Value) -> serde_json::Value {
         parse_report(&handle_write(&self.orch, &make_preview_request(self.cwd(), payload)).await)
     }
+
+    /// `handle_write`'s raw answer. A refusal taken before any mutation applies
+    /// is prose, not a change report, so it cannot go through `change_report`.
+    async fn change_raw(&self, payload: serde_json::Value) -> String {
+        let mut request = make_request(self.cwd(), payload);
+        request.run_id = Some("run-change".to_string());
+        handle_write(&self.orch, &request).await
+    }
+
+    /// Turn this fixture's issue into a thread, changing nothing else. The kind
+    /// is then the only difference between the two directions asserted below.
+    async fn become_a_thread(&self) {
+        self.orch
+            .db
+            .local
+            .execute(
+                "UPDATE issues SET kind = 'thread' WHERE id = 'issue-change'",
+                params![],
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// The tracked-writes half of the thread posture, at the `write` door.
+///
+/// A thread owns no branch, so its job runs ON the base branch and a commit from
+/// it publishes to the project's default branch with no pull request and no
+/// review surface. Both directions run the same batch against the same fixture,
+/// so the issue's kind is the only variable: an ordinary issue commits and the
+/// content is really on the branch, and the thread is refused before anything
+/// applies — the branch still holds exactly what the ordinary commit left there.
+#[tokio::test]
+async fn a_thread_cannot_commit_a_tracked_file_and_an_ordinary_issue_still_can() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("posture.txt", "before\n");
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:posture.txt",
+                "mode": "patch",
+                "payload": { "old_string": "before", "new_string": "after" }
+            }],
+            "commit_msg": "an ordinary issue lands its work"
+        }))
+        .await;
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("posture.txt"),
+        "after\n",
+        "an ordinary issue's commit must reach the branch unchanged: {report:?}"
+    );
+
+    repo.become_a_thread().await;
+    let refusal = repo
+        .change_raw(json!({
+            "changes": [{
+                "target": "file:posture.txt",
+                "mode": "patch",
+                "payload": { "old_string": "after", "new_string": "from a thread" }
+            }],
+            "commit_msg": "should never land"
+        }))
+        .await;
+
+    assert!(
+        refusal.contains("it is a thread") && refusal.contains("child issue"),
+        "the thread must be told the posture and where the work belongs: {refusal}"
+    );
+    assert_eq!(
+        repo.read("posture.txt"),
+        "after\n",
+        "the refusal must be taken before the mutation applies: {refusal}"
+    );
+}
+
+/// The refusal is keyed on the `commit_msg`, which is the whole surface a
+/// tracked write needs — so a thread keeps every resource mutation it depends on
+/// to do its actual job (arc, children, messages, todos). A guard that fired on
+/// authorship rather than on the commit field would silence the thread.
+#[tokio::test]
+async fn a_thread_still_writes_resources() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.become_a_thread().await;
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "cairn://p/CHG/1/messages",
+                "mode": "append",
+                "payload": { "content": "a thread speaking on its own issue" }
+            }]
+        }))
+        .await;
+
+    assert_successful_change(&report, 1);
 }
 
 /// The incident shape: a patch that inserts a block *before* an anchor and

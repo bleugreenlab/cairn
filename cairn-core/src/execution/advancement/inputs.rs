@@ -49,6 +49,8 @@ pub fn format_resolved_inputs(inputs: &[ResolvedInput]) -> String {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
+                    let is_thread = issue.get("kind").and_then(|v| v.as_str()) == Some("thread");
+
                     if has_event {
                         let mut section = format!(
                             "## Source Issue\n\nThe following issue's job has ended. This is the issue that was worked on:\n\n**{}**",
@@ -58,6 +60,14 @@ pub fn format_resolved_inputs(inputs: &[ResolvedInput]) -> String {
                             section.push_str(&format!("\n\n{}", description));
                         }
                         parts.push(section);
+                    } else if is_thread && !description.is_empty() {
+                        // A thread opens with what the user said, verbatim. Its
+                        // title is a NAME for a place — usually derived from this
+                        // very message — so leading with it as a heading states
+                        // the message twice and dresses a conversation up as a
+                        // work item. An issue keeps the heading: there the title
+                        // is the objective, and the body is its detail.
+                        parts.push(description.to_string());
                     } else if description.is_empty() {
                         parts.push(format!("# {}", title));
                     } else {
@@ -183,6 +193,63 @@ mod tests {
         assert!(output.contains("# Fix the bug"));
         assert!(output.contains("It crashes on startup"));
         assert!(!output.contains("Trigger Event"));
+    }
+
+    #[test]
+    fn a_thread_opens_with_the_message_itself() {
+        // The thread's title is a name derived from this same message; rendering
+        // it as a heading above the message states it twice and reads as a work
+        // item rather than as something the user said.
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "issue": {
+                    "id": "iss-1",
+                    "title": "where should placement live",
+                    "description": "where should placement live",
+                    "kind": "thread",
+                }
+            }),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        assert_eq!(output, "where should placement live");
+    }
+
+    #[test]
+    fn a_thread_with_nothing_said_still_names_itself() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "issue": {
+                    "id": "iss-1",
+                    "title": "Executor placement",
+                    "description": null,
+                    "kind": "thread",
+                }
+            }),
+        }];
+        assert_eq!(format_resolved_inputs(&inputs), "# Executor placement");
+    }
+
+    #[test]
+    fn an_issue_keeps_its_title_heading() {
+        // An issue's title is its objective and the body is the detail, so the
+        // heading is carrying real information there.
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "issue": {
+                    "id": "iss-1",
+                    "title": "Fix the bug",
+                    "description": "It crashes on startup",
+                    "kind": "issue",
+                }
+            }),
+        }];
+        assert_eq!(
+            format_resolved_inputs(&inputs),
+            "# Fix the bug\n\nIt crashes on startup"
+        );
     }
 
     #[test]

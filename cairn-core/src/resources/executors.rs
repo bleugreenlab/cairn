@@ -30,6 +30,8 @@ use cairn_common::executor_protocol::{
 // file do not collide on one line neither of them cares about.
 use cairn_common::executor_protocol::{EnrolledRemote, RemoteLinkState};
 
+use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
+
 /// Render the fleet collection: one line per machine, plus the toolchains and
 /// load an agent weighs before targeting one.
 ///
@@ -41,9 +43,10 @@ use cairn_common::executor_protocol::{EnrolledRemote, RemoteLinkState};
 pub(crate) fn render_executors(
     executors: &[ExecutorInspection],
     enrolled: &[EnrolledRemote],
+    enrolling: &[EnrollmentOperation],
     captured_at_unix_ms: u64,
 ) -> String {
-    if executors.is_empty() && enrolled.is_empty() {
+    if executors.is_empty() && enrolled.is_empty() && enrolling.is_empty() {
         return "# Executors\n\nNo executor is attached to this runner.\n\nThe runner supervises a colocated executor named `local`; if nothing is listed here it is not currently attached. Enrolled machines are added with `cairn executor add <user@host>`.".to_string();
     }
     let mut out = String::from("# Executors\n\n");
@@ -96,7 +99,60 @@ pub(crate) fn render_executors(
             out.push_str(&format!("- Read: cairn://executors/{}\n\n", remote.name));
         }
     }
+    if !enrolling.is_empty() {
+        out.push_str(&format!(
+            "## Enrolling now ({})\n\nThese machines are being brought up. They are not targetable until they report ready.\n\n",
+            enrolling.len()
+        ));
+        for operation in enrolling {
+            out.push_str(&format!("### {}\n", operation.name));
+            out.push_str(&format!(
+                "- Phase: {} ({})\n",
+                operation.phase.label(),
+                age(operation.elapsed_ms(captured_at_unix_ms))
+            ));
+            out.push_str(&format!("- Read: {}\n\n", operation.uri));
+        }
+    }
     out.push_str("Target one with `run({executor:{name:\"<name>\"}})`, or any machine on a platform with `run({executor:{os:\"linux\"}})`.\n");
+    out
+}
+
+/// Render an enrollment that is still running, or the one that most recently
+/// failed, for a name that has no machine behind it yet.
+///
+/// This is what makes an enrollment legible while it happens: the alternative is
+/// a name that reads as unknown for the several minutes an SSH bootstrap takes,
+/// which is indistinguishable from a name that was never enrolled at all.
+pub(crate) fn render_enrollment(
+    operation: &EnrollmentOperation,
+    captured_at_unix_ms: u64,
+) -> String {
+    let mut out = format!("# Executor {}\n\n", operation.name);
+    out.push_str("## Enrollment\n");
+    out.push_str(&format!("- Phase: {}\n", operation.phase.label()));
+    out.push_str(&format!(
+        "- Elapsed: {}\n",
+        age(operation.elapsed_ms(captured_at_unix_ms))
+    ));
+    out.push_str(&format!("- Operation: {}\n", operation.id));
+    if let Some(diagnostic) = &operation.diagnostic {
+        out.push_str(&format!("- Diagnostic: {diagnostic}\n"));
+    }
+    out.push_str(&format!(
+        "- Rollback: {}\n\n",
+        match operation.cleanup {
+            EnrollmentCleanup::NotApplicable => "nothing to roll back",
+            EnrollmentCleanup::Complete => "complete — nothing was left on the host",
+            EnrollmentCleanup::Incomplete =>
+                "incomplete — remove this machine to clear what the rollback could not",
+        }
+    ));
+    out.push_str(if operation.phase.is_terminal() {
+        "This enrollment has finished. Nothing is placed here; the machine either attached or did not.\n"
+    } else {
+        "This machine is being enrolled. No load, admission, or occupancy is reported: those are measured on the machine, and it is not reporting yet.\n"
+    });
     out
 }
 
@@ -716,6 +772,7 @@ mod tests {
             colocated,
             health: ExecutorHealthSnapshot {
                 identity: identity.clone(),
+                public_name: name.into(),
                 colocated,
                 status: ExecutorHealthStatus::Online,
                 heartbeat_age_ms: 4_000,
@@ -788,6 +845,7 @@ mod tests {
         let rendered = render_executors(
             &[inspection("bglab-ub", false), inspection("local", true)],
             &[],
+            &[],
             CAPTURED_AT,
         );
         assert!(rendered.contains("## bglab-ub"), "{rendered}");
@@ -804,7 +862,7 @@ mod tests {
     /// rendering an empty list an agent has to interpret.
     #[test]
     fn an_empty_fleet_renders_an_explanation_not_an_empty_list() {
-        let rendered = render_executors(&[], &[], CAPTURED_AT);
+        let rendered = render_executors(&[], &[], &[], CAPTURED_AT);
         assert!(rendered.contains("No executor is attached"), "{rendered}");
         assert!(rendered.contains("local"), "{rendered}");
     }
@@ -835,6 +893,7 @@ mod tests {
         let rendered = render_executors(
             &[inspection("local", true)],
             &[enrolled("bglab-ub", RemoteLinkState::Unreachable)],
+            &[],
             REMOTE_CAPTURED_AT,
         );
         assert!(rendered.contains("### bglab-ub"), "{rendered}");
@@ -857,6 +916,7 @@ mod tests {
                 enrolled("bglab-mac", RemoteLinkState::AttachFailed),
                 enrolled("bglab-ub", RemoteLinkState::Unreachable),
             ],
+            &[],
             REMOTE_CAPTURED_AT,
         );
         assert!(rendered.contains("### bglab-mac"), "{rendered}");
@@ -1016,7 +1076,7 @@ mod tests {
         });
         for rendered in [
             render_executor(&executor),
-            render_executors(std::slice::from_ref(&executor), &[], CAPTURED_AT),
+            render_executors(std::slice::from_ref(&executor), &[], &[], CAPTURED_AT),
         ] {
             assert!(!rendered.contains("executor-7b21ce"), "{rendered}");
             assert!(!rendered.contains("device-9f3c1a"), "{rendered}");

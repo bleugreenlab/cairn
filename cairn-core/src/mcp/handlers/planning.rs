@@ -752,7 +752,7 @@ pub async fn answer_node_question(
     answer_prompt_id(orch, &prompt_id, response).await
 }
 
-async fn answer_prompt_id(
+pub(crate) async fn answer_prompt_id(
     orch: &Orchestrator,
     prompt_id: &str,
     response: String,
