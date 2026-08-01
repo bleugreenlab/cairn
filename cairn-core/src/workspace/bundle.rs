@@ -31,8 +31,18 @@ pub struct BundleSyncResult {
     pub skipped_conflicts: Vec<String>,
 }
 
+/// Bundled resources this build no longer ships. The sync walks the SOURCE tree,
+/// so simply deleting a bundled file leaves every existing workspace holding a
+/// stale copy that is still listed and still startable. Each path here is removed
+/// from the workspace when it is still bundle-owned; a copy the user edited is
+/// theirs and is kept.
+const RETIRED_BUNDLED_RESOURCES: &[&str] = &["recipes/main-coordinator.yaml"];
+
 struct SyncOutcome {
     changed: bool,
+    /// Workspace-relative paths written or removed by this sync. Both are
+    /// committed the same way: `git add --` records a deletion as readily as an
+    /// addition, so the retirement lands in the bundle-owned commit.
     copied_paths: Vec<String>,
     skipped_conflicts: Vec<String>,
 }
@@ -211,6 +221,23 @@ fn sync_bundle_resources(
                 changed = true;
             }
         }
+    }
+
+    for rel_path in RETIRED_BUNDLED_RESOURCES {
+        let dest = target_dir.join(rel_path);
+        if !fs.exists(&dest) {
+            continue;
+        }
+        // A Git failure means ownership cannot be established, and materializing
+        // defaults stays independent of Git — so keep the file rather than
+        // deleting something that might be the user's.
+        if bundled_file_is_user_owned(git, target_dir, rel_path).unwrap_or(true) {
+            skipped_conflicts.push((*rel_path).to_string());
+            continue;
+        }
+        fs.remove_file(&dest)?;
+        changed = true;
+        copied_paths.push((*rel_path).to_string());
     }
 
     Ok(SyncOutcome {
@@ -707,6 +734,78 @@ mod tests {
         assert!(repo.join("agents/new-agent.md").exists());
         assert!(repo.join("recipes/memory-triage.yaml").exists());
         assert!(repo.join("skills/example/SKILL.md").exists());
+    }
+
+    #[test]
+    fn a_retired_resource_is_no_longer_shipped() {
+        // Retiring a bundled resource is two edits that must agree: delete it
+        // from the shipped tree, and list it here so existing workspaces drop
+        // their copy. Listing alone leaves the file shipping, and the sync would
+        // copy it straight back after removing it — so the retirement would
+        // silently do nothing. Nothing else notices, because a retired resource
+        // is by definition absent from every list the other tests assert over.
+        let bundle_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("cairn-core manifest is nested under src-tauri");
+        for rel_path in RETIRED_BUNDLED_RESOURCES {
+            let shipped = bundle_root.join(rel_path);
+            assert!(
+                !shipped.exists(),
+                "{rel_path} is listed as retired but is still shipped at {shipped:?}; \
+                 delete it from the bundle or drop it from RETIRED_BUNDLED_RESOURCES"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_bundled_file_is_removed_unless_the_user_edited_it() {
+        use crate::services::{RealFileSystem, RealGitClient};
+
+        let retired = RETIRED_BUNDLED_RESOURCES
+            .first()
+            .expect("a retired path to exercise");
+
+        // An install that still carries the shipped copy: the sync removes it.
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources-a");
+        write_resources_a(&resources);
+
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+        sync_workspace_bundle(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+
+        let stale = repo.join(retired);
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "shipped copy\n").unwrap();
+        git.add_all(&repo).unwrap();
+        git.commit(&repo, "Sync bundled workspace defaults")
+            .unwrap();
+
+        sync_workspace_bundle(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+        assert!(
+            !stale.exists(),
+            "an untouched shipped copy of a retired resource is removed"
+        );
+
+        // An install whose copy the user edited: the sync keeps it and reports
+        // the conflict rather than deleting their work.
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources-a");
+        write_resources_a(&resources);
+        sync_workspace_bundle(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+
+        let edited = repo.join(retired);
+        std::fs::create_dir_all(edited.parent().unwrap()).unwrap();
+        std::fs::write(&edited, "my own version\n").unwrap();
+        git.add_all(&repo).unwrap();
+        git.commit(&repo, "Keep my coordinator").unwrap();
+
+        let result = sync_workspace_bundle(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+        assert!(edited.exists(), "a user-owned copy survives retirement");
+        assert!(result.skipped_conflicts.contains(&retired.to_string()));
     }
 
     #[test]

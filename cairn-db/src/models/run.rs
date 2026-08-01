@@ -14,6 +14,12 @@ pub struct ReadSegmentTokens {
     pub target: String,
     /// Approximate token count of this section's body.
     pub tokens: i64,
+    /// The durable `cairn://p/{KEY}/images/{sha256}` reference this section's read
+    /// promoted, when the target was an image. The list projection strips read
+    /// bodies, so this is how a row renders the image it read without re-fetching
+    /// the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_uri: Option<String>,
 }
 
 /// A run — one process attachment lifetime.

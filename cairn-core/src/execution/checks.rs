@@ -12,7 +12,7 @@
 //!
 //! The `checks` contract is read from the project's MAIN-CHECKOUT
 //! `.cairn/config.yaml` (located by `project_id`), which is exactly the file the
-//! Settings UI edits. It is NOT read from the agent worktree's own committed
+//! Settings UI edits. It is not read from a mutable executor projection's committed
 //! copy: that copy is snapshotted when the branch is cut, so a project-level
 //! checks edit made while a session is in flight would never reach it. Sourcing
 //! the contract live means a Settings edit takes effect on the very next commit
@@ -36,15 +36,28 @@
 //! process machinery directly (not `run_one`), so a sandbox-blocked syscall
 //! surfaces as a failed exit rather than an interactive fence prompt.
 //!
-//! ## Concurrency and isolation
+//! ## Concurrency, ordering, and the fold
 //!
-//! The affected cache-MISS checks run SEQUENTIALLY, in deterministic plan order,
-//! inside one pure-verdict cell lease materialized at the just-sealed commit.
-//! Cache hits are resolved before admission, so an all-hit cadence acquires no slot.
-//! The committing run's affinity key prefers its warm slot while each check retains
-//! its own cache identity, result, timing, output stream, and provenance. Checks may
-//! not mutate the checked-out tree; mutation is a typed substrate failure and no
-//! check path amends the agent's commit.
+//! The affected cache-MISS checks run SEQUENTIALLY inside ONE `AllowDelta` cell
+//! lease materialized at the just-sealed commit. Cache hits are resolved before
+//! admission, so an all-hit cadence acquires no slot. The committing run's
+//! affinity key prefers its warm slot while each check retains its own cache
+//! identity, result, timing, output stream, and provenance.
+//!
+//! The lease takes no per-item snapshot, so the checks share one mutable
+//! checkout and each observes what the checks before it wrote. That is what
+//! makes the write cadence the cadence that FOLDS a formatter's fix back into
+//! the commit that produced it, and it is why submission order is not plan
+//! order: checks declared `fixes: true` are submitted FIRST
+//! ([`fixer_first_submission_order`]), so every other check in the wave already
+//! validates the tree the fix produces. The wave then publishes that fix as one
+//! commit, re-keys its verdicts onto the tree that landed, and re-runs nothing —
+//! each check executes at most once per commit. Only a verdict the fix
+//! demonstrably invalidated ([`verdict_survives_fix`]) is re-verified, in one
+//! bounded batch that never folds again. Fixers run in plan order among
+//! themselves, so an earlier fixer cannot see a later one's rewrite and only the
+//! LAST fixer's own verdict is carried across the fold
+//! ([`fixers_superseded_by_a_later_fixer`]).
 //!
 //! ## Cache key
 //!
@@ -61,24 +74,33 @@
 //! reuse.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-// Isolated checks carry their configured fleet constraints into the immutable request.
-use crate::config::project_settings::{load_checks, CheckCommand, CheckPolicy, CheckWhen};
-use crate::execution::cache::{
-    get_check_result, list_latest_check_results_for_project, store_check_result,
-    CheckResultCacheEntry, CheckResultCacheWrite,
+// Isolated checks carry their configured executor selector into the immutable request.
+use crate::config::project_settings::{
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckWhen, ChecksContract,
 };
-use crate::execution::check_admission::CheckAdmissionController;
+use crate::execution::cache::{
+    claim_check_execution, claim_infra_escalation, get_check_result,
+    get_exact_reusable_check_result, get_reusable_check_observation_id,
+    get_suppressed_check_result, list_latest_passing_check_results_for_job,
+    record_cached_check_observation, record_fresh_check_observation, store_check_result,
+    CachedCheckObservationWrite, CheckExecutionClaim, CheckResultCacheEntry, CheckResultCacheWrite,
+    CheckTestResultRow, FreshCheckObservationWrite,
+};
+use crate::execution::inputs::{
+    any_check_declares_inputs, InputSelector, ResolvedInputs, TreeBlobs, TreeSnapshot,
+};
 use crate::fleet::{
     CellOutcome, CellPriority, CellRequest, CommandResourceIdentity, MutationPolicy,
     PureVerdictBatchItem,
 };
 use crate::mcp::git::GitAuthor;
 use cairn_common::executor_protocol::{
-    PlacementConstraints, ProcessBatchExecution, ProcessBatchItem, RepositoryLocator,
+    CellCommandClass, ExecutorSelector, PlacementMobility, ProcessBatchExecution, ProcessBatchItem,
+    RepositoryLocator, ResourceReservation, ResourceReservationSource,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +120,27 @@ fn slot_check_env(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
     env
 }
 
+/// The commit coordinates one planned check run is bound to.
+///
+/// `evaluated` and `defined_by` are distinct concepts and are recorded
+/// separately: a verdict is only interpretable when you know both which content
+/// was checked and which tree declared the check that produced it. They are the
+/// same commit for every cadence; the write cadence's fix fold is the one
+/// legitimate divergence, where a definition read from the sealed commit is
+/// re-run against the commit the fix produced.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CheckRunCommit<'a> {
+    /// The immutable commit whose content the checks evaluate.
+    pub(crate) evaluated: &'a str,
+    /// The commit whose `.cairn/config.yaml` declared these checks.
+    pub(crate) defined_by: &'a str,
+}
+
+/// Test-only shorthand for a run with no commit coordinate of its own: the tree
+/// identity stands in for both the evaluated and the defining commit. Production
+/// callers name a real commit, because that is what makes a recorded verdict
+/// attributable to a definition.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_planned_checks<F, Fut, N, E>(
     db: Arc<LocalDb>,
@@ -107,7 +150,45 @@ pub(crate) async fn run_planned_checks<F, Fut, N, E>(
     plans: &[(CheckPlan, String)],
     tool_use_id: &str,
     mode: CheckExecMode,
-    admission: &CheckAdmissionController,
+    diagnostic_orch: Option<&Orchestrator>,
+    execute: F,
+    notify: N,
+) -> Vec<CheckOutcome>
+where
+    F: Fn(usize, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<CheckExecResult, E>>,
+    E: Into<CheckExecutionFailure>,
+    N: Fn(Vec<CheckStatusEntry>) + Send + Sync + 'static,
+{
+    run_planned_checks_at_commit(
+        db,
+        project_id,
+        CheckRunCommit {
+            evaluated: tree_hash,
+            defined_by: tree_hash,
+        },
+        tree_hash,
+        job_id,
+        plans,
+        tool_use_id,
+        mode,
+        diagnostic_orch,
+        execute,
+        notify,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_planned_checks_at_commit<F, Fut, N, E>(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    job_id: &str,
+    plans: &[(CheckPlan, String)],
+    tool_use_id: &str,
+    mode: CheckExecMode,
     diagnostic_orch: Option<&Orchestrator>,
     execute: F,
     notify: N,
@@ -121,12 +202,12 @@ where
     run_planned_checks_with_board(
         db,
         project_id,
+        commit,
         tree_hash,
         job_id,
         plans,
         tool_use_id,
         mode,
-        admission,
         diagnostic_orch,
         None,
         execute,
@@ -208,6 +289,7 @@ impl CheckStatusBoard {
 pub struct ManualCheckCacheContext {
     pub project_id: String,
     pub job_id: String,
+    pub commit_sha: String,
     pub tree_hash: String,
     pub input_hash: String,
     cacheable: bool,
@@ -217,71 +299,348 @@ pub struct ManualCheckCacheContext {
 impl ManualCheckCacheContext {
     pub fn require_cacheable(&self) -> Result<(), String> {
         self.cacheable.then_some(()).ok_or_else(|| {
-            "impact-relevant working-copy changes cannot be stored as sealed-tree evidence"
-                .to_string()
+            "the run coordinate cannot be stored as sealed-tree evidence".to_string()
         })
     }
 }
 
-/// Resolve the canonical check-result identity for a manual command launched in
-/// a managed worktree. Impact-relevant loose edits make the request a cache miss;
-/// unrelated dirt may still reuse the sealed tree's evidence.
-pub async fn manual_check_cache_context(
-    orch: &Orchestrator,
-    worktree: &Path,
-    check_name: &str,
-) -> Result<ManualCheckCacheContext, String> {
-    let canonical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-    let mut owner = None;
-    for db in orch.db.all_dbs().await {
-        let needle = canonical.to_string_lossy().to_string();
-        let found = db.read(|conn| Box::pin(async move {
-            let mut rows = conn.query(
-                "SELECT id, project_id FROM jobs WHERE worktree_path = ?1 ORDER BY created_at DESC LIMIT 1",
-                (needle.as_str(),),
-            ).await?;
-            rows.next().await?.map(|row| Ok((row.text(0)?, row.text(1)?))).transpose()
-        })).await.map_err(|e| e.to_string())?;
-        if let Some((job_id, project_id)) = found {
-            owner = Some((db, job_id, project_id));
-            break;
-        }
+fn require_snapshot_command(expected: &str, submitted: &str) -> Result<(), CheckExecutionFailure> {
+    if submitted == expected {
+        Ok(())
+    } else {
+        Err(CheckExecutionFailure::substrate(
+            SubstrateFailureShape::Result,
+            "manual check command diverged from its immutable contract snapshot",
+        ))
     }
-    let (db, job_id, project_id) =
-        owner.ok_or_else(|| "current directory is not a managed Cairn worktree".to_string())?;
-    let checks = load_live_project_checks(orch, &project_id, &canonical)
+}
+
+#[derive(Debug, Clone)]
+struct ManualCheckContractSnapshot {
+    context: ManualCheckCacheContext,
+    repository_path: String,
+    /// The commit whose `.cairn/config.yaml` declared the requested check. An
+    /// explicitly requested branch supplies both the definition and the content,
+    /// so a manual check on one branch can never run another branch's definition.
+    defined_by_commit: String,
+    configured_check: CheckCommand,
+    plan: CheckPlan,
+    timeout_ms: u32,
+    resource_identity_key: String,
+    environment_fingerprint: String,
+}
+
+/// Resolve every mutable input to a manual check exactly once. The returned owned
+/// values are the contract carried through cache lookup, execution, and recording;
+/// callers must not consult the live project config again during this operation.
+async fn resolve_manual_check_contract_snapshot(
+    orch: &Orchestrator,
+    run_id: &str,
+    check_name: &str,
+    branch: Option<&str>,
+) -> Result<ManualCheckContractSnapshot, String> {
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
         .await
-        .ok_or_else(|| "project has no configured checks".to_string())?;
+        .map_err(|error| error.to_string())?;
+    let run_id = run_id.to_string();
+    let (job_id, project_id, repository_path) = db
+        .read(move |conn| {
+            let run_id = run_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT r.job_id, r.project_id, p.repo_path
+                         FROM runs r
+                         JOIN projects p ON p.id = r.project_id
+                         WHERE r.id = ?1 AND r.job_id IS NOT NULL
+                         LIMIT 1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                let row = rows.next().await?.ok_or_else(|| {
+                    crate::storage::DbError::Row(format!(
+                        "run {run_id} has no resolvable job coordinate"
+                    ))
+                })?;
+                Ok((row.text(0)?, row.text(1)?, row.text(2)?))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let repository = PathBuf::from(&repository_path);
+    // Resolve the coordinate FIRST: the requested branch (or the job's logical
+    // head) supplies the content to check AND the definition to check it with.
+    let commit = match branch {
+        Some(branch) => {
+            let store = crate::jj::project_store_dir(&orch.config_dir, &repository);
+            let coordinate_repository = if crate::jj::is_jj_dir(&store) {
+                store
+            } else {
+                repository.clone()
+            };
+            cairn_vcs::resolve_coordinate(&coordinate_repository, branch)
+                .await
+                .map_err(|error| format!("branch {branch:?} is unresolvable: {error}"))?
+        }
+        None => crate::execution::cache::resolve_job_logical_head(orch, &job_id).await?,
+    };
+    let CommitChecksContract {
+        contract: ChecksContract {
+            checks,
+            extra_inputs,
+        },
+        defined_by_commit,
+    } = load_checks_contract_at_commit(&repository, &commit)
+        .await
+        .ok_or_else(|| format!("commit {commit} declares no configured checks"))?;
+    assert_eq!(
+        defined_by_commit, commit,
+        "a manual check must be defined by the commit it evaluates"
+    );
     let check = checks
         .get(check_name)
         .ok_or_else(|| format!("configured check {check_name:?} was not found"))?;
     let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let dirty = crate::jj::working_copy_dirty_paths(&jj, &canonical)?;
-    let relevant_dirty = match check.impact.as_ref() {
-        None => !dirty.is_empty(),
-        Some(globs) => crate::execution::selection::paths_match_impact(globs, &dirty),
+    let tree_hash = crate::jj::logical_tree_hash(&jj, &repository, &commit)?;
+    let entries = crate::jj::tree_entries(&jj, &repository, &commit).ok();
+    let blobs = TreeBlobs {
+        jj: &jj,
+        repository: &repository,
     };
-    let tree_hash = crate::jj::sealed_tree_hash(&jj, &canonical)?;
-    let entries = crate::jj::sealed_tree_entries(&jj, &canonical).ok();
+    let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+    let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
     let input_hash = check_result_key(
         check,
+        inputs.for_check(check_name),
         entries.as_deref(),
         &tree_hash,
         &check_platform_identity(),
         check_toolchain_identity(),
     );
-    let entry = if relevant_dirty {
-        None
-    } else {
-        crate::execution::cache::get_check_result(db, &project_id, check_name, &input_hash)?
-    };
-    Ok(ManualCheckCacheContext {
-        project_id,
-        job_id,
-        tree_hash,
-        input_hash,
-        cacheable: !relevant_dirty,
-        entry,
+    let plan = plan_checks(&checks, &inputs, &[], &repository)
+        .into_iter()
+        .find(|plan| plan.name == check_name)
+        .ok_or_else(|| format!("configured check {check_name:?} could not be planned"))?;
+    if let Some(error) = plan.config_error.as_deref() {
+        return Err(format!(
+            "configured check {check_name:?} is unrunnable: {error}"
+        ));
+    }
+    let configured_check = check.clone();
+    let timeout_ms =
+        resolve_check_timeout_ms(Some(&configured_check), DEFAULT_REVIEW_CHECK_TIMEOUT_MS);
+    let resource_identity_key = check_resource_identity(check_name, &configured_check).key;
+    let environment_fingerprint = plan_environment_fingerprint(&plan);
+    let entry =
+        crate::execution::cache::get_check_result(db, &project_id, check_name, &input_hash)?;
+    Ok(ManualCheckContractSnapshot {
+        context: ManualCheckCacheContext {
+            project_id,
+            job_id,
+            commit_sha: commit,
+            tree_hash,
+            input_hash,
+            cacheable: true,
+            entry,
+        },
+        repository_path,
+        defined_by_commit,
+        configured_check,
+        plan,
+        timeout_ms,
+        resource_identity_key,
+        environment_fingerprint,
+    })
+}
+
+/// Resolve manual check evidence from an authenticated run's durable coordinate.
+/// The logical head is sealed by construction, so process cwd and loose host files
+/// cannot influence cache ownership or the computed tree.
+pub async fn manual_check_cache_context(
+    orch: &Orchestrator,
+    run_id: &str,
+    check_name: &str,
+    branch: Option<&str>,
+) -> Result<ManualCheckCacheContext, String> {
+    Ok(
+        resolve_manual_check_contract_snapshot(orch, run_id, check_name, branch)
+            .await?
+            .context,
+    )
+}
+
+/// Result of a trusted, agent-initiated configured check run.
+///
+/// Every identity in this response was derived by the runner from the authenticated
+/// run coordinate and the project's live checks contract. Callers never supply a
+/// command, content hash, environment fingerprint, or verdict.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualConfiguredCheckResult {
+    pub check_name: String,
+    pub commit_sha: String,
+    pub tree_hash: String,
+    pub input_hash: String,
+    pub environment_fingerprint: String,
+    pub observation_id: String,
+    pub source_observation_id: String,
+    pub disposition: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub cached: bool,
+    pub output_tail: String,
+}
+
+/// Execute one named configured suite at an authenticated agent run's sealed head.
+///
+/// This is the trusted manual producer. It deliberately accepts no raw command or
+/// caller-asserted result metadata: the durable run resolves ownership and commit,
+/// the live project contract supplies the command, and the normal planned-check
+/// path computes identities, performs conservative reuse, executes misses, parses
+/// results, and records immutable observations.
+pub async fn run_manual_configured_check(
+    orch: &Orchestrator,
+    run_id: &str,
+    check_name: &str,
+    branch: Option<&str>,
+) -> Result<ManualConfiguredCheckResult, String> {
+    let contract = resolve_manual_check_contract_snapshot(orch, run_id, check_name, branch).await?;
+    let context = contract.context;
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &context.job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let repository_path = contract.repository_path;
+    let repository = PathBuf::from(&repository_path);
+    let plan = contract.plan;
+    let keyed = vec![(plan.clone(), context.input_hash.clone())];
+    let timeout_ms = contract.timeout_ms;
+    let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repository);
+    let tool_use_id = format!("manual-check:{run_id}:{check_name}");
+    let project_id = context.project_id.clone();
+    let job_id = context.job_id.clone();
+    let commit_sha = context.commit_sha.clone();
+    let command_check = contract.configured_check;
+    let resource_identity_key = contract.resource_identity_key;
+    let environment_fingerprint = contract.environment_fingerprint;
+    let submission_orch = orch.clone();
+    let submission_repo = repository_path.clone();
+    let submission_store = store_dir.clone();
+    let submission_project = project_id.clone();
+    let submission_job = job_id.clone();
+    let submission_commit = commit_sha.clone();
+    let submission_tool = tool_use_id.clone();
+    let submission_input_hash = context.input_hash.clone();
+    let submission_check_name = check_name.to_string();
+    let submission_resource_class = plan.resource_class;
+    let snapshot_command = plan.command.clone();
+    let outcomes = run_planned_checks_at_commit(
+        db.clone(),
+        &project_id,
+        CheckRunCommit {
+            evaluated: &commit_sha,
+            defined_by: &contract.defined_by_commit,
+        },
+        &context.tree_hash,
+        &job_id,
+        &keyed,
+        &tool_use_id,
+        CheckExecMode::Shared,
+        None,
+        move |_index, command, stream_id| {
+            let orch = submission_orch.clone();
+            let repository = submission_repo.clone();
+            let store_dir = submission_store.clone();
+            let project_id = submission_project.clone();
+            let job_id = submission_job.clone();
+            let commit_sha = submission_commit.clone();
+            let tool_use_id = submission_tool.clone();
+            let check = command_check.clone();
+            let resource_identity_key = resource_identity_key.clone();
+            let input_hash = submission_input_hash.clone();
+            let check_name = submission_check_name.clone();
+            let snapshot_command = snapshot_command.clone();
+            async move {
+                require_snapshot_command(&snapshot_command, &command)?;
+                submit_planned_check_batch(
+                    &orch,
+                    PlannedCheckBatchRequest {
+                        project_id: project_id.clone(),
+                        repository,
+                        store_dir,
+                        sealed_commit: commit_sha,
+                        requesting_job_id: job_id.clone(),
+                        owner: cairn_common::executor_protocol::CellOwnerRef {
+                            project_id,
+                            project_key: None,
+                            issue_number: None,
+                            job_id: Some(job_id.clone()),
+                            execution_seq: None,
+                            node_kind: Some("manual-check".to_string()),
+                        },
+                        affinity_key: Some(job_id),
+                        priority: CellPriority::ReviewCheck,
+                        env: Vec::new(),
+                        items: vec![PlannedCheckBatchItem {
+                            index: 0,
+                            name: check_name.clone(),
+                            input_hash,
+                            resource_identity_key,
+                            command,
+                            stream_id,
+                            env: Vec::new(),
+                            timeout_ms,
+                            executor: check.executor.clone(),
+                            resource_class: submission_resource_class,
+                        }],
+                        run_context: None,
+                        mutation_policy: MutationPolicy::PureVerdict,
+                        status_board: None,
+                    },
+                )
+                .await?
+                .results
+                .remove(&0)
+                .ok_or_else(|| {
+                    CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Result,
+                        format!("missing manual batch outcome for {tool_use_id}"),
+                    )
+                })?
+            }
+        },
+        move |_| {},
+    )
+    .await;
+    let outcome = outcomes
+        .into_iter()
+        .next()
+        .ok_or_else(|| "manual configured check produced no outcome".to_string())?;
+    let projection = crate::execution::cache::get_check_result_observation(
+        db,
+        &project_id,
+        &commit_sha,
+        check_name,
+        &environment_fingerprint,
+        crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+        None,
+        None,
+        0,
+        0,
+    )?
+    .ok_or_else(|| "manual configured check outcome was not recorded".to_string())?;
+    Ok(ManualConfiguredCheckResult {
+        check_name: check_name.to_string(),
+        commit_sha,
+        tree_hash: context.tree_hash,
+        input_hash: context.input_hash,
+        environment_fingerprint,
+        observation_id: projection.observation_id.clone(),
+        source_observation_id: projection.observation_id,
+        disposition: projection.disposition,
+        passed: outcome.passed,
+        exit_code: outcome.exit_code,
+        cached: outcome.cached,
+        output_tail: outcome.output_tail,
     })
 }
 
@@ -310,6 +669,121 @@ fn delta_patch_excerpt(repo: &Path, delta: &crate::fleet::MutationDelta) -> Stri
         .unwrap_or_else(|| "(delta patch unavailable)".into())
 }
 
+/// The write cadence's SUBMISSION order: declared fixers first, then every
+/// other check in plan order.
+///
+/// This ordering is the whole mechanism behind the one-execution-per-commit
+/// contract. Write-cadence checks share ONE slot working tree and run
+/// sequentially inside it under `MutationPolicy::AllowDelta`, which takes no
+/// per-item snapshot (`after_item` is wired only for the pure-verdict lane), so
+/// each check observes every write the checks before it made. Running the
+/// declared fixers first therefore makes every later check a verdict on the tree
+/// that will actually land, and the fix folds into the sealed commit without
+/// re-running anything.
+///
+/// Only submission order changes. Plan indices — and with them the status board,
+/// the per-check output streams, and the rendered summary — stay in plan order.
+fn fixer_first_submission_order(
+    keyed: &[(CheckPlan, String)],
+    checks: &HashMap<String, CheckCommand>,
+    indices: &[usize],
+) -> Vec<usize> {
+    let mut ordered = indices.to_vec();
+    ordered.sort_by_key(|index| {
+        let fixes = checks
+            .get(&keyed[*index].0.name)
+            .is_some_and(|check| check.fixes);
+        (!fixes, *index)
+    });
+    ordered
+}
+
+/// Whether a folded fix is fully explained by the declared fixers that ran.
+///
+/// The wave's verdicts describe the post-fix tree only because the fixers ran
+/// first. A fixed path that no declared fixer's INPUT SET covers means some other
+/// check rewrote the tree mid-wave, and whatever ran before it validated a tree
+/// that never landed — so those verdicts cannot be keyed to the landed tree and
+/// must be re-verified. Uncertainty (an uncompilable glob, or no declared fixer
+/// at all) resolves to NOT attributed: that costs one extra verification batch,
+/// never a verdict recorded against a tree it never saw.
+///
+/// The combined delta is the only mutation evidence a folding batch produces —
+/// the executor attributes dirt per item only on the pure-verdict lane, which
+/// reverts after each item and so cannot fold. Attribution therefore rests on
+/// the same declaration the result cache already rests on: an undeclared check
+/// that rewrites paths INSIDE a declared fixer's input set is indistinguishable
+/// from the fixer's own output, and the wave would trust it. Closing that would
+/// take observe-only per-item dirt reporting in the executor (CAIRN-3155);
+/// until then the declared inputs and `fixes` are the trust boundary, as
+/// everywhere else.
+fn fix_is_attributed_to_declared_fixers(paths: &[String], fixers: &[&InputSelector]) -> bool {
+    !fixers.is_empty()
+        && paths
+            .iter()
+            .all(|path| fixers.iter().any(|fixer| fixer.matches(path)))
+}
+
+/// Whether a check's batch verdict still describes the tree a fix landed.
+///
+/// Two independent proofs, either of which suffices:
+///
+/// - the fix left the check's impact-filtered inputs untouched, so its cache key
+///   is unchanged — the same argument the result cache itself rests on; or
+/// - the check ran after every mutation the wave folded. Ordering supplies that:
+///   [`fixer_first_submission_order`] puts the declared fixers first, so a
+///   NON-fixer observes all of them, and the LAST declared fixer observes all
+///   the fixers before it plus its own output.
+///
+/// The last qualifier is the whole reason `superseded_by_later_fixer` exists. A
+/// wave may declare several fixers, and they run in plan order among themselves,
+/// so an EARLIER fixer never sees a later one's output — Prettier passes, then
+/// `eslint --fix` rewrites the same file, and Prettier's green verdict would be
+/// keyed to a tree it never checked. Impact globs cannot separate the two: their
+/// paths overlap by construction, which is exactly why they are both fixers. So
+/// every fixer but the last is re-verified whenever the fold moved its key.
+///
+/// A fixer's own output is not an invalidation of its own verdict: producing
+/// this tree is what it just did, and re-checking it against that is precisely
+/// the redundant second wave this rule exists to delete.
+fn verdict_survives_fix(
+    executed: bool,
+    fix_attributed: bool,
+    superseded_by_later_fixer: bool,
+    key_before: &str,
+    key_after: &str,
+) -> bool {
+    key_before == key_after || (fix_attributed && executed && !superseded_by_later_fixer)
+}
+
+/// The submitted plan indices whose declared fix a LATER declared fixer could
+/// have overwritten — every fixer in the wave except the last one to run.
+///
+/// `order` is the wave's submission order, so the fixers form its prefix and the
+/// last of them is the one that observed all the others. A non-fixer is never
+/// here: it runs after the whole fixer prefix.
+fn fixers_superseded_by_a_later_fixer(
+    keyed: &[(CheckPlan, String)],
+    checks: &HashMap<String, CheckCommand>,
+    order: &[usize],
+) -> BTreeSet<usize> {
+    let submitted_fixers: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|index| {
+            checks
+                .get(&keyed[*index].0.name)
+                .is_some_and(|check| check.fixes)
+        })
+        .collect();
+    submitted_fixers
+        .iter()
+        .rev()
+        .skip(1)
+        .copied()
+        .collect::<BTreeSet<usize>>()
+}
+
 fn split_write_check_batch_outcome(
     outcome: CellOutcome,
     expected: usize,
@@ -322,8 +796,6 @@ fn split_write_check_batch_outcome(
             output,
             metadata,
             mutation_delta,
-            sandbox_denials: _,
-            tracked_modifications: _,
             ..
         } => {
             let decoded = serde_json::from_str::<
@@ -362,46 +834,47 @@ fn split_write_check_batch_outcome(
                 }
                 Ok(items) => batch_failure_results(
                     expected,
-                    format!(
-                        "executor returned {} item outcomes for {expected} checks",
-                        items.len()
+                    CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Result,
+                        format!(
+                            "executor returned {} item outcomes for {expected} checks",
+                            items.len()
+                        ),
                     ),
                 ),
                 Err(error) => batch_failure_results(
                     expected,
-                    format!("decode typed write-check batch outcomes: {error}"),
+                    CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Result,
+                        format!("decode typed write-check batch outcomes: {error}"),
+                    ),
                 ),
             }
         }
+        // The composed failure travels whole: flattening it to text here would
+        // discard the operator half before it ever reaches the log.
         other => {
-            let error = check_result_from_cell_outcome(other, None)
+            let failure = check_result_from_cell_outcome(other, None)
                 .err()
                 .unwrap_or_else(|| {
-                    CheckExecutionFailure::Substrate("write-check batch produced no result".into())
+                    CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Result,
+                        "write-check batch produced no result",
+                    )
                 });
-            let text = match error {
-                CheckExecutionFailure::Process(text) | CheckExecutionFailure::Substrate(text) => {
-                    text
-                }
-            };
-            batch_failure_results(expected, text)
+            batch_failure_results(expected, failure)
         }
     }
 }
 
 fn batch_failure_results(
     expected: usize,
-    error: String,
+    failure: CheckExecutionFailure,
 ) -> (
     Vec<Result<CheckExecResult, CheckExecutionFailure>>,
     Option<crate::fleet::MutationDelta>,
 ) {
-    (
-        (0..expected)
-            .map(|_| Err(CheckExecutionFailure::Substrate(error.clone())))
-            .collect(),
-        None,
-    )
+    ((0..expected).map(|_| Err(failure.clone())).collect(), None)
 }
 
 /// Stable cost identity for a configured check. Unlike [`check_result_key`],
@@ -438,15 +911,15 @@ pub(crate) fn check_resource_identity(name: &str, check: &CheckCommand) -> Comma
         &mut hasher,
         check.timeout.map(|value| value.to_string()).as_deref(),
     );
-    if let Some(constraints) = check.constraints.as_ref() {
-        field(&mut hasher, "constraints");
-        option(&mut hasher, constraints.executor_id.as_deref());
-        option(&mut hasher, constraints.device_id.as_deref());
-        option(&mut hasher, constraints.os.as_deref());
-        option(&mut hasher, constraints.arch.as_deref());
-        strings(&mut hasher, Some(&constraints.required_toolchains));
+    // Where a check runs is part of what its verdict means, so two checks that
+    // differ only in the machine they demand must not share a cost identity.
+    if let Some(selector) = check.executor.as_ref() {
+        field(&mut hasher, "executor");
+        option(&mut hasher, selector.name.as_deref());
+        option(&mut hasher, selector.os.as_deref());
+        strings(&mut hasher, Some(&selector.required_toolchains));
     } else {
-        field(&mut hasher, "no-constraints");
+        field(&mut hasher, "no-executor");
     }
     CommandResourceIdentity {
         version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
@@ -458,44 +931,29 @@ pub(crate) async fn resolve_check_repository(
     orch: &Orchestrator,
     project_id: &str,
     job_id: &str,
-    workspace: &Path,
+    _residence: &Path,
 ) -> Result<(String, std::path::PathBuf), String> {
-    let context = crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
-        orch.db.local.clone(),
-        job_id.to_string(),
-    )
-    .await?
-    .ok_or_else(|| format!("check dispatch job {job_id} has no managed workspace assignment"))?;
-    if context.identity.project_id != project_id {
-        return Err(format!(
-            "check dispatch project mismatch: request names {project_id}, managed workspace names {}",
-            context.identity.project_id
-        ));
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let job_id = job_id.to_string();
+    let (resolved_project, repo_path) = db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(
+                "SELECT j.project_id, p.repo_path FROM jobs j JOIN projects p ON p.id = j.project_id WHERE j.id = ?1",
+                (job_id.as_str(),),
+            ).await?;
+            let row = rows.next().await?.ok_or_else(|| crate::storage::DbError::Row(format!("check job {job_id} was not found")))?;
+            Ok((row.text(0)?, row.text(1)?))
+        })
+    }).await.map_err(|error| error.to_string())?;
+    if resolved_project != project_id {
+        return Err(format!("check dispatch project mismatch: request names {project_id}, job names {resolved_project}"));
     }
-    let store = crate::jj::project_store_dir(&orch.config_dir, &context.identity.project_root);
-    let target = crate::execution::jobs::workspace_identity::resolve_managed_workspace_git_target(
-        &orch.config_dir,
-        &context,
-        &store,
-        "check dispatch",
-    )?;
-    let requested_workspace = std::fs::canonicalize(workspace).map_err(|error| {
-        format!(
-            "canonicalize check dispatch workspace {}: {error}",
-            workspace.display()
-        )
-    })?;
-    if requested_workspace != target.workspace {
-        return Err(format!(
-            "check dispatch workspace mismatch: request resolves to {}, managed assignment resolves to {}",
-            requested_workspace.display(),
-            target.workspace.display()
-        ));
-    }
-    Ok((
-        target.repository.to_string_lossy().into_owned(),
-        target.store_dir,
-    ))
+    let repo = std::path::PathBuf::from(repo_path);
+    let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
+    Ok((repo.to_string_lossy().into_owned(), store))
 }
 
 struct TemporaryCheckRef {
@@ -703,9 +1161,9 @@ async fn cleanup_check_commit_ref(
     temporary_ref.delete_locked()
 }
 
-fn merge_batch_constraints(
+fn merge_batch_executor(
     items: &[PlannedCheckBatchItem],
-) -> Result<Option<PlacementConstraints>, String> {
+) -> Result<Option<ExecutorSelector>, String> {
     fn merge_scalar(
         current: &mut Option<String>,
         incoming: &Option<String>,
@@ -716,7 +1174,7 @@ fn merge_batch_constraints(
         };
         match current {
             Some(current) if current != incoming => Err(format!(
-                "conflicting review check placement constraint {field}: {current:?} vs {incoming:?}"
+                "conflicting review check executor selector {field}: {current:?} vs {incoming:?}"
             )),
             Some(_) => Ok(()),
             None => {
@@ -726,29 +1184,321 @@ fn merge_batch_constraints(
         }
     }
 
-    let mut merged = PlacementConstraints::default();
+    let mut merged = ExecutorSelector::default();
     let mut toolchains = BTreeSet::new();
-    for constraints in items.iter().filter_map(|item| item.constraints.as_ref()) {
-        merge_scalar(
-            &mut merged.executor_id,
-            &constraints.executor_id,
-            "executorId",
-        )?;
-        merge_scalar(&mut merged.device_id, &constraints.device_id, "deviceId")?;
-        merge_scalar(&mut merged.os, &constraints.os, "os")?;
-        merge_scalar(&mut merged.arch, &constraints.arch, "arch")?;
-        toolchains.extend(constraints.required_toolchains.iter().cloned());
+    for selector in items.iter().filter_map(|item| item.executor.as_ref()) {
+        merge_scalar(&mut merged.name, &selector.name, "name")?;
+        merge_scalar(&mut merged.os, &selector.os, "os")?;
+        toolchains.extend(selector.required_toolchains.iter().cloned());
     }
     merged.required_toolchains = toolchains.into_iter().collect();
+    // Two checks in one batch can each be satisfiable while their union is not:
+    // a named machine and a bare platform are different questions, and running
+    // the batch under either alone would place a check somewhere it declined.
+    if merged.name.is_some() && merged.os.is_some() {
+        return Err(
+            "checks batched together declare conflicting executor selectors: one names a machine and another names a platform"
+                .into(),
+        );
+    }
     Ok((!merged.is_empty()).then_some(merged))
 }
+
+pub(crate) struct JobVerdictResult {
+    pub(crate) coordinate: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) output: String,
+    pub(crate) timed_out: bool,
+}
+
+/// Run one command against a job's current runner-owned branch coordinate in a
+/// disposable pure-verdict cell. This is the canonical non-agent command path
+/// for workflow checkpoints: it may lease execution capacity but cannot publish
+/// a delta or become a ref authority.
+pub(crate) async fn execute_job_verdict(
+    orch: &Orchestrator,
+    job_id: &str,
+    name: &str,
+    command: &str,
+) -> Result<JobVerdictResult, String> {
+    use sha2::{Digest, Sha256};
+
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let job_id_owned = job_id.to_string();
+    let (project_id, project_key, branch, repository) = db
+        .read(move |conn| {
+            let job_id = job_id_owned.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT j.project_id, p.key, j.branch, p.repo_path
+                         FROM jobs j
+                         JOIN projects p ON p.id = j.project_id
+                         WHERE j.id = ?1 AND j.branch IS NOT NULL
+                         LIMIT 1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                let row = rows.next().await?.ok_or_else(|| {
+                    crate::storage::DbError::Row(format!(
+                        "checkpoint job {job_id} has no resolvable branch coordinate"
+                    ))
+                })?;
+                Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.text(3)?))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let repository_path = std::path::PathBuf::from(&repository);
+    let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repository_path);
+    let coordinate_repository = if crate::jj::is_jj_dir(&store_dir) {
+        store_dir.clone()
+    } else {
+        repository_path.clone()
+    };
+    let coordinate = cairn_vcs::resolve_coordinate(&coordinate_repository, &branch)
+        .await
+        .map_err(|error| format!("checkpoint branch '{branch}' is unresolvable: {error}"))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(command.as_bytes());
+    let identity = format!("{:x}", hasher.finalize());
+    let fleet = crate::config::settings::load_fleet(&orch.config_dir);
+    let outcome = submit_planned_check_batch(
+        orch,
+        PlannedCheckBatchRequest {
+            project_id: project_id.clone(),
+            repository,
+            store_dir,
+            sealed_commit: coordinate.clone(),
+            requesting_job_id: job_id.to_string(),
+            owner: cairn_common::executor_protocol::CellOwnerRef {
+                project_id,
+                project_key: Some(project_key),
+                issue_number: None,
+                job_id: Some(job_id.to_string()),
+                execution_seq: None,
+                node_kind: Some(name.to_string()),
+            },
+            affinity_key: Some(job_id.to_string()),
+            priority: CellPriority::ReviewCheck,
+            env: vec![("PATH".to_string(), crate::env::get_user_path().to_string())],
+            items: vec![PlannedCheckBatchItem {
+                index: 0,
+                name: name.to_string(),
+                input_hash: coordinate.clone(),
+                resource_identity_key: identity,
+                command: command.to_string(),
+                stream_id: format!("checkpoint:{job_id}"),
+                env: Vec::new(),
+                timeout_ms: fleet
+                    .default_timeout_seconds
+                    .saturating_mul(1_000)
+                    .min(u32::MAX as u64) as u32,
+                executor: None,
+                resource_class: CheckResourceClass::Shared,
+            }],
+            run_context: None,
+            mutation_policy: MutationPolicy::PureVerdict,
+            status_board: None,
+        },
+    )
+    .await?;
+    let result = outcome
+        .results
+        .into_iter()
+        .find_map(|(index, result)| (index == 0).then_some(result))
+        .ok_or_else(|| "checkpoint executor returned no result".to_string())?
+        .map_err(|error| match error {
+            CheckExecutionFailure::Process(error) => error,
+            // The checkpoint's caller is a workflow surface, not an operator
+            // console: it gets the composed half, and the substrate detail is
+            // correlated here by job id and checkpoint name.
+            CheckExecutionFailure::Substrate(failure) => {
+                log::warn!(
+                    "checkpoint check infrastructure failure: {}",
+                    serde_json::json!({
+                        "jobId": job_id,
+                        "checkpoint": name,
+                        "substrateDiagnostic": failure.diagnostic(),
+                    })
+                );
+                failure.agent_message()
+            }
+            // The checkpoint's triple has spent its bounded retries on
+            // infrastructure failures, so Cairn declined to run it. Say that,
+            // rather than reporting a verdict the command never produced.
+            CheckExecutionFailure::Suppressed => suppressed_check_message(
+                crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                "see the operator log for this check's last substrate diagnostic",
+            ),
+        })?;
+    Ok(JobVerdictResult {
+        coordinate,
+        exit_code: result.exit_code,
+        output: result.output,
+        timed_out: result.timed_out,
+    })
+}
+
+/// Reserve one bounded retry for every item about to be launched, dropping the
+/// items whose budget is spent.
+///
+/// This belongs at SUBMISSION because submission is what launches the command.
+/// Both cadences build a batch, hand it to a build cell, and only afterwards
+/// settle the results through the engine — so a decision taken later can discard
+/// a result but cannot prevent the work: the cell has already run, the admission
+/// is already spent, and the triple has already cost another execution. Every
+/// path to a build cell passes through here, which is what makes the bound hold
+/// no matter which cadence arrives first.
+pub(crate) fn reserve_batch_items(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    items: Vec<PlannedCheckBatchItem>,
+) -> (
+    Vec<PlannedCheckBatchItem>,
+    HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>,
+) {
+    let mut admitted = Vec::with_capacity(items.len());
+    let mut refused: HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>> =
+        HashMap::new();
+    for item in items {
+        match claim_check_execution(db.clone(), project_id, &item.name, &item.input_hash) {
+            Ok(CheckExecutionClaim::Suppressed) => {
+                refused.insert(item.index, Err(CheckExecutionFailure::Suppressed));
+            }
+            // Fail open. A reservation that could not be read must not become one
+            // more way for a check to go unmeasured: the bound exists to end a
+            // loop, not to start a different outage.
+            _ => admitted.push(item),
+        }
+    }
+    (admitted, refused)
+}
+
+/// Extra immediate attempts a capacity refusal earns before it is allowed to
+/// become an agent-visible infrastructure result.
+///
+/// A verdictless red check costs an agent a wake, a re-read, and a re-run of the
+/// whole suite, so a momentary contention spike is worth a second and third ask
+/// before it is reported as a failure of anything.
+const CAPACITY_RETRY_ATTEMPTS: usize = 2;
+/// Pause before each retry, so a retry does not simply re-ask a host that is
+/// still finishing whatever displaced it.
+const CAPACITY_RETRY_BACKOFF_MS: [u64; CAPACITY_RETRY_ATTEMPTS] = [2_000, 5_000];
+/// How long a RETRY waits for capacity, regardless of the configured horizon.
+///
+/// The first attempt already waited out the fleet's full horizon, so a retry
+/// that waited another one would turn a bounded retry policy into an unbounded
+/// stall on a genuinely saturated machine. A minute answers the question the
+/// retry is actually asking — did the thing blocking us just clear? — and keeps
+/// the whole policy's added latency bounded by construction.
+const CAPACITY_RETRY_HORIZON_MS: u64 = 60_000;
 
 pub(crate) async fn submit_planned_check_batch(
     orch: &Orchestrator,
     mut batch: PlannedCheckBatchRequest,
 ) -> Result<PlannedCheckBatchOutcome, String> {
+    let (admitted, refused) = reserve_batch_items(
+        orch.db.local.clone(),
+        &batch.project_id,
+        std::mem::take(&mut batch.items),
+    );
+    batch.items = admitted;
+    // Nothing survived the reservation: launch no command and request no cell, so
+    // a fully suppressed suite costs no build-slot admission whatsoever.
+    if batch.items.is_empty() {
+        return Ok(PlannedCheckBatchOutcome {
+            results: refused,
+            request: None,
+            delta: None,
+            store_dir: Some(batch.store_dir.clone()),
+        });
+    }
+    // The reservation above is claimed ONCE and the retries below sit inside it,
+    // so an immediate retry cannot spend the persisted per-check
+    // infrastructure-failure budget. That budget remains the outer circuit
+    // breaker across cadences; this loop is the inner one within a single ask.
+    let mut attempt = 0;
+    let mut outcome = loop {
+        let outcome =
+            submit_reserved_check_batch(orch, batch.clone(), attempt_horizon_ms(attempt)).await?;
+        let CapacityRetry::Again { backoff } = capacity_retry_decision(attempt, &outcome) else {
+            break outcome;
+        };
+        log::info!(
+            "check batch [{}] found no capacity; retrying ({} of {CAPACITY_RETRY_ATTEMPTS})",
+            batch
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            attempt + 1,
+        );
+        // Cancellation stops this immediately: the caller holds this future, and
+        // a resolved issue or an ended wave drops it mid-sleep rather than
+        // waiting out a retry nobody wants any more.
+        tokio::time::sleep(backoff).await;
+        attempt += 1;
+    };
+    outcome.results.extend(refused);
+    Ok(outcome)
+}
+
+/// The horizon an attempt waits on: the fleet's configured one first (`None`),
+/// a short bounded one for every retry.
+fn attempt_horizon_ms(attempt: usize) -> Option<u64> {
+    (attempt > 0).then_some(CAPACITY_RETRY_HORIZON_MS)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CapacityRetry {
+    /// Present the same request again after this pause.
+    Again { backoff: std::time::Duration },
+    /// Let the outcome stand as the batch's answer.
+    Surface,
+}
+
+/// Whether to present this batch again, from the outcome it just got.
+///
+/// Two conditions, both required. The bound must not be spent — the retries are
+/// an inner circuit breaker within one ask, and the persisted per-check
+/// infrastructure-failure bound remains the outer one across cadences. And the
+/// refusal must be WHOLLY transient: a batch may split across machines, so a
+/// partial outcome means some of it already ran, and re-presenting the whole
+/// request would spend the machine twice for an answer it already has. A
+/// structural refusal (no matching machine, a toolchain fault, a draining host),
+/// a cancellation, a storage failure, and anything that happened after the
+/// command ran are all re-presented unchanged, so none of them retry.
+fn capacity_retry_decision(attempt: usize, outcome: &PlannedCheckBatchOutcome) -> CapacityRetry {
+    let wholly_transient = !outcome.results.is_empty()
+        && outcome.results.values().all(|result| {
+            matches!(
+                result,
+                Err(CheckExecutionFailure::Substrate(failure)) if failure.shape().is_transient()
+            )
+        });
+    match CAPACITY_RETRY_BACKOFF_MS.get(attempt) {
+        Some(backoff) if wholly_transient => CapacityRetry::Again {
+            backoff: std::time::Duration::from_millis(*backoff),
+        },
+        _ => CapacityRetry::Surface,
+    }
+}
+
+async fn submit_reserved_check_batch(
+    orch: &Orchestrator,
+    mut batch: PlannedCheckBatchRequest,
+    wait_horizon_ms: Option<u64>,
+) -> Result<PlannedCheckBatchOutcome, String> {
     if batch.mutation_policy == MutationPolicy::PureVerdict {
-        let mut groups = partition_check_items_by_constraints(std::mem::take(&mut batch.items));
+        let mut groups = partition_check_items_by_executor(std::mem::take(&mut batch.items));
         if groups.len() > 1 {
             let mut combined = PlannedCheckBatchOutcome {
                 results: HashMap::new(),
@@ -763,6 +1513,7 @@ pub(crate) async fn submit_planned_check_batch(
                         items,
                         ..batch.clone()
                     },
+                    wait_horizon_ms,
                 )
                 .await?;
                 combined.results.extend(outcome.results);
@@ -771,22 +1522,47 @@ pub(crate) async fn submit_planned_check_batch(
         }
         batch.items = groups.pop().map(|(_, items)| items).unwrap_or_default();
     }
-    submit_single_planned_check_batch(orch, batch).await
+    submit_single_planned_check_batch(orch, batch, wait_horizon_ms).await
 }
 
-fn partition_check_items_by_constraints(
+/// Whether a planned check batch is free for placement policy to move.
+///
+/// A pure-verdict batch is the one request class that genuinely is. It is
+/// disposable, it publishes a verdict rather than a mutation, and its tree is
+/// materialized from managed objects wherever it lands, so nothing about it is
+/// tied to the runner's own machine. A write-cadence batch is the opposite on
+/// every count: it mutates one shared working tree that later checks in the same
+/// batch observe, and its delta has to come back.
+///
+/// Stated from the mutation policy, never inferred from the absence of a
+/// selector. A group that named a platform is just as mobile within that
+/// platform as an unconstrained one is across the fleet, and an agent's
+/// untargeted `run` batch is not mobile at all -- which is why the two facts are
+/// separate fields.
+///
+/// A batch that needs the runner's ignored project content is pinned back to the
+/// colocated executor by `fleet::require_colocated_population`, which overrides
+/// this and is the hard boundary rather than a preference.
+fn batch_placement_mobility(policy: &MutationPolicy) -> PlacementMobility {
+    match policy {
+        MutationPolicy::PureVerdict => PlacementMobility::SpillEligible,
+        MutationPolicy::AllowDelta => PlacementMobility::PinnedOrColocated,
+    }
+}
+
+fn partition_check_items_by_executor(
     items: Vec<PlannedCheckBatchItem>,
-) -> Vec<(Option<PlacementConstraints>, Vec<PlannedCheckBatchItem>)> {
-    let mut groups: Vec<(Option<PlacementConstraints>, Vec<PlannedCheckBatchItem>)> = Vec::new();
+) -> Vec<(Option<ExecutorSelector>, Vec<PlannedCheckBatchItem>)> {
+    let mut groups: Vec<(Option<ExecutorSelector>, Vec<PlannedCheckBatchItem>)> = Vec::new();
     for item in items {
-        let constraints = item.constraints.clone().filter(|value| !value.is_empty());
+        let selector = item.executor.clone().filter(|value| !value.is_empty());
         if let Some((_, items)) = groups
             .iter_mut()
-            .find(|(candidate, _)| candidate == &constraints)
+            .find(|(candidate, _)| candidate == &selector)
         {
             items.push(item);
         } else {
-            groups.push((constraints, vec![item]));
+            groups.push((selector, vec![item]));
         }
     }
     groups
@@ -795,16 +1571,18 @@ fn partition_check_items_by_constraints(
 async fn submit_single_planned_check_batch(
     orch: &Orchestrator,
     batch: PlannedCheckBatchRequest,
+    wait_horizon_ms: Option<u64>,
 ) -> Result<PlannedCheckBatchOutcome, String> {
     // Configuration conflicts are deterministic caller errors and must surface
     // before any transient infrastructure preflight can obscure them.
-    let constraints = merge_batch_constraints(&batch.items)?;
+    let executor = merge_batch_executor(&batch.items)?;
     if let Some(failure) =
         active_build_service_failure(&orch.build_service_diagnostic_snapshot("sccache"))
     {
         return Ok(PlannedCheckBatchOutcome::failed(
             batch.items.iter().map(|item| item.index).collect(),
-            failure,
+            SubstrateFailure::new(SubstrateFailureShape::Dispatch, failure)
+                .implicating_build_service(),
         ));
     }
     let timeout_ms = batch
@@ -827,7 +1605,7 @@ async fn submit_single_planned_check_batch(
         Err(error) => {
             return Ok(PlannedCheckBatchOutcome::failed(
                 batch.items.iter().map(|item| item.index).collect(),
-                error,
+                SubstrateFailure::new(SubstrateFailureShape::Dispatch, error),
             ))
         }
     };
@@ -847,23 +1625,32 @@ async fn submit_single_planned_check_batch(
             absolute_path: batch.repository,
         },
         base_commit: batch.sealed_commit,
-        command_class: cairn_common::executor_protocol::CellCommandClass::classify(&command),
+        command_class: batch_command_class(&batch.items),
         command,
         owner: Some(batch.owner.clone()),
         cwd: String::new(),
         env: batch.env,
         priority: batch.priority,
-        deadline_unix_ms: unix_time_ms_for_checks()
-            + fleet_config
-                .acquisition_deadline_seconds
-                .saturating_mul(1_000),
+        // A check yields to interactive work by priority and then waits its
+        // turn. Past the machine-wide horizon the machine is genuinely saturated
+        // and "no room for a check right now" is honest, and the cadence that
+        // planned this check will plan it again. Every attempt gets a horizon
+        // derived from NOW, so a retry re-enters admission with a live wait
+        // rather than one that already expired.
+        wait_horizon_unix_ms: wait_horizon_ms.map_or_else(
+            || crate::fleet::default_wait_horizon_unix_ms(&fleet_config),
+            |window| unix_time_ms_for_checks().saturating_add(window),
+        ),
+        waiting_since_unix_ms: unix_time_ms_for_checks(),
         timeout_ms,
-        mutation_policy: batch.mutation_policy,
+        mutation_policy: batch.mutation_policy.clone(),
         requesting_job_id: Some(batch.requesting_job_id),
         affinity_key: batch.affinity_key,
-        constraints,
+        executor,
+        pinned_executor_id: None,
+        placement_mobility: batch_placement_mobility(&batch.mutation_policy),
         command_resource_identity: None,
-        resource_reservation: Default::default(),
+        resource_reservation: declared_batch_reservation(&batch.items),
         learned_estimate: None,
     };
     let indexed: Vec<_> = batch.items.iter().map(|item| item.index).collect();
@@ -917,7 +1704,10 @@ async fn submit_single_planned_check_batch(
         if let Err(error) =
             cleanup_check_commit_ref(orch, &batch.store_dir, &mut temporary_ref).await
         {
-            return Ok(PlannedCheckBatchOutcome::failed(indexed, error));
+            return Ok(PlannedCheckBatchOutcome::failed(
+                indexed,
+                SubstrateFailure::new(SubstrateFailureShape::Result, error),
+            ));
         }
         return Ok(PlannedCheckBatchOutcome {
             results,
@@ -927,7 +1717,10 @@ async fn submit_single_planned_check_batch(
         });
     };
     if let Err(error) = cleanup_check_commit_ref(orch, &batch.store_dir, &mut temporary_ref).await {
-        return Ok(PlannedCheckBatchOutcome::failed(indexed, error));
+        return Ok(PlannedCheckBatchOutcome::failed(
+            indexed,
+            SubstrateFailure::new(SubstrateFailureShape::Result, error),
+        ));
     }
     let results = indexed
         .into_iter()
@@ -960,7 +1753,92 @@ pub(crate) struct PlannedCheckBatchItem {
     pub stream_id: String,
     pub env: Vec<(String, String)>,
     pub timeout_ms: u32,
-    pub constraints: Option<PlacementConstraints>,
+    pub executor: Option<ExecutorSelector>,
+    /// The project's declaration of whether this check can co-run with others.
+    /// Carried onto the submission so the scheduler's budget sees an exclusive
+    /// lane as the whole-machine work it is.
+    pub resource_class: CheckResourceClass,
+}
+
+/// What a check batch's cell will actually fan out to.
+///
+/// This is DEMAND, not enforcement. The check system is the only party that
+/// knows what it is asking for; capping an admitted cell's internal parallelism
+/// and yielding to interactive work belong to the executor (CAIRN-3248). A batch
+/// that declares honestly cannot overrun a budget by itself — it just lets the
+/// scheduler plan against the work rather than against the request count.
+///
+/// Concurrency is STATED by the project, never inferred from the command text.
+/// A tool that parallelizes internally — cargo across the crate graph, vitest
+/// across workers, a bundler across modules — uses the cores that happen to be
+/// free when it runs; it does not require them. Charging that opportunistic
+/// parallelism as an admission reservation makes every ordinary build claim the
+/// whole host, which is exactly how a 16-core machine came to report `17 of 16`
+/// concurrency units reserved at ~31% utilization while five-second checks died
+/// at their acquisition deadlines (CAIRN-3345). Only
+/// [`CheckResourceClass::Exclusive`] — the project's own statement that a check
+/// needs a quiet machine — reserves the whole executor.
+///
+/// The command still classifies the work ([`batch_command_class`]) for the
+/// per-class memory, disk, and duration profiles, which is a different question:
+/// how much a run costs, not how many lanes it must be handed.
+///
+/// Memory and disk are deliberately left at zero: those are learned per command
+/// identity from observed runs, and a declaration here would suppress a better
+/// estimate than any submitter could write down.
+pub(crate) fn declared_check_reservation(
+    resource_class: CheckResourceClass,
+) -> ResourceReservation {
+    ResourceReservation {
+        memory_bytes: 0,
+        disk_growth_bytes: 0,
+        concurrency_units: match resource_class {
+            CheckResourceClass::Exclusive => ResourceReservation::WHOLE_MACHINE_CONCURRENCY,
+            CheckResourceClass::Shared => 1,
+        },
+        source: ResourceReservationSource::Declared,
+    }
+}
+
+/// Demand for a batch that runs several checks in one cell: as heavy as the
+/// heaviest DECLARED class among its items, since they share the cell.
+pub(crate) fn declared_batch_reservation(items: &[PlannedCheckBatchItem]) -> ResourceReservation {
+    let heaviest = items.iter().map(|item| item.resource_class).fold(
+        CheckResourceClass::Shared,
+        |heaviest, class| match (heaviest, class) {
+            (CheckResourceClass::Exclusive, _) | (_, CheckResourceClass::Exclusive) => {
+                CheckResourceClass::Exclusive
+            }
+            _ => CheckResourceClass::Shared,
+        },
+    );
+    declared_check_reservation(heaviest)
+}
+
+/// The command class of a batch: the heaviest class among its items.
+///
+/// A batch runs every item in one cell, so the cell is as heavy as the heaviest
+/// thing in it. This used to classify the batch's DISPLAY string — a join of
+/// check *names* like `rust-lint · rust-full` — which matches none of the
+/// command patterns, so every batch reported `other` and the learned resource
+/// profiles keyed off a class that never described the work.
+pub(crate) fn batch_command_class(items: &[PlannedCheckBatchItem]) -> CellCommandClass {
+    fn weight(class: CellCommandClass) -> u8 {
+        match class {
+            CellCommandClass::Other => 0,
+            CellCommandClass::Typecheck => 1,
+            CellCommandClass::Vitest => 2,
+            CellCommandClass::Build => 3,
+            CellCommandClass::CargoCheck => 4,
+            CellCommandClass::CargoClippy => 5,
+            CellCommandClass::CargoTest => 6,
+        }
+    }
+    items
+        .iter()
+        .map(|item| CellCommandClass::classify(&item.command))
+        .max_by_key(|class| weight(*class))
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -988,16 +1866,14 @@ pub(crate) struct PlannedCheckBatchOutcome {
 }
 
 impl PlannedCheckBatchOutcome {
-    fn failed(indices: Vec<usize>, error: String) -> Self {
+    fn failed(indices: Vec<usize>, failure: SubstrateFailure) -> Self {
         Self {
             results: indices
                 .into_iter()
                 .map(|index| {
                     (
                         index,
-                        Err(CheckExecutionFailure::Substrate(format!(
-                            "Cairn check infrastructure failure: {error}"
-                        ))),
+                        Err(CheckExecutionFailure::Substrate(failure.clone())),
                     )
                 })
                 .collect(),
@@ -1008,10 +1884,266 @@ impl PlannedCheckBatchOutcome {
     }
 }
 
+/// What Cairn's own machinery failed to do, in the only terms an agent can act
+/// on. Every arm answers one question — why is there no verdict? — without
+/// naming a slot, a cell, a scratch path, or an executor outcome variant. Those
+/// coordinates are real and they matter, but they address a substrate the agent
+/// has no standing inside: the operator log is where they belong.
+/// The no-start conditions an agent can meet, kept apart because they call for
+/// different responses. "It did not start" is not one condition: a machine that
+/// is momentarily full will take the same check in a minute, a fleet with no
+/// machine for its toolchain never will, and work whose own environment was torn
+/// down is not a fault at all. Collapsing them into one lead sentence forced
+/// every reader to the operator log to learn which had happened (CAIRN-3345).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubstrateFailureShape {
+    /// Cairn never got the check started, for a reason that is Cairn's own.
+    Dispatch,
+    /// Execution capacity never became available before the deadline. The one
+    /// condition time alone relieves, and so the only one worth retrying.
+    Capacity,
+    /// Contact with the machine that would have run the check was lost.
+    MachineUnreachable,
+    /// The machine is being taken out of service and accepts no new work.
+    Draining,
+    /// Nothing in the fleet matches what this check requires.
+    NoMachine,
+    /// A working environment for the check could not be prepared.
+    Preparation,
+    /// The command ran, but Cairn could not obtain or record its result.
+    Result,
+    /// Cairn's own storage for the check failed.
+    Storage,
+    /// Cairn cancelled the check before it produced a verdict.
+    Cancelled,
+}
+
+impl SubstrateFailureShape {
+    fn lead(self) -> &'static str {
+        match self {
+            Self::Dispatch => "Cairn could not start this check.",
+            Self::Capacity => {
+                "Cairn could not obtain the capacity to run this check before its deadline."
+            }
+            Self::MachineUnreachable => {
+                "Cairn lost contact with the machine that would have run this check."
+            }
+            Self::Draining => {
+                "The machine that runs checks is being taken out of service, so this check did not start."
+            }
+            Self::NoMachine => {
+                "No machine available to Cairn can run this check's platform or toolchain."
+            }
+            Self::Preparation => {
+                "Cairn could not prepare a working environment for this check."
+            }
+            Self::Result => "This check ran, but Cairn could not record its result.",
+            Self::Storage => "Cairn's own storage for this check failed.",
+            Self::Cancelled => "Cairn cancelled this check before it produced a verdict.",
+        }
+    }
+
+    /// Whether presenting this work again could plausibly change the answer.
+    ///
+    /// Exactly one condition qualifies: capacity is relieved by time passing and
+    /// nothing else here is. A structural refusal (no matching machine, a
+    /// toolchain fault, a draining host), a cancellation, and anything that
+    /// happened after the command ran are all re-presented unchanged, so
+    /// retrying them would only spend the machine twice for the same answer.
+    fn is_transient(self) -> bool {
+        matches!(self, Self::Capacity)
+    }
+}
+
+/// The condition class behind an executor's refusal to start a cell.
+///
+/// Exhaustive over [`CellUnavailableReason`] on purpose: a new reason cannot be
+/// added upstream without landing here, which is what keeps a novel refusal from
+/// silently arriving at an agent as the generic "could not start this check".
+/// The sibling classifier in [`crate::fleet::placement`] answers a different
+/// question about the same input — whether the fleet should keep waiting — and
+/// the two are deliberately separate: what the fleet does next and what the
+/// agent is told are not the same decision.
+fn no_start_shape(
+    reason: &cairn_common::executor_protocol::CellUnavailableReason,
+) -> SubstrateFailureShape {
+    use cairn_common::executor_protocol::{AdmissionRejectionReason, CellUnavailableReason};
+    match reason {
+        CellUnavailableReason::Deadline {
+            host_pressure,
+            substrate,
+        } => deadline_shape(host_pressure.as_ref(), substrate.as_ref()),
+        CellUnavailableReason::AdmissionRejected { reason } => match reason {
+            AdmissionRejectionReason::QueueFull => SubstrateFailureShape::Capacity,
+            AdmissionRejectionReason::Draining => SubstrateFailureShape::Draining,
+            AdmissionRejectionReason::StorageCleanupFailed => SubstrateFailureShape::Storage,
+            // A reservation larger than the machine's whole budget is not a
+            // wait: no amount of idling makes the host bigger.
+            AdmissionRejectionReason::RequestTooLarge => SubstrateFailureShape::NoMachine,
+        },
+        CellUnavailableReason::ExecutorUnavailable => SubstrateFailureShape::MachineUnreachable,
+        CellUnavailableReason::NoMatchingExecutor => SubstrateFailureShape::NoMachine,
+        CellUnavailableReason::Provisioning
+        | CellUnavailableReason::Checkout
+        | CellUnavailableReason::Preparation => SubstrateFailureShape::Preparation,
+        // The environment was ready and the command still could not be launched,
+        // which is Cairn's own machinery failing rather than the machine's state.
+        CellUnavailableReason::Spawn | CellUnavailableReason::ObjectInfrastructure(_) => {
+            SubstrateFailureShape::Dispatch
+        }
+    }
+}
+
+/// What an elapsed acquisition deadline actually says happened.
+///
+/// A deadline is not a condition of its own: it is the moment a wait ended, and
+/// what the wait was ON is in the executor's evidence. `CapacityBusy` behind a
+/// queue is a machine doing its job; `ConnectedStalled`, a draining host, a disk
+/// below its floor, or no evidence at all are machines that were never going to
+/// get to this request. Telling an agent "could not obtain capacity" for the
+/// second group — and, worse, asking twice more before saying it — is the
+/// condition-class collapse this whole mapping exists to remove.
+///
+/// The wait/refuse split itself is NOT re-decided here: it is
+/// [`crate::fleet::placement`]'s, read through the same two predicates that
+/// module uses, so retry eligibility here and the fleet's own waiting decision
+/// cannot drift apart. This function only names which condition a refusal was.
+fn deadline_shape(
+    host_pressure: Option<&cairn_common::executor_protocol::HostPressureEvidence>,
+    substrate: Option<&cairn_common::executor_protocol::ExecutorSubstrateEvidence>,
+) -> SubstrateFailureShape {
+    use crate::fleet::placement::{pressure_relieves_itself, substrate_is_working};
+    use cairn_common::executor_protocol::HostPressureCondition;
+    let working = substrate.is_some_and(|evidence| substrate_is_working(evidence.state));
+    let relieving = host_pressure.is_some_and(pressure_relieves_itself);
+    if working || relieving {
+        return SubstrateFailureShape::Capacity;
+    }
+    // The executor's own statement about itself outranks inferred pressure.
+    if let Some(evidence) = substrate {
+        return stalled_substrate_shape(evidence.state);
+    }
+    match host_pressure {
+        // Disk below its floor is the one hold nothing running will relieve: the
+        // bytes come back from an operator, not from the queue draining.
+        Some(evidence)
+            if evidence
+                .conditions
+                .iter()
+                .any(|condition| matches!(condition, HostPressureCondition::DiskFree { .. })) =>
+        {
+            SubstrateFailureShape::Storage
+        }
+        // Silence. The machine said nothing about why the wait ended, which is
+        // the same reading placement takes: one that stopped answering.
+        _ => SubstrateFailureShape::MachineUnreachable,
+    }
+}
+
+/// The condition a substrate state describes when it is not one the fleet waits
+/// on. Exhaustive so a new executor state must be decided here rather than
+/// inheriting whichever answer happens to be nearest.
+fn stalled_substrate_shape(
+    state: cairn_common::executor_protocol::ExecutorSubstrateState,
+) -> SubstrateFailureShape {
+    use cairn_common::executor_protocol::ExecutorSubstrateState as State;
+    match state {
+        // Refusing new work on purpose, usually on its way out.
+        State::Draining => SubstrateFailureShape::Draining,
+        // Connected and no longer reporting: the machine stopped answering.
+        State::ConnectedStalled => SubstrateFailureShape::MachineUnreachable,
+        // Running work already admitted, and every state the fleet counts as the
+        // machine working. Those were answered as capacity above; naming them
+        // keeps this match total.
+        State::ExecutionRunning
+        | State::SupervisorSpawning
+        | State::SupervisorRespawning
+        | State::ProtocolAttaching
+        | State::InitialStorageSweep
+        | State::StorageAccounting
+        | State::DispatchPreparing
+        | State::SlotAdoption
+        | State::CapacityBusy => SubstrateFailureShape::Capacity,
+    }
+}
+
+/// The closing half of every agent-facing infrastructure message: what the
+/// failure means for the agent's own work, and where the rest of the story
+/// lives. "Runs again" is a fact rather than a hope — an infrastructure verdict
+/// is never reusable from the result cache, so the next cadence re-executes the
+/// check (see [`crate::execution::cache::get_check_result`]).
+const SUBSTRATE_FAILURE_CONSEQUENCE: &str = "This is a failure inside Cairn, not a result about your change: no verdict was recorded, and the check runs again the next time checks run. The full diagnostic is in Cairn's operator log.";
+
+/// A check-infrastructure failure, composed into its two audiences at the seam
+/// where an executor outcome becomes a check verdict.
+///
+/// The agent-facing half is authored here, at the source, rather than scrubbed
+/// downstream: [`Self::agent_message`] is plain language an agent can act on.
+/// [`Self::diagnostic`] keeps the substrate detail — outcome variants,
+/// slot-absolute paths, queue evidence — and goes only to the operator log,
+/// whose record already carries the check name, job id, and suite id that
+/// correlate it back to the agent's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubstrateFailure {
+    shape: SubstrateFailureShape,
+    diagnostic: String,
+    build_service_implicated: bool,
+}
+
+impl SubstrateFailure {
+    pub(crate) fn new(shape: SubstrateFailureShape, diagnostic: impl Into<String>) -> Self {
+        Self {
+            shape,
+            diagnostic: diagnostic.into(),
+            build_service_implicated: false,
+        }
+    }
+
+    /// Mark this failure as one the shared build-cache service caused, so its
+    /// verdict may carry the service's advisory. Applicability is a property of
+    /// the failure, established where the failure is composed — never inferred
+    /// downstream from whether the daemon happens to be sick at the time.
+    pub(crate) fn implicating_build_service(mut self) -> Self {
+        self.build_service_implicated = true;
+        self
+    }
+
+    pub(crate) fn build_service_implicated(&self) -> bool {
+        self.build_service_implicated
+    }
+
+    /// The authored text an agent reads in place of the substrate diagnostic.
+    pub(crate) fn agent_message(&self) -> String {
+        format!("{} {SUBSTRATE_FAILURE_CONSEQUENCE}", self.shape.lead())
+    }
+
+    /// The substrate diagnostic. Operator log only.
+    pub(crate) fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+
+    /// The condition class this failure preserves.
+    pub(crate) fn shape(&self) -> SubstrateFailureShape {
+        self.shape
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckExecutionFailure {
+    /// The check's own process failed — output the agent owns and can act on.
     Process(String),
-    Substrate(String),
+    /// Cairn's machinery failed before, around, or after the check.
+    Substrate(SubstrateFailure),
+    /// Submission declined to launch this command at all: the triple's bounded
+    /// retries are spent. This is not a failure of anything — nothing ran — and
+    /// it must never be classified, stored, or counted as one.
+    Suppressed,
+}
+
+impl CheckExecutionFailure {
+    pub(crate) fn substrate(shape: SubstrateFailureShape, diagnostic: impl Into<String>) -> Self {
+        Self::Substrate(SubstrateFailure::new(shape, diagnostic))
+    }
 }
 
 impl From<String> for CheckExecutionFailure {
@@ -1143,7 +2275,12 @@ struct FailureClassification {
     evidence_line: Option<usize>,
 }
 
+/// Name the way a failing check DIED when the death is not an ordinary test
+/// failure, so a red verdict never sends an agent hunting for a test that never
+/// failed. `None` means "this is an ordinary failure": the parsed failures and
+/// the exit code already explain it.
 fn classify_check_failure(
+    command: &str,
     exit_code: Option<i32>,
     timed_out: bool,
     spawn_error: bool,
@@ -1174,7 +2311,9 @@ fn classify_check_failure(
             evidence_line: None,
         });
     }
-    if parsed.is_some_and(|result| result.failed > 0) {
+    // Named failure sites — failing assertions, or files that failed to collect
+    // — are an ordinary failure the detail path already renders.
+    if parsed.is_some_and(|result| result.failed > 0 || result.suite_failures > 0) {
         return None;
     }
 
@@ -1218,8 +2357,16 @@ fn classify_check_failure(
         });
     }
 
-    if let Some(result) = parsed.filter(|result| result.parser == "vitest" && result.failed == 0) {
-        let reason = if result.passed == 0 {
+    if let Some(result) = parsed.filter(|result| result.parser == "vitest") {
+        // Vitest exited nonzero having reported neither a failing test nor a
+        // failing suite. The dominant cause is an error that escaped a test file
+        // asynchronously: Vitest fails the run over it but attributes it to no
+        // test, and its JSON `success` stays true. Point at that line so the tail
+        // excerpt carries the stack rather than trailing render noise.
+        let unhandled = lines
+            .iter()
+            .position(|line| line.to_ascii_lowercase().contains("unhandled error"));
+        let mut reason = if result.passed == 0 {
             "Cairn: Vitest failed before reporting any test assertions".to_string()
         } else {
             format!(
@@ -1227,9 +2374,28 @@ fn classify_check_failure(
                 result.passed
             )
         };
+        if unhandled.is_some() {
+            reason.push_str(
+                " \u{2014} an error escaped a test file after it finished; Vitest fails the run \
+                 without attributing it to any test",
+            );
+        }
         return Some(FailureClassification {
             kind: CheckFailureKind::RunnerError,
             reason,
+            evidence_line: unhandled,
+        });
+    }
+
+    // A Vitest command that exited nonzero having emitted no report at all never
+    // reached a test: its config or its dependencies failed to load. Without this
+    // arm the verdict is a bare `exit 1` beside a tail of resolver noise.
+    if parsed.is_none() && crate::execution::check_parsers::is_vitest_command(command) {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::RunnerError,
+            reason: "Cairn: Vitest exited without producing a report \u{2014} the run failed \
+                     before collecting any test file"
+                .to_string(),
             evidence_line: None,
         });
     }
@@ -1278,8 +2444,59 @@ fn classified_output_excerpt(
 /// cancels exactly its suite. A sub-agent/task that commits into the builder's
 /// inherited worktree under a *different* job id would not hit the builder's
 /// suite; that edge case is deliberately left as-is.
-pub(crate) fn cancel_stale_review_on_branch_advance(orch: &Orchestrator, job_id: &str) {
-    orch.cancel_turn_end_checks(job_id);
+pub(crate) async fn cancel_stale_review_on_branch_advance(orch: &Orchestrator, job_id: &str) {
+    for stale in jobs_sharing_branch(&orch.db.local, job_id).await {
+        orch.cancel_turn_end_checks(&stale);
+    }
+}
+
+/// Every job whose in-flight review suite a commit on `job_id`'s branch
+/// invalidates: `job_id` itself, plus any other job sharing that branch.
+///
+/// Suites are registered per job, but a wave's inputs are a BRANCH's sealed
+/// tree. A sub-agent or task commits into the branch under its own job id, so
+/// keying the cancellation to the committing job alone left the node's suite
+/// running against a tree that no longer existed — the wave still burned a full
+/// exclusive lane, and its verdicts were discarded on arrival because they were
+/// keyed to the superseded tree. Jobs that share a branch share a tree, so a
+/// commit supersedes all of their waves at once.
+///
+/// Scoped to the owner's project, because a branch name identifies a tree only
+/// within one repository. Names like `main` recur across projects, and generated
+/// names are only unique per project, so matching on the name alone would let a
+/// commit in one project cancel live review suites in an unrelated one whose
+/// tree it never touched.
+///
+/// Always yields `job_id`, so a job with no recorded branch (or an unreadable
+/// row) still cancels its own suite exactly as before.
+async fn jobs_sharing_branch(db: &LocalDb, job_id: &str) -> Vec<String> {
+    let owner = job_id.to_string();
+    let siblings = db
+        .read(|conn| {
+            let owner = owner.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM jobs
+                         WHERE branch IS NOT NULL
+                           AND branch <> ''
+                           AND branch = (SELECT branch FROM jobs WHERE id = ?1)
+                           AND project_id = (SELECT project_id FROM jobs WHERE id = ?1)",
+                        (owner.as_str(),),
+                    )
+                    .await?;
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    ids.push(row.text(0)?);
+                }
+                Ok(ids)
+            })
+        })
+        .await
+        .unwrap_or_default();
+    let mut jobs = vec![job_id.to_string()];
+    jobs.extend(siblings.into_iter().filter(|id| id != job_id));
+    jobs
 }
 
 /// Run the affected `when:write` checks after a source-touching commit has been
@@ -1298,7 +2515,7 @@ pub(crate) async fn run_write_checks_after_seal(
     tool_use_id: &str,
 ) -> Option<String> {
     let _guard = run_context.map(|context| WriteChecksInFlightGuard::new(orch, &context.job_id));
-    run_write_checks_after_seal_inner(orch, run_context, cwd, tool_use_id, true).await
+    run_write_checks_after_seal_inner(orch, run_context, cwd, tool_use_id).await
 }
 
 struct WriteChecksInFlightGuard<'a> {
@@ -1335,31 +2552,29 @@ async fn run_write_checks_after_seal_inner(
     run_context: Option<&RunContext>,
     cwd: &str,
     tool_use_id: &str,
-    may_fold: bool,
 ) -> Option<String> {
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
     let run_context = run_context?;
-    let repo_root = Path::new(cwd);
+    let owning_db = crate::execution::routing::owning_db_for_job(&orch.db, &run_context.job_id)
+        .await
+        .ok()?;
+    let job_id = run_context.job_id.clone();
+    let repo_path = owning_db
+        .query_text(
+            "SELECT p.repo_path FROM jobs j JOIN projects p ON p.id = j.project_id WHERE j.id = ?1",
+            (job_id,),
+        )
+        .await
+        .ok()??;
+    let project_path = std::path::PathBuf::from(repo_path);
+    let repo_root = project_path.as_path();
 
-    // 1. Load the LIVE checks contract from the project's main checkout — the same
-    // `.cairn/config.yaml` the Settings UI edits. The worktree's own committed
-    // copy was snapshotted when the branch was cut, so a project-level edit made
-    // mid-session would never reach an in-flight agent if we read it. Sourcing the
-    // contract from the live project config makes a Settings edit take effect on
-    // the very next commit, no restart. (Changed files, glob matching, the tree
-    // hash, and the check commands themselves still run against the sealed
-    // worktree commit at `repo_root` — only the contract is project-sourced.)
-    let checks = load_live_project_checks(orch, &run_context.project_id, repo_root).await?;
-    if checks.is_empty() {
-        return None;
-    }
-
-    // 2–5. VCS inspection, cargo-metadata planning, and the synchronous cache
-    // bridge all wait on subprocesses or joined threads. Gather the DB anchors
-    // asynchronously, then keep the complete synchronous planning unit off Tokio
-    // runtime workers.
-    let (_base_branch, base_commit) =
-        load_node_vcs_anchors(&orch.db.local, &run_context.job_id).await;
+    // 1. Resolve the sealed commit this cadence is about, BEFORE anything reads a
+    // check definition. VCS inspection, cargo-metadata planning, and the
+    // synchronous cache bridge all wait on subprocesses or joined threads, so
+    // gather the DB anchors asynchronously and keep the complete synchronous
+    // planning unit off Tokio runtime workers.
+    let live_base = live_node_base(orch, &run_context.job_id).await;
     let logical = crate::mcp::handlers::branch::resolve_current_for_read(
         orch,
         &crate::mcp::types::McpCallbackRequest {
@@ -1370,37 +2585,76 @@ async fn run_write_checks_after_seal_inner(
     )
     .await
     .ok()?;
+
+    // 2. Load the checks contract DECLARED BY that exact commit. The definition
+    // and the content it evaluates are the same tree, so a `.cairn/config.yaml`
+    // edit governs the commits that carry it and nothing else — a branch
+    // experimenting with check config cannot reach a sibling job's cadence
+    // (CAIRN-3333). A project-level Settings edit takes effect for a job on the
+    // first commit that contains it.
+    let CommitChecksContract {
+        contract: ChecksContract {
+            checks,
+            extra_inputs,
+        },
+        defined_by_commit,
+    } = load_checks_contract_at_commit(&logical.object_repository_path, &logical.commit_id).await?;
+    if checks.is_empty() {
+        return None;
+    }
+    // Structural guard, deliberately a hard assert rather than a log: planning
+    // selects, keys, and submits checks that this exact commit declared. If a
+    // future edit reintroduces a second contract source, this fails visibly here
+    // rather than silently recording a sibling's definition.
+    assert_eq!(
+        defined_by_commit, logical.commit_id,
+        "write-cadence checks must be defined by the commit they evaluate"
+    );
+
     let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let planning_jj = jj.clone();
     let planning_repo = logical.repository_path;
     let planning_head = logical.commit_id;
-    let planning_base = base_commit.unwrap_or(logical.default_commit_id);
+    let planning_base = live_base.unwrap_or(logical.default_commit_id);
     let planning_checks = checks.clone();
+    let planning_extra_inputs = extra_inputs.clone();
     let planning_db = orch.db.local.clone();
     let planning_project_id = run_context.project_id.clone();
+    let planning_job_id = run_context.job_id.clone();
+    let planning_started = std::time::Instant::now();
     let planned = tokio::task::spawn_blocking(move || {
         let changed =
             logical_changed_files(&planning_jj, &planning_repo, &planning_base, &planning_head)?;
         if changed.is_empty() {
             return None;
         }
-        let plans = applicable_write_checks(&planning_checks, &changed, &planning_repo);
+        // The sealed tree's entry listing feeds BOTH halves of input resolution:
+        // the manifest blobs the dependency closures are derived from, and the
+        // per-check filtered-tree cache component. One read serves both, and it
+        // is skipped entirely when no check declares inputs at all.
+        let entries = if any_check_declares_inputs(planning_checks.values()) {
+            tree_entries(&planning_jj, &planning_repo, &planning_head).ok()
+        } else {
+            None
+        };
+        let blobs = TreeBlobs {
+            jj: &planning_jj,
+            repository: &planning_repo,
+        };
+        let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+        let inputs = ResolvedInputs::resolve(&planning_checks, &planning_extra_inputs, &snapshot);
+        let plans = applicable_write_checks(&planning_checks, &inputs, &changed, &planning_repo);
         if plans.is_empty() {
             return None;
         }
         let tree_hash = logical_tree_hash(&planning_jj, &planning_repo, &planning_head).ok()?;
         let sealed_commit = planning_head.clone();
-        let entries = if plans.iter().any(|plan| {
-            planning_checks
-                .get(&plan.name)
-                .is_some_and(|check| check.impact.is_some())
-        }) {
-            tree_entries(&planning_jj, &planning_repo, &planning_head).ok()
-        } else {
-            None
-        };
-        let latest_by_check: HashMap<String, CheckResultCacheEntry> =
-            list_latest_check_results_for_project(planning_db.clone(), &planning_project_id)
+        // The narrowing baseline is this JOB's last green run of each check, not the
+        // project's most recent row of any status. Both qualifiers carry weight: a
+        // sibling branch's tree is not an anchor on this branch's lineage, and a red
+        // run must not displace the green one it superseded.
+        let baseline_by_check: HashMap<String, CheckResultCacheEntry> =
+            list_latest_passing_check_results_for_job(planning_db.clone(), &planning_job_id)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|row| (row.check_name.clone(), row))
@@ -1411,8 +2665,10 @@ async fn run_write_checks_after_seal_inner(
                 let check = planning_checks
                     .get(&plan.name)
                     .expect("planned check must retain its configured definition");
+                let selector = inputs.for_check(&plan.name);
                 let input_hash = check_result_key(
                     check,
+                    selector,
                     entries.as_deref(),
                     &tree_hash,
                     &check_platform_identity(),
@@ -1429,15 +2685,22 @@ async fn run_write_checks_after_seal_inner(
                 .is_none();
                 let selected_plan = if should_reselect {
                     let selected_changed = selected_changed_files_for_miss(
-                        latest_by_check.get(&plan.name),
+                        baseline_by_check.get(&plan.name),
                         entries.as_deref(),
-                        check.impact.as_ref(),
+                        check,
+                        &inputs,
+                        selector,
                         &changed,
-                        &planning_jj,
-                        &planning_repo,
+                        &blobs,
                     );
-                    replan_one_check(&plan.name, check, &selected_changed, &planning_repo)
-                        .unwrap_or(plan)
+                    replan_one_check(
+                        &plan.name,
+                        check,
+                        &inputs,
+                        &selected_changed,
+                        &planning_repo,
+                    )
+                    .unwrap_or(plan)
                 } else {
                     plan
                 };
@@ -1450,9 +2713,23 @@ async fn run_write_checks_after_seal_inner(
     .ok()??;
     let (keyed, tree_hash, sealed_commit) = planned;
 
+    // The planning unit above is synchronous and sits on the critical path of
+    // every source-touching commit, between the sealed commit and the agent
+    // getting its tool result. Its elapsed time is logged because that is exactly
+    // where CAIRN-3108 hid: a quadratic cache read inside it pinned a
+    // blocking-pool thread for ~59 SECONDS per commit while every subsystem that
+    // does log stayed silent, so the stall was invisible in the logs for days.
+    // Expect tens of milliseconds; seconds here means something in planning has
+    // started scaling with history again.
+    //
+    // (The batch these plans feed submits under `MutationPolicy::AllowDelta`, not
+    // a pure-verdict lease — the write cadence is the cadence that folds
+    // formatter fixes back into the commit. The old wording of this line claimed
+    // otherwise and sent this investigation's first pass chasing slot admission.)
     log::info!(
-        "when:write checks: cache-filtering {} planned check(s) before one sequential pure-verdict slot lease",
-        keyed.len()
+        "when:write checks: planned {} check(s) in {}ms; cache-filtering before submission",
+        keyed.len(),
+        planning_started.elapsed().as_millis()
     );
 
     // The live status-line emitter. `run_planned_checks` calls this with a full
@@ -1471,22 +2748,11 @@ async fn run_write_checks_after_seal_inner(
             resolve_check_timeout_ms(checks.get(&plan.name), DEFAULT_WRITE_CHECK_TIMEOUT_MS)
         })
         .collect();
-    let miss_indices: Vec<usize> = keyed
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (plan, input_hash))| {
-            get_check_result(
-                orch.db.local.clone(),
-                &run_context.project_id,
-                &plan.name,
-                input_hash,
-            )
-            .ok()
-            .flatten()
-            .is_none()
-            .then_some(index)
-        })
-        .collect();
+    // This wave is fleet-backed and placement has not happened yet. Treat every
+    // plan as an execution candidate; reservation still removes infrastructure-
+    // suppressed triples before admission. A coordinator-local hit must not erase
+    // a command that the scheduler may place remotely.
+    let miss_indices: Vec<usize> = (0..keyed.len()).collect();
     let status_notify: CheckStatusNotify = Arc::new(move |checks, phase, phase_detail| {
         let _ = emitter.emit(
             "check-status",
@@ -1523,116 +2789,91 @@ async fn run_write_checks_after_seal_inner(
         }
     }
 
+    let slot_env = slot_check_env(jj.shell_env());
     let batch_outcome = if miss_indices.is_empty() {
         None
     } else {
-        let slot_env = slot_check_env(jj.shell_env());
-        let items = miss_indices
-            .iter()
-            .map(|index| PlannedCheckBatchItem {
-                index: *index,
-                name: keyed[*index].0.name.clone(),
-                input_hash: keyed[*index].1.clone(),
-                resource_identity_key: check_resource_identity(
-                    &keyed[*index].0.name,
-                    checks
-                        .get(&keyed[*index].0.name)
-                        .expect("planned check must retain its configured definition"),
-                )
-                .key,
-                command: keyed[*index].0.command.clone(),
-                stream_id: crate::mcp::handlers::run::check_stream_id(tool_use_id, *index),
-                env: slot_env.clone(),
-                timeout_ms: timeouts[*index],
-                constraints: checks
-                    .get(&keyed[*index].0.name)
-                    .and_then(|check| check.constraints.clone()),
-            })
-            .collect();
-        status_board.set_phase(Some("provisioning"), Some("resolving build slot".into()));
-        let repository = resolve_check_repository(
-            orch,
-            &run_context.project_id,
-            &run_context.job_id,
-            repo_root,
-        )
-        .await;
-        let submitted = match repository {
-            Ok((repository, store_dir)) => {
-                submit_planned_check_batch(
-                    orch,
-                    PlannedCheckBatchRequest {
-                        project_id: run_context.project_id.clone(),
-                        repository,
-                        store_dir,
-                        sealed_commit,
-                        requesting_job_id: run_context.job_id.clone(),
-                        owner: cairn_common::executor_protocol::CellOwnerRef {
-                            project_id: run_context.project_id.clone(),
-                            project_key: Some(run_context.project_key.clone()),
-                            issue_number: run_context.issue_number,
-                            job_id: Some(run_context.job_id.clone()),
-                            execution_seq: run_context.exec_seq,
-                            node_kind: run_context.job_name.clone(),
-                        },
-                        affinity_key: Some(run_context.job_id.clone()),
-                        priority: CellPriority::WriteCheck,
-                        env: slot_env,
-                        items,
-                        run_context: Some(run_context.clone()),
-                        mutation_policy: MutationPolicy::AllowDelta,
-                        status_board: Some(status_board.clone()),
-                    },
-                )
-                .await
-            }
-            Err(error) => Ok(PlannedCheckBatchOutcome::failed(
-                miss_indices.clone(),
-                error,
-            )),
-        };
-        Some(match submitted {
-            Ok(results) => results,
-            Err(error) => PlannedCheckBatchOutcome::failed(miss_indices.clone(), error),
-        })
-    };
-    if let Some(delta) = batch_outcome
-        .as_ref()
-        .and_then(|outcome| outcome.delta.as_ref())
-    {
-        if !may_fold {
-            let patch = delta_patch_excerpt(repo_root, delta);
-            return Some(format!(
-                "Checks: ✗ write-check batch (non-convergent: verification mutated again)\n```diff\n{patch}\n```"
-            ));
-        }
-        let request = batch_outcome.as_ref()?.request.as_ref()?;
-        let store_dir = batch_outcome.as_ref()?.store_dir.as_ref()?;
-        let author = GitAuthor::new("Cairn checks", "checks@cairn.local");
-        let branch =
-            match crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
-                orch.db.local.clone(),
-                run_context.job_id.clone(),
+        Some(
+            submit_write_check_batch_for(
+                orch,
+                WriteCheckBatchRequest {
+                    run_context,
+                    repo_root,
+                    checks: &checks,
+                    extra_inputs: &extra_inputs,
+                    keyed: &keyed,
+                    order: &fixer_first_submission_order(&keyed, &checks, &miss_indices),
+                    timeouts: &timeouts,
+                    sealed_commit: &sealed_commit,
+                    slot_env: &slot_env,
+                    tool_use_id,
+                    status_board: Some(status_board.clone()),
+                },
             )
-            .await
+            .await,
+        )
+    };
+    let (mut batched_results, delta, request, store_dir) = match batch_outcome {
+        Some(outcome) => (
+            outcome.results,
+            outcome.delta,
+            outcome.request,
+            outcome.store_dir,
+        ),
+        None => (HashMap::new(), None, None, None),
+    };
+
+    // A fix lands as its own commit on the branch, and every verdict this wave
+    // records has to describe the tree that landed. The wave does not re-run to
+    // get there. The declared fixers ran FIRST inside the shared slot, so the
+    // checks after them already validated the fixed tree; re-keying carries
+    // their verdicts onto it. Only a check the fix demonstrably invalidated runs
+    // again, in one bounded verification batch that never folds.
+    let mut keyed = keyed;
+    let mut tree_hash = tree_hash;
+    let mut fixed = None;
+    if let Some(delta) = delta {
+        let (Some(request), Some(store_dir)) = (request.as_ref(), store_dir.as_ref()) else {
+            return Some(
+                "Checks: \u{2717} write-check fold (the slot publication context was lost)".into(),
+            );
+        };
+        let author = GitAuthor::new("Cairn checks", "checks@cairn.local");
+        let branch = {
+            let db =
+                match crate::execution::routing::owning_db_for_job(&orch.db, &run_context.job_id)
+                    .await
+                {
+                    Ok(db) => db,
+                    Err(error) => {
+                        return Some(format!(
+                            "Checks: \u{2717} write-check fold (resolve owning database: {error})"
+                        ))
+                    }
+                };
+            let job_id = run_context.job_id.clone();
+            match db
+                .query_text("SELECT branch FROM jobs WHERE id = ?1", (job_id,))
+                .await
             {
-                Ok(Some(context)) => context.identity.branch,
+                Ok(Some(branch)) => branch,
                 Ok(None) => {
                     return Some(
-                        "Checks: ✗ write-check fold (managed logical branch is absent)".into(),
+                        "Checks: \u{2717} write-check fold (logical branch is absent)".into(),
                     )
                 }
                 Err(error) => {
                     return Some(format!(
-                        "Checks: ✗ write-check fold (resolve managed logical branch: {error})"
+                        "Checks: \u{2717} write-check fold (resolve logical branch: {error})"
                     ))
                 }
-            };
+            }
+        };
         let published = crate::mcp::handlers::run::publish_and_seal_slot_delta(
             orch,
             store_dir,
             request,
-            delta,
+            &delta,
             &branch,
             "fix: apply write-check changes",
             Some(&author),
@@ -1641,9 +2882,9 @@ async fn run_write_checks_after_seal_inner(
         let published = match published {
             Ok(published) => published,
             Err(error) => {
-                let patch = delta_patch_excerpt(repo_root, delta);
+                let patch = delta_patch_excerpt(repo_root, &delta);
                 return Some(format!(
-                    "Checks: ✗ write-check fold ({error})\n```diff\n{patch}\n```"
+                    "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
                 ));
             }
         };
@@ -1661,46 +2902,81 @@ async fn run_write_checks_after_seal_inner(
             "db-change",
             serde_json::json!({"table": "check_result_cache", "action": "invalidate"}),
         );
-        let rerun = Box::pin(run_write_checks_after_seal_inner(
+        let rekeyed = rekey_wave_onto_fix(
             orch,
-            Some(run_context),
+            WriteCheckBatchRequest {
+                run_context,
+                repo_root,
+                checks: &checks,
+                extra_inputs: &extra_inputs,
+                keyed: &keyed,
+                order: &miss_indices,
+                timeouts: &timeouts,
+                sealed_commit: &sealed_commit,
+                slot_env: &slot_env,
+                tool_use_id,
+                status_board: Some(status_board.clone()),
+            },
             cwd,
-            tool_use_id,
-            false,
-        ))
-        .await
-        .unwrap_or_else(|| "Checks: ✗ write-check verification produced no verdict".into());
-        return Some(format_fixed_batch_summary(
-            &rerun,
-            &published.commit,
             &published.paths,
-        ));
+        )
+        .await;
+        let rekeyed = match rekeyed {
+            Ok(rekeyed) => rekeyed,
+            Err(error) => {
+                let patch = delta_patch_excerpt(repo_root, &delta);
+                return Some(format!(
+                    "Checks: \u{2717} write-check fold ({error})\n```diff\n{patch}\n```"
+                ));
+            }
+        };
+        // Verification that dirties the tree AGAIN is never folded. With the
+        // recursion gone this is what bounds the fix loop: a wave publishes at
+        // most one fix commit and reports the second mutation instead of chasing
+        // it.
+        if let Some(delta) = rekeyed.non_convergent {
+            let patch = delta_patch_excerpt(repo_root, &delta);
+            return Some(format!(
+                "Checks: \u{2717} write-check batch (non-convergent: verification mutated again)\n```diff\n{patch}\n```"
+            ));
+        }
+        keyed = rekeyed.keyed;
+        tree_hash = rekeyed.tree_hash;
+        batched_results.extend(rekeyed.results);
+        fixed = Some(published);
     }
-    let batched_results = batch_outcome.map_or_else(HashMap::new, |outcome| outcome.results);
+    let observation_commit = fixed
+        .as_ref()
+        .map(|published| published.commit.as_str())
+        .unwrap_or(sealed_commit.as_str());
     let batched_results = Arc::new(std::sync::Mutex::new(batched_results));
     let results = run_planned_checks_with_board(
         orch.db.local.clone(),
         &run_context.project_id,
+        CheckRunCommit {
+            evaluated: observation_commit,
+            defined_by: &defined_by_commit,
+        },
         &tree_hash,
         run_context.job_id.as_str(),
         &keyed,
         tool_use_id,
         CheckExecMode::Shared,
-        &orch.check_admission,
         Some(orch),
         Some(status_board),
         move |index, _command, _stream_id| {
             let batched_results = batched_results.clone();
             async move {
                 batched_results
-                .lock()
-                .unwrap()
-                .remove(&index)
-                .unwrap_or_else(|| {
-                    Err(CheckExecutionFailure::Substrate(format!(
-                        "Cairn check infrastructure failure: missing batched outcome for plan index {index}"
-                    )))
-                })
+                    .lock()
+                    .unwrap()
+                    .remove(&index)
+                    .unwrap_or_else(|| {
+                        Err(CheckExecutionFailure::substrate(
+                            SubstrateFailureShape::Result,
+                            format!("missing batched outcome for plan index {index}"),
+                        ))
+                    })
             }
         },
         move |_checks| {},
@@ -1719,54 +2995,399 @@ async fn run_write_checks_after_seal_inner(
     if results.is_empty() {
         return None;
     }
-    Some(format!("Checks: {}", format_check_summary(&results)))
+    let summary = format!("Checks: {}", format_check_summary(&results));
+    // The fix is attributed ONCE, at batch level: it is the wave's combined
+    // delta, not any single check's, so no per-check annotation can honestly
+    // claim it.
+    Some(match fixed {
+        Some(published) => {
+            format_fixed_batch_summary(&summary, &published.commit, &published.paths)
+        }
+        None => summary,
+    })
 }
 
-/// Resolve the project's LIVE `checks` contract for the runner.
-///
-/// The contract source is the project's main-checkout `.cairn/config.yaml`,
-/// located by `project_id` (this resolves team replicas through the route table,
-/// not just `projects.repo_path`). That is the same file the Settings UI writes,
-/// so a project-level edit is visible here on the next commit without restarting
-/// the session. This runs in the host orchestrator process (the MCP callback
-/// handler), not the fenced agent subprocess, so reading the main checkout is
-/// not a fence crossing — the same host-side read `projects::remote` already does.
-///
-/// Precedence: the live project config wins outright. The worktree's own
-/// committed `.cairn/config.yaml` is consulted ONLY as a fallback when the
-/// project repo path cannot be resolved (e.g. a team project with no local
-/// clone), so an unresolved project never silently drops every check.
-pub(crate) async fn load_live_project_checks(
+/// Everything one build-slot submission of write-cadence checks needs. The
+/// fields are the wave's shared identity; `order` is the only per-submission
+/// part, and it carries the plan indices to run in the order to run them.
+struct WriteCheckBatchRequest<'a> {
+    run_context: &'a RunContext,
+    repo_root: &'a Path,
+    checks: &'a HashMap<String, CheckCommand>,
+    /// Node-level extra inputs, carried so the post-fix re-key can resolve every
+    /// selector afresh against the tree the fix actually landed.
+    extra_inputs: &'a HashMap<String, Vec<String>>,
+    keyed: &'a [(CheckPlan, String)],
+    order: &'a [usize],
+    timeouts: &'a [u32],
+    sealed_commit: &'a str,
+    slot_env: &'a [(String, String)],
+    tool_use_id: &'a str,
+    status_board: Option<CheckStatusBoard>,
+}
+
+/// Submit one build-slot batch for the given cache-MISS plan indices, in the
+/// given execution order. Every failure mode resolves to per-index failures, so
+/// the caller always holds exactly one outcome per submitted index.
+async fn submit_write_check_batch_for(
     orch: &Orchestrator,
-    project_id: &str,
-    worktree_root: &Path,
-) -> Option<HashMap<String, CheckCommand>> {
-    let project_repo = crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, project_id)
+    batch: WriteCheckBatchRequest<'_>,
+) -> PlannedCheckBatchOutcome {
+    let WriteCheckBatchRequest {
+        run_context,
+        repo_root,
+        checks,
+        extra_inputs: _,
+        keyed,
+        order,
+        timeouts,
+        sealed_commit,
+        slot_env,
+        tool_use_id,
+        status_board,
+    } = batch;
+    let items: Vec<PlannedCheckBatchItem> = order
+        .iter()
+        .map(|index| PlannedCheckBatchItem {
+            index: *index,
+            name: keyed[*index].0.name.clone(),
+            input_hash: keyed[*index].1.clone(),
+            resource_identity_key: check_resource_identity(
+                &keyed[*index].0.name,
+                checks
+                    .get(&keyed[*index].0.name)
+                    .expect("planned check must retain its configured definition"),
+            )
+            .key,
+            command: keyed[*index].0.command.clone(),
+            stream_id: crate::mcp::handlers::run::check_stream_id(tool_use_id, *index),
+            env: slot_env.to_vec(),
+            timeout_ms: timeouts[*index],
+            executor: checks
+                .get(&keyed[*index].0.name)
+                .and_then(|check| check.executor.clone()),
+            resource_class: keyed[*index].0.resource_class,
+        })
+        .collect();
+    if let Some(board) = status_board.as_ref() {
+        board.set_phase(Some("provisioning"), Some("resolving build slot".into()));
+    }
+    let repository = resolve_check_repository(
+        orch,
+        &run_context.project_id,
+        &run_context.job_id,
+        repo_root,
+    )
+    .await;
+    let submitted = match repository {
+        Ok((repository, store_dir)) => {
+            submit_planned_check_batch(
+                orch,
+                PlannedCheckBatchRequest {
+                    project_id: run_context.project_id.clone(),
+                    repository,
+                    store_dir,
+                    sealed_commit: sealed_commit.to_string(),
+                    requesting_job_id: run_context.job_id.clone(),
+                    owner: cairn_common::executor_protocol::CellOwnerRef {
+                        project_id: run_context.project_id.clone(),
+                        project_key: Some(run_context.project_key.clone()),
+                        issue_number: run_context.issue_number,
+                        job_id: Some(run_context.job_id.clone()),
+                        execution_seq: run_context.exec_seq,
+                        node_kind: run_context.job_name.clone(),
+                    },
+                    affinity_key: Some(run_context.job_id.clone()),
+                    priority: CellPriority::WriteCheck,
+                    env: slot_env.to_vec(),
+                    items,
+                    run_context: Some(run_context.clone()),
+                    mutation_policy: MutationPolicy::AllowDelta,
+                    status_board,
+                },
+            )
+            .await
+        }
+        Err(error) => Ok(PlannedCheckBatchOutcome::failed(
+            order.to_vec(),
+            SubstrateFailure::new(SubstrateFailureShape::Dispatch, error),
+        )),
+    };
+    match submitted {
+        Ok(outcome) => outcome,
+        Err(error) => PlannedCheckBatchOutcome::failed(
+            order.to_vec(),
+            SubstrateFailure::new(SubstrateFailureShape::Dispatch, error),
+        ),
+    }
+}
+
+/// A write-check wave re-keyed onto the tree its fix actually landed.
+struct FixedWave {
+    /// The wave's plans paired with their cache key on the POST-fix tree. A
+    /// re-verified check also carries its re-planned command.
+    keyed: Vec<(CheckPlan, String)>,
+    /// Whole-tree hash of the post-fix commit, re-stamped onto every row.
+    tree_hash: String,
+    /// Outcomes from the re-verification batch, by plan index. They replace the
+    /// pre-fix outcome for those checks; every other index keeps its original.
+    results: HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>,
+    /// Set when re-verification dirtied the tree AGAIN. Never folded.
+    non_convergent: Option<crate::fleet::MutationDelta>,
+}
+
+/// What re-planning a wave against the fixed commit yields: every plan paired
+/// with its re-derived result key, the indices whose verdict the fix invalidated,
+/// and the fixed commit's tree hash.
+type Replan = (Vec<(CheckPlan, String)>, Vec<usize>, String);
+
+/// Re-key a wave onto the commit its fix landed, re-verifying exactly the checks
+/// whose verdict the fix invalidated.
+///
+/// Survival is decided per check by [`verdict_survives_fix`]. In the ordinary
+/// case — a declared formatter rewriting files inside its own `impact` — every
+/// verdict survives and no second batch is submitted at all; the wave costs one
+/// slot admission and one execution per check. A fix that no declared fixer
+/// explains, or a check that was answered from the cache before the fix touched
+/// its inputs, falls back to running that check once against the fixed commit.
+async fn rekey_wave_onto_fix(
+    orch: &Orchestrator,
+    wave: WriteCheckBatchRequest<'_>,
+    cwd: &str,
+    fixed_paths: &[String],
+) -> Result<FixedWave, String> {
+    let logical = crate::mcp::handlers::branch::resolve_current_for_read(
+        orch,
+        &crate::mcp::types::McpCallbackRequest {
+            run_id: Some(wave.run_context.run_id.clone()),
+            cwd: cwd.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|error| format!("resolve the fixed commit: {error}"))?;
+    let live_base = live_node_base(orch, &wave.run_context.job_id).await;
+
+    // Fixers run in plan order among themselves, so only the last one observed
+    // the whole fold. Every earlier fixer whose key the fold moved is re-verified.
+    let superseded = fixers_superseded_by_a_later_fixer(wave.keyed, wave.checks, wave.order);
+
+    let executed: BTreeSet<usize> = wave.order.iter().copied().collect();
+    let plans: Vec<CheckPlan> = wave.keyed.iter().map(|(plan, _)| plan.clone()).collect();
+    let keys_before: Vec<String> = wave.keyed.iter().map(|(_, key)| key.clone()).collect();
+    let checks = wave.checks.clone();
+    let extra_inputs = wave.extra_inputs.clone();
+    let fixer_names: Vec<String> = wave
+        .order
+        .iter()
+        .map(|index| wave.keyed[*index].0.name.clone())
+        .filter(|name| wave.checks.get(name).is_some_and(|check| check.fixes))
+        .collect();
+    let fixed_paths = fixed_paths.to_vec();
+    let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let repository = logical.repository_path.clone();
+    let head = logical.commit_id.clone();
+    let base = live_base.unwrap_or(logical.default_commit_id);
+    let planning_head = head.clone();
+    let planning_repository = repository.clone();
+
+    let (rekeyed, invalidated, tree_hash) =
+        tokio::task::spawn_blocking(move || -> Result<Replan, String> {
+            let tree_hash = logical_tree_hash(&jj, &planning_repository, &planning_head)?;
+            let entries = if any_check_declares_inputs(checks.values()) {
+                tree_entries(&jj, &planning_repository, &planning_head).ok()
+            } else {
+                None
+            };
+            let blobs = TreeBlobs {
+                jj: &jj,
+                repository: &planning_repository,
+            };
+            let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+            let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+            // Attribution is a property of the whole wave: the fix is the slot's
+            // combined delta, so the question is whether the declared fixers that
+            // ran can account for every path in it. It is asked against the FIXED
+            // tree's inputs, which is the tree the verdicts are being keyed to.
+            let fixers: Vec<&InputSelector> = fixer_names
+                .iter()
+                .map(|name| inputs.for_check(name))
+                .collect();
+            let attributed = fix_is_attributed_to_declared_fixers(&fixed_paths, &fixers);
+            let changed = logical_changed_files(&jj, &planning_repository, &base, &planning_head)
+                .unwrap_or_default();
+            let mut rekeyed = Vec::with_capacity(plans.len());
+            let mut invalidated = Vec::new();
+            for (index, plan) in plans.into_iter().enumerate() {
+                let check = checks
+                    .get(&plan.name)
+                    .expect("planned check must retain its configured definition");
+                let key_after = check_result_key(
+                    check,
+                    inputs.for_check(&plan.name),
+                    entries.as_deref(),
+                    &tree_hash,
+                    &check_platform_identity(),
+                    check_toolchain_identity(),
+                );
+                if verdict_survives_fix(
+                    executed.contains(&index),
+                    attributed,
+                    superseded.contains(&index),
+                    &keys_before[index],
+                    &key_after,
+                ) {
+                    rekeyed.push((plan, key_after));
+                    continue;
+                }
+                // The fix changed this check's inputs and nothing proves it saw
+                // them. Re-plan against the fixed commit so a `{changedFiles}`
+                // selector covers the fixed paths too, then run it once.
+                let replanned =
+                    replan_one_check(&plan.name, check, &inputs, &changed, &planning_repository)
+                        .unwrap_or_else(|| plan.clone());
+                invalidated.push(index);
+                rekeyed.push((replanned, key_after));
+            }
+            Ok((rekeyed, invalidated, tree_hash))
+        })
+        .await
+        .map_err(|error| format!("join the post-fix planning unit: {error}"))??;
+
+    // An invalidated verdict may still be answerable from the cache on the FIXED
+    // tree; only a genuine miss needs the slot.
+    let misses: Vec<usize> = invalidated
+        .into_iter()
+        .filter(|index| {
+            needs_execution(
+                orch.db.local.clone(),
+                &wave.run_context.project_id,
+                &rekeyed[*index].0,
+                &rekeyed[*index].1,
+            )
+        })
+        .collect();
+    if misses.is_empty() {
+        return Ok(FixedWave {
+            keyed: rekeyed,
+            tree_hash,
+            results: HashMap::new(),
+            non_convergent: None,
+        });
+    }
+    log::info!(
+        "when:write checks: fix invalidated {} verdict(s), re-verifying {:?} against {head}",
+        misses.len(),
+        misses
+            .iter()
+            .map(|index| rekeyed[*index].0.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let outcome = submit_write_check_batch_for(
+        orch,
+        WriteCheckBatchRequest {
+            keyed: &rekeyed,
+            order: &fixer_first_submission_order(&rekeyed, wave.checks, &misses),
+            sealed_commit: &head,
+            ..wave
+        },
+    )
+    .await;
+    Ok(FixedWave {
+        keyed: rekeyed,
+        tree_hash,
+        results: outcome.results,
+        non_convergent: outcome.delta,
+    })
+}
+
+/// Where a project declares its checks, inside whatever tree is being read.
+const CHECKS_CONFIG_PATH: &str = ".cairn/config.yaml";
+
+/// A checks contract together with the commit that DECLARED it.
+///
+/// The two travel together because a verdict is only interpretable when you know
+/// which definition produced it. Every execution path binds both halves to one
+/// commit: the definition and the content it evaluates come from the same tree.
+#[derive(Debug, Clone)]
+pub(crate) struct CommitChecksContract {
+    pub(crate) contract: ChecksContract,
+    pub(crate) defined_by_commit: String,
+}
+
+/// Load the `checks` contract DECLARED BY an immutable commit.
+///
+/// The bytes come out of the commit's own tree through the git object database,
+/// so no checkout is materialized and no live file can influence the answer. A
+/// missing, unreadable, invalid, or check-less `.cairn/config.yaml` in that
+/// commit means exactly what an absent contract has always meant: nothing is
+/// selected. There is deliberately NO fallback to the project checkout — falling
+/// back is what let a check defined only on one agent branch execute inside a
+/// sibling job's cadence against the sibling's tree (CAIRN-3333).
+///
+/// `object_repository` is the path holding the git object database (the project
+/// checkout); jj writes every sealed commit into it, so a branch commit that was
+/// never checked out anywhere is still readable here.
+pub(crate) fn checks_contract_at_commit(
+    object_repository: &Path,
+    commit: &str,
+) -> Option<CommitChecksContract> {
+    let bytes = match crate::mcp::handlers::read::file_at_commit(
+        object_repository.to_path_buf(),
+        commit.to_string(),
+        CHECKS_CONFIG_PATH,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return None,
+        Err(error) => {
+            log::warn!(
+                "checks: cannot read {CHECKS_CONFIG_PATH} at commit {commit}: {error}; \
+                 no checks are selected for it"
+            );
+            return None;
+        }
+    };
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(_) => {
+            log::warn!(
+                "checks: {CHECKS_CONFIG_PATH} at commit {commit} is not valid UTF-8; \
+                 no checks are selected for it"
+            );
+            return None;
+        }
+    };
+    // The migration flag is ignored on purpose: a sealed commit is read, never
+    // rewritten. Only the checkout loader migrates.
+    let (settings, _needs_migration) =
+        match crate::config::project_settings::parse_project_settings(&content) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                log::warn!(
+                    "checks: {CHECKS_CONFIG_PATH} at commit {commit} is invalid ({error}); \
+                     no checks are selected for it"
+                );
+                return None;
+            }
+        };
+    Some(CommitChecksContract {
+        contract: crate::config::project_settings::checks_contract_from(settings)?,
+        defined_by_commit: commit.to_string(),
+    })
+}
+
+/// [`checks_contract_at_commit`] off the async caller's runtime thread. The read
+/// touches the object database, which is filesystem work.
+pub(crate) async fn load_checks_contract_at_commit(
+    object_repository: &Path,
+    commit: &str,
+) -> Option<CommitChecksContract> {
+    let object_repository = object_repository.to_path_buf();
+    let commit = commit.to_string();
+    tokio::task::spawn_blocking(move || checks_contract_at_commit(&object_repository, &commit))
         .await
         .ok()
-        .and_then(|(path, _key)| path);
-    let worktree_root = worktree_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        checks_from_source(project_repo.as_deref().map(Path::new), &worktree_root)
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Pick the live `checks` contract given the optionally-resolved project repo
-/// path and the worktree fallback. Pure (filesystem reads only, no orchestrator)
-/// so the project-wins / worktree-fallback precedence is unit-testable. Both
-/// reads use the non-migrating [`load_checks`] so neither path triggers a config
-/// migration commit from inside an agent run.
-fn checks_from_source(
-    project_repo: Option<&Path>,
-    worktree_root: &Path,
-) -> Option<HashMap<String, CheckCommand>> {
-    match project_repo {
-        Some(path) => load_checks(path),
-        None => load_checks(worktree_root),
-    }
+        .flatten()
 }
 
 /// The subset of planned checks that both apply to the change set AND run at the
@@ -1776,10 +3397,11 @@ fn checks_from_source(
 /// so the cadence gate is unit-tested.
 pub(crate) fn applicable_turn_end_checks(
     checks: &HashMap<String, CheckCommand>,
+    inputs: &ResolvedInputs,
     changed: &[GraphFileChange],
     repo_root: &Path,
 ) -> Vec<CheckPlan> {
-    plan_checks(checks, changed, repo_root)
+    plan_checks(checks, inputs, changed, repo_root)
         .into_iter()
         .filter(|plan| plan.applies)
         .filter(|plan| {
@@ -1798,10 +3420,11 @@ pub(crate) fn applicable_turn_end_checks(
 /// manual child-PR merge must not launch them.
 fn applicable_combined_tree_gate_checks(
     checks: &HashMap<String, CheckCommand>,
+    inputs: &ResolvedInputs,
     changed: &[GraphFileChange],
     repo_root: &Path,
 ) -> Vec<CheckPlan> {
-    applicable_turn_end_checks(checks, changed, repo_root)
+    applicable_turn_end_checks(checks, inputs, changed, repo_root)
         .into_iter()
         .filter(|plan| {
             checks
@@ -1813,10 +3436,11 @@ fn applicable_combined_tree_gate_checks(
 
 fn applicable_write_checks(
     checks: &HashMap<String, CheckCommand>,
+    inputs: &ResolvedInputs,
     changed: &[GraphFileChange],
     repo_root: &Path,
 ) -> Vec<CheckPlan> {
-    plan_checks(checks, changed, repo_root)
+    plan_checks(checks, inputs, changed, repo_root)
         .into_iter()
         .filter(|plan| plan.applies)
         .filter(|plan| {
@@ -1830,12 +3454,13 @@ fn applicable_write_checks(
 fn replan_one_check(
     name: &str,
     check: &CheckCommand,
+    inputs: &ResolvedInputs,
     changed: &[GraphFileChange],
     repo_root: &Path,
 ) -> Option<CheckPlan> {
     let mut one = HashMap::new();
     one.insert(name.to_string(), check.clone());
-    plan_checks(&one, changed, repo_root)
+    plan_checks(&one, inputs, changed, repo_root)
         .into_iter()
         .next()
         .filter(|plan| plan.applies)
@@ -1847,11 +3472,13 @@ fn replan_one_check(
 fn selected_changed_files_for_miss(
     latest: Option<&CheckResultCacheEntry>,
     current_entries: Option<&[(String, String)]>,
-    impact: Option<&Vec<String>>,
+    check: &CheckCommand,
+    inputs: &ResolvedInputs,
+    selector: &InputSelector,
     cumulative: &[GraphFileChange],
-    jj: &JjEnv,
-    repo_root: &Path,
+    tree: &TreeBlobs<'_>,
 ) -> Vec<GraphFileChange> {
+    let (jj, repo_root) = (tree.jj, tree.repository);
     let Some(latest) = latest.filter(|row| row.passed) else {
         return cumulative.to_vec();
     };
@@ -1870,65 +3497,133 @@ fn selected_changed_files_for_miss(
             return cumulative.to_vec();
         }
     };
+    // The baseline's key must be recomputed under the selector the baseline TREE
+    // resolves to, because that is the selector the original run keyed by. A
+    // closure is a pure function of the tree, so a baseline whose manifests
+    // differ genuinely had a different input set.
+    let baseline_snapshot = TreeSnapshot::new(Some(&baseline_entries), tree);
+    let baseline_selector = inputs.resolve_for_tree(check, &baseline_snapshot);
     baseline_delta_changed_files(
         Some(latest),
         Some(&baseline_entries),
         Some(current_entries),
-        impact,
+        check,
+        &baseline_selector,
+        selector,
+        &check_platform_identity(),
+        check_toolchain_identity(),
         cumulative,
     )
+}
+
+/// Whether a cached green row was produced under the CURRENT check contract.
+///
+/// Recomputes the row's cache key from the baseline tree's own entries under the
+/// live contract and compares it against the key actually stored. Equality means
+/// every input folded into [`check_result_key`] — command, impact globs, policy,
+/// cadence, resource class, timeout, executor selector, platform, toolchain —
+/// is unchanged since that verdict was written.
+///
+/// This gate exists because the contract is deliberately re-read from the LIVE
+/// project config on every commit (see `run_write_checks_after_seal_inner`), so it
+/// can change underneath a cached row. The dangerous direction is **impact
+/// expansion**: a check whose globs were `src/**` passes on a tree that also
+/// contains an unexamined `packages/ui` edit, the globs later grow to include
+/// `packages/ui/**`, and diffing that same tree under the new globs reports the UI
+/// file as unchanged — so it is omitted from the selector even though no passing
+/// run ever covered it. The input-hash cache correctly misses in that situation;
+/// only the narrowing baseline needed the same contract awareness.
+///
+/// Failure is one-directional by construction: any mismatch, including an
+/// incidental one such as a toolchain bump, discards the baseline and falls back to
+/// the cumulative branch diff. That costs selectivity, never coverage. A false
+/// accept is not reachable, because every contract field is hashed into the key.
+fn baseline_matches_current_contract(
+    baseline: &CheckResultCacheEntry,
+    baseline_entries: &[(String, String)],
+    check: &CheckCommand,
+    baseline_selector: &InputSelector,
+    platform: &str,
+    toolchain: &str,
+) -> bool {
+    check_result_key(
+        check,
+        baseline_selector,
+        Some(baseline_entries),
+        &baseline.tree_hash,
+        platform,
+        toolchain,
+    ) == baseline.input_hash
 }
 
 /// Pure decision rule for choosing a placeholder-selection change set. A passing
 /// baseline means the cached verdict covered the baseline tree's impact-matched
 /// subset, so the next run only has to select tests/targets reachable from the
-/// paths whose matching tree entries changed since then. The baseline row is
-/// project-global: it may have been re-stamped by another branch, but comparing
-/// tree objects under the same impact globs is still sound. If the other branch's
-/// tree differs in extra matching paths, the delta over-includes; it cannot hide a
-/// current change from a passing baseline.
+/// paths whose matching tree entries changed since then.
+///
+/// A usable baseline has to clear three gates, and they fail for different reasons:
+///
+/// - **Passing.** Narrowing is anchored on a green verdict, so a later red run must
+///   not displace the green one it superseded.
+/// - **Same job** ([`list_latest_passing_check_results_for_job`], enforced by the
+///   caller's query). Only a same-branch tree narrows usefully. Against a
+///   concurrently running sibling branch the delta is the symmetric difference of
+///   two unrelated trees, so it drags in every file the sibling touched and
+///   routinely exceeds the cumulative branch diff it was supposed to beat.
+/// - **Same contract** ([`baseline_matches_current_contract`]). The checks contract
+///   is re-read live on every commit, so a verdict can outlive the definition that
+///   produced it. Diffing an old green tree under newly widened `impact` globs
+///   silently omits files the old run never examined.
+///
+/// The first two are selectivity concerns; the third is a coverage concern. All
+/// three fall back to the cumulative branch diff, which is always safe.
+#[allow(clippy::too_many_arguments)]
 fn baseline_delta_changed_files(
     latest: Option<&CheckResultCacheEntry>,
     baseline_entries: Option<&[(String, String)]>,
     current_entries: Option<&[(String, String)]>,
-    impact: Option<&Vec<String>>,
+    check: &CheckCommand,
+    baseline_selector: &InputSelector,
+    current_selector: &InputSelector,
+    platform: &str,
+    toolchain: &str,
     cumulative: &[GraphFileChange],
 ) -> Vec<GraphFileChange> {
-    if !latest.is_some_and(|row| row.passed) {
+    let Some(latest) = latest.filter(|row| row.passed) else {
         return cumulative.to_vec();
-    }
+    };
     let (Some(baseline), Some(current)) = (baseline_entries, current_entries) else {
         return cumulative.to_vec();
     };
-    match diff_tree_entries_for_impact(baseline, current, impact) {
-        Some(delta) if !delta.is_empty() => delta,
+    if !baseline_matches_current_contract(
+        latest,
+        baseline,
+        check,
+        baseline_selector,
+        platform,
+        toolchain,
+    ) {
+        return cumulative.to_vec();
+    }
+    match diff_tree_entries_for_selector(baseline, current, current_selector) {
+        delta if !delta.is_empty() => delta,
         _ => cumulative.to_vec(),
     }
 }
 
-fn diff_tree_entries_for_impact(
+fn diff_tree_entries_for_selector(
     baseline: &[(String, String)],
     current: &[(String, String)],
-    impact: Option<&Vec<String>>,
-) -> Option<Vec<GraphFileChange>> {
-    let matcher = match impact {
-        Some(globs) => Some(crate::execution::selection::build_glob_set(globs).ok()?),
-        None => None,
-    };
-    let is_match = |path: &str| {
-        matcher
-            .as_ref()
-            .map(|set| set.is_match(path))
-            .unwrap_or(true)
-    };
+    selector: &InputSelector,
+) -> Vec<GraphFileChange> {
     let baseline: BTreeMap<&str, &str> = baseline
         .iter()
-        .filter(|(path, _)| is_match(path))
+        .filter(|(path, _)| selector.matches(path))
         .map(|(path, blob)| (path.as_str(), blob.as_str()))
         .collect();
     let current: BTreeMap<&str, &str> = current
         .iter()
-        .filter(|(path, _)| is_match(path))
+        .filter(|(path, _)| selector.matches(path))
         .map(|(path, blob)| (path.as_str(), blob.as_str()))
         .collect();
     let paths: BTreeSet<&str> = baseline.keys().chain(current.keys()).copied().collect();
@@ -1953,7 +3648,7 @@ fn diff_tree_entries_for_impact(
             deletions: 0,
         });
     }
-    Some(changes)
+    changes
 }
 
 /// The outcome of one planned check: its exit-code-driven verdict, the parsed
@@ -1982,14 +3677,54 @@ pub(crate) struct CheckOutcome {
     /// non-test-runner checks (typecheck, api, …) where a test count is not
     /// meaningful.
     pub(crate) duration_ms: i64,
+    /// When set, Cairn did not execute this check AT ALL: the triple had already
+    /// failed for infrastructure reasons this many consecutive times, reaching
+    /// [`crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND`]. This is neither a verdict
+    /// nor a reused one — it is the honest absence of both — so it must never
+    /// wake anyone or read as a red the agent's change caused.
+    pub(crate) suppressed_after: Option<i64>,
+}
+
+impl CheckOutcome {
+    /// Whether this outcome is a verdict about the agent's own change. An
+    /// infrastructure failure is a fact about Cairn; a suppression is the absence
+    /// of a run. Neither is the agent's business, and this is the predicate that
+    /// keeps both out of the wake path.
+    pub(crate) fn is_genuine_failure(&self) -> bool {
+        !self.passed
+            && self.suppressed_after.is_none()
+            && !self
+                .failure_kind
+                .is_some_and(CheckFailureKind::is_infrastructure)
+    }
+}
+
+/// The agent-facing text for a check Cairn declined to run. Authored in the same
+/// voice as [`SubstrateFailure::agent_message`]: what happened, that the agent's
+/// change is not implicated, what will make it run again, and where the substrate
+/// half of the story lives. The stored diagnostic from the last real attempt is
+/// appended so the agent still sees WHAT kept breaking.
+pub(crate) fn suppressed_check_message(streak: i64, last_diagnostic: &str) -> String {
+    let head = format!(
+        "Cairn is no longer running this check. It failed for infrastructure reasons \
+         {streak} times in a row on unchanged inputs, so Cairn stopped executing it rather \
+         than repeating the same failure indefinitely. This is a failure inside Cairn, not a \
+         result about your change: no verdict was recorded, and none is being withheld. The \
+         check runs again as soon as its inputs change, and an operator can restore it for \
+         these same inputs by repairing the substrate and restarting Cairn. The full \
+         diagnostic is in Cairn's operator log."
+    );
+    let last = last_diagnostic.trim();
+    if last.is_empty() {
+        head
+    } else {
+        format!("{head}\n\nLast infrastructure failure:\n{last}")
+    }
 }
 
 /// Versioned identity of the host tools that can affect project-check outcomes.
 /// Probes run at most once per runner process; cache lookups never shell out.
 static CHECK_TOOLCHAIN_IDENTITY: OnceLock<String> = OnceLock::new();
-// v4 includes the slot-check line-tables-only Cargo profile used by every
-// executed check, invalidating verdicts produced under the old codegen profile.
-const CHECK_RESULT_KEY_VERSION: &str = "check-result-v4";
 
 pub(crate) fn check_platform_identity() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -2008,7 +3743,6 @@ pub fn check_toolchain_identity() -> &'static str {
                     .filter(|output| !output.is_empty())
                     .unwrap_or_else(|| "unavailable".to_string())
             }
-
             format!(
                 "rustc={};bun={}",
                 version("rustc", &["--version", "--verbose"]),
@@ -2018,93 +3752,234 @@ pub fn check_toolchain_identity() -> &'static str {
         .as_str()
 }
 
-/// Canonical identity for one project-check result. This is deliberately the
-/// single composition seam shared by cache lookups today and in-flight request
-/// coalescing later: `(impact-filtered tree, command, platform, toolchain)`.
-///
-/// A check with no impact globs uses the whole sealed tree. When tree entries
-/// cannot be read, an impact-scoped check also falls back to the whole-tree hash,
-/// conservatively over-invalidating rather than falsely reusing a verdict.
-/// Length-prefixing every component makes the tuple encoding unambiguous, and the
-/// version prefix guarantees existing input-only rows invalidate by miss.
+fn check_environment_fingerprint(variable_names: impl IntoIterator<Item = String>) -> String {
+    crate::execution::check_identity::local_environment_identity(
+        vec![check_toolchain_identity().to_string()],
+        variable_names,
+    )
+    .fingerprint
+}
+
+fn plan_environment_fingerprint(plan: &CheckPlan) -> String {
+    check_environment_fingerprint(plan.verdict_environment_names.clone())
+}
+
+#[cfg(test)]
+fn current_check_environment_fingerprint() -> String {
+    check_environment_fingerprint(Vec::new())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckReuseDecision {
+    reusable: bool,
+    reason: Option<String>,
+}
+
+fn check_reuse_decision(
+    command: &str,
+    passed: bool,
+    failure_kind: Option<CheckFailureKind>,
+    parsed: Option<&ParsedCheckResult>,
+) -> CheckReuseDecision {
+    let reject = |reason: &str| CheckReuseDecision {
+        reusable: false,
+        reason: Some(reason.to_string()),
+    };
+    if !passed {
+        return reject("check did not pass");
+    }
+    if failure_kind.is_some() {
+        return reject("check ended with an infrastructure or process failure");
+    }
+    let configured_test_runner = command.contains("test:rust")
+        || command.contains("cargo test")
+        || command.contains("nextest")
+        || command.contains("vitest");
+    let Some(parsed) = parsed else {
+        return if configured_test_runner {
+            reject("test runner did not produce a structured result")
+        } else {
+            CheckReuseDecision {
+                reusable: true,
+                reason: None,
+            }
+        };
+    };
+    if !parsed.is_test_runner() {
+        return CheckReuseDecision {
+            reusable: true,
+            reason: None,
+        };
+    }
+    if !parsed.complete {
+        return reject("test result is incomplete or degraded");
+    }
+    if parsed.selection == "empty" || parsed.tests_run() == 0 {
+        return reject("test selection was empty");
+    }
+    if parsed.undeclared_skips > 0 {
+        return reject("test result contains undeclared skips");
+    }
+    if parsed
+        .tests
+        .iter()
+        .any(|test| test.retried || test.attempts > 1)
+    {
+        return reject("one or more tests required a retry");
+    }
+    if parsed.tests.iter().any(|test| test.flaky) {
+        return reject("one or more tests were marked flaky");
+    }
+    CheckReuseDecision {
+        reusable: true,
+        reason: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fresh_observation_write(
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    input_hash: &str,
+    plan: &CheckPlan,
+    job_id: &str,
+    tool_use_id: &str,
+    exit_code: i32,
+    failure_kind: Option<CheckFailureKind>,
+    duration_ms: i64,
+    output_tail: &str,
+    provenance: Option<&cairn_common::executor_protocol::CellExecutionMeta>,
+    parsed: Option<&ParsedCheckResult>,
+    reuse: CheckReuseDecision,
+) -> FreshCheckObservationWrite {
+    let tests = parsed
+        .map(|result| {
+            result
+                .tests
+                .iter()
+                .map(|test| CheckTestResultRow {
+                    test_id: test.id.clone(),
+                    status: test.status.clone(),
+                    duration_ms: test.duration_ms.map(|value| value as i64),
+                    attempt_count: Some(test.attempts as i64),
+                    failure_excerpt: test.failure_message.clone(),
+                    skip_reason: test.skip_reason.clone(),
+                    declaration_source: test.skip_declaration_source.clone(),
+                    flaky: test.flaky,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // A remote executor's verdict environment is not the coordinator's environment.
+    // Until executor admission returns the selected machine's full advertised identity
+    // and locally hashed verdict variables, retain the observation for diagnosis but
+    // never publish it as reusable under a coordinator-derived cache key.
+    let remote_environment_unknown =
+        provenance.is_some_and(|meta| meta.executor_id != crate::fleet::COLOCATED_EXECUTOR_ID);
+    let reuse = if remote_environment_unknown {
+        CheckReuseDecision {
+            reusable: false,
+            reason: Some(
+                "selected executor did not report a complete verdict environment identity"
+                    .to_string(),
+            ),
+        }
+    } else {
+        reuse
+    };
+    let environment_fingerprint = if remote_environment_unknown {
+        String::new()
+    } else {
+        plan_environment_fingerprint(plan)
+    };
+    FreshCheckObservationWrite {
+        id: uuid::Uuid::new_v4().to_string(),
+        project_id: project_id.to_string(),
+        commit_sha: commit.evaluated.to_string(),
+        defined_by_commit_sha: commit.defined_by.to_string(),
+        tree_hash: tree_hash.to_string(),
+        check_name: plan.name.clone(),
+        input_hash: input_hash.to_string(),
+        environment_fingerprint,
+        exit_code,
+        verdict: if exit_code == 0 { "passed" } else { "failed" }.to_string(),
+        failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
+        complete: parsed
+            .map(|result| !result.is_test_runner() || result.complete)
+            .unwrap_or(!plan.command.contains("test")),
+        reusable: reuse.reusable,
+        non_reusable_reason: reuse.reason,
+        parser_version: crate::execution::check_identity::CHECK_PARSER_VERSION as i64,
+        result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+        ran_at: chrono::Utc::now().timestamp_millis(),
+        duration_ms,
+        job_id: Some(job_id.to_string()),
+        run_id: tool_use_id
+            .strip_prefix("manual-check:")
+            .and_then(|value| value.split_once(':').map(|(run_id, _)| run_id.to_string())),
+        cadence: if tool_use_id.starts_with("turn-checks:") {
+            "review"
+        } else if tool_use_id.starts_with("manual-check:") {
+            "manual"
+        } else {
+            "write"
+        }
+        .to_string(),
+        executor_id: provenance.map(|meta| meta.executor_id.clone()),
+        executor_device_id: provenance.map(|meta| meta.executor_device_id.clone()),
+        executor_connection_generation: provenance
+            .map(|meta| meta.executor_connection_generation as i64),
+        executor_cell_id: provenance.map(|meta| meta.cell_id.clone()),
+        executor_lease_epoch: provenance.map(|meta| meta.cell_epoch as i64),
+        executor_started_at_unix_ms: provenance.map(|meta| meta.started_at_unix_ms as i64),
+        executor_finished_at_unix_ms: provenance.map(|meta| meta.finished_at_unix_ms as i64),
+        runner_build_id: cairn_common::build_identity::current_executable_build_id().ok(),
+        toolchain_fingerprint: Some(check_toolchain_identity().to_string()),
+        output_tail: output_tail.to_string(),
+        target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
+        tests,
+    }
+}
+
 fn check_command_identity(
     check: &CheckCommand,
+    selector: &InputSelector,
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
     platform: &str,
     toolchain: &str,
 ) -> CommandResourceIdentity {
-    use sha2::{Digest, Sha256};
-
-    fn field(hasher: &mut Sha256, value: &str) {
-        hasher.update(value.len().to_be_bytes());
-        hasher.update(value.as_bytes());
-    }
-    fn option(hasher: &mut Sha256, value: Option<&str>) {
-        match value {
-            Some(value) => {
-                field(hasher, "some");
-                field(hasher, value);
-            }
-            None => field(hasher, "none"),
-        }
-    }
-    fn strings(hasher: &mut Sha256, values: Option<&[String]>) {
-        let mut values = values.unwrap_or_default().to_vec();
-        values.sort();
-        field(hasher, &values.len().to_string());
-        for value in values {
-            field(hasher, &value);
-        }
-    }
-
-    let filtered_tree = match check.impact.as_ref() {
-        None => tree_hash.to_string(),
-        Some(globs) => match entries {
-            Some(entries) => crate::execution::selection::check_input_hash(entries, globs),
-            None => tree_hash.to_string(),
+    let (os, arch) = platform.split_once('-').unwrap_or((platform, "unknown"));
+    let content =
+        crate::execution::check_identity::content_identity(check, selector, entries, tree_hash);
+    let environment = crate::execution::check_identity::environment_identity(
+        crate::execution::check_identity::CheckEnvironmentInput {
+            os: os.to_string(),
+            arch: arch.to_string(),
+            executor_id: None,
+            device_id: None,
+            capabilities: vec![toolchain.to_string()],
+            runner_build_id: cairn_common::build_identity::current_executable_build_id().ok(),
+            variable_names: crate::execution::check_identity::verdict_environment_names(check),
         },
-    };
-    let mut hasher = Sha256::new();
-    field(&mut hasher, CHECK_RESULT_KEY_VERSION);
-    field(&mut hasher, &filtered_tree);
-    field(&mut hasher, &check.command);
-    strings(&mut hasher, check.impact.as_deref());
-    field(&mut hasher, check.policy.as_str());
-    field(&mut hasher, check.when.as_str());
-    field(&mut hasher, check.resource_class.as_str());
-    option(
-        &mut hasher,
-        check.timeout.map(|value| value.to_string()).as_deref(),
+        |name| std::env::var(name).ok(),
     );
-    if let Some(constraints) = check.constraints.as_ref() {
-        field(&mut hasher, "constraints");
-        option(&mut hasher, constraints.executor_id.as_deref());
-        option(&mut hasher, constraints.device_id.as_deref());
-        option(&mut hasher, constraints.os.as_deref());
-        option(&mut hasher, constraints.arch.as_deref());
-        strings(&mut hasher, Some(&constraints.required_toolchains));
-    } else {
-        field(&mut hasher, "no-constraints");
-    }
-    field(&mut hasher, platform);
-    // This fingerprint is runner-local and is sound while executors are colocated.
-    // Executor-resolved keying for heterogeneous fleets remains deliberately deferred.
-    field(&mut hasher, toolchain);
     CommandResourceIdentity {
         version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
-        key: format!("{:x}", hasher.finalize()),
+        key: crate::execution::check_identity::combined_result_key(&content, &environment),
     }
 }
 
 pub(crate) fn check_result_key(
     check: &CheckCommand,
+    selector: &InputSelector,
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
     platform: &str,
     toolchain: &str,
 ) -> String {
-    check_command_identity(check, entries, tree_hash, platform, toolchain).key
+    check_command_identity(check, selector, entries, tree_hash, platform, toolchain).key
 }
 
 /// Execute the planned checks against the sealed tree, consulting the cache
@@ -2161,12 +4036,12 @@ pub(crate) fn check_result_key(
 async fn run_planned_checks_with_board<F, Fut, N, E>(
     db: Arc<LocalDb>,
     project_id: &str,
+    commit: CheckRunCommit<'_>,
     tree_hash: &str,
     job_id: &str,
     plans: &[(CheckPlan, String)],
     tool_use_id: &str,
     mode: CheckExecMode,
-    admission: &CheckAdmissionController,
     diagnostic_orch: Option<&Orchestrator>,
     status_board: Option<CheckStatusBoard>,
     execute: F,
@@ -2189,46 +4064,71 @@ where
     board.emit_initial();
 
     // Phase 1: resolve cache HITS sequentially, and collect the MISS indices to
-    // execute. `outcomes` is index-addressed so misses can complete out of order
+    // execute. A fleet-backed call cannot admit coordinator-local evidence here:
+    // executor placement has not happened yet, so the eventual executor may be
+    // remote. Until selection returns a trusted environment identity, only the
+    // direct coordinator-local path (`diagnostic_orch == None`) can prove that
+    // this fingerprint describes the environment that would execute the check.
+    // `outcomes` is index-addressed so misses can complete out of order
     // (concurrent `Isolated` mode) and still reassemble into plan order.
+    let admit_coordinator_cache = diagnostic_orch.is_none();
     let mut outcomes: Vec<Option<CheckOutcome>> = (0..plans.len()).map(|_| None).collect();
     let mut misses: Vec<usize> = Vec::new();
     for (index, (plan, input_hash)) in plans.iter().enumerate() {
+        if !admit_coordinator_cache {
+            misses.push(index);
+            continue;
+        }
         // Cache hit ⇒ reuse the stored verdict and rehydrate the structured
         // detail; run nothing. The lookup is keyed by the per-check INPUT hash, so
         // a commit that changed none of this check's impact-matched files hits
         // even though the whole-tree hash moved.
-        let Ok(Some(entry)) = get_check_result(db.clone(), project_id, &plan.name, input_hash)
-        else {
+        let environment_fingerprint = plan_environment_fingerprint(plan);
+        let schema_version = crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64;
+        let Ok(Some(entry)) = get_exact_reusable_check_result(
+            db.clone(),
+            project_id,
+            &plan.name,
+            input_hash,
+            &environment_fingerprint,
+            schema_version,
+        ) else {
+            // Legacy, incomplete, red, flaky, or environment-mismatched evidence is diagnostic only.
             misses.push(index);
             continue;
         };
-        // Re-stamp the row onto the current whole tree so the `/checks` listing
-        // (keyed by whole-tree hash) still surfaces this check at the current
-        // tree — without re-running it.
-        let _ = store_check_result(
+        let source_observation = get_reusable_check_observation_id(
             db.clone(),
-            CheckResultCacheWrite {
+            project_id,
+            &plan.name,
+            input_hash,
+            &environment_fingerprint,
+            schema_version,
+        )
+        .ok()
+        .flatten();
+        let Some(source_observation) = source_observation else {
+            // Legacy rows remain available for diagnosis, but cannot suppress execution.
+            misses.push(index);
+            continue;
+        };
+        let _ = record_cached_check_observation(
+            db.clone(),
+            CachedCheckObservationWrite {
                 project_id: project_id.to_string(),
+                commit_sha: commit.evaluated.to_string(),
+                // The reused verdict came from another commit's observation, but
+                // THIS alias is a statement about the commit being evaluated: it
+                // is that commit's definition the reuse was admitted under. The
+                // source observation keeps its own defining commit.
+                defined_by_commit_sha: commit.defined_by.to_string(),
                 tree_hash: tree_hash.to_string(),
-                input_hash: input_hash.clone(),
                 check_name: plan.name.clone(),
-                exit_code: entry.exit_code,
-                passed: entry.passed,
-                output_tail: entry.output_tail.clone(),
-                duration_ms: entry.duration_ms,
-                target_results_json: entry.target_results_json.clone(),
-                job_id: Some(job_id.to_string()),
-                cached: Some(true),
-                failure_kind: entry.failure_kind.clone(),
-                executor_id: entry.executor_id.clone(),
-                executor_device_id: entry.executor_device_id.clone(),
-                executor_connection_generation: entry.executor_connection_generation,
-                executor_cell_id: entry.executor_cell_id.clone(),
-                executor_lease_epoch: entry.executor_lease_epoch,
-                executor_started_at_unix_ms: entry.executor_started_at_unix_ms,
-                executor_finished_at_unix_ms: entry.executor_finished_at_unix_ms,
-                toolchain_fingerprint: entry.toolchain_fingerprint.clone(),
+                input_hash: input_hash.to_string(),
+                environment_fingerprint: environment_fingerprint.clone(),
+                result_schema_version: schema_version,
+                source_observation_id: source_observation,
+                evaluated_at: chrono::Utc::now().timestamp_millis(),
             },
         );
         if let Some(orch) = diagnostic_orch {
@@ -2266,6 +4166,7 @@ where
             output_tail: entry.output_tail,
             cached: true,
             duration_ms: entry.duration_ms,
+            suppressed_after: None,
         };
         // A cache hit jumps straight from pending to its final state.
         board.transition(
@@ -2287,23 +4188,58 @@ where
         let board = &board;
         async move {
             let (plan, input_hash) = &plans[index];
-            // Slot scheduling owns its own priority-aware admission. Acquiring the
-            // legacy FIFO permit before entering that queue would let a review
-            // request hold host capacity while blocking a later interactive/write
-            // request. Local checks retain the existing controller unchanged.
-            let permit = if plan.requires_runner_local_admission {
-                Some(
-                    admission
-                        .acquire(plan.resource_class)
-                        .await
-                        .expect("check admission semaphore must remain open"),
-                )
-            } else {
-                None
-            };
+            // Admission happens once, in the executor's priority-aware queue, and
+            // this submission declares what it will fan out to so that queue can
+            // account for it. There is deliberately no second gate here: a
+            // runner-local permit taken BEFORE entering the executor's queue is
+            // what let a review request hold host capacity while a later
+            // write-cadence request waited behind it (CAIRN-3108).
             board.transition(index, "running", None);
             let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
             let started = Instant::now();
+            let exec_outcome = execute(index, plan.command.clone(), stream_id)
+                .await
+                .map_err(Into::<CheckExecutionFailure>::into);
+
+            // A refused reservation is not an execution. Submission declined to
+            // launch this command because the triple's retry budget is spent, so
+            // there is no output to parse, no verdict to classify, and nothing to
+            // store — doing any of those would invent a result for a command that
+            // never ran. Render the suppression from the last real attempt.
+            if matches!(exec_outcome, Err(CheckExecutionFailure::Suppressed)) {
+                let outcome = match get_suppressed_check_result(
+                    db.clone(),
+                    project_id,
+                    &plan.name,
+                    input_hash,
+                ) {
+                    Ok(Some(entry)) => {
+                        record_suppressed_check(db, tree_hash, job_id, &plan.name, entry)
+                    }
+                    // The row cannot normally be missing — only a suppressed
+                    // triple is ever refused — but the outcome must still say
+                    // "not run" rather than fall through to a verdict.
+                    _ => CheckOutcome {
+                        name: plan.name.clone(),
+                        passed: false,
+                        exit_code: None,
+                        failure_kind: Some(CheckFailureKind::Infrastructure),
+                        parsed: None,
+                        output_tail: suppressed_check_message(
+                            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                            "the stored diagnostic is no longer available",
+                        ),
+                        cached: false,
+                        duration_ms: 0,
+                        suppressed_after: Some(
+                            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                        ),
+                    },
+                };
+                board.transition(index, "failed", summary_annotation(&outcome));
+                return (index, outcome);
+            }
+
             let (
                 exit_code,
                 output,
@@ -2313,7 +4249,7 @@ where
                 authoritative_duration_ms,
                 provenance,
                 publication,
-            ) = match execute(index, plan.command.clone(), stream_id).await {
+            ) = match exec_outcome {
                 Ok(CheckExecResult {
                     exit_code,
                     output,
@@ -2326,19 +4262,31 @@ where
                     output,
                     timed_out,
                     false,
-                    false,
+                    None,
                     duration_ms,
                     provenance,
                     publication,
                 ),
-                Err(error) => match error.into() {
-                    CheckExecutionFailure::Process(err) => {
-                        (None, err, false, true, false, None, None, None)
-                    }
-                    CheckExecutionFailure::Substrate(err) => {
-                        (None, err, false, false, true, None, None, None)
-                    }
-                },
+                Err(CheckExecutionFailure::Process(err)) => {
+                    (None, err, false, true, None, None, None, None)
+                }
+                // The two halves part here: the agent-facing message becomes
+                // the check's output, while the composed failure travels
+                // beside it — its diagnostic to the operator log record
+                // below, its applicability to the advisory gate.
+                Err(CheckExecutionFailure::Substrate(failure)) => (
+                    None,
+                    failure.agent_message(),
+                    false,
+                    false,
+                    Some(failure),
+                    None,
+                    None,
+                    None,
+                ),
+                Err(CheckExecutionFailure::Suppressed) => {
+                    unreachable!("a refused reservation returns above")
+                }
             };
             let duration_ms =
                 authoritative_duration_ms.unwrap_or_else(|| started.elapsed().as_millis() as i64);
@@ -2347,22 +4295,36 @@ where
             // Parse before classifying: positive assertion failures outrank any
             // incidental infrastructure warning in the combined output.
             let parsed = parse_check_output(&plan.command, &output);
-            let classification = if substrate_failure {
+            let classification = if substrate_failure.is_some() {
                 Some(FailureClassification {
                     kind: CheckFailureKind::Infrastructure,
-                    reason: "Cairn: check execution substrate failed before producing a verdict"
+                    reason: "Cairn: this check produced no verdict because Cairn's own \
+                             infrastructure failed"
                         .to_string(),
                     evidence_line: None,
                 })
             } else {
-                classify_check_failure(exit_code, timed_out, spawn_error, parsed.as_ref(), &output)
+                classify_check_failure(
+                    &plan.command,
+                    exit_code,
+                    timed_out,
+                    spawn_error,
+                    parsed.as_ref(),
+                    &output,
+                )
             };
             let failure_kind = classification.as_ref().map(|c| c.kind);
             let target_results_json = parsed.as_ref().and_then(|p| serde_json::to_string(p).ok());
-            let mut output_tail = classified_output_excerpt(&output, classification.as_ref());
+            // A substrate failure's `output` is already the message composed for
+            // the agent; framing authored text as "evidence" beneath a reason
+            // header would only wrap it in a second voice.
+            let mut output_tail = if substrate_failure.is_some() {
+                tail(&output, OUTPUT_TAIL_CHARS)
+            } else {
+                classified_output_excerpt(&output, classification.as_ref())
+            };
 
             if failure_kind == Some(CheckFailureKind::Infrastructure) {
-                let admission_snapshot = admission.snapshot();
                 let resources = crate::pressure::platform::read_process_resources();
                 let host = crate::pressure::platform::read_host_resources();
                 let process_tree = crate::pressure::process_tree::sample_ps_rows()
@@ -2388,13 +4350,11 @@ where
                     .unwrap_or_default();
                 let build_service =
                     diagnostic_orch.map(|orch| orch.build_service_diagnostic_snapshot("sccache"));
-                if let Some(snapshot) = &build_service {
-                    let evidence_head: String = output_tail.chars().take(1_500).collect();
-                    let diagnostic = format!("Cairn diagnostic: {}", snapshot.compact_summary());
-                    let reserved = evidence_head.chars().count() + diagnostic.chars().count() + 4;
-                    let final_tail = tail(&output_tail, OUTPUT_TAIL_CHARS.saturating_sub(reserved));
-                    output_tail = format!("{evidence_head}\n\n{diagnostic}\n\n{final_tail}");
-                }
+                output_tail = with_build_service_advisory(
+                    output_tail,
+                    build_service.as_ref(),
+                    substrate_failure.as_ref(),
+                );
                 log::warn!(
                     "check infrastructure failure: {}",
                     serde_json::json!({
@@ -2403,11 +4363,14 @@ where
                         "suiteId": tool_use_id,
                         "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
                         "resourceClass": plan.resource_class.as_str(),
-                        "queueWaitMs": permit.as_ref().map_or(0, |permit| permit.waited().as_millis()),
+                        "declaredConcurrencyUnits": declared_check_reservation(plan.resource_class).concurrency_units,
                         "durationMs": duration_ms,
                         "exitCode": exit_code,
                         "timedOut": timed_out,
-                        "admission": admission_snapshot,
+                        // The half the agent never sees: outcome variants, slot
+                        // paths, queue evidence. Correlated to the agent's
+                        // verdict by the check, job, and suite ids above.
+                        "substrateDiagnostic": substrate_failure.as_ref().map(SubstrateFailure::diagnostic),
                         "runnerRssBytes": resources.rss_bytes,
                         "runnerPhysicalFootprintBytes": resources.phys_footprint_bytes,
                         "hostTotalMemoryBytes": host.total_memory_bytes,
@@ -2428,44 +4391,80 @@ where
                 Some(crate::fleet::PublicationRole::Published)
             );
             if should_publish {
-                let _ = store_check_result(
-                    db.clone(),
-                    CheckResultCacheWrite {
-                        project_id: project_id.to_string(),
-                        tree_hash: tree_hash.to_string(),
-                        input_hash: input_hash.clone(),
-                        check_name: plan.name.clone(),
-                        exit_code: exit_code.unwrap_or(-1),
-                        passed,
-                        output_tail: output_tail.clone(),
-                        duration_ms,
-                        target_results_json,
-                        job_id: Some(job_id.to_string()),
-                        cached: Some(false),
-                        failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
-                        executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
-                        executor_device_id: provenance
-                            .as_ref()
-                            .map(|meta| meta.executor_device_id.clone()),
-                        executor_connection_generation: provenance
-                            .as_ref()
-                            .map(|meta| meta.executor_connection_generation as i64),
-                        executor_cell_id: provenance.as_ref().map(|meta| meta.cell_id.clone()),
-                        executor_lease_epoch: provenance
-                            .as_ref()
-                            .map(|meta| meta.lease_epoch as i64),
-                        executor_started_at_unix_ms: provenance
-                            .as_ref()
-                            .map(|meta| meta.started_at_unix_ms as i64),
-                        executor_finished_at_unix_ms: provenance
-                            .as_ref()
-                            .map(|meta| meta.finished_at_unix_ms as i64),
-                        toolchain_fingerprint: Some(check_toolchain_identity().to_string()),
-                    },
+                let legacy_write = CheckResultCacheWrite {
+                    project_id: project_id.to_string(),
+                    defined_by_commit_sha: Some(commit.defined_by.to_string()),
+                    tree_hash: tree_hash.to_string(),
+                    input_hash: input_hash.clone(),
+                    check_name: plan.name.clone(),
+                    exit_code: exit_code.unwrap_or(-1),
+                    passed,
+                    output_tail: output_tail.clone(),
+                    duration_ms,
+                    target_results_json,
+                    job_id: Some(job_id.to_string()),
+                    cached: Some(false),
+                    failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
+                    executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
+                    executor_device_id: provenance
+                        .as_ref()
+                        .map(|meta| meta.executor_device_id.clone()),
+                    executor_connection_generation: provenance
+                        .as_ref()
+                        .map(|meta| meta.executor_connection_generation as i64),
+                    executor_cell_id: provenance.as_ref().map(|meta| meta.cell_id.clone()),
+                    executor_lease_epoch: provenance.as_ref().map(|meta| meta.cell_epoch as i64),
+                    executor_started_at_unix_ms: provenance
+                        .as_ref()
+                        .map(|meta| meta.started_at_unix_ms as i64),
+                    executor_finished_at_unix_ms: provenance
+                        .as_ref()
+                        .map(|meta| meta.finished_at_unix_ms as i64),
+                    toolchain_fingerprint: Some(check_toolchain_identity().to_string()),
+                };
+                let reuse =
+                    check_reuse_decision(&plan.command, passed, failure_kind, parsed.as_ref());
+                let observation = fresh_observation_write(
+                    project_id,
+                    commit,
+                    tree_hash,
+                    input_hash,
+                    plan,
+                    job_id,
+                    tool_use_id,
+                    exit_code.unwrap_or(-1),
+                    failure_kind,
+                    duration_ms,
+                    &output_tail,
+                    provenance.as_ref(),
+                    parsed.as_ref(),
+                    reuse,
                 );
+                if let Err(error) = record_fresh_check_observation(db.clone(), observation) {
+                    log::warn!("failed to record immutable check observation: {error}");
+                }
+                // The legacy row is retained only for infrastructure retry/suppression diagnosis.
+                if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
+                    let _ = store_check_result(db.clone(), legacy_write);
+                }
                 if let Some(crate::fleet::PublicationRole::Publisher(guard)) = publication_role {
                     guard.published();
                 }
+            }
+
+            // The bound may have just been reached by the store above. Claim the
+            // ONE escalation this triple is allowed and, if we won it, put the
+            // operator's half of the story where the rest of it already lives.
+            if should_publish && failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
+                escalate_suppressed_check(
+                    db,
+                    project_id,
+                    &plan.name,
+                    input_hash,
+                    job_id,
+                    tool_use_id,
+                    &output_tail,
+                );
             }
 
             let outcome = CheckOutcome {
@@ -2477,13 +4476,13 @@ where
                 output_tail,
                 cached: false,
                 duration_ms,
+                suppressed_after: None,
             };
             board.transition(
                 index,
                 if passed { "passed" } else { "failed" },
                 summary_annotation(&outcome),
             );
-            drop(permit);
             (index, outcome)
         }
     };
@@ -2512,6 +4511,140 @@ where
         .into_iter()
         .map(|o| o.expect("every plan resolved to a hit or a miss outcome"))
         .collect()
+}
+
+/// Whether a triple needs a fresh execution: it has no reusable verdict AND it is
+/// not already infrastructure-suppressed.
+///
+/// This is ADVISORY. It keeps a plan that is visibly suppressed from consuming
+/// build-slot admission, but it does not decide anything — the authoritative
+/// answer is [`crate::execution::cache::claim_check_execution`] in phase 1 of
+/// [`run_planned_checks_with_board`], which reserves the attempt in the same
+/// statement that grants it. Keeping the decision at the execution seam is what
+/// makes the bound hold under two cadences evaluating one triple at once; a
+/// filter this far upstream could only ever read state that is already stale by
+/// the time the command runs.
+///
+/// A filter that admits a plan the engine then suppresses is safe: the engine
+/// records the suppressed outcome itself, so the batch still settles.
+fn needs_execution(db: Arc<LocalDb>, project_id: &str, plan: &CheckPlan, input_hash: &str) -> bool {
+    get_exact_reusable_check_result(
+        db,
+        project_id,
+        &plan.name,
+        input_hash,
+        &plan_environment_fingerprint(plan),
+        crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+    )
+    .ok()
+    .flatten()
+    .is_none()
+}
+
+/// Turn a suppressed triple's stored row into this evaluation's outcome, and
+/// re-stamp that row onto the current tree so the tree-keyed `/checks` listing
+/// still shows the check instead of silently dropping it off the checklist.
+///
+/// The re-stamp carries `cached: true`, which the cache layer reads as
+/// [`crate::execution::cache::InfraStreakOp::Hold`]: nothing executed, so the
+/// counter must not move. The row's own `output_tail` is left as the faithful
+/// record of the last real infrastructure failure; the suppression is rendered
+/// FROM the counter by every surface, rather than overwritten into the evidence.
+pub(crate) fn record_suppressed_check(
+    db: &Arc<LocalDb>,
+    tree_hash: &str,
+    job_id: &str,
+    check_name: &str,
+    entry: CheckResultCacheEntry,
+) -> CheckOutcome {
+    let streak = entry.infra_failure_streak;
+    let _ = store_check_result(
+        db.clone(),
+        CheckResultCacheWrite {
+            project_id: entry.project_id.clone(),
+            tree_hash: tree_hash.to_string(),
+            input_hash: entry.input_hash.clone(),
+            check_name: check_name.to_string(),
+            exit_code: entry.exit_code,
+            passed: entry.passed,
+            output_tail: entry.output_tail.clone(),
+            duration_ms: entry.duration_ms,
+            target_results_json: entry.target_results_json.clone(),
+            job_id: Some(job_id.to_string()),
+            cached: Some(true),
+            failure_kind: entry.failure_kind.clone(),
+            executor_id: entry.executor_id.clone(),
+            executor_device_id: entry.executor_device_id.clone(),
+            executor_connection_generation: entry.executor_connection_generation,
+            executor_cell_id: entry.executor_cell_id.clone(),
+            executor_lease_epoch: entry.executor_lease_epoch,
+            executor_started_at_unix_ms: entry.executor_started_at_unix_ms,
+            executor_finished_at_unix_ms: entry.executor_finished_at_unix_ms,
+            toolchain_fingerprint: entry.toolchain_fingerprint.clone(),
+            // A re-stamp reports the row that already exists; the definition
+            // behind it is the one that failed, so it carries forward unchanged.
+            defined_by_commit_sha: entry.defined_by_commit_sha.clone(),
+        },
+    );
+    log::info!(
+        "check {check_name:?} is infrastructure-suppressed after {streak} consecutive \
+         infrastructure failures; not executing it for job {job_id}"
+    );
+    CheckOutcome {
+        name: check_name.to_string(),
+        passed: false,
+        exit_code: None,
+        failure_kind: entry
+            .failure_kind
+            .as_deref()
+            .and_then(CheckFailureKind::from_stored)
+            .or(Some(CheckFailureKind::Infrastructure)),
+        parsed: None,
+        output_tail: suppressed_check_message(streak, &entry.output_tail),
+        cached: false,
+        duration_ms: 0,
+        suppressed_after: Some(streak),
+    }
+}
+
+/// Claim and emit the single operator escalation a suppressed triple is allowed.
+///
+/// It rides the same `check infrastructure failure` log channel that already
+/// carries the substrate half of every infrastructure failure, so an operator
+/// reads the escalation beside the diagnostics that led to it. It fires once per
+/// triple rather than once per evaluation because
+/// [`claim_infra_escalation`] settles that in the database.
+fn escalate_suppressed_check(
+    db: &Arc<LocalDb>,
+    project_id: &str,
+    check_name: &str,
+    input_hash: &str,
+    job_id: &str,
+    tool_use_id: &str,
+    last_diagnostic: &str,
+) {
+    match claim_infra_escalation(db.clone(), project_id, check_name, input_hash) {
+        Ok(true) => log::error!(
+            "check infrastructure failure: {}",
+            serde_json::json!({
+                "escalation": "suppressed",
+                "check": check_name,
+                "projectId": project_id,
+                "inputHash": input_hash,
+                "jobId": job_id,
+                "suiteId": tool_use_id,
+                "bound": crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                "lastDiagnostic": last_diagnostic,
+                "consequence": "Cairn has stopped executing this check for these inputs. It \
+                                runs again when its inputs change, or for these same inputs \
+                                after the substrate is repaired and Cairn restarts.",
+            })
+        ),
+        Ok(false) => {}
+        Err(error) => log::warn!(
+            "failed to claim the infrastructure escalation for check {check_name:?}: {error}"
+        ),
+    }
 }
 
 /// Render the inline pass/fail summary appended to the originating tool result.
@@ -2545,25 +4678,43 @@ fn format_check_summary(results: &[CheckOutcome]) -> String {
 
 /// The parenthetical annotation for one check's status line, or `None` when there
 /// is nothing worth adding beyond the bare `\u{2713}`/`\u{2717} <name>`. This is
-/// the trust-carrying part of the summary: it turns three indistinguishable
-/// greens (a real N-test pass, a zero-selection vacuous pass, and a reused cache
-/// hit) into three visibly different lines.
+/// the trust-carrying part of the summary: it turns four indistinguishable greens
+/// (a real N-test pass, a zero-selection vacuous pass, a reused cache hit, and a
+/// pass whose suite skipped part of itself) into four visibly different lines.
 ///
 /// - Passing TEST-RUNNER check: `12 tests`, or `no tests matched the change`
 ///   when the selector executed zero tests (a `related` run that matched nothing).
+/// - Any skipped test is named: `12 tests, 3 skipped`, and `no tests ran, 12
+///   skipped` for a suite that skipped ITSELF entirely — the shape that let a
+///   whole cross-surface suite read green while validating nothing (CAIRN-3164).
+///   A skip is not a pass, so it can never be silent in the verdict.
 /// - Passing non-test check (tsc/api/dead-code): `4.1s` on a fresh run (duration
 ///   is the only meaningful signal; a test count would be a lie).
-/// - Failing TEST-RUNNER check: `2 of 40 failed, exit 101`.
+/// - Failing TEST-RUNNER check: `2 of 40 failed, exit 101`, or `1 suite failed
+///   to load, exit 1` when a file threw during collection and so ran no test.
 /// - Failing non-test check: `exit 101`, or `failed to run` on a spawn error.
 /// - A cache hit appends `cached` so a reused verdict never masquerades as fresh.
 ///
 /// Pure, so it is unit-tested directly.
 fn summary_annotation(o: &CheckOutcome) -> Option<String> {
+    // A check Cairn declined to run has no verdict to annotate, and every other
+    // arm below would describe one. Say what actually happened instead.
+    if let Some(streak) = o.suppressed_after {
+        return Some(format!(
+            "not run \u{2014} suppressed after {streak} infrastructure failures"
+        ));
+    }
     let test_parse = o.parsed.as_ref().filter(|p| p.is_test_runner());
     let mut parts: Vec<String> = Vec::new();
     if o.passed {
         match test_parse {
+            Some(p) if p.tests_run() == 0 && p.skipped > 0 => {
+                parts.push(format!("no tests ran, {} skipped", p.skipped))
+            }
             Some(p) if p.tests_run() == 0 => parts.push("no tests matched the change".to_string()),
+            Some(p) if p.skipped > 0 => {
+                parts.push(format!("{} tests, {} skipped", p.tests_run(), p.skipped))
+            }
             Some(p) => parts.push(format!("{} tests", p.tests_run())),
             // Non-test check: duration is the only honest signal, and only on a
             // fresh run (a cache hit's stored duration would be misleading).
@@ -2594,7 +4745,22 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
                     .exit_code
                     .map(|c| format!(", exit {c}"))
                     .unwrap_or_default();
-                parts.push(format!("{} of {} failed{exit}", p.failed, p.tests_run()));
+                // A file that failed to collect ran no test, so folding it into
+                // the assertion tally would read as "0 of 882 failed" — a red
+                // check pointing at nothing. Count the two separately.
+                let mut segments = Vec::new();
+                if p.failed > 0 || p.suite_failures == 0 {
+                    segments.push(format!("{} of {} failed", p.failed, p.tests_run()));
+                }
+                if p.suite_failures > 0 {
+                    let noun = if p.suite_failures == 1 {
+                        "suite"
+                    } else {
+                        "suites"
+                    };
+                    segments.push(format!("{} {noun} failed to load", p.suite_failures));
+                }
+                parts.push(format!("{}{exit}", segments.join(", ")));
             }
             None => match o.exit_code {
                 Some(code) => parts.push(format!("exit {code}")),
@@ -2680,35 +4846,23 @@ fn tail(s: &str, max_chars: usize) -> String {
     s.chars().skip(count - max_chars).collect()
 }
 
-/// The node job's `(base_branch, base_commit)` VCS anchors — the inputs
-/// [`node_changed_files`] needs to diff `fork..@`. Mirrors the projection in
-/// `resources/files.rs`; empty/missing values fall through to `None`.
-async fn load_node_vcs_anchors(db: &LocalDb, job_id: &str) -> (Option<String>, Option<String>) {
-    let job_id = job_id.to_string();
-    let row = db
-        .read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT base_branch, base_commit FROM jobs WHERE id = ?1 LIMIT 1",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                match rows.next().await? {
-                    Some(row) => Ok(Some((row.opt_text(0)?, row.opt_text(1)?))),
-                    None => Ok(None),
-                }
-            })
+/// The fork point a node's write-check impact gate diffs from, resolved live.
+///
+/// `None` when the job has no branch or an endpoint does not resolve; the
+/// caller falls back to the project default tip, which is what this path did
+/// for a job with no recorded coordinate at all. What it must never do is start
+/// from `jobs.base_commit`: that row is the coordinate the branch was cut at
+/// and does not follow a base advance, so a stale one hands the impact gate
+/// every file the target merged in the meantime.
+async fn live_node_base(orch: &Orchestrator, job_id: &str) -> Option<String> {
+    crate::diff::live_job_branch_range(&orch.db.local, job_id, &orch.config_dir)
+        .await
+        .map_err(|error| {
+            log::debug!("node {job_id} write checks: no live base coordinate ({error})");
         })
-        .await;
-    match row {
-        Ok(Some((branch, commit))) => (
-            branch.filter(|s| !s.is_empty()),
-            commit.filter(|s| !s.is_empty()),
-        ),
-        _ => (None, None),
-    }
+        .ok()
+        .flatten()
+        .map(|range| range.base)
 }
 
 async fn submit_review_check(
@@ -2718,7 +4872,10 @@ async fn submit_review_check(
 ) -> Result<CheckExecResult, CheckExecutionFailure> {
     let build_service = orch.build_service_diagnostic_snapshot("sccache");
     if let Some(failure) = active_build_service_failure(&build_service) {
-        return Err(CheckExecutionFailure::Substrate(failure));
+        return Err(CheckExecutionFailure::Substrate(
+            SubstrateFailure::new(SubstrateFailureShape::Dispatch, failure)
+                .implicating_build_service(),
+        ));
     }
     let submitted = match orch
         .fleet
@@ -2733,12 +4890,55 @@ async fn submit_review_check(
     check_result_from_cell_outcome(submitted.outcome, Some(submitted.publication))
 }
 
+/// Append the shared build-cache service's advisory to a verdict — but only for
+/// a failure the service can plausibly explain.
+///
+/// Two failure classes qualify. A check whose OWN output looked like an abnormal
+/// build reaches [`CheckFailureKind::Infrastructure`] through
+/// [`classify_check_failure`]'s evidence arms, which is exactly the shape a sick
+/// cache daemon produces; it carries no [`SubstrateFailure`], so `substrate` is
+/// `None`. And a dispatch refusal the service itself caused is marked
+/// [`SubstrateFailure::implicating_build_service`] where it is composed.
+///
+/// Every other substrate failure — a cell's storage cleanup, a capacity
+/// deadline, a cancellation, a lost result — is unrelated to the cache, and
+/// attaching "this commonly causes failures of this kind" to one would assert a
+/// cause that is not one, however sick the daemon happens to be at that moment.
+/// The snapshot itself is operator vocabulary and rides the log record
+/// regardless.
+fn with_build_service_advisory(
+    output_tail: String,
+    build_service: Option<&crate::orchestrator::build_services::BuildServiceDiagnosticSnapshot>,
+    substrate: Option<&SubstrateFailure>,
+) -> String {
+    if substrate.is_some_and(|failure| !failure.build_service_implicated()) {
+        return output_tail;
+    }
+    let Some(advisory) = build_service.and_then(|snapshot| snapshot.agent_advisory()) else {
+        return output_tail;
+    };
+    // The remainder resumes where the head stopped, so a short verdict is not
+    // printed twice around the advisory.
+    let head: String = output_tail.chars().take(1_500).collect();
+    let remainder: String = output_tail.chars().skip(1_500).collect();
+    let reserved = head.chars().count() + advisory.chars().count() + 4;
+    let rest = tail(&remainder, OUTPUT_TAIL_CHARS.saturating_sub(reserved));
+    if rest.is_empty() {
+        format!("{head}\n\n{advisory}")
+    } else {
+        format!("{head}\n\n{advisory}\n\n{rest}")
+    }
+}
+
+/// The operator-facing diagnostic for a build-service failure that must stop
+/// check dispatch, or `None`. The agent-facing half of the same failure is
+/// composed by [`SubstrateFailure`] at the call site.
 fn active_build_service_failure(
     snapshot: &crate::orchestrator::build_services::BuildServiceDiagnosticSnapshot,
 ) -> Option<String> {
-    snapshot.current_failure().map(|failure| {
-        format!("Cairn check infrastructure failure: sccache port conflict: {failure}")
-    })
+    snapshot
+        .current_failure()
+        .map(|failure| format!("sccache port conflict: {failure}"))
 }
 
 fn append_sandbox_denial_evidence(
@@ -2814,14 +5014,18 @@ fn check_result_from_cell_outcome(
         CellOutcome::Completed {
             mutation_delta: Some(delta),
             ..
-        } => Err(CheckExecutionFailure::Substrate(format!(
-            "Cairn check infrastructure failure: cell produced mutation delta {} based on {}",
-            delta.delta_commit, delta.base_commit
-        ))),
+        } => Err(CheckExecutionFailure::substrate(
+            SubstrateFailureShape::Result,
+            format!(
+                "cell produced mutation delta {} based on {}",
+                delta.delta_commit, delta.base_commit
+            ),
+        )),
         CellOutcome::FailedAfterExecution { diagnostic, .. } => {
-            Err(CheckExecutionFailure::Substrate(format!(
-                "Cairn check infrastructure failure: slot result publication failed: {diagnostic}"
-            )))
+            Err(CheckExecutionFailure::substrate(
+                SubstrateFailureShape::Result,
+                format!("slot result publication failed: {diagnostic}"),
+            ))
         }
         CellOutcome::Unavailable {
             reason:
@@ -2855,24 +5059,27 @@ fn check_result_from_cell_outcome(
             if let Some(pressure) = host_pressure {
                 facts.push(format!("hostPressure={pressure:?}"));
             }
-            Err(CheckExecutionFailure::Substrate(format!(
-                "Cairn check infrastructure failure: build-slot deadline ({}) — {diagnostic}",
-                facts.join(", ")
-            )))
+            Err(CheckExecutionFailure::substrate(
+                SubstrateFailureShape::Capacity,
+                format!("build-slot deadline ({}) — {diagnostic}", facts.join(", ")),
+            ))
         }
-        CellOutcome::Unavailable { reason, diagnostic } => Err(CheckExecutionFailure::Substrate(
-            format!("Cairn check infrastructure failure: {reason:?}: {diagnostic}"),
+        CellOutcome::Unavailable { reason, diagnostic } => Err(CheckExecutionFailure::substrate(
+            no_start_shape(&reason),
+            format!("{reason:?}: {diagnostic}"),
         )),
         CellOutcome::StorageFailure {
             stage,
             kind,
             diagnostic,
             ..
-        } => Err(CheckExecutionFailure::Substrate(format!(
-            "Cairn check infrastructure storage failure ({stage:?}/{kind:?}): {diagnostic}"
-        ))),
-        CellOutcome::Cancelled { .. } => Err(CheckExecutionFailure::Substrate(
-            "Cairn check infrastructure failure: cell request was cancelled".to_string(),
+        } => Err(CheckExecutionFailure::substrate(
+            SubstrateFailureShape::Storage,
+            format!("storage failure ({stage:?}/{kind:?}): {diagnostic}"),
+        )),
+        CellOutcome::Cancelled { .. } => Err(CheckExecutionFailure::substrate(
+            SubstrateFailureShape::Cancelled,
+            "cell request was cancelled",
         )),
     }
 }
@@ -2900,10 +5107,34 @@ pub(crate) async fn verify_review_tree(
     if changed.is_empty() {
         return ReviewTreeGateResult::Green;
     }
-    let Some(checks) = load_live_project_checks(orch, project_id, planning_root).await else {
+    // The gate's definition comes from the PROSPECTIVE commit it is verifying,
+    // not from the project checkout: the combined tree is what merges, so the
+    // checks it must satisfy are the ones that tree declares.
+    let Some(CommitChecksContract {
+        contract: ChecksContract {
+            checks,
+            extra_inputs,
+        },
+        defined_by_commit,
+    }) = load_checks_contract_at_commit(Path::new(repository), commit_id).await
+    else {
         return ReviewTreeGateResult::Green;
     };
-    let mut plans = applicable_combined_tree_gate_checks(&checks, changed, planning_root);
+    assert_eq!(
+        defined_by_commit, commit_id,
+        "a combined-tree gate must be defined by the tree it verifies"
+    );
+    // The gate evaluates the PROSPECTIVE tree, so its input closures are derived
+    // from that tree's manifests — the same entries it keys verdicts by.
+    let gate_jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let gate_repository = PathBuf::from(repository);
+    let blobs = TreeBlobs {
+        jj: &gate_jj,
+        repository: &gate_repository,
+    };
+    let snapshot = TreeSnapshot::new(Some(tree_entries), &blobs);
+    let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+    let mut plans = applicable_combined_tree_gate_checks(&checks, &inputs, changed, planning_root);
     if plans.is_empty() {
         return ReviewTreeGateResult::Green;
     }
@@ -2911,13 +5142,13 @@ pub(crate) async fn verify_review_tree(
     let platform = check_platform_identity();
     let toolchain = check_toolchain_identity();
     let mut keyed = Vec::with_capacity(plans.len());
-    for mut plan in plans.drain(..) {
-        plan.requires_runner_local_admission = false;
+    for plan in plans.drain(..) {
         let configured = checks
             .get(&plan.name)
             .expect("planned check must retain its configured definition");
         let key = check_result_key(
             configured,
+            inputs.for_check(&plan.name),
             Some(tree_entries),
             tree_hash,
             &platform,
@@ -2960,18 +5191,21 @@ pub(crate) async fn verify_review_tree(
             .key
         })
         .collect();
-    let constraints: Vec<_> = keyed
+    let executors: Vec<_> = keyed
         .iter()
         .map(|(plan, _)| {
             checks
                 .get(&plan.name)
-                .and_then(|check| check.constraints.clone())
+                .and_then(|check| check.executor.clone())
         })
         .collect();
-    let fleet_config = crate::config::settings::load_fleet(&orch.config_dir);
-    let deadline = fleet_config
-        .acquisition_deadline_seconds
-        .saturating_mul(1_000);
+    // One horizon for the whole wave: these are the items of one planned check
+    // run, and staggering their willingness to wait by whenever each closure
+    // happened to run would make the ordering of a fan-out decide which checks
+    // get a verdict.
+    let wait_horizon_unix_ms = crate::fleet::default_wait_horizon_unix_ms(
+        &crate::config::settings::load_fleet(&orch.config_dir),
+    );
     let project = project_id.to_string();
     let repository = repository.to_string();
     let commit = commit_id.to_string();
@@ -2990,15 +5224,18 @@ pub(crate) async fn verify_review_tree(
                 node_kind: Some(coords.node_segment),
             });
     let keyed_ref = &keyed;
-    let outcomes = run_planned_checks(
+    let outcomes = run_planned_checks_at_commit(
         orch.db.local.clone(),
         project_id,
+        CheckRunCommit {
+            evaluated: commit_id,
+            defined_by: &defined_by_commit,
+        },
         tree_hash,
         requesting_job_id,
         &keyed,
         &format!("merge-gate:{requesting_job_id}"),
         CheckExecMode::Isolated,
-        &orch.check_admission,
         Some(orch),
         move |index, command, _| {
             let project = project.clone();
@@ -3008,11 +5245,13 @@ pub(crate) async fn verify_review_tree(
             let owner = resolved_owner.clone();
             let env = env.clone();
             let timeout_ms = timeouts[index];
-            let constraints = constraints[index].clone();
+            let executor = executors[index].clone();
             let command_resource_identity = CommandResourceIdentity {
                 version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
                 key: command_identity_keys[index].clone(),
             };
+            let resource_reservation =
+                declared_check_reservation(keyed_ref[index].0.resource_class);
             async move {
                 let request = CellRequest {
                     request_id: uuid::Uuid::new_v4().to_string(),
@@ -3024,22 +5263,23 @@ pub(crate) async fn verify_review_tree(
                         absolute_path: repository,
                     },
                     base_commit: commit,
-                    command_class: cairn_common::executor_protocol::CellCommandClass::classify(
-                        &command,
-                    ),
+                    command_class: CellCommandClass::classify(&command),
                     command,
                     owner,
                     cwd: String::new(),
                     env,
                     priority,
-                    deadline_unix_ms: unix_time_ms_for_checks() + deadline,
+                    wait_horizon_unix_ms,
+                    waiting_since_unix_ms: unix_time_ms_for_checks(),
                     timeout_ms,
                     mutation_policy: MutationPolicy::PureVerdict,
                     requesting_job_id: Some(job),
                     affinity_key: None,
-                    constraints,
+                    executor,
+                    pinned_executor_id: None,
+                    placement_mobility: Default::default(),
                     command_resource_identity: Some(command_resource_identity),
-                    resource_reservation: Default::default(),
+                    resource_reservation,
                     learned_estimate: None,
                 };
                 submit_review_check(
@@ -3093,7 +5333,64 @@ fn unix_time_ms_for_checks() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Eligibility is a property of what the work does, not of what it asked
+    /// for. Both a constrained and an unconstrained pure-verdict group are free
+    /// to move; a mutating group never is, whatever it stated.
+    #[test]
+    fn only_pure_verdict_check_batches_are_free_to_move() {
+        use super::batch_placement_mobility;
+        use crate::fleet::MutationPolicy;
+        use cairn_common::executor_protocol::PlacementMobility;
+
+        assert_eq!(
+            batch_placement_mobility(&MutationPolicy::PureVerdict),
+            PlacementMobility::SpillEligible
+        );
+        assert_eq!(
+            batch_placement_mobility(&MutationPolicy::AllowDelta),
+            PlacementMobility::PinnedOrColocated,
+            "a batch whose delta has to come back cannot be placed away from the tree it mutates"
+        );
+    }
+
+    /// The selector partition runs before dispatch, so a group that named two
+    /// contradictory machines is refused as the configuration error it is rather
+    /// than becoming a placement problem.
+    #[test]
+    fn contradictory_selectors_within_a_group_refuse_before_dispatch() {
+        use super::{merge_batch_executor, PlannedCheckBatchItem};
+        use cairn_common::executor_protocol::ExecutorSelector;
+
+        let named = |name: &str| ExecutorSelector {
+            name: Some(name.into()),
+            ..ExecutorSelector::default()
+        };
+        let item = |name: &str| PlannedCheckBatchItem {
+            executor: Some(named(name)),
+            ..batch_item("true", super::CheckResourceClass::Shared)
+        };
+        let refusal = merge_batch_executor(&[item("bglab-ub"), item("bglab-mac")]).unwrap_err();
+        assert!(refusal.contains("bglab-ub"), "{refusal}");
+        assert!(refusal.contains("bglab-mac"), "{refusal}");
+    }
+
     use super::*;
+
+    /// Every check's selector, resolved with NO tree in hand. Glob and
+    /// no-input checks resolve exactly as they do in production; a `scope:`
+    /// check would degrade to the conservative whole-tree selector, which the
+    /// tests below do not exercise (see `execution::inputs` for those).
+    fn inputs(checks: &HashMap<String, CheckCommand>) -> ResolvedInputs {
+        ResolvedInputs::resolve(checks, &HashMap::new(), &TreeSnapshot::empty())
+    }
+
+    fn inputs_for(name: &str, check: &CheckCommand) -> ResolvedInputs {
+        inputs(&HashMap::from([(name.to_string(), check.clone())]))
+    }
+
+    fn selector(check: &CheckCommand) -> InputSelector {
+        crate::execution::inputs::resolve_one(check, &HashMap::new(), &TreeSnapshot::empty())
+    }
 
     #[test]
     fn slot_check_env_enforces_line_tables_only_without_mutating_agent_env() {
@@ -3120,10 +5417,66 @@ mod tests {
     }
 
     #[test]
+    fn manual_contract_snapshot_refuses_command_changed_at_execution_seam() {
+        let original = plan("race", "command-a");
+        let snapshot_command = original.command.clone();
+        let snapshot_identity = check_resource_identity(
+            "race",
+            &serde_yaml::from_str::<CheckCommand>("command: command-a\n").unwrap(),
+        )
+        .key;
+
+        // This models Settings replacing the live contract after planning. The
+        // operation carries only owned snapshot values across the seam.
+        let changed = plan("race", "command-b");
+        let changed_identity = check_resource_identity(
+            "race",
+            &serde_yaml::from_str::<CheckCommand>("command: command-b\n").unwrap(),
+        )
+        .key;
+
+        assert_ne!(snapshot_identity, changed_identity);
+        assert!(require_snapshot_command(&snapshot_command, "command-a").is_ok());
+        assert!(require_snapshot_command(&snapshot_command, &changed.command).is_err());
+    }
+
+    #[test]
+    fn manual_producer_uses_the_same_observation_shape_with_manual_provenance() {
+        let plan = plan("rust-tests", "bun run test:rust");
+        let write = fresh_observation_write(
+            "project",
+            CheckRunCommit {
+                evaluated: "commit",
+                defined_by: "commit",
+            },
+            "tree",
+            "input",
+            &plan,
+            "job",
+            "manual-check:run-123:rust-tests",
+            0,
+            None,
+            12,
+            "ok",
+            None,
+            None,
+            CheckReuseDecision {
+                reusable: true,
+                reason: None,
+            },
+        );
+        assert_eq!(write.cadence, "manual");
+        assert_eq!(write.run_id.as_deref(), Some("run-123"));
+        assert_eq!(write.commit_sha, "commit");
+        assert_eq!(write.check_name, "rust-tests");
+    }
+
+    #[test]
     fn dirty_manual_cache_context_rejects_store() {
         let context = ManualCheckCacheContext {
             project_id: "project".into(),
             job_id: "job".into(),
+            commit_sha: "commit".into(),
             tree_hash: "tree".into(),
             input_hash: "input".into(),
             cacheable: false,
@@ -3146,10 +5499,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
-
-    fn admission() -> CheckAdmissionController {
-        CheckAdmissionController::new(2)
-    }
 
     async fn test_orchestrator(config_dir: &Path) -> Orchestrator {
         let local = LocalDb::open(config_dir.join("checks.db")).await.unwrap();
@@ -3316,6 +5665,7 @@ mod tests {
         ];
         let key = check_result_key(
             &definition,
+            &selector(&definition),
             Some(&base),
             "whole-tree-a",
             "macos-aarch64",
@@ -3328,6 +5678,7 @@ mod tests {
             key,
             check_result_key(
                 &changed_definition,
+                &selector(&changed_definition),
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
@@ -3340,6 +5691,7 @@ mod tests {
             key,
             check_result_key(
                 &changed_definition,
+                &selector(&changed_definition),
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
@@ -3352,6 +5704,7 @@ mod tests {
             key,
             check_result_key(
                 &changed_definition,
+                &selector(&changed_definition),
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
@@ -3364,6 +5717,7 @@ mod tests {
             key,
             check_result_key(
                 &changed_definition,
+                &selector(&changed_definition),
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
@@ -3371,18 +5725,16 @@ mod tests {
             )
         );
         changed_definition = definition.clone();
-        changed_definition.constraints =
-            Some(cairn_common::executor_protocol::PlacementConstraints {
-                executor_id: Some("executor-a".to_string()),
-                device_id: Some("device-a".to_string()),
-                os: Some("macos".to_string()),
-                arch: Some("aarch64".to_string()),
-                required_toolchains: vec!["rust".to_string()],
-            });
+        changed_definition.executor = Some(cairn_common::executor_protocol::ExecutorSelector {
+            name: Some("bglab-mac".to_string()),
+            os: None,
+            required_toolchains: vec!["rust".to_string()],
+        });
         assert_ne!(
             key,
             check_result_key(
                 &changed_definition,
+                &selector(&changed_definition),
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
@@ -3393,6 +5745,7 @@ mod tests {
             key,
             check_result_key(
                 &definition,
+                &selector(&definition),
                 Some(&base),
                 "whole-tree-a",
                 "linux-x86_64",
@@ -3403,6 +5756,7 @@ mod tests {
             key,
             check_result_key(
                 &definition,
+                &selector(&definition),
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
@@ -3418,6 +5772,7 @@ mod tests {
             key,
             check_result_key(
                 &definition,
+                &selector(&definition),
                 Some(&inside_changed),
                 "whole-tree-b",
                 "macos-aarch64",
@@ -3432,6 +5787,7 @@ mod tests {
             key,
             check_result_key(
                 &definition,
+                &selector(&definition),
                 Some(&outside_changed),
                 "whole-tree-b",
                 "macos-aarch64",
@@ -3444,6 +5800,7 @@ mod tests {
             key,
             check_result_key(
                 &definition,
+                &selector(&definition),
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
@@ -3452,12 +5809,174 @@ mod tests {
         );
     }
 
+    // --- keying by the derived closure --------------------------------------
+
+    /// The repository's real manifests plus the source files a case needs, as a
+    /// sealed tree. `version` distinguishes two trees whose source differs.
+    fn workspace_tree(sources: &[(&str, &str)]) -> crate::execution::inputs::fixtures::TreeFixture {
+        let mut fixture = crate::execution::inputs::fixtures::real_workspace();
+        for (path, version) in sources {
+            fixture = fixture.source(path, version);
+        }
+        fixture
+    }
+
+    fn scoped(command: &str, tokens: &[&str]) -> CheckCommand {
+        let mut definition = check(command, None, CheckWhen::Review);
+        definition.scope = Some(crate::config::project_settings::CheckScopeSelector::Many(
+            tokens.iter().map(|token| token.to_string()).collect(),
+        ));
+        definition
+    }
+
+    /// This check's key over this tree, with its selector resolved from the same
+    /// tree — exactly what the runners do.
+    fn scoped_key(
+        definition: &CheckCommand,
+        extra_inputs: &HashMap<String, Vec<String>>,
+        fixture: &crate::execution::inputs::fixtures::TreeFixture,
+    ) -> String {
+        let entries = fixture.entries();
+        let snapshot = TreeSnapshot::new(Some(&entries), fixture);
+        let selector = crate::execution::inputs::resolve_one(definition, extra_inputs, &snapshot);
+        check_result_key(
+            definition,
+            &selector,
+            Some(&entries),
+            "whole-tree",
+            TEST_PLATFORM,
+            TEST_TOOLCHAIN,
+        )
+    }
+
+    #[test]
+    fn a_change_outside_a_scoped_check_s_closure_reuses_its_verdict() {
+        let rust = scoped("bun run test:rust", &["rust:cairn-core"]);
+        let no_extra = HashMap::new();
+        let before = workspace_tree(&[
+            ("src/App.tsx", "v1"),
+            ("src-tauri/os/cairn-core/src/lib.rs", "v1"),
+        ]);
+        let frontend_only = workspace_tree(&[
+            ("src/App.tsx", "v2"),
+            ("src-tauri/os/cairn-core/src/lib.rs", "v1"),
+        ]);
+        assert_eq!(
+            scoped_key(&rust, &no_extra, &before),
+            scoped_key(&rust, &no_extra, &frontend_only),
+            "a frontend-only commit changes no Rust input, so the verdict is reused"
+        );
+
+        // And a change INSIDE the closure moves the key, including one in a
+        // transitive dependency the check never names.
+        for path in [
+            "src-tauri/os/cairn-core/src/lib.rs",
+            "src-tauri/os/cairn-vcs/src/lib.rs",
+            "src-tauri/Cargo.lock",
+        ] {
+            let changed = workspace_tree(&[
+                ("src/App.tsx", "v1"),
+                ("src-tauri/os/cairn-core/src/lib.rs", "v1"),
+                (path, "v2"),
+            ]);
+            assert_ne!(
+                scoped_key(&rust, &no_extra, &before),
+                scoped_key(&rust, &no_extra, &changed),
+                "{path} is an input of rust:cairn-core and must produce a new key"
+            );
+        }
+    }
+
+    #[test]
+    fn retargeting_a_scope_or_an_extra_input_produces_a_new_key() {
+        let tree = workspace_tree(&[("src-tauri/os/cairn-core/src/lib.rs", "v1")]);
+        let no_extra = HashMap::new();
+        let core = scoped("bun run test:rust", &["rust:cairn-core"]);
+        let cmd = scoped("bun run test:rust", &["rust:cairn-cmd"]);
+        assert_ne!(
+            scoped_key(&core, &no_extra, &tree),
+            scoped_key(&cmd, &no_extra, &tree),
+            "the selector definition is part of the key"
+        );
+
+        let with_extra = HashMap::from([(
+            "rust:cairn-db".to_string(),
+            vec!["src-tauri/turso_migrations/**".to_string()],
+        )]);
+        assert_ne!(
+            scoped_key(&core, &no_extra, &tree),
+            scoped_key(&core, &with_extra, &tree),
+            "declaring an extra input its closure reaches re-keys the check"
+        );
+    }
+
+    #[test]
+    fn a_migration_is_an_input_of_every_check_whose_closure_reaches_cairn_db() {
+        let extra_inputs = HashMap::from([(
+            "rust:cairn-db".to_string(),
+            vec!["src-tauri/turso_migrations/**".to_string()],
+        )]);
+        let core = scoped("bun run test:rust", &["rust:cairn-core"]);
+        let cmd = scoped("bun run test:rust", &["rust:cairn-cmd"]);
+        let before = workspace_tree(&[("src-tauri/turso_migrations/0084_x.sql", "v1")]);
+        let after = workspace_tree(&[("src-tauri/turso_migrations/0084_x.sql", "v2")]);
+        assert_ne!(
+            scoped_key(&core, &extra_inputs, &before),
+            scoped_key(&core, &extra_inputs, &after)
+        );
+        assert_eq!(
+            scoped_key(&cmd, &extra_inputs, &before),
+            scoped_key(&cmd, &extra_inputs, &after),
+            "cairn-cmd never compiles the migrations in"
+        );
+    }
+
+    #[test]
+    fn a_config_error_runs_nothing_and_caches_nothing() {
+        let mut both = check(
+            "bun run test:rust",
+            Some(&["src-tauri/**"]),
+            CheckWhen::Write,
+        );
+        both.scope = Some(crate::config::project_settings::CheckScopeSelector::One(
+            "rust:cairn-core".to_string(),
+        ));
+        let map = HashMap::from([("rust".to_string(), both)]);
+        let plans = plan_checks(
+            &map,
+            &inputs(&map),
+            &[change("src-tauri/os/cairn-core/src/lib.rs")],
+            Path::new("/repo"),
+        );
+        let plan = plans.first().expect("one plan");
+        let error = plan
+            .config_error
+            .as_deref()
+            .expect("a check with two input definitions is unrunnable");
+        assert!(error.contains("impact"));
+        assert!(error.contains("scope"));
+    }
+
     #[test]
     fn resource_identity_is_stable_across_tree_states() {
         let definition = check("cargo test", Some(&["src/**"]), CheckWhen::Review);
         assert_ne!(
-            check_result_key(&definition, None, "tree-one", "platform", "toolchain"),
-            check_result_key(&definition, None, "tree-two", "platform", "toolchain"),
+            check_result_key(
+                &definition,
+                &selector(&definition),
+                None,
+                "tree-one",
+                "platform",
+                "toolchain"
+            ),
+            check_result_key(
+                &definition,
+                &selector(&definition),
+                None,
+                "tree-two",
+                "platform",
+                "toolchain"
+            ),
         );
         assert_eq!(
             check_resource_identity("rust-full", &definition),
@@ -3470,34 +5989,59 @@ mod tests {
     }
 
     #[test]
-    fn repository_rust_checks_select_all_cargo_control_inputs() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .expect("cairn-core manifest is nested under the repository root");
-        let checks = load_checks(repo_root).expect("repository check configuration must parse");
-        for name in ["rust-lint", "rust-full"] {
-            let check = checks.get(name).expect("configured Rust review check");
-            assert_eq!(check.when, CheckWhen::Review);
-            let impacts = check.impact.as_ref().expect("Rust check has impacts");
-            for path in [
-                "src-tauri/.cargo/config.toml",
-                "src-tauri/Cargo.toml",
-                "src-tauri/os/cairn-core/Cargo.toml",
-                "src-tauri/Cargo.lock",
-                "src-tauri/os/cairn-core/build.rs",
-            ] {
-                let planned = plan_checks(
-                    &HashMap::from([(name.to_string(), check.clone())]),
-                    &[change(path)],
-                    repo_root,
-                );
-                assert!(
-                    planned.iter().any(|plan| plan.name == name && plan.applies),
-                    "{name} must apply when {path} changes; impacts={impacts:?}"
-                );
-            }
+    fn cargo_control_inputs_select_a_rust_check() {
+        // A Rust check that only watched `**/*.rs` would skip a rebuild that a
+        // lockfile bump, a feature-flag edit, a linker setting, or a build script
+        // makes necessary. The impact set below is the one a Rust check must
+        // declare to cover every input cargo's output depends on; this pins that
+        // each of those inputs actually selects the check.
+        //
+        // The globs are the fixture, not a reading of the repository's own
+        // `.cairn/config.yaml`: a check set is project configuration a user may
+        // edit or clear at will, so asserting against the live file tests the
+        // configuration rather than the selection logic and breaks on an
+        // unrelated settings edit.
+        let impact = [
+            "src-tauri/**/*.rs",
+            "src-tauri/Cargo.toml",
+            "src-tauri/**/Cargo.toml",
+            "src-tauri/Cargo.lock",
+            "src-tauri/.cargo/config.toml",
+            "src-tauri/**/build.rs",
+        ];
+        let definition = check("bun run check:rust", Some(&impact), CheckWhen::Review);
+        let temp = TempDir::new().unwrap();
+
+        for path in [
+            "src-tauri/os/cairn-core/src/execution/checks.rs",
+            "src-tauri/.cargo/config.toml",
+            "src-tauri/Cargo.toml",
+            "src-tauri/os/cairn-core/Cargo.toml",
+            "src-tauri/Cargo.lock",
+            "src-tauri/os/cairn-core/build.rs",
+        ] {
+            let map = HashMap::from([("rust".to_string(), definition.clone())]);
+            let planned = plan_checks(&map, &inputs(&map), &[change(path)], temp.path());
+            assert!(
+                planned
+                    .iter()
+                    .any(|plan| plan.name == "rust" && plan.applies),
+                "a Rust check must apply when {path} changes; impact={impact:?}"
+            );
         }
+
+        // The impact set stays a filter: a change outside it selects nothing.
+        let map = HashMap::from([("rust".to_string(), definition)]);
+        let planned = plan_checks(
+            &map,
+            &inputs(&map),
+            &[change("web/src/pages/docs/recipes.mdx")],
+            temp.path(),
+        );
+        assert!(
+            planned.iter().all(|plan| !plan.applies),
+            "a documentation-only change selects no Rust check"
+        );
     }
 
     #[test]
@@ -3546,6 +6090,7 @@ mod tests {
         assert_eq!(
             check_result_key(
                 &definition,
+                &selector(&definition),
                 Some(&first_entries),
                 &tree,
                 "test-platform",
@@ -3553,6 +6098,7 @@ mod tests {
             ),
             check_result_key(
                 &definition,
+                &selector(&definition),
                 Some(&second_entries),
                 &tree,
                 "test-platform",
@@ -3576,11 +6122,14 @@ mod tests {
         CheckCommand {
             command: command.to_string(),
             impact: impact.map(|globs| globs.iter().map(|s| s.to_string()).collect()),
+            scope: None,
             policy: CheckPolicy::Advisory,
             when,
             resource_class: CheckResourceClass::Shared,
             timeout: None,
-            constraints: None,
+            executor: None,
+            verdict_environment: Vec::new(),
+            fixes: false,
         }
     }
 
@@ -3599,6 +6148,7 @@ mod tests {
             job_id: None,
             cached: None,
             failure_kind: None,
+            infra_failure_streak: 0,
             executor_id: None,
             executor_device_id: None,
             executor_connection_generation: None,
@@ -3607,6 +6157,7 @@ mod tests {
             executor_started_at_unix_ms: None,
             executor_finished_at_unix_ms: None,
             toolchain_fingerprint: None,
+            defined_by_commit_sha: Some(format!("commit-{tree_hash}")),
         }
     }
 
@@ -3646,16 +6197,24 @@ mod tests {
 
     #[test]
     fn gate_selects_write_checks_for_a_src_change() {
-        let plans =
-            applicable_write_checks(&repo_checks(), &[change("src/App.tsx")], Path::new("/repo"));
+        let plans = applicable_write_checks(
+            &repo_checks(),
+            &inputs(&repo_checks()),
+            &[change("src/App.tsx")],
+            Path::new("/repo"),
+        );
         let names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["frontend", "typecheck"]);
     }
 
     #[test]
     fn gate_is_empty_for_a_doc_only_change() {
-        let plans =
-            applicable_write_checks(&repo_checks(), &[change("docs/x.md")], Path::new("/repo"));
+        let plans = applicable_write_checks(
+            &repo_checks(),
+            &inputs(&repo_checks()),
+            &[change("docs/x.md")],
+            Path::new("/repo"),
+        );
         assert!(plans.is_empty(), "a doc-only commit triggers no checks");
     }
 
@@ -3663,6 +6222,7 @@ mod tests {
     fn gate_excludes_review_checks_for_a_rust_change() {
         let plans = applicable_write_checks(
             &repo_checks(),
+            &inputs(&repo_checks()),
             &[change("src-tauri/os/cairn-core/src/lib.rs")],
             Path::new("/repo"),
         );
@@ -3675,57 +6235,194 @@ mod tests {
         assert!(plans.is_empty());
     }
 
-    // --- contract source: live project config wins over the worktree -------
+    // --- contract source: the evaluated commit declares its own checks ------
 
-    /// Write a minimal `.cairn/config.yaml` declaring one `when:write` check.
+    /// Write a minimal `.cairn/config.yaml` declaring one `when:write` check
+    /// whose command greps a marker file of the same name.
     fn write_checks_config(dir: &Path, check_name: &str) {
         let path = crate::config::project_settings::get_project_config_path(dir);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
             format!(
-                "checks:\n  {check_name}:\n    command: run-it\n    impact:\n      - src/**\n    when: write\n"
+                "checks:\n  {check_name}:\n    command: grep marker {check_name}.txt\n    impact:\n      - src/**\n    when: write\n"
             ),
         )
         .unwrap();
     }
 
-    #[test]
-    fn checks_from_source_prefers_project_over_worktree() {
-        let project = tempfile::TempDir::new().unwrap();
-        let worktree = tempfile::TempDir::new().unwrap();
-        // Project (live) config and the worktree's committed config disagree:
-        // the project edited its checks after this branch was cut.
-        write_checks_config(project.path(), "frontend");
-        write_checks_config(worktree.path(), "typecheck");
+    /// An empty `checks:` mapping is a config that declares no checks at all.
+    fn write_checkless_config(dir: &Path) {
+        let path = crate::config::project_settings::get_project_config_path(dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "setupCommands: []\n").unwrap();
+    }
 
-        let checks = checks_from_source(Some(project.path()), worktree.path()).unwrap();
+    fn commit_at(repo: &Path, message: &str) -> String {
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=Cairn Test",
+                "-c",
+                "user.email=test@cairn.local",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ],
+        );
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// A repository whose default branch carries check A and whose sibling
+    /// branch carries check B — the exact shape of the leak: two live commits,
+    /// each declaring a check the other's tree knows nothing about.
+    fn sibling_definitions(temp: &TempDir) -> (std::path::PathBuf, String, String) {
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("src").join("lib.rs"), "fn base() {}").unwrap();
+        let base = commit_at(&repo, "base");
+
+        write_checks_config(&repo, "check-a");
+        std::fs::write(repo.join("check-a.txt"), "marker").unwrap();
+        let commit_a = commit_at(&repo, "define check-a");
+
+        git(&repo, &["checkout", "-q", "-b", "sibling", &base]);
+        write_checks_config(&repo, "check-b");
+        std::fs::write(repo.join("check-b.txt"), "marker").unwrap();
+        let commit_b = commit_at(&repo, "define check-b");
+        // Leave the checkout on the default branch, as a project checkout sits
+        // while an agent branch advances elsewhere.
+        git(&repo, &["checkout", "-q", "main"]);
+        (repo, commit_a, commit_b)
+    }
+
+    /// Each sealed commit declares its own checks, and only its own: the
+    /// definition and the content it evaluates come from one tree.
+    #[test]
+    fn a_commit_declares_its_own_checks_and_only_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, commit_a, commit_b) = sibling_definitions(&temp);
+
+        for (commit, own, foreign) in [
+            (&commit_a, "check-a", "check-b"),
+            (&commit_b, "check-b", "check-a"),
+        ] {
+            let loaded = checks_contract_at_commit(&repo, commit)
+                .unwrap_or_else(|| panic!("commit {commit} declares {own}"));
+            assert_eq!(
+                loaded.defined_by_commit, *commit,
+                "the contract records the commit that declared it"
+            );
+            let names: Vec<&str> = loaded.contract.checks.keys().map(String::as_str).collect();
+            assert_eq!(names, vec![own], "only {own} is declared at {commit}");
+            assert_eq!(
+                loaded.contract.checks[own].command,
+                format!("grep marker {own}.txt"),
+                "the command is the one this commit's own tree declares"
+            );
+
+            // Selection agrees: planning this contract can only ever select the
+            // commit's own check, so a sibling's definition is never run or
+            // recorded against it.
+            let changed = vec![change("src/lib.rs")];
+            let inputs = inputs(&loaded.contract.checks);
+            let planned =
+                applicable_write_checks(&loaded.contract.checks, &inputs, &changed, &repo);
+            let planned_names: Vec<&str> = planned.iter().map(|plan| plan.name.as_str()).collect();
+            assert_eq!(planned_names, vec![own]);
+            assert!(
+                !planned.iter().any(|plan| plan.command.contains(foreign)),
+                "{foreign} must never be planned for {commit}"
+            );
+        }
+    }
+
+    /// The canonical checkout sits on the default branch while a sibling job
+    /// seals its own commit. The sibling's cadence sees only its own check; the
+    /// project-level projection still reads the canonical configuration.
+    #[test]
+    fn a_sibling_commit_neither_reads_nor_feeds_the_project_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, _commit_a, commit_b) = sibling_definitions(&temp);
+
+        let sibling = checks_contract_at_commit(&repo, &commit_b).unwrap();
         assert!(
-            checks.contains_key("frontend"),
-            "the live project contract must win"
+            !sibling.contract.checks.contains_key("check-a"),
+            "the default branch's check must not reach a sibling commit"
+        );
+
+        let project = crate::config::project_settings::load_checks_contract(&repo)
+            .expect("the project checkout declares checks");
+        assert!(
+            project.checks.contains_key("check-a"),
+            "the project-level projection reads the canonical checkout"
         );
         assert!(
-            !checks.contains_key("typecheck"),
-            "the stale worktree contract must not leak in"
+            !project.checks.contains_key("check-b"),
+            "a branch's definition never becomes the project's"
         );
     }
 
+    /// A check begins at the commit that adds it and stops at the commit that
+    /// removes it — never earlier, never later.
     #[test]
-    fn checks_from_source_falls_back_to_worktree_when_project_unresolved() {
-        let worktree = tempfile::TempDir::new().unwrap();
-        write_checks_config(worktree.path(), "typecheck");
-        // No resolvable project repo path (e.g. a team project with no local
-        // clone): fall back to the worktree's own committed contract rather than
-        // silently dropping every check.
-        let checks = checks_from_source(None, worktree.path()).unwrap();
-        assert!(checks.contains_key("typecheck"));
+    fn adding_and_removing_a_check_takes_effect_only_from_its_own_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        write_checkless_config(&repo);
+        let before = commit_at(&repo, "no checks yet");
+        write_checks_config(&repo, "check-a");
+        let added = commit_at(&repo, "add check-a");
+        write_checkless_config(&repo);
+        let removed = commit_at(&repo, "remove check-a");
+
+        assert!(
+            checks_contract_at_commit(&repo, &before).is_none(),
+            "a later addition cannot reach back to an earlier commit"
+        );
+        assert!(checks_contract_at_commit(&repo, &added)
+            .unwrap()
+            .contract
+            .checks
+            .contains_key("check-a"));
+        assert!(
+            checks_contract_at_commit(&repo, &removed).is_none(),
+            "the removal takes effect at the commit that carries it"
+        );
     }
 
+    /// A commit with no config, an unparseable one, or one that declares no
+    /// checks selects nothing — the same as an absent contract always has. It
+    /// never falls back to another tree.
     #[test]
-    fn checks_from_source_none_when_neither_declares_checks() {
-        let project = tempfile::TempDir::new().unwrap();
-        let worktree = tempfile::TempDir::new().unwrap();
-        assert!(checks_from_source(Some(project.path()), worktree.path()).is_none());
+    fn an_absent_or_invalid_config_selects_nothing_rather_than_falling_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "no config here").unwrap();
+        let bare = commit_at(&repo, "no config");
+        let config_path = crate::config::project_settings::get_project_config_path(&repo);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "checks: [this is not a mapping\n").unwrap();
+        let invalid = commit_at(&repo, "invalid config");
+        // A later commit DOES declare a check; neither earlier commit may borrow it.
+        write_checks_config(&repo, "check-a");
+        let valid = commit_at(&repo, "valid config");
+
+        assert!(checks_contract_at_commit(&repo, &bare).is_none());
+        assert!(checks_contract_at_commit(&repo, &invalid).is_none());
+        assert!(checks_contract_at_commit(&repo, &valid).is_some());
+        assert!(
+            checks_contract_at_commit(&repo, "0000000000000000000000000000000000000000").is_none(),
+            "an unresolvable commit selects nothing"
+        );
     }
 
     // --- passing-baseline delta selection ---------------------------------
@@ -3746,7 +6443,11 @@ mod tests {
         ];
         let impact = vec!["src/**".to_string()];
 
-        let delta = diff_tree_entries_for_impact(&baseline, &current, Some(&impact)).unwrap();
+        let delta = diff_tree_entries_for_selector(
+            &baseline,
+            &current,
+            &InputSelector::from_globs(&impact),
+        );
         let observed: Vec<(&str, &str)> = delta
             .iter()
             .map(|change| (change.path.as_str(), change.status.as_str()))
@@ -3761,6 +6462,52 @@ mod tests {
         );
     }
 
+    const TEST_PLATFORM: &str = "test-platform";
+    const TEST_TOOLCHAIN: &str = "test-toolchain";
+
+    /// A cache row whose `input_hash` is the REAL key for `check` over
+    /// `baseline_entries` — i.e. a green row genuinely written under that contract.
+    /// Narrowing now requires this, so a row with a synthetic hash reads as
+    /// contract-mismatched and correctly declines to narrow.
+    fn cache_entry_under(
+        check_name: &str,
+        tree_hash: &str,
+        passed: bool,
+        check: &CheckCommand,
+        baseline_entries: &[(String, String)],
+    ) -> CheckResultCacheEntry {
+        let mut entry = cache_entry(check_name, tree_hash, passed);
+        entry.input_hash = check_result_key(
+            check,
+            &selector(check),
+            Some(baseline_entries),
+            tree_hash,
+            TEST_PLATFORM,
+            TEST_TOOLCHAIN,
+        );
+        entry
+    }
+
+    fn delta_for(
+        row: Option<&CheckResultCacheEntry>,
+        baseline: Option<&[(String, String)]>,
+        current: Option<&[(String, String)]>,
+        check: &CheckCommand,
+        cumulative: &[GraphFileChange],
+    ) -> Vec<GraphFileChange> {
+        baseline_delta_changed_files(
+            row,
+            baseline,
+            current,
+            check,
+            &selector(check),
+            &selector(check),
+            TEST_PLATFORM,
+            TEST_TOOLCHAIN,
+            cumulative,
+        )
+    }
+
     #[test]
     fn baseline_decision_uses_delta_only_from_passing_baseline() {
         let baseline = vec![("src/a.ts".to_string(), "a1".to_string())];
@@ -3768,16 +6515,20 @@ mod tests {
             ("src/a.ts".to_string(), "a1".to_string()),
             ("src/b.ts".to_string(), "b1".to_string()),
         ];
-        let impact = vec!["src/**".to_string()];
+        let frontend = check(
+            "bunx vitest related {changedFiles}",
+            Some(&["src/**"]),
+            CheckWhen::Write,
+        );
         let cumulative = vec![change("src/a.ts"), change("src/b.ts")];
-        let passing = cache_entry("frontend", "tree-a", true);
-        let failing = cache_entry("frontend", "tree-a", false);
+        let passing = cache_entry_under("frontend", "tree-a", true, &frontend, &baseline);
+        let failing = cache_entry_under("frontend", "tree-a", false, &frontend, &baseline);
 
-        let narrowed = baseline_delta_changed_files(
+        let narrowed = delta_for(
             Some(&passing),
             Some(&baseline),
             Some(&current),
-            Some(&impact),
+            &frontend,
             &cumulative,
         );
         assert_eq!(
@@ -3785,20 +6536,20 @@ mod tests {
             vec!["src/b.ts"]
         );
 
-        let from_fail = baseline_delta_changed_files(
+        let from_fail = delta_for(
             Some(&failing),
             Some(&baseline),
             Some(&current),
-            Some(&impact),
+            &frontend,
             &cumulative,
         );
         assert_eq!(from_fail, cumulative);
 
-        let from_missing = baseline_delta_changed_files(
+        let from_missing = delta_for(
             None,
             Some(&baseline),
             Some(&current),
-            Some(&impact),
+            &frontend,
             &cumulative,
         );
         assert_eq!(from_missing, cumulative);
@@ -3807,27 +6558,146 @@ mod tests {
     #[test]
     fn baseline_decision_falls_back_to_cumulative_on_empty_or_uncertain_delta() {
         let entries = vec![("src/a.ts".to_string(), "a1".to_string())];
-        let impact = vec!["src/**".to_string()];
+        let frontend = check(
+            "bunx vitest related {changedFiles}",
+            Some(&["src/**"]),
+            CheckWhen::Write,
+        );
         let cumulative = vec![change("src/a.ts")];
-        let passing = cache_entry("frontend", "tree-a", true);
+        let passing = cache_entry_under("frontend", "tree-a", true, &frontend, &entries);
 
-        let empty_delta = baseline_delta_changed_files(
+        let empty_delta = delta_for(
             Some(&passing),
             Some(&entries),
             Some(&entries),
-            Some(&impact),
+            &frontend,
             &cumulative,
         );
         assert_eq!(empty_delta, cumulative);
 
-        let unreadable_current = baseline_delta_changed_files(
-            Some(&passing),
-            Some(&entries),
-            None,
-            Some(&impact),
+        let unreadable_current =
+            delta_for(Some(&passing), Some(&entries), None, &frontend, &cumulative);
+        assert_eq!(unreadable_current, cumulative);
+    }
+
+    /// The checks contract is re-read from the LIVE project config on every commit,
+    /// so a green verdict can outlive the definition that produced it. Widening
+    /// `impact` is the dangerous direction: the old run never examined the newly
+    /// covered tree, yet diffing that same tree under the new globs reports the file
+    /// as unchanged and drops it from the selector. Nothing else catches this — the
+    /// input-hash cache correctly misses, and the row-ranking query cannot know which
+    /// contract a row was written under.
+    #[test]
+    fn widened_impact_discards_a_baseline_that_never_covered_the_new_glob() {
+        // The green run examined only `src/**`, so the UI file in its tree went
+        // unchecked even though it sat right there.
+        let baseline = vec![
+            ("packages/ui/x.ts".to_string(), "x1".to_string()),
+            ("src/a.ts".to_string(), "a1".to_string()),
+        ];
+        let narrow = check(
+            "bunx vitest related {changedFiles}",
+            Some(&["src/**"]),
+            CheckWhen::Write,
+        );
+        let green = cache_entry_under("frontend", "tree-a", true, &narrow, &baseline);
+
+        // The user then widens the live contract to cover packages/ui too.
+        let widened = check(
+            "bunx vitest related {changedFiles}",
+            Some(&["src/**", "packages/ui/**"]),
+            CheckWhen::Write,
+        );
+        let current = vec![
+            ("packages/ui/x.ts".to_string(), "x1".to_string()),
+            ("src/a.ts".to_string(), "a1".to_string()),
+            ("src/b.ts".to_string(), "b1".to_string()),
+        ];
+        let cumulative = vec![
+            change("packages/ui/x.ts"),
+            change("src/a.ts"),
+            change("src/b.ts"),
+        ];
+
+        let selected = delta_for(
+            Some(&green),
+            Some(&baseline),
+            Some(&current),
+            &widened,
             &cumulative,
         );
-        assert_eq!(unreadable_current, cumulative);
+
+        assert_eq!(
+            selected, cumulative,
+            "a baseline written under narrower impact must not anchor narrowing"
+        );
+        assert!(
+            selected.iter().any(|c| c.path == "packages/ui/x.ts"),
+            "the newly covered file is unchanged since the baseline tree, so only \
+             discarding that baseline keeps it in the selector"
+        );
+    }
+
+    /// The same-contract case still narrows: the gate must not be so blunt that it
+    /// disables the optimization it guards.
+    #[test]
+    fn unchanged_contract_still_narrows_to_the_tree_delta() {
+        let baseline = vec![("src/a.ts".to_string(), "a1".to_string())];
+        let current = vec![
+            ("src/a.ts".to_string(), "a1".to_string()),
+            ("src/b.ts".to_string(), "b1".to_string()),
+        ];
+        let frontend = check(
+            "bunx vitest related {changedFiles}",
+            Some(&["src/**"]),
+            CheckWhen::Write,
+        );
+        let green = cache_entry_under("frontend", "tree-a", true, &frontend, &baseline);
+        let cumulative = vec![change("src/a.ts"), change("src/b.ts")];
+
+        let selected = delta_for(
+            Some(&green),
+            Some(&baseline),
+            Some(&current),
+            &frontend,
+            &cumulative,
+        );
+        assert_eq!(
+            selected.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/b.ts"]
+        );
+    }
+
+    /// Editing the command is the other contract change that invalidates a baseline:
+    /// the green verdict was produced by a different runner invocation.
+    #[test]
+    fn changed_command_discards_the_baseline() {
+        let baseline = vec![("src/a.ts".to_string(), "a1".to_string())];
+        let current = vec![
+            ("src/a.ts".to_string(), "a1".to_string()),
+            ("src/b.ts".to_string(), "b1".to_string()),
+        ];
+        let before = check(
+            "bunx vitest related {changedFiles}",
+            Some(&["src/**"]),
+            CheckWhen::Write,
+        );
+        let after = check(
+            "bunx vitest related --reporter=json {changedFiles}",
+            Some(&["src/**"]),
+            CheckWhen::Write,
+        );
+        let green = cache_entry_under("frontend", "tree-a", true, &before, &baseline);
+        let cumulative = vec![change("src/a.ts"), change("src/b.ts")];
+
+        let selected = delta_for(
+            Some(&green),
+            Some(&baseline),
+            Some(&current),
+            &after,
+            &cumulative,
+        );
+        assert_eq!(selected, cumulative);
     }
 
     #[test]
@@ -3840,23 +6710,29 @@ mod tests {
             ("src/f1.ts".to_string(), "f1-a".to_string()),
             ("src/f2.ts".to_string(), "f2-b".to_string()),
         ];
-        let impact = vec!["src/**".to_string()];
-        let cumulative = vec![change("src/f1.ts"), change("src/f2.ts")];
-        let passing = cache_entry("frontend", "tree-a", true);
-        let selected = baseline_delta_changed_files(
-            Some(&passing),
-            Some(&baseline),
-            Some(&current),
-            Some(&impact),
-            &cumulative,
-        );
         let check = check(
             "bunx vitest related --reporter=json {changedFiles}",
             Some(&["src/**"]),
             CheckWhen::Write,
         );
+        let cumulative = vec![change("src/f1.ts"), change("src/f2.ts")];
+        let passing = cache_entry_under("frontend", "tree-a", true, &check, &baseline);
+        let selected = delta_for(
+            Some(&passing),
+            Some(&baseline),
+            Some(&current),
+            &check,
+            &cumulative,
+        );
 
-        let plan = replan_one_check("frontend", &check, &selected, Path::new("/repo")).unwrap();
+        let plan = replan_one_check(
+            "frontend",
+            &check,
+            &inputs_for("frontend", &check),
+            &selected,
+            Path::new("/repo"),
+        )
+        .unwrap();
         assert_eq!(
             plan.command,
             "bunx vitest related --reporter=json src/f2.ts"
@@ -3884,6 +6760,7 @@ mod tests {
     fn turn_end_gate_runs_review_not_write() {
         let plans = applicable_turn_end_checks(
             &cadence_checks(),
+            &inputs(&cadence_checks()),
             &[change("src/App.tsx")],
             Path::new("/repo"),
         );
@@ -3902,8 +6779,12 @@ mod tests {
         gate.policy = CheckPolicy::Gate;
         checks.insert("g".to_string(), gate);
 
-        let plans =
-            applicable_turn_end_checks(&checks, &[change("src/App.tsx")], Path::new("/repo"));
+        let plans = applicable_turn_end_checks(
+            &checks,
+            &inputs(&checks),
+            &[change("src/App.tsx")],
+            Path::new("/repo"),
+        );
         let names: Vec<&str> = plans.iter().map(|plan| plan.name.as_str()).collect();
         assert_eq!(names, vec!["g", "r"]);
     }
@@ -3918,6 +6799,7 @@ mod tests {
 
         let plans = applicable_combined_tree_gate_checks(
             &checks,
+            &inputs(&checks),
             &[change("src/App.tsx")],
             Path::new("/repo"),
         );
@@ -3940,6 +6822,7 @@ mod tests {
 
         let plans = applicable_combined_tree_gate_checks(
             &checks,
+            &inputs(&checks),
             &[change("src/App.tsx")],
             Path::new("/repo"),
         );
@@ -3958,8 +6841,12 @@ mod tests {
             "legacy".to_string(),
             check("run", Some(&["src/**"]), aliased),
         );
-        let plans =
-            applicable_turn_end_checks(&checks, &[change("src/App.tsx")], Path::new("/repo"));
+        let plans = applicable_turn_end_checks(
+            &checks,
+            &inputs(&checks),
+            &[change("src/App.tsx")],
+            Path::new("/repo"),
+        );
         let names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["legacy"]);
     }
@@ -3969,6 +6856,7 @@ mod tests {
         // A doc-only change matches no impact glob, so nothing applies.
         let plans = applicable_turn_end_checks(
             &cadence_checks(),
+            &inputs(&cadence_checks()),
             &[change("docs/x.md")],
             Path::new("/repo"),
         );
@@ -3989,6 +6877,7 @@ mod tests {
             output_tail: String::new(),
             cached: false,
             duration_ms: 0,
+            suppressed_after: None,
         }
     }
 
@@ -3996,10 +6885,16 @@ mod tests {
     /// count-bearing annotations are exercised without a real runner.
     fn runner_parse(parser: &str, passed: usize, failed: usize) -> ParsedCheckResult {
         ParsedCheckResult {
+            schema_version: 1,
+            complete: false,
+            selection: "unknown".to_string(),
+            tests: vec![],
+            undeclared_skips: 0,
             parser: parser.to_string(),
             passed,
             failed,
             skipped: 0,
+            suite_failures: 0,
             failures: (0..failed)
                 .map(|i| crate::execution::check_parsers::CheckFailure {
                     name: format!("t{i}"),
@@ -4040,6 +6935,7 @@ mod tests {
             output_tail: "raw output tail".to_string(),
             cached: false,
             duration_ms: 0,
+            suppressed_after: None,
         }];
         let s = format_check_summary(&results);
         // Header status line first.
@@ -4067,6 +6963,7 @@ mod tests {
             output_tail: String::new(),
             cached,
             duration_ms: 0,
+            suppressed_after: None,
         }
     }
 
@@ -4096,6 +6993,73 @@ mod tests {
         assert_eq!(
             format_check_summary(&[o]),
             "\u{2713} frontend (no tests matched the change)"
+        );
+    }
+
+    #[test]
+    fn summary_names_skipped_tests_inside_a_passing_suite() {
+        // A skip is not a pass. A green whose suite skipped part of itself has to
+        // read differently from one that ran everything (CAIRN-3164).
+        let mut parse = runner_parse("nextest", 5009, 0);
+        parse.skipped = 44;
+        let o = parsed_outcome("rust-full", true, Some(0), parse, false);
+        assert_eq!(
+            format_check_summary(&[o]),
+            "\u{2713} rust-full (5009 tests, 44 skipped)"
+        );
+    }
+
+    #[test]
+    fn summary_distinguishes_a_wholly_self_skipped_suite_from_a_zero_selection() {
+        // The CAIRN-3112 shape: every test in the suite skipped, so the runner
+        // reported zero executed. "no tests matched the change" would be a lie
+        // about WHY nothing ran.
+        let mut parse = runner_parse("nextest", 0, 0);
+        parse.skipped = 12;
+        let o = parsed_outcome("rust-full", true, Some(0), parse, true);
+        assert_eq!(
+            format_check_summary(&[o]),
+            "\u{2713} rust-full (no tests ran, 12 skipped, cached)"
+        );
+    }
+
+    #[test]
+    fn summary_names_a_suite_collection_failure_instead_of_a_zero_tally() {
+        // 881 tests passed and none failed, yet the check is red because one file
+        // never got as far as running a test. Folding that into the assertion
+        // tally renders "0 of 881 failed": a red check pointing at nothing.
+        let mut parse = runner_parse("vitest", 881, 0);
+        parse.suite_failures = 1;
+        parse.failures = vec![crate::execution::check_parsers::CheckFailure {
+            name: "src/components/FileTabView.test.tsx".to_string(),
+            message: Some(
+                "Cannot find module '../../packages/ui/src/lib/readableMarkdown'".to_string(),
+            ),
+        }];
+        let o = parsed_outcome("frontend-partial", false, Some(1), parse, false);
+        let s = format_check_summary(&[o]);
+        assert!(
+            s.starts_with("\u{2717} frontend-partial (1 suite failed to load, exit 1)"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("src/components/FileTabView.test.tsx"),
+            "got: {s}"
+        );
+        assert!(s.contains("Cannot find module"), "got: {s}");
+    }
+
+    #[test]
+    fn summary_counts_failing_tests_and_uncollected_suites_separately() {
+        let mut parse = runner_parse("vitest", 38, 2);
+        parse.suite_failures = 3;
+        let o = parsed_outcome("frontend-partial", false, Some(1), parse, false);
+        let s = format_check_summary(&[o]);
+        assert!(
+            s.starts_with(
+                "\u{2717} frontend-partial (2 of 40 failed, 3 suites failed to load, exit 1)"
+            ),
+            "got: {s}"
         );
     }
 
@@ -4159,6 +7123,273 @@ mod tests {
             "Checks: ✓ write-check fixes (fixed, 1234567890ab; 2 files) · ✓ rust-fmt (2.1s) · ✓ migrations (cached)"
         );
         assert!(!rendered.contains("migrations (fixed"));
+    }
+
+    // --- one wave per commit: fixers first, then re-key, never re-run --------
+
+    /// A declared fixer — the formatter shape this contract exists for.
+    fn fixing_check(command: &str, impact: Option<&[&str]>) -> CheckCommand {
+        CheckCommand {
+            fixes: true,
+            ..check(command, impact, CheckWhen::Write)
+        }
+    }
+
+    /// The repro's wave: this repository's write cadence, where the formatter
+    /// sorts LAST by name and every other check reads the Rust sources it
+    /// rewrites.
+    fn write_wave() -> (HashMap<String, CheckCommand>, Vec<(CheckPlan, String)>) {
+        let checks = HashMap::from([
+            (
+                "api".to_string(),
+                check("bun run test:api", Some(&["api/**"]), CheckWhen::Write),
+            ),
+            (
+                "lockfile".to_string(),
+                check(
+                    "bun run check:lockfile",
+                    Some(&["src-tauri/**/Cargo.toml"]),
+                    CheckWhen::Write,
+                ),
+            ),
+            (
+                "migrations".to_string(),
+                check(
+                    "bun run check:migrations",
+                    Some(&["src-tauri/**/*.rs"]),
+                    CheckWhen::Write,
+                ),
+            ),
+            (
+                "rust-fmt".to_string(),
+                fixing_check("bun run fmt", Some(&["src-tauri/**/*.rs"])),
+            ),
+        ]);
+        // Plans are ordered by name, which is exactly where the formatter lands
+        // last and the cascade came from.
+        let keyed: Vec<(CheckPlan, String)> = ["api", "lockfile", "migrations", "rust-fmt"]
+            .into_iter()
+            .map(|name| {
+                (
+                    plan(name, &checks[name].command),
+                    format!("key-before-{name}"),
+                )
+            })
+            .collect();
+        (checks, keyed)
+    }
+
+    #[test]
+    fn a_declared_fixer_is_submitted_before_the_checks_that_read_its_output() {
+        let (checks, keyed) = write_wave();
+        let order = fixer_first_submission_order(&keyed, &checks, &[0, 1, 2, 3]);
+        let names: Vec<&str> = order.iter().map(|i| keyed[*i].0.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["rust-fmt", "api", "lockfile", "migrations"],
+            "the fixer runs first; every other check keeps plan order"
+        );
+        // Indices themselves are untouched, so the status board, the per-check
+        // output streams, and the rendered summary all stay in plan order.
+        let mut covered = order.clone();
+        covered.sort_unstable();
+        assert_eq!(covered, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn submission_order_is_plan_order_when_nothing_declares_a_fix() {
+        let (mut checks, keyed) = write_wave();
+        checks.get_mut("rust-fmt").unwrap().fixes = false;
+        assert_eq!(
+            fixer_first_submission_order(&keyed, &checks, &[0, 1, 2, 3]),
+            vec![0, 1, 2, 3],
+            "a wave with no declared fixer must submit exactly as it did before"
+        );
+    }
+
+    #[test]
+    fn a_declared_fixers_fix_re_verifies_nothing_and_never_re_runs_the_fixer() {
+        let (checks, keyed) = write_wave();
+        let fixed = vec![
+            "src-tauri/os/a.rs".to_string(),
+            "src-tauri/os/b.rs".to_string(),
+        ];
+        let resolved = [selector(&checks["rust-fmt"])];
+        let fixers: Vec<&InputSelector> = resolved.iter().collect();
+        assert!(fix_is_attributed_to_declared_fixers(&fixed, &fixers));
+        // The fix changed every Rust-impacted check's inputs, so every key moves.
+        // Each verdict still describes the tree that landed: the fixer ran first
+        // inside the shared slot, so the rest of the wave already validated its
+        // output — and the fixer's own verdict is a verdict on the tree it just
+        // produced. Nothing here executes twice.
+        for (plan, key_before) in &keyed {
+            let key_after = format!("key-after-{}", plan.name);
+            assert!(
+                verdict_survives_fix(true, true, false, key_before, &key_after),
+                "{} must not run again against a fix it already saw",
+                plan.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_verdict_the_fix_invalidated_is_re_verified_rather_than_re_keyed() {
+        // Answered from the cache BEFORE the fix: it never saw the fixed tree, so
+        // its verdict cannot be keyed onto it. Re-verifying is the only honest
+        // answer; re-keying it would be exactly the false green this forbids.
+        assert!(!verdict_survives_fix(false, true, false, "before", "after"));
+        // Unless the fix left its inputs alone — the same argument the result
+        // cache itself rests on.
+        assert!(verdict_survives_fix(false, true, false, "same", "same"));
+        // An unattributed fix invalidates even a check that ran: something else
+        // rewrote the tree mid-wave and nothing proves this check saw it.
+        assert!(!verdict_survives_fix(true, false, false, "before", "after"));
+        // A fixer another fixer ran after cannot carry: it never saw the output
+        // that landed, however well the fold is attributed.
+        assert!(!verdict_survives_fix(true, true, true, "before", "after"));
+        // Unless the later fixer left its inputs alone.
+        assert!(verdict_survives_fix(true, true, true, "same", "same"));
+    }
+
+    #[test]
+    fn a_fix_outside_every_declared_fixers_impact_is_not_attributed() {
+        let fmt = fixing_check("bun run fmt", Some(&["src-tauri/**/*.rs"]));
+        assert!(fix_is_attributed_to_declared_fixers(
+            &["src-tauri/os/a.rs".to_string()],
+            &[&selector(&fmt)]
+        ));
+        // A lockfile the formatter cannot have written: some undeclared check
+        // mutated the tree, so the wave falls back to re-verification.
+        assert!(!fix_is_attributed_to_declared_fixers(
+            &["src-tauri/Cargo.lock".to_string()],
+            &[&selector(&fmt)]
+        ));
+        // A wave with no declared fixer can attribute nothing, so an un-migrated
+        // config keeps re-verifying rather than recording verdicts about a tree
+        // no check ran against.
+        assert!(!fix_is_attributed_to_declared_fixers(
+            &["src-tauri/os/a.rs".to_string()],
+            &[]
+        ));
+        // A fixer with no impact globs owns the whole tree.
+        let everything = fixing_check("format-everything", None);
+        assert!(fix_is_attributed_to_declared_fixers(
+            &["anywhere/at/all".to_string()],
+            &[&selector(&everything)]
+        ));
+    }
+
+    #[test]
+    fn an_earlier_fixer_never_carries_a_later_fixers_rewrite() {
+        // The wave the single-fixer tests cannot reach: Prettier, then
+        // `eslint --fix`. Both are declared fixers over the same files, so
+        // ESLint can rewrite a file Prettier already passed. Prettier ran first
+        // and never saw that rewrite.
+        let checks = HashMap::from([
+            (
+                "prettier".to_string(),
+                fixing_check("bunx prettier --write .", Some(&["src/**/*.ts"])),
+            ),
+            (
+                "eslint".to_string(),
+                fixing_check("bunx eslint --fix src/", Some(&["src/**/*.ts"])),
+            ),
+            (
+                "typecheck".to_string(),
+                check(
+                    "bunx tsc --noEmit",
+                    Some(&["src/**/*.ts"]),
+                    CheckWhen::Write,
+                ),
+            ),
+        ]);
+        let keyed = vec![
+            (plan("prettier", "bunx prettier --write ."), "p".to_string()),
+            (plan("eslint", "bunx eslint --fix src/"), "e".to_string()),
+            (plan("typecheck", "bunx tsc --noEmit"), "t".to_string()),
+        ];
+        let order = fixer_first_submission_order(&keyed, &checks, &[0, 1, 2]);
+        assert_eq!(
+            order,
+            vec![0, 1, 2],
+            "both fixers precede the verdict check"
+        );
+
+        let superseded = fixers_superseded_by_a_later_fixer(&keyed, &checks, &order);
+        assert!(
+            superseded.contains(&0),
+            "prettier ran before eslint, so eslint's rewrite is behind its back"
+        );
+        assert!(
+            !superseded.contains(&1),
+            "eslint is the last fixer: it observed prettier's output and its own"
+        );
+        assert!(
+            !superseded.contains(&2),
+            "a non-fixer runs after the whole fixer prefix"
+        );
+
+        // The fold is attributed — every path is inside a declared fixer's impact
+        // — and prettier did execute. Attribution alone must NOT carry it.
+        let fixed = vec!["src/app.ts".to_string()];
+        let resolved = [selector(&checks["prettier"]), selector(&checks["eslint"])];
+        let fixers: Vec<&InputSelector> = resolved.iter().collect();
+        assert!(fix_is_attributed_to_declared_fixers(&fixed, &fixers));
+        assert!(
+            !verdict_survives_fix(true, true, superseded.contains(&0), "p", "p-after"),
+            "a green prettier verdict must not be keyed to a tree eslint rewrote"
+        );
+        // The other two are proven by ordering and carry as before.
+        assert!(verdict_survives_fix(
+            true,
+            true,
+            superseded.contains(&1),
+            "e",
+            "e-after"
+        ));
+        assert!(verdict_survives_fix(
+            true,
+            true,
+            superseded.contains(&2),
+            "t",
+            "t-after"
+        ));
+    }
+
+    #[test]
+    fn a_lone_fixer_is_never_superseded() {
+        // The repository's own wave, and the reason supersession is scoped to
+        // fixer-after-fixer: with one declared fixer there is nothing behind it,
+        // so rust-fmt still carries its verdict and never re-runs.
+        let (checks, keyed) = write_wave();
+        let order = fixer_first_submission_order(&keyed, &checks, &[0, 1, 2, 3]);
+        assert!(
+            fixers_superseded_by_a_later_fixer(&keyed, &checks, &order).is_empty(),
+            "a single-fixer wave keeps the one-execution-per-commit contract intact"
+        );
+    }
+
+    #[test]
+    fn a_fixer_that_keeps_rewriting_the_tree_terminates() {
+        // Termination is structural now that nothing recurses. A wave publishes
+        // at most ONE fix commit, and the fixer's verdict survives that fix, so
+        // the wave never asks it for a second one. A further mutation can only
+        // come from the bounded verification batch, whose delta is reported as
+        // non-convergent and never folded (`FixedWave::non_convergent`).
+        let checks = HashMap::from([(
+            "fmt".to_string(),
+            fixing_check("rewrite-forever", Some(&["**/*.rs"])),
+        )]);
+        let keyed = vec![(plan("fmt", "rewrite-forever"), "key-before".to_string())];
+        assert_eq!(fixer_first_submission_order(&keyed, &checks, &[0]), vec![0]);
+        assert!(fix_is_attributed_to_declared_fixers(
+            &["a.rs".to_string()],
+            &[&selector(&checks["fmt"])]
+        ));
+        assert!(
+            verdict_survives_fix(true, true, false, "key-before", "key-after"),
+            "re-checking a fixer against its own output is the loop this removes"
+        );
     }
 
     // --- timeout budgets + failure classification -------------------------
@@ -4293,6 +7524,14 @@ mod tests {
             request_id: "request".to_string(),
             attempt_id: "attempt".to_string(),
         });
+        failures.push(CellOutcome::StorageFailure {
+            request_id: "request".to_string(),
+            attempt_id: "attempt".to_string(),
+            stage: cairn_common::executor_protocol::StorageFailureStage::Recovery,
+            kind: cairn_common::executor_protocol::StorageFailureKind::CleanupFailed,
+            diagnostic: "cleanup failed".to_string(),
+            slot_retired: false,
+        });
         failures.push(CellOutcome::Completed {
             request_id: "request".to_string(),
             attempt_id: "attempt".to_string(),
@@ -4304,7 +7543,7 @@ mod tests {
                 executor_device_id: "device".to_string(),
                 executor_connection_generation: 1,
                 cell_id: "slot".to_string(),
-                lease_epoch: 1,
+                cell_epoch: 1,
                 started_at_unix_ms: 1,
                 finished_at_unix_ms: 2,
                 duration_ms: None,
@@ -4334,7 +7573,6 @@ mod tests {
                 &[(plan("rust", "cargo test"), format!("input-{index}"))],
                 "tool",
                 CheckExecMode::Shared,
-                &admission(),
                 None,
                 move |_, _, _| {
                     let failure = failure.clone();
@@ -4350,15 +7588,524 @@ mod tests {
         }
     }
 
+    /// Substrate vocabulary an agent must never be handed: slot-absolute paths,
+    /// cell and scratch nouns, executor outcome variants, queue evidence. Each
+    /// token is chosen to be absent from the authored sentences by construction,
+    /// so a match means real diagnostic text leaked into the composed half.
+    const SUBSTRATE_VOCABULARY: [&str; 12] = [
+        "slot",
+        "scratch",
+        "substrate",
+        "queue",
+        "delta",
+        "publication",
+        "/Users/",
+        "CleanupFailed",
+        "Recovery",
+        "Spawn",
+        "Deadline",
+        "executor",
+    ];
+
+    /// Every reason a cell can refuse to start, mapped to the condition class an
+    /// agent is told — one at a time, from an exhaustive match, so a new reason
+    /// upstream cannot reach an agent as a generic "could not start".
+    ///
+    /// The classes that matter are the ones that call for different responses:
+    /// wait (capacity), look at the fleet (no machine, draining, unreachable),
+    /// look at the environment (preparation), and look at Cairn (dispatch,
+    /// storage). Collapsing these into one label is what forced every reader to
+    /// the operator log (CAIRN-3345).
+    #[test]
+    fn every_no_start_reason_keeps_its_own_condition_class() {
+        use cairn_common::executor_protocol::{
+            AdmissionRejectionReason, CellUnavailableReason, ExecutorSubstrateState,
+            HostPressureCondition, ObjectInfrastructureStage,
+        };
+        let sample = CellUnavailableReason::Provisioning;
+        match &sample {
+            CellUnavailableReason::Deadline { .. }
+            | CellUnavailableReason::Provisioning
+            | CellUnavailableReason::Checkout
+            | CellUnavailableReason::Spawn
+            | CellUnavailableReason::Preparation
+            | CellUnavailableReason::ExecutorUnavailable
+            | CellUnavailableReason::NoMatchingExecutor
+            | CellUnavailableReason::AdmissionRejected { .. }
+            | CellUnavailableReason::ObjectInfrastructure(_) => {}
+        }
+        let cases = [
+            (
+                deadline(Some(ExecutorSubstrateState::CapacityBusy), None),
+                SubstrateFailureShape::Capacity,
+            ),
+            (
+                deadline(Some(ExecutorSubstrateState::SlotAdoption), None),
+                SubstrateFailureShape::Capacity,
+            ),
+            (
+                deadline(Some(ExecutorSubstrateState::ConnectedStalled), None),
+                SubstrateFailureShape::MachineUnreachable,
+            ),
+            (
+                deadline(Some(ExecutorSubstrateState::Draining), None),
+                SubstrateFailureShape::Draining,
+            ),
+            (
+                deadline(None, None),
+                SubstrateFailureShape::MachineUnreachable,
+            ),
+            (
+                deadline(
+                    None,
+                    Some(vec![HostPressureCondition::MemoryAvailable {
+                        available_bytes: 1,
+                        floor_bytes: 2,
+                    }]),
+                ),
+                SubstrateFailureShape::Capacity,
+            ),
+            (
+                deadline(
+                    None,
+                    Some(vec![HostPressureCondition::DiskFree {
+                        free_bytes: 1,
+                        floor_bytes: 2,
+                    }]),
+                ),
+                SubstrateFailureShape::Storage,
+            ),
+            (
+                deadline(None, Some(Vec::new())),
+                SubstrateFailureShape::MachineUnreachable,
+            ),
+            (
+                CellUnavailableReason::AdmissionRejected {
+                    reason: AdmissionRejectionReason::QueueFull,
+                },
+                SubstrateFailureShape::Capacity,
+            ),
+            (
+                CellUnavailableReason::AdmissionRejected {
+                    reason: AdmissionRejectionReason::Draining,
+                },
+                SubstrateFailureShape::Draining,
+            ),
+            (
+                CellUnavailableReason::AdmissionRejected {
+                    reason: AdmissionRejectionReason::StorageCleanupFailed,
+                },
+                SubstrateFailureShape::Storage,
+            ),
+            (
+                CellUnavailableReason::AdmissionRejected {
+                    reason: AdmissionRejectionReason::RequestTooLarge,
+                },
+                SubstrateFailureShape::NoMachine,
+            ),
+            (
+                CellUnavailableReason::ExecutorUnavailable,
+                SubstrateFailureShape::MachineUnreachable,
+            ),
+            (
+                CellUnavailableReason::NoMatchingExecutor,
+                SubstrateFailureShape::NoMachine,
+            ),
+            (
+                CellUnavailableReason::Provisioning,
+                SubstrateFailureShape::Preparation,
+            ),
+            (
+                CellUnavailableReason::Checkout,
+                SubstrateFailureShape::Preparation,
+            ),
+            (
+                CellUnavailableReason::Preparation,
+                SubstrateFailureShape::Preparation,
+            ),
+            (
+                CellUnavailableReason::Spawn,
+                SubstrateFailureShape::Dispatch,
+            ),
+            (
+                CellUnavailableReason::ObjectInfrastructure(
+                    ObjectInfrastructureStage::FetchInterrupted,
+                ),
+                SubstrateFailureShape::Dispatch,
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(no_start_shape(&reason), expected, "{reason:?}");
+        }
+    }
+
+    fn deadline(
+        substrate: Option<cairn_common::executor_protocol::ExecutorSubstrateState>,
+        pressure: Option<Vec<cairn_common::executor_protocol::HostPressureCondition>>,
+    ) -> cairn_common::executor_protocol::CellUnavailableReason {
+        cairn_common::executor_protocol::CellUnavailableReason::Deadline {
+            host_pressure: pressure.map(|conditions| {
+                cairn_common::executor_protocol::HostPressureEvidence { conditions }
+            }),
+            substrate: substrate.map(|state| {
+                cairn_common::executor_protocol::ExecutorSubstrateEvidence::without_queue(
+                    state, 0, 0,
+                )
+            }),
+        }
+    }
+
+    /// An elapsed deadline is a moment, not a condition: what the wait was ON is
+    /// in the executor's evidence, and the fleet already decides from that same
+    /// evidence whether the wait was worth having. So retry eligibility here must
+    /// equal the fleet's own capacity verdict, specimen for specimen.
+    ///
+    /// Without this, a machine that stopped answering or was draining would be
+    /// waited through two more horizons and then reported as "could not obtain
+    /// capacity" — the condition-class collapse this mapping exists to remove,
+    /// reintroduced at the one reason where evidence decides.
+    #[test]
+    fn a_deadlines_retry_eligibility_matches_the_fleets_own_capacity_verdict() {
+        use crate::fleet::placement::{classify_unavailable, LinkRestoration};
+        use cairn_common::executor_protocol::{ExecutorSubstrateState, HostPressureCondition};
+        let specimens = [
+            deadline(Some(ExecutorSubstrateState::CapacityBusy), None),
+            deadline(Some(ExecutorSubstrateState::SupervisorRespawning), None),
+            deadline(Some(ExecutorSubstrateState::SlotAdoption), None),
+            deadline(Some(ExecutorSubstrateState::ConnectedStalled), None),
+            deadline(Some(ExecutorSubstrateState::Draining), None),
+            deadline(None, None),
+            deadline(None, Some(Vec::new())),
+            deadline(
+                None,
+                Some(vec![HostPressureCondition::MemoryAvailable {
+                    available_bytes: 1,
+                    floor_bytes: 2,
+                }]),
+            ),
+            deadline(
+                None,
+                Some(vec![HostPressureCondition::DiskFree {
+                    free_bytes: 1,
+                    floor_bytes: 2,
+                }]),
+            ),
+            deadline(
+                Some(ExecutorSubstrateState::ConnectedStalled),
+                Some(vec![HostPressureCondition::DiskFree {
+                    free_bytes: 1,
+                    floor_bytes: 2,
+                }]),
+            ),
+        ];
+        for reason in specimens {
+            assert_eq!(
+                no_start_shape(&reason).is_transient(),
+                classify_unavailable(&reason, LinkRestoration::NotRestoring).is_capacity(),
+                "check composition and fleet placement must read {reason:?} the same way"
+            );
+        }
+    }
+
+    /// Capacity is the one condition time relieves, so it is the only one a
+    /// retry could change the answer to. Everything else is re-presented
+    /// unchanged and would only spend the machine twice.
+    #[test]
+    fn only_a_capacity_refusal_is_worth_asking_again() {
+        assert!(SubstrateFailureShape::Capacity.is_transient());
+        for shape in [
+            SubstrateFailureShape::Dispatch,
+            SubstrateFailureShape::MachineUnreachable,
+            SubstrateFailureShape::Draining,
+            SubstrateFailureShape::NoMachine,
+            SubstrateFailureShape::Preparation,
+            SubstrateFailureShape::Result,
+            SubstrateFailureShape::Storage,
+            SubstrateFailureShape::Cancelled,
+        ] {
+            assert!(!shape.is_transient(), "{shape:?} is not relieved by time");
+        }
+    }
+
+    fn capacity_outcome(indices: [usize; 2]) -> PlannedCheckBatchOutcome {
+        PlannedCheckBatchOutcome::failed(
+            indices.to_vec(),
+            SubstrateFailure::new(SubstrateFailureShape::Capacity, "no room"),
+        )
+    }
+
+    /// The retry policy, stated as the two bounds that keep it from becoming a
+    /// loop: it stops at the attempt bound, and every retry waits on a fresh,
+    /// short horizon rather than another full one.
+    #[test]
+    fn a_capacity_retry_is_bounded_and_waits_on_a_fresh_short_horizon() {
+        let refused = capacity_outcome([0, 1]);
+        for attempt in 0..CAPACITY_RETRY_ATTEMPTS {
+            assert!(
+                matches!(
+                    capacity_retry_decision(attempt, &refused),
+                    CapacityRetry::Again { .. }
+                ),
+                "attempt {attempt} is within the bound"
+            );
+        }
+        assert_eq!(
+            capacity_retry_decision(CAPACITY_RETRY_ATTEMPTS, &refused),
+            CapacityRetry::Surface,
+            "the bound is what makes this a policy rather than a loop"
+        );
+
+        assert_eq!(
+            attempt_horizon_ms(0),
+            None,
+            "the first ask waits on the fleet's own horizon"
+        );
+        for attempt in 1..=CAPACITY_RETRY_ATTEMPTS {
+            assert_eq!(
+                attempt_horizon_ms(attempt),
+                Some(CAPACITY_RETRY_HORIZON_MS),
+                "a retry gets a live horizon, bounded so the policy cannot stall"
+            );
+        }
+    }
+
+    /// What must NOT retry. A structural refusal has the same answer next time,
+    /// a cancellation was deliberate, and a partially-run batch already spent
+    /// the machine on the part that ran.
+    #[test]
+    fn a_refusal_that_time_cannot_relieve_surfaces_at_once() {
+        for shape in [
+            SubstrateFailureShape::NoMachine,
+            SubstrateFailureShape::Draining,
+            SubstrateFailureShape::Preparation,
+            SubstrateFailureShape::Storage,
+            SubstrateFailureShape::Result,
+            SubstrateFailureShape::Cancelled,
+            SubstrateFailureShape::Dispatch,
+        ] {
+            let outcome = PlannedCheckBatchOutcome::failed(
+                vec![0],
+                SubstrateFailure::new(shape, "diagnostic"),
+            );
+            assert_eq!(
+                capacity_retry_decision(0, &outcome),
+                CapacityRetry::Surface,
+                "{shape:?} must not be asked again"
+            );
+        }
+
+        let mut partial = capacity_outcome([0, 1]);
+        partial.results.insert(
+            1,
+            Ok(CheckExecResult {
+                exit_code: Some(0),
+                output: "ran".into(),
+                timed_out: false,
+                duration_ms: Some(1),
+                provenance: None,
+                publication: None,
+            }),
+        );
+        assert_eq!(
+            capacity_retry_decision(0, &partial),
+            CapacityRetry::Surface,
+            "a batch that partly ran is not the same ask any more"
+        );
+
+        assert_eq!(
+            capacity_retry_decision(
+                0,
+                &PlannedCheckBatchOutcome {
+                    results: HashMap::new(),
+                    request: None,
+                    delta: None,
+                    store_dir: None,
+                }
+            ),
+            CapacityRetry::Surface,
+            "an empty outcome states no condition to retry"
+        );
+    }
+
+    /// The composition rule at the seam: every executor outcome an agent can
+    /// meet yields an authored message with no substrate detail in it, and a
+    /// diagnostic that keeps every coordinate for the operator log.
+    #[test]
+    fn every_substrate_outcome_composes_an_agent_message_free_of_substrate_detail() {
+        use cairn_common::executor_protocol::CellUnavailableReason::*;
+        // The specimen from the transcript that opened CAIRN-3219.
+        let scratch_path = "remove cell scratch /Users/mitch/.cairn/build-slots/CAIRN/.authority/slot-366/scratch: Directory not empty";
+        let outcomes = vec![
+            CellOutcome::StorageFailure {
+                request_id: "request".to_string(),
+                attempt_id: "attempt".to_string(),
+                stage: cairn_common::executor_protocol::StorageFailureStage::Recovery,
+                kind: cairn_common::executor_protocol::StorageFailureKind::CleanupFailed,
+                diagnostic: scratch_path.to_string(),
+                slot_retired: true,
+            },
+            CellOutcome::Unavailable {
+                reason: Deadline {
+                    host_pressure: None,
+                    substrate: Some(cairn_common::executor_protocol::ExecutorSubstrateEvidence {
+                        state:
+                            cairn_common::executor_protocol::ExecutorSubstrateState::CapacityBusy,
+                        since_unix_ms: 0,
+                        last_progress_unix_ms: 0,
+                        diagnostic: None,
+                        queue_depth: Some(4),
+                        queue_position: Some(3),
+                        active_cell_count: Some(2),
+                        oldest_running_started_at_unix_ms: None,
+                    }),
+                },
+                diagnostic: "acquisition deadline elapsed".to_string(),
+            },
+            CellOutcome::Unavailable {
+                reason: Spawn,
+                diagnostic: "/Users/mitch/.cairn/build-slots/CAIRN/slot-366 spawn refused"
+                    .to_string(),
+            },
+            CellOutcome::FailedAfterExecution {
+                request_id: "request".to_string(),
+                attempt_id: "attempt".to_string(),
+                diagnostic: "executor lost the slot before publication".to_string(),
+            },
+            CellOutcome::Cancelled {
+                request_id: "request".to_string(),
+                attempt_id: "attempt".to_string(),
+            },
+            CellOutcome::Unavailable {
+                reason: NoMatchingExecutor,
+                diagnostic: "no executor advertises toolchain matlab".to_string(),
+            },
+            CellOutcome::Unavailable {
+                reason: AdmissionRejected {
+                    reason: cairn_common::executor_protocol::AdmissionRejectionReason::Draining,
+                },
+                diagnostic: "executor slot pool is draining".to_string(),
+            },
+            CellOutcome::Unavailable {
+                reason: Preparation,
+                diagnostic: "could not load canonical project execution policy".to_string(),
+            },
+            CellOutcome::Unavailable {
+                reason: ExecutorUnavailable,
+                diagnostic: "connection closed while the request was queued".to_string(),
+            },
+        ];
+
+        let mut leads = BTreeSet::new();
+        for outcome in outcomes {
+            let failure = check_result_from_cell_outcome(outcome, None)
+                .expect_err("substrate outcome must not become a command verdict");
+            let CheckExecutionFailure::Substrate(failure) = failure else {
+                panic!("a substrate outcome must compose a substrate failure");
+            };
+            let message = failure.agent_message();
+            for token in SUBSTRATE_VOCABULARY {
+                assert!(
+                    !message.contains(token),
+                    "agent message must not carry {token:?}: {message}"
+                );
+            }
+            assert!(
+                message.contains("not a result about your change")
+                    && message.contains("operator log"),
+                "agent message must say whose failure this is and where the rest is: {message}"
+            );
+            assert!(
+                !failure.diagnostic().is_empty(),
+                "the operator half must keep the diagnostic"
+            );
+            leads.insert(
+                message
+                    .split_once(". ")
+                    .expect("lead sentence")
+                    .0
+                    .to_string(),
+            );
+        }
+        // Nine outcome classes, nine distinct openings: composition informs, it
+        // does not flatten every infrastructure failure into one sentence. The
+        // count is the assertion — a new class that reuses an existing lead is
+        // exactly the collapse this guards against.
+        assert_eq!(leads.len(), 9, "each outcome class needs its own lead");
+    }
+
+    /// Composition happens at the executor seam, so it must survive the whole
+    /// path to the text an agent actually reads: the check outcome appended to
+    /// its tool result, and the cache row the `/checks` surface and the wake
+    /// detail read back later.
     #[tokio::test]
-    async fn completed_executor_provenance_is_persisted_with_toolchain_claim() {
+    async fn the_agent_facing_verdict_carries_the_composed_message_not_the_diagnostic() {
+        let scratch_path = "remove cell scratch /Users/mitch/.cairn/build-slots/CAIRN/.authority/slot-366/scratch: Directory not empty";
+        let failure = check_result_from_cell_outcome(
+            CellOutcome::StorageFailure {
+                request_id: "request".to_string(),
+                attempt_id: "attempt".to_string(),
+                stage: cairn_common::executor_protocol::StorageFailureStage::Recovery,
+                kind: cairn_common::executor_protocol::StorageFailureKind::CleanupFailed,
+                diagnostic: scratch_path.to_string(),
+                slot_retired: true,
+            },
+            None,
+        )
+        .expect_err("a storage failure is never a verdict");
+
+        let db = cache_db().await;
+        let results = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-specimen",
+            "job-a",
+            &[(plan("rust", "cargo test"), "input-specimen".to_string())],
+            "tool",
+            CheckExecMode::Shared,
+            None,
+            move |_, _, _| {
+                let failure = failure.clone();
+                async move { Err::<CheckExecResult, _>(failure) }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(
+            results[0].failure_kind,
+            Some(CheckFailureKind::Infrastructure),
+            "an infrastructure failure keeps its classification"
+        );
+        let row = crate::execution::cache::list_check_results(db, "project-a", "tree-specimen")
+            .unwrap()
+            .into_iter()
+            .find(|row| row.check_name == "rust")
+            .expect("the failure is recorded for the checks surface");
+
+        for text in [results[0].output_tail.as_str(), row.output_tail.as_str()] {
+            assert!(
+                text.starts_with("Cairn's own storage for this check failed."),
+                "the verdict text is the composed message: {text}"
+            );
+            for token in SUBSTRATE_VOCABULARY {
+                assert!(
+                    !text.contains(token),
+                    "agent-facing verdict must not carry {token:?}: {text}"
+                );
+            }
+            assert!(!text.contains("Directory not empty"));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_executor_without_environment_identity_is_not_reusable() {
         let db = cache_db().await;
         let provenance = cairn_common::executor_protocol::CellExecutionMeta {
             executor_id: "executor-a".to_string(),
             executor_device_id: "device-a".to_string(),
             executor_connection_generation: 3,
             cell_id: "slot-a".to_string(),
-            lease_epoch: 4,
+            cell_epoch: 4,
             started_at_unix_ms: 100,
             finished_at_unix_ms: 200,
             duration_ms: None,
@@ -4375,7 +8122,6 @@ mod tests {
             &[(plan("rust", "cargo test"), "input-provenance".to_string())],
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |_, _, _| {
                 let provenance = provenance.clone();
@@ -4395,20 +8141,18 @@ mod tests {
         .await;
         assert!(results[0].passed);
         assert_eq!(results[0].duration_ms, 12_345);
-        let row = get_check_result(db, "project-a", "rust", "input-provenance")
+        assert!(
+            get_exact_reusable_check_result(
+                db,
+                "project-a",
+                "rust",
+                "input-provenance",
+                &current_check_environment_fingerprint(),
+                crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+            )
             .unwrap()
-            .expect("completed verdict is reusable");
-        assert_eq!(row.executor_id.as_deref(), Some("executor-a"));
-        assert_eq!(row.executor_device_id.as_deref(), Some("device-a"));
-        assert_eq!(row.executor_connection_generation, Some(3));
-        assert_eq!(row.executor_cell_id.as_deref(), Some("slot-a"));
-        assert_eq!(row.executor_lease_epoch, Some(4));
-        assert_eq!(row.executor_started_at_unix_ms, Some(100));
-        assert_eq!(row.executor_finished_at_unix_ms, Some(200));
-        assert_eq!(row.duration_ms, 12_345);
-        assert_eq!(
-            row.toolchain_fingerprint.as_deref(),
-            Some(check_toolchain_identity())
+            .is_none(),
+            "a remote verdict with no executor-computed environment identity must miss"
         );
     }
 
@@ -4423,6 +8167,7 @@ mod tests {
             output_tail: "timed out after 30m".to_string(),
             cached: false,
             duration_ms: 1_800_000,
+            suppressed_after: None,
         }]);
         assert!(matches!(
             result,
@@ -4501,14 +8246,128 @@ mod tests {
     }
 
     fn plan(name: &str, command: &str) -> CheckPlan {
+        let configured: CheckCommand =
+            serde_yaml::from_str(&format!("command: {command:?}\n")).unwrap();
         CheckPlan {
             name: name.to_string(),
             applies: true,
             command: command.to_string(),
             scope: CheckScope::Full,
             resource_class: CheckResourceClass::Shared,
-            requires_runner_local_admission: true,
+            verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
+                &configured,
+            ),
+            config_error: None,
         }
+    }
+
+    fn batch_item(command: &str, resource_class: CheckResourceClass) -> PlannedCheckBatchItem {
+        PlannedCheckBatchItem {
+            index: 0,
+            name: "check".into(),
+            input_hash: "hash".into(),
+            resource_identity_key: "resource".into(),
+            command: command.into(),
+            stream_id: "stream".into(),
+            env: Vec::new(),
+            timeout_ms: 1,
+            executor: None,
+            resource_class,
+        }
+    }
+
+    /// A `shared` check declares one unit of concurrency, and a tool that
+    /// parallelizes internally is still a shared check.
+    ///
+    /// This is the reversal CAIRN-3345 turns on. Cargo, vitest, and bundlers
+    /// used to be read out of the command text as whole-machine work, so two
+    /// ordinary review batches reserved 32 units on a 16-unit host, admission
+    /// reported `17 of 16` reserved at ~31% CPU, and five-second write-cadence
+    /// checks queued until their deadlines and surfaced as verdictless red
+    /// infrastructure failures. Opportunistic parallelism is not a requirement.
+    #[test]
+    fn a_shared_check_declares_one_unit_however_its_tool_parallelizes() {
+        assert_eq!(
+            declared_check_reservation(CheckResourceClass::Shared).concurrency_units,
+            1
+        );
+        assert_eq!(
+            declared_check_reservation(CheckResourceClass::Shared).source,
+            ResourceReservationSource::Declared
+        );
+        for command in [
+            "cargo test --workspace",
+            "bun run check:rust",
+            "bunx vitest run",
+            "bun run build",
+        ] {
+            let items = [batch_item(command, CheckResourceClass::Shared)];
+            assert_eq!(
+                declared_batch_reservation(&items).concurrency_units,
+                1,
+                "{command} is co-runnable unless the project says otherwise"
+            );
+        }
+    }
+
+    /// An `exclusive` resource class is the project asserting whole-machine
+    /// demand directly, and it remains the ONLY route to that charge.
+    #[test]
+    fn an_exclusive_check_declares_the_whole_machine() {
+        assert_eq!(
+            declared_check_reservation(CheckResourceClass::Exclusive).concurrency_units,
+            ResourceReservation::WHOLE_MACHINE_CONCURRENCY
+        );
+    }
+
+    /// Memory and disk stay unstated: they are learned per command identity from
+    /// observed runs, and a number written down here would replace a better
+    /// estimate with a worse one.
+    #[test]
+    fn a_declaration_states_concurrency_only() {
+        let reservation = declared_check_reservation(CheckResourceClass::Exclusive);
+        assert_eq!(reservation.memory_bytes, 0);
+        assert_eq!(reservation.disk_growth_bytes, 0);
+    }
+
+    /// Items in a batch share one cell, so the batch is as heavy as its heaviest
+    /// DECLARED class — one exclusive lane cannot hide behind lighter company,
+    /// and a batch of heavyweight-looking shared commands stays co-runnable.
+    #[test]
+    fn a_batch_declares_its_heaviest_declared_class() {
+        let light = batch_item("bun run check:migrations", CheckResourceClass::Shared);
+        let parallel = batch_item("cargo clippy --workspace", CheckResourceClass::Shared);
+        let exclusive = batch_item("./run-the-suite", CheckResourceClass::Exclusive);
+        assert_eq!(
+            declared_batch_reservation(std::slice::from_ref(&light)).concurrency_units,
+            1
+        );
+        assert_eq!(
+            declared_batch_reservation(&[light.clone(), parallel]).concurrency_units,
+            1,
+            "a shared batch stays one unit no matter what its tools do internally"
+        );
+        assert_eq!(
+            declared_batch_reservation(&[light, exclusive]).concurrency_units,
+            ResourceReservation::WHOLE_MACHINE_CONCURRENCY
+        );
+    }
+
+    /// The cell's class must come from the commands it will run. Classifying the
+    /// batch's display string — a join of check NAMES — matched no command
+    /// pattern, so every batch reported `other`.
+    #[test]
+    fn a_batch_class_reads_its_commands_not_its_display_name() {
+        let items = [
+            batch_item("bun run check:migrations", CheckResourceClass::Shared),
+            batch_item("cargo test --workspace", CheckResourceClass::Shared),
+        ];
+        assert_eq!(batch_command_class(&items), CellCommandClass::CargoTest);
+        assert_eq!(
+            CellCommandClass::classify("rust-lint · rust-full"),
+            CellCommandClass::Other,
+            "the display join this replaced classifies as nothing"
+        );
     }
 
     /// A fake successful (or non-zero-exit) check run for the `run_planned_checks`
@@ -4528,19 +8387,539 @@ mod tests {
         })
     }
 
+    fn reusable_observation_for(
+        check_name: &str,
+        input_hash: &str,
+        environment_fingerprint: String,
+    ) -> FreshCheckObservationWrite {
+        FreshCheckObservationWrite {
+            id: format!("obs-{check_name}"),
+            project_id: "project-a".to_string(),
+            commit_sha: "commit-source".to_string(),
+            defined_by_commit_sha: "commit-source".to_string(),
+            tree_hash: "tree-source".to_string(),
+            check_name: check_name.to_string(),
+            input_hash: input_hash.to_string(),
+            environment_fingerprint,
+            exit_code: 0,
+            verdict: "passed".to_string(),
+            failure_kind: None,
+            complete: true,
+            reusable: true,
+            non_reusable_reason: None,
+            parser_version: crate::execution::check_identity::CHECK_PARSER_VERSION as i64,
+            result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION
+                as i64,
+            ran_at: 100,
+            duration_ms: 1,
+            job_id: Some("job-a".to_string()),
+            run_id: None,
+            cadence: "write".to_string(),
+            executor_id: None,
+            executor_device_id: None,
+            executor_connection_generation: None,
+            executor_cell_id: None,
+            executor_lease_epoch: None,
+            executor_started_at_unix_ms: None,
+            executor_finished_at_unix_ms: None,
+            runner_build_id: None,
+            toolchain_fingerprint: None,
+            output_tail: "cached".to_string(),
+            target_results_json: None,
+            tests: Vec::new(),
+        }
+    }
+
+    fn reusable_observation(environment_fingerprint: String) -> FreshCheckObservationWrite {
+        reusable_observation_for("frontend", "ih-frontend", environment_fingerprint)
+    }
+
     #[tokio::test]
-    async fn cache_hit_skips_execution() {
+    #[serial_test::serial]
+    async fn configured_verdict_environment_requires_an_exact_cache_hit() {
         let db = cache_db().await;
+        let configured: CheckCommand = serde_yaml::from_str(
+            "command: bun run test:rust\nverdictEnvironment:\n  - CAIRN_CUSTOM_VERDICT_MODE\n",
+        )
+        .unwrap();
+        let mut rust = plan("rust", &configured.command);
+        rust.verdict_environment_names =
+            crate::execution::check_identity::verdict_environment_names(&configured);
+
+        let old_optional = std::env::var_os("CAIRN_SYNC_TESTS_OPTIONAL");
+        let old_custom = std::env::var_os("CAIRN_CUSTOM_VERDICT_MODE");
+        std::env::set_var("CAIRN_SYNC_TESTS_OPTIONAL", "enabled");
+        std::env::set_var("CAIRN_CUSTOM_VERDICT_MODE", "strict");
+        let recorded = plan_environment_fingerprint(&rust);
+        record_fresh_check_observation(
+            db.clone(),
+            reusable_observation_for("rust", "input-env", recorded.clone()),
+        )
+        .unwrap();
+        assert!(!needs_execution(
+            db.clone(),
+            "project-a",
+            &rust,
+            "input-env"
+        ));
+
+        std::env::set_var("CAIRN_SYNC_TESTS_OPTIONAL", "disabled");
+        assert!(needs_execution(db.clone(), "project-a", &rust, "input-env"));
+        std::env::set_var("CAIRN_SYNC_TESTS_OPTIONAL", "enabled");
+        std::env::set_var("CAIRN_CUSTOM_VERDICT_MODE", "relaxed");
+        assert!(needs_execution(db.clone(), "project-a", &rust, "input-env"));
+        std::env::set_var("CAIRN_CUSTOM_VERDICT_MODE", "strict");
+        assert_eq!(plan_environment_fingerprint(&rust), recorded);
+        assert!(!needs_execution(db, "project-a", &rust, "input-env"));
+
+        match old_optional {
+            Some(value) => std::env::set_var("CAIRN_SYNC_TESTS_OPTIONAL", value),
+            None => std::env::remove_var("CAIRN_SYNC_TESTS_OPTIONAL"),
+        }
+        match old_custom {
+            Some(value) => std::env::set_var("CAIRN_CUSTOM_VERDICT_MODE", value),
+            None => std::env::remove_var("CAIRN_CUSTOM_VERDICT_MODE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_observation_is_reused_by_review_without_spawning() {
+        let db = cache_db().await;
+        let environment = current_check_environment_fingerprint();
+        record_fresh_check_observation(db.clone(), reusable_observation(environment.clone()))
+            .unwrap();
+
+        let plans = vec![(
+            plan("frontend", "bunx vitest run"),
+            "ih-frontend".to_string(),
+        )];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let results = run_planned_checks_at_commit(
+            db.clone(),
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "manual-check:run-a:frontend",
+            CheckExecMode::Shared,
+            None,
+            move |_index, _command, _stream_id| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    exec_ok(Some(0), "ran")
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a hit must spawn nothing");
+        assert!(results[0].cached);
+        assert_eq!(results[0].output_tail, "cached");
+        let alias = crate::execution::cache::get_check_result_observation(
+            db.clone(),
+            "project-a",
+            "commit-target",
+            "frontend",
+            &environment,
+            crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+            None,
+            None,
+            100,
+            0,
+        )
+        .unwrap()
+        .expect("cache hit must create a target-commit alias");
+        assert_eq!(alias.disposition, "cached");
+        assert_eq!(alias.observation_id, "obs-frontend");
+        assert_eq!(alias.source_commit_sha, "commit-source");
+        assert_eq!(alias.evaluated_tree_hash, "tree-target");
+
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let counted = review_calls.clone();
+        let review = run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-review",
+                defined_by: "commit-review",
+            },
+            "tree-review",
+            "job-a",
+            &plans,
+            "turn-checks:job-a",
+            CheckExecMode::Shared,
+            None,
+            move |_index, _command, _stream_id| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    exec_ok(Some(0), "must not run")
+                }
+            },
+            |_| {},
+        )
+        .await;
+        assert_eq!(review_calls.load(Ordering::SeqCst), 0);
+        assert!(review[0].cached);
+    }
+
+    #[tokio::test]
+    async fn fleet_backed_execution_ignores_coordinator_local_hit() {
+        let db = cache_db().await;
+        let environment = current_check_environment_fingerprint();
+        record_fresh_check_observation(db.clone(), reusable_observation(environment)).unwrap();
+
+        let config = TempDir::new().unwrap();
+        let orch = test_orchestrator(config.path()).await;
+        let plans = vec![(
+            plan("frontend", "bunx vitest run"),
+            "ih-frontend".to_string(),
+        )];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let results = run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "tool",
+            CheckExecMode::Shared,
+            Some(&orch),
+            move |_index, _command, _stream_id| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    exec_ok(Some(0), "remote-selected execution")
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a pre-selection local hit must not suppress fleet execution"
+        );
+        assert!(!results[0].cached);
+        assert_eq!(results[0].output_tail, "remote-selected execution");
+    }
+
+    #[tokio::test]
+    async fn exact_environment_mismatch_spawns_instead_of_reusing() {
+        let db = cache_db().await;
+        record_fresh_check_observation(
+            db.clone(),
+            reusable_observation("definitely-not-the-current-environment".to_string()),
+        )
+        .unwrap();
+
+        let plans = vec![(
+            plan("frontend", "bunx vitest run"),
+            "ih-frontend".to_string(),
+        )];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let results = run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "tool",
+            CheckExecMode::Shared,
+            None,
+            move |_index, _command, _stream_id| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    exec_ok(Some(0), "fresh execution")
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "mismatched evidence must run"
+        );
+        assert!(!results[0].cached);
+        assert_eq!(results[0].output_tail, "fresh execution");
+    }
+
+    /// One evaluation performed the way a cadence actually performs it: RESERVE
+    /// at submission, launch only what the reservation admits, and only then
+    /// settle the outcomes through the engine.
+    ///
+    /// The ordering is the whole point. Both real cadences build a batch, run it
+    /// on a build cell, and hand the finished results to `run_planned_checks`
+    /// afterwards — so a test that drives the engine with a closure that
+    /// executes inline models an ordering that does not exist, and cannot
+    /// observe an over-execution at all. `launches` counts commands actually
+    /// started, which is the number the bound is about.
+    async fn evaluate_infra_suite(
+        db: &Arc<LocalDb>,
+        plans: &[(CheckPlan, String)],
+        tree: &str,
+        launches: &Arc<AtomicUsize>,
+    ) -> Vec<CheckOutcome> {
+        let items: Vec<PlannedCheckBatchItem> = plans
+            .iter()
+            .enumerate()
+            .map(|(index, (plan, input_hash))| PlannedCheckBatchItem {
+                index,
+                name: plan.name.clone(),
+                input_hash: input_hash.clone(),
+                resource_identity_key: String::new(),
+                command: plan.command.clone(),
+                stream_id: String::new(),
+                env: Vec::new(),
+                timeout_ms: 1_000,
+                executor: None,
+                resource_class: CheckResourceClass::Shared,
+            })
+            .collect();
+        let (admitted, mut results) = reserve_batch_items(db.clone(), "project-a", items);
+        for item in &admitted {
+            launches.fetch_add(1, Ordering::SeqCst);
+            results.insert(
+                item.index,
+                Ok(CheckExecResult {
+                    exit_code: Some(254),
+                    // The sccache adoption shape: a real exit code with positive
+                    // infrastructure evidence in the output.
+                    output: "error: could not compile `serde`: process didn't exit successfully: \
+                             `rustc` (exit status: 254)"
+                        .to_string(),
+                    timed_out: false,
+                    duration_ms: None,
+                    provenance: None,
+                    publication: None,
+                }),
+            );
+        }
+
+        let results = Arc::new(std::sync::Mutex::new(results));
+        run_planned_checks(
+            db.clone(),
+            "project-a",
+            tree,
+            "job-a",
+            plans,
+            "tool",
+            CheckExecMode::Shared,
+            None,
+            move |index, _command, _stream_id| {
+                let results = results.clone();
+                async move {
+                    results.lock().unwrap().remove(&index).unwrap_or_else(|| {
+                        Err(CheckExecutionFailure::substrate(
+                            SubstrateFailureShape::Result,
+                            format!("missing batch outcome for plan index {index}"),
+                        ))
+                    })
+                }
+            },
+            |_| {},
+        )
+        .await
+    }
+
+    /// The whole point of the kill switch, driven through the real submission
+    /// ordering. Three consecutive infrastructure failures at one input hash, and
+    /// the fourth evaluation LAUNCHES NOTHING.
+    ///
+    /// Note the shape: the first three evaluations must each still launch. A
+    /// guard that stopped executing on the first infrastructure failure would
+    /// also pass a test that only asserted the fourth, and would strip every
+    /// genuinely transient failure of its retries.
+    #[tokio::test]
+    async fn repeated_infrastructure_failure_stops_being_executed_at_the_bound() {
+        let db = cache_db().await;
+        let plans = vec![(plan("rust", "cargo test"), "ih-rust".to_string())];
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        let mut last = Vec::new();
+        for evaluation in 1..=(crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND + 1) {
+            last =
+                evaluate_infra_suite(&db, &plans, &format!("tree-{evaluation}"), &launches).await;
+            let expected_launches =
+                evaluation.min(crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND) as usize;
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                expected_launches,
+                "evaluation {evaluation} must {} launch the command",
+                if evaluation > crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND {
+                    "NOT"
+                } else {
+                    "still"
+                }
+            );
+        }
+
+        // The suppressed evaluation reports itself as what it is: not run.
+        assert_eq!(last.len(), 1);
+        assert!(!last[0].passed, "a suppression is not a pass");
+        assert_eq!(
+            last[0].suppressed_after,
+            Some(crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND)
+        );
+        assert!(!last[0].is_genuine_failure(), "and it is not a red either");
+        assert!(last[0].output_tail.contains("no longer running this check"));
+        assert!(
+            last[0]
+                .output_tail
+                .contains("not a result about your change"),
+            "got: {}",
+            last[0].output_tail
+        );
+
+        // The row follows the current tree, so the checklist still shows the
+        // check rather than dropping it silently.
+        let listed = crate::execution::cache::list_check_results(
+            db.clone(),
+            "project-a",
+            &format!(
+                "tree-{}",
+                crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND + 1
+            ),
+        )
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].infra_failure_streak,
+            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+            "the re-stamp must not advance the counter"
+        );
+    }
+
+    /// Two cadences submitting the same triple at the same moment. The
+    /// reservation lives at submission, so only one batch ever carries the item
+    /// and only one command is ever launched.
+    ///
+    /// This is the ordering a post-execution check cannot fix: by the time the
+    /// engine sees either result, both cells would already have run.
+    #[tokio::test]
+    async fn concurrent_submissions_admit_the_item_to_only_one_batch() {
+        let db = cache_db().await;
+        let plans = vec![(plan("rust", "cargo test"), "ih-rust".to_string())];
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        // Spend every retry but the last.
+        for evaluation in 1..crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND {
+            evaluate_infra_suite(&db, &plans, &format!("tree-{evaluation}"), &launches).await;
+        }
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            (crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND - 1) as usize
+        );
+
+        let item = PlannedCheckBatchItem {
+            index: 0,
+            name: "rust".to_string(),
+            input_hash: "ih-rust".to_string(),
+            resource_identity_key: String::new(),
+            command: "cargo test".to_string(),
+            stream_id: String::new(),
+            env: Vec::new(),
+            timeout_ms: 1_000,
+            executor: None,
+            resource_class: CheckResourceClass::Shared,
+        };
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let db = db.clone();
+                let item = item.clone();
+                tokio::task::spawn_blocking(move || {
+                    reserve_batch_items(db, "project-a", vec![item]).0.len()
+                })
+            })
+            .collect();
+        let mut carried = 0;
+        for racer in racers {
+            carried += racer.await.unwrap();
+        }
+
+        assert_eq!(
+            carried, 1,
+            "exactly one of two simultaneous submissions may carry the item to a cell"
+        );
+    }
+
+    /// A genuine verdict at the same input hash restores execution immediately —
+    /// suppression can never be the reason a real result goes unmeasured.
+    #[tokio::test]
+    async fn a_genuine_verdict_restores_execution() {
+        let db = cache_db().await;
+        // Drive the triple to the bound the way execution does — reserve, then
+        // record. Storing alone would only ever OPEN the streak at 1, because a
+        // retry is counted when it is admitted, not when it completes.
+        for _ in 0..crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND {
+            let _ = crate::execution::cache::claim_check_execution(
+                db.clone(),
+                "project-a",
+                "rust",
+                "ih-rust",
+            );
+            store_check_result(
+                db.clone(),
+                CheckResultCacheWrite {
+                    project_id: "project-a".to_string(),
+                    tree_hash: "tree-a".to_string(),
+                    input_hash: "ih-rust".to_string(),
+                    check_name: "rust".to_string(),
+                    exit_code: 1,
+                    passed: false,
+                    output_tail: "sccache: server startup failed".to_string(),
+                    duration_ms: 1,
+                    target_results_json: None,
+                    job_id: Some("job-a".to_string()),
+                    cached: Some(false),
+                    failure_kind: Some("infrastructure".to_string()),
+                    executor_id: None,
+                    executor_device_id: None,
+                    executor_connection_generation: None,
+                    executor_cell_id: None,
+                    executor_lease_epoch: None,
+                    executor_started_at_unix_ms: None,
+                    executor_finished_at_unix_ms: None,
+                    toolchain_fingerprint: None,
+                    defined_by_commit_sha: Some("commit-a".to_string()),
+                },
+            )
+            .unwrap();
+        }
+
+        // An ordinary red lands at the same hash (e.g. a sibling cadence got a
+        // real answer out of the same command).
         store_check_result(
             db.clone(),
             CheckResultCacheWrite {
                 project_id: "project-a".to_string(),
                 tree_hash: "tree-a".to_string(),
-                input_hash: "ih-frontend".to_string(),
-                check_name: "frontend".to_string(),
-                exit_code: 0,
-                passed: true,
-                output_tail: "cached".to_string(),
+                input_hash: "ih-rust".to_string(),
+                check_name: "rust".to_string(),
+                exit_code: 101,
+                passed: false,
+                output_tail: "assertion failed".to_string(),
                 duration_ms: 1,
                 target_results_json: None,
                 job_id: Some("job-a".to_string()),
@@ -4554,107 +8933,12 @@ mod tests {
                 executor_started_at_unix_ms: None,
                 executor_finished_at_unix_ms: None,
                 toolchain_fingerprint: None,
+                defined_by_commit_sha: Some("commit-a".to_string()),
             },
         )
         .unwrap();
 
-        let plans = vec![(
-            plan("frontend", "bunx vitest run"),
-            "ih-frontend".to_string(),
-        )];
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = calls.clone();
-        let controller = CheckAdmissionController::new(1);
-        let _blocker = controller
-            .acquire(CheckResourceClass::Shared)
-            .await
-            .unwrap();
-        let results = run_planned_checks(
-            db.clone(),
-            "project-a",
-            "tree-a",
-            "job-a",
-            &plans,
-            "tool",
-            CheckExecMode::Shared,
-            &controller,
-            None,
-            move |_index, _command, _stream_id| {
-                let counted = counted.clone();
-                async move {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    exec_ok(Some(0), "ran")
-                }
-            },
-            |_| {},
-        )
-        .await;
-
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "a cache hit must not re-run the check"
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "frontend");
-        assert!(results[0].passed);
-        assert_eq!(results[0].exit_code, Some(0));
-    }
-
-    #[tokio::test]
-    async fn cancelling_queued_miss_spawns_nothing_and_stores_nothing() {
-        let db = cache_db().await;
-        let controller = Arc::new(CheckAdmissionController::new(1));
-        let blocker = controller
-            .acquire(CheckResourceClass::Shared)
-            .await
-            .unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let task = {
-            let db = db.clone();
-            let controller = controller.clone();
-            let calls = calls.clone();
-            tokio::spawn(async move {
-                let plans = vec![(plan("queued", "run-queued"), "ih-queued".to_string())];
-                run_planned_checks(
-                    db,
-                    "project-a",
-                    "tree-cancelled",
-                    "job-a",
-                    &plans,
-                    "tool",
-                    CheckExecMode::Isolated,
-                    controller.as_ref(),
-                    None,
-                    move |_index, _command, _stream_id| {
-                        let calls = calls.clone();
-                        async move {
-                            calls.fetch_add(1, Ordering::SeqCst);
-                            exec_ok(Some(0), "should not run")
-                        }
-                    },
-                    |_| {},
-                )
-                .await
-            })
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(controller.snapshot().queued_requests, 1);
-        task.abort();
-        let _ = task.await;
-        drop(blocker);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(
-            crate::execution::cache::list_check_results(db, "project-a", "tree-cancelled")
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn cache_miss_runs_then_stores() {
-        let db = cache_db().await;
-        let plans = vec![(plan("frontend", "bunx vitest run"), "ih-b".to_string())];
+        let plans = vec![(plan("rust", "cargo test"), "ih-rust".to_string())];
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         let results = run_planned_checks(
@@ -4665,13 +8949,98 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |_index, _command, _stream_id| {
                 let counted = counted.clone();
                 async move {
                     counted.fetch_add(1, Ordering::SeqCst);
-                    exec_ok(Some(1), "vitest failed")
+                    exec_ok(Some(0), "ok")
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the check runs again");
+        assert!(results[0].passed);
+        assert_eq!(results[0].suppressed_after, None);
+    }
+
+    /// A suite abandoned mid-flight — the shape a superseded review wave takes
+    /// when its cancellation lever fires — must leave no verdict behind. A
+    /// half-finished check is not a result, and persisting one would let a tree
+    /// nobody validated read as checked.
+    #[tokio::test]
+    async fn abandoning_a_running_miss_stores_nothing() {
+        let db = cache_db().await;
+        let started = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let db = db.clone();
+            let started = started.clone();
+            tokio::spawn(async move {
+                let plans = vec![(plan("queued", "run-queued"), "ih-queued".to_string())];
+                run_planned_checks(
+                    db,
+                    "project-a",
+                    "tree-cancelled",
+                    "job-a",
+                    &plans,
+                    "tool",
+                    CheckExecMode::Isolated,
+                    None,
+                    move |_index, _command, _stream_id| {
+                        let started = started.clone();
+                        async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            // Outlives the abort below, so the check is still
+                            // running when its suite is dropped.
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            exec_ok(Some(0), "never completes")
+                        }
+                    },
+                    |_| {},
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the check must be in flight when the suite is abandoned"
+        );
+        task.abort();
+        let _ = task.await;
+        assert!(
+            crate::execution::cache::list_check_results(db, "project-a", "tree-cancelled")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_miss_runs_then_stores() {
+        let db = cache_db().await;
+        // A command with no recognized runner, so this stays a test about cache
+        // write-through rather than about failure classification (which
+        // `miss_classifies_and_persists_timeout_spawn_and_signal` covers).
+        let plans = vec![(plan("frontend", "bun run check:web"), "ih-b".to_string())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let results = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-b",
+            "job-a",
+            &plans,
+            "tool",
+            CheckExecMode::Shared,
+            None,
+            move |_index, _command, _stream_id| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    exec_ok(Some(1), "check failed")
                 }
             },
             |_| {},
@@ -4703,7 +9072,7 @@ mod tests {
         assert_eq!(stored.exit_code, 1);
         assert!(!stored.passed);
         assert_eq!(stored.failure_kind, None);
-        assert_eq!(stored.output_tail, "vitest failed");
+        assert_eq!(stored.output_tail, "check failed");
         assert_eq!(stored.job_id.as_deref(), Some("job-a"));
         assert_eq!(stored.cached, Some(false));
         assert_eq!(stored.executor_id, None);
@@ -4738,7 +9107,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |_index, _command, _stream_id| {
                 let out = nextest_output.clone();
@@ -4795,60 +9163,40 @@ mod tests {
     }
 
     /// The repro this whole change fixes. A src-tauri commit runs the rust check
-    /// and caches its verdict keyed by the src-tauri input hash. A following
+    /// and records an immutable reusable observation keyed by the src-tauri input hash. A following
     /// doc-only commit moves the WHOLE-tree hash but leaves that input hash
     /// unchanged, so the verdict is a cache HIT — rust does not re-run — and the
-    /// row is re-stamped onto the doc commit's tree so the `/checks` listing still
-    /// surfaces it.
+    /// commit receives a cached alias rather than mutating its source evidence.
     #[tokio::test]
     async fn doc_only_commit_reuses_impact_scoped_verdict() {
         let db = cache_db().await;
         let calls = Arc::new(AtomicUsize::new(0));
 
-        // Commit 1 touches src-tauri: rust runs and caches its verdict for input
-        // hash IH1 at whole-tree tree-1.
+        // Commit 1 touches src-tauri and produced a complete immutable reusable
+        // observation for input hash IH1 at whole-tree tree-1.
         let plans = vec![(plan("rust", "bun run test:rust"), "IH1".to_string())];
-        let counted = calls.clone();
-        let r1 = run_planned_checks(
-            db.clone(),
-            "project-a",
-            "tree-1",
-            "job-a",
-            &plans,
-            "tool",
-            CheckExecMode::Shared,
-            &admission(),
-            None,
-            move |_index, _command, _stream_id| {
-                let counted = counted.clone();
-                async move {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    exec_ok(Some(0), "ran")
-                }
-            },
-            |_| {},
-        )
-        .await;
-        assert_eq!(r1.len(), 1);
-        assert_eq!(r1[0].name, "rust");
-        assert!(r1[0].passed);
-        assert_eq!(r1[0].exit_code, Some(0));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let environment = plan_environment_fingerprint(&plans[0].0);
+        let mut source = reusable_observation_for("rust", "IH1", environment.clone());
+        source.commit_sha = "commit-1".to_string();
+        source.tree_hash = "tree-1".to_string();
+        record_fresh_check_observation(db.clone(), source).unwrap();
 
         // Commit 2 is doc-only: the whole tree changes to tree-2, but the rust
         // input hash is UNCHANGED (still IH1), so the verdict is a cache hit and
         // the check does not re-run.
-        let plans2 = vec![(plan("rust", "bun run test:rust"), "IH1".to_string())];
         let counted = calls.clone();
-        let r2 = run_planned_checks(
+        let r2 = run_planned_checks_at_commit(
             db.clone(),
             "project-a",
+            CheckRunCommit {
+                evaluated: "commit-2",
+                defined_by: "commit-2",
+            },
             "tree-2",
             "job-a",
-            &plans2,
+            &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |_index, _command, _stream_id| {
                 let counted = counted.clone();
@@ -4866,19 +9214,26 @@ mod tests {
         assert_eq!(r2[0].exit_code, Some(0));
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
+            0,
             "a doc-only commit must not re-run the rust check"
         );
 
-        // The reused verdict was re-stamped onto the doc commit's tree, so the
-        // tree-keyed `/checks` listing surfaces rust at the current tree.
-        let stamped = get_check_result(db.clone(), "project-a", "rust", "IH1")
-            .unwrap()
-            .expect("the verdict is still cached");
-        assert_eq!(stamped.tree_hash, "tree-2");
-        let rows = crate::execution::cache::list_check_results(db, "project-a", "tree-2").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].check_name, "rust");
+        let alias = crate::execution::cache::get_check_result_observation(
+            db,
+            "project-a",
+            "commit-2",
+            "rust",
+            &environment,
+            crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+            None,
+            None,
+            1,
+            0,
+        )
+        .unwrap()
+        .expect("the doc commit must receive a cached alias");
+        assert_eq!(alias.disposition, "cached");
+        assert_eq!(alias.evaluated_tree_hash, "tree-2");
     }
 
     /// The three abnormal deaths a check can suffer are each classified,
@@ -4899,7 +9254,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |index, _command, _stream_id| async move {
                 match index {
@@ -4978,30 +9332,9 @@ mod tests {
     async fn notify_emits_planned_running_and_final_snapshots() {
         let db = cache_db().await;
         // frontend is already cached (passing); typecheck is a fresh miss.
-        store_check_result(
+        record_fresh_check_observation(
             db.clone(),
-            CheckResultCacheWrite {
-                project_id: "project-a".to_string(),
-                tree_hash: "tree-a".to_string(),
-                input_hash: "ih-frontend".to_string(),
-                check_name: "frontend".to_string(),
-                exit_code: 0,
-                passed: true,
-                output_tail: String::new(),
-                duration_ms: 1,
-                target_results_json: None,
-                job_id: Some("job-a".to_string()),
-                cached: Some(false),
-                failure_kind: None,
-                executor_id: None,
-                executor_device_id: None,
-                executor_connection_generation: None,
-                executor_cell_id: None,
-                executor_lease_epoch: None,
-                executor_started_at_unix_ms: None,
-                executor_finished_at_unix_ms: None,
-                toolchain_fingerprint: None,
-            },
+            reusable_observation(current_check_environment_fingerprint()),
         )
         .unwrap();
 
@@ -5023,7 +9356,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             // typecheck misses and fails with a bare exit code.
             move |_index, _command, _stream_id| async move { exec_ok(Some(1), "boom") },
@@ -5085,7 +9417,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |_index, _command, _stream_id| async move { exec_ok(Some(0), String::new()) },
             |_| {},
@@ -5128,7 +9459,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |_index, _command, _stream_id| {
                 let a = a.clone();
@@ -5160,30 +9490,13 @@ mod tests {
             (plan("cached", "cached"), "ih-cached".to_string()),
             (plan("reader", "read"), "ih-read".to_string()),
         ];
-        store_check_result(
+        record_fresh_check_observation(
             db.clone(),
-            CheckResultCacheWrite {
-                project_id: "project-a".to_string(),
-                tree_hash: "older-tree".to_string(),
-                input_hash: "ih-cached".to_string(),
-                check_name: "cached".to_string(),
-                exit_code: 0,
-                passed: true,
-                output_tail: String::new(),
-                duration_ms: 1,
-                target_results_json: None,
-                job_id: Some("job-a".to_string()),
-                cached: Some(false),
-                failure_kind: None,
-                executor_id: None,
-                executor_device_id: None,
-                executor_connection_generation: None,
-                executor_cell_id: None,
-                executor_lease_epoch: None,
-                executor_started_at_unix_ms: None,
-                executor_finished_at_unix_ms: None,
-                toolchain_fingerprint: None,
-            },
+            reusable_observation_for(
+                "cached",
+                "ih-cached",
+                current_check_environment_fingerprint(),
+            ),
         )
         .unwrap();
 
@@ -5200,7 +9513,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Shared,
-            &admission(),
             None,
             move |index, _command, _stream_id| {
                 let marker = marker_for_run.clone();
@@ -5264,7 +9576,6 @@ mod tests {
                 &plans,
                 "tool",
                 CheckExecMode::Isolated,
-                &admission(),
                 None,
                 move |_index, _command, _stream_id| {
                     let b = b.clone();
@@ -5303,7 +9614,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Isolated,
-            &admission(),
             None,
             // index 0 sleeps longest, so completion order reverses plan order.
             move |index, _command, _stream_id| async move {
@@ -5344,7 +9654,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Isolated,
-            &admission(),
             None,
             // z fails, the others pass — mixed final states under concurrency.
             move |index, _command, _stream_id| async move {
@@ -5369,11 +9678,12 @@ mod tests {
         assert_eq!(find(last, "z").state, "failed");
     }
 
-    /// Bounded `Isolated` mode caps in-flight misses: with `Some(2)` over 3 misses
-    /// the concurrent high-water mark never exceeds 2, yet still reaches 2 (genuine
-    /// overlap, not accidental sequencing).
+    /// `Isolated` mode runs its misses concurrently. Capping that concurrency is
+    /// the executor's job, reached through the reservation each submission
+    /// declares — there is deliberately no second cap here, so all three misses
+    /// overlap.
     #[tokio::test]
-    async fn bounded_isolated_never_exceeds_cap() {
+    async fn isolated_misses_run_concurrently() {
         let db = cache_db().await;
         let plans = vec![
             (plan("a", "cmd-a"), "ih-a".to_string()),
@@ -5392,7 +9702,6 @@ mod tests {
             &plans,
             "tool",
             CheckExecMode::Isolated,
-            &admission(),
             None,
             move |_index, _command, _stream_id| {
                 let a = a.clone();
@@ -5412,111 +9721,23 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(
             high_water.load(Ordering::SeqCst),
-            2,
-            "global admission must reach but never exceed capacity 2"
+            3,
+            "isolated misses must not be serialized by a runner-local gate"
         );
-    }
-
-    /// A one-permit global controller makes isolated shared checks sequential.
-    #[tokio::test]
-    async fn global_admission_capacity_one_is_sequential() {
-        let db = cache_db().await;
-        let plans = vec![
-            (plan("a", "cmd-a"), "ih-a".to_string()),
-            (plan("b", "cmd-b"), "ih-b".to_string()),
-            (plan("c", "cmd-c"), "ih-c".to_string()),
-        ];
-        let active = Arc::new(AtomicUsize::new(0));
-        let high_water = Arc::new(AtomicUsize::new(0));
-        let a = active.clone();
-        let hw = high_water.clone();
-        let controller = CheckAdmissionController::new(1);
-        run_planned_checks(
-            db.clone(),
-            "project-a",
-            "tree-seq1",
-            "job-a",
-            &plans,
-            "tool",
-            CheckExecMode::Isolated,
-            &controller,
-            None,
-            move |_index, _command, _stream_id| {
-                let a = a.clone();
-                let hw = hw.clone();
-                async move {
-                    let now = a.fetch_add(1, Ordering::SeqCst) + 1;
-                    hw.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    a.fetch_sub(1, Ordering::SeqCst);
-                    exec_ok(Some(0), String::new())
-                }
-            },
-            |_| {},
-        )
-        .await;
-
-        assert_eq!(
-            high_water.load(Ordering::SeqCst),
-            1,
-            "global capacity one must serialize isolated misses"
-        );
-    }
-
-    #[tokio::test]
-    async fn independent_suites_share_one_global_controller() {
-        let db = cache_db().await;
-        let controller = Arc::new(CheckAdmissionController::new(1));
-        let active = Arc::new(AtomicUsize::new(0));
-        let high_water = Arc::new(AtomicUsize::new(0));
-        let run_suite = |name: &'static str, tree: &'static str, job: &'static str| {
-            let db = db.clone();
-            let controller = controller.clone();
-            let active = active.clone();
-            let high_water = high_water.clone();
-            async move {
-                let plans = vec![(plan(name, "fixture"), format!("input-{name}"))];
-                run_planned_checks(
-                    db,
-                    "project-a",
-                    tree,
-                    job,
-                    &plans,
-                    "tool",
-                    CheckExecMode::Isolated,
-                    controller.as_ref(),
-                    None,
-                    move |_index, _command, _stream_id| {
-                        let active = active.clone();
-                        let high_water = high_water.clone();
-                        async move {
-                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                            high_water.fetch_max(now, Ordering::SeqCst);
-                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                            active.fetch_sub(1, Ordering::SeqCst);
-                            exec_ok(Some(0), "ok")
-                        }
-                    },
-                    |_| {},
-                )
-                .await
-            }
-        };
-        let (first, second) = tokio::join!(
-            run_suite("first", "tree-first", "job-first"),
-            run_suite("second", "tree-second", "job-second")
-        );
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_eq!(high_water.load(Ordering::SeqCst), 1);
     }
 
     fn parsed(parser: &str, passed: usize, failed: usize) -> ParsedCheckResult {
         ParsedCheckResult {
+            schema_version: 1,
+            complete: false,
+            selection: "unknown".to_string(),
+            tests: vec![],
+            undeclared_skips: 0,
             parser: parser.to_string(),
             passed,
             failed,
             skipped: 0,
+            suite_failures: 0,
             failures: Vec::new(),
         }
     }
@@ -5542,7 +9763,7 @@ mod tests {
         };
         assert_eq!(
             active_build_service_failure(&snapshot).as_deref(),
-            Some("Cairn check infrastructure failure: sccache port conflict: sccache: error: Address already in use (os error 48)")
+            Some("sccache port conflict: sccache: error: Address already in use (os error 48)")
         );
 
         let mut disabled = snapshot.clone();
@@ -5560,27 +9781,31 @@ mod tests {
         let failure = check_result_from_cell_outcome(outcome, None).unwrap_err();
         assert_eq!(
             failure,
-            CheckExecutionFailure::Substrate(
-                "Cairn check infrastructure failure: Spawn: sandbox denial cannot be adjudicated without runner context".to_string()
+            CheckExecutionFailure::substrate(
+                SubstrateFailureShape::Dispatch,
+                "Spawn: sandbox denial cannot be adjudicated without runner context"
             )
         );
     }
 
     #[test]
     fn failure_classifier_requires_positive_evidence_and_preserves_precedence() {
+        // A command with no recognized runner, so the Vitest arms stay clear of
+        // the infrastructure-evidence precedence under test.
+        let opaque = "bun run check:web";
         let warning = "sccache: warning: The server looks like it shut down unexpectedly";
         assert_eq!(
-            classify_check_failure(Some(0), false, false, None, warning),
+            classify_check_failure(opaque, Some(0), false, false, None, warning),
             None
         );
         assert_eq!(
-            classify_check_failure(Some(254), false, false, None, "script exited 254"),
+            classify_check_failure(opaque, Some(254), false, false, None, "script exited 254"),
             None
         );
 
         let abnormal = "error: process didn't exit successfully: sccache rustc --crate-name bytes (exit status: 254)";
         assert_eq!(
-            classify_check_failure(Some(254), false, false, None, abnormal)
+            classify_check_failure(opaque, Some(254), false, false, None, abnormal)
                 .map(|classification| classification.kind),
             Some(CheckFailureKind::Infrastructure)
         );
@@ -5591,7 +9816,7 @@ mod tests {
             "server looks like it shut down unexpectedly",
         ] {
             assert_eq!(
-                classify_check_failure(Some(1), false, false, None, signature)
+                classify_check_failure(opaque, Some(1), false, false, None, signature)
                     .map(|classification| classification.kind),
                 Some(CheckFailureKind::Infrastructure),
                 "signature: {signature}"
@@ -5600,12 +9825,13 @@ mod tests {
         let missing =
             "couldn't read target/debug/build/tree/out/generated.txt: No such file or directory";
         assert_eq!(
-            classify_check_failure(Some(1), false, false, None, missing)
+            classify_check_failure(opaque, Some(1), false, false, None, missing)
                 .map(|classification| classification.kind),
             Some(CheckFailureKind::Infrastructure)
         );
         assert_eq!(
             classify_check_failure(
+                VITEST_COMMAND,
                 Some(1),
                 false,
                 false,
@@ -5617,16 +9843,40 @@ mod tests {
         );
     }
 
+    const VITEST_COMMAND: &str = "bunx vitest related --reporter=default --reporter=json src/a.ts";
+
+    /// A parse shaped like Vitest's when a test FILE failed to collect: no
+    /// assertion failed, so `failed` stays zero while the file itself is a named
+    /// failure site.
+    fn suite_failed(passed: usize, suites: usize) -> ParsedCheckResult {
+        let mut result = parsed("vitest", passed, 0);
+        result.suite_failures = suites;
+        result.failures = (0..suites)
+            .map(|i| crate::execution::check_parsers::CheckFailure {
+                name: format!("src/s{i}.test.tsx"),
+                message: Some("Cannot find module './missing'".to_string()),
+            })
+            .collect();
+        result
+    }
+
     #[test]
     fn runner_error_is_vitest_only_and_reports_progress() {
         let vitest = parsed("vitest", 12, 0);
-        let classification =
-            classify_check_failure(Some(1), false, false, Some(&vitest), "report complete")
-                .expect("abnormal Vitest exit");
+        let classification = classify_check_failure(
+            VITEST_COMMAND,
+            Some(1),
+            false,
+            false,
+            Some(&vitest),
+            "report complete",
+        )
+        .expect("abnormal Vitest exit");
         assert_eq!(classification.kind, CheckFailureKind::RunnerError);
         assert!(classification.reason.contains("12 tests passed"));
         assert_eq!(
             classify_check_failure(
+                "bun run test:rust",
                 Some(101),
                 false,
                 false,
@@ -5638,8 +9888,73 @@ mod tests {
     }
 
     #[test]
-    fn review_batch_constraints_union_toolchains_and_reject_scalar_conflicts() {
-        let item = |index, constraints| PlannedCheckBatchItem {
+    fn a_suite_that_failed_to_collect_is_an_ordinary_named_failure() {
+        // The file failed; no assertion did. Calling this a runner error would
+        // bury the only thing that explains the red check (the file name and the
+        // resolver error under it) behind "no assertion failures".
+        assert_eq!(
+            classify_check_failure(
+                VITEST_COMMAND,
+                Some(1),
+                false,
+                false,
+                Some(&suite_failed(881, 1)),
+                "FAIL src/s0.test.tsx"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_error_escaping_a_test_file_is_named_as_such() {
+        // Vitest's own JSON calls this run a success (every count clean,
+        // `success` true) while the process exits 1. The only evidence is in the
+        // output, so the classification has to point the excerpt at it.
+        let output = concat!(
+            "881 passed\n",
+            " Unhandled Errors \n",
+            "Vitest caught 2 unhandled errors during the test run.\n",
+            "ReferenceError: window is not defined\n",
+            "  at resolveUpdatePriority react-dom-client.development.js:1308:7\n"
+        );
+        let classification = classify_check_failure(
+            VITEST_COMMAND,
+            Some(1),
+            false,
+            false,
+            Some(&parsed("vitest", 881, 0)),
+            output,
+        )
+        .expect("unhandled errors fail the run");
+        assert_eq!(classification.kind, CheckFailureKind::RunnerError);
+        assert!(classification.reason.contains("escaped a test file"));
+        let excerpt = classified_output_excerpt(output, Some(&classification));
+        assert!(
+            excerpt.contains("window is not defined"),
+            "the excerpt must carry the escaping error: {excerpt}"
+        );
+    }
+
+    #[test]
+    fn vitest_exiting_without_a_report_is_named_a_runner_error() {
+        // No JSON object at all: Vitest died loading its config or its deps, so
+        // nothing was ever collected. Left unclassified this renders as a bare
+        // `exit 1` beside a tail of module-resolution noise.
+        let output = concat!(
+            "failed to load config from /slot-176/vitest.config.ts\n",
+            "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'vitest'\n",
+            "Exit code: 1\n"
+        );
+        let classification =
+            classify_check_failure(VITEST_COMMAND, Some(1), false, false, None, output)
+                .expect("a Vitest run that produced no report");
+        assert_eq!(classification.kind, CheckFailureKind::RunnerError);
+        assert!(classification.reason.contains("without producing a report"));
+    }
+
+    #[test]
+    fn review_batch_selectors_union_toolchains_and_reject_scalar_conflicts() {
+        let item = |index, executor| PlannedCheckBatchItem {
             index,
             name: format!("check-{index}"),
             input_hash: format!("hash-{index}"),
@@ -5648,23 +9963,24 @@ mod tests {
             stream_id: format!("stream-{index}"),
             env: Vec::new(),
             timeout_ms: 1,
-            constraints: Some(constraints),
+            executor: Some(executor),
+            resource_class: CheckResourceClass::Shared,
         };
-        let merged = merge_batch_constraints(&[
+        let merged = merge_batch_executor(&[
             item(
                 0,
-                PlacementConstraints {
+                ExecutorSelector {
                     os: Some("linux".into()),
                     required_toolchains: vec!["rust".into()],
-                    ..PlacementConstraints::default()
+                    ..ExecutorSelector::default()
                 },
             ),
             item(
                 1,
-                PlacementConstraints {
+                ExecutorSelector {
                     os: Some("linux".into()),
                     required_toolchains: vec!["bun".into(), "rust".into()],
-                    ..PlacementConstraints::default()
+                    ..ExecutorSelector::default()
                 },
             ),
         ])
@@ -5673,29 +9989,50 @@ mod tests {
         assert_eq!(merged.os.as_deref(), Some("linux"));
         assert_eq!(merged.required_toolchains, vec!["bun", "rust"]);
 
-        let conflict = merge_batch_constraints(&[
+        let conflict = merge_batch_executor(&[
             item(
                 0,
-                PlacementConstraints {
-                    arch: Some("arm64".into()),
-                    ..PlacementConstraints::default()
+                ExecutorSelector {
+                    name: Some("bglab-ub".into()),
+                    ..ExecutorSelector::default()
                 },
             ),
             item(
                 1,
-                PlacementConstraints {
-                    arch: Some("x86_64".into()),
-                    ..PlacementConstraints::default()
+                ExecutorSelector {
+                    name: Some("bglab-mac".into()),
+                    ..ExecutorSelector::default()
                 },
             ),
         ])
         .unwrap_err();
-        assert!(conflict.contains("conflicting review check placement constraint arch"));
+        assert!(conflict.contains("conflicting review check executor selector name"));
+
+        // A named machine and a bare platform are different questions, and one
+        // batch cannot honor both.
+        let mixed = merge_batch_executor(&[
+            item(
+                0,
+                ExecutorSelector {
+                    name: Some("bglab-ub".into()),
+                    ..ExecutorSelector::default()
+                },
+            ),
+            item(
+                1,
+                ExecutorSelector {
+                    os: Some("linux".into()),
+                    ..ExecutorSelector::default()
+                },
+            ),
+        ])
+        .unwrap_err();
+        assert!(mixed.contains("conflicting executor selectors"), "{mixed}");
     }
 
     #[test]
-    fn pure_verdict_batches_keep_unconstrained_and_constrained_checks_separate() {
-        let item = |index, constraints| PlannedCheckBatchItem {
+    fn pure_verdict_batches_keep_untargeted_and_targeted_checks_separate() {
+        let item = |index, executor| PlannedCheckBatchItem {
             index,
             name: format!("check-{index}"),
             input_hash: format!("hash-{index}"),
@@ -5704,13 +10041,14 @@ mod tests {
             stream_id: format!("stream-{index}"),
             env: Vec::new(),
             timeout_ms: 1,
-            constraints,
+            executor,
+            resource_class: CheckResourceClass::Shared,
         };
-        let groups = partition_check_items_by_constraints(vec![
+        let groups = partition_check_items_by_executor(vec![
             item(0, None),
             item(
                 1,
-                Some(PlacementConstraints {
+                Some(ExecutorSelector {
                     os: Some("linux".into()),
                     ..Default::default()
                 }),
@@ -5742,7 +10080,8 @@ mod tests {
             "failed to fill whole buffer\n{}\nFINAL-MARKER",
             "noise\n".repeat(2000)
         );
-        let classification = classify_check_failure(Some(1), false, false, None, &output);
+        let classification =
+            classify_check_failure("bun run check:web", Some(1), false, false, None, &output);
         let excerpt = classified_output_excerpt(&output, classification.as_ref());
         assert!(excerpt.contains("failed to fill whole buffer"));
         assert!(excerpt.contains("FINAL-MARKER"));
@@ -5780,6 +10119,7 @@ mod tests {
         let CheckExecutionFailure::Substrate(fresh) = fresh else {
             panic!("deadline must be a substrate failure");
         };
+        let fresh = fresh.diagnostic();
         assert!(fresh.contains("substrate=CapacityBusy"));
         assert!(!fresh.contains("ConnectedStalled"));
 
@@ -5796,10 +10136,91 @@ mod tests {
         let CheckExecutionFailure::Substrate(stale) = stale else {
             panic!("deadline must be a substrate failure");
         };
+        // Every capacity fact survives — in the operator half. The agent half is
+        // authored text that names none of it.
+        let agent = stale.agent_message();
+        let stale = stale.diagnostic();
         assert!(stale.contains("substrate=ConnectedStalled"));
         assert!(stale.contains("lastProgressAge="));
         assert!(stale.contains("queueDepth=4"));
         assert!(stale.contains("queuePosition=3"));
         assert!(stale.contains("activeSlots=2"));
+        for fact in ["substrate=", "queueDepth", "activeSlots", "build-slot"] {
+            assert!(
+                !agent.contains(fact),
+                "agent message must not carry {fact}: {agent}"
+            );
+        }
+    }
+
+    fn reusable_test_result() -> ParsedCheckResult {
+        ParsedCheckResult {
+            schema_version: 1,
+            complete: true,
+            selection: "full".to_string(),
+            tests: vec![crate::execution::check_parsers::CheckTestResult {
+                id: "suite::passes".to_string(),
+                status: "passed".to_string(),
+                duration_ms: Some(1),
+                attempts: 1,
+                retried: false,
+                flaky: false,
+                failure_message: None,
+                skip_reason: None,
+                skip_declaration: None,
+                skip_declaration_source: None,
+            }],
+            undeclared_skips: 0,
+            parser: "nextest".to_string(),
+            passed: 1,
+            failed: 0,
+            suite_failures: 0,
+            skipped: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn strict_reuse_policy_accepts_only_complete_stable_test_green() {
+        let result = reusable_test_result();
+        assert!(check_reuse_decision("bun run test:rust", true, None, Some(&result)).reusable);
+
+        let mut incomplete = result.clone();
+        incomplete.complete = false;
+        assert!(!check_reuse_decision("bun run test:rust", true, None, Some(&incomplete)).reusable);
+
+        let mut empty = result.clone();
+        empty.selection = "empty".to_string();
+        empty.passed = 0;
+        assert!(!check_reuse_decision("bun run test:rust", true, None, Some(&empty)).reusable);
+
+        let mut retried = result.clone();
+        retried.tests[0].attempts = 2;
+        retried.tests[0].retried = true;
+        assert!(!check_reuse_decision("bun run test:rust", true, None, Some(&retried)).reusable);
+
+        let mut flaky = result.clone();
+        flaky.tests[0].flaky = true;
+        assert!(!check_reuse_decision("bun run test:rust", true, None, Some(&flaky)).reusable);
+
+        let mut undeclared = result;
+        undeclared.undeclared_skips = 1;
+        assert!(!check_reuse_decision("bun run test:rust", true, None, Some(&undeclared)).reusable);
+    }
+
+    #[test]
+    fn non_test_green_reuses_but_red_and_infrastructure_never_do() {
+        assert!(check_reuse_decision("bunx tsc --noEmit", true, None, None).reusable);
+        assert!(!check_reuse_decision("bunx tsc --noEmit", false, None, None).reusable);
+        assert!(
+            !check_reuse_decision(
+                "bunx tsc --noEmit",
+                true,
+                Some(CheckFailureKind::Infrastructure),
+                None,
+            )
+            .reusable
+        );
+        assert!(!check_reuse_decision("bun run test:rust", true, None, None).reusable);
     }
 }

@@ -652,11 +652,15 @@ async fn add_event(
     cost: Option<f64>,
 ) {
     let cost_sql = cost.map_or_else(|| "NULL".to_string(), |c| c.to_string());
+    // `sequence` is allocated here rather than hardcoded so a run can carry more
+    // than one seeded event: `events(run_id, sequence)` is UNIQUE (CAIRN-3290).
     db.execute_script(&format!(
         "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens, cost_usd)
-             VALUES ('{id}', 'run-{suffix}', 'sess-{suffix}', 1, {ts}, '{etype}', '{{}}',
+             VALUES ('{id}', 'run-{suffix}', 'sess-{suffix}',
+                (SELECT COALESCE(MAX(sequence), -1) + 1 FROM events WHERE run_id = 'run-{suffix}'),
+                {ts}, '{etype}', '{{}}',
                 NULL, {ts}, {input}, 0, 0, {output}, 0, {cost_sql});"
     ))
     .await
@@ -2190,6 +2194,90 @@ async fn cost_by_backend_sums_to_blended_total() {
         .map(|p| p.cost_usd)
         .sum();
     assert!((or - 0.42).abs() < 1e-9, "openrouter metered cost {or}");
+}
+
+#[tokio::test]
+async fn tokens_by_model_stacks_to_the_bucket_billable_total() {
+    let db = oracle_db().await;
+    queries::fold_token_rollup(&db).await.unwrap();
+    let points =
+        tokens_by_model_timeseries(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+            .await
+            .unwrap();
+    let blended = cost_timeseries(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+        .await
+        .unwrap();
+
+    // Every bucket's model stack sums to that bucket's blended billable total,
+    // so the main chart's column heights are the same number the stat card is.
+    for bucket in &blended {
+        let stacked: i64 = points
+            .iter()
+            .filter(|p| p.bucket_start == bucket.bucket_start)
+            .map(|p| p.billable_tokens)
+            .sum();
+        assert_eq!(
+            stacked, bucket.billable_tokens,
+            "bucket {} stack must equal the blended billable total",
+            bucket.bucket_start
+        );
+    }
+
+    // The seeded event timestamps floor onto these day buckets.
+    let day1 = (DAY1 / 86_400) * 86_400;
+    let day2 = (DAY2 / 86_400) * 86_400;
+    let at = |bucket_start: i64, model: &str| -> i64 {
+        points
+            .iter()
+            .filter(|p| p.bucket_start == bucket_start && p.model == model)
+            .map(|p| p.billable_tokens)
+            .sum()
+    };
+    // `sonnet` runs on both claude (160) and openrouter (2000) on day 1; the
+    // fold is by model alias alone, so the two backends land in one column.
+    assert_eq!(at(day1, "sonnet"), 2160);
+    assert_eq!(at(day1, "gpt-5"), 160);
+    assert_eq!(at(day1, "opus"), 550);
+    assert_eq!(at(day2, "sonnet"), 240);
+    assert_eq!(at(day2, "gpt-5"), 300);
+    // The openrouter `sonnet` settlement is real metered cost, so day 1's
+    // sonnet column prices above the ~$0 price-table estimate for that model.
+    let sonnet_day1_cost: f64 = points
+        .iter()
+        .filter(|p| p.bucket_start == day1 && p.model == "sonnet")
+        .map(|p| p.cost_usd)
+        .sum();
+    assert!(
+        sonnet_day1_cost >= 0.42 - 1e-9,
+        "sonnet day-1 cost {sonnet_day1_cost} must include the metered settlement"
+    );
+    // `gemini` only ever carried a cost settlement, never a billable token, so
+    // it must not appear as a zero-height stratum.
+    assert!(
+        !points.iter().any(|p| p.model == "gemini"),
+        "a cost-only model must not surface in the token-volume view"
+    );
+    // Sorted by bucket, then model, for stable client-side series assembly.
+    assert!(points
+        .windows(2)
+        .all(|w| (w[0].bucket_start, &w[0].model) <= (w[1].bucket_start, &w[1].model)));
+}
+
+#[tokio::test]
+async fn tokens_by_model_honors_project_scope() {
+    let db = oracle_db().await;
+    queries::fold_token_rollup(&db).await.unwrap();
+    let p2 = tokens_by_model_timeseries(
+        &db,
+        &Scope::new(Some("p2".to_string())),
+        &TimeRange::default(),
+        Bucket::Day,
+    )
+    .await
+    .unwrap();
+    // p2 runs only `opus`; p1's sonnet/gpt-5 usage must be filtered out.
+    assert!(p2.iter().all(|p| p.model == "opus"), "scoped models {p2:?}");
+    assert_eq!(p2.iter().map(|p| p.billable_tokens).sum::<i64>(), 550);
 }
 
 #[tokio::test]

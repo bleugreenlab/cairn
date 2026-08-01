@@ -41,27 +41,21 @@ use crate::orchestrator::Orchestrator;
 /// and likewise excluded.
 pub type PoolKey = String;
 
-/// The owning run and working directory bound to a pooled call's thread.
+/// The authenticated run bound to a pooled call's thread.
 ///
-/// The app-server process is spawned in the FIRST call's cwd and shared across N
-/// calls whose scratch/worktree dirs differ, so the host must override BOTH
-/// `run_id` and `cwd` on a pooled tool call from this binding — otherwise a
-/// second call would attribute results to the right run but read, write, and
-/// execute (`request.cwd`) in the first call's directory. Auth is the only pool
-/// key; per-thread filesystem isolation rides here instead.
+/// Process cwd is deliberately absent: repository identity and logical file
+/// resolution come from the run. Each Codex thread still receives its own cwd in
+/// its thread parameters, but that OS residence is not callback authority.
 #[derive(Clone, Debug)]
 pub struct CallBinding {
     pub(crate) run_id: String,
-    pub(crate) cwd: String,
 }
 
 /// One long-lived app-server hosting N ephemeral call threads.
 pub struct PooledAppServer {
     client: Arc<AppServerClient>,
-    /// `threadId -> (run_id, cwd)`. Read by the host (`binding_for_thread`) to map
-    /// a pooled tool call's `_meta.threadId` back to its owning run AND working
-    /// directory, and by teardown to fail every in-flight call if the app-server
-    /// dies.
+    /// `threadId -> run_id`. Read by the host (`binding_for_thread`) to map a
+    /// pooled tool call's `_meta.threadId` back to its authenticated run.
     thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
     /// `threadId -> per-call notification sender`. The dispatcher routes each
     /// notification carrying that threadId to the owning call's reader.
@@ -78,22 +72,14 @@ impl PooledAppServer {
         self.client.clone()
     }
 
-    /// Register a call thread: record its `threadId -> (run_id, cwd)` binding
-    /// BEFORE `turn/start` (so the first tool call routes AND resolves its cwd
-    /// correctly) and hand back the per-call notification receiver the dispatcher
-    /// will feed.
-    pub(super) fn register_call(
-        &self,
-        thread_id: &str,
-        run_id: &str,
-        cwd: &str,
-    ) -> Receiver<Value> {
+    /// Register a call thread before `turn/start`, so its first tool call routes
+    /// to the authenticated run, and return its notification receiver.
+    pub(super) fn register_call(&self, thread_id: &str, run_id: &str) -> Receiver<Value> {
         let (tx, rx) = unbounded();
         self.thread_runs.lock().unwrap().insert(
             thread_id.to_string(),
             CallBinding {
                 run_id: run_id.to_string(),
-                cwd: cwd.to_string(),
             },
         );
         self.senders
@@ -402,29 +388,25 @@ mod tests {
         serde_json::json!({ "method": method, "params": { "threadId": thread_id } })
     }
 
-    // Demux #2: the host maps a pooled call's threadId back to its run AND its
-    // own working directory, registered before turn/start and cleared on
-    // deregister. Two calls sharing the app-server bind to DIFFERENT cwds, so a
-    // scratch-dir fan-out keeps per-run filesystem isolation.
+    // Demux #2: the host maps a pooled call's threadId back to its authenticated
+    // run, registered before turn/start and cleared on deregister.
     #[test]
-    fn binding_for_thread_maps_run_and_cwd_and_clears_on_deregister() {
+    fn binding_for_thread_maps_run_and_clears_on_deregister() {
         let pool = CodexAppServerPool::default();
         let server = PooledAppServer::for_test(scripted_client());
         pool.insert_test_server("identity-a".to_string(), server.clone());
 
-        let _rx = server.register_call("thread-1", "run-1", "/scratch/one");
-        server.register_call("thread-2", "run-2", "/scratch/two");
+        let _rx = server.register_call("thread-1", "run-1");
+        server.register_call("thread-2", "run-2");
 
         let b1 = pool
             .binding_for_thread("thread-1")
             .expect("thread-1 binding");
         assert_eq!(b1.run_id, "run-1");
-        assert_eq!(b1.cwd, "/scratch/one");
         let b2 = pool
             .binding_for_thread("thread-2")
             .expect("thread-2 binding");
         assert_eq!(b2.run_id, "run-2");
-        assert_eq!(b2.cwd, "/scratch/two");
         assert!(pool.binding_for_thread("thread-unknown").is_none());
 
         server.deregister_call("thread-1");
@@ -441,7 +423,7 @@ mod tests {
     #[test]
     fn close_all_calls_disconnects_per_call_receivers() {
         let server = PooledAppServer::for_test(scripted_client());
-        let rx = server.register_call("thread-x", "run-x", "/scratch/x");
+        let rx = server.register_call("thread-x", "run-x");
         assert!(rx.try_recv().is_err(), "no messages yet");
 
         server.close_all_calls_for_test();
@@ -462,8 +444,8 @@ mod tests {
     #[test]
     fn deliver_routes_notifications_by_thread_id() {
         let server = PooledAppServer::for_test(scripted_client());
-        let rx_a = server.register_call("thread-a", "run-a", "/scratch/a");
-        let rx_b = server.register_call("thread-b", "run-b", "/scratch/b");
+        let rx_a = server.register_call("thread-a", "run-a");
+        let rx_b = server.register_call("thread-b", "run-b");
 
         server.deliver(notification("thread-a", "item/agentMessage/delta"));
         server.deliver(notification("thread-b", "turn/completed"));
@@ -502,7 +484,7 @@ mod tests {
     #[test]
     fn deliver_drops_notifications_for_unknown_threads() {
         let server = PooledAppServer::for_test(scripted_client());
-        let rx = server.register_call("thread-live", "run-live", "/scratch/live");
+        let rx = server.register_call("thread-live", "run-live");
 
         server.deliver(notification("thread-gone", "turn/completed"));
         assert!(

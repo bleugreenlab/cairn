@@ -15,6 +15,18 @@ const MEMORY_COLUMNS: &str = "id, name, project_id, content, status, \
 
 pub(crate) const MEMORY_COLUMNS_FOR_COMMANDS: &str = MEMORY_COLUMNS;
 
+/// Predicate restricting a joined `tm` link row to the memory's MOST RECENT
+/// triage-batch link — the batch that currently owns it.
+///
+/// `memory_triage_issue_memories` accumulates: a memory released back to
+/// `pending` (undecided, or re-pooled by a defer) can be claimed into a later
+/// batch while its earlier link rows survive as history. Ownership is therefore
+/// the latest link, never merely "linked". Without this, a long-merged batch
+/// re-applies its decision to a memory whose state has moved on, and every
+/// historical link of one stuck memory reports as its own failing batch.
+const LATEST_TRIAGE_LINK: &str = "tm.rowid = (SELECT MAX(tm2.rowid) \
+     FROM memory_triage_issue_memories tm2 WHERE tm2.memory_id = tm.memory_id)";
+
 fn memory_from_row(row: &cairn_db::turso::Row) -> DbResult<Memory> {
     memory_from_row_inner(row)
 }
@@ -128,66 +140,65 @@ pub async fn pending_memories_for_scope(
     .await
 }
 
-pub(crate) async fn count_pending_memories_for_scope(
+/// Claim a batch of pending memories AND record the batch that owns them, in one
+/// transaction.
+///
+/// Ownership has to be atomic with the claim. A memory that is `claimed` with no
+/// batch link is a memory no batch owns, and every sweep that keys off `claimed`
+/// — merge finalization, close release, orphan recovery — is then free to act on
+/// it: a batch spawned while an earlier merged batch still linked the memory could
+/// have that older batch apply its decision and take the memory back before the
+/// new link existed. Callers therefore create the triage issue first and claim
+/// through here, so a memory is `claimed` and owned together or neither.
+///
+/// `false` means the pool moved between the caller's read and this claim — at
+/// least one memory is no longer `pending` — and nothing was written.
+pub(crate) async fn claim_and_link_pending_batch(
     db: &LocalDb,
-    scope: &str,
-    scope_value: &str,
-) -> DbResult<i64> {
-    let scope = scope.to_string();
-    let scope_value = scope_value.to_string();
-    db.query_one(
-        "SELECT COUNT(*) FROM memories WHERE status = 'pending' AND scope = ?1 AND scope_value = ?2",
-        params![scope.as_str(), scope_value.as_str()],
-        |row| row.i64(0),
-    )
-    .await
-}
-
-pub(crate) async fn claim_pending_memories_for_scope(
-    db: &LocalDb,
-    scope: &str,
-    scope_value: &str,
-    limit: i64,
-) -> DbResult<Vec<Memory>> {
-    if limit <= 0 {
-        return Ok(Vec::new());
+    issue_id: &str,
+    memory_ids: &[String],
+) -> DbResult<bool> {
+    if memory_ids.is_empty() {
+        return Ok(false);
     }
-    let scope = scope.to_string();
-    let scope_value = scope_value.to_string();
+    let issue_id = issue_id.to_string();
+    let memory_ids = memory_ids.to_vec();
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
-        let scope = scope.clone();
-        let scope_value = scope_value.clone();
+        let issue_id = issue_id.clone();
+        let memory_ids = memory_ids.clone();
         Box::pin(async move {
-            let sql = format!(
-                "SELECT {MEMORY_COLUMNS} FROM memories \
-                 WHERE status = 'pending' AND scope = ?1 AND scope_value = ?2 \
-                 ORDER BY created_at ASC, id ASC LIMIT ?3"
-            );
-            let mut rows = conn
-                .query(&sql, params![scope.as_str(), scope_value.as_str(), limit])
-                .await?;
-            let mut memories = Vec::new();
-            while let Some(row) = rows.next().await? {
-                memories.push(memory_from_row(&row)?);
+            // Verify the whole batch before writing any of it, so losing the race
+            // leaves the pool exactly as it was.
+            for memory_id in &memory_ids {
+                let mut rows = conn
+                    .query(
+                        "SELECT status FROM memories WHERE id = ?1",
+                        params![memory_id.as_str()],
+                    )
+                    .await?;
+                let still_pending = match rows.next().await? {
+                    Some(row) => row.text(0)? == "pending",
+                    None => false,
+                };
+                if !still_pending {
+                    return Ok(false);
+                }
             }
-            if memories.len() < limit as usize {
-                return Ok(Vec::new());
-            }
-            for memory in &memories {
+            for memory_id in &memory_ids {
                 conn.execute(
-                    "UPDATE memories SET status = 'claimed', updated_at = ?1 \
-                     WHERE id = ?2 AND status = 'pending' AND scope = ?3 AND scope_value = ?4",
-                    params![
-                        now,
-                        memory.id.as_str(),
-                        scope.as_str(),
-                        scope_value.as_str()
-                    ],
+                    "UPDATE memories SET status = 'claimed', updated_at = ?1 WHERE id = ?2",
+                    params![now, memory_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_triage_issue_memories (issue_id, memory_id) \
+                     VALUES (?1, ?2)",
+                    params![issue_id.as_str(), memory_id.as_str()],
                 )
                 .await?;
             }
-            Ok(memories)
+            Ok(true)
         })
     })
     .await
@@ -334,6 +345,10 @@ pub async fn confirm_draft_memories_for_job(db: &LocalDb, job_id: &str) -> DbRes
     .await
 }
 
+/// Test-only batch linker. Production establishes a batch link ONLY through
+/// [`claim_and_link_pending_batch`], where the link lands in the same transaction
+/// as the claim; this seeds already-claimed fixtures directly.
+#[cfg(test)]
 pub(crate) async fn record_triage_issue_batch(
     db: &LocalDb,
     issue_id: &str,
@@ -362,21 +377,82 @@ pub(crate) async fn record_triage_issue_batch(
     .await
 }
 
-pub(crate) async fn triage_batch_memories_for_issue(
+/// The memories a triage batch still owns: `claimed`, with this issue as their
+/// latest batch link (see [`LATEST_TRIAGE_LINK`]).
+///
+/// This is the set a batch may act on — the ledger it renders, the decisions its
+/// merge applies, the claims its close releases. Memories that already reached a
+/// terminal status, or that a later batch has since claimed, are deliberately
+/// excluded even though their link rows remain.
+/// The ownership query, on a caller-supplied connection.
+///
+/// A write path MUST select through this inside its own `db.write` transaction
+/// rather than reading first and updating after: ownership can change between a
+/// read and a later write, and an update keyed only by memory id would apply a
+/// decision to a memory a newer batch had taken in between.
+async fn claimed_batch_memories_conn(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<Vec<Memory>> {
+    let sql = format!(
+        "SELECT {MEMORY_COLUMNS} FROM memories m
+         JOIN memory_triage_issue_memories tm ON tm.memory_id = m.id
+         WHERE tm.issue_id = ?1 AND m.status = 'claimed' AND {LATEST_TRIAGE_LINK}
+         ORDER BY tm.rowid ASC, m.created_at ASC, m.id ASC"
+    );
+    let mut rows = conn.query(&sql, params![issue_id]).await?;
+    let mut memories = Vec::new();
+    while let Some(row) = rows.next().await? {
+        memories.push(memory_from_row(&row)?);
+    }
+    Ok(memories)
+}
+
+pub(crate) async fn claimed_batch_memories_for_issue(
     db: &LocalDb,
     issue_id: &str,
 ) -> DbResult<Vec<Memory>> {
     let issue_id = issue_id.to_string();
-    db.query_all(
-        format!(
-            "SELECT {MEMORY_COLUMNS} FROM memories m
-             JOIN memory_triage_issue_memories tm ON tm.memory_id = m.id
-             WHERE tm.issue_id = ?1
-             ORDER BY tm.rowid ASC, m.created_at ASC, m.id ASC"
-        ),
-        params![issue_id.as_str()],
-        memory_from_row,
-    )
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move { claimed_batch_memories_conn(conn, &issue_id).await })
+    })
+    .await
+}
+
+/// Resolve a project reference — either a `projects.id` or a project key such as
+/// `CAIRN` — to the project id, or `None` when it names no project in this
+/// database.
+///
+/// Both `memories.project_id` (an enforced foreign key) and a project-scope
+/// memory's `scope_value` hold project *ids*, while agents and humans name
+/// projects by key. Every project reference on its way into a memory row passes
+/// through here so an id is what actually gets stored.
+async fn project_id_for_reference_conn(
+    conn: &cairn_db::turso::Connection,
+    reference: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT id FROM projects WHERE id = ?1 OR key = ?1 LIMIT 1",
+            params![reference],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row.text(0)?)),
+        None => Ok(None),
+    }
+}
+
+pub(crate) async fn project_id_for_reference(
+    db: &LocalDb,
+    reference: &str,
+) -> DbResult<Option<String>> {
+    let reference = reference.to_string();
+    db.read(|conn| {
+        let reference = reference.clone();
+        Box::pin(async move { project_id_for_reference_conn(conn, &reference).await })
+    })
     .await
 }
 
@@ -475,16 +551,83 @@ pub(crate) async fn set_memories_promoted_commit_sha(
     .await
 }
 
+/// The corrected pool a `defer` decision returns a memory to.
+struct DeferRescopeTarget {
+    scope: MemoryScope,
+    scope_value: String,
+    project_id: String,
+}
+
+/// Where a `defer` decision sends the memory, or `None` when it should be parked
+/// as `deferred` instead.
+///
+/// `None` covers two cases that are the same outcome: the integrator recorded no
+/// corrected scope, or the scope it did record names no project in this database.
+/// The second case must never be written: `memories.project_id` is an enforced
+/// foreign key, so a dangling target aborts the whole batch transaction and the
+/// reconcile sweep then retries and re-warns forever (CAIRN-3289). Parking is the
+/// explicit, terminal, human-visible alternative.
+async fn defer_rescope_target(
+    conn: &cairn_db::turso::Connection,
+    memory: &Memory,
+) -> DbResult<Option<DeferRescopeTarget>> {
+    let Some(scope) = memory.deferred_scope.clone() else {
+        return Ok(None);
+    };
+    let recorded = memory
+        .deferred_scope_value
+        .as_deref()
+        .unwrap_or(memory.scope_value.as_str());
+    let (pool_value, project_reference) = match scope {
+        // A project pool is keyed by project id, so its pool value and its owning
+        // project are both the resolution below.
+        MemoryScope::Project => (None, recorded.to_string()),
+        MemoryScope::Workspace => (Some("workspace".to_string()), "workspace".to_string()),
+        // CAIRN-1493 supplies role-pool routing; until then a role defer keeps the
+        // memory's owning project as its home.
+        MemoryScope::Role => (
+            Some(recorded.to_string()),
+            memory
+                .project_id
+                .clone()
+                .unwrap_or_else(|| "workspace".to_string()),
+        ),
+    };
+    let Some(project_id) = project_id_for_reference_conn(conn, &project_reference).await? else {
+        log::warn!(
+            "memory triage: memory {} defers to {scope}={project_reference}, which names no \
+             project in this database; parking it as deferred",
+            memory.id
+        );
+        return Ok(None);
+    };
+    Ok(Some(DeferRescopeTarget {
+        scope,
+        scope_value: pool_value.unwrap_or_else(|| project_id.clone()),
+        project_id,
+    }))
+}
+
+/// Apply a merged batch's recorded decisions to the memories that batch still
+/// owns.
+///
+/// Ownership is selected inside the same transaction as the updates, so a memory
+/// a newer batch has taken since cannot be resolved by this one. Every branch
+/// writing `project_id` — an enforced foreign key — resolves it to a live project
+/// first; an unresolvable defer target parks its memory rather than aborting its
+/// siblings. Re-running this for the same issue is a no-op: resolved memories are
+/// no longer `claimed`, so they are no longer owned.
 pub(crate) async fn resolve_triage_batch_on_merge(
     db: &LocalDb,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
-    let memories = triage_batch_memories_for_issue(db, issue_id).await?;
+    let issue_id = issue_id.to_string();
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
-        let memories = memories.clone();
+        let issue_id = issue_id.clone();
         let mut ids = Vec::new();
         Box::pin(async move {
+            let memories = claimed_batch_memories_conn(conn, &issue_id).await?;
             for memory in &memories {
                 ids.push(memory.id.clone());
                 match memory.triage_decision {
@@ -503,33 +646,38 @@ pub(crate) async fn resolve_triage_batch_on_merge(
                         .await?;
                     }
                     Some(MemoryTriageDecision::Defer) => {
-                        if let Some(scope) = memory.deferred_scope.as_ref() {
-                            let scope_raw = scope.to_string();
-                            let scope_value = memory.deferred_scope_value.as_deref().unwrap_or(match scope {
-                                MemoryScope::Workspace => "workspace",
-                                _ => memory.scope_value.as_str(),
-                            });
-                            let project_id = match scope {
-                                MemoryScope::Project => scope_value,
-                                MemoryScope::Workspace => "workspace",
-                                // CAIRN-1493 supplies per-(scope,value) pending batching and
-                                // role-pool routing; until integrated, retain the owning project id.
-                                MemoryScope::Role => memory.project_id.as_deref().unwrap_or("workspace"),
-                            };
-                            conn.execute(
-                                "UPDATE memories
-                                 SET status = 'pending', scope = ?1, scope_value = ?2,
-                                     project_id = ?3, updated_at = ?4
-                                 WHERE id = ?5",
-                                params![scope_raw.as_str(), scope_value, project_id, now, memory.id.as_str()],
-                            )
-                            .await?;
-                        } else {
-                            conn.execute(
-                                "UPDATE memories SET status = 'deferred', updated_at = ?1 WHERE id = ?2",
-                                params![now, memory.id.as_str()],
-                            )
-                            .await?;
+                        match defer_rescope_target(conn, memory).await? {
+                            // The decision is consumed by re-pooling, so it is
+                            // cleared: a stale `defer` left on a `pending` row
+                            // would be re-applied by the next merge even when the
+                            // new batch recorded nothing. `reason` stays as the
+                            // durable note of why the memory moved pools.
+                            Some(target) => {
+                                let scope = target.scope.to_string();
+                                conn.execute(
+                                    "UPDATE memories
+                                     SET status = 'pending', scope = ?1, scope_value = ?2,
+                                         project_id = ?3, triage_decision = NULL,
+                                         deferred_scope = NULL, deferred_scope_value = NULL,
+                                         updated_at = ?4
+                                     WHERE id = ?5",
+                                    params![
+                                        scope.as_str(),
+                                        target.scope_value.as_str(),
+                                        target.project_id.as_str(),
+                                        now,
+                                        memory.id.as_str()
+                                    ],
+                                )
+                                .await?;
+                            }
+                            None => {
+                                conn.execute(
+                                    "UPDATE memories SET status = 'deferred', updated_at = ?1 WHERE id = ?2",
+                                    params![now, memory.id.as_str()],
+                                )
+                                .await?;
+                            }
                         }
                     }
                     None => {
@@ -642,35 +790,37 @@ pub(crate) async fn discard_draft_memories_for_closed_issues(
     .await
 }
 
+/// Release the claims a closing triage batch still holds, so its memories
+/// re-enter their pending pool with no decision recorded. Ownership is selected
+/// inside the releasing transaction: a memory this issue once linked but that has
+/// since been resolved, or claimed by a later batch, is not this batch's to reset.
 pub(crate) async fn revert_triage_batch_on_close(
     db: &LocalDb,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
-    let memories = triage_batch_memories_for_issue(db, issue_id).await?;
-    let ids: Vec<String> = memories.into_iter().map(|memory| memory.id).collect();
-    if ids.is_empty() {
-        return Ok(ids);
-    }
+    let issue_id = issue_id.to_string();
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
-        let ids = ids.clone();
+        let issue_id = issue_id.clone();
         Box::pin(async move {
-            for id in &ids {
+            let memories = claimed_batch_memories_conn(conn, &issue_id).await?;
+            let mut ids = Vec::new();
+            for memory in &memories {
+                ids.push(memory.id.clone());
                 conn.execute(
                     "UPDATE memories
                      SET status = 'pending', triage_decision = NULL, reason = NULL,
                          promoted_commit_sha = NULL, deferred_scope = NULL,
                          deferred_scope_value = NULL, updated_at = ?1
-                     WHERE id = ?2",
-                    params![now, id.as_str()],
+                     WHERE id = ?2 AND status = 'claimed'",
+                    params![now, memory.id.as_str()],
                 )
                 .await?;
             }
-            Ok(())
+            Ok(ids)
         })
     })
-    .await?;
-    Ok(ids)
+    .await
 }
 
 /// Distinct `(scope, scope_value)` pools among `pending` memories. Drives the
@@ -772,18 +922,17 @@ pub(crate) async fn revert_claimed_for_failed_triage_issues(db: &LocalDb) -> DbR
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT m.id FROM memories m \
-                     JOIN memory_triage_issue_memories tm ON tm.memory_id = m.id \
-                     JOIN issues i ON i.id = tm.issue_id \
-                     WHERE m.status = 'claimed' \
-                       AND i.status = 'failed' \
-                       AND i.merged_at IS NULL AND i.closed_at IS NULL \
-                     ORDER BY m.id ASC",
-                    (),
-                )
-                .await?;
+            let sql = format!(
+                "SELECT m.id FROM memories m \
+                 JOIN memory_triage_issue_memories tm ON tm.memory_id = m.id \
+                 JOIN issues i ON i.id = tm.issue_id \
+                 WHERE m.status = 'claimed' \
+                   AND i.status = 'failed' \
+                   AND i.merged_at IS NULL AND i.closed_at IS NULL \
+                   AND {LATEST_TRIAGE_LINK} \
+                 ORDER BY m.id ASC"
+            );
+            let mut rows = conn.query(&sql, ()).await?;
             let mut ids = Vec::new();
             while let Some(row) = rows.next().await? {
                 ids.push(row.text(0)?);
@@ -814,16 +963,15 @@ pub(crate) async fn merged_triage_issues_with_claimed_memories(
 ) -> DbResult<Vec<String>> {
     db.read(|conn| {
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT DISTINCT tm.issue_id FROM memory_triage_issue_memories tm \
-                     JOIN memories m ON m.id = tm.memory_id \
-                     JOIN issues i ON i.id = tm.issue_id \
-                     WHERE m.status = 'claimed' AND i.merged_at IS NOT NULL \
-                     ORDER BY tm.issue_id ASC",
-                    (),
-                )
-                .await?;
+            let sql = format!(
+                "SELECT DISTINCT tm.issue_id FROM memory_triage_issue_memories tm \
+                 JOIN memories m ON m.id = tm.memory_id \
+                 JOIN issues i ON i.id = tm.issue_id \
+                 WHERE m.status = 'claimed' AND i.merged_at IS NOT NULL \
+                   AND {LATEST_TRIAGE_LINK} \
+                 ORDER BY tm.issue_id ASC"
+            );
+            let mut rows = conn.query(&sql, ()).await?;
             let mut ids = Vec::new();
             while let Some(row) = rows.next().await? {
                 ids.push(row.text(0)?);
@@ -1232,6 +1380,15 @@ mod tests {
         .unwrap();
     }
 
+    async fn pool_ids(db: &LocalDb, scope: &str, scope_value: &str) -> Vec<String> {
+        pending_memories_for_scope(db, scope, scope_value, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|memory| memory.id.clone())
+            .collect()
+    }
+
     async fn memory_status(db: &LocalDb, id: &str) -> String {
         let id = id.to_string();
         db.query_one(
@@ -1463,27 +1620,57 @@ mod tests {
         );
     }
 
+    /// The claim takes the batch it was given or writes nothing, and the ownership
+    /// link lands with it in the same transaction.
     #[tokio::test]
-    async fn claim_requires_full_batch_and_marks_oldest_claimed() {
+    async fn claim_and_link_takes_the_whole_batch_or_none_of_it() {
         let db = test_db().await;
         insert_memory(&db, "one", Some("workspace"), 1).await;
-        assert!(
-            claim_pending_memories_for_scope(&db, "workspace", "workspace", 2)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
         insert_memory(&db, "two", Some("workspace"), 2).await;
         insert_memory(&db, "three", Some("workspace"), 3).await;
-        let claimed = claim_pending_memories_for_scope(&db, "workspace", "workspace", 2)
+
+        let candidates = pending_memories_for_scope(&db, "workspace", "workspace", 2)
             .await
             .unwrap();
         assert_eq!(
-            claimed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["one", "two"]
+            candidates.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["one", "two"],
+            "the pool is read oldest-first"
         );
-        assert_eq!(count_pending_memories(&db, "workspace").await.unwrap(), 1);
+        let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+
+        // Another claimer takes part of the batch before this claim lands.
+        set_memories_status(&db, &["two".to_string()], "claimed")
+            .await
+            .unwrap();
+        assert!(!claim_and_link_pending_batch(&db, "issue-main", &ids)
+            .await
+            .unwrap());
+        assert_eq!(memory_status(&db, "one").await, "pending");
+        assert!(claimed_batch_memories_for_issue(&db, "issue-main")
+            .await
+            .unwrap()
+            .is_empty());
+
+        set_memories_status(&db, &["two".to_string()], "pending")
+            .await
+            .unwrap();
+        assert!(claim_and_link_pending_batch(&db, "issue-main", &ids)
+            .await
+            .unwrap());
+        assert_eq!(memory_status(&db, "one").await, "claimed");
+        assert_eq!(memory_status(&db, "two").await, "claimed");
+        assert_eq!(memory_status(&db, "three").await, "pending");
+        assert_eq!(
+            claimed_batch_memories_for_issue(&db, "issue-main")
+                .await
+                .unwrap()
+                .iter()
+                .map(|memory| memory.id.clone())
+                .collect::<Vec<_>>(),
+            ids,
+            "the claim is what makes this issue the batch's owner"
+        );
     }
 
     #[tokio::test]
@@ -1520,42 +1707,25 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            count_pending_memories_for_scope(&db, "project", "project-1")
-                .await
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            count_pending_memories_for_scope(&db, "role", "builder")
-                .await
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            count_pending_memories_for_scope(&db, "role", "coordinator")
-                .await
-                .unwrap(),
-            1
-        );
+        assert_eq!(pool_ids(&db, "role", "coordinator").await, vec!["role-two"]);
 
-        let claimed = claim_pending_memories_for_scope(&db, "project", "project-1", 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            claimed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["project-one", "project-two"]
+        let project_batch = pool_ids(&db, "project", "project-1").await;
+        assert_eq!(project_batch, vec!["project-one", "project-two"]);
+        assert!(
+            claim_and_link_pending_batch(&db, "issue-main", &project_batch)
+                .await
+                .unwrap()
         );
         assert_eq!(memory_status(&db, "role-one").await, "pending");
         assert_eq!(memory_status(&db, "role-two").await, "pending");
 
-        let claimed = claim_pending_memories_for_scope(&db, "role", "builder", 2)
+        // A role pool spans projects: both `builder` memories claim together.
+        let role_batch = pool_ids(&db, "role", "builder").await;
+        assert_eq!(role_batch, vec!["role-one", "role-other-project"]);
+        assert!(claim_and_link_pending_batch(&db, "issue-main", &role_batch)
             .await
-            .unwrap();
-        assert_eq!(
-            claimed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["role-one", "role-other-project"]
-        );
+            .unwrap());
+        assert_eq!(memory_status(&db, "role-two").await, "pending");
     }
 
     #[tokio::test]
@@ -1808,6 +1978,226 @@ mod tests {
             assert!(memory.deferred_scope.is_none());
             assert!(memory.deferred_scope_value.is_none());
         }
+    }
+
+    /// Seed a merged triage issue owning a two-memory batch: one `defer` carrying
+    /// the given project target, and one `discard` sibling that proves the batch
+    /// transaction survived.
+    async fn merged_batch_with_project_defer(db: &LocalDb, target: &str) {
+        db.execute(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at, merged_at)
+             VALUES ('issue-merged', 'project-1', 9, 'Memory triage', 'merged', 1, 1, 10)",
+            (),
+        )
+        .await
+        .unwrap();
+        for (seq, id) in ["rescoped", "sibling"].into_iter().enumerate() {
+            create_memory(
+                db,
+                id,
+                Some(id),
+                id,
+                Some("workspace"),
+                "workspace",
+                "workspace",
+                Some("job-main"),
+                Some(700 + seq as i64),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let ids = vec!["rescoped".to_string(), "sibling".to_string()];
+        set_memories_status(db, &ids, "claimed").await.unwrap();
+        record_triage_issue_batch(db, "issue-merged", &ids)
+            .await
+            .unwrap();
+        record_triage_decision(
+            db,
+            "rescoped",
+            MemoryTriageDecision::Defer,
+            "belongs to the project pool",
+            Some(MemoryScope::Project),
+            Some(target),
+        )
+        .await
+        .unwrap();
+        record_triage_decision(
+            db,
+            "sibling",
+            MemoryTriageDecision::Discard,
+            "noise",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A defer naming its project by KEY finalizes into the project's id.
+    /// `memories.project_id` is an enforced foreign key, so storing the key itself
+    /// aborted the whole batch transaction and left every sibling `claimed`, which
+    /// the reconcile sweep then re-attempted and re-warned on forever
+    /// (CAIRN-3289).
+    #[tokio::test]
+    async fn merged_batch_finalizes_a_defer_that_names_its_project_by_key() {
+        let db = test_db().await;
+        merged_batch_with_project_defer(&db, "PRJ").await;
+
+        let resolved = resolve_triage_batch_on_merge(&db, "issue-merged")
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, vec!["rescoped", "sibling"]);
+        let rescoped = load_memory(&db, "rescoped").await.unwrap();
+        assert_eq!(rescoped.status, MemoryStatus::Pending);
+        assert_eq!(rescoped.scope, MemoryScope::Project);
+        assert_eq!(rescoped.scope_value, "project-1");
+        assert_eq!(rescoped.project_id.as_deref(), Some("project-1"));
+        // The decision is consumed by the re-pooling, so a later merge cannot
+        // re-apply it; the reason survives as the note of why it moved.
+        assert!(rescoped.triage_decision.is_none());
+        assert!(rescoped.deferred_scope.is_none());
+        assert!(rescoped.deferred_scope_value.is_none());
+        assert_eq!(
+            rescoped.reason.as_deref(),
+            Some("belongs to the project pool")
+        );
+        assert_eq!(memory_status(&db, "sibling").await, "discarded");
+    }
+
+    /// A defer target naming no live project is parked as `deferred` — explicit,
+    /// terminal, and visible — instead of failing the batch's foreign key.
+    #[tokio::test]
+    async fn merged_batch_parks_a_defer_whose_target_project_is_missing() {
+        let db = test_db().await;
+        merged_batch_with_project_defer(&db, "ghost-project").await;
+
+        let resolved = resolve_triage_batch_on_merge(&db, "issue-merged")
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, vec!["rescoped", "sibling"]);
+        let rescoped = load_memory(&db, "rescoped").await.unwrap();
+        assert_eq!(rescoped.status, MemoryStatus::Deferred);
+        assert_eq!(
+            rescoped.triage_decision,
+            Some(MemoryTriageDecision::Defer),
+            "a parked defer keeps its decision: the decision still stands"
+        );
+        assert_eq!(memory_status(&db, "sibling").await, "discarded");
+        // Nothing is left claimed on the merged issue, so the sweep is done with it.
+        assert!(merged_triage_issues_with_claimed_memories(&db)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Only the batch that currently owns a memory may resolve it. A memory
+    /// released back to `pending` and re-claimed by a later batch keeps its older
+    /// link rows, and those historical batches must not act on it — otherwise every
+    /// merged batch a stuck memory ever belonged to reports as its own failing
+    /// batch, which is what made one defect warn across dozens of issues per sweep.
+    #[tokio::test]
+    async fn a_historical_merged_batch_does_not_own_a_re_claimed_memory() {
+        let db = test_db().await;
+        db.execute(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at, merged_at)
+             VALUES ('issue-old', 'project-1', 11, 'Memory triage', 'merged', 1, 1, 10)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-open', 'project-1', 12, 'Memory triage', 'active', 2, 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        create_memory(
+            &db,
+            "undecided",
+            Some("undecided"),
+            "undecided",
+            Some("project-1"),
+            "project",
+            "project-1",
+            Some("job-main"),
+            Some(800),
+            None,
+        )
+        .await
+        .unwrap();
+        let ids = vec!["undecided".to_string()];
+
+        // The old batch merged with no decision recorded, so it released the
+        // memory back to its pending pool.
+        set_memories_status(&db, &ids, "claimed").await.unwrap();
+        record_triage_issue_batch(&db, "issue-old", &ids)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_triage_batch_on_merge(&db, "issue-old")
+                .await
+                .unwrap(),
+            ids
+        );
+        assert_eq!(memory_status(&db, "undecided").await, "pending");
+
+        // A later, still-open batch claims it.
+        set_memories_status(&db, &ids, "claimed").await.unwrap();
+        record_triage_issue_batch(&db, "issue-open", &ids)
+            .await
+            .unwrap();
+
+        assert!(
+            merged_triage_issues_with_claimed_memories(&db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the merged issue no longer owns the memory, so it is not pending finalization"
+        );
+        assert!(resolve_triage_batch_on_merge(&db, "issue-old")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            memory_status(&db, "undecided").await,
+            "claimed",
+            "the open batch keeps its claim"
+        );
+        assert_eq!(
+            claimed_batch_memories_for_issue(&db, "issue-open")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn project_reference_resolves_by_key_and_by_id() {
+        let db = test_db().await;
+
+        assert_eq!(
+            project_id_for_reference(&db, "PRJ")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("project-1")
+        );
+        assert_eq!(
+            project_id_for_reference(&db, "project-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("project-1")
+        );
+        assert!(project_id_for_reference(&db, "nope")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

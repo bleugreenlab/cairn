@@ -1,26 +1,13 @@
 use super::*;
 use crate::pr_data::actions::context::MrContext;
-use crate::pr_data::actions::test_support::{migrated_db, test_orchestrator};
+use crate::pr_data::actions::test_support::migrated_db;
 use crate::services::testing::{MockGitClient, TestServicesBuilder};
 use crate::storage::SearchIndex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-// ---- rollback_merge refreshes both source and target worktrees ----
-
-fn jj_bin() -> Option<String> {
-    let bin = std::env::var("CAIRN_JJ_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "jj".to_string());
-    crate::env::command(&bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then_some(bin)
-}
+use crate::jj::tests::jj_bin;
 
 fn git(repo: &Path, args: &[&str]) {
     assert!(
@@ -74,20 +61,17 @@ async fn seed_branch_jobs(
     source_branch: &str,
     source_ws: &str,
 ) {
-    let (repo_path, int_branch, int_ws, source_branch, source_ws) = (
+    let (repo_path, int_branch, source_branch) = (
         repo_path.to_string(),
         int_branch.to_string(),
-        int_ws.to_string(),
         source_branch.to_string(),
-        source_ws.to_string(),
     );
+    let _ = (int_ws, source_ws);
     db.write(move |conn| {
-            let (repo_path, int_branch, int_ws, source_branch, source_ws) = (
+            let (repo_path, int_branch, source_branch) = (
                 repo_path.clone(),
                 int_branch.clone(),
-                int_ws.clone(),
                 source_branch.clone(),
-                source_ws.clone(),
             );
             Box::pin(async move {
                 conn.execute(
@@ -97,15 +81,15 @@ async fn seed_branch_jobs(
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO jobs (id, project_id, status, worktree_path, branch, base_branch, created_at, updated_at)
-                     VALUES ('job-int', 'proj-1', 'running', ?1, ?2, 'main', 1, 1)",
-                    params![int_ws.as_str(), int_branch.as_str()],
+                    "INSERT INTO jobs (id, project_id, status, branch, base_branch, created_at, updated_at)
+                     VALUES ('job-int', 'proj-1', 'running', ?1, 'main', 1, 1)",
+                    params![int_branch.as_str()],
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO jobs (id, project_id, status, worktree_path, branch, base_branch, created_at, updated_at)
-                     VALUES ('job-src', 'proj-1', 'running', ?1, ?2, ?3, 1, 1)",
-                    params![source_ws.as_str(), source_branch.as_str(), int_branch.as_str()],
+                    "INSERT INTO jobs (id, project_id, status, branch, base_branch, created_at, updated_at)
+                     VALUES ('job-src', 'proj-1', 'running', ?1, ?2, 1, 1)",
+                    params![source_branch.as_str(), int_branch.as_str()],
                 )
                 .await?;
                 Ok(())
@@ -116,137 +100,6 @@ async fn seed_branch_jobs(
 }
 
 /// The transactional-merge guarantee: after a failed post-mutation merge,
-/// `rollback_merge` restores the store AND refreshes BOTH the source and the
-/// (advanced) target worktrees. The mutation is modeled by the coordinator
-/// sealing a file (advancing the integration branch and materializing it on
-/// the coordinator's disk) — this touches only the coordinator workspace, as
-/// production does, never the store's own working copy. Assertions read the
-/// on-disk tree via `std::fs` because a jj read command would auto-recover a
-/// stale workspace and mask the difference the fix makes. The negative control
-/// (`target_branch = None`) proves the hazard the fix closes: the coordinator
-/// worktree is left on the rolled-back-away tree.
-#[tokio::test(flavor = "current_thread")]
-async fn rollback_refreshes_source_and_target_worktrees() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping rollback_refreshes_source_and_target_worktrees: jj not resolvable");
-        return;
-    };
-    let home = tempfile::tempdir().unwrap();
-    let proj = tempfile::tempdir().unwrap();
-    let wts = tempfile::tempdir().unwrap();
-    init_git_project(proj.path());
-    let jj = crate::jj::JjEnv::resolve(&bin, home.path());
-    let cfg = home.path().join("jj").join("config.toml");
-    let store = home.path().join("jj-stores").join("proj");
-    crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let int = "agent/PROJ-1-coordinator-0";
-    let ws_coord = wts.path().join("coord");
-    crate::jj::add_workspace(&jj, &store, &ws_coord, int, "main", None).unwrap();
-    let source = "agent/PROJ-2-builder-0";
-    let ws_child = wts.path().join("child");
-    crate::jj::add_workspace(&jj, &store, &ws_child, source, int, None).unwrap();
-    std::fs::write(ws_child.join("child.rs"), "child\n").unwrap();
-    crate::jj::seal(&jj, &ws_child, "child work", None).unwrap();
-
-    let db = migrated_db().await;
-    seed_branch_jobs(
-        &db,
-        &proj.path().to_string_lossy(),
-        int,
-        &ws_coord.to_string_lossy(),
-        source,
-        &ws_child.to_string_lossy(),
-    )
-    .await;
-    let orch = test_orchestrator(db, MockGitClient::new());
-
-    // Export bookmarks so the backing git refs are consistent with the store
-    // before the snapshot (in production, prior seals/merges always export, so
-    // the op-restore rewind is clean).
-    jj_raw(
-        &bin,
-        &cfg,
-        &store,
-        &["git", "export", "--ignore-working-copy"],
-    );
-    let int_pre = crate::jj::bookmark_commit(&jj, &store, int).unwrap();
-    let source_pre = crate::jj::bookmark_commit(&jj, &store, source).unwrap();
-    let op = crate::jj::operation_id(&jj, &store).unwrap();
-
-    // Advance the integration branch by having the coordinator seal a file, and
-    // rebase the source onto it (the mid-merge mutations rollback must undo).
-    std::fs::write(ws_coord.join("hub.rs"), "hub-1\n").unwrap();
-    crate::jj::seal(&jj, &ws_coord, "hub work", None).unwrap();
-    crate::jj::rebase_branch_onto(&jj, &store, source, int).unwrap();
-    assert!(
-        ws_coord.join("hub.rs").exists(),
-        "precondition: the coordinator's worktree carries the advanced tree"
-    );
-
-    // WITH THE FIX: target=Some refreshes the coordinator workspace, so after
-    // the op-restore its on-disk tree returns to the restored (pre-merge) state
-    // (no hub.rs), and both bookmarks are rolled back.
-    let err = rollback_merge(
-        &orch,
-        "proj-1",
-        &jj,
-        &store,
-        &op,
-        source,
-        Some(int),
-        "boom".to_string(),
-    )
-    .await;
-    assert!(
-        err.contains("safe to retry"),
-        "the rollback error tells the caller a retry is safe"
-    );
-    assert_eq!(
-        crate::jj::bookmark_commit(&jj, &store, int).unwrap(),
-        int_pre
-    );
-    assert_eq!(
-        crate::jj::bookmark_commit(&jj, &store, source).unwrap(),
-        source_pre
-    );
-    assert!(
-        !ws_coord.join("hub.rs").exists(),
-        "the target/coordinator worktree is refreshed back to the restored (pre-merge) state"
-    );
-
-    // NEGATIVE CONTROL (old behavior): re-run the same mutation on the now-fresh
-    // coordinator, then roll back with target=None. Only the source is
-    // refreshed, so the coordinator's on-disk tree is left on the rolled-back-
-    // away state (hub.rs still present) — the hazard the fix closes.
-    std::fs::write(ws_coord.join("hub.rs"), "hub-2\n").unwrap();
-    crate::jj::seal(&jj, &ws_coord, "hub work again", None).unwrap();
-    crate::jj::rebase_branch_onto(&jj, &store, source, int).unwrap();
-    let _ = rollback_merge(
-        &orch,
-        "proj-1",
-        &jj,
-        &store,
-        &op,
-        source,
-        None,
-        "boom".to_string(),
-    )
-    .await;
-    assert_eq!(
-        crate::jj::bookmark_commit(&jj, &store, int).unwrap(),
-        int_pre
-    );
-    assert_eq!(
-        crate::jj::bookmark_commit(&jj, &store, source).unwrap(),
-        source_pre
-    );
-    assert!(
-        ws_coord.join("hub.rs").exists(),
-        "without the target refresh the coordinator worktree keeps the rolled-back-away tree"
-    );
-}
-
 /// A wedged hub with a bare origin plus a source child that genuinely conflicts
 /// on rebase, wired so `store_merge_child` runs end-to-end: an Orchestrator
 /// whose `config_dir` keys the store path the function computes, jobs seeded so
@@ -347,7 +200,9 @@ async fn setup_merge(bin: &str, wedge_target: bool) -> MergeFixture {
                 "--ignore-working-copy",
             ],
         );
-        crate::jj::rebase_branch_onto(&jj, &store, int, "main").unwrap();
+        // Unguarded on purpose: this fixture needs the conflicted shape that
+        // `rebase_branch_onto` now rolls back rather than leaves behind.
+        crate::jj::tests::rebase_recording_conflict(&jj, &store, int, "main");
         assert!(crate::jj::branch_has_conflict(&jj, &store, int).unwrap());
         crate::jj::update_stale(&jj, &ws_coord).unwrap();
         std::fs::write(ws_coord.join("shared.rs"), "hub-resolved\n").unwrap();
@@ -415,12 +270,19 @@ async fn source_conflict_refusal_leaves_target_unwedged_on_origin() {
     let fx = setup_wedged_merge(&bin).await;
     let origin_int_before = git_stdout(&fx.origin_path, &["rev-parse", fx.int]);
 
+    let source_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch);
+
     let err = store_merge_child(&fx.orch, &fx.ctx, "squash")
         .await
         .expect_err("the source conflict must refuse the merge");
     assert!(
-        err.contains("recorded a conflict"),
-        "the source conflict is surfaced for resolution: {err}"
+        err.contains("conflicts with the new tip") && err.contains("rolled back"),
+        "the refusal names the conflict and says the branch is untouched: {err}"
+    );
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch),
+        source_before,
+        "the refused merge left the source exactly where it was"
     );
 
     // The target repair was published to origin during the preflight (before
@@ -506,7 +368,10 @@ async fn prospective_conflict_restores_store_and_publishes_nothing() {
     let error = prospective_store_merge_child(&fx.orch, &fx.ctx, "squash")
         .await
         .expect_err("the prospective source conflict must refuse the plan");
-    assert!(error.contains("recorded a conflict"), "{error}");
+    assert!(
+        error.contains("conflicts with the new tip") && error.contains("rolled back"),
+        "{error}"
+    );
     assert_eq!(
         crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch),
         source_before

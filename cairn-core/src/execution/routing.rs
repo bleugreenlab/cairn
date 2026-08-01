@@ -395,12 +395,12 @@ mod tests {
         // The live failure: open_stream against the PRIVATE DB trips the
         // message_streams → runs foreign key.
         assert!(
-            open_stream(private.clone(), run, None, None, "claude", Some(0)).is_err(),
+            open_stream(private.clone(), run, None, None, "claude").is_err(),
             "open_stream against the private DB must fail the FK (the live condition)"
         );
 
         // Against the resolved owning DB it succeeds; the row lands in the replica.
-        open_stream(owning.clone(), run, None, None, "claude", Some(0)).unwrap();
+        open_stream(owning.clone(), run, None, None, "claude").unwrap();
         let count = |db: Arc<LocalDb>, sql: String| async move {
             db.query_one(&sql, (), |row| row.i64(0)).await.unwrap()
         };
@@ -428,7 +428,6 @@ mod tests {
             id: "evt-1".to_string(),
             run_id: run.to_string(),
             session_id: None,
-            sequence: 1,
             timestamp: now,
             event_type: "assistant".to_string(),
             data: "{}".to_string(),

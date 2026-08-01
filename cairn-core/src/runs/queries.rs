@@ -8,7 +8,7 @@ use crate::transcripts::stream_store::ActiveMessageStream;
 use crate::transcripts::stream_store::{
     find_active_stream_for_run, find_active_stream_for_session, read_active_stream,
 };
-use cairn_db::turso::{params, Row};
+use cairn_db::turso::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
@@ -38,46 +38,78 @@ pub async fn list_runs_for_job_async(db: &LocalDb, job_id: &str) -> Result<Vec<R
     .await
 }
 
-/// Incremental transcript loader for application views. The displayed job is
-/// part of the trust boundary: stale session pointers must fail rather than
-/// returning another job's transcript from either storage or the live stream.
-pub fn list_events_for_job_session_delta(
+/// Incremental transcript loader for application views, keyed by the NODE.
+///
+/// A displayed transcript's identity is the job, never the session instance
+/// under it. Sessions are mortal: a cold-resume reseed, a prompt edit, or a
+/// cross-provider model change rotates the job onto a fresh successor session
+/// (`sessions::queries::rotate_session`). A caller that named a session id
+/// would be holding a dead key from that moment on, and — because the delta is
+/// a cursor walk that simply returns nothing for a session no longer being
+/// written to — would go silently blind rather than fail (CAIRN-3262). So the
+/// session is resolved here, per read, from the job itself.
+///
+/// Resolving from the job also makes cross-job leakage structural instead of
+/// validated: the session comes from the requested job's own row, so no client
+/// pointer can address another job's transcript at all.
+pub fn list_events_for_job_delta(
     db: Arc<LocalDb>,
     job_id: &str,
-    session_id: &str,
     after_rowid: Option<i64>,
 ) -> Result<SessionEventsDelta, CairnError> {
     let job_id = job_id.to_string();
-    let session_id = session_id.to_string();
-    let validation_db = db.clone();
-    let validation_job_id = job_id.clone();
-    let validation_session_id = session_id.clone();
-    run_query_db(async move {
-        let lineage = load_session_lineage_ids(&validation_db, &validation_session_id).await?;
-        for lineage_session_id in lineage {
-            let owner = validation_db
-                .query_opt(
-                    "SELECT job_id FROM sessions WHERE id = ?1",
-                    params![lineage_session_id.as_str()],
-                    |row| row.opt_text(0),
-                )
-                .await
-                .map_err(CairnError::from)?
-                .flatten()
-                .ok_or_else(|| CairnError::NotFound {
-                    entity: "session",
-                    id: lineage_session_id.clone(),
-                })?;
-            if owner != validation_job_id {
-                return Err(CairnError::Internal(format!(
-                    "session {lineage_session_id} belongs to job {owner}, not requested job {validation_job_id}"
-                )));
-            }
-        }
-        Ok(())
-    })?;
+    let resolve_db = db.clone();
+    let session_id =
+        run_query_db(async move { resolve_job_transcript_session(&resolve_db, job_id).await })?;
+
+    let Some(session_id) = session_id else {
+        // A node that has never opened a session has an empty transcript, not an
+        // error; echo the cursor so the caller holds position.
+        return Ok(SessionEventsDelta {
+            events: Vec::new(),
+            last_rowid: after_rowid,
+            streaming: None,
+        });
+    };
 
     list_events_for_session_delta(db, &session_id, after_rowid)
+}
+
+/// The session whose rotation lineage is this job's transcript.
+///
+/// `jobs.current_session_id` is the live head. Before a job's first turn stamps
+/// it, the newest run already carries the session its events are written under,
+/// so that is the same transcript by another name — one resolution covers both
+/// windows and there is no second client-side fallback path to keep in step.
+async fn resolve_job_transcript_session(
+    db: &LocalDb,
+    job_id: String,
+) -> Result<Option<String>, CairnError> {
+    let current = db
+        .query_opt(
+            "SELECT current_session_id FROM jobs WHERE id = ?1",
+            params![job_id.as_str()],
+            |row| row.opt_text(0),
+        )
+        .await
+        .map_err(CairnError::from)?
+        .flatten();
+    if current.is_some() {
+        return Ok(current);
+    }
+
+    db.query_opt(
+        "SELECT session_id
+         FROM runs
+         WHERE job_id = ?1 AND session_id IS NOT NULL
+         ORDER BY created_at DESC
+         LIMIT 1",
+        params![job_id.as_str()],
+        |row| row.opt_text(0),
+    )
+    .await
+    .map_err(CairnError::from)
+    .map(Option::flatten)
 }
 
 /// Incremental session-event delta. Durable events insert monotonically per
@@ -90,9 +122,9 @@ pub struct SessionEventsDelta {
     /// New durable events. On the initial load (no cursor) these are
     /// run-ordered; on a delta they are in insertion (rowid) order.
     pub events: Vec<Event>,
-    /// Max rowid of all durable events returned; echoes the cursor when the
-    /// delta is empty so the caller can keep its position. `None` only when the
-    /// session has no durable events yet.
+    /// Newest durable event rowid across the session's whole rotation lineage;
+    /// echoes the cursor when the delta is empty so the caller can keep its
+    /// position. `None` only when the lineage has no durable events at all.
     pub last_rowid: Option<i64>,
     /// Active-stream placeholder, returned separately rather than spliced into
     /// `events` so the frontend merge stays append-only.
@@ -183,10 +215,18 @@ pub(crate) use crate::storage::events::columns::{
 
 const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id";
 
-#[derive(Debug, Default)]
+/// Exit reason for a stale run whose surviving process this sweep stopped. Kept
+/// distinct from the blanket `crash` so a row says whether the death was caused
+/// or assumed.
+pub const ORPHAN_REAPED_EXIT_REASON: &str = "orphan_reaped";
+
+#[derive(Default)]
 struct ReconcileResult {
     stale_run_count: usize,
     turn_count: usize,
+    /// Stale runs whose surviving process this sweep actually stopped, as
+    /// opposed to ones merely assumed dead.
+    reaped_count: usize,
 }
 
 pub fn list_runs(db: Arc<LocalDb>, issue_id: &str) -> Result<Vec<Run>, CairnError> {
@@ -388,13 +428,41 @@ pub fn get_job_todos_by_run(db: Arc<LocalDb>, job_id: &str) -> Result<Vec<RunTod
     }])
 }
 
-pub fn reconcile_stale_runs(db: Arc<LocalDb>, emitter: &dyn crate::services::EventEmitter) {
-    match run_query_db(reconcile_stale_runs_db(db)) {
+/// Reconcile runs left non-terminal by a host that is no longer running, and stop
+/// any of their processes that outlived it.
+///
+/// `boot_at` is this host's [`crate::orchestrator::Orchestrator::boot_at`]. It is
+/// required, not inferred: the transport is already serving when startup recovery
+/// runs, so "every non-terminal run is stale" is false, and acting on it would let
+/// this sweep signal an agent this host had just spawned.
+pub fn reconcile_stale_runs(
+    db: Arc<LocalDb>,
+    emitter: &dyn crate::services::EventEmitter,
+    boot_at: i64,
+) {
+    reconcile_stale_runs_with(
+        db,
+        emitter,
+        boot_at,
+        &crate::agent_process::orphan::OsProcessTable,
+    )
+}
+
+/// [`reconcile_stale_runs`] against an injected process table, so a test can
+/// assert which pids were signalled without spawning anything.
+pub fn reconcile_stale_runs_with(
+    db: Arc<LocalDb>,
+    emitter: &dyn crate::services::EventEmitter,
+    boot_at: i64,
+    processes: &dyn crate::agent_process::orphan::ProcessTable,
+) {
+    match run_query_db_scoped(|| reconcile_stale_runs_db(db, processes, boot_at)) {
         Ok(result) if result.stale_run_count == 0 => {}
         Ok(result) => {
             log::info!(
-                "Reconciled {} stale runs on startup",
-                result.stale_run_count
+                "Reconciled {} stale runs on startup; orphan processes stopped: {}",
+                result.stale_run_count,
+                result.reaped_count
             );
             // Intentionally bare: this startup sweep reconciles many stale runs
             // at once and carries no ids, so the frontend broad-invalidates
@@ -432,6 +500,30 @@ where
     })
     .join()
     .map_err(|_| CairnError::Internal("Run database task panicked".to_string()))?
+}
+
+/// [`run_query_db`] for work that borrows from its caller. A scoped thread joins
+/// before the borrow can end, which a detached `thread::spawn` cannot promise.
+fn run_query_db_scoped<T, F, Fut>(build: F) -> Result<T, CairnError>
+where
+    T: Send,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<T, CairnError>>,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        CairnError::Internal(format!("Failed to start run database runtime: {e}"))
+                    })?
+                    .block_on(build())
+            })
+            .join()
+            .map_err(|_| CairnError::Internal("Run database task panicked".to_string()))?
+    })
 }
 
 async fn load_runs_by_sql(
@@ -638,14 +730,49 @@ async fn load_events_for_session(
     session_id: String,
 ) -> Result<(Vec<Event>, std::collections::HashMap<String, usize>), CairnError> {
     let lineage = load_session_lineage_ids(db, &session_id).await?;
+    load_events_for_lineage(db, &lineage).await
+}
 
+/// The newest event rowid anywhere in a rotation lineage.
+///
+/// The delta cursor must span the whole lineage, not just the session named in
+/// the request. A session that was just rotated to has no events of its own yet
+/// while its lineage carries the entire prior transcript, so a session-scoped
+/// `MAX(rowid)` would hand back a null cursor after returning that history —
+/// and the caller's append-only merge would re-append the whole transcript on
+/// its next (again cursor-less) fetch.
+async fn max_event_rowid_for_lineage(
+    db: &LocalDb,
+    lineage: &[String],
+) -> Result<Option<i64>, CairnError> {
+    let mut newest: Option<i64> = None;
+    for session_id in lineage {
+        let candidate = db
+            .query_one(
+                "SELECT MAX(rowid) FROM events WHERE session_id = ?1",
+                params![session_id.as_str()],
+                |row| row.opt_i64(0),
+            )
+            .await
+            .map_err(CairnError::from)?;
+        if let Some(rowid) = candidate {
+            newest = Some(newest.map_or(rowid, |current: i64| current.max(rowid)));
+        }
+    }
+    Ok(newest)
+}
+
+async fn load_events_for_lineage(
+    db: &LocalDb,
+    lineage: &[String],
+) -> Result<(Vec<Event>, std::collections::HashMap<String, usize>), CairnError> {
     // Runs across the whole rotation lineage, in creation order. Sessions rotate
     // strictly sequentially, so per-session `created_at` order concatenated across
     // the lineage is global chronological order — the position map the event sort
     // below keys on. For an un-rotated session the lineage is `[session_id]`, so
     // this is identical to a single-session load.
     let mut ordered_run_ids: Vec<String> = Vec::new();
-    for sid in &lineage {
+    for sid in lineage {
         let ids = db
             .query_all(
                 "SELECT id
@@ -667,7 +794,7 @@ async fn load_events_for_session(
         .collect();
 
     let mut db_events: Vec<Event> = Vec::new();
-    for sid in &lineage {
+    for sid in lineage {
         let events = db
             .query_all(
                 format!(
@@ -942,15 +1069,9 @@ async fn load_session_events_delta(
         // Initial load: reuse the run-ordered sort, and take the session-wide
         // MAX(rowid) as the cursor (all durable rows are returned here).
         None => {
-            let (events, _run_position) = load_events_for_session(db, session_id.clone()).await?;
-            let last_rowid = db
-                .query_one(
-                    "SELECT MAX(rowid) FROM events WHERE session_id = ?1",
-                    params![session_id.as_str()],
-                    |row| row.opt_i64(0),
-                )
-                .await
-                .map_err(CairnError::from)?;
+            let lineage = load_session_lineage_ids(db, &session_id).await?;
+            let (events, _run_position) = load_events_for_lineage(db, &lineage).await?;
+            let last_rowid = max_event_rowid_for_lineage(db, &lineage).await?;
             Ok((events, last_rowid))
         }
         // Delta: rows insert monotonically, so rowid order is the append order
@@ -1067,78 +1188,180 @@ async fn load_pending_prompt_for_job(
     .map_err(CairnError::from)
 }
 
-async fn reconcile_stale_runs_db(db: Arc<LocalDb>) -> Result<ReconcileResult, CairnError> {
-    db.write(|conn| {
+/// Mark every run left non-terminal by a PREDECESSOR host as crashed, and stop any
+/// of their processes that outlived it.
+///
+/// The sweep used to be blind twice over. It recorded `exit_reason = 'crash'` for a
+/// death it had neither caused nor confirmed, while whatever was still running kept
+/// running; and it selected every non-terminal row regardless of who spawned it.
+/// The second part became dangerous the moment the sweep started sending signals:
+/// the transport is already serving when startup recovery runs, so a run created in
+/// that window would have appeared in this candidate set, been matched in `ps` by
+/// its own session id, and had the current host SIGTERM an agent it had just
+/// spawned.
+///
+/// So ownership is now enforced rather than assumed, through the same
+/// [`crate::runs::ownership::predates_host_boot`] boundary the tool-serving fence
+/// uses: only runs that positively predate this host are candidates. A run this
+/// host spawned is neither signalled nor rewritten, however non-terminal it looks.
+///
+/// The row then distinguishes a run whose process this sweep actually stopped
+/// ([`ORPHAN_REAPED_EXIT_REASON`]) from one merely presumed dead (`crash`), so the
+/// forensics for the next incident say which happened.
+async fn reconcile_stale_runs_db(
+    db: Arc<LocalDb>,
+    processes: &dyn crate::agent_process::orphan::ProcessTable,
+    boot_at: i64,
+) -> Result<ReconcileResult, CairnError> {
+    // Filtered in Rust rather than SQL so the boundary has exactly one definition
+    // and cannot drift from the fence's. The candidate set is only non-terminal
+    // runs, so the rows read are few.
+    let stale: Vec<(String, Option<String>)> = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, session_id, started_at, created_at
+                         FROM runs
+                         WHERE status IN ('starting', 'live')",
+                        (),
+                    )
+                    .await?;
+                let mut stale = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let (id, session_id) = (row.text(0)?, row.opt_text(1)?);
+                    if crate::runs::ownership::predates_host_boot(
+                        row.opt_i64(2)?,
+                        row.i64(3)?,
+                        boot_at,
+                    ) {
+                        stale.push((id, session_id));
+                    }
+                }
+                Ok(stale)
+            })
+        })
+        .await
+        .map_err(CairnError::from)?;
+    if stale.is_empty() {
+        return Ok(ReconcileResult::default());
+    }
+
+    // Signalling happens BEFORE the rows are written, so each row records the
+    // outcome it actually had rather than being corrected afterwards.
+    let session_ids: Vec<String> = stale.iter().filter_map(|(_, s)| s.clone()).collect();
+    let reaped = crate::agent_process::orphan::reap_sessions(processes, &session_ids);
+
+    db.write(move |conn| {
+        let stale = stale.clone();
+        let reaped = reaped.clone();
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp();
 
-            let mut stale_rows = conn
-                .query(
-                    "SELECT id
-                     FROM runs
-                     WHERE status IN ('starting', 'live')",
-                    (),
-                )
-                .await?;
-            let mut stale_runs = Vec::new();
-            while let Some(row) = stale_rows.next().await? {
-                stale_runs.push(row.text(0)?);
-            }
-
             let mut turn_count = 0usize;
-            for run_id in &stale_runs {
-                conn.execute(
-                    "UPDATE runs
-                     SET status = 'crashed',
-                         exit_reason = 'crash',
-                         exited_at = ?1,
-                         updated_at = ?2
-                     WHERE id = ?3",
-                    params![now, now, run_id.as_str()],
-                )
-                .await?;
-
-                let mut turn_rows = conn
-                    .query(
-                        "SELECT id, state
-                         FROM turns
-                         WHERE run_id = ?1
-                           AND state IN ('running', 'pending')",
-                        params![run_id.as_str()],
-                    )
-                    .await?;
-                let mut orphaned_turns = Vec::new();
-                while let Some(row) = turn_rows.next().await? {
-                    orphaned_turns.push((row.text(0)?, row.text(1)?));
+            let mut reaped_count = 0usize;
+            let mut stale_run_count = 0usize;
+            for (run_id, session_id) in &stale {
+                let was_reaped = session_id
+                    .as_deref()
+                    .is_some_and(|session_id| reaped.iter().any(|s| s == session_id));
+                let exit_reason = if was_reaped {
+                    ORPHAN_REAPED_EXIT_REASON
+                } else {
+                    "crash"
+                };
+                let Some(settled_turns) = settle_stale_run(conn, run_id, exit_reason, now).await?
+                else {
+                    continue;
+                };
+                stale_run_count += 1;
+                if was_reaped {
+                    reaped_count += 1;
                 }
-
-                for (turn_id, turn_state) in orphaned_turns {
-                    let target_state = match turn_state.as_str() {
-                        "running" => "interrupted",
-                        "pending" => "failed",
-                        _ => continue,
-                    };
-                    conn.execute(
-                        "UPDATE turns
-                         SET state = ?1,
-                             ended_at = ?2,
-                             updated_at = ?3
-                         WHERE id = ?4",
-                        params![target_state, now, now, turn_id.as_str()],
-                    )
-                    .await?;
-                    turn_count += 1;
-                }
+                turn_count += settled_turns.len();
             }
 
             Ok(ReconcileResult {
-                stale_run_count: stale_runs.len(),
+                stale_run_count,
                 turn_count,
+                reaped_count,
             })
         })
     })
     .await
     .map_err(CairnError::from)
+}
+
+/// Settle one stale run: mark it `crashed` with `exit_reason`, and terminalize
+/// the turns it stranded (`running -> interrupted`, `pending -> failed`).
+/// Returns the ids of the turns settled, or `None` when the run was no longer
+/// non-terminal and nothing was written.
+///
+/// The status is re-checked inside the UPDATE rather than trusted from the
+/// caller's read. Every caller decides staleness outside this write — the
+/// startup sweep spends up to a second signalling processes first, the
+/// in-session reaper reads its candidates before taking the write — and a run
+/// can legitimately finalize in that window. Without the guard, a real outcome
+/// would be overwritten with an invented crash.
+///
+/// Shared so "what settling a stale run means" has exactly one definition:
+/// [`reconcile_stale_runs`] owns the question at startup, and
+/// [`crate::runs::reap`] owns it inside a live session.
+pub(crate) async fn settle_stale_run(
+    conn: &Connection,
+    run_id: &str,
+    exit_reason: &str,
+    now: i64,
+) -> DbResult<Option<Vec<String>>> {
+    let updated = conn
+        .execute(
+            "UPDATE runs
+             SET status = 'crashed',
+                 exit_reason = ?1,
+                 exited_at = ?2,
+                 updated_at = ?3
+             WHERE id = ?4
+               AND status IN ('starting', 'live')",
+            params![exit_reason, now, now, run_id],
+        )
+        .await?;
+    if updated == 0 {
+        return Ok(None);
+    }
+
+    let mut turn_rows = conn
+        .query(
+            "SELECT id, state
+             FROM turns
+             WHERE run_id = ?1
+               AND state IN ('running', 'pending')",
+            params![run_id],
+        )
+        .await?;
+    let mut stranded = Vec::new();
+    while let Some(row) = turn_rows.next().await? {
+        stranded.push((row.text(0)?, row.text(1)?));
+    }
+
+    let mut settled = Vec::new();
+    for (turn_id, turn_state) in stranded {
+        let target_state = match turn_state.as_str() {
+            "running" => "interrupted",
+            "pending" => "failed",
+            _ => continue,
+        };
+        conn.execute(
+            "UPDATE turns
+             SET state = ?1,
+                 ended_at = ?2,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![target_state, now, now, turn_id.as_str()],
+        )
+        .await?;
+        settled.push(turn_id);
+    }
+    Ok(Some(settled))
 }
 
 /// Map a `runs` row projected by [`RUN_COLUMNS`] into a [`Run`]. Canonical

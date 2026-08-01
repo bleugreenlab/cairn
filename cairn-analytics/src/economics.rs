@@ -72,7 +72,7 @@ fn finalize(map: HashMap<String, Acc>) -> Vec<EconomicsRow> {
             }
         })
         .collect();
-    rows.sort_by(|a, b| b.billable_tokens.cmp(&a.billable_tokens));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.billable_tokens));
     rows
 }
 

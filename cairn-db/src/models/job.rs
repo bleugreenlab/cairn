@@ -1,7 +1,7 @@
 //! Job types - the unit of agent work.
 //!
 //! Jobs replace timeline_nodes as the core execution unit. A job owns:
-//! - Worktree and branch (execution environment)
+//! - durable branch and logical-head coordinates
 //! - backend session (conversation state)
 //! - Artifacts (outputs)
 //! - Runs (execution attempts)
@@ -89,12 +89,20 @@ pub struct Job {
     pub recipe_node_id: Option<String>,
     pub parent_job_id: Option<String>,
 
-    // Execution environment
-    pub worktree_path: Option<String>,
+    // Durable repository coordinate.
+    //
+    // The branch is the whole of a job's live coordinate: a base commit is
+    // resolved from the store at the moment it is needed, never carried on this
+    // model. `jobs.base_commit` is deliberately absent here — it is an archival
+    // record of where the branch was last anchored, and every surface that
+    // presents or acts on a base coordinate derives it live (CAIRN-3224). A
+    // plausible-looking commit id on the model a UI receives is exactly how the
+    // CAIRN-3094 / 3108 / 3150 stale-coordinate family started, so it does not
+    // cross this boundary (CAIRN-3226).
     pub branch: Option<String>,
-    pub base_commit: Option<String>,
-    /// Nearest durable ancestor commit (reachable from the project default
-    /// branch), captured alongside `base_commit` at worktree creation.
+    /// Nearest durable ancestor commit reachable from the project default
+    /// branch. Archival: it selects the range a pack is built against and is
+    /// never a placement coordinate.
     pub pack_anchor: Option<String>,
     pub current_session_id: Option<String>,
 
@@ -128,7 +136,7 @@ pub struct Job {
     pub node_name: Option<String>,
     /// Execution sequence number (1-indexed) for URI routing
     pub exec_seq: Option<i32>,
-    /// Base branch for worktree creation and PR targeting (None = use HEAD / repo default)
+    /// Base branch for logical branch creation and PR targeting (None = repository default).
     pub base_branch: Option<String>,
     /// Stable URI segment assigned at creation for addressable job resources.
     pub uri_segment: Option<String>,
@@ -159,9 +167,7 @@ impl TryFrom<crate::db_records::DbJob> for Job {
             execution_id: db.execution_id,
             recipe_node_id: db.recipe_node_id,
             parent_job_id: db.parent_job_id,
-            worktree_path: db.worktree_path,
             branch: db.branch,
-            base_commit: db.base_commit,
             pack_anchor: db.pack_anchor,
             current_session_id: db.current_session_id,
             status,

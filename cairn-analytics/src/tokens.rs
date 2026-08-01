@@ -1,5 +1,7 @@
-//! Token-economics analytics: tokens per session, token-to-line efficiency, and
-//! token-composition over time.
+//! Token-economics analytics: tokens per session, token-to-line efficiency,
+//! token volume per model over time, and token-composition over time.
+
+use std::collections::HashMap;
 
 use cairn_db::storage::{DbResult, LocalDb};
 
@@ -7,7 +9,8 @@ use super::cost::exact_or_priced;
 use super::queries;
 use super::roles::normalize_role;
 use super::types::{
-    Bucket, Scope, TimeRange, TokenCompositionPoint, TokensPerLocPoint, TokensPerSessionPoint,
+    Bucket, ModelTokenPoint, Scope, TimeRange, TokenCompositionPoint, TokensPerLocPoint,
+    TokensPerSessionPoint,
 };
 
 /// Average billable tokens per session, bucketed by the session's first event.
@@ -65,6 +68,67 @@ pub async fn tokens_per_loc(
             }
         })
         .collect())
+}
+
+/// Billable tokens over time split per model — the dashboard's main chart.
+///
+/// Reuses [`queries::cost_components`] (no new SQL), folding its
+/// (bucket, model, backend) groups down to (bucket, model): the same alias
+/// served through two providers is one model to the reader. Because the fold
+/// only drops the backend key, each bucket's model heights sum to the same
+/// billable total as [`super::cost_timeseries`].
+///
+/// Groups with no billable tokens are dropped. A metered settlement can land in
+/// a (bucket, model) group that carries no token event — a zero-height bar whose
+/// only content is cost, which this token-volume view has nothing to say about.
+pub async fn tokens_by_model_timeseries(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<ModelTokenPoint>> {
+    let rows = queries::cost_components(db, scope, range, bucket).await?;
+    let mut agg: HashMap<(i64, String), ModelTokenPoint> = HashMap::new();
+    for row in &rows {
+        let model = row
+            .model
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let entry = agg
+            .entry((row.bucket_start, model.clone()))
+            .or_insert_with(|| ModelTokenPoint {
+                bucket_start: row.bucket_start,
+                model,
+                billable_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: 0.0,
+            });
+        entry.billable_tokens += row.billable;
+        entry.input_tokens += row.input + row.cache_read + row.cache_create;
+        entry.output_tokens += row.output;
+        entry.cost_usd += exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            row.input,
+            row.cache_read,
+            row.cache_create,
+            row.output,
+            row.exact_cost,
+            row.exact_cost_count,
+        );
+    }
+    let mut points: Vec<ModelTokenPoint> = agg
+        .into_values()
+        .filter(|p| p.billable_tokens > 0)
+        .collect();
+    points.sort_by(|a, b| {
+        a.bucket_start
+            .cmp(&b.bucket_start)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    Ok(points)
 }
 
 /// Token components (input / cache-read / cache-create / output / thinking) over

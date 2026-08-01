@@ -655,6 +655,7 @@ mod tests {
             commit_msg: None,
             preview: None,
             atomic: None,
+            conflict_markers_reason: None,
         };
 
         let rewritten = mcp.rewrite_change_targets(&input).unwrap();

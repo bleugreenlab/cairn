@@ -74,7 +74,7 @@ When an execution starts, `create_jobs_from_nodes()` converts recipe nodes into 
 3. **Worktree assignment** — each agent job gets a worktree mode:
    - **Own** (default): new branch and worktree created at job preparation time
    - **Inherit**: uses parent agent's worktree path and branch
-   - **None**: reads from main branch, no dedicated worktree
+   - **None**: reads from the resolved base coordinate without minting a branch
 
 All jobs start in `pending` status.
 

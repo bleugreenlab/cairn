@@ -8,7 +8,7 @@ use cairn_common::uri::CairnResource;
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
-    _request: &McpCallbackRequest,
+    request: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
     dry_run: bool,
@@ -122,11 +122,8 @@ pub(super) async fn dispatch(
                                 .await
                                 .map_err(|error| build_failure(index, item, error))?;
                             format!(
-                                "Refreshed PR #{} for {node_id}/{artifact_label} (state {}, +{} -{})",
-                                cache.pr_number,
-                                cache.state,
-                                cache.additions.unwrap_or(0),
-                                cache.deletions.unwrap_or(0)
+                                "Refreshed {} for {node_id}/{artifact_label}",
+                                crate::pr_data::publication::refreshed_summary(&cache)
                             )
                         }
                     }
@@ -178,6 +175,7 @@ pub(super) async fn dispatch(
             } else {
                 comments_artifacts::write_artifact_change(
                     orch,
+                    request,
                     project,
                     *number,
                     *exec_seq,
@@ -220,6 +218,7 @@ pub(super) async fn dispatch(
             } else {
                 comments_artifacts::write_artifact_change(
                     orch,
+                    request,
                     project,
                     *number,
                     *exec_seq,

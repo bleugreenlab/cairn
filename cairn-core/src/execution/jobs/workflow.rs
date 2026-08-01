@@ -3,7 +3,7 @@
 //! A workflow run is a node-less job+session+run whose process is a supervised
 //! `bun <script>` (see `backends/workflow.rs`), NOT an agent session. It reuses
 //! the same real-run row shape as an ephemeral call — `insert_child_job_session_run`,
-//! a per-run `output_contract`, a `none`/`inherit` worktree — so the delegated
+//! a per-run `output_contract`, and a durable branch policy — so the delegated
 //! task/call wait/suspend/resume tail runs it unchanged. It differs from a call
 //! in skipping ALL agent-config/model/preset resolution (a script has no model)
 //! and in creating its own initial turn here (a call's turn is created by
@@ -30,8 +30,7 @@ pub(crate) struct CreateWorkflowRunInput {
     pub project_id: Option<String>,
     /// Standalone anchor: the issue whose execution hosts the run.
     pub issue_id: Option<String>,
-    /// Standalone worktree base branch — an `inherit` workflow mints its ephemeral
-    /// worktree off this ref (ignored for `none`, which runs in a scratch dir).
+    /// Standalone logical branch anchor.
     pub base_branch: Option<String>,
     pub execution_id: Option<String>,
     pub workflow_id: String,
@@ -41,7 +40,7 @@ pub(crate) struct CreateWorkflowRunInput {
     /// The validated named args, forwarded to the script as `CAIRN_WORKFLOW_ARGS`.
     pub args_json: String,
     pub output_contract: DelegatedOutputContract,
-    pub worktree: CallWorktree,
+    pub branch_policy: CallBranchPolicy,
     pub label: Option<String>,
     pub phase: Option<String>,
     pub parent_tool_use_id: Option<String>,
@@ -55,9 +54,8 @@ pub(crate) struct PreparedWorkflowRun {
     pub project_id: String,
     pub repository_path: PathBuf,
     pub anchor_branch: String,
-    pub worktree_mode: String,
+    pub branch_mode: String,
     pub package_path: PathBuf,
-    pub working_dir: String,
     pub script_path: PathBuf,
     pub args_json: String,
     pub execution_id: Option<String>,
@@ -66,10 +64,6 @@ pub(crate) struct PreparedWorkflowRun {
     /// The declared output artifact name (`CAIRN_WORKFLOW_OUTPUT`); the harness
     /// `output()` writes `cairn:~/{name}` to complete the run.
     pub output_name: String,
-    /// True when this workflow minted its own ephemeral worktree (an Inherit
-    /// workflow from an ambient, no-worktree parent). Drives the startup-failure
-    /// reclaim so a workflow that never starts cannot strand a worktree.
-    pub owns_ephemeral_worktree: bool,
 }
 
 /// Mint the job+session+run rows and the initial turn for a workflow run, seed
@@ -82,12 +76,8 @@ pub(crate) fn prepare_workflow_run(
     orch: &Orchestrator,
     input: CreateWorkflowRunInput,
 ) -> Result<PreparedWorkflowRun, String> {
-    // Resolve the anchor context. A delegated workflow derives it from its caller
-    // job (routed DB, project/issue/execution, and the worktree to share). A
-    // standalone launch (CAIRN-2651) carries the anchor explicitly, lives in the
-    // local DB, and has no parent worktree to inherit — so an `inherit` workflow
-    // mints its own ephemeral tree off `base_branch`, exactly the ambient case.
-    let (db, project_id, issue_id, execution_id, parent_worktree_path, parent_base_branch) =
+    // Resolve the durable branch coordinate. No workflow owns or shares a checkout.
+    let (db, project_id, issue_id, execution_id, anchor_branch, inherited_head) =
         match input.parent_job_id.clone() {
             Some(parent_job_id) => {
                 let db = run_db({
@@ -113,8 +103,8 @@ pub(crate) fn prepare_workflow_run(
                     parent_job.project_id.clone(),
                     parent_job.issue_id.clone(),
                     execution_id,
-                    parent_job.worktree_path.clone(),
                     parent_job.branch.clone().or(parent_job.base_branch.clone()),
+                    parent_job.base_commit.clone(),
                 )
             }
             None => {
@@ -143,12 +133,27 @@ pub(crate) fn prepare_workflow_run(
                     project_id,
                     input.issue_id.clone(),
                     Some(execution_id),
-                    None,
                     input.base_branch.clone(),
+                    None,
                 )
             }
         };
-    let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
+    let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?
+        .ok_or("Workflow project has no local repository path")?;
+    let anchor_branch = anchor_branch.ok_or("Workflow execution anchor has no logical branch")?;
+    let store = crate::jj::project_store_dir(&orch.config_dir, &project_path);
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, &project_path)?;
+    let base_commit = match inherited_head {
+        Some(head) => head,
+        None => crate::jj::resolve_base_rev(&jj, &store, &anchor_branch, |revision| {
+            orch.services
+                .git
+                .rev_parse(&project_path, vec![revision.to_string()])
+                .ok()
+                .filter(|sha| !sha.is_empty())
+        }),
+    };
     let node_path = run_db({
         let db = db.clone();
         let project_id = project_id.clone();
@@ -161,53 +166,10 @@ pub(crate) fn prepare_workflow_run(
     let turn_id = ids::mint_child(&run_id);
     let now = chrono::Utc::now().timestamp() as i32;
 
-    // Worktree mode mirrors a call: `inherit` shares the caller's tree; `none`
-    // runs in a fresh scratch dir with no project-tree binding.
-    let (worktree_path, working_dir, base_commit, ephemeral_branch, owns_ephemeral_worktree) =
-        match super::worktrees::resolve_call_worktree_plan(
-            input.worktree,
-            parent_worktree_path.as_deref(),
-            parent_base_branch.as_deref(),
-        ) {
-            // A worktree-backed parent shares its tree with the workflow.
-            super::worktrees::CallWorktreePlan::Share { path } => {
-                let base = worktree_head_commit(orch, Path::new(&path));
-                (Some(path.clone()), path, base, None, false)
-            }
-            // An ambient (no-worktree) parent has none to inherit, so the workflow
-            // gets its own ephemeral worktree off the parent's base branch —
-            // reclaimed when the workflow job terminalizes. Mirrors the
-            // child-task / call precedent exactly.
-            super::worktrees::CallWorktreePlan::MintEphemeral { base_ref } => {
-                let repo_path = project_path
-                    .as_ref()
-                    .ok_or("Project has no repo path for ephemeral workflow worktree")?
-                    .to_string_lossy()
-                    .to_string();
-                let (path, branch) = super::worktrees::ensure_ephemeral_task_worktree(
-                    orch,
-                    &repo_path,
-                    &project_id,
-                    &job_id,
-                    issue_id.clone(),
-                    &base_ref,
-                )?;
-                let base = worktree_head_commit(orch, Path::new(&path));
-                (Some(path.clone()), path, base, Some(branch), true)
-            }
-            super::worktrees::CallWorktreePlan::Scratch => {
-                let scratch = std::env::temp_dir().join(format!("cairn-workflow-{run_id}"));
-                std::fs::create_dir_all(&scratch)
-                    .map_err(|e| format!("Failed to create workflow scratch dir: {e}"))?;
-                (
-                    None,
-                    scratch.to_string_lossy().into_owned(),
-                    None,
-                    None,
-                    false,
-                )
-            }
-        };
+    let branch = match input.branch_policy {
+        CallBranchPolicy::Inherit => Some(anchor_branch.clone()),
+        CallBranchPolicy::None => None,
+    };
 
     let output_name = input.output_contract.artifact_name();
     let output_contract_json = serde_json::to_string(&input.output_contract)
@@ -220,11 +182,7 @@ pub(crate) fn prepare_workflow_run(
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             parent_job_id: input.parent_job_id.clone(),
-            worktree_path: worktree_path.clone(),
-            // Shares the parent's worktree / runs in a scratch dir (branch None),
-            // or owns an ephemeral worktree minted off the parent's base (inherit
-            // from an ambient parent) — recorded so teardown can forget the branch.
-            branch: ephemeral_branch,
+            branch,
             // A workflow has no agent; the synthetic id marks the job as a workflow
             // node without loading an agent config.
             agent_config_id: "workflow".to_string(),
@@ -233,8 +191,7 @@ pub(crate) fn prepare_workflow_run(
             execution_id: execution_id.clone(),
             description: input.description.clone(),
             model: None,
-            base_commit,
-            owns_ephemeral_worktree,
+            base_commit: Some(base_commit),
             output_contract: Some(output_contract_json),
             label: input.label.clone(),
             phase: input.phase.clone(),
@@ -272,7 +229,7 @@ pub(crate) fn prepare_workflow_run(
         "Workflow `{}` invoked.\n\nArgs:\n{}",
         input.workflow_id, input.args_json
     );
-    store_user_event(orch, &run_id, &session_id, &seed, now, -1)?;
+    store_user_event(orch, &run_id, &session_id, &seed, now)?;
 
     // Create the initial turn (pending) and point the job at it; the backend
     // moves it to running once the process spawns.
@@ -288,10 +245,10 @@ pub(crate) fn prepare_workflow_run(
         workflow_id: input.workflow_id.clone(),
         project_id: project_id.clone(),
         execution_id: execution_id.clone(),
-        anchor_branch: parent_base_branch.clone(),
-        worktree_mode: match input.worktree {
-            CallWorktree::None => "none".to_string(),
-            CallWorktree::Inherit => "inherit".to_string(),
+        anchor_branch: Some(anchor_branch.clone()),
+        branch_mode: match input.branch_policy {
+            CallBranchPolicy::None => "none".to_string(),
+            CallBranchPolicy::Inherit => "inherit".to_string(),
         },
         package_path: input
             .script_path
@@ -301,7 +258,6 @@ pub(crate) fn prepare_workflow_run(
             .into_owned(),
         script_path: input.script_path.to_string_lossy().into_owned(),
         args_json: input.args_json.clone(),
-        working_dir: working_dir.clone(),
         output_name: output_name.clone(),
         node_path: node_path.clone(),
     };
@@ -317,51 +273,24 @@ pub(crate) fn prepare_workflow_run(
         run_id,
         session_id,
         project_id,
-        repository_path: project_path.ok_or("Workflow project has no local repository path")?,
-        anchor_branch: parent_base_branch
-            .ok_or("Workflow execution anchor has no logical branch")?,
-        worktree_mode: match input.worktree {
-            CallWorktree::None => "none".to_string(),
-            CallWorktree::Inherit => "inherit".to_string(),
+        repository_path: project_path,
+        anchor_branch,
+        branch_mode: match input.branch_policy {
+            CallBranchPolicy::None => "none".to_string(),
+            CallBranchPolicy::Inherit => "inherit".to_string(),
         },
         package_path: input
             .script_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf(),
-        working_dir,
         script_path: input.script_path,
         args_json: input.args_json,
         execution_id,
         turn_id,
         workflow_id: input.workflow_id,
         output_name,
-        owns_ephemeral_worktree,
     })
-}
-
-/// Reclaim the ephemeral worktree an Inherit workflow from an ambient parent
-/// minted in [`prepare_workflow_run`], when the workflow fails to fully start
-/// (packet persist or process spawn). The workflow job never terminalizes on such
-/// a failure, so neither the finalize reclaim nor the terminal-status GC fires —
-/// discard it here so a failed spawn cannot strand a worktree + branch. No-op for
-/// a shared/inherited or scratch-dir workflow.
-pub(crate) async fn reclaim_ephemeral_workflow_worktree(
-    orch: &Orchestrator,
-    prepared: &PreparedWorkflowRun,
-) {
-    if !prepared.owns_ephemeral_worktree {
-        return;
-    }
-    if let Err(e) = crate::execution::teardown::teardown_worktrees(
-        orch,
-        crate::execution::teardown::TeardownScope::Job(prepared.job_id.clone()),
-        crate::execution::teardown::TeardownReason::Discarded,
-    )
-    .await
-    {
-        log::warn!("failed to reclaim ephemeral workflow worktree after start failure: {e}");
-    }
 }
 
 /// The durable spawn parameters of a workflow run, recorded in `workflow_run`
@@ -379,11 +308,10 @@ pub(crate) struct WorkflowRunRow {
     pub project_id: String,
     pub execution_id: Option<String>,
     pub anchor_branch: Option<String>,
-    pub worktree_mode: String,
+    pub branch_mode: String,
     pub package_path: String,
     pub script_path: String,
     pub args_json: String,
-    pub working_dir: String,
     pub output_name: String,
     /// The invoking project repo's `node_modules`, recorded diagnostically. It no
     /// longer drives resolution — the harness is linked into a `node_modules`
@@ -406,9 +334,9 @@ pub(crate) async fn persist_workflow_run_row(
             conn.execute(
                 "INSERT OR REPLACE INTO workflow_run \
                  (run_id, job_id, session_id, workflow_id, project_id, execution_id, \
-                  anchor_branch, worktree_mode, package_path, script_path, args_json, \
-                  working_dir, output_name, node_path, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  anchor_branch, branch_mode, package_path, script_path, args_json, \
+                  output_name, node_path, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     row.run_id.as_str(),
                     row.job_id.as_str(),
@@ -417,11 +345,10 @@ pub(crate) async fn persist_workflow_run_row(
                     row.project_id.as_str(),
                     row.execution_id.as_deref(),
                     row.anchor_branch.as_deref(),
-                    row.worktree_mode.as_str(),
+                    row.branch_mode.as_str(),
                     row.package_path.as_str(),
                     row.script_path.as_str(),
                     row.args_json.as_str(),
-                    row.working_dir.as_str(),
                     row.output_name.as_str(),
                     row.node_path.as_deref(),
                     now
@@ -447,8 +374,8 @@ pub(crate) async fn load_all_workflow_run_rows(
             let mut rows = conn
                 .query(
                     "SELECT run_id, job_id, session_id, workflow_id, project_id, execution_id, \
-                     anchor_branch, worktree_mode, package_path, script_path, args_json, \
-                     working_dir, output_name, node_path \
+                     anchor_branch, branch_mode, package_path, script_path, args_json, \
+                     output_name, node_path \
                      FROM workflow_run",
                     (),
                 )
@@ -463,13 +390,12 @@ pub(crate) async fn load_all_workflow_run_rows(
                     project_id: row.opt_text(4)?.unwrap_or_default(),
                     execution_id: row.opt_text(5)?,
                     anchor_branch: row.opt_text(6)?,
-                    worktree_mode: row.text(7)?,
+                    branch_mode: row.text(7)?,
                     package_path: row.opt_text(8)?.unwrap_or_default(),
                     script_path: row.text(9)?,
                     args_json: row.text(10)?,
-                    working_dir: row.text(11)?,
-                    output_name: row.text(12)?,
-                    node_path: row.opt_text(13)?,
+                    output_name: row.text(11)?,
+                    node_path: row.opt_text(12)?,
                 });
             }
             Ok(out)
@@ -650,7 +576,7 @@ async fn respawn_workflow_run(
                 .anchor_branch
                 .clone()
                 .ok_or("Workflow execution anchor has no logical branch")?,
-            worktree_mode: row.worktree_mode.clone(),
+            branch_mode: row.branch_mode.clone(),
             package_path: PathBuf::from(&row.package_path),
             script_path: PathBuf::from(&row.script_path),
             args_json: row.args_json.clone(),
@@ -715,8 +641,8 @@ pub(crate) async fn load_workflow_run_row_by_job(
             let mut rows = conn
                 .query(
                     "SELECT run_id, job_id, session_id, workflow_id, project_id, execution_id, \
-                     anchor_branch, worktree_mode, package_path, script_path, args_json, \
-                     working_dir, output_name, node_path \
+                     anchor_branch, branch_mode, package_path, script_path, args_json, \
+                     output_name, node_path \
                      FROM workflow_run WHERE job_id = ?1 LIMIT 1",
                     (job_id.as_str(),),
                 )
@@ -730,13 +656,12 @@ pub(crate) async fn load_workflow_run_row_by_job(
                     project_id: row.opt_text(4)?.unwrap_or_default(),
                     execution_id: row.opt_text(5)?,
                     anchor_branch: row.opt_text(6)?,
-                    worktree_mode: row.text(7)?,
+                    branch_mode: row.text(7)?,
                     package_path: row.opt_text(8)?.unwrap_or_default(),
                     script_path: row.text(9)?,
                     args_json: row.text(10)?,
-                    working_dir: row.text(11)?,
-                    output_name: row.text(12)?,
-                    node_path: row.opt_text(13)?,
+                    output_name: row.text(11)?,
+                    node_path: row.opt_text(12)?,
                 })),
                 None => Ok(None),
             }
@@ -751,7 +676,7 @@ pub(crate) async fn load_workflow_run_row_by_job(
 /// states (deliberate stop / script failure / crash) and is dropped only on
 /// clean completion — so this is the liveness signal that gates ephemeral
 /// workflow-worktree reclaim: while the record lives, the worktree must survive
-/// so `restart_workflow` can respawn into its persisted `working_dir`.
+/// so `restart_workflow` can respawn from its durable branch coordinate.
 pub(crate) async fn workflow_run_record_exists(db: &LocalDb, job_id: &str) -> Result<bool, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
@@ -859,7 +784,7 @@ pub(crate) async fn start_workflow_run(
             project_id: prepared.project_id.clone(),
             repository_path: prepared.repository_path.clone(),
             anchor_branch: prepared.anchor_branch.clone(),
-            worktree_mode: prepared.worktree_mode.clone(),
+            branch_mode: prepared.branch_mode.clone(),
             package_path: prepared.package_path.clone(),
             script_path: prepared.script_path.clone(),
             args_json: prepared.args_json.clone(),
@@ -938,8 +863,8 @@ pub async fn launch_standalone_workflow(
             .map_err(|e| e.to_string())?
     };
     let project_path = repo_path.map(std::path::PathBuf::from);
-    // Stored default branch (config-file precedence is applied at worktree mint
-    // time); a `worktree: none` workflow — the common ad-hoc case — never uses it.
+    // The stored default branch anchors standalone workflows that opt into a
+    // repository coordinate. A `branch: none` workflow never uses it.
     let base_branch = stored_default_branch.unwrap_or_else(|| "main".to_string());
 
     // 2. Resolve the workflow package + validate args through the SAME validator
@@ -986,6 +911,7 @@ pub async fn launch_standalone_workflow(
     let now = chrono::Utc::now().timestamp() as i32;
     let execution_id = ids::mint_child(project_id);
     let snapshot = crate::models::ExecutionSnapshot {
+        branch_target: Default::default(),
         recipe: crate::models::RecipeSnapshot {
             id: format!("workflow-{workflow_id}"),
             name: format!("Workflow: {display_name}"),
@@ -1050,9 +976,9 @@ pub async fn launch_standalone_workflow(
     // 5. Create the top-level node-less workflow job + turn, then spawn the
     //    supervised process. No delegated packet is persisted — there is no caller
     //    to resume.
-    let worktree = match workflow.worktree {
-        crate::config::workflows::WorkflowWorktreeMode::None => super::CallWorktree::None,
-        crate::config::workflows::WorkflowWorktreeMode::Inherit => super::CallWorktree::Inherit,
+    let branch_policy = match workflow.branch {
+        crate::config::workflows::WorkflowBranchMode::None => super::CallBranchPolicy::None,
+        crate::config::workflows::WorkflowBranchMode::Inherit => super::CallBranchPolicy::Inherit,
     };
     let prepared = prepare_workflow_run(
         orch,
@@ -1067,7 +993,7 @@ pub async fn launch_standalone_workflow(
             description: format!("Workflow: {workflow_id}"),
             args_json: args_str,
             output_contract: contract,
-            worktree,
+            branch_policy,
             label: None,
             phase: None,
             parent_tool_use_id: None,
@@ -1081,11 +1007,10 @@ pub async fn launch_standalone_workflow(
         // `bun`, MCP auth, a process-spawn error) must NOT leave a durable issue
         // with a forever-`starting` workflow that startup re-dispatch would
         // resurrect and that Restart refuses (not stopped/failed). Reclaim the
-        // ephemeral worktree, drop the re-dispatch record so it is never
-        // respawned, record why in the node's transcript, and terminalize the run
+        // Drop the re-dispatch record so it is never respawned, record why in
+        // the node's transcript, and terminalize the run
         // Failed — which reduces the top-level job → execution → issue Failed —
         // before surfacing the error to the dialog.
-        reclaim_ephemeral_workflow_worktree(orch, &prepared).await;
         let _ = delete_workflow_run_row(&orch.db.local, &prepared.run_id).await;
         crate::orchestrator::session::insert_error_event(
             orch,
@@ -1158,11 +1083,10 @@ mod redispatch_tests {
             project_id: "p".to_string(),
             execution_id: Some("e".to_string()),
             anchor_branch: Some("agent/PRJ-9-parent".to_string()),
-            worktree_mode: "inherit".to_string(),
+            branch_mode: "inherit".to_string(),
             package_path: "/wf".to_string(),
             script_path: "/wf/main.ts".to_string(),
             args_json: "{\"q\":1}".to_string(),
-            working_dir: "/tmp/wf".to_string(),
             output_name: "return".to_string(),
             node_path: Some("/repo/node_modules".to_string()),
         }
@@ -1223,7 +1147,11 @@ mod redispatch_tests {
         let db = Arc::new(DbState::new(local.clone(), search));
         let orch = OrchestratorBuilder::new(
             db,
-            Arc::new(TestServicesBuilder::new().build()),
+            Arc::new(
+                TestServicesBuilder::new()
+                    .with_git(crate::services::RealGitClient)
+                    .build(),
+            ),
             tempfile::tempdir().unwrap().keep(),
         )
         .build();
@@ -1282,11 +1210,10 @@ mod redispatch_tests {
             project_id: "p".to_string(),
             execution_id: Some("e".to_string()),
             anchor_branch: Some("main".to_string()),
-            worktree_mode: "none".to_string(),
+            branch_mode: "none".to_string(),
             package_path: "/wf".to_string(),
             script_path: "/wf/main.ts".to_string(),
             args_json: "{}".to_string(),
-            working_dir: "/tmp/wf".to_string(),
             output_name: "return".to_string(),
             node_path: None,
         };
@@ -1348,7 +1275,7 @@ mod redispatch_tests {
         assert_eq!(rows[0].project_id, "p");
         assert_eq!(rows[0].execution_id.as_deref(), Some("e"));
         assert_eq!(rows[0].anchor_branch.as_deref(), Some("agent/PRJ-9-parent"));
-        assert_eq!(rows[0].worktree_mode, "inherit");
+        assert_eq!(rows[0].branch_mode, "inherit");
         assert_eq!(rows[0].package_path, "/wf");
         assert_eq!(rows[0].args_json, "{\"q\":1}");
         assert_eq!(rows[0].node_path.as_deref(), Some("/repo/node_modules"));
@@ -1490,6 +1417,33 @@ mod redispatch_tests {
     async fn standalone_prepare_mints_top_level_nodeless_workflow_job() {
         let (orch, db) = orch_with_db().await;
         seed_chain(&db).await;
+        let repo = tempfile::tempdir().unwrap();
+        assert!(crate::env::git()
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        for args in [
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test"],
+            &["add", "README.md"],
+            &["commit", "-q", "-m", "base"],
+        ] {
+            assert!(crate::env::git()
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        db.execute(
+            "UPDATE projects SET repo_path = ?1 WHERE id = 'p'",
+            (repo.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
 
         let contract =
             crate::execution::delegation::resolve_delegated_output_contract(None).unwrap();
@@ -1506,7 +1460,7 @@ mod redispatch_tests {
                 description: "Workflow: fan-out".to_string(),
                 args_json: "{}".to_string(),
                 output_contract: contract,
-                worktree: CallWorktree::None,
+                branch_policy: CallBranchPolicy::None,
                 label: None,
                 phase: None,
                 parent_tool_use_id: None,

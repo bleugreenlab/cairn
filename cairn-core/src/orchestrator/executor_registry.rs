@@ -113,6 +113,7 @@ mod tests {
                 commit: "abc".into(),
             }],
             observed_at_unix_ms: 1,
+            liveness_observed_at_unix_ms: None,
         };
         upsert_executor(&db, &advertisement, 3, "online").await;
         upsert_executor(&db, &advertisement, 3, "offline").await;

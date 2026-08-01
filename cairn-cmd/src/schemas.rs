@@ -51,6 +51,8 @@ pub(crate) struct ChangeInput {
     pub(crate) preview: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) atomic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) conflict_markers_reason: Option<String>,
 }
 
 impl schemars::JsonSchema for ChangeInput {
@@ -75,12 +77,12 @@ impl schemars::JsonSchema for ChangeInput {
                             },
                             "mode": {
                                 "type": "string",
-                                "enum": ["create", "append", "patch", "unified_patch", "replace", "delete", "rename", "apply"],
-                                "description": "Mutation mode. Use unified_patch for native *** Begin Patch envelopes on file: targets, rename for an ast-grep-backed structural identifier rename on a file: target, and apply only with a single transcript event URI from a pending preview. Unsupported target/mode pairs fail explicitly."
+                                "enum": ["create", "append", "patch", "unified_patch", "replace", "delete", "rename", "apply", "revert"],
+                                "description": "Mutation mode. Use unified_patch for native *** Begin Patch envelopes on file: targets, rename for an ast-grep-backed structural identifier rename on a file: target, apply only with a single transcript event URI from a pending preview, and revert only as a sole bare-file: item naming an immutable commit. Unsupported target/mode pairs fail explicitly."
                             },
                             "payload": {
                                 "type": "object",
-                                "description": "Structured payload carrying this item's keys for file and resource targets alike. File targets: create/replace/append take {content}; patch takes {diff} OR {old_string, new_string} (optional {replace_all}); unified_patch takes {patch} containing a native *** Begin Patch envelope; delete needs no payload; rename takes {new_name, and exactly one of old_name | symbol_at} and resolves every edit site by parsing the worktree with the in-process ast-grep engine. The ~~*~~ wildcard marker applies inside old_string. Resource targets carry keys like {title} or {content}; read the target URI for its exact payload keys.",
+                                "description": "Structured payload carrying this item's keys for file and resource targets alike. File targets: create/replace/append take {content}; patch takes {diff} OR {old_string, new_string} (optional {replace_all}); unified_patch takes {patch} containing a native *** Begin Patch envelope; delete needs no payload; rename takes {new_name, and exactly one of old_name | symbol_at}; revert takes exactly {commit}, where commit is the full immutable commit object ID. Revert requires bare file:, must be the sole change, always creates a new child commit, and does not support preview or atomic:false. Resource targets carry keys like {title} or {content}; read the target URI for its exact payload keys.",
                                 "additionalProperties": true
                             }
                         }
@@ -97,6 +99,10 @@ impl schemars::JsonSchema for ChangeInput {
                 "atomic": {
                     "type": "boolean",
                     "description": "Apply-phase atomicity opt-in. Default false applies every item whose anchor matches, reports per-item failures, and commits only files that applied. true preserves fail-fast behavior."
+                },
+                "conflict_markers_reason": {
+                    "type": "string",
+                    "description": "A short written reason for committing content that contains literal Git conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>` at the start of a line). By default such a commit is REFUSED, because conflict scaffolding must never become durable history — during a conflict resolution the markers belong in your working tree, not in a commit. Set this only for a deliberate literal example in documentation or a test fixture; the reason is recorded with the commit."
                 }
             }
         }))
@@ -234,6 +240,33 @@ pub(crate) fn validate_run_input(input: &RunInput) -> Result<(), String> {
                 .to_string(),
         );
     }
+    if input.constraints.is_some() {
+        return Err(
+            "`constraints` was replaced by `executor`: state {name:\"<public-name>\"} for one machine or {os:\"linux\"} for any machine on a platform, optionally with requiredToolchains. Read cairn://executors for the names available"
+                .to_string(),
+        );
+    }
+    if let Some(executor) = &input.executor {
+        validate_executor_selector(executor)?;
+    }
+    Ok(())
+}
+
+/// A selector that asks for nothing, or for two contradictory things, is a
+/// caller error rather than a request to interpret.
+fn validate_executor_selector(selector: &RunExecutorSelectorInput) -> Result<(), String> {
+    if selector.name.is_some() && selector.os.is_some() {
+        return Err(
+            "`executor` states `name` or `os`, never both: naming a machine already settles its platform. Read cairn://executors for the names available"
+                .to_string(),
+        );
+    }
+    if selector.name.is_none() && selector.os.is_none() && selector.required_toolchains.is_empty() {
+        return Err(
+            "`executor` must state at least one of `name`, `os`, or `requiredToolchains`. Read cairn://executors for the names available"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -262,30 +295,59 @@ pub(crate) struct RunInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) commit_msg: Option<String>,
-    /// Branch/ref resolved to its head commit for verdict-only build-slot execution.
-    /// Cannot be combined with commit_msg.
+    /// Run the batch against another revision — a branch name, a commit, or a
+    /// node URI — to tell a regression from a failure already on the base.
+    /// Verdict-only: tracked writes are discarded, and commit_msg, MCP, and
+    /// REPL items are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) branch: Option<String>,
-    /// Hard executor placement requirements for the entire batch. The callback
-    /// handler owns semantic validation; cairn-cmd must preserve this object
-    /// verbatim so independently managed executors remain addressable.
+    /// Which machine runs this batch: `{name}` for one executor by its public
+    /// name, or `{os}` for any machine on that platform, optionally refined by
+    /// `requiredToolchains`. Read cairn://executors to see the names, platforms,
+    /// and toolchains available. Omit unless the batch must land somewhere
+    /// specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) constraints: Option<RunPlacementConstraintsInput>,
+    pub(crate) executor: Option<RunExecutorSelectorInput>,
+    /// A short written reason for committing files that contain literal Git
+    /// conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>` at the start
+    /// of a line). By default such a commit is REFUSED and the working tree is
+    /// left intact, because conflict scaffolding must never become durable
+    /// history. Set this only for a deliberate literal example in documentation
+    /// or a test fixture; the reason is recorded with the commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) conflict_markers_reason: Option<String>,
+    /// The retired placement key, captured for the sole purpose of refusing it.
+    ///
+    /// Ignoring it is the exact failure this vocabulary replaced: a caller that
+    /// believed it had pinned a machine would have its batch run wherever the
+    /// fleet felt like, with nothing anywhere to see. Deserializing it into a
+    /// named field is what lets [`validate_run_input`] answer with the key that
+    /// replaced it instead of a generic unknown-field error; it is kept out of
+    /// the published schema and never forwarded.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub(crate) constraints: Option<serde_json::Value>,
 }
 
+/// Which machine a batch is asking for.
+///
+/// `name` and `os` are mutually exclusive: naming a machine already settles its
+/// platform, so a request stating both is contradicting itself rather than
+/// narrowing. Unknown keys are refused rather than ignored — a caller reaching
+/// for the retired `executorId`, `deviceId`, or `arch` needs to be told those
+/// are gone, not to have its placement silently dropped.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RunPlacementConstraintsInput {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RunExecutorSelectorInput {
+    /// The executor's public name, exactly as `cairn://executors` lists it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    executor_id: Option<String>,
+    pub(crate) name: Option<String>,
+    /// The operating system the batch needs (`linux`, `macos`, `windows`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    os: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    arch: Option<String>,
+    pub(crate) os: Option<String>,
+    /// Toolchains the chosen machine must advertise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    required_toolchains: Vec<String>,
+    pub(crate) required_toolchains: Vec<String>,
 }
 
 /// A single run item: exactly one of `command` (shell), inline `code` (with an
@@ -298,9 +360,13 @@ pub(crate) struct RunItemInput {
     /// Short description of what this command does (5-10 words).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    /// Timeout in milliseconds (max: 600000). Explicit values win. Omitted
-    /// direct-host items fall back to 120000; executor-routed items use the
-    /// configured build-slot default after seconds-to-milliseconds conversion.
+    /// Kill bound in milliseconds for this item, never a bound on the call.
+    /// Setting it terminates this item at the bound, its result block reporting
+    /// the timeout with whatever output it produced. Omitting it lets a shell,
+    /// code, or skill-script item run to completion, bounded only by the 6-hour
+    /// ceiling on a single batch (a larger value is clamped to it). An MCP-tool
+    /// or REPL item executes on the host and is capped at the 120-second
+    /// synchronous window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout: Option<u32>,
     /// A `cairn://skills/<id>/scripts/<name>` target. Mutually exclusive with `command` and `code`.
@@ -328,7 +394,9 @@ pub(crate) struct RunItemInput {
     /// slug) instead of a fresh process, so variables/imports/defs persist
     /// across `run` calls. Requires `code` + `interpreter` (matching the REPL's
     /// language); rejects `command`/`target`/`payload`. Create the REPL first
-    /// with `write cairn:~/repl/<slug> {interpreter:"python"}`.
+    /// with `write cairn:~/repl/<slug> {interpreter:"python", deps:["pandas"]}`
+    /// (`deps` preloads python packages via uv — use it instead of installing
+    /// from inside the session).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repl: Option<String>,
     /// Suspend this turn without polling until a duration elapses or a terminal
@@ -500,29 +568,107 @@ mod tests {
         );
     }
 
+    /// Both selector forms survive the forward to the backend byte for byte:
+    /// the tool schema is the only place the agent's words are checked, so a
+    /// key that silently changed shape here would place work elsewhere.
     #[test]
-    fn run_input_preserves_executor_constraints_when_forwarded() {
-        let input = run_input(serde_json::json!({
+    fn run_input_forwards_each_executor_selector_form_verbatim() {
+        let named = run_input(serde_json::json!({
             "commands": [{"command": "uname -m"}],
-            "constraints": {
-                "executorId": "linux-builder",
-                "deviceId": "linux-device",
-                "os": "linux",
-                "arch": "x86_64",
-                "requiredToolchains": ["rust"]
-            }
+            "executor": {"name": "bglab-ub", "requiredToolchains": ["rust"]}
         }));
-        let forwarded = serde_json::to_value(input).expect("serialize RunInput");
+        assert!(validate_run_input(&named).is_ok());
         assert_eq!(
-            forwarded["constraints"],
-            serde_json::json!({
-                "executorId": "linux-builder",
-                "deviceId": "linux-device",
-                "os": "linux",
-                "arch": "x86_64",
-                "requiredToolchains": ["rust"]
-            })
+            serde_json::to_value(named).expect("serialize RunInput")["executor"],
+            serde_json::json!({"name": "bglab-ub", "requiredToolchains": ["rust"]})
         );
+
+        let platform = run_input(serde_json::json!({
+            "commands": [{"command": "uname -m"}],
+            "executor": {"os": "linux"}
+        }));
+        assert!(validate_run_input(&platform).is_ok());
+        assert_eq!(
+            serde_json::to_value(platform).expect("serialize RunInput")["executor"],
+            serde_json::json!({"os": "linux"})
+        );
+    }
+
+    /// The retired placement vocabulary is refused, not ignored. A silently
+    /// dropped `constraints` block would run the batch wherever the fleet felt
+    /// like while the caller believed it had pinned a machine.
+    #[test]
+    fn run_input_rejects_the_retired_placement_vocabulary() {
+        for retired in [
+            serde_json::json!({"executorId": "linux-builder"}),
+            serde_json::json!({"deviceId": "linux-device"}),
+            serde_json::json!({"arch": "x86_64"}),
+        ] {
+            let raw = serde_json::json!({
+                "commands": [{"command": "uname -m"}],
+                "executor": retired
+            });
+            assert!(
+                serde_json::from_value::<RunInput>(raw.clone()).is_err(),
+                "expected a rejection for {raw}"
+            );
+        }
+        // The retired TOP-LEVEL block is the dangerous one: silently dropping it
+        // runs the batch untargeted while its caller believes it pinned a
+        // machine. It is refused by name, pointing at the key that replaced it.
+        let legacy = run_input(serde_json::json!({
+            "commands": [{"command": "uname -m"}],
+            "constraints": {"os": "linux"}
+        }));
+        let error = validate_run_input(&legacy)
+            .expect_err("a legacy `constraints` block must be refused, never ignored");
+        assert!(
+            error.contains("`constraints` was replaced by `executor`"),
+            "{error}"
+        );
+        assert!(error.contains("cairn://executors"), "{error}");
+        // And it never rides along to the backend as an unrecognized key.
+        assert!(serde_json::to_value(&legacy)
+            .expect("serialize RunInput")
+            .get("constraints")
+            .is_none());
+    }
+
+    /// The retired key is refused, not advertised. Publishing it in the tool
+    /// schema would invite the very call the validator exists to reject.
+    #[test]
+    fn the_published_run_schema_does_not_advertise_the_retired_key() {
+        let schema = serde_json::to_value(schemars::schema_for!(RunInput))
+            .expect("the run tool schema serializes");
+        let properties = schema
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("RunInput publishes properties");
+        assert!(
+            properties.contains_key("executor"),
+            "the placement key must be discoverable: {properties:?}"
+        );
+        assert!(
+            !properties.contains_key("constraints"),
+            "the retired placement key must not be advertised: {properties:?}"
+        );
+    }
+
+    /// An empty selector and a self-contradicting one are caller errors.
+    #[test]
+    fn run_input_rejects_empty_and_contradictory_executor_selectors() {
+        let empty =
+            run_input(serde_json::json!({"commands": [{"command": "true"}], "executor": {}}));
+        assert!(validate_run_input(&empty)
+            .unwrap_err()
+            .contains("at least one"));
+        let both = run_input(serde_json::json!({
+            "commands": [{"command": "true"}],
+            "executor": {"name": "bglab-ub", "os": "linux"}
+        }));
+        assert!(validate_run_input(&both)
+            .unwrap_err()
+            .contains("never both"));
     }
 
     #[test]

@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+use cairn_common::uri::{build_agent_uri, build_project_agent_uri};
+
 use crate::agents::{agent_to_markdown, parse_agent_markdown, AgentExportData};
 use crate::config::agents::{self as config_agents, FileAgent};
 use crate::config::slugify;
@@ -190,7 +192,11 @@ pub(super) async fn apply_agent_create(
         std::slice::from_ref(&path),
         &format!("cairn: create agent {id}"),
     );
-    Ok(format!("Created agent '{id}' at {}", path.display()))
+    let agent_uri = match explicit_project {
+        Some(project) => build_project_agent_uri(project, &id),
+        None => build_agent_uri(&id),
+    };
+    Ok(super::created_resource_ack("agent", &id, &agent_uri))
 }
 
 pub(super) async fn apply_agent_patch(

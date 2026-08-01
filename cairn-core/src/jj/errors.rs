@@ -74,9 +74,46 @@ pub(crate) fn is_conflicted_branch_seal_error(msg: &str) -> bool {
     msg.contains(CONFLICTED_BRANCH_SEAL_MSG)
 }
 
+/// Stable marker phrase for a publication refused because the backing git ref
+/// disagrees with the bookmark it must publish, and the repair could not close
+/// the gap — the EXPORT FREEZE family.
+///
+/// jj reports a refused ref on stderr and exits 0, so without an explicit
+/// comparison this state is indistinguishable from a successful export. It is
+/// never `Ok`: a push carrying a frozen ref publishes a tree nobody tested.
+pub(crate) const EXPORT_FREEZE_MSG: &str =
+    "jj→git export froze: the backing git ref does not match the bookmark it must publish";
+
+/// Classify a jj error as the EXPORT-FREEZE family. Distinct from every other
+/// family here because it is not a refusal jj raised — it is a disagreement
+/// Cairn detected across the jj/git boundary after jj reported success.
+pub fn is_export_freeze_error(msg: &str) -> bool {
+    msg.contains(EXPORT_FREEZE_MSG)
+}
+
 /// Refresh a workspace whose `@` was rebased out from under it. A rebased live
 /// workspace goes stale; `update-stale` updates the on-disk files and
 /// materializes any conflict markers for the agent to resolve.
+///
+/// jj's semantics here were pinned empirically against jj 0.42 on scratch
+/// stores, because an incident had recorded them as unreliable. They are not.
+/// `update-stale` reconciles the disk to the repo view in every staleness state
+/// Cairn can produce — an `@` rebased out from under the disk, an **abandoned**
+/// `@` whose replacement the view minted, and a view rewound below the disk by
+/// `jj op restore` — and when the workspace is not stale it says so
+/// (`Attempted recovery, but the working copy is not stale`) rather than
+/// pretending to have worked. There is no state in which it silently declines.
+///
+/// The incident's "exits 0 and changes nothing" was Cairn's own `jj` shim
+/// (`crate::env::jj_shim_script_unix`), which intercepts exactly this command;
+/// `<cairn_home>/bin` leads PATH in agent shells and the operator's shell alike,
+/// so a hand-run refresh never reached jj. The shim now narrates itself. Calls
+/// from here always reach the real binary: [`JjEnv`] resolves `CAIRN_JJ_BIN` or
+/// the bundled sidecar, never `<cairn_home>/bin`.
+///
+/// Deliberately does NOT pass `--ignore-working-copy`: updating the working copy
+/// is the entire operation, and jj refuses the flag on commands that must write
+/// one.
 pub(crate) fn update_stale(jj: &JjEnv, ws: &Path) -> Result<(), String> {
     jj.run(
         ws,
@@ -84,6 +121,47 @@ pub(crate) fn update_stale(jj: &JjEnv, ws: &Path) -> Result<(), String> {
         "jj workspace update-stale",
     )
     .map(|_| ())
+}
+
+/// Run a store operation that jj refuses to perform with
+/// `--ignore-working-copy`, repairing the store's default workspace when its
+/// staleness blocks the attempt.
+///
+/// Every other store operation sidesteps that workspace by passing the flag:
+/// nothing reads its `@`, and it goes stale as the ordinary consequence of those
+/// very writes. `jj workspace add` is the one exception, and not by Cairn's
+/// choice — jj rejects the flag outright there (`This command must be able to
+/// update the working copy`), because adding a workspace writes a working copy.
+/// So this is the single point at which the store's default workspace must
+/// actually be current, and leaving it uncovered is what let default-workspace
+/// staleness strand every new job spawn.
+///
+/// Measured on scratch stores: the blocked attempt leaves no directory and no
+/// registration behind, [`update_stale`] against the store clears the staleness,
+/// and the retry produces a usable workspace. Moving disk→view is the right
+/// direction here — the store's default working copy holds nothing any reader
+/// consults, whereas moving view→disk (`jj edit --ignore-working-copy <the
+/// commit the disk remembers>`, which also clears it) would mutate the
+/// branch-graph authority to chase a scratch directory.
+///
+/// Exactly one retry: a second refusal is an answer, not a reason to loop.
+pub(crate) fn run_needing_store_workspace(
+    jj: &JjEnv,
+    store_dir: &Path,
+    args: &[&str],
+    ctx: &str,
+) -> Result<String, String> {
+    match jj.run(store_dir, args, ctx) {
+        Err(error) if is_stale_error(&error) => {
+            log::info!(
+                "{ctx}: the store's default workspace is stale ({error}); refreshing it and \
+                 retrying once"
+            );
+            update_stale(jj, store_dir)?;
+            jj.run(store_dir, args, ctx)
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]

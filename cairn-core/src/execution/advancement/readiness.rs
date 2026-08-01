@@ -431,7 +431,6 @@ mod tests {
             execution_id: Some("e-1".to_string()),
             recipe_node_id: Some("agent".to_string()),
             parent_job_id: None,
-            worktree_path: None,
             branch: None,
             base_commit: None,
             pack_anchor: None,

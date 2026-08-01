@@ -137,20 +137,31 @@ fn pr_cache_from_row(row: &cairn_db::turso::Row) -> DbResult<PrCache> {
         .unwrap_or_default();
     let status = row.text(7)?;
 
+    // A non-positive number is not a pull request binding; see `bound_pr_number`
+    // in `pr_data::actions::context`.
+    let pr_number = row.opt_i64(2)?.filter(|value| *value > 0).map(|v| v as i32);
+    let is_local = row.opt_i64(18)?.unwrap_or(0) != 0;
+
     Ok(PrCache {
         id: row.text(0)?,
         job_id: row.opt_text(1)?,
-        pr_number: row.opt_i64(2)?.unwrap_or(0) as i32,
+        pr_number,
         pr_url: row.opt_text(3)?.unwrap_or_default(),
         title: row.opt_text(4)?,
         body: row.opt_text(5)?,
+        // This is the cached read: no probe runs here, so it may not assert more
+        // than the row can support. GitHub's own last-seen state is authoritative
+        // when present; otherwise an unresolved change is OPEN only when there is
+        // something open to point at — a bound pull request, or a local-only
+        // change that is open by construction.
         state: row
             .opt_text(6)?
             .and_then(|s| s.parse().ok())
             .unwrap_or(match status.as_str() {
                 "merged" => PrState::Merged,
                 "closed" => PrState::Closed,
-                _ => PrState::Open,
+                _ if pr_number.is_some() || is_local => PrState::Open,
+                _ => PrState::Unpublished,
             }),
         is_draft: false,
         review_decision: row.opt_text(8)?.and_then(|s| s.parse().ok()),
@@ -164,7 +175,7 @@ fn pr_cache_from_row(row: &cairn_db::turso::Row) -> DbResult<PrCache> {
         checks,
         fetched_at: row.opt_i64(14)?.unwrap_or(0),
         updated_at: row.i64(15)?,
-        is_local: row.opt_i64(18)?.unwrap_or(0) != 0,
+        is_local,
         source_branch: row.opt_text(16)?,
         target_branch: row.opt_text(17)?,
     })
@@ -256,7 +267,7 @@ async fn pr_summary_for_job(
             Ok(PrDataSummary {
                 id: row.text(0)?,
                 action_run_id: Some(action_run_id.clone()),
-                pr_number: row.opt_i64(1)?.unwrap_or(0) as i32,
+                pr_number: row.opt_i64(1)?.filter(|value| *value > 0).map(|v| v as i32),
                 pr_url: row.opt_text(2)?.unwrap_or_default(),
                 pr_status: row.text(3)?,
             })

@@ -114,7 +114,7 @@ pub(crate) async fn create_jobs_for_new_nodes_conn(
             });
 
         let behavior = crate::execution::step_behavior::resolve_node_behavior(node);
-        let parent_job_id = if behavior.inherits_worktree {
+        let parent_job_id = if behavior.inherits_branch {
             find_parent_agent_job_id(&node_id, &reverse_control_edges, &node_map, &node_to_job)
         } else {
             None
@@ -253,14 +253,14 @@ async fn insert_job_for_node_conn(
     conn.execute(
         "INSERT INTO jobs(
             id, execution_id, recipe_node_id, parent_job_id,
-            worktree_path, branch, base_commit, current_session_id, resume_session_id,
+            branch, base_commit, current_session_id, resume_session_id,
             status, agent_config_id, issue_id, project_id, task_description,
             created_at, updated_at, completed_at, parent_tool_use_id, task_index,
             started_at, model, node_name, base_branch, current_turn_id, uri_segment
          )
          VALUES(
             ?1, ?2, ?3, ?4,
-            NULL, NULL, NULL, ?5, NULL,
+            NULL, NULL, ?5, NULL,
             'pending', ?6, ?7, ?8, ?9,
             ?10, ?10, NULL, NULL, NULL,
             NULL, ?11, ?12, ?13, NULL, ?14
@@ -391,8 +391,7 @@ async fn default_branch_for_project(
     };
 
     // The project-config `defaultBranch` override wins over the stored column,
-    // mirroring how a project is projected for the UI, so worktree creation and
-    // display always agree on the base branch.
+    // so branch preparation and the UI share one base coordinate.
     let config =
         crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
     Ok(crate::config::project_settings::resolve_default_branch(
@@ -524,8 +523,8 @@ mod tests {
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, created_at, updated_at)
-                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', '/wt/parent', 'integration', 1, 1)",
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, created_at, updated_at)
+                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', 'integration', 1, 1)",
                     (),
                 )
                 .await?;
@@ -567,14 +566,12 @@ mod tests {
                     (),
                 )
                 .await?;
-                // The coordinator runs ambiently with no worktree (Branch:
-                // main), so its live job never matches the `worktree_path IS NOT
-                // NULL` filter in `resolve_parent_branch`: the child bases off
-                // the project default branch 'main' rather than any parent
+                // The coordinator has no durable branch coordinate, so the child
+                // bases off the project default branch rather than inheriting an
                 // integration branch.
                 conn.execute(
-                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, created_at, updated_at)
-                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', NULL, NULL, 1, 1)",
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, created_at, updated_at)
+                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', NULL, 1, 1)",
                     (),
                 )
                 .await?;
@@ -591,7 +588,7 @@ mod tests {
     async fn base_branch_inherits_parent_job_branch_via_parent_job_id() {
         // A Feature coordinator child records its exact spawner in
         // `issues.parent_job_id`. The child inherits the coordinator's
-        // worktree-backed integration branch even when that coordinator job is
+        // durable integration branch even when that coordinator job is
         // no longer live — here it is 'complete', which the parent-issue
         // fallback (non-terminal only) would reject.
         let db = migrated_db().await;
@@ -617,12 +614,12 @@ mod tests {
                 .await?;
                 // Terminal ('complete') coordinator job that the parent-issue
                 // fallback would skip, but which the exact `parent_job_id`
-                // lookup still honors because it is worktree-backed. Inserted
+                // lookup still honors because the branch coordinate is durable. Inserted
                 // before the child issue, which references it via a
                 // `parent_job_id` foreign key.
                 conn.execute(
-                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, created_at, updated_at)
-                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'complete', '/wt/coord', 'agent/coord-integration', 1, 1)",
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, created_at, updated_at)
+                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'complete', 'agent/coord-integration', 1, 1)",
                     (),
                 )
                 .await?;
@@ -644,9 +641,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn base_branch_falls_back_to_default_when_parent_job_is_ambient() {
         // A Manager coordinator is ambient: its recorded spawner job has no
-        // worktree (`worktree_path = NULL`, `branch = NULL`). Even though the
-        // child records that job in `parent_job_id`, the worktree guard means
-        // no integration branch is inherited and the child targets 'main'.
+        // branch coordinate. Even though the child records that job in
+        // `parent_job_id`, no integration branch is inherited and the child
+        // targets `main`.
         let db = migrated_db().await;
         db.write(|conn| {
             Box::pin(async move {
@@ -668,12 +665,12 @@ mod tests {
                     (),
                 )
                 .await?;
-                // Ambient (Manager) coordinator job: no worktree, no branch.
+                // Ambient (Manager) coordinator job: no repository coordinate.
                 // Inserted before the child that references it via a
                 // `parent_job_id` foreign key.
                 conn.execute(
-                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, created_at, updated_at)
-                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', NULL, NULL, 1, 1)",
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, created_at, updated_at)
+                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', NULL, 1, 1)",
                     (),
                 )
                 .await?;

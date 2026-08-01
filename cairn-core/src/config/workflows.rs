@@ -36,40 +36,38 @@ pub const DEFAULT_SCRIPT: &str = "main.ts";
 /// The manifest filename inside a workflow package directory.
 pub const MANIFEST_FILE: &str = "workflow.yaml";
 
-/// Whether a workflow binds to the project tree. Declared in `workflow.yaml` as
-/// `worktree: none|inherit`; defaults to `none`.
+/// Whether a workflow inherits the caller's durable branch coordinate. Declared
+/// in `workflow.yaml` as `branch: none|inherit`; defaults to `none`.
 ///
-/// The worktree decision belongs to the workflow, not the caller: a workflow
-/// script knows whether it (and the agent calls it fans out, which inherit its
-/// cwd) needs to read the repo. `none` runs the script in a scratch dir; the
-/// invocation surface maps this onto `CallWorktree` (see `mcp/handlers/workflows`),
-/// where `inherit` shares a worktree-backed caller's tree or mints an ephemeral
-/// one under an ambient (no-worktree) caller.
+/// The branch decision belongs to the workflow, not the caller. `none` runs the
+/// script as repository-independent orchestration. `inherit` gives the workflow
+/// and its delegated calls the authenticated caller's branch and logical head;
+/// neither mode creates or binds a dedicated checkout.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum WorkflowWorktreeMode {
+pub enum WorkflowBranchMode {
     /// Scratch dir, no project-tree binding — the default; right for research /
     /// orchestration workflows that never read the repo.
     #[default]
     None,
-    /// Give the workflow the project worktree.
+    /// Inherit the caller's durable branch and logical head.
     Inherit,
 }
 
-impl WorkflowWorktreeMode {
+impl WorkflowBranchMode {
     /// The manifest string for this mode (`"none"` | `"inherit"`).
     pub fn as_str(&self) -> &'static str {
         match self {
-            WorkflowWorktreeMode::None => "none",
-            WorkflowWorktreeMode::Inherit => "inherit",
+            WorkflowBranchMode::None => "none",
+            WorkflowBranchMode::Inherit => "inherit",
         }
     }
 
-    /// Parse a manifest worktree string; unknown values yield `None`.
+    /// Parse a manifest branch string; unknown values yield `None`.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "none" => Some(WorkflowWorktreeMode::None),
-            "inherit" => Some(WorkflowWorktreeMode::Inherit),
+            "none" => Some(WorkflowBranchMode::None),
+            "inherit" => Some(WorkflowBranchMode::Inherit),
             _ => None,
         }
     }
@@ -77,14 +75,14 @@ impl WorkflowWorktreeMode {
 
 /// Serializable `workflow.yaml` manifest, for writing a package from the editor.
 /// The inverse of [`WorkflowManifest`]: only the fields the settings surface
-/// authors, always emitting `script` and `worktree` so the effective shape is
+/// authors, always emitting `script` and `branch` so the effective shape is
 /// visible on disk.
 #[derive(Debug, Serialize)]
 struct WorkflowManifestOut<'a> {
     name: &'a str,
     description: &'a str,
     script: &'a str,
-    worktree: WorkflowWorktreeMode,
+    branch: WorkflowBranchMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     args: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,9 +107,9 @@ struct WorkflowManifest {
     /// default `return` contract at invocation.
     #[serde(default)]
     output: Option<OutputSchema>,
-    /// Whether the workflow binds to the project tree. Defaults to `none`.
+    /// Whether the workflow inherits the caller's branch. Defaults to `none`.
     #[serde(default)]
-    worktree: WorkflowWorktreeMode,
+    branch: WorkflowBranchMode,
 }
 
 /// A workflow package loaded from a directory.
@@ -126,8 +124,8 @@ pub struct FileWorkflow {
     pub args_schema: Option<serde_json::Value>,
     /// The workflow's output schema, if declared.
     pub output: Option<OutputSchema>,
-    /// Whether the workflow binds to the project tree (default `none`/scratch).
-    pub worktree: WorkflowWorktreeMode,
+    /// Whether the workflow inherits the caller's branch (default `none`).
+    pub branch: WorkflowBranchMode,
     pub is_project_scoped: bool,
     /// Path to the package directory.
     pub dir_path: PathBuf,
@@ -221,7 +219,7 @@ pub struct SaveWorkflowSpec<'a> {
     pub description: &'a str,
     /// Script entry filename (a plain filename, no path separators).
     pub script: &'a str,
-    pub worktree: WorkflowWorktreeMode,
+    pub branch: WorkflowBranchMode,
     pub args_schema: Option<&'a serde_json::Value>,
     pub output: Option<&'a OutputSchema>,
     pub script_content: &'a str,
@@ -264,7 +262,7 @@ pub fn save_workflow(
         name: spec.name,
         description: spec.description,
         script,
-        worktree: spec.worktree,
+        branch: spec.branch,
         args: spec.args_schema,
         output: spec.output,
     };
@@ -395,7 +393,7 @@ fn load_workflow_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<F
         script,
         args_schema: manifest.args,
         output: manifest.output,
-        worktree: manifest.worktree,
+        branch: manifest.branch,
         is_project_scoped,
         dir_path: dir_path.to_path_buf(),
         script_path,
@@ -437,23 +435,23 @@ mod tests {
     }
 
     #[test]
-    fn worktree_defaults_to_none_and_parses_inherit() {
+    fn branch_defaults_to_none_and_parses_inherit() {
         let temp = tempdir().unwrap();
         // Default when omitted.
         let none_dir = temp.path().join("workflows").join("research");
         write_workflow(&none_dir, "name: Research\ndescription: d\n");
         match load_workflow_dir(&none_dir, false) {
-            ConfigResult::Ok(w) => assert_eq!(w.worktree, WorkflowWorktreeMode::None),
+            ConfigResult::Ok(w) => assert_eq!(w.branch, WorkflowBranchMode::None),
             ConfigResult::Err { error, .. } => panic!("{error}"),
         }
         // Explicit inherit.
         let inherit_dir = temp.path().join("workflows").join("repo-reader");
         write_workflow(
             &inherit_dir,
-            "name: Repo Reader\ndescription: d\nworktree: inherit\n",
+            "name: Repo Reader\ndescription: d\nbranch: inherit\n",
         );
         match load_workflow_dir(&inherit_dir, false) {
-            ConfigResult::Ok(w) => assert_eq!(w.worktree, WorkflowWorktreeMode::Inherit),
+            ConfigResult::Ok(w) => assert_eq!(w.branch, WorkflowBranchMode::Inherit),
             ConfigResult::Err { error, .. } => panic!("{error}"),
         }
     }
@@ -567,7 +565,7 @@ mod tests {
                 assert_eq!(w.id, "fan-out");
                 assert!(!w.description.trim().is_empty());
                 // The orchestrator only dispatches, so the manifest binds no tree.
-                assert_eq!(w.worktree, WorkflowWorktreeMode::None);
+                assert_eq!(w.branch, WorkflowBranchMode::None);
                 // The args schema is present and validated as a JSON Schema at load.
                 let schema = w.args_schema.expect("fan-out declares an args schema");
                 assert_eq!(schema["required"][0], "prompt");
@@ -609,7 +607,7 @@ mod tests {
             name: "Greeter",
             description: "Says hi",
             script: DEFAULT_SCRIPT,
-            worktree: WorkflowWorktreeMode::Inherit,
+            branch: WorkflowBranchMode::Inherit,
             args_schema: Some(&args),
             output: None,
             script_content: "export {};\n// hello\n",
@@ -622,7 +620,7 @@ mod tests {
         let loaded = get_workflow(cfg, "greet", None).unwrap().unwrap();
         assert_eq!(loaded.name, "Greeter");
         assert_eq!(loaded.description, "Says hi");
-        assert_eq!(loaded.worktree, WorkflowWorktreeMode::Inherit);
+        assert_eq!(loaded.branch, WorkflowBranchMode::Inherit);
         assert_eq!(loaded.args_schema.as_ref().unwrap()["required"][0], "topic");
         assert_eq!(
             read_workflow_script(&loaded).unwrap(),
@@ -641,7 +639,7 @@ mod tests {
             name: "Bad",
             description: "",
             script: DEFAULT_SCRIPT,
-            worktree: WorkflowWorktreeMode::None,
+            branch: WorkflowBranchMode::None,
             args_schema: Some(&bad),
             output: None,
             script_content: "x",
@@ -660,7 +658,7 @@ mod tests {
             name: "X",
             description: "",
             script: "../evil.ts",
-            worktree: WorkflowWorktreeMode::None,
+            branch: WorkflowBranchMode::None,
             args_schema: None,
             output: None,
             script_content: "x",
@@ -678,7 +676,7 @@ mod tests {
             name: "Gone",
             description: "",
             script: DEFAULT_SCRIPT,
-            worktree: WorkflowWorktreeMode::None,
+            branch: WorkflowBranchMode::None,
             args_schema: None,
             output: None,
             script_content: "x",

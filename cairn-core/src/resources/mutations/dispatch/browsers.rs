@@ -88,7 +88,7 @@ pub(super) async fn dispatch(
                 return Err(build_failure(
                     index,
                     item,
-                    "payload requires url/navigate or action (back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad)",
+                    "payload requires url/navigate or action (back|forward|reload|click|type|select|drag|scroll|waitFor|waitForNavigation|waitForLoad|clearData)",
                 ));
             }
             let args = BrowserInteractionArgs {
@@ -97,6 +97,25 @@ pub(super) async fn dispatch(
                 text: payload_trimmed_non_empty_str(payload, "text", &[]).map(ToOwned::to_owned),
                 handle: payload_trimmed_non_empty_str(payload, "handle", &["ref"])
                     .map(ToOwned::to_owned),
+                to_selector: payload_trimmed_non_empty_str(payload, "toSelector", &["to_selector"])
+                    .map(ToOwned::to_owned),
+                to_text: payload_trimmed_non_empty_str(payload, "toText", &["to_text"])
+                    .map(ToOwned::to_owned),
+                to_handle: payload_trimmed_non_empty_str(
+                    payload,
+                    "toHandle",
+                    &["to_handle", "toRef"],
+                )
+                .map(ToOwned::to_owned),
+                mode: payload_trimmed_non_empty_str(payload, "mode", &[]).map(ToOwned::to_owned),
+                steps: payload
+                    .get("steps")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|steps| steps.min(u64::from(u32::MAX)) as u32),
+                delay_ms: payload
+                    .get("delayMs")
+                    .or_else(|| payload.get("delay_ms"))
+                    .and_then(serde_json::Value::as_u64),
                 // value may legitimately be empty (clearing a field), so it is
                 // not trimmed-non-empty filtered.
                 value: payload_str(payload, "value", &[]).map(ToOwned::to_owned),

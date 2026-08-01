@@ -84,7 +84,6 @@ pub(super) fn store_event(
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
-    sequence: i32,
     event: &TranscriptEvent,
 ) {
     let event_id = ids::mint_child(run_id);
@@ -94,7 +93,6 @@ pub(super) fn store_event(
         emitter,
         run_id,
         session_id,
-        sequence,
         &event_id,
         event,
         TokenCounts::default(),
@@ -139,7 +137,6 @@ fn ensure_stream_open(
     run_id: &str,
     session_id: Option<&str>,
     streaming_state: &mut Option<StreamingState>,
-    sequence: i32,
 ) -> Result<(), String> {
     if streaming_state.is_some() {
         return Ok(());
@@ -151,7 +148,6 @@ fn ensure_stream_open(
         session_id,
         current_turn.as_deref(),
         "codex",
-        Some(sequence),
     )?;
     *streaming_state = Some(StreamingState::new(&stream, run_id));
     let _ = emitter.emit(
@@ -169,20 +165,9 @@ pub(super) fn handle_agent_message_delta(
     run_id: &str,
     session_id: Option<&str>,
     streaming_state: &mut Option<StreamingState>,
-    sequence: &mut i32,
     delta: &str,
 ) {
-    if ensure_stream_open(
-        orch,
-        run_db,
-        emitter,
-        run_id,
-        session_id,
-        streaming_state,
-        *sequence,
-    )
-    .is_err()
-    {
+    if ensure_stream_open(orch, run_db, emitter, run_id, session_id, streaming_state).is_err() {
         return;
     }
 
@@ -213,20 +198,9 @@ pub(super) fn handle_reasoning_delta(
     run_id: &str,
     session_id: Option<&str>,
     streaming_state: &mut Option<StreamingState>,
-    sequence: i32,
     delta: &str,
 ) {
-    if ensure_stream_open(
-        orch,
-        run_db,
-        emitter,
-        run_id,
-        session_id,
-        streaming_state,
-        sequence,
-    )
-    .is_err()
-    {
+    if ensure_stream_open(orch, run_db, emitter, run_id, session_id, streaming_state).is_err() {
         return;
     }
 
@@ -257,7 +231,6 @@ pub(super) fn finalize_agent_message(
     run_id: &str,
     session_id: Option<&str>,
     streaming_state: &mut Option<StreamingState>,
-    sequence: &mut i32,
     text: &str,
 ) {
     if streaming_state.is_some() {
@@ -281,7 +254,6 @@ pub(super) fn finalize_agent_message(
                 thinking_ms: None,
                 raw: None,
             }),
-            sequence,
         );
     } else {
         let event = TranscriptEvent {
@@ -299,8 +271,7 @@ pub(super) fn finalize_agent_message(
             thinking_ms: None,
             raw: None,
         };
-        store_event(orch, run_db, emitter, run_id, session_id, *sequence, &event);
-        *sequence += 1;
+        store_event(orch, run_db, emitter, run_id, session_id, &event);
     }
 }
 
@@ -312,7 +283,6 @@ pub(super) fn handle_turn_completed(
     run_id: &str,
     session_id: Option<&str>,
     streaming_state: &mut Option<StreamingState>,
-    sequence: &mut i32,
     status: &str,
     usage: Option<Usage>,
     // Pooled ephemeral call (CAIRN-2549): a call thread is one-shot and abandoned
@@ -321,7 +291,7 @@ pub(super) fn handle_turn_completed(
     ephemeral_call: bool,
     failure_disposition: TurnFailureDisposition,
 ) {
-    finalize_streaming(orch, run_db, emitter, streaming_state, session_id, sequence);
+    finalize_streaming(orch, run_db, emitter, streaming_state, session_id);
     let counts = TokenCounts::from_optional_usage(usage.as_ref());
 
     match status {
@@ -332,7 +302,6 @@ pub(super) fn handle_turn_completed(
                 emitter,
                 run_id,
                 session_id,
-                sequence,
                 "result:success",
                 false,
                 counts,
@@ -373,7 +342,6 @@ pub(super) fn handle_turn_completed(
                 emitter,
                 run_id,
                 session_id,
-                sequence,
                 "result:interrupted",
                 false,
                 counts,
@@ -388,7 +356,6 @@ pub(super) fn handle_turn_completed(
                 emitter,
                 run_id,
                 session_id,
-                sequence,
                 "result:error",
                 true,
                 counts,
@@ -417,7 +384,6 @@ fn store_usage_result_event(
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
-    sequence: &mut i32,
     event_type: &str,
     is_error: bool,
     counts: TokenCounts,
@@ -448,9 +414,8 @@ fn store_usage_result_event(
     };
     let event_id = ids::mint_child(run_id);
     store_event_with_id(
-        orch, run_db, emitter, run_id, session_id, *sequence, &event_id, &event, counts,
+        orch, run_db, emitter, run_id, session_id, &event_id, &event, counts,
     );
-    *sequence += 1;
 }
 
 pub(super) fn emit_codex_run_turn_completed(
@@ -743,7 +708,6 @@ fn store_event_with_id(
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
-    sequence: i32,
     event_id: &str,
     event: &TranscriptEvent,
     counts: TokenCounts,
@@ -759,7 +723,6 @@ fn store_event_with_id(
             id: event_id.to_string(),
             run_id: run_id.to_string(),
             session_id: session_id.map(str::to_string),
-            sequence,
             timestamp: now,
             event_type: event.event_type.clone(),
             data: data.clone(),
@@ -828,7 +791,6 @@ fn finalize_streaming_with_event(
     emitter: &Arc<dyn crate::services::EventEmitter>,
     streaming_state: &mut Option<StreamingState>,
     final_event: Option<TranscriptEvent>,
-    sequence: &mut i32,
 ) {
     let Some(mut state) = streaming_state.take() else {
         return;
@@ -860,7 +822,6 @@ fn finalize_streaming_with_event(
     ) {
         Ok(finalized) => {
             process_post_commit_outbox(orch, &finalized.outbox_entries);
-            *sequence += 1;
         }
         Err(error) => {
             log::warn!(
@@ -878,9 +839,8 @@ pub(super) fn finalize_streaming(
     emitter: &Arc<dyn crate::services::EventEmitter>,
     streaming_state: &mut Option<StreamingState>,
     _session_id: Option<&str>,
-    sequence: &mut i32,
 ) {
-    finalize_streaming_with_event(orch, run_db, emitter, streaming_state, None, sequence);
+    finalize_streaming_with_event(orch, run_db, emitter, streaming_state, None);
 }
 
 /// Extract display text from a Codex MCP CallToolResult.

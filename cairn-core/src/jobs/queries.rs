@@ -13,7 +13,6 @@ use serde::Serialize;
 #[derive(Debug, Clone)]
 pub struct ImplementationInfo {
     pub job_id: String,
-    pub worktree_path: String,
     pub branch: String,
     pub project_id: String,
 }
@@ -134,39 +133,6 @@ pub(crate) async fn home_uri_for_job_conn(
     Ok(segment.map(|seg| {
         cairn_common::uri::build_job_base_uri(&key, number, seq, &seg, parent_segment.as_deref())
     }))
-}
-
-pub(crate) async fn task_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
-    let job_id = job_id.to_string();
-    let (stored_segment, node_name, agent_config_id) = db
-        .query_opt(
-            "SELECT uri_segment, node_name, agent_config_id FROM jobs WHERE id = ?1",
-            params![job_id.as_str()],
-            |row| Ok((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
-        )
-        .await
-        .ok()??;
-
-    if stored_segment
-        .as_deref()
-        .is_some_and(|segment| !segment.is_empty())
-    {
-        return stored_segment;
-    }
-
-    let from_node = node_name
-        .as_deref()
-        .map(slugify_resource_segment)
-        .filter(|segment| !segment.is_empty());
-    if from_node.is_some() {
-        return from_node;
-    }
-
-    agent_config_id
-        .as_deref()
-        .map(slugify_resource_segment)
-        .filter(|segment| !segment.is_empty())
-        .or_else(|| Some("task".to_string()))
 }
 
 /// Resolve the canonical URI segment of a job's parent, if any. Returns

@@ -150,11 +150,8 @@ pub(super) async fn dispatch(
                                     .await
                                     .map_err(|error| build_failure(index, item, error))?;
                             format!(
-                                "Refreshed PR #{} for {node_id} (state {}, +{} -{})",
-                                cache.pr_number,
-                                cache.state,
-                                cache.additions.unwrap_or(0),
-                                cache.deletions.unwrap_or(0)
+                                "Refreshed {} for {node_id}",
+                                crate::pr_data::publication::refreshed_summary(&cache)
                             )
                         }
                     }

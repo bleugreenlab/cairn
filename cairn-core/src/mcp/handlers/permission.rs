@@ -289,7 +289,7 @@ pub(crate) async fn await_permission_decision(
         }
         Ok(Err(msg)) => {
             log::warn!("Permission wait channel ended for run {}: {}", run_id, msg);
-            let _ = crate::orchestrator::lifecycle::suspend_run_for_durable_wait(
+            crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff(
                 orch,
                 run_id,
                 "permission_wait_suspended",
@@ -300,7 +300,7 @@ pub(crate) async fn await_permission_decision(
             // Inline budget expired: durably suspend (no auto-deny). The request
             // stays pending and is answerable whenever via the UI or the
             // `permissions` resource; a successor turn resumes the run.
-            let _ = crate::orchestrator::lifecycle::suspend_run_for_durable_wait(
+            crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff(
                 orch,
                 run_id,
                 "permission_wait_suspended",
@@ -471,18 +471,19 @@ pub fn deny_response(message: &str) -> String {
 /// Resolve the effective worktree-fence policy for a run.
 ///
 /// Path: run → job → execution → snapshot → agent.fence, applying
-/// [`Fence::default`] when the field is `None`. Returns `None` when the run has
-/// no execution snapshot — in which case no fence applies,
-/// preserving the unconfined default.
+/// [`Fence::default`] when the field is `None`. The run ID is routed to its
+/// owning private or team database before reading the execution snapshot.
+/// Returns `None` when the authenticated coordinate cannot resolve.
 pub(crate) async fn resolve_fence_policy(
     orch: &Orchestrator,
     run_id: Option<&str>,
 ) -> Option<Fence> {
     let run_id = run_id?.to_string();
+    let owning_db = crate::execution::routing::routing_db_for_id(&orch.db, &run_id)
+        .await
+        .ok()?;
 
-    let (agent_config_id, execution_id) = orch
-        .db
-        .local
+    let (agent_config_id, execution_id) = owning_db
         .read(|conn| {
             let run_id = run_id.clone();
             Box::pin(async move {
@@ -512,9 +513,7 @@ pub(crate) async fn resolve_fence_policy(
     let execution_id = execution_id?;
     let agent_config_id = agent_config_id?;
 
-    let snapshot_json = orch
-        .db
-        .local
+    let snapshot_json = owning_db
         .query_opt_text(
             "SELECT snapshot FROM executions WHERE id = ?1 LIMIT 1",
             params![execution_id.as_str()],
@@ -2097,12 +2096,12 @@ mod tests {
     #[test]
     fn fence_crossing_tool_input_parses_as_crossing() {
         let detail = serde_json::json!({
-            "kind": "read_outside_worktree",
+            "kind": "sensitive_host_read",
             "verb": "read",
             "descriptor": "/etc/hosts",
-            "summary": "read a file outside the worktree: /etc/hosts",
+            "summary": "read a sensitive denied path: /etc/hosts",
             "request": {
-                "cwd": "/wt",
+                "cwd": "/scratch/run-1",
                 "run_id": "r1",
                 "tool": "read",
                 "payload": {"path": "file:/etc/hosts"},
@@ -2141,7 +2140,7 @@ mod tests {
             "summary": "command blocked by the worktree sandbox: ps aux",
             "origin": "terminal",
             "request": {
-                "cwd": "/wt",
+                "cwd": "/scratch/run-1",
                 "run_id": "r1",
                 "tool": "run",
                 "payload": {"commands": [{"command": "ps aux"}]},

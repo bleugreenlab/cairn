@@ -8,49 +8,14 @@ use crate::services::sandbox;
 
 /// Build the OS sandbox policy for a run, or `None` when no confinement applies.
 ///
-/// Two regimes:
-/// - **Worktree cwd**: gated on the fence — `allow` (or no run context) runs
-///   unconfined; `ask`/`deny` confine writes to the worktree.
-/// - **Non-worktree cwd** (the project's live checkout, for example triage or
-///   read-only analysis): a read-only-checkout policy applies STRUCTURALLY, regardless of
-///   fence, so a stray write into the live checkout is kernel-denied while the
-///   checkout stays readable.
+/// The fence dial is the only gate on whether a profile exists at all: `allow`,
+/// or a spawn with no agent run behind it, is unconfined everywhere. What the
+/// dial does not decide is the profile's *shape*, which follows the checkout:
+/// - **Executor checkout cwd**: a fenced spawn confines writes to the cell.
+/// - **User live-checkout cwd** (triage, project terminals): a fenced spawn keeps
+///   the checkout readable but kernel-denies every write into it, and no session
+///   grant, declared check, or accepted command re-opens it.
 ///
-/// The unconfined escape hatches — an already-granted command and an accepted
-/// dev-command carveout with no declared scopes — are WORKTREE-ONLY: a
-/// non-worktree run never returns `None` for them, because the live checkout is
-/// read-only and non-grantable. The only `None` for a non-worktree cwd is a host
-/// with no sandbox primitive, where the restored dirt-detection warning covers
-/// the gap. Carveout write-globs still apply on a non-worktree cwd, but any glob
-/// that would write the checkout itself is dropped.
-///
-/// Whether a writable carveout scope `glob` would permit a write into `checkout`
-/// (the project's live checkout). Used to refuse a dev-command scope that would
-/// defeat the read-only-checkout guarantee on a non-worktree run.
-///
-/// A scope can only ever write at or below its **non-wildcard literal prefix**
-/// (everything from the first `*` on merely widens the match within that prefix).
-/// So the scope re-opens checkout writes iff that prefix sits inside the checkout
-/// — including a nested subtree like `{checkout}/target/**`, which a root/child
-/// regex probe would miss — or is an ancestor whose subpath grant would include
-/// the checkout. Concrete (wildcard-free) scopes fall out of the same check with
-/// the whole scope as the prefix. Fail-closed: an empty prefix (a leading-`*`
-/// glob) counts as covering.
-fn glob_covers_checkout(glob: &str, checkout: &std::path::Path) -> bool {
-    let checkout = checkout
-        .canonicalize()
-        .unwrap_or_else(|_| checkout.to_path_buf());
-    let literal_prefix = match glob.find('*') {
-        Some(i) => &glob[..i],
-        None => glob,
-    };
-    let prefix = std::path::Path::new(literal_prefix);
-    let prefix = prefix
-        .canonicalize()
-        .unwrap_or_else(|_| prefix.to_path_buf());
-    prefix.starts_with(&checkout) || checkout.starts_with(&prefix)
-}
-
 fn is_safe_jj_workspace_refresh_status_command(command: &str) -> bool {
     let segments: Vec<&str> = command.split("&&").map(str::trim).collect();
     if segments.len() != 2 {
@@ -104,36 +69,66 @@ fn apply_safe_jj_workspace_refresh_status_carveout(
     policy.writable_extra.push(repo_dir);
 }
 
+/// Which checkout a process is about to run in.
+///
+/// This is structural, not inferable from the path. A job's execution home is an
+/// ordinary detached Git checkout carrying no `.jj` markers — on disk it is
+/// indistinguishable from the project's live checkout — yet one is the agent's
+/// own writable home and the other is read-only for agents, non-negotiably. A
+/// caller that knows which it holds says so; only the ambient host path, whose
+/// cwd is either the agent's jj residence or the live checkout, may infer it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RunCheckout {
+    /// The agent's own checkout: its jj residence, or its execution home.
+    AgentOwned,
+    /// The project's live checkout, read-only for agents.
+    ProjectLive,
+}
+
+impl RunCheckout {
+    /// Classify a cwd that is known to be either the agent's jj residence or the
+    /// project's live checkout. An execution home is neither, so a surface that
+    /// runs in one must state its class instead of calling this.
+    pub(crate) fn infer(cwd: &str) -> Self {
+        if crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
+            Self::AgentOwned
+        } else {
+            Self::ProjectLive
+        }
+    }
+
+    pub(crate) fn is_project_live(self) -> bool {
+        matches!(self, Self::ProjectLive)
+    }
+}
+
 /// Build the OS sandbox policy for a run, or `None` when no confinement applies.
 pub(crate) async fn build_run_sandbox_policy(
     orch: &Orchestrator,
     cwd: &str,
+    checkout_kind: RunCheckout,
     run_id: Option<&str>,
     project_id: Option<&str>,
     command_for_grant: Option<&str>,
 ) -> Option<(sandbox::SandboxPolicy, Fence)> {
     use crate::mcp::handlers::permission::resolve_fence_policy;
 
-    // The project's live checkout (a non-jj cwd: triage / read-only analysis)
-    // is read-only for agents, non-negotiable, so the read-only-checkout sandbox
-    // applies STRUCTURALLY regardless of fence; a request without an execution
-    // snapshot would otherwise be fully unconfined. A real worktree
-    // keeps the fence gate (ask/deny confine; allow runs free).
-    let non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
-    let readonly_non_worktree = non_worktree;
-    let fence = if readonly_non_worktree {
-        // Read-only and non-grantable: `Deny` makes run_one never route a denial
-        // through the fence (no prompt, no session grant). Detection of the block
-        // itself is enabled separately in execute_process so the agent still gets
-        // the clear read-only-checkout message.
-        Fence::Deny
-    } else {
-        let fence = resolve_fence_policy(orch, run_id).await?;
-        if !sandbox::sandbox_applies(fence) {
-            return None;
-        }
-        fence
-    };
+    // One gate, every surface: the agent's dial decides whether Cairn applies any
+    // policy at all. `allow` means nothing of Cairn's blocks the spawn, including
+    // on the project's live checkout — the operator runs every agent at `allow`
+    // deliberately, and a confinement the dial cannot switch off is the dial
+    // lying. A spawn with no resolvable run identity is nobody's agent operation
+    // (an operator's own project terminal), so there is likewise nothing to fence.
+    let fence = resolve_fence_policy(orch, run_id).await?;
+    if !sandbox::sandbox_applies(fence) {
+        return None;
+    }
+
+    // The checkout decides the fenced profile's shape. The live checkout is
+    // read-only for a fenced agent and non-grantable with it: run_one routes a
+    // denial there to a plain explanation rather than a fence prompt, since no
+    // grant can publish through someone else's working tree.
+    let readonly_non_worktree = checkout_kind.is_project_live();
 
     if !sandbox::is_available() {
         log::warn!("OS sandbox unavailable on this host; running command unconfined (cwd={cwd})");
@@ -150,9 +145,8 @@ pub(crate) async fn build_run_sandbox_policy(
     // A command-scoped session grant escalates: skip the sandbox so the approved
     // command (shell command, or a skill script's program) runs with full reach
     // without re-tripping the fence. Keyed identically to the crossing descriptor
-    // raised in `run_one`. WORKTREE-ONLY: the project's live checkout is read-only
-    // and non-negotiable, so a command grant (earned in some worktree run, since
-    // the session set is shared) must never re-open the checkout to writes.
+    // raised in `run_one`. Executor-only: the project's live checkout is read-only
+    // and non-negotiable, so a command grant must never re-open it to writes.
     if !readonly_non_worktree {
         if let Some(cmd) = command_for_grant {
             if granted.contains(&normalize_command(cmd)) {
@@ -164,17 +158,19 @@ pub(crate) async fn build_run_sandbox_policy(
     // Project-declared check/test commands are trusted, not risky mutations: run
     // them with host permissions (no fence prompt, no idle-hang), matching the
     // turn-end cadence which already runs these exact commands unconfined.
-    // Worktree-only — the live checkout stays read-only.
+    // Executor-checkout only — the live checkout stays read-only.
     //
     // The trust source is the CANONICAL main checkout, not the agent-mutable
     // worktree: the `checks` contract and package.json `scripts` are resolved from
     // the project's live main checkout (worktree used only as a fallback when the
-    // project repo is unresolved), mirroring the check cadences'
-    // `load_live_project_checks`. This runs host-side (not in the fenced agent
-    // subprocess), so reading the main checkout is not a fence crossing, and a
-    // branch cannot self-grant an unconfined run by committing its own check or
-    // package script. See `crate::config::check_exemption` and
-    // docs/worktree-fence.md.
+    // project repo is unresolved). This is deliberately the OPPOSITE of the check
+    // cadences, which bind their contract to the commit they evaluate: here the
+    // question is not "which checks does this tree declare" but "has the project
+    // sanctioned this command to run unconfined", and only the canonical checkout
+    // can answer that. This runs host-side (not in the fenced agent subprocess),
+    // so reading the main checkout is not a fence crossing, and a branch cannot
+    // self-grant an unconfined run by committing its own check or package script.
+    // See `crate::config::check_exemption` and docs/worktree-fence.md.
     if !readonly_non_worktree {
         if let (Some(cmd), Some(pid)) = (command_for_grant, project_id) {
             let main_repo = crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, pid)
@@ -198,60 +194,32 @@ pub(crate) async fn build_run_sandbox_policy(
 
     let deny_read = orch.sandbox_deny_read();
 
-    // Durable dev-command fence carveouts: a project terminal command the user
-    // has accepted as a fence-crosser pre-ordains the crossings it needs (e.g.
-    // Cairn's `bun run dev:instance` writing its per-instance home outside the
-    // worktree), so an approved launch does not park on a fence prompt. The
-    // declaration lives in repo config but only takes effect once the user has
-    // accepted that command (stored per project in workspace settings), so a
-    // cloned repo can declare a fence-crosser but cannot grant itself the
-    // crossing. See `crate::config::dev_commands` and `docs/worktree-fence.md`.
-    let carveouts = match (command_for_grant, project_id) {
-        (Some(cmd), Some(pid)) => {
+    // User-owned acceptance is the single trust decision for an exact command
+    // declared by this project. Accepted executor commands skip policy creation
+    // entirely, restoring the user's normal shell state and credential access.
+    // Live checkouts retain their structural read-only wrapper.
+    let accepted_command = match (command_for_grant, project_id) {
+        (Some(command), Some(project_id)) => {
             let accepted = crate::config::settings::load_accepted_fence_commands(&orch.config_dir)
-                .remove(pid)
+                .remove(project_id)
                 .unwrap_or_default();
-            if accepted.is_empty() {
-                Default::default()
-            } else {
-                let project_terminals = crate::config::project_settings::load_terminal_commands(
-                    std::path::Path::new(cwd),
-                );
-                let templates = crate::config::settings::build_service_templates(
-                    &orch.config_dir,
-                    Some(std::path::PathBuf::from(cwd)),
-                );
-                crate::config::dev_commands::resolve_carveouts(
-                    cmd,
-                    &project_terminals,
-                    &accepted,
-                    &deny_read,
-                    &templates,
-                )
-            }
+            let project_terminals =
+                crate::config::project_settings::load_terminal_commands(std::path::Path::new(cwd));
+            crate::config::dev_commands::resolve_carveouts(command, &project_terminals, &accepted)
+                .unconfined
         }
-        _ => Default::default(),
+        _ => false,
     };
-
-    // An accepted command with no declared scopes crosses fully: skip the sandbox
-    // like a command-scoped session grant does. WORKTREE-ONLY for the same reason
-    // — on the live checkout an unconfined carveout still resolves to a read-only
-    // checkout policy; nothing re-opens the checkout to writes.
-    if carveouts.unconfined && !readonly_non_worktree {
-        log::info!("dev-command carveout: running accepted command unconfined (cwd={cwd})");
+    if accepted_command && !readonly_non_worktree {
+        log::info!(
+            "accepted dev command matched project shortcut; launching unfenced (command={:?}, cwd={cwd})",
+            command_for_grant.unwrap_or_default()
+        );
         return None;
     }
-    if !carveouts.dropped_sensitive.is_empty() {
-        log::warn!(
-            "dev-command carveout dropped {} declared scope(s) that touch the read denylist \
-             (a repo-committed terminal command cannot grant a secret-store crossing): {:?}",
-            carveouts.dropped_sensitive.len(),
-            carveouts.dropped_sensitive,
-        );
-    }
 
-    // Non-worktree cwd: the live checkout is read-only (dropped from the writable
-    // set) but readable; a worktree cwd keeps the worktree writable. Session path
+    // A user live-checkout cwd is read-only (dropped from the writable set) but
+    // readable; an executor checkout remains writable within its cell boundary. Session path
     // grants flow into either policy, but `for_readonly_checkout` drops any grant
     // that lies within (or contains) the checkout, so a grant can never re-open it.
     let checkout = std::path::Path::new(cwd);
@@ -263,25 +231,6 @@ pub(crate) async fn build_run_sandbox_policy(
     if !readonly_non_worktree {
         apply_safe_jj_workspace_refresh_status_carveout(&mut policy, checkout, command_for_grant);
     }
-    // Writable carveout scopes are globs: realize them as macOS SBPL regex grants
-    // (matching the build-service mechanism), and additionally as a concrete
-    // writable subpath for any wildcard-free scope so the Linux landlock path
-    // (which does not translate regex grants) still honors simple carveouts. On a
-    // non-worktree cwd, refuse any scope that would write the read-only live
-    // checkout — the read-only guarantee outranks a dev-command's declared scope.
-    for glob in &carveouts.write_globs {
-        if readonly_non_worktree && glob_covers_checkout(glob, checkout) {
-            log::warn!(
-                "dev-command carveout scope {glob:?} would write the read-only live checkout; \
-                 dropping it (cwd={cwd})"
-            );
-            continue;
-        }
-        policy.writable_regex.push(sandbox::glob_to_regex(glob));
-        if !glob.contains('*') {
-            policy.writable_extra.push(std::path::PathBuf::from(glob));
-        }
-    }
 
     Some((policy, fence))
 }
@@ -290,33 +239,6 @@ pub(crate) async fn build_run_sandbox_policy(
 mod tests {
     use super::*;
 
-    #[test]
-    fn glob_covers_checkout_drops_checkout_scopes_keeps_external() {
-        // A non-worktree run must drop any carveout scope that could write the
-        // read-only live checkout, while keeping scopes safely outside it.
-        let checkout = std::path::Path::new("/project/live");
-        // Wildcard scopes that reach into the checkout are covered.
-        assert!(glob_covers_checkout("/project/live/**", checkout));
-        // A broader ancestor wildcard that also matches the checkout.
-        assert!(glob_covers_checkout("/project/**", checkout));
-        // A nested subtree wildcard INSIDE the checkout (the case a root/child
-        // regex probe missed): `target/`, `node_modules/`, etc.
-        assert!(glob_covers_checkout("/project/live/target/**", checkout));
-        assert!(glob_covers_checkout(
-            "/project/live/node_modules/**",
-            checkout
-        ));
-        // Concrete scope inside the checkout.
-        assert!(glob_covers_checkout("/project/live/target", checkout));
-        // Concrete ancestor whose subpath grant would include the checkout.
-        assert!(glob_covers_checkout("/project", checkout));
-        // The checkout itself.
-        assert!(glob_covers_checkout("/project/live", checkout));
-        // Safely-outside scopes are not covered (they stay writable).
-        assert!(!glob_covers_checkout("/other/**", checkout));
-        assert!(!glob_covers_checkout("/home/u/.cairn-dev/**", checkout));
-        assert!(!glob_covers_checkout("/scratch/ok", checkout));
-    }
     #[test]
     fn safe_jj_workspace_refresh_status_command_accepts_exact_status_forms() {
         assert!(is_safe_jj_workspace_refresh_status_command(

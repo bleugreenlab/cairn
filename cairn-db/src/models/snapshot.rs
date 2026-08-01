@@ -12,7 +12,7 @@ use super::agent::OutputSchema;
 use super::common::{Model, ModelSelection, Preset, RuntimeExtras};
 use super::execution::TriggerType;
 use super::permissions::{Fence, LegacyOnEscape, LegacySandbox};
-use super::recipe::{RecipeEdge, RecipeNode, RecipeTrigger};
+use super::recipe::{BranchTarget, RecipeEdge, RecipeNode, RecipeTrigger};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -254,6 +254,11 @@ pub struct ExecutionSnapshot {
     /// Durable task delegations awaiting or resulting from materialization into the DAG
     #[serde(default)]
     pub delegated_packets: Vec<DelegatedWorkPacket>,
+    /// Which branch target this execution actually ran under. The graph above is
+    /// already transformed to match; this records the choice for display and
+    /// debugging. Pre-existing snapshots deserialize as `New`.
+    #[serde(default)]
+    pub branch_target: BranchTarget,
     /// When the snapshot was created
     pub created_at: i64,
 }
@@ -286,6 +291,7 @@ impl ExecutionSnapshot {
             trigger_context,
             presets: None,
             delegated_packets: Vec::new(),
+            branch_target: BranchTarget::default(),
             created_at: chrono::Utc::now().timestamp(),
         }
     }
@@ -332,6 +338,7 @@ mod tests {
     #[test]
     fn test_snapshot_serialization_roundtrip() {
         let snapshot = ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Test Recipe".to_string(),
@@ -640,5 +647,37 @@ mod tests {
 
         let restored: ExecutionSnapshot = serde_json::from_str(json).unwrap();
         assert!(restored.delegated_packets.is_empty());
+        // Every snapshot written before the branch target existed ran under the
+        // only behaviour there was: mint a branch and ship a PR.
+        assert_eq!(restored.branch_target, BranchTarget::New);
+    }
+
+    #[test]
+    fn snapshot_records_the_branch_target_it_ran_under() {
+        let mut snapshot = ExecutionSnapshot::new(
+            RecipeSnapshot {
+                id: "recipe-1".to_string(),
+                name: "Coordinator".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![],
+                edges: vec![],
+            },
+            HashMap::new(),
+            HashMap::new(),
+            TriggerContext {
+                issue_id: None,
+                project_id: "project-1".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+        );
+        assert_eq!(snapshot.branch_target, BranchTarget::New);
+
+        snapshot.branch_target = BranchTarget::Base;
+        let restored: ExecutionSnapshot =
+            serde_json::from_str(&snapshot.to_json().unwrap()).unwrap();
+        assert_eq!(restored.branch_target, BranchTarget::Base);
     }
 }

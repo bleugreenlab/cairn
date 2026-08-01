@@ -11,7 +11,7 @@ use std::sync::Arc;
 ///
 /// - If `repo_path` is empty and `projects_dir` is provided, creates a directory
 ///   and initializes a git repo there.
-/// - Creates `.cairn/config.yaml` and adds `.cairn/assets/` to `.gitignore`.
+/// - Creates `.cairn/config.yaml`.
 /// - Skips filesystem setup for remote project bookmarks.
 ///
 pub async fn create(
@@ -56,9 +56,6 @@ pub async fn create(
             {
                 log::warn!("Failed to create project config: {}", e);
             }
-            if let Err(e) = add_cairn_assets_to_gitignore(repo_path) {
-                log::warn!("Failed to update .gitignore: {}", e);
-            }
             if let Err(e) = ensure_initial_commit(repo_path) {
                 log::warn!("Failed to ensure initial project commit: {}", e);
             }
@@ -66,47 +63,6 @@ pub async fn create(
     }
 
     Ok(db_project)
-}
-
-/// Add `.cairn/assets/` to `.gitignore` if not already present.
-fn add_cairn_assets_to_gitignore(repo_path: &Path) -> Result<(), CairnError> {
-    use std::io::{BufRead, BufReader, Write};
-
-    let gitignore_path = repo_path.join(".gitignore");
-    let assets_entry = ".cairn/assets/";
-
-    if gitignore_path.exists() {
-        let file = std::fs::File::open(&gitignore_path)?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed == assets_entry
-                || trimmed == ".cairn/assets"
-                || trimmed == ".cairn/"
-                || trimmed == ".cairn"
-            {
-                return Ok(());
-            }
-        }
-
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&gitignore_path)?;
-
-        let contents = std::fs::read_to_string(&gitignore_path)?;
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            writeln!(file)?;
-        }
-        writeln!(file, "{}", assets_entry)?;
-    } else {
-        std::fs::write(&gitignore_path, format!("{}\n", assets_entry))?;
-    }
-
-    // Stage the .gitignore change
-    run_git(&["add", ".gitignore"], repo_path)?;
-
-    Ok(())
 }
 
 /// Ensure a local project repository has at least one commit so git worktrees can branch from it.
@@ -856,31 +812,6 @@ pub async fn repo_path(db: &LocalDb, id: &str) -> Result<Option<String>, CairnEr
     db.query_text("SELECT repo_path FROM projects WHERE id = ?1", (id,))
         .await
         .map_err(CairnError::from)
-}
-
-pub async fn worktree_paths(db: &LocalDb, project_id: &str) -> Result<Vec<String>, CairnError> {
-    let project_id = project_id.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT j.worktree_path
-                     FROM jobs j
-                     INNER JOIN issues i ON j.issue_id = i.id
-                     WHERE i.project_id = ?1
-                       AND j.worktree_path IS NOT NULL",
-                    (project_id.as_str(),),
-                )
-                .await?;
-            let mut paths = Vec::new();
-            while let Some(row) = rows.next().await? {
-                paths.push(row.text(0)?);
-            }
-            Ok(paths)
-        })
-    })
-    .await
-    .map_err(CairnError::from)
 }
 
 fn db_project_from_row(row: &cairn_db::turso::Row) -> Result<DbProject, DbError> {

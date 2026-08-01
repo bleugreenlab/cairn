@@ -652,15 +652,18 @@ pub(super) async fn apply_project_settings_patch(
         file_changed = true;
         ops.push("checks".to_string());
     }
-    if let Some(populate) = first_value(payload, &["worktreePopulate", "worktree_populate"]) {
+    if let Some(populate) = first_value(
+        payload,
+        &["materializationPopulate", "materialization_populate"],
+    ) {
         let populate: PopulateConfig = serde_json::from_value(populate.clone())
-            .map_err(|error| format!("invalid worktreePopulate: {error}"))?;
+            .map_err(|error| format!("invalid materializationPopulate: {error}"))?;
         config
-            .worktree
+            .materialization
             .get_or_insert_with(Default::default)
             .populate = populate;
         file_changed = true;
-        ops.push("worktreePopulate".to_string());
+        ops.push("materializationPopulate".to_string());
     }
     if let Some(branch) = opt_trimmed(payload, &["defaultBranch", "default_branch"]) {
         config.default_branch = Some(branch.clone());
@@ -697,7 +700,7 @@ pub(super) async fn apply_project_settings_patch(
 
     if ops.is_empty() {
         return Err(
-            "payload must set at least one of: setupCommands, terminalCommands, checks, worktreePopulate, defaultBranch, accountOverrides, references"
+            "payload must set at least one of: setupCommands, terminalCommands, checks, materializationPopulate, defaultBranch, accountOverrides, references"
                 .to_string(),
         );
     }

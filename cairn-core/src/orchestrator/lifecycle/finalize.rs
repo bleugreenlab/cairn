@@ -76,7 +76,6 @@ pub fn transition_to_warm_state(
             // without depending on the recompute sweep poke that this work
             // is replacing.
             let needs_attention = emit_for_turn_end(orch, &job_id);
-            maybe_reclaim_ephemeral_task_worktree(orch, &job_id);
             // Raise the desktop "completed" toast only when that idle left
             // something for the driver/user to act on — a plan awaiting
             // confirmation, a PR awaiting merge, a pending question, or a
@@ -511,91 +510,6 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
     finalize_run(orch, run_id, RunStatus::Crashed);
 }
 
-/// Reclaim a task's ephemeral worktree the moment its owning job terminalizes.
-///
-/// A task (or Inherit-mode call/workflow) delegated by an ambient (no-worktree)
-/// parent runs in its own throwaway worktree marked `owns_ephemeral_worktree`; it
-/// has no PR machinery, so nothing else tears it down. When the job reaches a
-/// terminal status, discard that one worktree — detached so it never blocks the
-/// turn from ending. A task suspended waiting on its own sub-tasks is not
-/// terminal, so this cannot fire while inheritors still share the worktree; by
-/// the time the task terminalizes they already have. Both turn-end sites (warm
-/// transition and run finalize) call this after recompute so a clean completion
-/// and a crash are covered.
-///
-/// Exception for a restartable workflow: a workflow keeps a `workflow_run`
-/// re-dispatch record across every *restartable* terminal state (deliberate
-/// stop / script failure / crash) and drops it only on clean completion, and
-/// `restart_workflow` respawns into the worktree's persisted `working_dir`. So
-/// while that record still exists the worktree must survive — the reclaim is
-/// bound to the record's lifetime, not to bare terminalization. Clean completion
-/// clears the record *before* `finalize_run`, so the reclaim still fires then;
-/// the worktree GC's terminal-`owns_ephemeral_worktree` backstop catches any
-/// stray a never-restarted, record-dropped workflow leaves behind.
-fn maybe_reclaim_ephemeral_task_worktree(orch: &Orchestrator, job_id: &str) {
-    let Some((status, owns)) = load_job_status_and_ephemeral(orch, job_id) else {
-        return;
-    };
-    if !owns || !matches!(status.as_str(), "complete" | "failed" | "cancelled") {
-        return;
-    }
-    // A surviving workflow_run record marks a restartable workflow whose worktree
-    // Restart still needs; defer reclaim until the record is dropped.
-    let record_exists = crate::storage::run_db_blocking({
-        let db = orch.db.local.clone();
-        let job_id = job_id.to_string();
-        move || async move {
-            crate::execution::jobs::workflow_run_record_exists(&db, &job_id).await
-        }
-    })
-    .unwrap_or(false);
-    if record_exists {
-        return;
-    }
-    let orch = orch.clone();
-    let job_id = job_id.to_string();
-    detach_onto_runtime(
-        async move {
-            if let Err(e) = crate::execution::teardown::teardown_worktrees(
-                &orch,
-                crate::execution::teardown::TeardownScope::Job(job_id.clone()),
-                crate::execution::teardown::TeardownReason::Discarded,
-            )
-            .await
-            {
-                log::warn!("ephemeral task worktree reclaim failed for {job_id}: {e}");
-            }
-        },
-        || {},
-    );
-}
-
-fn load_job_status_and_ephemeral(orch: &Orchestrator, job_id: &str) -> Option<(String, bool)> {
-    let db = orch.db.local.clone();
-    let job_id = job_id.to_string();
-    run_db_blocking(move || async move {
-        db.read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT status, owns_ephemeral_worktree FROM jobs WHERE id = ?1",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                Ok(match rows.next().await? {
-                    Some(row) => Some((row.text(0)?, row.i64(1)? != 0)),
-                    None => None,
-                })
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
-    })
-    .ok()
-    .flatten()
-}
-
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     // Clean up system prompt temp file
     crate::orchestrator::session::cleanup_prompt_file(run_id);
@@ -716,7 +630,6 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
             // hears about it through this fact rather than the recompute-sweep
             // poke this work removes.
             emit_for_turn_end(orch, &job_id);
-            maybe_reclaim_ephemeral_task_worktree(orch, &job_id);
             // Run-terminal idle: flush any directs/side-channel notices still
             // pending for this run so a queued child-attention update is not
             // stranded when the run never takes another turn (CAIRN-1297).
@@ -755,42 +668,106 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     // Signal run_completions broadcast (unblocks handle_task waiters)
     let _ = orch.run_completions.send(run_id.to_string());
 
-    // Log session context for crash observability
-    if status == RunStatus::Crashed {
-        log_session_crash_context(orch, run_id);
-    }
+    // Crash observability, and the decision to self-heal a native resume the
+    // backend reported unresolvable. Computed here — before the terminal
+    // attention toast — so a planned fallback suppresses the failure alarm.
+    let reseed_fallback = if status == RunStatus::Crashed {
+        handle_session_crash(orch, run_id, turn_id.as_deref())
+    } else {
+        None
+    };
 
     // Completion attention fires when the agent goes idle/warm. Finalization is
     // only a legacy toast source for genuine crash paths that terminalize an
-    // in-flight turn without reaching the idle boundary first.
-    if had_active_turn && status == RunStatus::Crashed {
+    // in-flight turn without reaching the idle boundary first. A crash we are
+    // about to recover from is a self-healing event, not a failure to report.
+    if had_active_turn && status == RunStatus::Crashed && reseed_fallback.is_none() {
         emit_agent_terminal_attention_once(orch, run_id, "failed");
+    }
+
+    // Last statement: the fallback opens a NEW turn on this job, so the job's
+    // derived state (recompute, DAG advance, turn-end emits above) must have
+    // settled before it runs.
+    if let Some(plan) = reseed_fallback {
+        spawn_digest_reseed_fallback(orch, plan);
     }
 }
 
-/// Log session context when a run crashes. If this was a resume attempt, the session
-/// may be invalid — log a warning so operators can investigate.
-fn log_session_crash_context(orch: &Orchestrator, run_id: &str) {
+/// A crashed run whose native resume handle the backend could not resolve, and
+/// the job that should be reseeded from its transcript digest to recover.
+pub(crate) struct DigestReseedFallback {
+    pub(crate) job_id: String,
+    pub(crate) session_id: String,
+}
+
+/// Which crashed run earns the digest-reseed fallback.
+///
+/// A run that already started fresh cannot have failed to resolve a resume
+/// handle, so the start-mode check is belt-and-braces on top of the typed
+/// reason. Pure so the matrix is unit-testable without a database.
+fn should_fall_back_to_digest_reseed(
+    status: &RunStatus,
+    start_mode: Option<&str>,
+    exit_reason: Option<&str>,
+) -> bool {
+    *status == RunStatus::Crashed
+        && start_mode == Some("resume")
+        && exit_reason.and_then(crate::backends::BackendFailure::from_exit_reason)
+            == Some(crate::backends::BackendFailure::SessionUnresolvable)
+}
+
+/// Claim the one-shot fallback slot for a session identity.
+///
+/// Insert-and-check: only the caller that wins the insert schedules. Returns
+/// false when this session was already handed to the fallback.
+fn claim_reseed_fallback(
+    attempted: &std::sync::Mutex<std::collections::HashSet<String>>,
+    session_id: &str,
+) -> bool {
+    let mut attempted = attempted.lock().unwrap();
+    attempted.insert(session_id.to_string())
+}
+
+/// React to a crashed run's session context.
+///
+/// Always logs a crashed resume for operator visibility. When the backend
+/// recorded [`BackendFailure::SessionUnresolvable`], claims the one-shot
+/// per-session fallback slot, notes the reconstruction in the transcript, and
+/// returns the plan for the caller to schedule.
+///
+/// [`BackendFailure::SessionUnresolvable`]: crate::backends::BackendFailure::SessionUnresolvable
+pub(crate) fn handle_session_crash(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: Option<&str>,
+) -> Option<DigestReseedFallback> {
     let dbs = orch.db.clone();
     let log_run_id = run_id.to_string();
-    let run_id = run_id.to_string();
+    let query_run_id = run_id.to_string();
     let run_info = run_db_blocking(move || async move {
-        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &query_run_id)
             .await
             .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT session_id, start_mode
+                        "SELECT session_id, start_mode, exit_reason, job_id
                          FROM runs
                          WHERE id = ?1",
-                        (run_id.as_str(),),
+                        (query_run_id.as_str(),),
                     )
                     .await?;
                 rows.next()
                     .await?
-                    .map(|row| Ok((row.opt_text(0)?, row.opt_text(1)?)))
+                    .map(|row| {
+                        Ok((
+                            row.opt_text(0)?,
+                            row.opt_text(1)?,
+                            row.opt_text(2)?,
+                            row.opt_text(3)?,
+                        ))
+                    })
                     .transpose()
             })
         })
@@ -800,7 +777,17 @@ fn log_session_crash_context(orch: &Orchestrator, run_id: &str) {
     .ok()
     .flatten();
 
-    if let Some((Some(session_id), start_mode)) = run_info {
+    let (Some(session_id), start_mode, exit_reason, job_id) = run_info? else {
+        return None;
+    };
+
+    if !should_fall_back_to_digest_reseed(
+        &RunStatus::Crashed,
+        start_mode.as_deref(),
+        exit_reason.as_deref(),
+    ) {
+        // Still the right observability for a resume that died for some other
+        // reason — that one has no automatic recovery.
         if start_mode.as_deref() == Some("resume") {
             log::warn!(
                 "Resume run {} crashed for session {} — \
@@ -809,6 +796,88 @@ fn log_session_crash_context(orch: &Orchestrator, run_id: &str) {
                 &session_id[..session_id.len().min(8)]
             );
         }
+        return None;
+    }
+
+    let Some(job_id) = job_id else {
+        log::warn!(
+            "Run {} reported an unresolvable session but has no job to reseed",
+            &log_run_id[..log_run_id.len().min(8)]
+        );
+        return None;
+    };
+
+    if !claim_reseed_fallback(&orch.session_reseed_fallback_attempted, &session_id) {
+        log::warn!(
+            "Session {} already had a digest-reseed fallback attempt; not retrying for run {}",
+            &session_id[..session_id.len().min(8)],
+            &log_run_id[..log_run_id.len().min(8)]
+        );
+        return None;
+    }
+
+    log::warn!(
+        "Resume run {} crashed because session {} was unresolvable by the backend — \
+         reseeding the job from its transcript digest.",
+        &log_run_id[..log_run_id.len().min(8)],
+        &session_id[..session_id.len().min(8)]
+    );
+
+    // Without this the user watches a digest-seeded turn appear from nowhere.
+    if let Err(error) = crate::messages::transcript::insert_system_message_sync(
+        orch,
+        run_id,
+        Some(&session_id),
+        turn_id,
+        "This session's conversation could not be resumed, so it is being reconstructed from the node's transcript digest.",
+        serde_json::json!({ "kind": "session_reseed_fallback" }),
+    ) {
+        log::warn!(
+            "Failed to record the session reseed notice for run {}: {}",
+            &log_run_id[..log_run_id.len().min(8)],
+            error
+        );
+    }
+
+    Some(DigestReseedFallback { job_id, session_id })
+}
+
+/// Drive the claimed fallback on its own thread.
+///
+/// A thread is required: `finalize_run` runs on the backend's reader thread,
+/// and the continuation does blocking database work and spawns a process.
+/// [`resume_job_from_digest`] is the same entry point the manual **resume from
+/// digest** control uses, so the automatic recovery and the manual one stay one
+/// implementation — including its `head_turn_active_sync` guard, which declines
+/// if a user continuation raced in first.
+///
+/// [`resume_job_from_digest`]: crate::execution::jobs::resume_job_from_digest
+fn spawn_digest_reseed_fallback(orch: &Orchestrator, plan: DigestReseedFallback) {
+    let orch = orch.clone();
+    let spawn_job_id = plan.job_id.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("session-reseed-fallback".to_string())
+        .spawn(move || {
+            if let Err(error) =
+                crate::execution::jobs::resume_job_from_digest(&orch, &plan.job_id, None)
+            {
+                // Nothing was rotated (an empty digest fails before any
+                // mutation), so the turn stays crashed exactly as it does
+                // today. The claim is not released: retrying will not fix it.
+                log::warn!(
+                    "Digest-reseed fallback for job {} (session {}) did not launch: {}",
+                    plan.job_id,
+                    &plan.session_id[..plan.session_id.len().min(8)],
+                    error
+                );
+            }
+        })
+    {
+        log::warn!(
+            "Failed to schedule the digest-reseed fallback for job {}: {}",
+            spawn_job_id,
+            error
+        );
     }
 }
 
@@ -892,6 +961,75 @@ fn emit_agent_terminal_attention_once(
 }
 
 #[cfg(test)]
+mod session_reseed_fallback_tests {
+    use super::{claim_reseed_fallback, should_fall_back_to_digest_reseed};
+    use crate::models::RunStatus;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    #[test]
+    fn only_a_crashed_unresolvable_resume_falls_back() {
+        assert!(should_fall_back_to_digest_reseed(
+            &RunStatus::Crashed,
+            Some("resume"),
+            Some("session_unresolvable")
+        ));
+    }
+
+    #[test]
+    fn a_fresh_start_never_falls_back() {
+        // A fresh run passes no --resume flag, so it cannot have failed to
+        // resolve one. This is what structurally bounds the loop.
+        assert!(!should_fall_back_to_digest_reseed(
+            &RunStatus::Crashed,
+            Some("fresh"),
+            Some("session_unresolvable")
+        ));
+        assert!(!should_fall_back_to_digest_reseed(
+            &RunStatus::Crashed,
+            Some("fork"),
+            Some("session_unresolvable")
+        ));
+        assert!(!should_fall_back_to_digest_reseed(
+            &RunStatus::Crashed,
+            None,
+            Some("session_unresolvable")
+        ));
+    }
+
+    #[test]
+    fn a_clean_exit_never_falls_back() {
+        assert!(!should_fall_back_to_digest_reseed(
+            &RunStatus::Exited,
+            Some("resume"),
+            Some("session_unresolvable")
+        ));
+    }
+
+    #[test]
+    fn other_crash_reasons_never_fall_back() {
+        // The pre-existing crashed-resume warning still covers these; they have
+        // no automatic recovery.
+        for reason in [None, Some("capacity_retry"), Some("turn_failed")] {
+            assert!(
+                !should_fall_back_to_digest_reseed(&RunStatus::Crashed, Some("resume"), reason),
+                "exit reason {reason:?} must not trigger the fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_is_claimed_exactly_once() {
+        let attempted = Mutex::new(HashSet::new());
+        assert!(claim_reseed_fallback(&attempted, "session-a"));
+        assert!(!claim_reseed_fallback(&attempted, "session-a"));
+        // A distinct session identity — including the one a reseed rotates to —
+        // gets its own attempt.
+        assert!(claim_reseed_fallback(&attempted, "session-b"));
+    }
+}
+
+#[cfg(test)]
 mod ordering_tests {
     //! CAIRN-2483: the turn-end-check single-flight slot must be claimed
     //! (`spawn_turn_end_checks`) BEFORE `recompute_job` in both turn-end callers,
@@ -922,5 +1060,28 @@ mod ordering_tests {
     fn turn_end_callers_claim_checks_slot_before_recompute() {
         assert_spawn_before_recompute("pub fn transition_to_warm_state");
         assert_spawn_before_recompute("pub fn finalize_run");
+    }
+
+    /// CAIRN-3104: the digest-reseed fallback opens a NEW turn on the job, so it
+    /// must be scheduled only after `recompute_job` and the turn-end emits have
+    /// settled the job's derived state. Guarded structurally for the same reason
+    /// as the check above — a silent reorder would race the new turn against the
+    /// recompute of the crashed one.
+    #[test]
+    fn reseed_fallback_is_spawned_after_recompute() {
+        let start = SOURCE
+            .find("pub fn finalize_run")
+            .expect("finalize_run present in source");
+        let body = &SOURCE[start..];
+        let recompute = body
+            .find("recompute_job(orch")
+            .expect("recompute_job call present");
+        let fallback = body
+            .find("spawn_digest_reseed_fallback(orch")
+            .expect("spawn_digest_reseed_fallback call present");
+        assert!(
+            recompute < fallback,
+            "finalize_run: the reseed fallback must be spawned after recompute_job (CAIRN-3104)"
+        );
     }
 }

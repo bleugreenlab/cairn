@@ -114,8 +114,11 @@ fn string_array(value: &Value, key: &str) -> Result<Vec<String>, String> {
 }
 
 fn parse_provider(value: &str) -> Result<ApiProvider, String> {
-    serde_json::from_value(Value::String(value.to_string()))
-        .map_err(|_| format!("unknown provider '{value}'; expected anthropic|openai|google|github"))
+    serde_json::from_value(Value::String(value.to_string())).map_err(|_| {
+        format!(
+            "unknown provider '{value}'; expected anthropic|openai|google|openrouter|ollama|github"
+        )
+    })
 }
 
 fn parse_auth(auth_type: &str, auth_value: Option<String>) -> Result<ProviderAuth, String> {
@@ -126,9 +129,13 @@ fn parse_auth(auth_type: &str, auth_value: Option<String>) -> Result<ProviderAut
         "oauth_token" => Ok(ProviderAuth::OAuthToken {
             value: auth_value.ok_or("authValue is required for authType=oauth_token")?,
         }),
+        "base_url" => ProviderAuth::base_url(
+            &auth_value.ok_or("authValue is required for authType=base_url")?,
+        ),
         "local_cli" => Ok(ProviderAuth::LocalCli),
+        "claude_profile" => Ok(ProviderAuth::ClaudeProfile),
         other => Err(format!(
-            "unknown authType '{other}'; expected api_key|oauth_token|local_cli (OAuth browser add stays UI-only)"
+            "unknown authType '{other}'; expected api_key|oauth_token|base_url|local_cli|claude_profile (OAuth browser add stays UI-only)"
         )),
     }
 }
@@ -369,6 +376,30 @@ mod tests {
                  resources/mutations/settings.rs so cairn://settings accepts it"
             );
         }
+    }
+
+    #[test]
+    fn parses_ollama_provider_and_normalizes_base_url() {
+        assert_eq!(parse_provider("ollama").unwrap(), ApiProvider::Ollama);
+        let auth = parse_auth(
+            "base_url",
+            Some("  http://localhost:11434///  ".to_string()),
+        )
+        .unwrap();
+        assert!(matches!(
+            auth,
+            ProviderAuth::BaseUrl { url } if url == "http://localhost:11434"
+        ));
+    }
+
+    #[test]
+    fn base_url_requires_valid_http_or_https_url() {
+        for value in ["localhost:11434", "ftp://localhost:11434", "://bad"] {
+            let error = parse_auth("base_url", Some(value.to_string())).unwrap_err();
+            assert!(error.contains("invalid base URL"), "{value}: {error}");
+        }
+        assert!(parse_auth("base_url", Some("https://ollama.example.test/".to_string())).is_ok());
+        assert!(parse_auth("base_url", None).is_err());
     }
 
     #[test]

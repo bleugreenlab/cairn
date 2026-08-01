@@ -16,7 +16,7 @@ pub(super) struct ProjectContext {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ResourceJob {
+pub(crate) struct ResourceJob {
     pub(super) id: String,
     pub(super) parent_job_id: Option<String>,
     pub(super) status: String,
@@ -95,11 +95,23 @@ pub(crate) async fn resolve_home_relative_resource_uri(
     }
 }
 
+/// Home-relative suffixes that a delegated task resolves against its OWNING
+/// NODE rather than itself.
+///
+/// Both are properties of the branch, not of the agent reading them: a task edits
+/// its owning node's worktree, so the workspace diff is the node's, and a
+/// conflict resolution session belongs to the branch the node owns. A task has
+/// neither of its own, and leaving these task-scoped would produce a URI that
+/// names nothing.
+const BRANCH_SCOPED_HOME_SUFFIXES: &[&str] = &["diff", "rebase"];
+
 fn resolve_home_suffix(home_uri: &str, suffix: &str) -> String {
-    // A delegated task edits its owning node's worktree, so its workspace diff is
-    // the owning node's diff rather than a task-local resource. Project only this
-    // one capability upward; every other home-relative resource remains task-owned.
-    if suffix == "diff" || suffix.starts_with("diff?") {
+    // Project only these capabilities upward; every other home-relative resource
+    // remains task-owned.
+    let branch_scoped = BRANCH_SCOPED_HOME_SUFFIXES
+        .iter()
+        .any(|name| suffix == *name || suffix.starts_with(&format!("{name}?")));
+    if branch_scoped {
         if let Some((node_uri, task_name)) = home_uri.rsplit_once("/task/") {
             if !task_name.is_empty() && !task_name.contains('/') {
                 return format!("{node_uri}/{suffix}");
@@ -557,7 +569,7 @@ pub(super) async fn get_todo_progress(
     (total > 0).then(|| format!("{completed}/{total} todos"))
 }
 
-pub(super) async fn connect_and_find_node_job(
+pub(crate) async fn connect_and_find_node_job(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -575,6 +587,29 @@ pub(super) async fn connect_and_find_node_job(
             )
         })?;
     Ok((conn, job))
+}
+
+/// The bookmark a node's work lives on, or `None` when it has no branch yet.
+pub(crate) async fn node_branch(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    let mut rows = conn
+        .query("SELECT branch FROM jobs WHERE id = ?1 LIMIT 1", (job_id,))
+        .await
+        .map_err(|error| format!("Failed to load node branch: {error}"))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| format!("Failed to load node branch: {error}"))?
+    else {
+        return Ok(None);
+    };
+    Ok(row
+        .opt_text(0)
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty()))
 }
 
 pub(super) async fn connect_and_find_task_job(
@@ -1007,6 +1042,28 @@ mod tests {
         assert_eq!(
             resolve_home_suffix(home, "messages"),
             "cairn://p/CAIRN/2691/1/builder/task/review/messages"
+        );
+    }
+
+    /// A conflict resolution session belongs to the branch, and a delegated task
+    /// has no branch of its own. Left task-scoped, a sub-agent following the wake
+    /// would build a URI that names nothing — and it is sub-agents who most often
+    /// meet the conflict, since they do the editing.
+    #[test]
+    fn task_home_rebase_projects_to_the_owning_node() {
+        let home = "cairn://p/CAIRN/2691/1/builder/task/review";
+        assert_eq!(
+            resolve_home_suffix(home, "rebase"),
+            "cairn://p/CAIRN/2691/1/builder/rebase"
+        );
+        assert_eq!(
+            resolve_home_suffix(home, "rebase?view=base-theirs&file=a.rs"),
+            "cairn://p/CAIRN/2691/1/builder/rebase?view=base-theirs&file=a.rs"
+        );
+        // The projection is a short, deliberate list, not a general rule.
+        assert_eq!(
+            resolve_home_suffix(home, "todos"),
+            "cairn://p/CAIRN/2691/1/builder/task/review/todos"
         );
     }
 

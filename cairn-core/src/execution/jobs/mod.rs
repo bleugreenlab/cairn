@@ -5,7 +5,7 @@
 //!
 //! ## Key functions
 //!
-//! - [`prepare_job`] — DB work + worktree setup, returns [`PreparedJob`] for session spawn.
+//! - [`prepare_job`] — branch-coordinate and DB preparation, returns [`PreparedJob`] for session spawn.
 //! - [`continue_job_impl`] — sends follow-up message to a running/warm job.
 //! - [`on_job_complete_impl`] — DAG advancement after a job finishes.
 //! - [`create_child_task`] — user-initiated sub-agent under a running job.
@@ -15,7 +15,6 @@ use crate::config::presets::{
     load_effective_presets, resolve_agent_snapshot, resolve_runtime_selection,
     LaunchSelectionOverride,
 };
-use crate::config::project_settings::load_project_settings;
 use crate::config::{self, agents as config_agents, ConfigResult};
 use crate::db_records::{db_job_from_row, DbJob, DbRecipeEdge, DbRecipeNode, JOB_COLUMNS};
 use crate::execution::advancement::{format_resolved_inputs, ResolvedInput};
@@ -28,17 +27,14 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use crate::transcripts::stream_store::{
-    get_next_sequence, insert_event, insert_event_stamping_pushes, EventInsert,
-};
+use crate::transcripts::stream_store::{insert_event, insert_event_stamping_pushes, EventInsert};
 use cairn_common::ids;
 use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod call_admission;
 mod calls;
@@ -47,19 +43,14 @@ mod config_loading;
 mod inputs;
 mod lifecycle;
 mod persistence;
-pub(crate) mod setup_progress;
 mod slash_commands;
 mod snapshots;
 mod status;
 mod turns;
 mod workflow;
-pub(crate) mod workspace_identity;
-mod worktrees;
 
 pub(crate) use call_admission::CallAdmission;
-pub(crate) use calls::{
-    on_call_run_finalized, prepare_call_run, reclaim_ephemeral_call_worktree, start_call_run,
-};
+pub(crate) use calls::{on_call_run_finalized, prepare_call_run, start_call_run};
 // The per-call Restart action reaches this via
 // `cairn_core::internal::execution::jobs::restart_call`.
 pub use calls::restart_call;
@@ -69,22 +60,32 @@ pub(crate) use calls::fail_orphaned_calls_on_startup;
 pub use child_tasks::create_child_task;
 pub(crate) use inputs::{
     find_downstream_artifact_schema_conn, find_downstream_artifact_schema_with_snapshot_conn,
-    is_long_running_node, resolve_ctx_self_schemas_conn, resolve_ctx_self_schemas_with_snapshot,
+    is_long_running_node, is_long_running_node_conn, node_ships_a_pr_conn,
+    resolve_ctx_self_schemas_conn, resolve_ctx_self_schemas_with_snapshot,
     resolve_instruction_prompt_conn,
 };
 pub(crate) use lifecycle::continue_automatic_retry;
-#[cfg(any(test, feature = "test-utils"))]
-pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;
+// The branch-mode coordinate decision. Production reaches it only through
+// `prepare_job`; the delegation edge's regression imports it to run the mode it
+// emits all the way to the commit a delegated task starts from.
 pub use lifecycle::{
     continue_job_impl, continue_job_or_enqueue, on_job_complete_impl, prepare_job,
     resume_job_from_digest, ResumeContext,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use lifecycle::{in_flight_launch_for_test, reconcile_stale_active_turn_for_continue_for_test};
+#[cfg(test)]
+pub(crate) use lifecycle::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
 pub(crate) use slash_commands::resolve_skill_slash_command;
 pub use snapshots::store_tool_result_event_with_turn;
+// Exercised end-to-end by the `synthetic_continuation_event` integration test,
+// which pins the stored event type that keeps a Cairn-synthesized resume out of
+// every user-attributed surface (CAIRN-3175).
+#[cfg(any(test, feature = "test-utils"))]
+pub use snapshots::store_continuation_event_with_turn;
 pub(crate) use workflow::{
-    delete_workflow_run_row, prepare_workflow_run, reclaim_ephemeral_workflow_worktree,
-    redispatch_crashed_workflows, start_workflow_run, workflow_run_record_exists,
-    CreateWorkflowRunInput,
+    delete_workflow_run_row, prepare_workflow_run, redispatch_crashed_workflows,
+    start_workflow_run, CreateWorkflowRunInput,
 };
 // The header Restart action reaches this from the host crates via
 // `cairn_core::internal::execution::jobs::restart_workflow`.
@@ -99,7 +100,6 @@ pub(crate) use turns::{
     abandon_pending_retry_if_head_matches, claim_retry_successor_if_head_matches,
     claim_retry_turn_start, consecutive_retry_turn_count,
 };
-pub(crate) use worktrees::prepare_worktree_for_job;
 
 use config_loading::*;
 use inputs::*;
@@ -139,14 +139,13 @@ pub struct CreateChildTaskResult {
     run_id: String,
 }
 
-/// Worktree binding for an ephemeral call (CAIRN-2481).
+/// Durable branch policy for an ephemeral call (CAIRN-2481).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CallWorktree {
-    /// Run in the caller's inherited worktree; mutating calls are first-class.
+pub enum CallBranchPolicy {
+    /// Inherit the caller's branch and logical head.
     #[default]
     Inherit,
-    /// Run in a fresh scratch dir with no project-tree binding (a pure
-    /// prompt->JSON worker, e.g. web-research calls).
+    /// Keep the call branchless; its process still resides in job scratch.
     None,
 }
 
@@ -162,7 +161,7 @@ pub(crate) struct CreateCallRunInput {
     pub(crate) tier: Option<String>,
     pub(crate) backend_preference: Option<String>,
     pub(crate) output_contract: crate::models::DelegatedOutputContract,
-    pub(crate) worktree: CallWorktree,
+    pub(crate) branch_policy: CallBranchPolicy,
     pub(crate) label: Option<String>,
     pub(crate) phase: Option<String>,
     pub(crate) parent_tool_use_id: Option<String>,
@@ -186,34 +185,31 @@ pub struct PreparedCallRun {
     session_id: String,
     pub(crate) agent_config: AgentConfig,
     selected_model: Option<Model>,
-    working_dir: String,
     prompt: String,
     output_schema: OutputSchemaInfo,
     execution_id: Option<String>,
-    pub(crate) worktree_path: Option<String>,
-    /// True when this call minted its own ephemeral worktree (an Inherit call
-    /// from an ambient, no-worktree parent). Drives the startup-failure reclaim
-    /// in the spawn path so a call that never starts cannot strand a worktree.
-    owns_ephemeral_worktree: bool,
 }
 
 /// Everything needed by the host layer to spawn a Claude process for a job.
 ///
-/// Returned by [`prepare_job`] after all DB work, worktree setup, run creation,
+/// Returned by [`prepare_job`] after branch preparation, DB work, run creation,
 /// and initial user-event storage are complete.
-const SETUP_CANCELLED_ERROR: &str = "__cairn_setup_cancelled__";
-
 pub struct PreparedJob {
     pub run_id: String,
     pub session_id: String,
     pub session_start: crate::backends::SessionStart,
     pub prompt: String,
-    pub worktree_path: String,
     pub job_model: Option<Model>,
     pub agent_config: Option<AgentConfig>,
     pub artifact_schema_info: Option<OutputSchemaInfo>,
     pub execution_id: Option<String>,
     pub turn_id: String,
+    /// Ownership of this job's launch, held from admission until the spawned
+    /// process registers. The host layer must keep it alive across the spawn and
+    /// drop it only once the process is registered or the start has failed;
+    /// dropping it early re-opens the job to a concurrent resume that would
+    /// launch a second process against this same session (CAIRN-3283).
+    pub launch_claim: crate::orchestrator::JobLaunchClaim,
 }
 
 fn run_start_mode(session_start: &crate::backends::SessionStart) -> &'static str {

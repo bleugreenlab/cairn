@@ -384,13 +384,194 @@ pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<V
 // prepare_job
 // ============================================================================
 
-/// Prepare a job for execution: set up worktree, create run record, store initial
-/// user event. Returns a [`PreparedJob`] with everything the host layer needs to
+/// Where a job that inherits its parent's branch starts, resolved live-first and
+/// never failing.
+///
+/// The store is the authority: the parent's bookmark is what the branch
+/// currently means, and it is the only rung of this ladder that is a coordinate
+/// rather than a memory of one.
+///
+/// Below it sits the parent's recorded `jobs.base_commit`. That row is
+/// bookkeeping, not a coordinate (CAIRN-3224), and the standing operator ruling
+/// forbids failing a spawn over substrate state — so it stays as a fallback, but
+/// only when the store can still produce the commit it names. An unverified
+/// recorded commit is the worse failure of the two: minting a job at a commit
+/// the store cannot resolve does not fail here, it fails later inside
+/// materialization, far from the row that caused it.
+///
+/// The floor is the job's own base branch, resolved live. `resolve_base_rev`
+/// always yields something — down to jj's root commit on an unborn repository —
+/// so a parent whose branch has vanished entirely degrades to a real coordinate
+/// instead of refusing to start.
+fn inherited_head<F>(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+    recorded_base: Option<&str>,
+    base_ref: &str,
+    git_rev_parse: F,
+) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(live) = crate::jj::bookmark_commit(jj, store, branch) {
+        return live;
+    }
+    if let Some(recorded) = recorded_base {
+        if crate::jj::revset_resolves(jj, store, recorded) {
+            log::warn!(
+                "[prepare_job] inherited branch {branch} does not resolve in the store; starting \
+                 from the parent's recorded base {recorded}, which the store can still produce"
+            );
+            return recorded.to_string();
+        }
+        log::warn!(
+            "[prepare_job] inherited branch {branch} does not resolve in the store, and the \
+             parent's recorded base {recorded} does not resolve either; falling back to \
+             {base_ref}"
+        );
+    } else {
+        log::warn!(
+            "[prepare_job] inherited branch {branch} does not resolve in the store and the parent \
+             has no recorded base; falling back to {base_ref}"
+        );
+    }
+    crate::jj::resolve_base_rev(jj, store, base_ref, git_rev_parse)
+}
+
+/// The parent's durable coordinate, as an inheriting child needs to see it.
+pub(crate) struct ParentCoordinate {
+    /// The branch the child continues. Its absence is fatal to inheritance.
+    pub branch: Option<String>,
+    /// The parent's archival `jobs.base_commit`, the verified fallback rung of
+    /// [`inherited_head`] — never the primary coordinate.
+    pub recorded_base: Option<String>,
+}
+
+/// The job facts coordinate selection reads, without the rest of the row.
+pub(crate) struct CoordinateRequest<'a> {
+    pub job_id: &'a str,
+    pub parent_job_id: Option<&'a str>,
+    /// A branch already recorded on the row — pre-assigned lineage, honored
+    /// instead of minting a fresh name.
+    pub existing_branch: Option<&'a str>,
+    /// The job's own base branch, the floor every non-inheriting job starts from.
+    pub base_ref: &'a str,
+}
+
+/// Select the durable coordinate a job starts from, one outcome per branch mode.
+///
+/// `inherit` is the only mode that reads another job: the child continues its
+/// parent's branch and starts at that branch's **live head**, not at the base
+/// branch either of them was cut from.
+///
+/// Two grades of inheritance, and the difference is what happens when the store
+/// cannot produce that head. Plain `inherit` degrades through
+/// [`inherited_head`]'s ladder, which always yields a coordinate. With
+/// `requires_parent_head` it refuses instead: nothing below the parent's live
+/// bookmark is the parent's work, so a child seeded from a recorded base or from
+/// the base branch is doing confidently wrong work rather than degraded work.
+/// Delegated tasks take the strict grade (CAIRN-3309). Both refusals — no
+/// lineage, and a branch the store cannot resolve — name the child, the parent,
+/// and what is missing, so a broken edge is legible without opening this file.
+///
+/// `isolate` mints a child branch at the resolved base; `none` stays on the base
+/// coordinate with no branch of its own. Both resolve base live, and neither
+/// consults a parent.
+///
+/// The DB-shaped work is passed in: `load_parent` fetches the parent's
+/// coordinate, and `mint_name` derives a fresh branch name (it is only called
+/// when a mint actually needs one). That keeps the whole decision testable
+/// against a real jj store without an orchestrator.
+pub(crate) fn select_job_coordinate<P, M, F>(
+    behavior: &crate::execution::step_behavior::StepBehavior,
+    request: CoordinateRequest<'_>,
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    load_parent: P,
+    mint_name: M,
+    git_rev_parse: F,
+) -> Result<(Option<String>, Option<String>), String>
+where
+    P: FnOnce(&str) -> Result<ParentCoordinate, String>,
+    M: FnOnce() -> Result<String, String>,
+    F: Fn(&str) -> Option<String>,
+{
+    if behavior.inherits_branch {
+        let job_id = request.job_id;
+        let parent_job_id = request.parent_job_id.ok_or_else(|| {
+            format!(
+                "Job {job_id} inherits its parent's branch but has no parent_job_id: \
+                 the delegation edge that created it never recorded lineage"
+            )
+        })?;
+        let parent = load_parent(parent_job_id)?;
+        let branch = parent.branch.ok_or_else(|| {
+            format!(
+                "Job {job_id} cannot start: its parent job {parent_job_id} has no branch, \
+                 so there is no logical head to inherit"
+            )
+        })?;
+        if behavior.requires_parent_head {
+            let head = crate::jj::bookmark_commit(jj, store, &branch).ok_or_else(|| {
+                format!(
+                    "Job {job_id} cannot start: the branch {branch} it inherits from parent job \
+                     {parent_job_id} does not resolve in the store, so its logical head cannot \
+                     be seeded. Starting from the base branch would run this job against code \
+                     its parent has already moved past."
+                )
+            })?;
+            return Ok((Some(branch), Some(head)));
+        }
+        let head = inherited_head(
+            jj,
+            store,
+            &branch,
+            parent.recorded_base.as_deref(),
+            request.base_ref,
+            git_rev_parse,
+        );
+        return Ok((Some(branch), Some(head)));
+    }
+
+    let base = crate::jj::resolve_base_rev(jj, store, request.base_ref, git_rev_parse);
+    if !behavior.mints_branch {
+        return Ok((None, Some(base)));
+    }
+
+    let branch = match request.existing_branch {
+        Some(branch) => branch.to_string(),
+        None => mint_name()?,
+    };
+    match crate::jj::bookmark_commit(jj, store, &branch) {
+        Some(existing) if existing != base => {
+            return Err(format!(
+                "Branch {branch} already exists at a different commit"
+            ));
+        }
+        Some(_) => {}
+        None => crate::jj::create_bookmark_at(jj, store, &branch, &base)?,
+    }
+    Ok((Some(branch), Some(base)))
+}
+
+/// Prepare a job for execution: resolve its durable branch coordinate, create the
+/// run record and scratch residence, and store the initial user event. Returns a
+/// [`PreparedJob`] with everything the host layer needs to
 /// call `start_agent_session`.
 ///
 /// The job status must already be set to `"running"` by the caller before this is
 /// invoked (Tauri does this synchronously so the UI sees the change immediately).
 pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, String> {
+    // The cold-start funnel inserts a run exactly the way the resume funnel does,
+    // so it takes the same per-job launch lock (CAIRN-3283). Admission control
+    // for a cold start is the durable compare-and-set claim on `jobs.status` in
+    // the transport's `start_job_background`; this lock is what keeps that claim
+    // from interleaving with a concurrent resume of the same job.
+    let launch_lock = orch.job_launch_lock(job_id);
+    let _launch_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     log::info!("[prepare_job] resolving owner for job {job_id}");
     // Resolve the job's owning database ONCE (fail-closed) and thread it through
     // every run/session/turn/event write below: a team job's rows live wholly in
@@ -459,378 +640,97 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     }
 
     let behavior = resolve_node_behavior(node);
-    let (needs_worktree, inherits_worktree, step_name): (bool, bool, String) = (
-        behavior.needs_worktree,
-        behavior.inherits_worktree,
+    let (mints_branch, inherits_branch, step_name): (bool, bool, String) = (
+        behavior.mints_branch,
+        behavior.inherits_branch,
         node.name.clone(),
     );
 
     log::info!(
-        "[prepare_job] job {job_id}: behavior needs_worktree={needs_worktree} inherits_worktree={inherits_worktree} step={step_name}"
+        "[prepare_job] job {job_id}: behavior mints_branch={mints_branch} inherits_branch={inherits_branch} step={step_name}"
     );
 
-    // ---- Worktree setup -------------------------------------------------
-    // Create / inherit owner for the worktree lifecycle. The unit is the
-    // `worktree_path`/`branch` pair: inherited children (below) copy the
-    // parent's pair, so N jobs reference ONE path. Teardown
-    // (`execution::teardown`) keys on the same pair; it happens once, at
-    // issue/PR-terminal time, removing the path unconditionally.
-    let assigned_context = if job.worktree_path.is_some() {
-        run_db(workspace_identity::resolve_managed_workspace_context(
-            owning_db.clone(),
-            job_id.to_string(),
-        ))?
-    } else {
-        None
-    };
-    let assigned_workspace_ready = assigned_context.as_ref().is_some_and(|context| {
-        let path = context.identity.worktree_path.as_path();
-        crate::jj::is_jj_dir(path)
-            && crate::jj::read_workspace_identity(path).as_ref() == Some(&context.identity)
-    });
-    if assigned_workspace_ready {
-        // The durable assignment and physical marker agree — reuse it.
-        let _ = orch.services.emitter.emit(
-            "job-activated",
-            serde_json::json!({
-                "jobId": job_id,
-                "issueId": job.issue_id,
-                "nodeName": job.node_name,
-                "execSeq": exec_seq,
-            }),
-        );
-    } else if inherits_worktree && job.worktree_path.is_none() {
-        // Copy worktree from parent job
-        let parent_job_id = job
-            .parent_job_id
-            .as_ref()
-            .ok_or("Job with inherit mode has no parent_job_id")?;
+    // ---- Virtual branch preparation -------------------------------------
+    // Agent jobs own only durable store coordinates. No directory is allocated
+    // here: the backend process resides in the job scratch directory and command
+    // execution obtains disposable executor projections separately.
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+    crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path))?;
 
-        let (parent_worktree, parent_branch): (String, Option<String>) = {
+    let base_ref = job.base_branch.as_deref().unwrap_or("HEAD");
+    let git_rev_parse = |revision: &str| {
+        orch.services
+            .git
+            .rev_parse(Path::new(&repo_path), vec![revision.to_string()])
+            .ok()
+            .filter(|sha| !sha.is_empty())
+    };
+
+    let (branch, base_commit) = select_job_coordinate(
+        &behavior,
+        CoordinateRequest {
+            job_id,
+            parent_job_id: job.parent_job_id.as_deref(),
+            existing_branch: job.branch.as_deref(),
+            base_ref,
+        },
+        &jj,
+        &store,
+        |parent_job_id| {
             let parent = run_db(load_job(
                 owning_db.clone(),
                 parent_job_id.to_string(),
                 "Parent job not found",
             ))?;
-            (
-                parent
-                    .worktree_path
-                    .ok_or("Parent job has no worktree - cannot inherit")?,
-                parent.branch,
-            )
-        };
-
-        // The child shares the parent's worktree, so its base_commit is that
-        // worktree's HEAD at the moment of inheritance.
-        let base_commit = worktree_head_commit(orch, Path::new(&parent_worktree));
-        let now = chrono::Utc::now().timestamp() as i32;
-        run_db(update_job_worktree(
-            owning_db.clone(),
-            job_id.to_string(),
-            Some(parent_worktree.clone()),
-            parent_branch.clone(),
-            base_commit,
-            now,
-        ))?;
-
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            crate::notify::job_db_change_ids(
-                "update",
-                &job.id,
-                job.issue_id.as_deref(),
-                job.execution_id.as_deref(),
-                job.parent_job_id.as_deref(),
-                job.parent_tool_use_id.as_deref(),
-                &job.project_id,
-            ),
-        );
-        let _ = orch.services.emitter.emit(
-            "job-activated",
-            serde_json::json!({
-                "jobId": job_id,
-                "issueId": job.issue_id,
-                "nodeName": job.node_name,
-                "execSeq": exec_seq,
-            }),
-        );
-    } else if needs_worktree {
-        // Count existing branched jobs to compute unique sequence number
-        let seq = run_db(count_existing_branched_jobs(
-            owning_db.clone(),
-            job.issue_id.clone(),
-            job.execution_id.clone(),
-        ))?;
-
-        let safe_step_name: String = step_name
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string();
-
-        let worktrees_dir = crate::managed_worktrees::base_dir()
-            .ok_or("Could not find managed worktrees directory")?;
-
-        let initial_name = if let Some(ref existing) = job.branch {
-            job.worktree_path
-                .as_deref()
-                .and_then(|path| Path::new(path).file_name())
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| existing.replace('/', "-"))
-        } else {
-            format!("{}-{}-{}-{}", project_key, display_id, safe_step_name, seq)
-        };
-        let initial_branch = job
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("agent/{initial_name}"));
-
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-        // Allocation is serialized separately from workspace mutation. The DB
-        // reservation made below keeps the chosen coordinates fail-closed after
-        // this brief guard is released.
-        let allocation_orch = orch.clone();
-        let allocation_store = store.clone();
-        let allocation_operation = format!("workspace provisioning allocation for {job_id}");
-        let allocation_guard = run_db(async move {
-            Ok(allocation_orch
-                .acquire_jj_store_lock(&allocation_store, allocation_operation)
-                .await)
-        })?;
-        crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path))?;
-
-        let short_job: String = job_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(8)
-            .collect();
-        let mut branch = initial_branch.clone();
-        let mut wt_dir = initial_name.clone();
-        let mut allow_retry_cleanup = false;
-        for attempt in 0..=100 {
-            let wt_path = worktrees_dir.join(&wt_dir);
-            let workspace_name = crate::jj::workspace_name_for_branch(&branch);
-            let db_owner = run_db(workspace_identity::coordinate_owner(
+            Ok(ParentCoordinate {
+                branch: parent.branch,
+                recorded_base: parent.base_commit,
+            })
+        },
+        || {
+            let seq = run_db(count_existing_branched_jobs(
                 owning_db.clone(),
-                job.project_id.clone(),
-                branch.clone(),
-                wt_path.to_string_lossy().to_string(),
-            ))?;
-            let exact_retry = db_owner.as_deref() == Some(job_id)
-                && job.branch.as_deref() == Some(branch.as_str())
-                && job.worktree_path.as_deref() == Some(wt_path.to_string_lossy().as_ref());
-            let occupied = wt_path.exists()
-                || crate::jj::workspace_registered(&jj, &store, &workspace_name)
-                || crate::jj::bookmark_commit(&jj, &store, &branch).is_some()
-                || db_owner.is_some();
-            if exact_retry || !occupied {
-                allow_retry_cleanup = exact_retry;
-                break;
-            }
-            if attempt == 100 {
-                return Err(format!(
-                    "Could not allocate an unoccupied managed workspace for job {job_id}"
-                ));
-            }
-            let suffix = if attempt == 0 {
-                format!("-j{short_job}")
-            } else {
-                format!("-j{short_job}-{attempt}")
-            };
-            branch = format!("{}{}", initial_branch, suffix);
-            wt_dir = format!("{}{}", initial_name, suffix);
-        }
-
-        let wt_path = worktrees_dir.join(&wt_dir);
-        let base_ref = job.base_branch.as_deref().unwrap_or("HEAD");
-        let base_rev = crate::jj::resolve_base_rev(&jj, &store, base_ref, |r| {
-            orch.services
-                .git
-                .rev_parse(Path::new(&repo_path), vec![r.to_string()])
-                .ok()
-                .filter(|sha| !sha.is_empty())
-        });
-        let identity = crate::jj::WorkspaceIdentity::new(
-            job_id,
-            job_id,
-            job.project_id.clone(),
-            PathBuf::from(&repo_path),
-            wt_path.clone(),
-            branch.clone(),
-            crate::jj::workspace_name_for_branch(&branch),
-            base_rev,
-        );
-        let now = chrono::Utc::now().timestamp() as i32;
-        run_db(workspace_identity::assign_workspace_if_unset_or_same(
-            owning_db.clone(),
-            job_id.to_string(),
-            job.worktree_path.clone(),
-            job.branch.clone(),
-            wt_path.to_string_lossy().to_string(),
-            branch.clone(),
-            now,
-        ))?;
-        drop(allocation_guard);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let child_slot = Arc::new(Mutex::new(None));
-        let sink = setup_progress::make_sink(orch, job_id, job.issue_id.clone());
-        setup_progress::emit(
-            &sink,
-            job_id,
-            job.issue_id.clone(),
-            "started",
-            None,
-            None,
-            None,
-        );
-        {
-            let mut registry = orch.setup_registry.lock().unwrap();
-            registry.insert(
-                job_id.to_string(),
-                crate::orchestrator::SetupHandle {
-                    cancel: cancel.clone(),
-                    child: child_slot.clone(),
-                },
-            );
-        }
-
-        log::info!(
-            "[prepare_job] job {job_id}: creating worktree {} from {base_ref} on branch {branch}",
-            wt_path.display()
-        );
-        let setup_result = prepare_worktree_for_job(
-            orch,
-            &repo_path,
-            &wt_path,
-            &branch,
-            base_ref,
-            &identity,
-            allow_retry_cleanup,
-            job_id,
-            job.issue_id.clone(),
-            &sink,
-            &cancel,
-            &child_slot,
-        );
-        orch.setup_registry.lock().unwrap().remove(job_id);
-        let restore_assignment = || {
-            if let Err(error) = run_db(workspace_identity::restore_workspace_assignment(
-                owning_db.clone(),
-                job_id.to_string(),
-                wt_path.to_string_lossy().to_string(),
-                branch.clone(),
-                job.worktree_path.clone(),
-                job.branch.clone(),
-                chrono::Utc::now().timestamp() as i32,
-            )) {
-                log::error!("failed to restore workspace ownership after setup failure for {job_id}: {error}");
-            }
-        };
-        match setup_result {
-            Ok(()) => setup_progress::emit(
-                &sink,
-                job_id,
                 job.issue_id.clone(),
-                "complete",
-                None,
-                None,
-                None,
-            ),
-            Err(crate::git::worktree::SetupError::Cancelled) => {
-                restore_assignment();
-                setup_progress::emit(
-                    &sink,
-                    job_id,
-                    job.issue_id.clone(),
-                    "failed",
-                    None,
-                    None,
-                    Some("Setup cancelled".to_string()),
-                );
-                return Err(SETUP_CANCELLED_ERROR.to_string());
-            }
-            Err(e) => {
-                restore_assignment();
-                setup_progress::emit(
-                    &sink,
-                    job_id,
-                    job.issue_id.clone(),
-                    "failed",
-                    None,
-                    None,
-                    Some(e.to_string()),
-                );
-                return Err(e.to_string());
-            }
-        }
+                job.execution_id.clone(),
+            ))?;
+            let safe_step_name: String = step_name
+                .to_lowercase()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+                .trim_matches('-')
+                .to_string();
+            Ok(format!(
+                "agent/{project_key}-{display_id}-{safe_step_name}-{seq}"
+            ))
+        },
+        git_rev_parse,
+    )?;
 
-        log::info!("[prepare_job] job {job_id}: worktree setup complete");
-        let wt_path_str = wt_path.to_string_lossy().to_string();
-        // Reading jj's head may snapshot the workspace, so serialize this final
-        // short store access without extending the guard into DB activation.
-        let head_orch = orch.clone();
-        let head_store = store.clone();
-        let head_operation = format!("workspace provisioning head read for {job_id}");
-        let head_guard = run_db(async move {
-            Ok(head_orch
-                .acquire_jj_store_lock(&head_store, head_operation)
-                .await)
-        })?;
-        let base_commit = worktree_head_commit(orch, &wt_path);
-        drop(head_guard);
-        let now = chrono::Utc::now().timestamp() as i32;
-        run_db(update_job_worktree(
-            owning_db.clone(),
-            job_id.to_string(),
-            Some(wt_path_str.clone()),
-            Some(branch.clone()),
-            base_commit,
-            now,
-        ))?;
+    run_db(update_job_coordinate(
+        owning_db.clone(),
+        job_id.to_string(),
+        branch,
+        base_commit,
+        chrono::Utc::now().timestamp() as i32,
+    ))?;
 
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            crate::notify::job_db_change_ids(
-                "update",
-                &job.id,
-                job.issue_id.as_deref(),
-                job.execution_id.as_deref(),
-                job.parent_job_id.as_deref(),
-                job.parent_tool_use_id.as_deref(),
-                &job.project_id,
-            ),
-        );
-        let _ = orch.services.emitter.emit(
-            "job-activated",
-            serde_json::json!({
-                "jobId": job_id,
-                "issueId": job.issue_id,
-                "nodeName": job.node_name,
-                "execSeq": exec_seq,
-            }),
-        );
-    } else {
-        // No worktree needed — just emit job-activated
-        let _ = orch.services.emitter.emit(
-            "job-activated",
-            serde_json::json!({
-                "jobId": job_id,
-                "issueId": job.issue_id,
-                "nodeName": job.node_name,
-                "execSeq": exec_seq,
-            }),
-        );
-    }
+    let _ = orch.services.emitter.emit(
+        "job-activated",
+        serde_json::json!({
+            "jobId": job_id,
+            "issueId": job.issue_id,
+            "nodeName": job.node_name,
+            "execSeq": exec_seq,
+        }),
+    );
 
-    // ---- Reload job (picks up worktree_path/branch updates) -------------
+    // ---- Reload job with its durable branch coordinate ------------------
     let job = run_db(load_job(
         owning_db.clone(),
         job_id.to_string(),
-        "Job not found after worktree setup",
+        "Job not found after branch preparation",
     ))?;
 
     // ---- Agent config ---------------------------------------------------
@@ -891,6 +791,12 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         },
     ))?;
 
+    // Admission passes from the launch lock to the claim here, while the lock is
+    // still held: from now until the transport registers the spawned process,
+    // this job has a run and a turn but no serving process — the exact shape a
+    // resume reads as idle (CAIRN-3283).
+    let launch_claim = orch.claim_job_launch(job_id, &run_id);
+
     log::info!("[prepare_job] job {job_id}: run {run_id} inserted");
     if existing_active_count > 0 {
         log::warn!(
@@ -921,20 +827,16 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
     let prompt = format_resolved_inputs(&resolved_inputs);
 
-    let worktree_path: String = job
-        .worktree_path
-        .clone()
-        .or_else(|| {
-            project_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-        })
-        .ok_or("Job has no worktree path and project path is unavailable")?;
+    // Provision the process residence independently of repository coordinates.
+    // Session startup resolves the canonical home URI and registers the readable
+    // scratch name; this early ensure guarantees a writable residence exists as
+    // soon as preparation completes.
+    crate::scratch::ensure_job_scratch_dir(job_id, None);
 
     let job_model = job.model.as_ref().map(Model::new);
 
     // ---- Store initial user event ---------------------------------------
-    store_user_event_with_turn(orch, &run_id, &session_id, &prompt, now, -1, Some(&turn_id))?;
+    store_user_event_with_turn(orch, &run_id, &session_id, &prompt, now, Some(&turn_id))?;
 
     // ---- Emit system message for job start ------------------------------
     crate::messages::system::emit_job_event(
@@ -949,12 +851,12 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         session_id,
         session_start,
         prompt,
-        worktree_path,
         job_model,
         agent_config,
         artifact_schema_info,
         execution_id: job.execution_id,
         turn_id,
+        launch_claim,
     })
 }
 
@@ -1071,6 +973,25 @@ pub fn continue_job_or_enqueue(
             {
                 return Ok(run);
             }
+        }
+        // An idle child takes the operator's text straight into a resume, so there
+        // is no queued row for the watchers' catch-up copy to hang off. Fire it
+        // here, so an operator message reaches a child's watchers whichever branch
+        // it took (CAIRN-3342). If both branches ran — an active turn with no run
+        // row — supersede-by-key collapses the two identical rows into one.
+        let dbs = orch.db.clone();
+        let watched_job_id = job_id.to_string();
+        if let Err(error) = run_db(async move {
+            let db = crate::execution::routing::owning_db_for_job(&dbs, &watched_job_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(
+                &db,
+                &watched_job_id,
+            )
+            .await
+        }) {
+            log::warn!("catch-up push creation for an operator message failed: {error}");
         }
     }
     continue_job_impl(
@@ -1214,7 +1135,155 @@ pub fn continue_job_impl(
     )
 }
 
+/// The launch funnel for an existing job, and the one place a resume is
+/// admitted (CAIRN-3283).
+///
+/// Deciding a job is idle, inserting its run, allocating its turn, spawning the
+/// backend process and registering that process are five separate steps with no
+/// mutual exclusion between them. Two wake facts routed concurrently for one job
+/// each evaluated the idle check before either had created a turn, so both fell
+/// through, both inserted a run, both drove the same turn row, and both spawned a
+/// process against the same session — two independent agent contexts racing every
+/// side effect of one turn. The per-job launch lock makes that whole section
+/// atomic; the recheck under it is what makes the serialization correct, since a
+/// caller that blocked and then acquired must attach to the launch it waited on
+/// rather than mint a second one.
+///
+/// Nothing is lost by attaching: [`continue_job_impl`] claims ALL of a job's
+/// pending side-channel notices, queued messages and attention pushes, so the
+/// launch already in flight carries the waiting caller's content too — and
+/// anything persisted after that claim is swept by the turn-end flush.
 fn continue_job_impl_with_intent(
+    orch: &Orchestrator,
+    job_id: &str,
+    message: Option<&str>,
+    identity_override: Option<crate::identity::UserIdentity>,
+    prompt_resume: Option<ResumeContext>,
+    continuation_intent: ContinuationIntent,
+) -> Result<Run, String> {
+    let launch_lock = orch.job_launch_lock(job_id);
+    // A poisoned lock means some earlier launch panicked. What it guards is
+    // durable rows that the recheck below re-reads from scratch, so recover the
+    // guard rather than refusing this job every resume from here on.
+    let _launch_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // A pre-created retry or owned-wait successor turn is the caller's own
+    // claimed turn (pending, validated below), not somebody else's launch.
+    let owns_preclaimed_turn = prompt_resume.as_ref().is_some_and(|context| {
+        context.preclaimed_retry_turn_id.is_some() || context.preclaimed_successor_turn_id.is_some()
+    });
+    if !owns_preclaimed_turn {
+        if let Some(in_flight) = in_flight_launch(orch, job_id)? {
+            // A resume carrying in-memory content has nowhere durable to leave
+            // it, so refuse loudly instead of silently dropping the text. Every
+            // such caller runs at a genuine turn boundary, where this branch
+            // cannot fire unless something raced it.
+            if message.is_some() {
+                return Err(format!(
+                    "Job {} is already running a turn (run {}); this resume was refused rather than started as a second concurrent session.",
+                    &job_id[..job_id.len().min(8)],
+                    &in_flight.id[..in_flight.id.len().min(8)]
+                ));
+            }
+            log::info!(
+                "Job {} already has a launch in flight (run {}); attaching to it instead of starting a second",
+                &job_id[..job_id.len().min(8)],
+                &in_flight.id[..in_flight.id.len().min(8)]
+            );
+            return Ok(in_flight);
+        }
+    }
+
+    continue_job_launch_locked(
+        orch,
+        job_id,
+        message,
+        identity_override,
+        prompt_resume,
+        continuation_intent,
+    )
+}
+
+/// The launch already in flight for this job, if there is one. Called only under
+/// the per-job launch lock, before this resume has mutated anything.
+///
+/// A launch is in flight in either of two ways.
+///
+/// An admitted cold start holds a [`JobLaunchClaim`](crate::orchestrator::JobLaunchClaim)
+/// from `prepare_job` until its process registers. Nothing observable is serving
+/// a turn during that interval — that is the whole reason the claim exists — so
+/// it is checked first, before any turn state.
+///
+/// Otherwise both halves must agree: the job's head turn is `running` in the
+/// database AND the run driving it has a live in-process handle serving exactly
+/// that turn. Requiring both is deliberate.
+///
+/// - A `pending` head turn is not in flight: it is a pre-created retry or
+///   owned-wait successor whose owner is the caller.
+/// - An active turn whose run has no live handle is not in flight either — that
+///   is the stale turn [`reconcile_stale_active_turn_for_continue`] recovers, and
+///   the incident's own job read as idle to both nudges precisely because a run
+///   had sat in `starting` for two hours with no process behind it. Treating that
+///   as in flight would convert a rare transient race into a permanently wedged
+///   node.
+fn in_flight_launch(orch: &Orchestrator, job_id: &str) -> Result<Option<Run>, String> {
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+
+    // A cold start that has been admitted but whose process has not registered
+    // yet owns this job's launch, even though nothing observable is serving a
+    // turn for it. Checked before the turn state because that interval is
+    // precisely where the turn state cannot tell the two apart.
+    if let Some(run_id) = orch.claimed_launch_run(job_id) {
+        return run_db(load_run(
+            owning_db,
+            run_id,
+            "Run not found for claimed launch",
+        ))
+        .map(Some);
+    }
+
+    let Some(active) = load_active_turn_for_continue(owning_db.clone(), job_id.to_string())? else {
+        return Ok(None);
+    };
+    if active.state != TurnState::Running {
+        return Ok(None);
+    }
+    let Some(run_id) = active.run_id else {
+        return Ok(None);
+    };
+    if orch.process_state.get_current_turn_id(&run_id).as_deref() != Some(active.turn_id.as_str()) {
+        return Ok(None);
+    }
+    run_db(load_run(
+        owning_db,
+        run_id,
+        "Run not found for in-flight turn",
+    ))
+    .map(Some)
+}
+
+/// Test seam for the launch recheck: the predicate is what makes serialization
+/// correct, and its two failure modes (attaching to nothing, or refusing a
+/// resume forever) are opposite and both severe.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn in_flight_launch_for_test(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    in_flight_launch(orch, job_id).map(|run| run.map(|run| run.id))
+}
+
+fn continue_job_launch_locked(
     orch: &Orchestrator,
     job_id: &str,
     message: Option<&str>,
@@ -1240,7 +1309,6 @@ fn continue_job_impl_with_intent(
         orch.db.clone(),
         job_id.to_string(),
     ))?;
-
     let preclaimed_retry_turn_id = prompt_resume
         .as_ref()
         .and_then(|context| context.preclaimed_retry_turn_id.clone());
@@ -1303,16 +1371,8 @@ fn continue_job_impl_with_intent(
     }
 
     let agent_config = load_agent_config(orch, &job, project_path.as_deref())?;
-
-    let worktree_path: String = job
-        .worktree_path
-        .clone()
-        .or_else(|| {
-            project_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-        })
-        .ok_or("Job has no worktree path and project path is unavailable")?;
+    let process_residence = crate::scratch::ensure_job_scratch_dir(job_id, None);
+    let process_residence = process_residence.to_string_lossy().to_string();
 
     let now = chrono::Utc::now().timestamp() as i32;
 
@@ -1399,12 +1459,14 @@ fn continue_job_impl_with_intent(
                                 let session = session.clone();
                                 let job_id = job_id.to_string();
                                 let want = want.to_string();
+                                let emitter = orch.services.emitter.clone();
                                 async move {
                                     crate::sessions::queries::rotate_job_session_to_backend(
                                         db.as_ref(),
                                         &session,
                                         &job_id,
                                         &want,
+                                        emitter.as_ref(),
                                     )
                                     .await
                                 }
@@ -1432,11 +1494,13 @@ fn continue_job_impl_with_intent(
                                 let db = owning_db.clone();
                                 let session = session.clone();
                                 let job_id = job_id.to_string();
+                                let emitter = orch.services.emitter.clone();
                                 async move {
                                     crate::sessions::queries::rotate_job_session(
                                         db.as_ref(),
                                         &session,
                                         &job_id,
+                                        emitter.as_ref(),
                                     )
                                     .await
                                 }
@@ -1506,12 +1570,22 @@ fn continue_job_impl_with_intent(
                     }
                 }
             }
-            SessionStatus::Failed | SessionStatus::Closed => {
-                return Err(format!(
-                    "Session {} is {:?} and cannot be continued",
-                    &session.id[..session.id.len().min(8)],
-                    session.status
-                ));
+            // A closed or failed session cannot take another turn, and that is
+            // not something the caller can retry past. Name what WOULD work
+            // instead of reporting an internal session state: an operator who
+            // reached this while trying to intervene on a merged issue got only
+            // "Session cf7a2f00 is Closed and cannot be continued", which told
+            // them nothing they could act on (CAIRN-3253).
+            SessionStatus::Closed => {
+                return Err(match session.terminal_reason.as_deref() {
+                    Some("issue_merged") => "This node's issue has been merged, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog) and start a new execution on it.".to_string(),
+                    Some("issue_closed") => "This node's issue has been closed, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog) and start a new execution on it.".to_string(),
+                    Some("node_removed") => "This node was removed from its execution, which closed its session, so it cannot take another turn. Add the node back to the execution to run it again.".to_string(),
+                    _ => "This node's session has been closed, so it cannot take another turn. Start a new execution on the issue to carry the work forward.".to_string(),
+                });
+            }
+            SessionStatus::Failed => {
+                return Err("This node's session ended in a failure, so it cannot take another turn. Start a new execution on the issue to carry the work forward.".to_string());
             }
         },
         None => {
@@ -1540,6 +1614,14 @@ fn continue_job_impl_with_intent(
             return Err("automatic retry was superseded before run launch".to_string());
         }
     }
+    // A run row this host holds no process for is not a launch in flight; it is
+    // a predecessor that never reached a terminal status, and left alone it
+    // keeps answering `latest_run_for_job` (and therefore the whole delivery
+    // ladder) on behalf of a process that does not exist (CAIRN-3291). Reap it
+    // here, where the reaper's precondition is already met: the launch lock is
+    // held, and this precedes the warm-reuse decision below, so every row is
+    // still carrying whatever process it had when this resume arrived.
+    crate::runs::reap::reap_stale_runs_for_job(orch, &owning_db, job_id);
     // Reconcile a reusable process against the job's requested model *before*
     // deciding to reuse it. `jobs.model` is the source of truth: a model change
     // restarts the process (cold resume with the new model) so the persisted
@@ -1594,7 +1676,10 @@ fn continue_job_impl_with_intent(
                 created_at: now,
                 updated_at: now,
                 start_mode: Some(run_start_mode.clone()),
-                warn_existing_active: false,
+                // Advisory only, and logged on the prepare path already: under
+                // the per-job launch lock a pre-existing active run for this job
+                // should now be impossible, so say so if one ever appears.
+                warn_existing_active: true,
             },
         ))?;
         let _ = orch.services.emitter.emit(
@@ -1725,12 +1810,8 @@ fn continue_job_impl_with_intent(
     } else {
         None
     };
-    let user_message = match message {
-        Some(m) => m.to_string(),
-        None if has_queued || has_pushes => String::new(),
-        None => "Continue where you left off.".to_string(),
-    };
-    let base_prompt = resolve_skill_slash_command(orch, &user_message, project_path.as_deref());
+    let trigger = resolve_resume_trigger(message, has_queued, has_pushes);
+    let base_prompt = resolve_skill_slash_command(orch, &trigger.message, project_path.as_deref());
     let side_channel_notices =
         match crate::messages::side_channel::claim_pending_side_channel_for_job(&owning_db, job_id)
         {
@@ -1830,7 +1911,9 @@ fn continue_job_impl_with_intent(
     // reuse it here.
     // Skip the default "You" event when the user supplied no explicit message and
     // the content is carried entirely by queued follow-ups (stored individually
-    // below) — storing the empty placeholder would render a blank You block.
+    // below) — storing the empty placeholder would render a blank You block. A
+    // resume with no operator content at all still stores its event, but as the
+    // `user:continuation` marker rather than a "You" block.
     // CAIRN-1881: persist the carrying event for the drained pushes and stamp each
     // delivered by it, atomically (same transaction as the event INSERT). The
     // pushes already ride in the resume prompt above, so they are delivered
@@ -1847,7 +1930,6 @@ fn continue_job_impl_with_intent(
             &session_id,
             &outcome.seed_content,
             now,
-            -1,
             Some(&turn_id),
         )?;
     }
@@ -1876,7 +1958,6 @@ fn continue_job_impl_with_intent(
                 &session_id,
                 &display_message,
                 now,
-                -1,
                 Some(&turn_id),
             )?;
         }
@@ -1885,17 +1966,22 @@ fn continue_job_impl_with_intent(
             serde_json::json!({"table": "queued_messages", "action": "update"}),
         );
     }
-    let store_default_user_event =
-        !(suppress_user_event || (message.is_none() && (has_queued || has_pushes)));
+    let store_default_user_event = !suppress_user_event && !trigger.message.is_empty();
     if store_default_user_event {
-        let display_message = user_message.clone();
-        store_user_event_with_turn(
+        let display_message = trigger.message.clone();
+        // A synthesized continuation is stored under its own namespaced type so
+        // no surface can render it as something the operator said (CAIRN-3175).
+        let store = if trigger.synthetic {
+            store_continuation_event_with_turn
+        } else {
+            store_user_event_with_turn
+        };
+        store(
             orch,
             &run_id,
             &session_id,
             &display_message,
             now,
-            -1,
             Some(&turn_id),
         )?;
     }
@@ -1920,20 +2006,40 @@ fn continue_job_impl_with_intent(
             .set_current_turn_id(&run_id, Some(&turn_id));
 
         // Run stays Live — no durable status change for warm reuse.
+        let message_text = prompt.clone();
+        let image_project_id = project_id.clone();
+        let image_project_key = run_db({
+            let db = owning_db.clone();
+            let project_id = project_id.clone();
+            async move {
+                db.query_opt_text("SELECT key FROM projects WHERE id = ?1", (project_id,))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "resume project authority is unavailable".to_string())
+            }
+        })?;
+        let message_content = crate::storage::run_db_blocking(move || async move {
+            crate::agent_process::stdin::resolve_stable_images(
+                &orch.db,
+                &image_project_id,
+                &image_project_key,
+                message_text,
+            )
+            .await
+        })?;
         crate::backends::stdin::send_user_message(
             &orch.process_state,
             &run_id,
-            &prompt,
+            &message_content,
             &session_id,
             None,
-            Some(&worktree_path),
+            Some(&process_residence),
         )?;
     } else {
         crate::orchestrator::session::start_agent_session(
             orch,
             &run_id,
             &prompt,
-            &worktree_path,
             session_start,
             job_model,
             None,
@@ -2013,6 +2119,62 @@ fn artifact_handoff_resume_note(
     })
 }
 
+/// The immediate message a resume leads with, and whether Cairn wrote it.
+struct ResumeTrigger {
+    /// Text that becomes the resume prompt's immediate message. Empty when the
+    /// content is carried entirely by queued follow-ups or attention pushes,
+    /// which are assembled (and stored) as their own blocks.
+    message: String,
+    /// True when no operator content reached this resume at all, so `message` is
+    /// [`SYNTHETIC_CONTINUATION_PROMPT`] — Cairn's own text. Every attribution
+    /// decision downstream keys off this flag.
+    synthetic: bool,
+}
+
+/// Decide what a resume leads with, given the caller's message and whether the
+/// claims for this wake swept up queued follow-ups or attention pushes.
+///
+/// A blank message is no message: it reaches this seam only from a caller with
+/// nothing to say, and treating it as operator content would store an empty
+/// "You" block.
+fn resolve_resume_trigger(
+    message: Option<&str>,
+    has_queued: bool,
+    has_pushes: bool,
+) -> ResumeTrigger {
+    match message.filter(|text| !text.trim().is_empty()) {
+        Some(operator) => ResumeTrigger {
+            message: operator.to_string(),
+            synthetic: false,
+        },
+        None if has_queued || has_pushes => ResumeTrigger {
+            message: String::new(),
+            synthetic: false,
+        },
+        None => ResumeTrigger {
+            message: SYNTHETIC_CONTINUATION_PROMPT.to_string(),
+            synthetic: true,
+        },
+    }
+}
+
+/// Prompt for a resume that carries no operator content at all.
+///
+/// Cairn resumes a job on its own for reasons the operator never authored — an
+/// automatic retry, a flush that found nothing pending, a suspension whose
+/// result arrives without a message. The wake still needs prompt text, so Cairn
+/// writes it. The previous text ("Continue where you left off.") read as a terse
+/// operator instruction, and agents obeyed it as one, planning around a
+/// directive nobody gave (CAIRN-3175). This text names itself as substrate
+/// instead: it says what happened, denies operator intent explicitly, and gives
+/// the safe default for a turn that was already finished.
+///
+/// Sibling to [`RESUME_AFTER_SELF_SUSPEND_NOTE`], which corrects the adjacent
+/// misattribution (CAIRN-3162): that note rebuts a *suspension* the CLI rendered
+/// as a user rejection, while this text is the *prompt* for a resume nobody
+/// asked for. A self-suspend resume with no message carries both.
+const SYNTHETIC_CONTINUATION_PROMPT: &str = "Automatic resume: Cairn restarted this turn after the previous one ended without completing. No message accompanies it — nobody asked you to continue, and there is no new instruction here. Pick your own work back up from where it stopped; if it was already finished, close the turn with a short status rather than starting something new.";
+
 /// Short note that leads the forwarded prompt on a durable self-suspend resume.
 ///
 /// On the slow (>45s) path the awaited result is delivered as the suspended tool
@@ -2020,7 +2182,7 @@ fn artifact_handoff_resume_note(
 /// interrupted mid-execution and then returns — a deliberate pause that reads
 /// like a glitch. Naming it as an intentional suspend up front removes that
 /// tension (CAIRN-2173).
-const RESUME_AFTER_SELF_SUSPEND_NOTE: &str = "Resuming after an intentional self-suspend. Your run paused itself to wait on delegated work (a sub-agent task or a user question) and resumed now that the work finished — the earlier tool call was suspended on purpose, not interrupted or errored, and its result follows.";
+const RESUME_AFTER_SELF_SUSPEND_NOTE: &str = "Resuming after an intentional self-suspend. Your run paused itself to wait on work it had already started — delegated work (a sub-agent task or a user question), an explicit wait, or one or more long-running command batches — and resumed now that the work finished. Cairn, not the user, parked those tool calls on purpose. If the CLI described any of them as rejected or interrupted by the user, that wording was a transport artifact; the real results follow, labeled by call when there is more than one.";
 
 fn prepend_resume_stamp(
     prompt: String,
@@ -2105,7 +2267,7 @@ fn assemble_resume_prompt(
         }
     }
     if parts.is_empty() {
-        "Continue where you left off.".to_string()
+        SYNTHETIC_CONTINUATION_PROMPT.to_string()
     } else {
         parts.join("\n\n")
     }
@@ -2317,10 +2479,16 @@ fn force_session_reseed(
         let db = owning_db.clone();
         let session = session.clone();
         let job_id = job.id.clone();
+        let emitter = orch.services.emitter.clone();
         async move {
-            crate::sessions::queries::rotate_job_session(db.as_ref(), &session, &job_id)
-                .await
-                .map_err(|error| format!("Failed to rotate session for digest resume: {error}"))
+            crate::sessions::queries::rotate_job_session(
+                db.as_ref(),
+                &session,
+                &job_id,
+                emitter.as_ref(),
+            )
+            .await
+            .map_err(|error| format!("Failed to rotate session for digest resume: {error}"))
         }
     })?;
 
@@ -2564,9 +2732,10 @@ mod tests {
         apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content,
         decide_continue_action, ensure_reused_process_model, finish_forced_session_reseed,
         is_session_stale, prepend_resume_stamp, previous_turn_end_for_resume, push_job_coordinate,
-        session_prefers_native_resume, staleness_threshold_secs, take_needs_fresh_session,
-        ContinueSessionAction, PushJobCoordinate, ReseedOutcome, ReuseDecision, RESEED_SEED_HEADER,
-        SESSION_STALENESS_THRESHOLD_SECS,
+        resolve_resume_trigger, session_prefers_native_resume, staleness_threshold_secs,
+        take_needs_fresh_session, ContinueSessionAction, PushJobCoordinate, ReseedOutcome,
+        ReuseDecision, RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
+        SYNTHETIC_CONTINUATION_PROMPT,
     };
     use crate::agent_process::process::{wrap_plain_stdin, AgentProcessState, RunHandle};
     use crate::storage::migrated_test_db;
@@ -2721,9 +2890,69 @@ mod tests {
     }
 
     #[test]
-    fn empty_resume_falls_back_to_placeholder() {
+    fn empty_resume_falls_back_to_the_synthetic_continuation() {
+        // Second construction site: every part came back empty, so the assembled
+        // prompt is Cairn's own continuation text rather than a bare directive.
         let prompt = assemble_resume_prompt(None, None, "", None, None);
-        assert_eq!(prompt, "Continue where you left off.");
+        assert_eq!(prompt, SYNTHETIC_CONTINUATION_PROMPT);
+    }
+
+    #[test]
+    fn synthetic_continuation_never_speaks_as_the_operator() {
+        // The text an agent reads must name itself as Cairn's own resume and deny
+        // operator intent outright. The retired placeholder ("Continue where you
+        // left off.") read as a terse instruction and was obeyed as one
+        // (CAIRN-3175), so its exact shape is pinned out.
+        let text = SYNTHETIC_CONTINUATION_PROMPT;
+        assert!(
+            text.starts_with("Automatic resume:"),
+            "the continuation must announce itself before anything else: {text}"
+        );
+        assert!(
+            text.contains("nobody asked you to continue"),
+            "the continuation must deny operator intent explicitly: {text}"
+        );
+        assert_ne!(
+            text, "Continue where you left off.",
+            "the bare directive form is exactly what agents mistook for an instruction"
+        );
+    }
+
+    #[test]
+    fn resume_without_operator_content_is_synthetic() {
+        // First construction site: no message, no queued follow-up, no attention
+        // push — Cairn is waking the job on its own.
+        let trigger = resolve_resume_trigger(None, false, false);
+        assert!(trigger.synthetic);
+        assert_eq!(trigger.message, SYNTHETIC_CONTINUATION_PROMPT);
+    }
+
+    #[test]
+    fn blank_operator_message_is_no_message() {
+        // A whitespace-only message carries no operator intent, so it resolves to
+        // the synthetic continuation instead of an empty "You" block.
+        let trigger = resolve_resume_trigger(Some("   \n"), false, false);
+        assert!(trigger.synthetic);
+        assert_eq!(trigger.message, SYNTHETIC_CONTINUATION_PROMPT);
+    }
+
+    #[test]
+    fn operator_message_resume_keeps_its_attribution() {
+        let trigger = resolve_resume_trigger(Some("ship the fix"), false, false);
+        assert!(!trigger.synthetic);
+        assert_eq!(trigger.message, "ship the fix");
+    }
+
+    #[test]
+    fn queued_or_pushed_content_leaves_the_trigger_empty() {
+        // Queued follow-ups and attention pushes are assembled and stored as their
+        // own blocks, so the trigger contributes nothing — and is not synthetic
+        // either, because real content did reach this resume.
+        for (has_queued, has_pushes) in [(true, false), (false, true), (true, true)] {
+            let trigger = resolve_resume_trigger(None, has_queued, has_pushes);
+            assert!(trigger.message.is_empty());
+            assert!(!trigger.synthetic);
+        }
     }
 
     #[test]
@@ -2966,5 +3195,318 @@ mod tests {
         state.begin_turn("run-1", "turn-1");
         let err = ensure_reused_process_model(&state, "run-1", Some("sonnet")).unwrap_err();
         assert!(err.contains("busy"), "unexpected error: {err}");
+    }
+
+    // ---- The inherit ladder ---------------------------------------------
+    //
+    // Where a job that inherits its parent's branch starts is the one place a
+    // recorded `jobs.base_commit` can still influence where work begins, so
+    // every rung is pinned against a real jj store rather than reasoned about.
+    // Two properties matter: a commit the store cannot produce is never chosen,
+    // and no rung fails. A job minted at an unresolvable coordinate does not
+    // fail here — it fails inside materialization, far from the row that
+    // caused it.
+
+    use super::inherited_head;
+    use crate::jj::tests::{git, git_stdout, init_project, jj_bin};
+    use crate::jj::{create_bookmark_at, ensure_project_store, JjEnv};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// A store holding two real commits on `main`, with the tempdirs that keep
+    /// it alive.
+    struct InheritFixture {
+        _home: TempDir,
+        _project: TempDir,
+        jj: JjEnv,
+        store: PathBuf,
+        first: String,
+        second: String,
+    }
+
+    /// `None` when jj is not resolvable on this machine, matching the skip
+    /// convention the rest of the real-store suites use.
+    fn inherit_fixture() -> Option<InheritFixture> {
+        let bin = jj_bin()?;
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        init_project(project.path());
+        let first = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(project.path().join("second.rs"), "second\n").unwrap();
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-q", "-m", "second"]);
+        let second = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, project.path()).unwrap();
+        Some(InheritFixture {
+            _home: home,
+            _project: project,
+            jj,
+            store,
+            first,
+            second,
+        })
+    }
+
+    /// A commit id that is well-formed and absent from the store — the shape a
+    /// recorded row takes after its commit is abandoned or was never fetched.
+    const ABSENT_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Rung one: the store is the authority. A resolvable recorded base does not
+    /// get a say while the branch itself still resolves.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn the_live_bookmark_outranks_a_resolvable_recorded_base() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!("skipping the_live_bookmark_outranks_a_resolvable_recorded_base: no jj");
+            return;
+        };
+        create_bookmark_at(&fx.jj, &fx.store, "agent/parent", &fx.first).unwrap();
+
+        let head = inherited_head(
+            &fx.jj,
+            &fx.store,
+            "agent/parent",
+            Some(&fx.second),
+            "main",
+            |_| None,
+        );
+
+        assert_eq!(
+            head, fx.first,
+            "the branch's own bookmark is where the branch is; the recorded row is not"
+        );
+    }
+
+    /// Rung two: the recorded base is used, but only once the branch is gone AND
+    /// the store can still produce the commit it names.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_resolvable_recorded_base_is_used_once_the_bookmark_is_gone() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!(
+                "skipping a_resolvable_recorded_base_is_used_once_the_bookmark_is_gone: no jj"
+            );
+            return;
+        };
+
+        let head = inherited_head(
+            &fx.jj,
+            &fx.store,
+            "agent/never-created",
+            Some(&fx.first),
+            "main",
+            |_| None,
+        );
+
+        assert_eq!(
+            head, fx.first,
+            "a recorded commit the store can still produce is a legitimate degraded start"
+        );
+    }
+
+    /// Rung three, and the whole point of the rung: a recorded commit the store
+    /// cannot resolve is refused, not carried forward. This is the case that
+    /// used to mint a job at a coordinate materialization would later fail on.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_unresolvable_recorded_base_is_refused_for_the_live_base_branch() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!("skipping an_unresolvable_recorded_base_is_refused: no jj");
+            return;
+        };
+        let base_tip = fx.second.clone();
+
+        let head = inherited_head(
+            &fx.jj,
+            &fx.store,
+            "agent/never-created",
+            Some(ABSENT_COMMIT),
+            "main",
+            |revision| (revision == "main").then(|| base_tip.clone()),
+        );
+
+        assert_ne!(
+            head, ABSENT_COMMIT,
+            "a commit the store cannot produce must never be handed to a job"
+        );
+        assert_eq!(
+            head, fx.second,
+            "the floor is the job's own base branch, resolved live"
+        );
+    }
+
+    /// The same floor carries a job whose parent recorded nothing at all — the
+    /// state every sub-agent task, call, and workflow child is in when its
+    /// parent's row was never written.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_absent_recorded_base_falls_through_to_the_live_base_branch() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!("skipping an_absent_recorded_base_falls_through: no jj");
+            return;
+        };
+        let base_tip = fx.second.clone();
+
+        let head = inherited_head(
+            &fx.jj,
+            &fx.store,
+            "agent/never-created",
+            None,
+            "main",
+            |revision| (revision == "main").then(|| base_tip.clone()),
+        );
+
+        assert_eq!(head, fx.second);
+    }
+
+    // ---- Mode dispatch ---------------------------------------------------
+    //
+    // The ladder above answers "where does an inheriting job start?". These
+    // answer the question one level up: which jobs ask it at all, and what
+    // happens to a job that asks with no lineage to answer from.
+
+    use super::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
+    use crate::execution::step_behavior::StepBehavior;
+
+    /// Plain inheritance: degrades through the ladder when the parent's branch
+    /// cannot be resolved. The strict grade the delegation edge uses is pinned
+    /// beside the node that emits it.
+    fn inherits() -> StepBehavior {
+        StepBehavior {
+            mints_branch: false,
+            inherits_branch: true,
+            requires_parent_head: false,
+        }
+    }
+
+    fn child_request(parent_job_id: Option<&str>) -> CoordinateRequest<'_> {
+        CoordinateRequest {
+            job_id: "child-job",
+            parent_job_id,
+            existing_branch: None,
+            base_ref: "main",
+        }
+    }
+
+    /// A branchless mode is not "no opinion": it puts the job on its base
+    /// branch. That is right for a node authored that way and wrong for a
+    /// delegated task, which is the substance of CAIRN-3309.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_branchless_mode_stays_on_the_base_branch() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!("skipping a_branchless_mode_stays_on_the_base_branch: no jj");
+            return;
+        };
+        create_bookmark_at(&fx.jj, &fx.store, "agent/parent", &fx.first).unwrap();
+        let base_tip = fx.second.clone();
+
+        let (branch, base_commit) = select_job_coordinate(
+            &StepBehavior {
+                mints_branch: false,
+                inherits_branch: false,
+                requires_parent_head: false,
+            },
+            child_request(Some("parent-job")),
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!("a branchless job never reads its parent's coordinate"),
+            || unreachable!("a branchless job mints nothing"),
+            move |revision| (revision == "main").then(|| base_tip.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(branch, None, "the job owns no branch");
+        assert_eq!(
+            base_commit.as_deref(),
+            Some(fx.second.as_str()),
+            "it starts at its base branch, regardless of where any parent's branch sits"
+        );
+    }
+
+    /// Inheritance is a hard requirement, not a preference. A parent whose
+    /// branch is missing leaves nothing to seed from, and the refusal names the
+    /// parent and what it lacks so the broken edge is legible from the message.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_parent_without_a_branch_refuses_the_spawn() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!("skipping a_parent_without_a_branch_refuses_the_spawn: no jj");
+            return;
+        };
+
+        let error = select_job_coordinate(
+            &inherits(),
+            child_request(Some("parent-job")),
+            &fx.jj,
+            &fx.store,
+            |_| {
+                Ok(ParentCoordinate {
+                    branch: None,
+                    recorded_base: Some(fx.first.clone()),
+                })
+            },
+            || unreachable!("an inheriting job mints nothing"),
+            |_| None,
+        )
+        .expect_err("a child with no parent branch must not fall through to base");
+
+        assert!(error.contains("parent job parent-job"), "{error}");
+        assert!(error.contains("no branch"), "{error}");
+        assert!(error.contains("child-job"), "{error}");
+    }
+
+    /// The same refusal one step earlier: a job that inherits but was never
+    /// re-parented has no edge to follow at all.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn missing_lineage_refuses_the_spawn() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!("skipping missing_lineage_refuses_the_spawn: no jj");
+            return;
+        };
+
+        let error = select_job_coordinate(
+            &inherits(),
+            child_request(None),
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!("there is no parent to load"),
+            || unreachable!("an inheriting job mints nothing"),
+            |_| None,
+        )
+        .expect_err("an inheriting job with no parent_job_id must not fall through to base");
+
+        assert!(error.contains("parent_job_id"), "{error}");
+    }
+
+    /// The ladder has no failing rung. With the branch gone, nothing recorded,
+    /// an unresolvable base ref, and a git that answers nothing, it still yields
+    /// a coordinate — jj's always-present root commit. Refusing to start over
+    /// substrate state is what the operator ruling forbids.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn the_ladder_yields_a_coordinate_even_when_every_rung_is_unresolvable() {
+        let Some(fx) = inherit_fixture() else {
+            eprintln!("skipping the_ladder_yields_a_coordinate_even_when_every_rung_fails: no jj");
+            return;
+        };
+
+        let head = inherited_head(
+            &fx.jj,
+            &fx.store,
+            "agent/never-created",
+            Some(ABSENT_COMMIT),
+            "no-such-base-branch",
+            |_| None,
+        );
+
+        assert_eq!(
+            head, "root()",
+            "the ladder degrades to jj's root commit rather than failing the spawn"
+        );
     }
 }

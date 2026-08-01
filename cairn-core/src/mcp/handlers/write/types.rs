@@ -24,9 +24,14 @@ pub(super) struct ChangeReport {
     pub(super) apply_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) target_hashes: Vec<TargetHash>,
+    /// Set only on a report returned for a re-delivered `write` call, naming it
+    /// as such. A replay applies nothing, so the agent is told the report it is
+    /// reading came from the first delivery rather than from this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) replayed: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct AppliedChange {
     pub(super) index: usize,
     pub(super) target: String,
@@ -40,7 +45,7 @@ pub(super) struct AppliedChange {
     pub(super) data: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ChangeFailure {
     pub(super) index: usize,
     pub(super) target: String,
@@ -49,7 +54,7 @@ pub(super) struct ChangeFailure {
     pub(super) error: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct CommitReport {
     pub(super) status: String,
     pub(super) sha: Option<String>,
@@ -132,6 +137,7 @@ pub(super) fn empty_change_report(
         event_uri: None,
         apply_uri: None,
         target_hashes: Vec::new(),
+        replayed: None,
     }
 }
 
@@ -153,6 +159,7 @@ pub(super) fn mode_name(mode: ChangeMode) -> &'static str {
         ChangeMode::Delete => "delete",
         ChangeMode::Rename => "rename",
         ChangeMode::Apply => "apply",
+        ChangeMode::Revert => "revert",
     }
 }
 

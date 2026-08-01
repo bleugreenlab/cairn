@@ -1,7 +1,9 @@
 pub mod auth;
 pub mod build_identity;
 pub mod change_validation;
+pub mod conflict_scaffolding;
 pub mod contract;
+pub mod dev_instance_protocol;
 pub mod executor_protocol;
 pub mod ids;
 pub mod logging;
@@ -11,4 +13,7 @@ pub mod paths;
 pub mod protocol;
 pub mod query;
 pub mod read;
+pub mod run_contract;
+pub mod scratch;
 pub mod uri;
+pub mod write_contract;

@@ -58,7 +58,6 @@ pub(crate) fn store_user_event(
     session_id: &str,
     content: &str,
     now: i32,
-    sequence: i32,
 ) -> Result<(), String> {
     let current_turn = orch.process_state.get_current_turn_id(run_id);
     store_user_event_with_turn(
@@ -67,17 +66,14 @@ pub(crate) fn store_user_event(
         session_id,
         content,
         now,
-        sequence,
         current_turn.as_deref(),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn store_transcript_event_with_turn(
     orch: &Orchestrator,
     run_id: &str,
     session_id: &str,
-    sequence: i32,
     now: i32,
     turn_id: Option<&str>,
     transcript_event: TranscriptEvent,
@@ -92,7 +88,6 @@ fn store_transcript_event_with_turn(
         id: event_id.clone(),
         run_id: run_id.to_string(),
         session_id: Some(session_id.to_string()),
-        sequence,
         timestamp: now,
         event_type: event_type.clone(),
         data: event_data.clone(),
@@ -145,12 +140,9 @@ pub(crate) fn store_user_event_with_turn(
     session_id: &str,
     content: &str,
     now: i32,
-    sequence: i32,
     turn_id: Option<&str>,
 ) -> Result<(), String> {
-    store_user_like_event_with_turn(
-        orch, run_id, session_id, content, now, sequence, turn_id, "user",
-    )
+    store_user_like_event_with_turn(orch, run_id, session_id, content, now, turn_id, "user")
 }
 
 /// Store the cold-resume seed as a `user:seed` event (CAIRN-2534).
@@ -165,7 +157,26 @@ pub(crate) fn store_seed_event_with_turn(
     session_id: &str,
     content: &str,
     now: i32,
-    sequence: i32,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    store_user_like_event_with_turn(orch, run_id, session_id, content, now, turn_id, "user:seed")
+}
+
+/// Store a Cairn-synthesized resume nudge as a `user:continuation` event.
+///
+/// A resume that carries no operator content at all — no message, no queued
+/// follow-up, no attention push — still needs a prompt to wake the agent, and
+/// Cairn writes that prompt itself. Storing it under the namespaced
+/// `user:continuation` type (the `user:seed` pattern) is what keeps every
+/// downstream surface from attributing Cairn's own nudge to the operator: the
+/// transcript projection collapses it to a marker line and the frontend draws
+/// system framing instead of a "You" bubble.
+pub fn store_continuation_event_with_turn(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    content: &str,
+    now: i32,
     turn_id: Option<&str>,
 ) -> Result<(), String> {
     store_user_like_event_with_turn(
@@ -174,15 +185,14 @@ pub(crate) fn store_seed_event_with_turn(
         session_id,
         content,
         now,
-        sequence,
         turn_id,
-        "user:seed",
+        crate::transcripts::CONTINUATION_EVENT_TYPE,
     )
 }
 
-/// Shared storage path for a user-authored transcript event (`user` and its
-/// `user:seed` sibling): resolve the sequence, build the `TranscriptEvent` with
-/// the given `event_type`, and persist it.
+/// Shared storage path for a user-slot transcript event (`user` and its
+/// `user:seed` / `user:continuation` siblings): build the `TranscriptEvent` with
+/// the given `event_type` and persist it.
 #[allow(clippy::too_many_arguments)]
 fn store_user_like_event_with_turn(
     orch: &Orchestrator,
@@ -190,24 +200,9 @@ fn store_user_like_event_with_turn(
     session_id: &str,
     content: &str,
     now: i32,
-    sequence: i32,
     turn_id: Option<&str>,
     event_type: &str,
 ) -> Result<(), String> {
-    let sequence = if sequence >= 0 {
-        sequence
-    } else {
-        let owning = crate::storage::run_db_blocking({
-            let dbs = orch.db.clone();
-            let run_id = run_id.to_string();
-            move || async move {
-                crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        })?;
-        get_next_sequence(owning, run_id)?
-    };
     let transcript_event = TranscriptEvent {
         event_type: event_type.to_string(),
         session_id: Some(session_id.to_string()),
@@ -227,7 +222,6 @@ fn store_user_like_event_with_turn(
         orch,
         run_id,
         session_id,
-        sequence,
         now,
         turn_id,
         transcript_event,
@@ -253,16 +247,6 @@ pub fn store_tool_result_event_with_turn(
     now: i32,
     turn_id: Option<&str>,
 ) -> Result<(), String> {
-    let owning = crate::storage::run_db_blocking({
-        let dbs = orch.db.clone();
-        let run_id = run_id.to_string();
-        move || async move {
-            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    let sequence = get_next_sequence(owning, run_id)?;
     let transcript_event = TranscriptEvent {
         event_type: "tool_result".to_string(),
         session_id: Some(session_id.to_string()),
@@ -282,7 +266,6 @@ pub fn store_tool_result_event_with_turn(
         orch,
         run_id,
         session_id,
-        sequence,
         now,
         turn_id,
         transcript_event,
@@ -303,16 +286,6 @@ pub(crate) fn store_attention_push_event(
     now: i32,
     turn_id: Option<&str>,
 ) -> Result<(), String> {
-    let owning = crate::storage::run_db_blocking({
-        let dbs = orch.db.clone();
-        let run_id = run_id.to_string();
-        move || async move {
-            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    let sequence = get_next_sequence(owning, run_id)?;
     // CAIRN-1891: the carrying event for a resumed-into wake renders through the
     // wake-card formatter; `content` is the structured `{active, catchup}` JSON.
     let transcript_event = TranscriptEvent {
@@ -334,7 +307,6 @@ pub(crate) fn store_attention_push_event(
         orch,
         run_id,
         session_id,
-        sequence,
         now,
         turn_id,
         transcript_event,

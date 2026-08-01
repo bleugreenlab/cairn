@@ -653,6 +653,38 @@ pub async fn read_cursor(db: &LocalDb, recipient: &str, source: &str) -> DbResul
     .await
 }
 
+/// When the parent's read cursor for `source` last advanced — the moment its last
+/// catch-up for that child job was delivered, stamped inside the same transaction
+/// as the carrying event. The catch-up digest anchors "messages since you last
+/// looked" on it (CAIRN-3342). `None` when the parent has never been shown
+/// catch-up for that child.
+pub async fn read_cursor_updated_at(
+    db: &LocalDb,
+    recipient: &str,
+    source: &str,
+) -> DbResult<Option<i64>> {
+    let recipient = recipient.to_string();
+    let source = source.to_string();
+    db.read(|conn| {
+        let recipient = recipient.clone();
+        let source = source.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT updated_at FROM attention_read_cursors
+                     WHERE recipient=?1 AND source=?2 LIMIT 1",
+                    params![recipient.as_str(), source.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(row.i64(0)?)),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+}
+
 /// Distinct chat turns currently recorded across one job's runs — the job-scoped
 /// chat tail, matching exactly what `{node}/chat` renders (the node chat loads
 /// events for that one job's runs). Runs on a caller-supplied connection so the

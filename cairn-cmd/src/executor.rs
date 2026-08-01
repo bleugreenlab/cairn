@@ -32,8 +32,14 @@ pub(crate) enum ExecutorCommand {
         #[arg(long = "ssh-arg", allow_hyphen_values = true)]
         extra_ssh_args: Vec<String>,
     },
-    /// Tear down an executor and revoke its enrollment.
-    Remove { executor_id: String },
+    /// Tear down an executor and revoke its enrollment, by public name.
+    Remove { name: String },
+    /// Give an executor a different public name.
+    ///
+    /// The name is the address every placement request is written in, so this
+    /// moves the configuration, the enrollment claim, and the running executor's
+    /// own advertisement together.
+    Rename { name: String, new_name: String },
     /// List configured remote executors and their live fleet status.
     List,
 }
@@ -73,7 +79,7 @@ struct MutationResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteConfig {
-    executor_id: String,
+    display_name: String,
 }
 
 struct InvokeClient {
@@ -182,16 +188,24 @@ pub(crate) async fn run(command: ExecutorCommand) -> bool {
                 .map(|result| format_mutation("Added", &result))
                 .map_err(|error| ("add", error))
         }
-        ExecutorCommand::Remove { executor_id } => {
+        ExecutorCommand::Remove { name } => {
             eprintln!("Stopping remote executor, verifying cleanup, and revoking enrollment…");
             client
-                .invoke::<MutationResult>(
-                    "remove_remote_executor",
-                    json!({ "executorId": executor_id }),
-                )
+                .invoke::<MutationResult>("remove_remote_executor", json!({ "name": name }))
                 .await
                 .map(|result| format_mutation("Removed", &result))
                 .map_err(|error| ("remove", error))
+        }
+        ExecutorCommand::Rename { name, new_name } => {
+            eprintln!("Moving the executor's public name and restarting supervision…");
+            client
+                .invoke::<MutationResult>(
+                    "rename_remote_executor",
+                    json!({ "name": name, "newName": new_name }),
+                )
+                .await
+                .map(|result| format_mutation("Renamed", &result))
+                .map_err(|error| ("rename", error))
         }
         ExecutorCommand::List => list(&client).await.map_err(|error| ("list", error)),
     };
@@ -216,7 +230,7 @@ fn format_mutation(action: &str, result: &MutationResult) -> String {
     };
     format!(
         "{action} {}: {}{platform}",
-        result.config.executor_id, result.attach_state
+        result.config.display_name, result.attach_state
     )
 }
 
@@ -271,13 +285,10 @@ fn format_list(config: &Value, health: &Value) -> String {
             .and_then(|entry| entry.pointer("/advertisement/capabilities/arch"))
             .and_then(Value::as_str)
             .unwrap_or("-");
-        rows.push(format!("{id}\t{name}\t{target}\t{status}\t{os}/{arch}"));
+        rows.push(format!("{name}\t{target}\t{status}\t{os}/{arch}"));
     }
     rows.sort();
-    format!(
-        "EXECUTOR\tNAME\tSSH TARGET\tSTATUS\tPLATFORM\n{}",
-        rows.join("\n")
-    )
+    format!("NAME\tSSH TARGET\tSTATUS\tPLATFORM\n{}", rows.join("\n"))
 }
 
 #[cfg(test)]
@@ -325,10 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn mutation_confirmation_prints_executor_identity_once() {
+    fn mutation_confirmation_names_the_machine_by_its_public_name() {
         let result = MutationResult {
             config: RemoteConfig {
-                executor_id: "192-168-1-18".into(),
+                display_name: "bglab-win".into(),
             },
             os: Some("windows".into()),
             arch: Some("x86_64".into()),
@@ -337,7 +348,7 @@ mod tests {
 
         assert_eq!(
             format_mutation("Added", &result),
-            "Added 192-168-1-18: ready (windows/x86_64)"
+            "Added bglab-win: ready (windows/x86_64)"
         );
     }
 
@@ -353,9 +364,9 @@ mod tests {
 
     #[test]
     fn list_combines_configuration_with_live_health() {
-        let config = json!({"remoteExecutors":{"linux":{"executorId":"linux","displayName":"Linux","sshUser":"dev","host":"builder"}}});
+        let config = json!({"remoteExecutors":{"linux":{"executorId":"linux","displayName":"bglab-ub","sshUser":"dev","host":"builder"}}});
         let health = json!({"executors":[{"identity":{"executorId":"linux"},"status":"online","advertisement":{"capabilities":{"os":"linux","arch":"x86_64"}}}]});
         let output = format_list(&config, &health);
-        assert!(output.contains("linux\tLinux\tdev@builder\tonline\tlinux/x86_64"));
+        assert!(output.contains("bglab-ub\tdev@builder\tonline\tlinux/x86_64"));
     }
 }

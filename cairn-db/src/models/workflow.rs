@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::agent::OutputSchema;
 
-/// A workflow package as a Settings list/scope row. `worktree` is the manifest's
-/// binding mode serialized as a lowercase string (`"none"` | `"inherit"`).
+/// A workflow package as a Settings list/scope row. `branch` is the manifest's
+/// coordinate policy serialized as a lowercase string (`"none"` | `"inherit"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowConfig {
@@ -24,8 +24,8 @@ pub struct WorkflowConfig {
     pub description: String,
     /// The resolved script entry filename (`main.ts` when the manifest omits it).
     pub script: String,
-    /// Worktree binding: `"none"` (scratch, default) or `"inherit"` (project tree).
-    pub worktree: String,
+    /// Branch policy: `"none"` (default) or `"inherit"` (caller coordinate).
+    pub branch: String,
     /// The args JSON Schema, if the workflow declares one.
     pub args_schema: Option<serde_json::Value>,
     /// The output schema (preset name or inline JSON Schema), if declared.
@@ -63,7 +63,7 @@ pub struct SaveWorkflowConfig {
     pub script: Option<String>,
     /// `"none"` | `"inherit"`; defaults to `"none"` when absent.
     #[serde(default)]
-    pub worktree: Option<String>,
+    pub branch: Option<String>,
     /// The args JSON Schema, or `None` for a workflow that takes no args.
     #[serde(default)]
     pub args_schema: Option<serde_json::Value>,

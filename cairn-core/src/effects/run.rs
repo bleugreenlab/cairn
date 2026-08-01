@@ -155,19 +155,11 @@ pub async fn execute_effects(
                     job_id,
                     node_name,
                     command,
-                    worktree_path,
                     cached_pass,
                     ..
                 } => {
-                    let result = run_checkpoint(
-                        orch,
-                        &job_id,
-                        &node_name,
-                        &command,
-                        &worktree_path,
-                        cached_pass,
-                    )
-                    .await;
+                    let result =
+                        run_checkpoint(orch, &job_id, &node_name, &command, cached_pass).await;
                     effects.extend(reduce_effect_result(result));
                 }
 
@@ -248,7 +240,6 @@ async fn run_checkpoint(
     job_id: &str,
     node_name: &str,
     command: &str,
-    worktree_path: &std::path::Path,
     cached_pass: bool,
 ) -> EffectResult {
     if cached_pass {
@@ -263,25 +254,27 @@ async fn run_checkpoint(
         };
     }
 
-    let worktree_str = worktree_path.to_string_lossy().to_string();
-    let commit_sha = crate::execution::cache::get_current_head_sha(orch, &worktree_str).ok();
-    let output =
-        match crate::execution::conditions::execute_programmatic_checkpoint(&worktree_str, command)
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                // The command could not even be spawned. Record it as a failed run
-                // (exit -1) so the loop treats it like any other failure.
-                log::error!("Programmatic checkpoint '{}' error: {}", node_name, e);
+    let (commit_sha, output) = match crate::execution::conditions::execute_programmatic_checkpoint(
+        orch, job_id, node_name, command,
+    )
+    .await
+    {
+        Ok(result) => (Some(result.coordinate), result.output),
+        Err(e) => {
+            // The command could not even be spawned. Record it as a failed run
+            // (exit -1) so the loop treats it like any other failure.
+            log::error!("Programmatic checkpoint '{}' error: {}", node_name, e);
+            (
+                None,
                 crate::execution::conditions::CheckpointRunOutput {
                     passed: false,
                     exit_code: -1,
                     stdout: String::new(),
                     stderr: e,
-                }
-            }
-        };
+                },
+            )
+        }
+    };
 
     if let Err(e) = crate::execution::checkpoint_runs::record_checkpoint_run(
         orch,
@@ -419,8 +412,7 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
-    use std::path::PathBuf;
+    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
     use std::sync::Arc;
 
     async fn test_orch() -> Orchestrator {
@@ -441,118 +433,15 @@ mod tests {
         Orchestrator::builder(db_state, services, config).build()
     }
 
-    /// Insert a project + job so a recorded checkpoint run satisfies the
-    /// `checkpoint_runs.job_id -> jobs(id)` foreign key.
-    async fn seed_job(orch: &Orchestrator, job_id: &str) {
-        let job_id = job_id.to_string();
-        orch.db
-            .local
-            .write(|conn| {
-                let job_id = job_id.clone();
-                Box::pin(async move {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                         VALUES ('p-run', 'default', 'P', 'PRUN', '/tmp/p', 1, 1)",
-                        (),
-                    )
-                    .await?;
-                    conn.execute(
-                        "INSERT INTO jobs (id, project_id, status, created_at, updated_at)
-                         VALUES (?1, 'p-run', 'running', 1, 1)",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-    }
-
-    async fn recorded_runs(orch: &Orchestrator, job_id: &str) -> i64 {
-        let job_id = job_id.to_string();
-        orch.db
-            .local
-            .read(|conn| {
-                let job_id = job_id.clone();
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT COUNT(*) FROM checkpoint_runs WHERE job_id = ?1",
-                            (job_id.as_str(),),
-                        )
-                        .await?;
-                    rows.next().await?.unwrap().i64(0)
-                })
-            })
-            .await
-            .unwrap()
-    }
-
     #[tokio::test]
     async fn run_checkpoint_cached_pass_returns_complete_true() {
         let orch = test_orch().await;
-        let result = run_checkpoint(
-            &orch,
-            "job-1",
-            "ci-check",
-            "bun run test",
-            &PathBuf::from("/tmp/test"),
-            true,
-        )
-        .await;
+        let result = run_checkpoint(&orch, "job-1", "ci-check", "bun run test", true).await;
 
         assert!(matches!(
             result,
             EffectResult::CheckpointComplete { ref job_id, passed, ref error }
                 if job_id == "job-1" && passed && error.is_none()
         ));
-        // A cached pass does not run the command, so nothing is recorded.
-        assert_eq!(recorded_runs(&orch, "job-1").await, 0);
-    }
-
-    #[tokio::test]
-    async fn run_checkpoint_not_cached_runs_command_and_records() {
-        let orch = test_orch().await;
-        seed_job(&orch, "job-2").await;
-        // "exit 0" should pass on any system.
-        let result = run_checkpoint(
-            &orch,
-            "job-2",
-            "exit-check",
-            "exit 0",
-            &PathBuf::from("/tmp"),
-            false,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            EffectResult::CheckpointComplete { ref job_id, passed, ref error }
-                if job_id == "job-2" && passed && error.is_none()
-        ));
-        assert_eq!(recorded_runs(&orch, "job-2").await, 1);
-    }
-
-    #[tokio::test]
-    async fn run_checkpoint_command_failure_returns_false_and_records() {
-        let orch = test_orch().await;
-        seed_job(&orch, "job-3").await;
-        let result = run_checkpoint(
-            &orch,
-            "job-3",
-            "fail-check",
-            "exit 1",
-            &PathBuf::from("/tmp"),
-            false,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            EffectResult::CheckpointComplete { ref job_id, passed, .. }
-                if job_id == "job-3" && !passed
-        ));
-        assert_eq!(recorded_runs(&orch, "job-3").await, 1);
     }
 }

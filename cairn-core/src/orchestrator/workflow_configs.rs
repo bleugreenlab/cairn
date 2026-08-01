@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::workflows::{self as config_workflows, FileWorkflow, WorkflowWorktreeMode};
+use crate::config::workflows::{self as config_workflows, FileWorkflow, WorkflowBranchMode};
 use crate::config::{slugify, ConfigResult};
 use crate::models::{SaveWorkflowConfig, WorkflowConfig, WorkflowConfigDetail};
 
@@ -35,7 +35,7 @@ fn to_workflow_config(
         name: w.name,
         description: w.description,
         script: w.script,
-        worktree: w.worktree.as_str().to_string(),
+        branch: w.branch.as_str().to_string(),
         args_schema: w.args_schema,
         output: w.output,
         workspace_id,
@@ -127,7 +127,7 @@ impl Orchestrator {
             }
         }
 
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|config| config.name.to_lowercase());
         Ok(out)
     }
 
@@ -184,10 +184,11 @@ impl Orchestrator {
             return Err("Workflow name must produce a non-empty id".to_string());
         }
 
-        let worktree = match input.worktree.as_deref() {
-            None | Some("") => WorkflowWorktreeMode::None,
-            Some(v) => WorkflowWorktreeMode::parse(v)
-                .ok_or_else(|| format!("Invalid worktree mode: {v}"))?,
+        let branch = match input.branch.as_deref() {
+            None | Some("") => WorkflowBranchMode::None,
+            Some(v) => {
+                WorkflowBranchMode::parse(v).ok_or_else(|| format!("Invalid branch mode: {v}"))?
+            }
         };
         let script = input
             .script
@@ -200,7 +201,7 @@ impl Orchestrator {
             name: &input.name,
             description: &input.description,
             script: &script,
-            worktree,
+            branch,
             args_schema: input.args_schema.as_ref(),
             output: input.output.as_ref(),
             script_content: &input.script_content,
@@ -226,7 +227,7 @@ impl Orchestrator {
             name: input.name,
             description: input.description,
             script,
-            worktree: worktree.as_str().to_string(),
+            branch: branch.as_str().to_string(),
             args_schema: input.args_schema,
             output: input.output,
             workspace_id: if is_project {
@@ -467,7 +468,7 @@ mod tests {
                 .join(".cairn")
                 .join("workflows")
                 .join("proj-flow"),
-            "name: Proj Flow\ndescription: project\nworktree: inherit\n",
+            "name: Proj Flow\ndescription: project\nbranch: inherit\n",
         );
 
         let orch = orch_with_project(&config_dir, &project_dir).await;
@@ -480,7 +481,7 @@ mod tests {
         assert!(ws.project_id.is_none());
         let proj = all.iter().find(|w| w.id == "proj-flow").unwrap();
         assert_eq!(proj.project_id.as_deref(), Some("proj1"));
-        assert_eq!(proj.worktree, "inherit");
+        assert_eq!(proj.branch, "inherit");
 
         // Workspace-only filter drops the project package.
         let ws_only = orch.list_workflow_configs(Some("default"), None).unwrap();
@@ -517,7 +518,7 @@ mod tests {
                 name: "My Flow".to_string(),
                 description: "desc".to_string(),
                 script: None,
-                worktree: Some("inherit".to_string()),
+                branch: Some("inherit".to_string()),
                 args_schema: Some(serde_json::json!({
                     "type": "object",
                     "properties": { "topic": { "type": "string" } },
@@ -530,7 +531,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(created.id, "my-flow");
-        assert_eq!(created.worktree, "inherit");
+        assert_eq!(created.branch, "inherit");
 
         // Re-read round-trips manifest + script.
         let detail = orch
@@ -550,7 +551,7 @@ mod tests {
             name: "My Flow".to_string(),
             description: "updated".to_string(),
             script: None,
-            worktree: Some("none".to_string()),
+            branch: Some("none".to_string()),
             args_schema: None,
             output: None,
             script_content: "export {};\n// v2\n".to_string(),
@@ -563,7 +564,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.config.description, "updated");
-        assert_eq!(after.config.worktree, "none");
+        assert_eq!(after.config.branch, "none");
         assert!(after.config.args_schema.is_none());
         assert_eq!(after.script_content, "export {};\n// v2\n");
 
@@ -573,7 +574,7 @@ mod tests {
             name: "My Flow".to_string(),
             description: "x".to_string(),
             script: None,
-            worktree: None,
+            branch: None,
             args_schema: Some(serde_json::json!({ "type": "string", "pattern": "(" })),
             output: None,
             script_content: "x".to_string(),

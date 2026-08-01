@@ -1,92 +1,39 @@
 //! Guarded flatten recovery and sibling reconcile onto an advanced tip.
 use super::*;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManagedWorkspaceReconcileOutcome {
-    Unchanged,
-    AdvancedClean,
-    AdvancedConflicted,
-    PreservedDirty,
-}
-
-/// Read-only optimistic probe used before entering the project-wide store lock.
-/// The full reconciler revalidates after acquisition, so a concurrent advance can
-/// only cause a harmless false negative that seal-time stale recovery catches.
-pub(crate) fn managed_workspace_needs_reconcile(
-    jj: &JjEnv,
-    store: &Path,
-    workspace_path: &Path,
-    branch: &str,
-) -> Result<bool, String> {
-    if branch_has_conflict(jj, store, branch).unwrap_or(true) {
-        return Ok(false);
-    }
-    let Some(tip) = bookmark_commit(jj, store, branch) else {
-        return Ok(false);
-    };
-    let source = format!("{}@", workspace_name_for_branch(branch));
-    let _ = workspace_path;
-    Ok(!revset_descends_from(jj, store, &source, &tip))
-}
-
-/// Bring one managed workspace's working copy into agreement with its bookmark.
-/// The caller must hold the project's owner-tagged jj store lock.
-pub(crate) fn reconcile_managed_workspace(
-    jj: &JjEnv,
-    store: &Path,
-    workspace_path: &Path,
-    branch: &str,
-    pinned_destination_tip: Option<&str>,
-) -> Result<ManagedWorkspaceReconcileOutcome, String> {
-    update_stale(jj, workspace_path)?;
-
-    if is_working_copy_dirty(jj, workspace_path)? {
-        return Ok(ManagedWorkspaceReconcileOutcome::PreservedDirty);
-    }
-
-    let tip = match pinned_destination_tip {
-        Some(tip) => tip.to_string(),
-        None => {
-            // Run/write preflight must preserve the conflicted-branch recovery
-            // boundary: a clean workspace behind a conflicted bookmark stays
-            // untouched so ordinary command preparation cannot materialize the
-            // conflict into `@`. Probe failures are conservative for the same
-            // reason. Pinned base-advance callers intentionally continue because
-            // they own surfacing conflicts recorded by that reconciliation.
-            if branch_has_conflict(jj, store, branch).unwrap_or(true) {
-                return Ok(ManagedWorkspaceReconcileOutcome::Unchanged);
-            }
-            match bookmark_commit(jj, store, branch) {
-                Some(tip) => tip,
-                None => return Ok(ManagedWorkspaceReconcileOutcome::Unchanged),
-            }
-        }
-    };
-    let source = format!("{}@", workspace_name_for_branch(branch));
-    if revset_descends_from(jj, store, &source, &tip) {
-        return Ok(ManagedWorkspaceReconcileOutcome::Unchanged);
-    }
-
-    let conflicted = advance_workspace_onto(jj, store, workspace_path, branch, &tip)?;
-    Ok(if conflicted {
-        ManagedWorkspaceReconcileOutcome::AdvancedConflicted
-    } else {
-        ManagedWorkspaceReconcileOutcome::AdvancedClean
-    })
-}
-
-fn record_failure(
-    report: &mut ReconcileReport,
-    branch: &str,
-    workspace_path: &Path,
-    error: String,
-) {
+fn record_failure(report: &mut ReconcileReport, branch: &str, error: String) {
     report.failed.push(ReconcileFailure {
         branch: branch.to_string(),
-        workspace_path: workspace_path.to_path_buf(),
         error,
     });
+}
+
+/// Record a rolled-back conflicting rebase, carrying the paths captured inside
+/// the rebase out to the notification layer.
+///
+/// The caller MUST `continue` past `classify_reconciled_sibling` after this. That
+/// is load-bearing: the rebase was undone, so the branch is genuinely clean
+/// again, and classification would read it as `Clean`, publish it, and push it —
+/// silently reporting a successful reconcile for a branch that never moved.
+fn record_conflict(report: &mut ReconcileReport, branch: &str, diagnostic: ConflictDiagnostic) {
+    let paths = diagnostic.conflicting_paths();
+    log::warn!(
+        "jj reconcile: {branch} hit a {} against the advanced base; the rebase was rolled back and \
+         the branch is unchanged. Conflicting file(s): {}. The incoming change also carries {} \
+         file(s) that arrive cleanly on retry.",
+        diagnostic.condition.as_str(),
+        if paths.is_empty() {
+            "<none enumerated>".to_string()
+        } else {
+            paths.join(", ")
+        },
+        diagnostic.clean_on_retry_paths().len()
+    );
+    report.conflicted.push(branch.to_string());
+    report
+        .conflict_diagnostics
+        .insert(branch.to_string(), diagnostic);
 }
 
 /// The set of paths a branch changes relative to a dest, plus which of those are
@@ -163,8 +110,10 @@ pub(crate) fn branch_description(jj: &JjEnv, store: &Path, branch: &str) -> Stri
 /// re-export the ref to git. Used to UNDO a [`squash_branch_onto`] when a
 /// post-squash guard in [`flatten_branch_recovery`] refuses the result: the squash
 /// has already moved the bookmark, so without this a rejected flatten would leave
-/// the visible branch rewritten. The git export is best-effort (a stale ref
-/// self-heals on the next seal); the bookmark move is load-bearing and propagated.
+/// the visible branch rewritten. The bookmark move is load-bearing and propagated;
+/// the git export stays best-effort so a ref failure cannot mask the guard failure
+/// that got us here — but it is VERIFIED against `tip`, because a refused export
+/// does not self-heal and would silently leave the git ref on the rejected flatten.
 pub(crate) fn restore_bookmark(
     jj: &JjEnv,
     store: &Path,
@@ -184,7 +133,13 @@ pub(crate) fn restore_bookmark(
         ],
         "flatten: restore bookmark after guard failure",
     )?;
-    let _ = export_git_preserving_checkout(jj, store, true, "flatten: git export after restore");
+    let _ = export_git_verified(
+        jj,
+        store,
+        true,
+        "flatten: git export after restore",
+        &[(branch, tip)],
+    );
     Ok(())
 }
 
@@ -232,6 +187,10 @@ pub(crate) fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result
         &["op", "restore", op_id, "--ignore-working-copy"],
         "jj op restore",
     )?;
+    // The one export with no expectation to name: an op restore rewinds WHOLE-STORE
+    // state, so the set of bookmarks it realigns is not known here and there is no
+    // single (branch, commit) invariant to assert. Every other export site advances
+    // a specific bookmark and passes it.
     export_git_preserving_checkout(jj, store, true, "jj git export (after op restore)")
 }
 
@@ -432,11 +391,12 @@ pub(crate) fn flatten_branch_recovery(
             "flatten: re-point rider bookmark",
         ) {
             Ok(_) => {
-                let _ = export_git_preserving_checkout(
+                let _ = export_git_verified(
                     jj,
                     store,
                     true,
                     "flatten: git export after rider re-point",
+                    &[(rider.as_str(), post_tip.as_str())],
                 );
                 repointed_bookmarks.push(rider);
             }
@@ -546,11 +506,11 @@ pub(crate) fn publish_reconciled_bookmark(
     store: &Path,
     branch: &str,
     origin: OriginPresence,
-) -> Result<(), String> {
+) -> Result<(), StoreBookmarkPushError> {
     if origin == OriginPresence::Absent {
         return Ok(());
     }
-    push_store_bookmark(jj, store, branch)
+    push_store_bookmark_classified(jj, store, branch)
 }
 
 #[derive(Clone, Copy)]
@@ -574,7 +534,6 @@ fn classify_reconciled_sibling(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
-    ws_path: &Path,
     dest_commit: Option<&str>,
     publication: ReconcilePublication,
     report: &mut ReconcileReport,
@@ -593,7 +552,7 @@ fn classify_reconciled_sibling(
                         discover_origin_presence(jj, store),
                     ) {
                         log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
-                        record_failure(report, branch, ws_path, e);
+                        record_failure(report, branch, e.to_string());
                         return;
                     }
                 }
@@ -601,7 +560,7 @@ fn classify_reconciled_sibling(
             }
             Err(e) => {
                 log::warn!("jj reconcile: conflict check for {branch} failed: {e}");
-                record_failure(report, branch, ws_path, e);
+                record_failure(report, branch, e.to_string());
             }
         },
         Some(FlattenState::Clean) => {
@@ -613,7 +572,7 @@ fn classify_reconciled_sibling(
                     discover_origin_presence(jj, store),
                 ) {
                     log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
-                    record_failure(report, branch, ws_path, e);
+                    record_failure(report, branch, e.to_string());
                     return;
                 }
             }
@@ -635,22 +594,6 @@ fn classify_reconciled_sibling(
             };
             match flatten_branch_recovery(jj, store, branch, dest, &message) {
                 Ok(recovered) => {
-                    // Re-parent the sibling's live workspace onto the flattened
-                    // commit so its `@` no longer sits on the abandoned conflicted
-                    // line; this refreshes the on-disk files via update-stale.
-                    if let Err(e) = reconcile_managed_workspace(
-                        jj,
-                        store,
-                        ws_path,
-                        branch,
-                        Some(&recovered.flattened_commit),
-                    ) {
-                        log::warn!(
-                            "jj reconcile: re-parent workspace {branch} onto flattened tip failed: {e}"
-                        );
-                        record_failure(report, branch, ws_path, e);
-                        return;
-                    }
                     // The flatten rewrote the commit id, so the PR head must move
                     // even when a plain clean rebase would have been skipped.
                     if publication.flattened {
@@ -661,7 +604,7 @@ fn classify_reconciled_sibling(
                             discover_origin_presence(jj, store),
                         ) {
                             log::warn!("jj reconcile: push flattened sibling {branch} failed: {e}");
-                            record_failure(report, branch, ws_path, e);
+                            record_failure(report, branch, e.to_string());
                             return;
                         }
                     }
@@ -689,10 +632,16 @@ fn classify_reconciled_sibling(
 /// Stable failure classification consumed by durable reconcile progress. String
 /// matching is quarantined here at the jj adapter boundary; orchestration stores
 /// only this closed vocabulary.
+/// A permanent failure is never retried and never repaired. `conflicted_bookmark`
+/// is deliberately NOT in this set: a conflicted tracked bookmark is a
+/// reconciliation TODO that [`crate::jj::reconcile_tracked_bookmark`] now clears,
+/// so recording it as terminal was the exact shape this system must not have —
+/// runner-owned state failing into a dead end no agent can reach. It is retried
+/// instead, and the next base advance repairs the bookmark on its way through.
 pub(crate) fn reconcile_failure_is_permanent(kind: &str) -> bool {
     matches!(
         kind,
-        "immutable_commit" | "conflicted_bookmark" | "ambiguous_divergence" | "missing_bookmark"
+        "immutable_commit" | "ambiguous_divergence" | "missing_bookmark"
     )
 }
 
@@ -717,25 +666,53 @@ pub(crate) fn reconcile_failure_kind(error: &str) -> &'static str {
     }
 }
 
-/// Reconcile in-flight siblings onto the locally-advanced integration tip: the
-/// store already owns the merge (the child's commit was folded into the
-/// integration bookmark by `merge_into_bookmark`), so there is no fetch or origin
-/// round-trip — each sibling bookmark rebases non-blockingly onto the local
-/// integration bookmark, its workspace refreshes, and a cleanly-rebased sibling
-/// is pushed so its PR head advances on origin. This replaces the git "notify
-/// each sibling to rebase + force-push" tax: conflicts are recorded (not
-/// blocking), change-IDs are preserved, and no force-push is needed.
+/// Rebase one sibling onto the reconcile dest, recording the outcome. Returns
+/// whether the caller should go on to classify the sibling.
 ///
-/// `siblings` pairs each in-flight sibling's bookmark with its workspace dir.
-/// Every step is best-effort per sibling: a failure on one is logged and the
-/// rest proceed. A conflicted sibling is not pushed (and `jj git push` would
-/// refuse it anyway — the self-enforcing backstop). Returns which siblings landed
-/// clean versus conflicted.
+/// `RebasedOverConflictedAncestry` deliberately continues to classification: that
+/// is the clean-tip / conflicted-intermediate shape, and
+/// [`classify_reconciled_sibling`] heals it with the guarded flatten, which is
+/// the whole reason the branch had to be moved onto its dest first.
+fn rebase_sibling(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    integration_branch: &str,
+    report: &mut ReconcileReport,
+) -> bool {
+    match rebase_branch_onto(jj, store, branch, integration_branch) {
+        Ok(RebaseOutcome::Rebased) => true,
+        Ok(RebaseOutcome::RebasedOverConflictedAncestry { paths }) => {
+            log::info!(
+                "jj reconcile: {branch} rebased clean-tip over conflicted history ({}); handing it \
+                 to flatten recovery",
+                if paths.is_empty() {
+                    "<none enumerated>".to_string()
+                } else {
+                    paths.join(", ")
+                }
+            );
+            true
+        }
+        Ok(RebaseOutcome::Conflicted { diagnostic }) => {
+            record_conflict(report, branch, diagnostic);
+            false
+        }
+        Err(error) => {
+            log::warn!("jj reconcile: rebase {branch} onto {integration_branch} failed: {error}");
+            record_failure(report, branch, error);
+            false
+        }
+    }
+}
+
+/// Reconcile runner-owned sibling bookmarks onto the locally advanced integration
+/// tip. Graph advancement never reads, refreshes, or follows a workspace.
 pub fn reconcile_siblings(
     jj: &JjEnv,
     store: &Path,
     integration_branch: &str,
-    siblings: &[(String, PathBuf)],
+    siblings: &[String],
 ) -> Result<ReconcileReport, String> {
     reconcile_siblings_with_publication(jj, store, integration_branch, siblings, true)
 }
@@ -744,7 +721,7 @@ pub(crate) fn reconcile_siblings_without_publication(
     jj: &JjEnv,
     store: &Path,
     integration_branch: &str,
-    siblings: &[(String, PathBuf)],
+    siblings: &[String],
 ) -> Result<ReconcileReport, String> {
     reconcile_siblings_with_publication(jj, store, integration_branch, siblings, false)
 }
@@ -753,7 +730,7 @@ fn reconcile_siblings_with_publication(
     jj: &JjEnv,
     store: &Path,
     integration_branch: &str,
-    siblings: &[(String, PathBuf)],
+    siblings: &[String],
     publish: bool,
 ) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
@@ -794,14 +771,14 @@ fn reconcile_siblings_with_publication(
             "jj reconcile: rebase dest {integration_branch} carries a conflict; holding {} sibling(s) off the conflicted base",
             siblings.len()
         );
-        report.held = siblings.iter().map(|(branch, _)| branch.clone()).collect();
+        report.held = siblings.to_vec();
         return Ok(report);
     }
 
     // Missing-bookmark siblings are filtered upstream in `reconcile_base_advance`
     // (one store-wide bookmark list before ANY per-sibling jj work), so every
     // sibling reaching this loop has a live bookmark. See `retain_present_siblings`.
-    for (branch, ws_path) in siblings {
+    for branch in siblings {
         let already_on_dest = dest_commit
             .as_deref()
             .map(|dest| branch_descends_from(jj, store, branch, dest))
@@ -814,57 +791,29 @@ fn reconcile_siblings_with_publication(
                 if branch_is_ancestor_of(jj, store, branch, dest) {
                     if let Err(error) = fast_forward_bookmark(jj, store, branch, dest) {
                         log::warn!("jj reconcile: fast-forward {branch} to {dest} failed: {error}");
-                        record_failure(&mut report, branch, ws_path, error);
+                        record_failure(&mut report, branch, error);
                         continue;
                     }
                     push_clean = false;
                     trivial_fast_forward = true;
-                } else if let Err(error) = rebase_branch_onto(jj, store, branch, integration_branch)
-                {
-                    log::warn!(
-                        "jj reconcile: rebase {branch} onto {integration_branch} failed: {error}"
-                    );
-                    record_failure(&mut report, branch, ws_path, error);
+                } else if !rebase_sibling(jj, store, branch, integration_branch, &mut report) {
                     continue;
                 }
-            } else if let Err(error) = rebase_branch_onto(jj, store, branch, integration_branch) {
-                log::warn!(
-                    "jj reconcile: rebase {branch} onto {integration_branch} failed: {error}"
-                );
-                record_failure(&mut report, branch, ws_path, error);
+            } else if !rebase_sibling(jj, store, branch, integration_branch, &mut report) {
                 continue;
             }
         }
 
-        let workspace_outcome =
-            match reconcile_managed_workspace(jj, store, ws_path, branch, dest_commit.as_deref()) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    log::warn!(
-                        "jj reconcile: managed workspace {} failed: {error}",
-                        ws_path.display()
-                    );
-                    record_failure(&mut report, branch, ws_path, error);
-                    continue;
-                }
-            };
-
-        if workspace_outcome == ManagedWorkspaceReconcileOutcome::AdvancedConflicted {
-            report.conflicted.push(branch.clone());
-            continue;
-        }
         if trivial_fast_forward {
             report.rebased_clean.push(branch.clone());
             report.silent.push(branch.clone());
             continue;
         }
 
-        let clean_len = report.rebased_clean.len();
         classify_reconciled_sibling(
             jj,
             store,
             branch,
-            ws_path,
             dest_commit.as_deref(),
             ReconcilePublication {
                 clean: push_clean && publish,
@@ -872,82 +821,6 @@ fn reconcile_siblings_with_publication(
             },
             &mut report,
         );
-        if workspace_outcome == ManagedWorkspaceReconcileOutcome::PreservedDirty
-            && report.rebased_clean.len() > clean_len
-        {
-            report.rebased_clean.retain(|candidate| candidate != branch);
-            report.preserved_dirty.push(branch.clone());
-        }
     }
     Ok(report)
-}
-
-/// Advance an active workspace that sits ON `dest`'s branch (a Coordinator on its
-/// integration bookmark) after that bookmark was folded forward out from under
-/// the workspace's working copy. The sibling auto-rebase ([`reconcile_siblings`])
-/// only touches workspaces branched *from* the branch; the workspace *on* the
-/// branch has its `@` re-parented onto the new tip here, then its on-disk files
-/// refreshed — the jj-native form of the old git "post-merge fast-forward of
-/// active worktrees".
-///
-/// Store-driven for consistency with [`reconcile_siblings`]: `jj rebase -s
-/// <name>@ -o <dest>` over the store re-parents the workspace's working-copy
-/// commit (`<name>` is [`workspace_name_for_branch`]), then [`update_stale`]
-/// materializes the new files (and any conflict markers) on disk.
-/// `--ignore-working-copy` because the rebase is driven from the store, not the
-/// workspace. Idempotent: when `@` already sits on `dest`, jj reports "Nothing
-/// changed" and this is a no-op, so it is safe under the merge/webhook
-/// double-fire.
-///
-/// Guaranteed-safe by the forward-only fold: a successful `merge_into_bookmark`
-/// means the new tip is a descendant of the prior integration bookmark, hence of
-/// every coordinator seal, so re-parenting the coordinator's empty/idle `@` onto
-/// it never drops coordinator work.
-///
-/// Returns whether the re-parent recorded a conflict (non-blocking: jj
-/// materializes it for the agent rather than failing). A Coordinator's `@` is
-/// empty/idle, so re-parenting it never conflicts in practice; the signal exists
-/// so a caller can wake a workspace that somehow lands on a conflicted `@` rather
-/// than leaving it idle there.
-pub(crate) fn advance_workspace_onto(
-    jj: &JjEnv,
-    store: &Path,
-    ws_path: &Path,
-    ws_branch: &str,
-    dest: &str,
-) -> Result<bool, String> {
-    // Skip a workspace whose directory is gone: the rebase drives from the store,
-    // but `update_stale` (and the conflict check below) operate inside `ws_path`,
-    // so a missing workspace can only fail. A base advance that still lists a
-    // long-reclaimed on-branch workspace would otherwise spawn a doomed rebase.
-    if !ws_path.exists() {
-        log::debug!(
-            "jj advance: workspace {} no longer exists; skipping",
-            ws_path.display()
-        );
-        return Ok(false);
-    }
-    let source = format!("{}@", workspace_name_for_branch(ws_branch));
-    // Idempotent skip: when `@` already descends from `dest`, a re-rebase would
-    // re-rewrite the working-copy commit (and could mint a divergent copy under
-    // the merge/webhook double-fire). `dest` here is a concrete commit id
-    // (resolved by the caller via `bookmark_commit`). Nothing to move, no
-    // conflict to surface — report a clean no-op.
-    if revset_descends_from(jj, store, &source, dest) {
-        return Ok(false);
-    }
-    jj.run(
-        store,
-        &["rebase", "-s", &source, "-o", dest, "--ignore-working-copy"],
-        "jj rebase (advance workspace onto branch tip)",
-    )?;
-    // Refresh the live workspace: the rebase rewrote its `@` out from under it.
-    update_stale(jj, ws_path)?;
-    // A conflict from the re-parent lands in the rewritten working-copy commit.
-    let out = jj.run(
-        ws_path,
-        &["log", "-r", "@", "--no-graph", "-T", "self.conflict()"],
-        "jj advance conflict check",
-    )?;
-    Ok(out.contains("true"))
 }

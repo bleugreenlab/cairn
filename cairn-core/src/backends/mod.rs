@@ -19,10 +19,13 @@
 //! disallowed lists.
 
 pub mod claude;
+mod claude_transcript;
 pub mod claude_usage;
 pub mod codex;
 pub mod context_window;
 mod http_loop;
+pub mod ollama;
+mod openai_compat;
 pub mod openrouter;
 mod run_state;
 pub mod stdin;
@@ -71,6 +74,44 @@ impl SessionStart {
             SessionStart::Fork {
                 source_backend_id, ..
             } => Some(source_backend_id),
+            _ => None,
+        }
+    }
+
+    /// The provider-side conversation this start replays, if any: a resume
+    /// continues its own, a fork replays its source's. A new session replays
+    /// nothing.
+    pub fn replayed_backend_id(&self) -> Option<&str> {
+        self.backend_id().or_else(|| self.source_backend_id())
+    }
+}
+
+/// A backend-diagnosed failure the lifecycle layer reacts to structurally.
+///
+/// Recorded on the run as `runs.exit_reason` before finalization, so the
+/// reaction reads a typed fact rather than re-parsing provider CLI text. The
+/// only layer that matches provider wording is the backend that emitted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendFailure {
+    /// The backend could not resolve the native conversation handle it was
+    /// asked to resume. Cairn's own transcript is intact; only the
+    /// provider-side conversation is unreachable.
+    SessionUnresolvable,
+}
+
+impl BackendFailure {
+    /// The token written to `runs.exit_reason`.
+    pub fn exit_reason(self) -> &'static str {
+        match self {
+            BackendFailure::SessionUnresolvable => "session_unresolvable",
+        }
+    }
+
+    /// Inverse of [`BackendFailure::exit_reason`]. Returns `None` for the exit
+    /// reasons written by other paths (`capacity_retry`, `turn_failed`, …).
+    pub fn from_exit_reason(value: &str) -> Option<Self> {
+        match value {
+            "session_unresolvable" => Some(BackendFailure::SessionUnresolvable),
             _ => None,
         }
     }
@@ -218,8 +259,12 @@ pub struct SessionConfig {
     pub(crate) run_id: String,
     /// Working directory for the agent process
     pub(crate) working_dir: String,
-    /// The user prompt to send
+    /// Independently established owning project authority for durable resources.
+    pub(crate) project_id: String,
+    pub(crate) project_key: String,
+    /// The user prompt to send, including any natively delivered images.
     pub(crate) prompt: String,
+    pub(crate) message_content: crate::agent_process::stdin::MessageContent,
     /// Agent role instructions (injected as system prompt content)
     pub(crate) system_prompt_content: Option<String>,
     /// The trailing per-run dynamic suffix of `system_prompt_content` (the
@@ -352,7 +397,7 @@ pub trait AgentBackend: Send + Sync {
     fn send_user_message(
         &self,
         stdin: &mut dyn BackendStdin,
-        content: &str,
+        content: &crate::agent_process::stdin::MessageContent,
         session_id: &str,
         parent_tool_use_id: Option<&str>,
         working_dir: Option<&str>,
@@ -378,6 +423,7 @@ pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
     match name {
         Some("codex") => Box::new(codex::CodexBackend),
         Some("openrouter") => Box::new(openrouter::OpenRouterBackend),
+        Some("ollama") => Box::new(ollama::OllamaBackend),
         _ => Box::new(claude::ClaudeBackend),
     }
 }
@@ -394,6 +440,8 @@ const CODEX_MODEL_PREFIXES: &[&str] = &["codex-mini", "gpt-5"];
 /// for legacy data (snapshots, concrete model strings not yet migrated to tiers).
 pub(crate) fn backend_for_model(model: &str) -> Option<&'static str> {
     let lower = model.to_lowercase();
+    // Legacy inference cannot distinguish slash-containing Ollama tags (for
+    // example hf.co/user/model). Atomic { backend, model } selections bypass it.
     if lower == "openrouter/auto" || lower.starts_with('~') || lower.contains('/') {
         return Some("openrouter");
     }
@@ -403,6 +451,34 @@ pub(crate) fn backend_for_model(model: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod backend_failure_tests {
+    use super::BackendFailure;
+
+    #[test]
+    fn exit_reason_round_trips() {
+        let failure = BackendFailure::SessionUnresolvable;
+        assert_eq!(failure.exit_reason(), "session_unresolvable");
+        assert_eq!(
+            BackendFailure::from_exit_reason(failure.exit_reason()),
+            Some(failure)
+        );
+    }
+
+    #[test]
+    fn existing_exit_reasons_are_not_backend_failures() {
+        // `runs.exit_reason` is a shared column; the tokens other paths write
+        // must never be read back as a backend diagnosis.
+        for reason in ["capacity_retry", "turn_failed", "", "session unresolvable"] {
+            assert_eq!(
+                BackendFailure::from_exit_reason(reason),
+                None,
+                "{reason:?} must not decode as a backend failure"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -558,7 +634,7 @@ pub(crate) mod tests {
             fn send_user_message(
                 &self,
                 _: &mut dyn BackendStdin,
-                _: &str,
+                _: &crate::agent_process::stdin::MessageContent,
                 _: &str,
                 _: Option<&str>,
                 _: Option<&str>,
@@ -623,7 +699,7 @@ pub(crate) mod tests {
             fn send_user_message(
                 &self,
                 _: &mut dyn BackendStdin,
-                _: &str,
+                _: &crate::agent_process::stdin::MessageContent,
                 _: &str,
                 _: Option<&str>,
                 _: Option<&str>,

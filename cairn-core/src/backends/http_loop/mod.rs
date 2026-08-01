@@ -46,7 +46,6 @@ use crate::orchestrator::session::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
-use crate::transcripts::stream_store::get_next_sequence;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::any::Any;
@@ -145,6 +144,12 @@ pub(in crate::backends) struct Generation<M> {
 /// monomorphized over the adapter (no `dyn`), and the adapter converts its wire
 /// types to the neutral [`Generation`]/[`TurnToolCall`]/[`TurnUsage`] at this
 /// boundary so no wire DTO ever reaches the loop.
+
+#[derive(Debug, Clone)]
+pub(in crate::backends) struct Connection {
+    pub(in crate::backends) api_key: Option<String>,
+}
+
 pub(in crate::backends) trait WireAdapter {
     /// The adapter's own conversation-message type (OpenRouter: `ChatMessage`).
     type Message: Clone + Send;
@@ -159,8 +164,8 @@ pub(in crate::backends) trait WireAdapter {
     /// Fallback model id when the session carries none.
     fn default_model(&self) -> &'static str;
 
-    /// The configured API key, or `None` when the provider is unauthenticated.
-    fn api_key(&self, orch: &Orchestrator) -> Option<String>;
+    /// Resolve provider connection details and own any missing-configuration error.
+    fn connection(&self, orch: &Orchestrator) -> Result<Connection, String>;
 
     /// Build the outgoing message array (system + prior transcript + new user).
     fn build_conversation(
@@ -189,14 +194,13 @@ pub(in crate::backends) trait WireAdapter {
         &self,
         orch: &Orchestrator,
         run_db: &Arc<LocalDb>,
-        api_key: &str,
+        connection: &Connection,
         model: &str,
         session_id: &str,
         outgoing: &[Self::Message],
         config: &SessionConfig,
         run_id: &str,
         turn_id: Option<&str>,
-        sequence: i32,
         cancel: &Arc<AtomicBool>,
     ) -> Result<Generation<Self::Message>, String>;
 
@@ -248,20 +252,9 @@ where
     let session_id = config.session_start.session_id().to_string();
     let backend_key = adapter.backend_key();
     let backend_name = adapter.backend_name();
-    let api_key = match adapter.api_key(orch) {
-        Some(key) => key,
-        None => {
-            insert_error_event(
-                orch,
-                &config.run_id,
-                Some(&session_id),
-                &format!(
-                    "{backend_name} API key not configured. Add an {backend_name} API key in Settings → Providers."
-                ),
-            );
-            return Err(format!("Missing {backend_name} API key"));
-        }
-    };
+    let connection = adapter.connection(orch).inspect_err(|error| {
+        insert_error_event(orch, &config.run_id, Some(&session_id), error);
+    })?;
 
     let workspace_instructions = crate::workspace::instructions::read_workspace_instructions();
     let project_instructions = crate::workspace::instructions::read_project_instructions(
@@ -286,7 +279,7 @@ where
         }
     };
 
-    let initial_sequence = if matches!(
+    if matches!(
         config.session_start,
         SessionStart::New { .. } | SessionStart::Fork { .. }
     ) {
@@ -296,10 +289,8 @@ where
             Some(&session_id),
             backend_key,
             &prompt_segments,
-        )
-    } else {
-        get_next_sequence(run_db.clone(), &config.run_id).unwrap_or(0)
-    };
+        );
+    }
     // Flatten the same segments that were (or would be) persisted. Each HTTP turn
     // re-sends the whole message array with no server-side system-prompt
     // retention, so the full harness contract (Cairn prompt + workspace + agent +
@@ -330,8 +321,11 @@ where
         // process, so foreground questions and inline delegated tasks suspend the
         // turn rather than inline-waiting. The blocking handlers key off this flag.
         handle.owns_turn_loop = true;
-        if let Ok(mut processes) = orch.process_state.processes.lock() {
-            processes.register(config.run_id.clone(), handle);
+        if let Err(error) = orch
+            .process_state
+            .register_process(config.run_id.clone(), handle)
+        {
+            log::warn!("Failed to register {backend_name} run handle: {error}");
         }
     }
 
@@ -350,9 +344,8 @@ where
                 &orch_clone,
                 run_db,
                 config,
-                api_key,
+                connection,
                 session_id,
-                initial_sequence,
                 None,
                 cancel,
                 system_prompt,
@@ -393,9 +386,8 @@ fn run_http_turn<A: WireAdapter>(
     orch: &Orchestrator,
     run_db: Arc<LocalDb>,
     config: SessionConfig,
-    api_key: String,
+    connection: Connection,
     session_id: String,
-    mut sequence: i32,
     turn_id: Option<String>,
     cancel: Arc<AtomicBool>,
     system_prompt: String,
@@ -432,14 +424,13 @@ fn run_http_turn<A: WireAdapter>(
         let generation = adapter.post_generation(
             orch,
             &run_db,
-            &api_key,
+            &connection,
             &model,
             &session_id,
             &outgoing,
             &config,
             &config.run_id,
             turn_id.as_deref(),
-            sequence,
             &cancel,
         )?;
         drop(outgoing);
@@ -508,26 +499,22 @@ fn run_http_turn<A: WireAdapter>(
         }
 
         if tool_calls.is_empty() {
-            if !assistant_text.is_empty() {
-                if streamed_text {
-                    sequence += 1;
-                } else {
-                    store_assistant_message(
-                        orch,
-                        &run_db,
-                        &config.run_id,
-                        &session_id,
-                        turn_id.as_deref(),
-                        sequence,
-                        &assistant_text,
-                        usage.as_ref(),
-                        generation_id.as_deref(),
-                        response_model.as_deref(),
-                        exact_cost,
-                        backend_key,
-                    )?;
-                    sequence += 1;
-                }
+            // Streamed text already landed as a finalized stream event; only an
+            // unstreamed generation still needs its assistant event written.
+            if !assistant_text.is_empty() && !streamed_text {
+                store_assistant_message(
+                    orch,
+                    &run_db,
+                    &config.run_id,
+                    &session_id,
+                    turn_id.as_deref(),
+                    &assistant_text,
+                    usage.as_ref(),
+                    generation_id.as_deref(),
+                    response_model.as_deref(),
+                    exact_cost,
+                    backend_key,
+                )?;
             }
             store_success_result(
                 orch,
@@ -535,7 +522,6 @@ fn run_http_turn<A: WireAdapter>(
                 &config.run_id,
                 &session_id,
                 turn_id.as_deref(),
-                sequence,
                 usage.as_ref(),
                 generation_id.as_deref(),
                 response_model.as_deref(),
@@ -579,7 +565,6 @@ fn run_http_turn<A: WireAdapter>(
         }
 
         let tool_call_text = if streamed_text {
-            sequence += 1;
             ""
         } else {
             assistant_text.as_str()
@@ -590,7 +575,6 @@ fn run_http_turn<A: WireAdapter>(
             &config.run_id,
             &session_id,
             turn_id.as_deref(),
-            sequence,
             tool_call_text,
             &tool_calls,
             tool_call_usage(streamed_text, usage.as_ref()),
@@ -599,7 +583,6 @@ fn run_http_turn<A: WireAdapter>(
             reasoning_details.as_ref(),
             backend_key,
         )?;
-        sequence += 1;
 
         let mut suspend: Option<(usize, SuspendKind)> = None;
         for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -622,12 +605,10 @@ fn run_http_turn<A: WireAdapter>(
                 &config.run_id,
                 &session_id,
                 turn_id.as_deref(),
-                sequence,
                 &tool_call.id,
                 &result,
                 backend_key,
             )?;
-            sequence += 1;
             conversation.push(adapter.render_tool_result_message(&tool_call.id, result));
         }
 
@@ -648,12 +629,10 @@ fn run_http_turn<A: WireAdapter>(
                     &config.run_id,
                     &session_id,
                     turn_id.as_deref(),
-                    sequence,
                     &tool_call.id,
                     &placeholder,
                     backend_key,
                 )?;
-                sequence += 1;
             }
             return finalize_suspended(orch, &config.run_id, kind);
         }
@@ -673,7 +652,6 @@ fn run_http_turn<A: WireAdapter>(
                 &config.run_id,
                 &session_id,
                 turn_id.as_deref(),
-                sequence,
                 usage.as_ref(),
                 generation_id.as_deref(),
                 response_model.as_deref(),
@@ -698,7 +676,6 @@ fn run_http_turn<A: WireAdapter>(
         &config.run_id,
         &session_id,
         turn_id.as_deref(),
-        sequence,
         &format!(
             "Reached the per-turn tool-iteration budget ({MAX_TOOL_ITERATIONS}); finalizing this turn."
         ),
@@ -708,14 +685,12 @@ fn run_http_turn<A: WireAdapter>(
         exact_cost,
         backend_key,
     )?;
-    sequence += 1;
     store_success_result(
         orch,
         &run_db,
         &config.run_id,
         &session_id,
         turn_id.as_deref(),
-        sequence,
         None,
         None,
         None,

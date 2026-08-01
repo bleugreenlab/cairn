@@ -58,18 +58,75 @@ const MESSAGE_CHARS: usize = 240;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParsedCheckResult {
+    /// Version of the canonical per-test JSON contract.
+    #[serde(default = "current_result_schema_version")]
+    pub(crate) schema_version: u32,
+    /// Whether the producer enumerated the complete selected test manifest.
+    #[serde(default)]
+    pub(crate) complete: bool,
+    /// `full`, `filtered`, `empty`, or `unknown`.
+    #[serde(default = "unknown_selection")]
+    pub(crate) selection: String,
+    /// Final result for every selected test when `complete` is true.
+    #[serde(default)]
+    pub(crate) tests: Vec<CheckTestResult>,
+    /// Self-skips lacking manifest or environment authority.
+    #[serde(default)]
+    pub(crate) undeclared_skips: usize,
     /// Which runner produced this: `"nextest"`, `"vitest"`, or `"tsc"`.
     pub(crate) parser: String,
     /// Passing test count. `0` for tsc, which has no test concept.
     pub(crate) passed: usize,
     /// Failing test / error count (the runner's own tally when available).
     pub(crate) failed: usize,
+    /// Suites that failed as a whole without any test failing: a vitest file
+    /// that could not be COLLECTED (unresolved import, `vi.mock` hoisting error,
+    /// throwing top-level). Such a file runs no test, so it contributes nothing
+    /// to `failed` even though it fails the run — leaving a red check with
+    /// nothing named. Zero for runners that have no separate collection phase.
+    #[serde(default)]
+    pub(crate) suite_failures: usize,
     /// Skipped / ignored / todo test count.
     pub(crate) skipped: usize,
     /// The failing tests, in report order. This is the substrate future
     /// baseline/delta work compares across trees, so `name` is a stable
     /// identifier.
     pub(crate) failures: Vec<CheckFailure>,
+}
+
+fn current_result_schema_version() -> u32 {
+    1
+}
+
+fn unknown_selection() -> String {
+    "unknown".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CheckTestResult {
+    pub(crate) id: String,
+    pub(crate) status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) duration_ms: Option<u64>,
+    #[serde(default = "one_attempt")]
+    pub(crate) attempts: u32,
+    #[serde(default)]
+    pub(crate) retried: bool,
+    #[serde(default)]
+    pub(crate) flaky: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) skip_declaration: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) skip_declaration_source: Option<String>,
+}
+
+fn one_attempt() -> u32 {
+    1
 }
 
 impl ParsedCheckResult {
@@ -118,6 +175,10 @@ enum ParserKind {
 /// Detect the runner family from the command string. Returns `None` for a
 /// command with no recognized runner, so the check degrades to exit-code +
 /// raw-tail behavior.
+pub(crate) fn is_vitest_command(command: &str) -> bool {
+    detect_parser(command) == Some(ParserKind::Vitest)
+}
+
 fn detect_parser(command: &str) -> Option<ParserKind> {
     if command.contains("nextest")
         || command.contains("cargo test")
@@ -144,10 +205,62 @@ pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCh
     let kind = detect_parser(command)?;
     let clean = strip_ansi(output);
     match kind {
-        ParserKind::Rust => parse_rust(&clean),
+        ParserKind::Rust => parse_structured_artifact(&clean).or_else(|| parse_rust(&clean)),
         ParserKind::Vitest => parse_vitest(&clean),
         ParserKind::Tsc => parse_tsc(&clean),
     }
+}
+
+const RESULT_ARTIFACT_JSON_MARKER: &str = "CAIRN_CHECK_RESULT_JSON=";
+
+fn parse_structured_artifact(clean: &str) -> Option<ParsedCheckResult> {
+    let json = clean
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(RESULT_ARTIFACT_JSON_MARKER))?
+        .to_string();
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    if value.get("schemaVersion")?.as_u64()? != 1 || value.get("parser")?.as_str()? != "nextest" {
+        return None;
+    }
+    let tests: Vec<CheckTestResult> = serde_json::from_value(value.get("tests")?.clone()).ok()?;
+    let passed = tests.iter().filter(|test| test.status == "passed").count();
+    let failed = tests.iter().filter(|test| test.status == "failed").count();
+    let skipped = tests.iter().filter(|test| test.status == "skipped").count();
+    let failures = tests
+        .iter()
+        .filter(|test| test.status == "failed")
+        .map(|test| CheckFailure {
+            name: test.id.clone(),
+            message: test
+                .failure_message
+                .clone()
+                .map(|message| cap_chars(first_line(&message), MESSAGE_CHARS)),
+        })
+        .collect();
+    Some(ParsedCheckResult {
+        schema_version: 1,
+        complete: value
+            .get("complete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        selection: value
+            .get("selection")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        tests,
+        undeclared_skips: value
+            .get("undeclaredSkips")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
+        parser: "nextest".to_string(),
+        passed,
+        failed,
+        skipped,
+        suite_failures: 0,
+        failures,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -176,10 +289,16 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
     // passing typecheck), and a failing exit with no matched errors still
     // records structured emptiness so callers fall back to the raw tail.
     Some(ParsedCheckResult {
+        schema_version: 1,
+        complete: false,
+        selection: "unknown".to_string(),
+        tests: vec![],
+        undeclared_skips: 0,
         parser: "tsc".to_string(),
         passed: 0,
         failed: failures.len(),
         skipped: 0,
+        suite_failures: 0,
         failures,
     })
 }
@@ -205,41 +324,135 @@ fn parse_vitest(clean: &str) -> Option<ParsedCheckResult> {
     let failed = count("numFailedTests") as usize;
     let skipped = (count("numPendingTests") + count("numTodoTests")) as usize;
 
+    let empty = Vec::new();
+    let files = value
+        .get("testResults")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    // Vitest reports each file by absolute path, which on a check run is rooted
+    // in an ephemeral build slot. Strip the deepest directory every reported file
+    // shares so a suite name is legible and identical across trees.
+    let root = common_dir_prefix(files.iter().filter_map(|f| f.get("name")?.as_str()));
+
     let mut failures = Vec::new();
-    if let Some(files) = value.get("testResults").and_then(|v| v.as_array()) {
-        for file in files {
-            let Some(assertions) = file.get("assertionResults").and_then(|v| v.as_array()) else {
-                continue;
+    let mut tests = Vec::new();
+    let mut suite_failures = 0usize;
+    for file in files {
+        let mut assertion_failed = false;
+        for a in file
+            .get("assertionResults")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty)
+        {
+            let status = a
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let name = a
+                .get("fullName")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| a.get("title").and_then(|v| v.as_str()))
+                .unwrap_or("<unknown test>")
+                .to_string();
+            let message = a
+                .get("failureMessages")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|m| m.as_str())
+                .map(|m| cap_chars(first_line(m), MESSAGE_CHARS));
+            let canonical_status = match status {
+                "passed" => "passed",
+                "failed" => "failed",
+                "pending" | "todo" | "skipped" => "skipped",
+                _ => continue,
             };
-            for a in assertions {
-                if a.get("status").and_then(|v| v.as_str()) != Some("failed") {
-                    continue;
-                }
-                let name = a
-                    .get("fullName")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| a.get("title").and_then(|v| v.as_str()))
-                    .unwrap_or("<unknown test>")
-                    .to_string();
-                let message = a
-                    .get("failureMessages")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|m| m.as_str())
-                    .map(|m| cap_chars(first_line(m), MESSAGE_CHARS));
+            tests.push(CheckTestResult {
+                id: name.clone(),
+                status: canonical_status.to_string(),
+                duration_ms: a.get("duration").and_then(|v| v.as_u64()),
+                attempts: 1,
+                retried: false,
+                flaky: false,
+                failure_message: message.clone(),
+                skip_reason: None,
+                skip_declaration: None,
+                skip_declaration_source: None,
+            });
+            if status == "failed" {
+                assertion_failed = true;
                 failures.push(CheckFailure { name, message });
             }
+        }
+
+        // A file that failed while no assertion in it did never got as far as
+        // running a test: collection threw. Vitest tallies that only in
+        // `numFailedTestSuites` and puts the reason in the file's own `message`,
+        // so reading `numFailedTests` alone yields a red check with zero named
+        // failures. Record the file as the failure site it is.
+        if !assertion_failed && file.get("status").and_then(|v| v.as_str()) == Some("failed") {
+            suite_failures += 1;
+            let name = file
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| strip_root(n, &root))
+                .unwrap_or_else(|| "<unknown suite>".to_string());
+            let message = file
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|m| strip_root(m, &root))
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| cap_chars(first_line(&m), MESSAGE_CHARS));
+            failures.push(CheckFailure { name, message });
         }
     }
 
     Some(ParsedCheckResult {
+        schema_version: 1,
+        complete: tests.len() == passed + failed + skipped,
+        selection: "unknown".to_string(),
+        tests,
+        undeclared_skips: 0,
         parser: "vitest".to_string(),
         passed,
         failed,
         skipped,
+        suite_failures,
         failures,
     })
+}
+
+/// The deepest directory shared by every path in `paths`, without a trailing
+/// slash, or `""` when they share none. Each path's own file name is excluded, so
+/// a single path yields its parent directory and reduces to a bare basename.
+fn common_dir_prefix<'a>(paths: impl Iterator<Item = &'a str>) -> String {
+    let mut common: Option<Vec<&str>> = None;
+    for path in paths {
+        let mut segments: Vec<&str> = path.split('/').collect();
+        segments.pop();
+        common = Some(match common {
+            None => segments,
+            Some(previous) => previous
+                .into_iter()
+                .zip(segments)
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect(),
+        });
+    }
+    common
+        .map(|segments| segments.join("/"))
+        .unwrap_or_default()
+}
+
+/// Rewrite every occurrence of `root/` in `s` away, so both a suite's path and
+/// the paths quoted inside its error message read relative to the run root.
+fn strip_root(s: &str, root: &str) -> String {
+    if root.is_empty() {
+        return s.to_string();
+    }
+    s.replace(&format!("{root}/"), "")
 }
 
 // ---------------------------------------------------------------------------
@@ -321,10 +534,16 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
     }
 
     Some(ParsedCheckResult {
+        schema_version: 1,
+        complete: false,
+        selection: "unknown".to_string(),
+        tests: vec![],
+        undeclared_skips: 0,
         parser: "nextest".to_string(),
         passed: grab(&COUNT_PASSED),
         failed: grab(&COUNT_FAILED),
         skipped: grab(&COUNT_SKIPPED),
+        suite_failures: 0,
         failures,
     })
 }
@@ -408,12 +627,18 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
     }
 
     Some(ParsedCheckResult {
+        schema_version: 1,
+        complete: false,
+        selection: "unknown".to_string(),
+        tests: vec![],
+        undeclared_skips: 0,
         // `nextest` is the persisted label for the whole Rust test-runner family,
         // including the wrapper's cargo-test fallback.
         parser: "nextest".to_string(),
         passed,
         failed,
         skipped: ignored,
+        suite_failures: 0,
         failures,
     })
 }
@@ -637,11 +862,124 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
         assert_eq!(r.failures[1].name, "top level fail");
     }
 
+    /// A faithful reduction of the JSON Vitest emits when one file fails to
+    /// COLLECT: `numFailedTestSuites` counts it, `numFailedTests` does not, and
+    /// the reason lives on the file entry rather than on any assertion. Paths are
+    /// absolute and rooted in the ephemeral build slot the check ran in.
+    const VITEST_SUITE_FAILURE_FIXTURE: &str = concat!(
+        "{\"numTotalTestSuites\":2,\"numFailedTestSuites\":1,\"numPassedTests\":881,",
+        "\"numFailedTests\":0,\"numPendingTests\":0,\"numTodoTests\":0,\"success\":false,",
+        "\"testResults\":[",
+        "{\"name\":\"/slots/slot-178/src/components/FileTabView.test.tsx\",",
+        "\"status\":\"failed\",\"assertionResults\":[],",
+        "\"message\":\"Error: Cannot find module '../../packages/ui/src/lib/readableMarkdown' ",
+        "imported from '/slots/slot-178/src/components/FileTabView.test.tsx'\\n  at load\"},",
+        "{\"name\":\"/slots/slot-178/packages/ui/src/types.test.ts\",",
+        "\"status\":\"passed\",\"assertionResults\":[",
+        "{\"status\":\"passed\",\"fullName\":\"STATUS_COLORS maps complete\"}]}]}"
+    );
+
+    #[test]
+    fn vitest_counts_a_suite_that_failed_to_collect() {
+        let r = parse_check_output(
+            "bunx vitest run --reporter=json",
+            VITEST_SUITE_FAILURE_FIXTURE,
+        )
+        .unwrap();
+        // The run failed, but not one assertion did: without the suite tally this
+        // parse is indistinguishable from a clean pass.
+        assert_eq!(r.failed, 0);
+        assert_eq!(r.suite_failures, 1);
+        assert_eq!(r.failures.len(), 1);
+        // The build-slot root is stripped, so the name is the repo-relative path
+        // rather than a path into a directory that no longer exists.
+        assert_eq!(r.failures[0].name, "src/components/FileTabView.test.tsx");
+        let message = r.failures[0].message.as_deref().unwrap();
+        assert!(
+            message.contains("Cannot find module '../../packages/ui/src/lib/readableMarkdown'"),
+            "the collection error is the whole explanation: {message}"
+        );
+        assert!(
+            message.contains("imported from 'src/components/FileTabView.test.tsx'"),
+            "paths quoted inside the message are stripped too: {message}"
+        );
+    }
+
+    #[test]
+    fn vitest_leaves_suite_failures_at_zero_when_every_file_collected() {
+        let r = parse_check_output("bunx vitest run --reporter=json", VITEST_FIXTURE).unwrap();
+        assert_eq!(r.suite_failures, 0);
+    }
+
+    #[test]
+    fn common_dir_prefix_reduces_a_lone_path_to_its_basename() {
+        // A narrow `vitest related` selection can report a single file, where the
+        // deepest shared directory is that file's own parent.
+        assert_eq!(
+            common_dir_prefix(["/slots/slot-1/src/a.test.ts"].into_iter()),
+            "/slots/slot-1/src"
+        );
+        assert_eq!(
+            common_dir_prefix(
+                [
+                    "/slots/slot-1/src/a.test.ts",
+                    "/slots/slot-1/packages/b.test.ts"
+                ]
+                .into_iter()
+            ),
+            "/slots/slot-1"
+        );
+        assert_eq!(common_dir_prefix([].into_iter()), "");
+        // Nothing shared: leave the paths alone rather than mangling them.
+        assert_eq!(
+            common_dir_prefix(["/a/x.test.ts", "/b/y.test.ts"].into_iter()),
+            ""
+        );
+    }
+
     #[test]
     fn vitest_without_json_blob_degrades_to_none() {
         // A vitest command whose output carries no JSON object (reporter absent)
         // parses to nothing — the caller degrades to the raw tail, never a pass.
         assert!(parse_check_output("bunx vitest run", " FAIL  a.test.ts\n").is_none());
+    }
+
+    #[test]
+    fn parses_versioned_nextest_artifact_as_canonical_per_test_result() {
+        let json = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":1,"tests":[{"id":"crate test::passes","status":"passed","durationMs":12,"attempts":1,"retried":false,"flaky":false},{"id":"crate test::flaky","status":"passed","attempts":2,"retried":true,"flaky":true},{"id":"crate test::fails","status":"failed","attempts":1,"retried":false,"flaky":false,"failureMessage":"panic: expected true"},{"id":"crate test::skip","status":"skipped","attempts":1,"retried":false,"flaky":false,"skipReason":"worktree-fence","skipDeclaration":"undeclared"}]}"#;
+        let output = format!("human output\n{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
+        let parsed = parse_check_output("bun run test:rust", &output).unwrap();
+        assert_eq!(parsed.schema_version, 1);
+        assert!(parsed.complete);
+        assert_eq!(parsed.selection, "full");
+        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (2, 1, 1));
+        assert_eq!(parsed.undeclared_skips, 1);
+        assert_eq!(parsed.tests.len(), 4);
+        assert!(parsed.tests[1].flaky);
+        assert_eq!(parsed.failures[0].name, "crate test::fails");
+        assert_eq!(
+            parsed.failures[0].message.as_deref(),
+            Some("panic: expected true")
+        );
+    }
+
+    #[test]
+    fn parses_transferred_nextest_artifact_without_executor_filesystem_access() {
+        let json = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"filtered","undeclaredSkips":0,"tests":[{"id":"crate test::remote","status":"passed","attempts":1,"retried":false,"flaky":false}]}"#;
+        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
+        let parsed = parse_check_output("bun run test:rust", &output).unwrap();
+        assert!(parsed.complete);
+        assert_eq!(parsed.selection, "filtered");
+        assert_eq!(parsed.tests[0].id, "crate test::remote");
+        assert_eq!(parsed.passed, 1);
+    }
+
+    #[test]
+    fn malformed_transferred_artifact_fails_closed_without_reading_path() {
+        let output = format!(
+            "CAIRN_CHECK_RESULT_ARTIFACT=/etc/hosts\n{RESULT_ARTIFACT_JSON_MARKER}{{not-json}}\n"
+        );
+        assert!(parse_structured_artifact(&output).is_none());
     }
 
     #[test]
@@ -723,10 +1061,16 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
     #[test]
     fn format_failure_names_caps_and_counts() {
         let parsed = ParsedCheckResult {
+            schema_version: 1,
+            complete: false,
+            selection: "unknown".to_string(),
+            tests: vec![],
+            undeclared_skips: 0,
             parser: "tsc".to_string(),
             passed: 0,
             failed: 8,
             skipped: 0,
+            suite_failures: 0,
             failures: (0..8)
                 .map(|i| CheckFailure {
                     name: format!("f{i}"),
@@ -743,10 +1087,16 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
     #[test]
     fn format_failure_names_empty_is_none() {
         let parsed = ParsedCheckResult {
+            schema_version: 1,
+            complete: false,
+            selection: "unknown".to_string(),
+            tests: vec![],
+            undeclared_skips: 0,
             parser: "nextest".to_string(),
             passed: 3,
             failed: 0,
             skipped: 0,
+            suite_failures: 0,
             failures: vec![],
         };
         assert!(format_failure_names(&parsed).is_none());
@@ -756,10 +1106,16 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
     fn excerpt_prefers_messages_then_raw_tail() {
         // vitest/tsc: composed name: message lines.
         let with_msgs = ParsedCheckResult {
+            schema_version: 1,
+            complete: false,
+            selection: "unknown".to_string(),
+            tests: vec![],
+            undeclared_skips: 0,
             parser: "vitest".to_string(),
             passed: 0,
             failed: 1,
             skipped: 0,
+            suite_failures: 0,
             failures: vec![CheckFailure {
                 name: "suite test".to_string(),
                 message: Some("AssertionError: boom".to_string()),
@@ -770,10 +1126,16 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
 
         // nextest (no messages): raw tail.
         let no_msgs = ParsedCheckResult {
+            schema_version: 1,
+            complete: false,
+            selection: "unknown".to_string(),
+            tests: vec![],
+            undeclared_skips: 0,
             parser: "nextest".to_string(),
             passed: 0,
             failed: 1,
             skipped: 0,
+            suite_failures: 0,
             failures: vec![CheckFailure {
                 name: "crate test::x".to_string(),
                 message: None,

@@ -489,7 +489,6 @@ async fn fire_scheduled_recipe(
         None,
         None,
         None,
-        None,
     )
     .await?;
 
@@ -498,6 +497,7 @@ async fn fire_scheduled_recipe(
         &outcome.issue_id,
         Some(&recipe.id),
         &recipe.project_id,
+        None,
         None,
         None,
         TriggerType::Schedule,

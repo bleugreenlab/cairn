@@ -546,6 +546,7 @@ mod tests {
         use crate::models::{NodePosition, RecipeNode, RecipeTrigger, TriggerConfig};
 
         Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
             id: "r1".to_string(),
             name: "Test".to_string(),
             description: None,

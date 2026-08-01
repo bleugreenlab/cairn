@@ -150,21 +150,20 @@ fn init_git_repo(path: &std::path::Path) {
 async fn seed_change_run(
     db: &LocalDb,
     project_id: &str,
-    worktree: &Path,
+    _worktree: &Path,
     branch: &str,
     base_commit: &str,
 ) {
     let snapshot = json!({"agent_configs": []}).to_string();
     db.write(|conn| {
         let project_id = project_id.to_string();
-        let worktree = worktree.display().to_string();
         let branch = branch.to_string();
         let base_commit = base_commit.to_string();
         let snapshot = snapshot.clone();
         Box::pin(async move {
             conn.execute("INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at) VALUES ('issue-change', ?1, 1, 'Change', 'active', 1, 1)", params![project_id.as_str()]).await?;
             conn.execute("INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot, triggered_by) VALUES ('exec-change', 'recipe-1', 'issue-change', ?1, 'running', 1, 1, ?2, 'manual')", params![project_id.as_str(), snapshot.as_str()]).await?;
-            conn.execute("INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, node_name, status, uri_segment, worktree_path, branch, base_commit, created_at, updated_at) VALUES ('job-change', 'exec-change', 'agent-1', 'issue-change', ?1, 'builder', 'running', 'builder', ?2, ?3, ?4, 1, 1)", params![project_id.as_str(), worktree.as_str(), branch.as_str(), base_commit.as_str()]).await?;
+            conn.execute("INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, node_name, status, uri_segment, branch, base_commit, created_at, updated_at) VALUES ('job-change', 'exec-change', 'agent-1', 'issue-change', ?1, 'builder', 'running', 'builder', ?2, ?3, 1, 1)", params![project_id.as_str(), branch.as_str(), base_commit.as_str()]).await?;
             conn.execute("INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode) VALUES ('run-change', ?1, 'issue-change', 'job-change', 'live', 1, 1, 'resume')", params![project_id.as_str()]).await?;
             Ok(())
         })
@@ -202,10 +201,11 @@ fn assert_successful_change(report: &serde_json::Value, applied_count: usize) {
 
 struct ChangeTestRepo {
     dir: tempfile::TempDir,
-    _project: tempfile::TempDir,
+    project: tempfile::TempDir,
     _origin: tempfile::TempDir,
     config: tempfile::TempDir,
     orch: Orchestrator,
+    project_id: String,
 }
 
 impl ChangeTestRepo {
@@ -248,24 +248,45 @@ impl ChangeTestRepo {
             &base_commit,
         )
         .await;
-        let identity = jj::WorkspaceIdentity::new(
-            "job-change",
-            "job-change",
-            &project_id,
-            project.path().to_path_buf(),
-            dir.path().to_path_buf(),
-            branch,
-            jj::workspace_name_for_branch(branch),
-            &base_commit,
-        );
-        jj::write_workspace_identity(dir.path(), &identity).unwrap();
         Some(Self {
             dir,
-            _project: project,
+            project,
             _origin: origin,
             config,
             orch,
+            project_id,
         })
+    }
+
+    /// Put an open, remote pull request on this branch, which is what makes
+    /// publication to origin mandatory rather than deferred.
+    async fn open_remote_pr_on_branch(&self) {
+        self.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO merge_requests
+                 (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at, github_pr_number)
+                 VALUES ('mr-chg', 'job-chg', ?1, 'PR', 'agent/CHG-1-builder-0', 'main', 'open', 0, 1, 1, 4242)",
+                cairn_db::turso::params![self.project_id.clone()],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Point `origin` at nothing, so the required push fails while the commit
+    /// itself still lands. The remote stays *configured*, so this is a genuine
+    /// publication failure rather than the benign no-remote case.
+    fn break_origin(&self) {
+        let output = std::process::Command::new("git")
+            .args(["remote", "set-url", "origin", "/nonexistent/origin.git"])
+            .current_dir(self.project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "breaking origin failed: {output:?}"
+        );
     }
 
     /// Seal the current working copy into a base commit, so a later delete or
@@ -335,9 +356,40 @@ impl ChangeTestRepo {
         parse_report(&handle_write(&self.orch, &request).await)
     }
 
+    /// Drive `handle_write` carrying an explicit `tool_use_id`, the correlation
+    /// key a replayed delivery of the same tool call arrives under.
+    async fn change_report_as_tool_use(
+        &self,
+        tool_use_id: &str,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut request = make_request(self.cwd(), payload);
+        request.run_id = Some("run-change".to_string());
+        request.tool_use_id = Some(tool_use_id.to_string());
+        parse_report(&handle_write(&self.orch, &request).await)
+    }
+
     async fn preview_report(&self, payload: serde_json::Value) -> serde_json::Value {
         parse_report(&handle_write(&self.orch, &make_preview_request(self.cwd(), payload)).await)
     }
+}
+
+/// The incident shape: a patch that inserts a block *before* an anchor and
+/// re-emits the anchor verbatim inside `new_string`. Such a patch is not
+/// idempotent — after it applies its `old_string` is still present, so a second
+/// delivery matches again, inserts a second copy, and reports success.
+fn anchor_preserving_insertion(commit_msg: &str) -> serde_json::Value {
+    json!({
+        "changes": [{
+            "target": "file:contracts.rs",
+            "mode": "patch",
+            "payload": {
+                "old_string": "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {",
+                "new_string": "pub const PROJECT_IMAGES_CONTRACT: Contract = Contract {\n    name: \"images\",\n};\n\npub const PROJECT_IMAGE_CONTRACT: Contract = Contract {"
+            }
+        }],
+        "commit_msg": commit_msg
+    })
 }
 
 fn seed_bad_good_files(repo: &ChangeTestRepo) {
@@ -415,6 +467,105 @@ async fn change_unified_patch_adds_file_with_codex_envelope() {
     assert_eq!(repo.read("src/new.rs"), "pub fn new() {}");
 }
 
+/// A file body carrying a real conflict, as an agent mid-resolution would send
+/// it if it forgot to finish.
+const MARKER_BODY: &str =
+    "fn main() {\n<<<<<<< HEAD\n    ours();\n=======\n    theirs();\n>>>>>>> main\n}\n";
+
+/// The durable boundary CAIRN-3197 now guards at the ordinary write carrier:
+/// content containing conflict markers cannot become a commit. The refusal is
+/// whole-batch — the marker file is not published, and neither is its clean
+/// sibling, because half a resolution is not a landable state.
+#[tokio::test]
+async fn change_refuses_to_commit_content_carrying_conflict_markers() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:src/main.rs", "mode": "create", "payload": { "content": MARKER_BODY } },
+                { "target": "file:src/other.rs", "mode": "create", "payload": { "content": "fn other() {}\n" } }
+            ],
+            "commit_msg": "resolve conflict"
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    let error = report["failures"][0]["error"].as_str().unwrap();
+    assert!(error.contains("conflict markers"), "{error}");
+    assert!(
+        error.contains("src/main.rs") && error.contains("2:<<<<<<<"),
+        "the refusal names the file and the line: {error}"
+    );
+    assert!(
+        error.contains("conflict_markers_reason"),
+        "the refusal names its escape: {error}"
+    );
+    assert_eq!(
+        report["commit"]["status"].as_str().unwrap(),
+        "failed",
+        "{report:?}"
+    );
+}
+
+/// The false-positive case the guard must not punish: literal markers in a
+/// document, committed on an explicit written reason. The default is refusal, so
+/// the same batch that fails above succeeds here purely because it explained
+/// itself.
+#[tokio::test]
+async fn change_commits_literal_markers_with_an_explicit_reason() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:docs/conflicts.md", "mode": "create", "payload": { "content": MARKER_BODY } }
+            ],
+            "commit_msg": "document marker syntax",
+            "conflict_markers_reason": "documenting Git conflict-marker syntax"
+        }))
+        .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("docs/conflicts.md").trim_end(),
+        MARKER_BODY.trim_end()
+    );
+}
+
+/// An all-whitespace reason is no reason at all. The escape is audited, so it
+/// has to actually say something; anything else is a silent boolean bypass
+/// wearing a string's clothes.
+#[tokio::test]
+async fn change_treats_a_blank_marker_reason_as_no_reason() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:a.rs", "mode": "create", "payload": { "content": MARKER_BODY } }
+            ],
+            "commit_msg": "sneak it through",
+            "conflict_markers_reason": "   "
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert!(report["failures"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("conflict markers"));
+}
+
 #[tokio::test]
 async fn change_unified_patch_requires_commit_msg_for_file_targets() {
     let dir = tempfile::tempdir().unwrap();
@@ -474,9 +625,7 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
         eprintln!("skipping: jj not resolvable");
         return;
     };
-    common::create_project(&repo.orch.db.local, "MCP").await;
-
-    let request = make_request(
+    let mut request = make_request(
         repo.cwd(),
         json!({
             "changes": [
@@ -486,7 +635,7 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
                     "payload": { "patch": "*** Begin Patch\n*** Add File: mixed.rs\n+mixed();\n*** End Patch\n" }
                 },
                 {
-                    "target": "cairn://p/MCP/messages",
+                    "target": "cairn://p/CHG/messages",
                     "mode": "append",
                     "payload": { "content": "Unified patch landed" }
                 }
@@ -494,6 +643,7 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
             "commit_msg": "mixed batch"
         }),
     );
+    request.run_id = Some("run-change".to_string());
 
     let report = parse_report(&handle_write(&repo.orch, &request).await);
 
@@ -503,7 +653,7 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
     assert_eq!(
         count_rows(
             &repo.orch.db.local,
-            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'MCP' AND content = 'Unified patch landed'"
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND content = 'Unified patch landed'"
         )
         .await,
         1
@@ -1299,4 +1449,426 @@ async fn change_unified_patch_updates_file_with_codex_envelope() {
 
     assert_successful_change(&report, 1);
     assert_eq!(repo.read("lib.rs"), "let x = 2;\n");
+}
+
+// ---------------------------------------------------------------------------
+// Write replay (the edit-echo)
+//
+// A single `handle_write` cannot double-apply: it snapshots the logical head,
+// computes whole-file replacement content, and publishes under a compare-and-swap
+// inside one store-lock epoch. The echo comes from a *second delivery* of the
+// same tool call — a socket that fired while the host went on to land the
+// commit, a provider-level retry, anything that re-issues the payload. These
+// tests pin the guard that makes the second delivery a no-op.
+// ---------------------------------------------------------------------------
+
+/// PHASE 1 REPRODUCTION, now the guard's headline test. Two byte-identical
+/// deliveries of one anchor-preserving insertion under the same `tool_use_id`
+/// apply once. Without the guard the second delivery matches the re-emitted
+/// anchor and inserts a second copy, which is exactly the CAIRN-3242 incident.
+#[tokio::test]
+async fn an_anchor_preserving_insertion_is_not_applied_twice_by_a_replay() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "contracts.rs",
+        "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {\n    name: \"image\",\n};\n",
+    );
+
+    let first = repo
+        .change_report_as_tool_use(
+            "toolu_echo",
+            anchor_preserving_insertion("add images contract"),
+        )
+        .await;
+    assert_successful_change(&first, 1);
+
+    let replay = repo
+        .change_report_as_tool_use(
+            "toolu_echo",
+            anchor_preserving_insertion("add images contract"),
+        )
+        .await;
+    assert_successful_change(&replay, 1);
+
+    let landed = repo.read("contracts.rs");
+    assert_eq!(
+        landed.matches("PROJECT_IMAGES_CONTRACT").count(),
+        1,
+        "a replayed insertion must land one copy, not two: {landed}"
+    );
+}
+
+/// The replay returns the first delivery's report verbatim, so the agent that
+/// re-issued the call sees the same commit it already acted on rather than a
+/// second sha for a commit that never happened.
+#[tokio::test]
+async fn a_replayed_write_applies_once_and_returns_the_first_report() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "tail\n");
+
+    let payload = json!({
+        "changes": [{
+            "target": "file:notes.txt",
+            "mode": "patch",
+            "payload": { "old_string": "tail", "new_string": "head\ntail" }
+        }],
+        "commit_msg": "prepend head"
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_same", payload.clone())
+        .await;
+    assert_successful_change(&first, 1);
+    let replay = repo.change_report_as_tool_use("toolu_same", payload).await;
+
+    assert_eq!(
+        replay["commit"]["sha"], first["commit"]["sha"],
+        "the replay must report the commit the first delivery landed: {replay:?}"
+    );
+    assert_eq!(repo.read("notes.txt"), "head\ntail\n");
+}
+
+/// The replay ledger claims its row inside the store lock, BEFORE the
+/// publication ladder's remaining rungs have run. So the report it records says
+/// `committed` even when the export or the required origin push then fails and
+/// the call actually answers `sealed locally; unpublished`.
+///
+/// A redelivery must not be handed that stale success. The row is deliberately
+/// immutable to competing deliveries, so if the claiming delivery does not
+/// correct it, nothing ever will, and the agent is told a head nobody outside
+/// Cairn can see has been published — the exact inversion the fail-closed
+/// publication contract exists to prevent.
+#[tokio::test]
+async fn a_write_whose_publication_failed_is_not_replayed_as_committed() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "tail\n");
+    repo.open_remote_pr_on_branch().await;
+    repo.break_origin();
+
+    let payload = json!({
+        "changes": [{
+            "target": "file:notes.txt",
+            "mode": "patch",
+            "payload": { "old_string": "tail", "new_string": "head\ntail" }
+        }],
+        "commit_msg": "prepend head"
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_unpublished", payload.clone())
+        .await;
+    assert_eq!(
+        first["commit"]["status"], "sealed locally; unpublished",
+        "a commit whose required push failed must not report as committed: {first:?}"
+    );
+
+    let replay = repo
+        .change_report_as_tool_use("toolu_unpublished", payload)
+        .await;
+    assert_eq!(
+        replay["commit"]["status"], "sealed locally; unpublished",
+        "the redelivery must be answered with what actually happened: {replay:?}"
+    );
+    assert_eq!(
+        replay["commit"]["sha"], first["commit"]["sha"],
+        "and with the commit the first delivery landed, not a second one"
+    );
+    assert_eq!(
+        repo.read("notes.txt"),
+        "head\ntail\n",
+        "the redelivery must still not re-apply the patch"
+    );
+}
+
+/// The guard keys on the tool call, not on the payload: a genuine second edit
+/// the agent meant to make carries its own `tool_use_id` and must still apply.
+#[tokio::test]
+async fn distinct_tool_use_ids_still_apply_independently() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "contracts.rs",
+        "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {\n    name: \"image\",\n};\n",
+    );
+
+    let first = repo
+        .change_report_as_tool_use("toolu_one", anchor_preserving_insertion("first insert"))
+        .await;
+    assert_successful_change(&first, 1);
+    let second = repo
+        .change_report_as_tool_use("toolu_two", anchor_preserving_insertion("second insert"))
+        .await;
+    assert_successful_change(&second, 1);
+
+    let landed = repo.read("contracts.rs");
+    assert_eq!(
+        landed.matches("PROJECT_IMAGES_CONTRACT").count(),
+        2,
+        "distinct tool calls are distinct edits: {landed}"
+    );
+    assert_ne!(first["commit"]["sha"], second["commit"]["sha"]);
+}
+
+/// A delivery with no `tool_use_id` cannot be correlated to a prior one, so it
+/// applies as it always has rather than being keyed under an invented identity.
+#[tokio::test]
+async fn a_write_without_a_tool_use_id_applies_as_today() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "contracts.rs",
+        "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {\n    name: \"image\",\n};\n",
+    );
+
+    assert_successful_change(
+        &repo
+            .change_report(anchor_preserving_insertion("unkeyed first"))
+            .await,
+        1,
+    );
+    assert_successful_change(
+        &repo
+            .change_report(anchor_preserving_insertion("unkeyed second"))
+            .await,
+        1,
+    );
+
+    let landed = repo.read("contracts.rs");
+    assert_eq!(
+        landed.matches("PROJECT_IMAGES_CONTRACT").count(),
+        2,
+        "an unkeyed write is not deduplicated: {landed}"
+    );
+}
+
+/// Resource-only writes claim replay identity before dispatch, so a transport
+/// redelivery returns the settled first report without appending twice.
+#[tokio::test]
+async fn a_resource_only_write_is_deduplicated_by_the_replay_guard() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let payload = json!({
+        "changes": [{
+            "target": "cairn://p/CHG/messages",
+            "mode": "append",
+            "payload": { "content": "a message" }
+        }]
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_res", payload.clone())
+        .await;
+    let second = repo.change_report_as_tool_use("toolu_res", payload).await;
+
+    assert_successful_change(&first, 1);
+    assert!(second["replayed"].is_string(), "{second:?}");
+    assert_eq!(second["applied"], first["applied"]);
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND content = 'a message'"
+        )
+        .await,
+        1,
+        "the redelivery must not append a second message"
+    );
+}
+
+/// A settled failure is replayed as the same failure. It is not treated as an
+/// empty claim that permits another pass through a partially effectful batch.
+#[tokio::test]
+async fn a_failed_resource_only_write_replays_its_failure() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let payload = json!({
+        "atomic": true,
+        "changes": [{
+            "target": "cairn://p/MISSING/messages",
+            "mode": "append",
+            "payload": { "content": "never appended" }
+        }]
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_resource_failure", payload.clone())
+        .await;
+    let replay = repo
+        .change_report_as_tool_use("toolu_resource_failure", payload)
+        .await;
+
+    assert_eq!(failure_count(&first), 1, "{first:?}");
+    assert!(replay["replayed"].is_string(), "{replay:?}");
+    assert_eq!(replay["failures"], first["failures"]);
+}
+
+fn revert_payload(commit: &str) -> serde_json::Value {
+    json!({
+        "changes": [{
+            "target": "file:",
+            "mode": "revert",
+            "payload": { "commit": commit }
+        }],
+        "commit_msg": "revert selected change"
+    })
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn handler_revert_preserves_disjoint_work_reports_paths_and_records_ledger() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let selected = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:selected.txt", "mode": "create", "payload": { "content": "selected\n" } },
+                { "target": "file:also-selected.txt", "mode": "create", "payload": { "content": "also\n" } }
+            ],
+            "commit_msg": "selected change"
+        }))
+        .await;
+    assert_successful_change(&selected, 2);
+    let selected_sha = selected["commit"]["sha"].as_str().unwrap();
+
+    let later = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:later.txt",
+                "mode": "create",
+                "payload": { "content": "later\n" }
+            }],
+            "commit_msg": "disjoint later change"
+        }))
+        .await;
+    assert_successful_change(&later, 1);
+
+    let reverted = repo
+        .change_report_as_tool_use("toolu_revert_success", revert_payload(selected_sha))
+        .await;
+    assert_successful_change(&reverted, 1);
+    assert_eq!(reverted["applied"][0]["mode"], "revert");
+    assert_eq!(reverted["applied"][0]["target"], "file:");
+    assert_eq!(
+        reverted["applied"][0]["summary"],
+        format!("Reverted {selected_sha} (2 paths)")
+    );
+    assert!(!repo.logical_exists("selected.txt"));
+    assert!(!repo.logical_exists("also-selected.txt"));
+    assert_eq!(repo.read("later.txt"), "later\n");
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change' AND status = 'deleted' AND file_path IN ('selected.txt', 'also-selected.txt') AND additions = 0 AND deletions = 1"
+        )
+        .await,
+        2,
+        "the handler must ledger the inverse changes, not the original additions"
+    );
+
+    let replay = repo
+        .change_report_as_tool_use("toolu_revert_success", revert_payload(selected_sha))
+        .await;
+    assert!(replay["replayed"].is_string(), "{replay:?}");
+    assert_eq!(replay["commit"]["sha"], reverted["commit"]["sha"]);
+    assert_eq!(replay["applied"], reverted["applied"]);
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change' AND status = 'deleted' AND file_path IN ('selected.txt', 'also-selected.txt')"
+        )
+        .await,
+        2,
+        "a replayed revert must not duplicate the file-change ledger"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn handler_revert_overlap_failure_leaves_head_and_ledger_unchanged() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let selected = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:shared.txt",
+                "mode": "create",
+                "payload": { "content": "selected\n" }
+            }],
+            "commit_msg": "selected change"
+        }))
+        .await;
+    let selected_sha = selected["commit"]["sha"].as_str().unwrap();
+    let later = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:shared.txt",
+                "mode": "replace",
+                "payload": { "content": "later\n" }
+            }],
+            "commit_msg": "overlapping later change"
+        }))
+        .await;
+    assert_successful_change(&later, 1);
+    let ledger_before = count_rows(
+        &repo.orch.db.local,
+        "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change'",
+    )
+    .await;
+
+    let failed = repo
+        .change_report_as_tool_use("toolu_revert_overlap", revert_payload(selected_sha))
+        .await;
+    assert_eq!(failure_count(&failed), 1, "{failed:?}");
+    assert!(
+        failed["failures"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps later edits at: shared.txt"),
+        "{failed:?}"
+    );
+    assert_eq!(failed["applied"], json!([]), "{failed:?}");
+    assert!(failed.get("partial_success").is_none(), "{failed:?}");
+    assert!(failed.get("commit").is_none(), "{failed:?}");
+    assert_eq!(repo.read("shared.txt"), "later\n");
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change'",
+        )
+        .await,
+        ledger_before
+    );
+
+    let retry = repo
+        .change_report_as_tool_use("toolu_revert_overlap", revert_payload(selected_sha))
+        .await;
+    assert_eq!(retry["failures"], failed["failures"]);
+    assert!(
+        retry.get("replayed").is_none(),
+        "failed file writes remain retryable"
+    );
+    assert_eq!(retry["applied"], json!([]), "{retry:?}");
+    assert_eq!(repo.read("shared.txt"), "later\n");
 }

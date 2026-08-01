@@ -30,13 +30,20 @@ pub(crate) use review_push::detach_onto_runtime;
 pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_review_checks_on_startup,
 };
+#[cfg(test)]
+pub(crate) use stop::USER_STOP_TOOL_RESULT;
 pub use stop::{
     kill_session, kill_session_with_reason, live_run_id_for_job, stop_active_turn_for_run,
-    stop_call, stop_job, stop_session, stop_workflow, suspend_run_for_durable_wait,
+    stop_agents_for_host_shutdown, stop_call, stop_job, stop_session, stop_workflow,
+    suspend_run_for_durable_wait, suspend_run_for_durable_wait_after_handoff,
+    suspend_run_for_durable_wait_after_handoff_then, HostShutdownStops, ParkSlots,
+    RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
 };
 
 #[cfg(test)]
 pub(crate) use finalize::finish_memory_review_if_due;
+#[cfg(test)]
+pub(crate) use finalize::handle_session_crash;
 #[cfg(test)]
 pub(crate) use review_push::review_artifact_ref;
 #[cfg(test)]
@@ -44,6 +51,14 @@ pub(crate) use stop::{stop_session_internal, InterruptFailurePolicy};
 
 #[cfg(test)]
 mod memory_review_tests;
+
+/// CAIRN-3104: the decide-and-record half of the crashed-resume digest-reseed
+/// fallback, exercised against a migrated database. These cover what the pure
+/// predicate cannot — that the widened `runs` query reads the right columns,
+/// that the notice lands in the transcript, and that the per-session claim holds
+/// across a duplicate finalize.
+#[cfg(test)]
+mod reseed_fallback_tests;
 
 /// CAIRN-1582: a run that completes via the terminal-tool warm transition
 /// (instead of `finalize_run`) must still carry the full completion contract —

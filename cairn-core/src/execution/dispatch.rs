@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// Called from each host's subscriber loop (Tauri and cairn-server)
 /// inside `spawn_blocking` since it does synchronous DB work.
 pub fn process_trigger_event(orch: &Orchestrator, event: TriggerEvent) {
-    log::info!("trigger-dispatch: received {:?}", &event);
+    log::info!("trigger-dispatch: received {event:?}");
 
     match event {
         TriggerEvent::JobEnded {

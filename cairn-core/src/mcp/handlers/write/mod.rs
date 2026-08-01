@@ -1,13 +1,13 @@
 //! Write-verb MCP handler.
 
 pub(crate) mod file_mutations;
-pub(crate) mod host_edit;
 mod preview;
+mod replay;
 mod types;
 
 use self::file_mutations::{
-    apply_logical_file_batch, apply_prepared_logical, emit_worktree_changed, finalize_file_commit,
-    record_file_change_async, CommitOutcome, FileBatchSuccess,
+    apply_logical_file_batch, apply_prepared_logical, finalize_file_commit,
+    record_agent_file_change, reverted_file_changes, CommitOutcome, FileBatchSuccess,
 };
 use self::preview::{handle_apply_change, preview_change};
 use self::types::{
@@ -225,33 +225,14 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         payload.changes.len()
     );
 
-    // Changes can only happen in a worktree. A non-jj cwd is the project's live
-    // checkout behind a long-lived triage / read-only agent or another
-    // no-worktree run; reject any file-target edit BEFORE applying it so the
-    // user's checkout is never written to and never reverted. Resource-only
-    // writes (issues, messages, todos, tasks) are unaffected.
-    if !crate::jj::is_jj_dir(std::path::Path::new(&request.cwd)) {
-        if let Some((index, item)) = payload
-            .changes
-            .iter()
-            .enumerate()
-            .find(|(_, item)| matches!(target_family(&item.target), Ok(TargetFamily::File)))
-        {
-            let IndexedFailure { failure, .. } = *build_failure(
-                index,
-                item,
-                file_mutations::NON_WORKTREE_CHANGE_ERROR.to_string(),
-            );
-            return change_report_json(Vec::new(), vec![failure], None, false);
-        }
-    }
-
-    // Worktree fence (writes). Detect any out-of-worktree file target up front
+    // Logical namespace fence (writes). Repository-relative names are always
+    // handled by the runner logical-head transaction and never joined to cwd.
+    // Detect explicit host paths up front
     // and gate it BEFORE applying anything, so a suspend leaves no partial side
     // effects and the slow-path resume can safely re-drive the whole batch.
     // `allow_escape` then permits the approved escaping write(s) on the apply
     // path. Resolution is once per call:
-    //   - no active run -> worktree-jailed (today's behavior)
+    //   - no active run -> host-path writes refused
     //   - fence allow -> writes anywhere, no fence
     //   - fence ask/deny -> fence each escaping target; allow_escape iff any
     //     escaping target was approved.
@@ -271,10 +252,15 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 None => false,
                 Some((_, Fence::Allow)) => true,
                 Some((run_id, fence_mode @ (Fence::Ask | Fence::Deny))) => {
-                    let worktree = std::path::Path::new(&request.cwd);
+                    let residence = std::path::Path::new(&request.cwd);
                     let mut any_escape = false;
                     for (index, item) in payload.changes.iter().enumerate() {
                         if !matches!(target_family(&item.target), Ok(TargetFamily::File)) {
+                            continue;
+                        }
+                        if crate::mcp::file_targets::resolve_logical_file_target(&item.target)
+                            .is_ok()
+                        {
                             continue;
                         }
                         let Ok(normalized) =
@@ -283,13 +269,16 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                             continue; // invalid target — the apply path reports it
                         };
                         let Ok(full) = crate::mcp::file_targets::resolve_change_target(
-                            worktree,
+                            residence,
                             &normalized,
                             true,
                         ) else {
                             continue;
                         };
-                        if !crate::mcp::file_targets::path_escapes_worktree(worktree, &full) {
+                        // Anything not classified as a logical target must be an
+                        // explicit absolute host path. Traversal and malformed
+                        // targets fail later without receiving a capability.
+                        if !full.is_absolute() {
                             continue;
                         }
                         // Temp dirs + toolchain caches are in the sandbox
@@ -330,7 +319,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                                 });
                             }
                             fence::FenceDecision::Suspended => {
-                                return "Change suspended pending worktree fence approval; resume \
+                                return "Change suspended pending logical fence approval; resume \
                                     will continue once it is answered."
                                     .to_string();
                             }
@@ -342,14 +331,11 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         }
     };
 
-    // Worktree fence (out-of-worktree workspace config writes). A workspace-scope
-    // `write cairn://mcp` create/patch/delete and any `write cairn://settings`
-    // patch edit files under ~/.cairn (settings.yaml, keybinds.json, the identity
-    // store) — the SAME out-of-worktree write that a direct `>> settings.yaml`
-    // would be. They route through the identical fence permission flow rather
-    // than a parallel gate. Raised once for the batch and BEFORE any change
-    // applies, so a suspend leaves no partial side effects and resume re-drives
-    // the whole batch. Project-scope MCP writes are in-worktree and skip this.
+    // Logical namespace fence for workspace configuration. These mutations edit
+    // files under ~/.cairn, so they are explicit host capabilities rather than
+    // logical project targets. They route through the same permission flow as an
+    // absolute file target. The crossing is raised before any change applies, so
+    // suspension leaves no partial side effects.
     if let Some((index, _)) =
         payload.changes.iter().enumerate().find(|(_, item)| {
             is_workspace_mcp_mutation(item) || is_workspace_settings_mutation(item)
@@ -386,30 +372,28 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     fence::FenceDecision::Allow => {}
                     fence::FenceDecision::Deny(msg) => return deny(msg),
                     fence::FenceDecision::Suspended => {
-                        return "Change suspended pending worktree fence approval; resume \
+                        return "Change suspended pending logical namespace approval; resume \
                             will continue once it is answered."
                             .to_string();
                     }
                 }
             }
-            // No active run: there is no run to gate the out-of-worktree write
-            // against, mirroring how a no-run file write to settings.yaml is
-            // worktree-jailed. Deny rather than silently write.
+            // No authenticated run means there is no authority to adjudicate
+            // this explicit host write. Deny rather than silently write.
             None => {
                 return deny(
-                    "Denied: a workspace-scope cairn://mcp write edits ~/.cairn/settings.yaml \
-                     (outside the worktree) and requires an active run to gate via the worktree \
-                     fence. Use scope:\"project\" to edit the project's .cairn/config.yaml instead."
+                    "Denied: a workspace-scope cairn://mcp write edits ~/.cairn/settings.yaml as an \
+                     explicit host capability and requires an authenticated run for logical namespace \
+                     adjudication. Use scope:\"project\" for the project's logical .cairn/config.yaml."
                         .to_string(),
                 );
             }
         }
     }
 
-    // Worktree fence (out-of-worktree project repo writes). Creating a project
-    // git-inits/commits at an arbitrary `repoPath`, and attach-remote runs git on
-    // the project's repo — both outside the worktree, even more arbitrary than
-    // settings.yaml. They route through the same fence keyed on the target repo
+    // Logical namespace fence for explicit repository-host operations. Creating
+    // a project initializes an arbitrary `repoPath`, and attach-remote runs git on
+    // the project's live repository. They route through the same fence keyed on the target repo
     // path. Pure-DB project writes (rename/hide, or a create with an empty
     // repoPath) return no crossing and skip this. Raised before any change
     // applies. Resolving the crossing for attach-remote needs a DB lookup, so
@@ -451,7 +435,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     fence::FenceDecision::Allow => {}
                     fence::FenceDecision::Deny(msg) => return deny(msg),
                     fence::FenceDecision::Suspended => {
-                        return "Change suspended pending worktree fence approval; resume \
+                        return "Change suspended pending logical namespace approval; resume \
                             will continue once it is answered."
                             .to_string();
                     }
@@ -459,20 +443,24 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             }
             None => {
                 return deny(
-                    "Denied: creating a project or attaching a remote writes to a git repo \
-                     outside the worktree and requires an active run to gate via the worktree \
-                     fence."
+                    "Denied: creating a project or attaching a remote writes an explicit host \
+                     repository and requires an authenticated run for logical namespace adjudication."
                         .to_string(),
                 );
             }
         }
     }
 
-    let mut bookmark_observation = None;
     let has_file_targets = payload
         .changes
         .iter()
         .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)));
+
+    // Resolve the provider call before either serialization boundary: file
+    // batches use the store lock, while resource-only batches claim the replay
+    // ledger itself before dispatching any effects.
+    let write_call = replay::invoking_write_call(orch, request).await;
+
     // The logical coordinate and every anchor evaluation must belong to the
     // same serialized writer epoch as publication. Acquiring here prevents a
     // second runner writer from advancing the bookmark between preparation and
@@ -518,6 +506,31 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         None
     };
     let store_trace = write_store_guard.as_ref().map(|guard| guard.trace());
+
+    // The replay guard. The lookup belongs inside the store-lock epoch that the
+    // matching record is written in: that is what serializes two deliveries of
+    // one call against each other, so the second cannot read an empty ledger
+    // while the first is still publishing.
+    if has_file_targets {
+        if let Some(call) = write_call.as_ref() {
+            if let Some(report) = replay::recorded_report(&orch.db.local, call).await {
+                return replay::mark_as_replay(&report);
+            }
+        }
+    }
+
+    let revert_commit = payload.changes.first().and_then(|change| {
+        (change.mode == ChangeMode::Revert).then(|| {
+            change
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("commit"))
+                .and_then(serde_json::Value::as_str)
+                .expect("validated revert carries payload.commit")
+                .to_string()
+        })
+    });
+
     let logical_resolution = if has_file_targets {
         match super::branch::resolve_current_for_read(orch, request).await {
             Ok(resolution) => Some(resolution),
@@ -554,79 +567,67 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     } else {
         None
     };
-    if has_file_targets {
-        if let Ok((run, db)) = super::run_context::lookup_run_routed(&orch.db, request).await {
-            if let Ok(context) =
-                crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
-                    db, run.job_id,
-                )
-                .await
-            {
-                bookmark_observation =
-                    crate::mcp::vcs::observe_managed_bookmark(orch, context.as_ref());
-            }
-        }
-    }
     let mut logical_snapshot = std::collections::HashMap::new();
-    if let Some(resolution) = logical_resolution.as_ref() {
-        let has_rename = payload.changes.iter().any(|change| {
-            change.mode == ChangeMode::Rename
-                && matches!(target_family(&change.target), Ok(TargetFamily::File))
-        });
-        type LogicalSnapshot = Vec<(String, Option<Vec<u8>>)>;
-        let snapshot_result: Result<LogicalSnapshot, String> = if has_rename {
-            super::read::files_at_commit(
-                resolution.object_repository_path.clone(),
-                resolution.commit_id.clone(),
-            )
-            .map(|files| {
-                files
-                    .into_iter()
-                    .map(|(path, bytes)| (path, Some(bytes)))
-                    .collect()
-            })
-        } else {
-            let indexed = payload
-                .changes
-                .iter()
-                .enumerate()
-                .filter(|(_, change)| {
-                    matches!(target_family(&change.target), Ok(TargetFamily::File))
+    if revert_commit.is_none() {
+        if let Some(resolution) = logical_resolution.as_ref() {
+            let has_rename = payload.changes.iter().any(|change| {
+                change.mode == ChangeMode::Rename
+                    && matches!(target_family(&change.target), Ok(TargetFamily::File))
+            });
+            type LogicalSnapshot = Vec<(String, Option<Vec<u8>>)>;
+            let snapshot_result: Result<LogicalSnapshot, String> = if has_rename {
+                super::read::files_at_commit(
+                    resolution.object_repository_path.clone(),
+                    resolution.commit_id.clone(),
+                )
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|(path, bytes)| (path, Some(bytes)))
+                        .collect()
                 })
-                .map(|(index, item)| IndexedChange { index, item })
-                .collect::<Vec<_>>();
-            file_mutations::logical_paths_for_changes(
-                std::path::Path::new(&request.cwd),
-                &indexed,
-                allow_escape,
-            )
-            .and_then(|paths| {
-                paths
-                    .into_iter()
-                    .map(|path| {
-                        super::read::file_at_commit(
-                            resolution.object_repository_path.clone(),
-                            resolution.commit_id.clone(),
-                            &path,
-                        )
-                        .map(|bytes| (path, bytes))
+            } else {
+                let indexed = payload
+                    .changes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, change)| {
+                        matches!(target_family(&change.target), Ok(TargetFamily::File))
                     })
-                    .collect()
-            })
-        };
-        match snapshot_result {
-            Ok(files) => {
-                for (path, bytes) in files {
-                    let content = bytes
-                        .map(String::from_utf8)
-                        .transpose()
-                        .map_err(|_| format!("File `{path}` is not valid UTF-8"));
-                    match content {
-                        Ok(content) => {
-                            logical_snapshot.insert(format!("file:{path}"), content);
-                        }
-                        Err(error) => {
-                            return serde_json::to_string(&empty_change_report(
+                    .map(|(index, item)| IndexedChange { index, item })
+                    .collect::<Vec<_>>();
+                file_mutations::logical_paths_for_changes(
+                    std::path::Path::new(&request.cwd),
+                    &indexed,
+                    allow_escape,
+                )
+                .and_then(|paths| {
+                    paths
+                        .into_iter()
+                        .map(|path| {
+                            super::read::file_at_commit(
+                                resolution.object_repository_path.clone(),
+                                resolution.commit_id.clone(),
+                                &path,
+                            )
+                            .map(|bytes| (path, bytes))
+                        })
+                        .collect()
+                })
+            };
+            match snapshot_result {
+                Ok(files) => {
+                    for (path, bytes) in files {
+                        let content = bytes
+                            .map(String::from_utf8)
+                            .transpose()
+                            .map_err(|_| format!("File `{path}` is not valid UTF-8"));
+                        match content {
+                            Ok(content) => {
+                                logical_snapshot.insert(format!("file:{path}"), content);
+                            }
+                            Err(error) => {
+                                return serde_json::to_string(&empty_change_report(
                                 Vec::new(),
                                 vec![ChangeFailure {
                                     index: 0,
@@ -640,36 +641,39 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                                 false,
                             ))
                             .unwrap_or_else(|serialize_error| format!("Failed to serialize logical-head snapshot failure: {serialize_error}"));
+                            }
                         }
                     }
                 }
-            }
-            Err(error) => {
-                return serde_json::to_string(&empty_change_report(
-                    Vec::new(),
-                    vec![ChangeFailure {
-                        index: 0,
-                        target: payload
-                            .changes
-                            .first()
-                            .map(|change| change.target.clone())
-                            .unwrap_or_default(),
-                        mode: payload
-                            .changes
-                            .first()
-                            .map(|change| mode_name(change.mode))
-                            .unwrap_or("patch")
-                            .to_string(),
-                        kind: "file".to_string(),
-                        error: format!("Read authoritative logical head for write: {error}"),
-                    }],
-                    None,
-                    payload.atomic.unwrap_or(false),
-                    false,
-                ))
-                .unwrap_or_else(|serialize_error| {
-                    format!("Failed to serialize logical-head snapshot failure: {serialize_error}")
-                });
+                Err(error) => {
+                    return serde_json::to_string(&empty_change_report(
+                        Vec::new(),
+                        vec![ChangeFailure {
+                            index: 0,
+                            target: payload
+                                .changes
+                                .first()
+                                .map(|change| change.target.clone())
+                                .unwrap_or_default(),
+                            mode: payload
+                                .changes
+                                .first()
+                                .map(|change| mode_name(change.mode))
+                                .unwrap_or("patch")
+                                .to_string(),
+                            kind: "file".to_string(),
+                            error: format!("Read authoritative logical head for write: {error}"),
+                        }],
+                        None,
+                        payload.atomic.unwrap_or(false),
+                        false,
+                    ))
+                    .unwrap_or_else(|serialize_error| {
+                        format!(
+                            "Failed to serialize logical-head snapshot failure: {serialize_error}"
+                        )
+                    });
+                }
             }
         }
     }
@@ -709,6 +713,38 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     };
 
     let atomic = payload.atomic.unwrap_or(false);
+    let guard_resource_report = !has_file_targets && write_call.is_some();
+    if let Some(call) = write_call.as_ref().filter(|_| !has_file_targets) {
+        match replay::claim_resource_call(&orch.db.local, call).await {
+            replay::ResourceClaim::Claimed => {}
+            replay::ResourceClaim::Replayed(report) => return replay::mark_as_replay(&report),
+            replay::ResourceClaim::Stalled => {
+                return change_report_json(
+                    Vec::new(),
+                    vec![ChangeFailure {
+                        index: 0,
+                        target: payload
+                            .changes
+                            .first()
+                            .map(|change| change.target.clone())
+                            .unwrap_or_default(),
+                        mode: payload
+                            .changes
+                            .first()
+                            .map(|change| mode_name(change.mode))
+                            .unwrap_or("append")
+                            .to_string(),
+                        kind: "replay".to_string(),
+                        error: "A previous delivery claimed this resource write but did not settle within 30 seconds. Nothing was applied again because the first delivery may already have produced side effects."
+                            .to_string(),
+                    }],
+                    None,
+                    atomic,
+                );
+            }
+            replay::ResourceClaim::Unguarded => {}
+        }
+    }
     let mut applied: Vec<AppliedChange> = Vec::new();
     let mut failures: Vec<ChangeFailure> = Vec::new();
     let mut commit: Option<CommitReport> = None;
@@ -721,6 +757,23 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
 
     while index < payload.changes.len() {
         let item = &payload.changes[index];
+
+        if item.mode == ChangeMode::Revert {
+            first_file_change = Some(IndexedChange { index, item });
+            applied.push(AppliedChange {
+                index,
+                target: item.target.clone(),
+                mode: mode_name(item.mode).to_string(),
+                kind: "file".to_string(),
+                summary: format!(
+                    "Revert {}",
+                    revert_commit.as_deref().expect("revert item has commit")
+                ),
+                data: None,
+            });
+            index += 1;
+            continue;
+        }
 
         // Rename is its own branch: its target is a file URI (so the contiguous
         // File slice below would otherwise swallow it), but the edit set is
@@ -774,9 +827,6 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                             logical_mutations.extend(success.logical_mutations);
                         }
                         Err(failure) => {
-                            if !affected_paths.is_empty() {
-                                emit_worktree_changed(orch, &request.cwd);
-                            }
                             let IndexedFailure {
                                 failure,
                                 commit: failure_commit,
@@ -802,12 +852,21 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                         commit: failure_commit,
                     } = *build_failure(index, item, error);
                     if atomic {
-                        return change_report_json(
+                        let report = change_report_json(
                             applied,
                             vec![failure],
                             failure_commit.or(commit),
                             atomic,
                         );
+                        if guard_resource_report {
+                            replay::finalize_report(
+                                &orch.db.local,
+                                write_call.as_ref().expect("guarded resource call"),
+                                &report,
+                            )
+                            .await;
+                        }
+                        return report;
                     }
                     if let Some(failure_commit) = failure_commit {
                         commit = Some(failure_commit);
@@ -822,20 +881,26 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         let family = match target_family(&item.target) {
             Ok(family) => family,
             Err(error) => {
-                if !affected_paths.is_empty() {
-                    emit_worktree_changed(orch, &request.cwd);
-                }
                 let IndexedFailure {
                     failure,
                     commit: failure_commit,
                 } = *build_failure(index, item, error);
                 if atomic {
-                    return change_report_json(
+                    let report = change_report_json(
                         applied,
                         vec![failure],
                         failure_commit.or(commit),
                         atomic,
                     );
+                    if guard_resource_report {
+                        replay::finalize_report(
+                            &orch.db.local,
+                            write_call.as_ref().expect("guarded resource call"),
+                            &report,
+                        )
+                        .await;
+                    }
+                    return report;
                 }
                 if let Some(failure_commit) = failure_commit {
                     commit = Some(failure_commit);
@@ -865,20 +930,26 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     applied.push(change.into());
                 }
                 Err(failure) => {
-                    if !affected_paths.is_empty() {
-                        emit_worktree_changed(orch, &request.cwd);
-                    }
                     let IndexedFailure {
                         failure,
                         commit: failure_commit,
                     } = *resource_failure(failure);
                     if atomic {
-                        return change_report_json(
+                        let report = change_report_json(
                             applied,
                             vec![failure],
                             failure_commit.or(commit),
                             atomic,
                         );
+                        if guard_resource_report {
+                            replay::finalize_report(
+                                &orch.db.local,
+                                write_call.as_ref().expect("guarded resource call"),
+                                &report,
+                            )
+                            .await;
+                        }
+                        return report;
                     }
                     if let Some(failure_commit) = failure_commit {
                         commit = Some(failure_commit);
@@ -930,20 +1001,26 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     logical_mutations.extend(success.logical_mutations);
                 }
                 Err(failure) => {
-                    if !affected_paths.is_empty() {
-                        emit_worktree_changed(orch, &request.cwd);
-                    }
                     let IndexedFailure {
                         failure,
                         commit: failure_commit,
                     } = *failure;
                     if atomic {
-                        return change_report_json(
+                        let report = change_report_json(
                             applied,
                             vec![failure],
                             failure_commit.or(commit),
                             atomic,
                         );
+                        if guard_resource_report {
+                            replay::finalize_report(
+                                &orch.db.local,
+                                write_call.as_ref().expect("guarded resource call"),
+                                &report,
+                            )
+                            .await;
+                        }
+                        return report;
                     }
                     if let Some(failure_commit) = failure_commit {
                         commit = Some(failure_commit);
@@ -964,6 +1041,12 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     let mut publication_requirement =
         crate::merge_requests::queries::PublicationRequirement::DeferredUntilPublication;
     let mut post_seal_publication = None;
+    // The publication ladder's second rung, carried out of the transaction:
+    // `Err` means the commit reached the jj bookmark but not the branch ref.
+    let mut export = Ok(());
+    // Whether this delivery owns the replay-ledger row, and so may correct the
+    // report it recorded once the ladder's remaining rungs have settled.
+    let mut ledger_claim = replay::LedgerClaim::NotClaimed;
     if let Some(first_file_change) = first_file_change {
         let _seal_phase = write_store_guard
             .as_ref()
@@ -979,12 +1062,45 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             logical_resolution
                 .as_ref()
                 .expect("file writes require a resolved logical head"),
-            &logical_mutations,
+            match revert_commit.as_ref() {
+                Some(commit) => crate::jj::ProposedPublication::Revert(commit.clone()),
+                None => crate::jj::ProposedPublication::Mutations(logical_mutations.clone()),
+            },
+            payload
+                .conflict_markers_reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty()),
         )
         .await
         {
             Ok(CommitOutcome::Done(mut completed)) => {
+                if revert_commit.is_some() {
+                    affected_paths = completed.affected_paths.clone();
+                    if let Some(report) = completed.report.as_ref() {
+                        if let Some(sha) = report.sha.as_deref() {
+                            match reverted_file_changes(
+                                logical_resolution.as_ref().expect("revert has resolution"),
+                                sha,
+                                &affected_paths,
+                            ) {
+                                Ok(changes) => recorded_changes = changes,
+                                Err(error) => {
+                                    log::warn!("Failed to build revert file ledger: {error}")
+                                }
+                            }
+                        }
+                    }
+                    if let Some(change) = applied.first_mut() {
+                        change.summary = format!(
+                            "Reverted {} ({} paths)",
+                            revert_commit.as_deref().expect("revert has commit"),
+                            affected_paths.len()
+                        );
+                    }
+                }
                 commit = completed.report.take();
+                export = completed.export;
                 publication_requirement = completed.publication_requirement;
                 post_seal_publication = completed.publication;
             }
@@ -993,15 +1109,34 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     failure,
                     commit: failure_commit,
                 } = *failure;
+                if revert_commit.is_some() {
+                    applied.retain(|change| change.index != failure.index);
+                }
                 if atomic {
                     rollback_promoted_memory_decisions(orch, &promoted_memories).await;
                     return change_report_json(applied, vec![failure], failure_commit, atomic);
                 }
-                if let Some(failure_commit) = failure_commit {
+                if revert_commit.is_some() {
+                    applied.clear();
+                } else if let Some(failure_commit) = failure_commit {
                     commit = Some(failure_commit);
                 }
                 failures.push(failure);
             }
+        }
+
+        // Record the publication against the call that produced it, still inside
+        // the epoch that published it, so a crash cannot leave a landed commit
+        // with no ledger row for a later delivery to find. Only a batch that
+        // actually sealed a commit records: a write that published nothing has no
+        // application to suppress and should stay freely retryable.
+        if let (Some(call), Some(_)) = (
+            write_call.as_ref(),
+            commit.as_ref().and_then(|report| report.sha.as_ref()),
+        ) {
+            let report =
+                change_report_json(applied.clone(), failures.clone(), commit.clone(), atomic);
+            ledger_claim = replay::record_report(&orch.db.local, call, &report).await;
         }
         drop(_seal_phase);
     }
@@ -1013,9 +1148,9 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         .is_some()
     {
         for change in &recorded_changes {
-            if let Err(error) = record_file_change_async(
+            if let Err(error) = record_agent_file_change(
                 orch,
-                &request.cwd,
+                request,
                 &change.path,
                 change.status,
                 change.additions,
@@ -1037,48 +1172,75 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             });
         }
     };
-    if publication_requirement
-        == crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr
-    {
-        let _phase = store_trace.as_ref().map(|trace| trace.phase("origin push"));
-        let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&request.cwd));
-        if let Err(error) = crate::mcp::vcs::publish_required_origin(
-            vcs.as_ref(),
-            std::path::Path::new(&request.cwd),
-        ) {
-            let index = first_file_change_index.unwrap_or(0);
-            let sealed_sha = commit.as_ref().and_then(|report| report.sha.clone());
-            let error = format!(
-                "Commit {} was sealed locally but remains unpublished because the required open-PR origin push failed: {error}. Retry a file-touching write to publish the current bookmark.",
-                sealed_sha.as_deref().unwrap_or("(unknown)")
-            );
-            failures.push(ChangeFailure {
-                index,
-                target: payload
-                    .changes
-                    .get(index)
-                    .map(|c| c.target.clone())
-                    .unwrap_or_else(|| "file:".to_string()),
-                mode: payload
-                    .changes
-                    .get(index)
-                    .map(|c| mode_name(c.mode).to_string())
-                    .unwrap_or_else(|| "patch".to_string()),
-                kind: "publication".to_string(),
-                error: error.clone(),
-            });
-            commit = Some(CommitReport {
-                status: "sealed locally; unpublished".to_string(),
-                sha: sealed_sha,
-                pr_number: commit.as_ref().and_then(|report| report.pr_number),
-                message: Some(error),
-            });
-            return change_report_json(applied, failures, commit, atomic);
+    // The publication ladder past the store transaction: the export already ran
+    // under the store lock inside it, and the origin push runs here because it is
+    // network I/O that must not hold the lock. Both legs report the same way,
+    // because both leave the same state behind — a commit that exists only where
+    // Cairn can see it.
+    let published = match (export, publication_requirement) {
+        (Err(error), _) => Err(error),
+        (Ok(()), crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr) => {
+            let _phase = store_trace.as_ref().map(|trace| trace.phase("origin push"));
+            match logical_resolution.as_ref() {
+                Some(resolution) => {
+                    crate::orchestrator::base_advance::publish_managed_branch(
+                        orch,
+                        &resolution.repository_path,
+                        &resolution.rev,
+                    )
+                    .await
+                }
+                // Only a file change reaches a required push, and a file change
+                // cannot be prepared without a resolved logical head.
+                None => Ok(()),
+            }
         }
-    } else if had_file_change {
-        if let Some(trace) = &store_trace {
-            trace.deferred("origin push deferred");
+        (
+            Ok(()),
+            crate::merge_requests::queries::PublicationRequirement::DeferredUntilPublication,
+        ) => {
+            if had_file_change {
+                if let Some(trace) = &store_trace {
+                    trace.deferred("origin push deferred");
+                }
+            }
+            Ok(())
         }
+    };
+    if let Err(error) = published {
+        let index = first_file_change_index.unwrap_or(0);
+        let sealed_sha = commit.as_ref().and_then(|report| report.sha.clone());
+        let error =
+            super::unpublished_commit_message(sealed_sha.as_deref().unwrap_or("(unknown)"), &error);
+        failures.push(ChangeFailure {
+            index,
+            target: payload
+                .changes
+                .get(index)
+                .map(|c| c.target.clone())
+                .unwrap_or_else(|| "file:".to_string()),
+            mode: payload
+                .changes
+                .get(index)
+                .map(|c| mode_name(c.mode).to_string())
+                .unwrap_or_else(|| "patch".to_string()),
+            kind: "publication".to_string(),
+            error: error.clone(),
+        });
+        commit = Some(CommitReport {
+            status: "sealed locally; unpublished".to_string(),
+            sha: sealed_sha,
+            pr_number: commit.as_ref().and_then(|report| report.pr_number),
+            message: Some(error),
+        });
+        let report = change_report_json(applied, failures, commit, atomic);
+        // The ledger recorded `committed` inside the store lock, before the
+        // export and push could say otherwise. Correct it here or a redelivery of
+        // this same call is answered, durably, with a success that did not happen.
+        if let (Some(call), replay::LedgerClaim::Claimed) = (write_call.as_ref(), ledger_claim) {
+            replay::finalize_report(&orch.db.local, call, &report).await;
+        }
+        return report;
     }
     if let Some(publication) = post_seal_publication {
         let _phase = store_trace
@@ -1100,31 +1262,6 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 format!("sealed commit cloud publication failed: {error}"),
             );
         }
-    }
-
-    // The file-seal guard has been released. Propagation takes the same store
-    // mutex, so it must run here rather than inside finalize_file_commit.
-    if let Err(error) =
-        crate::mcp::vcs::acknowledge_logical_bookmark_advance(orch, bookmark_observation.as_ref())
-    {
-        let index = first_file_change_index.unwrap_or(0);
-        failures.push(ChangeFailure {
-            index,
-            target: payload
-                .changes
-                .get(index)
-                .map(|change| change.target.clone())
-                .unwrap_or_else(|| "file:".to_string()),
-            mode: payload
-                .changes
-                .get(index)
-                .map(|change| mode_name(change.mode).to_string())
-                .unwrap_or_else(|| "patch".to_string()),
-            kind: "publication".to_string(),
-            error: format!(
-                "Managed branch advancement was committed, but logical bookmark validation failed: {error}"
-            ),
-        });
     }
 
     // Synchronous when:write check runner: a write that sealed a source-touching
@@ -1152,7 +1289,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         // rather than competing with a dying suite. See
         // cancel_stale_review_on_branch_advance for the rationale and job-id scoping.
         if let Some(ctx) = run_context.as_ref() {
-            crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &ctx.job_id);
+            crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &ctx.job_id)
+                .await;
         }
         crate::execution::checks::run_write_checks_after_seal(
             orch,
@@ -1217,17 +1355,36 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         // structured change report first so callers still see the failed indices.
         if !failures.is_empty() {
             let report = change_report_json(applied, failures, commit, atomic);
-            return append_check_summary(format!("{report}\n\n{blocking_result}"), &check_summary);
+            let result =
+                append_check_summary(format!("{report}\n\n{blocking_result}"), &check_summary);
+            if guard_resource_report {
+                replay::finalize_report(
+                    &orch.db.local,
+                    write_call.as_ref().expect("guarded resource call"),
+                    &result,
+                )
+                .await;
+            }
+            return result;
         }
         if applied.is_empty() {
-            return append_check_summary(blocking_result, &check_summary);
+            let result = append_check_summary(blocking_result, &check_summary);
+            if guard_resource_report {
+                replay::finalize_report(
+                    &orch.db.local,
+                    write_call.as_ref().expect("guarded resource call"),
+                    &result,
+                )
+                .await;
+            }
+            return result;
         }
         let summary = applied
             .iter()
             .map(|change| change.summary.clone())
             .collect::<Vec<_>>()
             .join("; ");
-        return append_check_summary(
+        let result = append_check_summary(
             format!(
                 "Applied {} change(s): {}\n\n{}",
                 applied.len(),
@@ -1236,12 +1393,30 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             ),
             &check_summary,
         );
+        if guard_resource_report {
+            replay::finalize_report(
+                &orch.db.local,
+                write_call.as_ref().expect("guarded resource call"),
+                &result,
+            )
+            .await;
+        }
+        return result;
     }
 
-    append_check_summary(
+    let result = append_check_summary(
         change_report_json(applied, failures, commit, atomic),
         &check_summary,
-    )
+    );
+    if guard_resource_report {
+        replay::finalize_report(
+            &orch.db.local,
+            write_call.as_ref().expect("guarded resource call"),
+            &result,
+        )
+        .await;
+    }
+    result
 }
 
 #[cfg(test)]

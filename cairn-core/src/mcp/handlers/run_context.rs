@@ -5,27 +5,26 @@ use cairn_common::protocol::CallbackRequest;
 use super::RunContext;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
+fn required_run_id(request: &CallbackRequest) -> Result<&str, String> {
+    request
+        .run_id
+        .as_deref()
+        .filter(|run_id| !run_id.is_empty())
+        .ok_or_else(|| "Authenticated agent request is missing its run ID".to_string())
+}
+
 pub(crate) async fn lookup_run(
     db: &LocalDb,
     request: &CallbackRequest,
 ) -> Result<RunContext, String> {
-    if let Some(run_id) = request.run_id.as_deref() {
-        lookup_run_by_id(db, run_id).await
-    } else {
-        lookup_run_by_cwd(db, &request.cwd).await
-    }
+    lookup_run_by_id(db, required_run_id(request)?).await
 }
 
 pub(crate) async fn lookup_home_uri(
     db: &LocalDb,
     request: &CallbackRequest,
 ) -> Result<String, String> {
-    if let Some(run_id) = request.run_id.as_deref() {
-        lookup_home_uri_by_run_id(db, run_id).await
-    } else {
-        let run = lookup_run_by_cwd(db, &request.cwd).await?;
-        lookup_home_uri_by_run_id(db, &run.run_id).await
-    }
+    lookup_home_uri_by_run_id(db, required_run_id(request)?).await
 }
 
 /// Resolve a run's context and the database that owns it (CAIRN-2132).
@@ -43,30 +42,12 @@ pub(crate) async fn lookup_run_routed(
     dbs: &crate::db::DbState,
     request: &CallbackRequest,
 ) -> Result<(RunContext, Arc<LocalDb>), String> {
-    // A run id is self-routing: parse its team prefix to the owning database in
-    // O(1) (CAIRN-2210) instead of scanning every open database. Only the
-    // cwd-keyed fallback (no run id to parse) still fans out.
-    if let Some(run_id) = request.run_id.as_deref() {
-        let db = crate::execution::routing::routing_db_for_id(dbs, run_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let ctx = lookup_run(&db, request).await?;
-        return Ok((ctx, db));
-    }
-    match lookup_run(&dbs.local, request).await {
-        Ok(ctx) => Ok((ctx, dbs.local.clone())),
-        Err(private_err) => {
-            for db in dbs.all_dbs().await {
-                if Arc::ptr_eq(&db, &dbs.local) {
-                    continue;
-                }
-                if let Ok(ctx) = lookup_run(&db, request).await {
-                    return Ok((ctx, db));
-                }
-            }
-            Err(private_err)
-        }
-    }
+    let run_id = required_run_id(request)?;
+    let db = crate::execution::routing::routing_db_for_id(dbs, run_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ctx = lookup_run_by_id(&db, run_id).await?;
+    Ok((ctx, db))
 }
 
 /// The home base URI for the request's run, searching every open database the
@@ -76,28 +57,11 @@ pub(crate) async fn lookup_home_uri_routed(
     dbs: &crate::db::DbState,
     request: &CallbackRequest,
 ) -> Result<String, String> {
-    // Self-routing run id → O(1) prefix parse (CAIRN-2210); cwd-keyed lookup
-    // (no run id) still fans out across open databases.
-    if let Some(run_id) = request.run_id.as_deref() {
-        let db = crate::execution::routing::routing_db_for_id(dbs, run_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        return lookup_home_uri(&db, request).await;
-    }
-    match lookup_home_uri(&dbs.local, request).await {
-        Ok(uri) => Ok(uri),
-        Err(private_err) => {
-            for db in dbs.all_dbs().await {
-                if Arc::ptr_eq(&db, &dbs.local) {
-                    continue;
-                }
-                if let Ok(uri) = lookup_home_uri(&db, request).await {
-                    return Ok(uri);
-                }
-            }
-            Err(private_err)
-        }
-    }
+    let run_id = required_run_id(request)?;
+    let db = crate::execution::routing::routing_db_for_id(dbs, run_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    lookup_home_uri_by_run_id(&db, run_id).await
 }
 
 async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String, String> {
@@ -163,7 +127,7 @@ async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String,
     .map_err(|e| e.to_string())
 }
 
-async fn lookup_run_by_id(db: &LocalDb, run_id: &str) -> Result<RunContext, String> {
+pub(crate) async fn lookup_run_by_id(db: &LocalDb, run_id: &str) -> Result<RunContext, String> {
     let run_id = run_id.to_string();
     db.read(|conn| {
         let run_id = run_id.clone();
@@ -173,7 +137,7 @@ async fn lookup_run_by_id(db: &LocalDb, run_id: &str) -> Result<RunContext, Stri
                     "
                     SELECT r.id, r.job_id, j.execution_id, j.recipe_node_id,
                            r.issue_id, i.number, j.project_id, p.key, j.node_name,
-                           e.seq, j.worktree_path
+                           e.seq
                     FROM runs r
                     JOIN jobs j ON r.job_id = j.id
                     LEFT JOIN issues i ON r.issue_id = i.id
@@ -197,47 +161,6 @@ async fn lookup_run_by_id(db: &LocalDb, run_id: &str) -> Result<RunContext, Stri
     .map_err(|e| e.to_string())
 }
 
-async fn lookup_run_by_cwd(db: &LocalDb, cwd: &str) -> Result<RunContext, String> {
-    let cwd = cwd.to_string();
-    db.read(|conn| {
-        let cwd = cwd.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "
-                    SELECT r.id, r.job_id, j.execution_id, j.recipe_node_id,
-                           r.issue_id, i.number, j.project_id, p.key, j.node_name,
-                           e.seq, j.worktree_path
-                    FROM runs r
-                    JOIN jobs j ON r.job_id = j.id
-                    LEFT JOIN issues i ON r.issue_id = i.id
-                    JOIN projects p ON j.project_id = p.id
-                    LEFT JOIN executions e ON j.execution_id = e.id
-                    WHERE r.status IN ('starting', 'live')
-                      AND (
-                        j.worktree_path = ?1
-                        OR (p.repo_path = ?1 AND j.issue_id IS NULL)
-                      )
-                    ORDER BY
-                        CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
-                        r.created_at DESC
-                    LIMIT 1
-                    ",
-                    (cwd.as_str(),),
-                )
-                .await?;
-
-            rows.next()
-                .await?
-                .map(|row| run_context_from_row(&row))
-                .transpose()?
-                .ok_or_else(|| DbError::Row(format!("No active run found for path '{}'", cwd)))
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
 fn run_context_from_row(row: &cairn_db::turso::Row) -> DbResult<RunContext> {
     let issue_number = row.opt_i64(5)?.map(|value| value as i32);
     let exec_seq = row.opt_i64(9)?.map(|value| value as i32);
@@ -252,7 +175,6 @@ fn run_context_from_row(row: &cairn_db::turso::Row) -> DbResult<RunContext> {
         project_id: row.text(6)?,
         project_key: row.text(7)?,
         job_name,
-        worktree_path: row.opt_text(10)?,
     })
 }
 
@@ -304,7 +226,7 @@ mod tests {
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',7,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
-            "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, worktree_path) VALUES ('j','e','i','p','Builder','running',1,1,'builder','/tmp/wt')",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch) VALUES ('j','e','i','p','Builder','running',1,1,'builder','agent/test')",
             "INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at) VALUES ('r','i','p','j','live',1,1)",
         ] {
             db.execute(sql, ()).await.unwrap();
@@ -368,6 +290,78 @@ mod tests {
         assert!(
             err.contains("ghost"),
             "the error should name the missing run id: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_run_refuses_missing_or_empty_run_identity() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+
+        for run_id in [None, Some(String::new())] {
+            let request = CallbackRequest {
+                cwd: "/tmp/wt".to_string(),
+                run_id,
+                ..Default::default()
+            };
+            let err = lookup_run_routed(&dbs, &request)
+                .await
+                .err()
+                .expect("missing identity must be refused");
+            assert!(err.contains("missing its run ID"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_run_identity_is_independent_of_cwd() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+        let request = CallbackRequest {
+            cwd: "/forged/other/project".to_string(),
+            ..request_for_run("r")
+        };
+
+        let (context, _) = lookup_run_routed(&dbs, &request)
+            .await
+            .expect("the authenticated run resolves regardless of cwd");
+        assert_eq!(context.run_id, "r");
+        assert_eq!(context.project_key, "PRJ");
+    }
+
+    #[tokio::test]
+    async fn simultaneous_runs_with_the_same_residence_do_not_cross_resolve() {
+        let dbs = local_dbs().await;
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p1','w','One','ONE','/repos/one',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p2','w','Two','TWO','/repos/two',1,1)",
+            "INSERT INTO jobs (id, project_id, node_name, status, created_at, updated_at, uri_segment) VALUES ('j1','p1','Builder','running',1,1,'builder-one')",
+            "INSERT INTO jobs (id, project_id, node_name, status, created_at, updated_at, uri_segment) VALUES ('j2','p2','Builder','running',1,1,'builder-two')",
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('r1','p1','j1','live',1,1)",
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('r2','p2','j2','live',1,1)",
+        ] {
+            dbs.local.execute(sql, ()).await.unwrap();
+        }
+
+        let shared_residence = "/home/tester/.cairn/scratch/PRJ.1.1.parent";
+        let first = CallbackRequest {
+            cwd: shared_residence.to_string(),
+            ..request_for_run("r1")
+        };
+        let second = CallbackRequest {
+            cwd: shared_residence.to_string(),
+            ..request_for_run("r2")
+        };
+
+        let (first, _) = lookup_run_routed(&dbs, &first).await.unwrap();
+        let (second, _) = lookup_run_routed(&dbs, &second).await.unwrap();
+        assert_eq!(
+            (first.run_id.as_str(), first.project_key.as_str()),
+            ("r1", "ONE")
+        );
+        assert_eq!(
+            (second.run_id.as_str(), second.project_key.as_str()),
+            ("r2", "TWO")
         );
     }
 }

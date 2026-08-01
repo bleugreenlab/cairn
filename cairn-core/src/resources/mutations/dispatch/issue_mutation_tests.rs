@@ -95,6 +95,73 @@ async fn seed_comment(
     .unwrap()
 }
 
+/// The label refs an issue write carries are a vocabulary the write may extend:
+/// naming a label nobody has created yet creates it rather than failing the
+/// whole change (CAIRN-3100).
+#[tokio::test]
+async fn creating_an_issue_with_an_unknown_label_creates_the_label() {
+    let orch = seeded_orch().await;
+    seed_issue(&orch).await;
+
+    let item = change_item(
+        "cairn://p/CAIRN/issues",
+        ChangeMode::Append,
+        Some(serde_json::json!({
+            "title": "Labelled issue",
+            "labels": ["execution-fabric"],
+        })),
+    );
+    apply(&orch, &item).await.unwrap();
+
+    let vocabulary = crate::labels::crud::list_labels(&orch.db.local)
+        .await
+        .unwrap();
+    assert_eq!(
+        vocabulary.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+        vec!["execution-fabric"]
+    );
+
+    let rendered = crate::resources::issue::read_issue(&orch.db.local, "CAIRN", 2).await;
+    assert!(rendered.contains("execution-fabric"), "in: {rendered}");
+}
+
+#[tokio::test]
+async fn patching_an_issue_with_an_unknown_label_creates_the_label() {
+    let orch = seeded_orch().await;
+    let (_issue_id, number) = seed_issue(&orch).await;
+
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{number}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"labels": ["Execution Fabric", "urgent"]})),
+    );
+    apply(&orch, &item).await.unwrap();
+
+    let vocabulary = crate::labels::crud::list_labels(&orch.db.local)
+        .await
+        .unwrap();
+    assert_eq!(
+        vocabulary.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+        vec!["execution-fabric", "urgent"]
+    );
+
+    // Re-attaching by the slug of a label created from prose reuses that label
+    // instead of minting a second row for the same words.
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{number}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"labels": ["execution-fabric"]})),
+    );
+    apply(&orch, &item).await.unwrap();
+    assert_eq!(
+        crate::labels::crud::list_labels(&orch.db.local)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn comments_get_sequential_per_issue_seqs() {
     let orch = seeded_orch().await;
@@ -288,26 +355,6 @@ async fn parent_issue_id_of(orch: &Orchestrator, issue_id: &str) -> Option<Strin
         .parent_issue_id
 }
 
-async fn parent_job_id_of(orch: &Orchestrator, issue_id: &str) -> Option<String> {
-    let issue_id = issue_id.to_string();
-    orch.db
-        .local
-        .read(move |conn| {
-            let issue_id = issue_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT parent_job_id FROM issues WHERE id = ?1",
-                        (issue_id.as_str(),),
-                    )
-                    .await?;
-                crate::storage::next_opt_text(&mut rows, 0).await
-            })
-        })
-        .await
-        .unwrap()
-}
-
 /// Run a SQL statement against the local db in a test.
 async fn exec_sql(orch: &Orchestrator, sql: String) {
     orch.db
@@ -379,8 +426,8 @@ async fn seed_running_node(orch: &Orchestrator) -> (i32, String, String) {
     exec_sql(
             orch,
             format!(
-                "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, worktree_path) \
-                 VALUES ('job-stop', 'exec-stop', '{issue_id}', '{project_id}', 'Builder', 'running', 1, 1, 'builder', '/tmp/repo-builder')"
+                "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch) \
+                 VALUES ('job-stop', 'exec-stop', '{issue_id}', '{project_id}', 'Builder', 'running', 1, 1, 'builder', 'agent/builder')"
             ),
         )
         .await;
@@ -546,19 +593,144 @@ async fn patch_status_merged_resolves_issue() {
     assert!(issue.merged_at.is_some());
 }
 
+/// Read an issue by its project-scoped number.
+async fn issue_by_number(orch: &Orchestrator, number: i32) -> crate::models::Issue {
+    let id = orch
+        .db
+        .local
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT id FROM issues WHERE number = ?1", (number,))
+                    .await?;
+                crate::storage::next_opt_text(&mut rows, 0).await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    issue_crud::get(&orch.db.local, &id).await.unwrap().unwrap()
+}
+
+/// Live work turns a close into a confirmation: the first attempt changes
+/// nothing and comes back naming both the work and the key that confirms it.
+#[tokio::test]
+async fn patch_status_closed_with_live_work_asks_to_confirm() {
+    let orch = seeded_orch().await;
+    let (number, _job_id, run_id) = seed_running_node(&orch).await;
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{number}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"status": "closed"})),
+    );
+
+    let err = apply(&orch, &item).await.unwrap_err();
+
+    assert!(
+        err.error.contains("confirm: true"),
+        "names the confirming key: {}",
+        err.error
+    );
+    assert!(
+        err.error.contains("Builder (running now)"),
+        "names the live work and its state: {}",
+        err.error
+    );
+    assert_eq!(
+        issue_by_number(&orch, number).await.status,
+        IssueStatus::Backlog
+    );
+    assert_eq!(
+        run_status_for(&orch, &run_id).await.as_deref(),
+        Some("live")
+    );
+}
+
+/// A refusal has to be true of the whole write. A combined patch that renames
+/// the issue and closes it must leave the title alone when the close is refused,
+/// or a caller retrying "the same write" repeats the rename.
+#[tokio::test]
+async fn a_refused_resolution_leaves_the_rest_of_the_patch_unapplied() {
+    let orch = seeded_orch().await;
+    let (number, _job_id, _run_id) = seed_running_node(&orch).await;
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{number}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"title": "Renamed", "status": "closed"})),
+    );
+
+    let err = apply(&orch, &item).await.unwrap_err();
+
+    assert!(err.error.contains("confirm: true"), "{}", err.error);
+    let issue = issue_by_number(&orch, number).await;
+    assert_eq!(
+        issue.title, "Test issue",
+        "a refused write applies none of its fields"
+    );
+    assert_eq!(issue.status, IssueStatus::Backlog);
+}
+
+/// The confirmed close resolves the issue and stops the work it named.
+#[tokio::test]
+async fn patch_status_closed_with_confirm_resolves_and_stops_live_work() {
+    let orch = seeded_orch().await;
+    let (number, _job_id, run_id) = seed_running_node(&orch).await;
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{number}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"status": "closed", "confirm": true})),
+    );
+
+    apply(&orch, &item).await.unwrap();
+
+    let issue = issue_by_number(&orch, number).await;
+    assert_eq!(issue.status, IssueStatus::Closed);
+    assert_ne!(
+        run_status_for(&orch, &run_id).await.as_deref(),
+        Some("live"),
+        "the confirmed close stops the run it named"
+    );
+}
+
+/// `confirm` answers a resolution; on its own it is a typo worth naming.
+#[tokio::test]
+async fn patch_confirm_without_a_resolution_is_rejected() {
+    let orch = seeded_orch().await;
+    let (_issue_id, number) = seed_issue(&orch).await;
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{number}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"title": "Renamed", "confirm": true})),
+    );
+
+    let err = apply(&orch, &item).await.unwrap_err();
+
+    assert!(
+        err.error.contains("payload.status"),
+        "points at the key confirm belongs with: {}",
+        err.error
+    );
+}
+
 #[tokio::test]
 async fn patch_invalid_status_is_rejected() {
     let orch = seeded_orch().await;
     let (issue_id, number) = seed_issue(&orch).await;
     // `backlog` is derived, not settable, and must be rejected alongside any
-    // other unknown value.
+    // other unknown value. Each is paired with a title so the refusal is shown
+    // to leave the rest of the write unapplied too.
     for bad in ["backlog", "active", "frobnicate"] {
         let item = change_item(
             &format!("cairn://p/CAIRN/{number}"),
             ChangeMode::Patch,
-            Some(serde_json::json!({"status": bad})),
+            Some(serde_json::json!({"title": "Renamed", "status": bad})),
         );
         let err = apply(&orch, &item).await.unwrap_err();
+        assert_eq!(
+            issue_by_number(&orch, number).await.title,
+            "Test issue",
+            "a refused status must not apply the rest of the patch"
+        );
         assert!(
             err.error.contains("merged") && err.error.contains("closed"),
             "expected allowed-set message, got: {}",
@@ -610,7 +782,7 @@ async fn patch_parent_adopts_issue() {
 }
 
 #[tokio::test]
-async fn patch_parent_records_parent_job_id_from_caller() {
+async fn patch_parent_hands_child_attention_to_the_parents_coordinator() {
     let orch = seeded_orch().await;
     let (number, job_id, run_id) = seed_running_node(&orch).await;
     let running_issue =
@@ -631,10 +803,40 @@ async fn patch_parent_records_parent_job_id_from_caller() {
         parent_issue_id_of(&orch, &child_id).await.as_deref(),
         Some(parent_id.as_str())
     );
-    // run-stop's job is a recipe-root, so its own job is the recorded spawner.
+
+    // The adopting run's job coordinates the *running* issue, not the newly
+    // adopted parent, so it gains nothing. The child's attention is addressed by
+    // the parent edge alone, and this parent has no execution on it yet.
+    assert!(
+        crate::orchestrator::wakes::watcher_jobs_for_issue(
+            &orch.db.local,
+            &format!("cairn://p/CAIRN/{child_num}")
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "adoption alone does not name a coordinator; the parent issue must have one"
+    );
+
+    // Re-point the caller's job at the parent issue and give it a session — the
+    // shape of a coordinator that has actually run on the parent. The child's
+    // attention follows with no mint.
+    exec_sql(
+        &orch,
+        format!(
+            "UPDATE jobs SET issue_id = '{parent_id}', current_session_id = 'sess' \
+             WHERE id = '{job_id}'"
+        ),
+    )
+    .await;
     assert_eq!(
-        parent_job_id_of(&orch, &child_id).await.as_deref(),
-        Some(job_id.as_str())
+        crate::orchestrator::wakes::watcher_jobs_for_issue(
+            &orch.db.local,
+            &format!("cairn://p/CAIRN/{child_num}")
+        )
+        .await
+        .unwrap(),
+        vec![job_id]
     );
 }
 
@@ -650,7 +852,6 @@ async fn patch_parent_null_orphans_issue() {
     let project_id = project_id_of(&orch, &running_issue).await;
     let (_parent_id, parent_num) = add_issue(&orch, &project_id, "Parent").await;
     let (child_id, child_num) = add_issue(&orch, &project_id, "Child").await;
-    // Adopt as a job-bound run so both parent fields are populated.
     let adopt = change_item(
         &format!("cairn://p/CAIRN/{child_num}"),
         ChangeMode::Patch,
@@ -658,8 +859,7 @@ async fn patch_parent_null_orphans_issue() {
     );
     apply_as_run(&orch, &adopt, &run_id).await.unwrap();
     assert!(parent_issue_id_of(&orch, &child_id).await.is_some());
-    assert!(parent_job_id_of(&orch, &child_id).await.is_some());
-    // Orphan clears both the parent and its now-meaningless spawner.
+
     let orphan = change_item(
         &format!("cairn://p/CAIRN/{child_num}"),
         ChangeMode::Patch,
@@ -667,7 +867,6 @@ async fn patch_parent_null_orphans_issue() {
     );
     apply(&orch, &orphan).await.unwrap();
     assert!(parent_issue_id_of(&orch, &child_id).await.is_none());
-    assert!(parent_job_id_of(&orch, &child_id).await.is_none());
 }
 
 #[tokio::test]
@@ -924,6 +1123,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::Node => "cairn://p/CAIRN/1/1/builder",
         K::NodeMessages => "cairn://p/CAIRN/1/1/builder/messages",
         K::NodeProgress => "cairn://p/CAIRN/1/1/builder/progress",
+        K::NodeRebase => "cairn://p/CAIRN/1/1/builder/rebase",
         K::NodeArtifact => "cairn://p/CAIRN/1/1/builder/plan",
         K::NodeTerminal => "cairn://p/CAIRN/1/1/builder/terminal/dev",
         K::NodeRepl => "cairn://p/CAIRN/1/1/builder/repl/analysis",

@@ -165,6 +165,11 @@ pub(super) async fn dispatch(
                 .get("unsubscribe")
                 .ok_or_else(|| build_failure(index, item, "payload.unsubscribe is required"))?;
             let filter = parse_wake_filter(index, item, value, "unsubscribe")?;
+            let created_by = if request.run_id.is_some() {
+                "agent"
+            } else {
+                "user"
+            };
             let job_id = crate::resources::node::resolve_todos_job_id(
                 &orch.db.local,
                 project,
@@ -186,6 +191,7 @@ pub(super) async fn dispatch(
                     &job_id,
                     &filter.kind,
                     filter.reference.as_deref(),
+                    created_by,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;

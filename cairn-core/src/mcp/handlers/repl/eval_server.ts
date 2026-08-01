@@ -12,6 +12,14 @@
 // calls. Because evaluation happens in bun's MAIN realm, `Bun`, `fetch`,
 // `console`, and `process` are all real with zero injection.
 //
+// This server sets no `vars` on its responses, so binding introspection is
+// python-only. A TS REPL's persistent `const`/`let`/`class`/`function`
+// declarations live in the context's global lexical environment (see above),
+// which has no enumeration API: `Object.keys(globalThis)` would report only bare
+// assignments and `var`, confidently omitting the most common declarations. A
+// partial list that looks complete is worse than none, so the host renders an
+// explicit python-only note instead.
+//
 // Framing is protected at the OS file-descriptor level, mirroring eval_server.py:
 // the JSON protocol is written to a private duplicate of the original stdout
 // (PROTOCOL_FD) and the process's own fd 1 is baselined to /dev/null. During each

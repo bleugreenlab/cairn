@@ -24,11 +24,11 @@ use crate::execution::advancement::{
     load_execution_snapshot, load_job, load_nodes_from_execution, load_project_repo_path,
     run_advancement_db, update_execution_snapshot,
 };
-use crate::execution::cache::{get_current_head_sha, is_worktree_dirty, normalize_command};
+use crate::execution::cache::normalize_command;
 use crate::models::{
-    AgentGitConfig, AgentNodeConfig, ContextNodeConfig, DelegatedOutputContract, DelegatedStatus,
-    DelegatedWorkPacket, ExecutionSnapshot, Job, Model, NodePosition, RecipeEdge, RecipeEdgeType,
-    RecipeNode, RecipeNodeType, SchemaConfig, WorktreeMode,
+    AgentGitConfig, AgentNodeConfig, BranchMode, ContextNodeConfig, DelegatedOutputContract,
+    DelegatedStatus, DelegatedWorkPacket, ExecutionSnapshot, Job, Model, NodePosition, RecipeEdge,
+    RecipeEdgeType, RecipeNode, RecipeNodeType, SchemaConfig,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
@@ -339,13 +339,14 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO jobs(id, status, project_id, created_at, updated_at, \
-                     recipe_node_id, parent_job_id, uri_segment) \
-                     VALUES (?1, 'pending', 'proj', 0, 0, ?2, ?3, ?4)",
+                     recipe_node_id, parent_job_id, uri_segment, branch, base_branch) \
+                     VALUES (?1, 'pending', 'proj', 0, 0, ?2, ?3, ?4, ?5, 'main')",
                     params![
                         id.as_str(),
                         recipe_node_id.as_deref(),
                         parent_job_id.as_deref(),
-                        uri_segment.as_deref()
+                        uri_segment.as_deref(),
+                        format!("agent/{id}")
                     ],
                 )
                 .await?;
@@ -615,6 +616,7 @@ mod tests {
             target_handle: "control-in".to_string(),
         };
         let snap = ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),

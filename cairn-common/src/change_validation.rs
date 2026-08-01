@@ -170,6 +170,7 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
             .any(|item| item.get("mode").and_then(|value| value.as_str()) == Some("rename")),
     };
     let mut first_file_without_commit: Option<usize> = None;
+    let mut revert_indices = Vec::new();
 
     for (index, item) in array.iter().enumerate() {
         let item_obj = match item.as_object() {
@@ -222,7 +223,7 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
         };
 
         // --- mode ---
-        match item_obj.get("mode") {
+        let mode = match item_obj.get("mode") {
             None | Some(Value::Null) => {
                 errors.push(ChangeValidationError {
                     index: Some(index),
@@ -232,9 +233,11 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
                         allowed_modes()
                     ),
                 });
+                None
             }
-            Some(Value::String(s)) => {
-                if parse_mode(s).is_none() {
+            Some(Value::String(s)) => match parse_mode(s) {
+                Some(mode) => Some(mode),
+                None => {
                     errors.push(ChangeValidationError {
                         index: Some(index),
                         field: "mode",
@@ -244,8 +247,9 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
                             allowed_modes()
                         ),
                     });
+                    None
                 }
-            }
+            },
             Some(other) => {
                 errors.push(ChangeValidationError {
                     index: Some(index),
@@ -256,6 +260,76 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
                         allowed_modes()
                     ),
                 });
+                None
+            }
+        };
+
+        if mode == Some(ChangeMode::Revert) {
+            revert_indices.push(index);
+
+            if target_str != Some("file:") {
+                errors.push(ChangeValidationError {
+                    index: Some(index),
+                    field: "target",
+                    message: "revert is commit-wide and requires the bare 'file:' target"
+                        .to_string(),
+                });
+            }
+
+            match item_obj.get("payload") {
+                Some(Value::Object(payload)) => {
+                    let extra_keys: Vec<&str> = payload
+                        .keys()
+                        .filter(|key| key.as_str() != "commit")
+                        .map(String::as_str)
+                        .collect();
+                    if !extra_keys.is_empty() {
+                        errors.push(ChangeValidationError {
+                            index: Some(index),
+                            field: "payload",
+                            message: format!(
+                                "revert payload accepts exactly {{commit}}; unexpected key(s): {}",
+                                extra_keys.join(", ")
+                            ),
+                        });
+                    }
+                    match payload.get("commit") {
+                        Some(Value::String(commit))
+                            if commit.len() == 40
+                                && commit.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
+                        Some(Value::String(_)) => errors.push(ChangeValidationError {
+                            index: Some(index),
+                            field: "payload",
+                            message: "revert payload.commit must be a full 40-character hexadecimal commit object ID, not a revset or abbreviation".to_string(),
+                        }),
+                        Some(other) => errors.push(ChangeValidationError {
+                            index: Some(index),
+                            field: "payload",
+                            message: format!(
+                                "revert payload.commit must be a string; got {}",
+                                json_type_name(other)
+                            ),
+                        }),
+                        None => errors.push(ChangeValidationError {
+                            index: Some(index),
+                            field: "payload",
+                            message: "revert requires payload with exactly one key: {commit: \"<full commit object id>\"}".to_string(),
+                        }),
+                    }
+                }
+                Some(other) => errors.push(ChangeValidationError {
+                    index: Some(index),
+                    field: "payload",
+                    message: format!(
+                        "revert requires an object payload {{commit: \"<full commit object id>\"}}; got {}",
+                        json_type_name(other)
+                    ),
+                }),
+                None => errors.push(ChangeValidationError {
+                    index: Some(index),
+                    field: "payload",
+                    message: "revert requires payload with exactly one key: {commit: \"<full commit object id>\"}".to_string(),
+                }),
             }
         }
 
@@ -284,6 +358,40 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
                 }
                 TargetKind::Resource => {}
             }
+        }
+    }
+
+    if !revert_indices.is_empty() {
+        if array.len() != 1 {
+            errors.push(ChangeValidationError {
+                index: None,
+                field: "changes",
+                message: "mode 'revert' must be the sole item in the changes array; it cannot be mixed with other changes".to_string(),
+            });
+        }
+        if obj.contains_key("preview") {
+            errors.push(ChangeValidationError {
+                index: None,
+                field: "preview",
+                message: "revert does not support preview/apply composition; omit 'preview'"
+                    .to_string(),
+            });
+        }
+        if obj.get("atomic") == Some(&Value::Bool(false)) {
+            errors.push(ChangeValidationError {
+                index: None,
+                field: "atomic",
+                message: "revert is always atomic; omit 'atomic' or pass atomic:true".to_string(),
+            });
+        }
+        if obj.get("commit_msg").and_then(Value::as_str) == Some("^") {
+            errors.push(ChangeValidationError {
+                index: None,
+                field: "commit_msg",
+                message:
+                    "revert always creates a new child commit; commit_msg:'^' is not supported"
+                        .to_string(),
+            });
         }
     }
 
@@ -548,5 +656,82 @@ mod tests {
             "commit_msg": "edit"
         }));
         assert!(errors.is_empty(), "unexpected: {errors:?}");
+    }
+
+    fn revert(commit: &str) -> Value {
+        json!({
+            "changes": [{
+                "target": "file:",
+                "mode": "revert",
+                "payload": { "commit": commit }
+            }],
+            "commit_msg": "Revert change"
+        })
+    }
+
+    #[test]
+    fn valid_revert_contract_passes() {
+        let errors = validate_change_value(&revert(&"a".repeat(40)));
+        assert!(errors.is_empty(), "unexpected: {errors:?}");
+    }
+
+    #[test]
+    fn revert_requires_bare_file_target_and_exact_payload() {
+        let errors = validate_change_value(&json!({
+            "changes": [{
+                "target": "file:src/lib.rs",
+                "mode": "revert",
+                "payload": { "commit": "short", "revset": "@" }
+            }],
+            "commit_msg": "Revert change"
+        }));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "target" && e.message.contains("bare 'file:'")));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "payload" && e.message.contains("unexpected key")));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "payload" && e.message.contains("40-character")));
+
+        let missing = validate_change_value(&json!({
+            "changes": [{ "target": "file:", "mode": "revert" }],
+            "commit_msg": "Revert change"
+        }));
+        assert!(missing
+            .iter()
+            .any(|e| e.field == "payload" && e.message.contains("requires payload")));
+    }
+
+    #[test]
+    fn revert_refuses_mixed_preview_non_atomic_and_amend_shapes() {
+        let errors = validate_change_value(&json!({
+            "changes": [
+                { "target": "file:", "mode": "revert", "payload": { "commit": "a".repeat(40) } },
+                { "target": "cairn:~/messages", "mode": "append", "payload": { "content": "done" } }
+            ],
+            "commit_msg": "^",
+            "preview": false,
+            "atomic": false
+        }));
+        for field in ["changes", "preview", "atomic", "commit_msg"] {
+            assert!(
+                errors.iter().any(|e| e.field == field),
+                "missing {field}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn revert_requires_commit_message() {
+        let errors = validate_change_value(&json!({
+            "changes": [{
+                "target": "file:",
+                "mode": "revert",
+                "payload": { "commit": "a".repeat(40) }
+            }]
+        }));
+        assert!(errors.iter().any(|e| e.field == "commit_msg"));
     }
 }

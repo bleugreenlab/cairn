@@ -111,6 +111,7 @@ impl ConfigResource for RecipeResource {
         now: i64,
     ) -> Self::File {
         let recipe = Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
             id,
             name: input.name,
             description: input.description,
@@ -601,6 +602,7 @@ mod tests {
     fn existing_recipe(is_system: bool) -> crate::config::recipes::FileRecipe {
         crate::config::recipes::FileRecipe {
             recipe: Recipe {
+                branch_targets: cairn_db::models::default_branch_targets(),
                 id: "recipe".to_string(),
                 name: "Recipe".to_string(),
                 description: None,

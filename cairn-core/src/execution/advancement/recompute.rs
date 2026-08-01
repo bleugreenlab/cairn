@@ -51,6 +51,38 @@ impl JobStatusChange {
     fn emits_blocked_lifecycle_message(&self) -> bool {
         self.to == JobStatus::Blocked && self.blocked_reason.is_none()
     }
+
+    /// Whether this transition is one after which the issue may have gone
+    /// quiescent, and so should re-evaluate the parent's review wake
+    /// (CAIRN-2483). Every status this sweep can DERIVE in which a job has
+    /// stopped working qualifies; `Running` and `Pending` do not.
+    ///
+    /// `Blocked` is a full member of that set, not an afterthought (CAIRN-3347).
+    /// It is the status of a job parked at a confirmation gate — an agent that
+    /// wrote its declared artifact under a `User` confirm policy derives Blocked
+    /// rather than Complete — and a child stopping to ask for judgment is the
+    /// single most review-worthy thing it can do. `issue_settled` already counts
+    /// a blocked job as settled, so excluding it here contradicted the gate the
+    /// evaluator itself applies.
+    ///
+    /// `Cancelled` is a stopped status too, and is absent on purpose: it is not
+    /// derived. Archiving is an explicit sticky override written by
+    /// `cancel_job_conn`, `derive_job_status` cannot return it, and the sweep
+    /// skips cancelled jobs before deriving anything — so no `JobStatusChange`
+    /// ever carries it and a match arm for it here would be unreachable.
+    ///
+    /// Archival is therefore covered elsewhere, and only partly: the startup
+    /// re-arm's candidate query filters stored status and so recovers archived
+    /// work at restart, but there is no live edge at the moment of archival.
+    /// Cancelling a `pending` DAG-ready job (the one state holding an issue
+    /// unsettled) can settle an issue with reviewable output and evaluate
+    /// nothing until the next status change — tracked in CAIRN-3349.
+    fn settles_for_review(&self) -> bool {
+        matches!(
+            self.to,
+            JobStatus::Complete | JobStatus::Failed | JobStatus::Idle | JobStatus::Blocked
+        )
+    }
 }
 
 struct SweepJob {
@@ -752,7 +784,7 @@ pub async fn recompute_execution_jobs_conn(
                 .unwrap_or_else(|| j.status.clone());
             // Never demote a claimed job back to Pending. Advancement claims a
             // ready job `pending→Running` synchronously, but its turn only goes
-            // live a moment later (worktree setup, session start). A sweep landing
+            // live a moment later (branch preparation, session start). A sweep landing
             // in that start-gap derives Pending (no live turn yet) — honor the
             // claim and leave it Running rather than un-starting and double-starting.
             if current == JobStatus::Running && derived == JobStatus::Pending {
@@ -1328,21 +1360,23 @@ pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Resu
         }
     }
 
-    // CAIRN-2483 review-readiness hook: when a job of an issue flips to a terminal
-    // or Idle status, the whole child issue may have just gone quiescent. Evaluate
-    // review readiness for each such issue — this is the edge that usually fires
-    // LAST for a planbuild child (the review agent completing), and it generalizes
-    // to any recipe shape (e.g. a build-only child settling after its builder
-    // terminalizes and the pr action completes). The evaluator is fully gated and
-    // deduped, so re-evaluation is a cheap idempotent no-op when nothing settled.
+    // CAIRN-2483 review-readiness hook: when a job of an issue stops working, the
+    // whole child issue may have just gone quiescent. Evaluate review readiness for
+    // each such issue — this is the edge that usually fires LAST for a planbuild
+    // child (the review agent completing), and it generalizes to any recipe shape
+    // (e.g. a build-only child settling after its builder terminalizes and the pr
+    // action completes). The evaluator is fully gated and deduped, so
+    // re-evaluation is a cheap idempotent no-op when nothing settled.
+    //
+    // This hook is the COVERING edge, and it has to be: every other edge covers
+    // strictly less. The PR-open edge needs a PR, which a plan gate does not have,
+    // and the turn-end check cadence runs only for branches that ship one
+    // (CAIRN-3334), which a planner's does not. When `settles_for_review` omitted `Blocked`, a planbuild
+    // child's plan gate matched no edge at all and its coordinator was never told
+    // (CAIRN-3347).
     let review_issue_ids: std::collections::HashSet<String> = changes
         .iter()
-        .filter(|change| {
-            matches!(
-                change.to,
-                JobStatus::Complete | JobStatus::Failed | JobStatus::Idle
-            )
-        })
+        .filter(|change| change.settles_for_review())
         .filter_map(|change| change.issue_id.clone())
         .collect();
     for issue_id in review_issue_ids {
@@ -1478,6 +1512,49 @@ mod gate_tests {
         };
 
         assert!(change.emits_blocked_lifecycle_message());
+    }
+
+    /// The review-wake vocabulary, pinned (CAIRN-3347). This hook is the covering
+    /// edge for the coordinator's durable wake — the PR-open edge needs a PR and
+    /// the turn-end check cadence runs only for PR-shipping branches — so a status
+    /// silently missing from this set is a class of child event no coordinator ever
+    /// hears about. `Blocked` is the gate case that was missing: it is what a
+    /// planner derives once its plan awaits confirmation.
+    #[test]
+    fn every_derivable_stopped_status_settles_for_review() {
+        let change = |to: JobStatus| JobStatusChange {
+            job_id: "job-1".to_string(),
+            from: JobStatus::Running,
+            to,
+            issue_id: Some("issue-1".to_string()),
+            project_id: "project-1".to_string(),
+            parent_job_id: None,
+            parent_tool_use_id: None,
+            blocked_reason: None,
+        };
+
+        assert!(
+            change(JobStatus::Blocked).settles_for_review(),
+            "a job parked at a confirmation gate must re-evaluate the parent's review wake"
+        );
+        assert!(change(JobStatus::Complete).settles_for_review());
+        assert!(change(JobStatus::Failed).settles_for_review());
+        assert!(change(JobStatus::Idle).settles_for_review());
+
+        // A job that is still working has not settled anything to review.
+        assert!(!change(JobStatus::Running).settles_for_review());
+        assert!(!change(JobStatus::Pending).settles_for_review());
+
+        // Cancelled is stopped but NOT derived: archiving is an explicit sticky
+        // override, and the sweep skips cancelled jobs before deriving anything, so
+        // no change ever carries it. If that ever stops being true this assertion
+        // fails, which is the point — a newly derivable stopped status has to be
+        // routed deliberately rather than inherited silently.
+        assert!(
+            !change(JobStatus::Cancelled).settles_for_review(),
+            "cancellation is not a derived transition; archived work is covered by \
+             the startup re-arm's stored-status query instead"
+        );
     }
 
     // The gate is now driven by the resolved terminal (context-out) target's
@@ -1626,6 +1703,7 @@ mod artifact_present_tests {
             context_config: None,
         };
         serde_json::to_string(&ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "recipe".to_string(),
                 name: "Recipe".to_string(),
@@ -1674,6 +1752,7 @@ mod artifact_present_tests {
             context_config: None,
         };
         serde_json::to_string(&ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "recipe".to_string(),
                 name: "Recipe".to_string(),
@@ -1706,6 +1785,7 @@ mod artifact_present_tests {
             .expect("bundled recipe parses")
             .into_recipe(Some("default".to_string()), None);
         ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: recipe.id.clone(),
                 name: recipe.name.clone(),
@@ -1781,8 +1861,9 @@ mod artifact_present_tests {
         // The long-running fact is derived from recipe topology, not a node flag:
         // an agent node stands idle at clean turn-end iff it declares no output
         // contract, is a control-terminal, AND its recipe ships no terminal action
-        // (`pr`/`action`) node. Only main-coordinator's `coordinator` agent node
-        // qualifies.
+        // (`pr`/`action`) node. Every shipping recipe derives false; the standing
+        // shape now comes from transforming the Coordinator to the base branch
+        // target rather than from a second recipe file.
         //
         // Every node of every shipping recipe derives false — crucially including
         // planbuild's contract-less review sink, which is node-shape-identical to
@@ -1790,12 +1871,9 @@ mod artifact_present_tests {
         // sits in a recipe that DOES contain a `pr` node. That single recipe-level
         // fact, condition (c), is exactly what separates the two.
         //
-        // `assert_recipe_derivation` checks EVERY node, so it also pins the new
-        // Instruction node in both coordinator recipes to false: an Instruction
-        // node has no agent_config, so it can never derive long-running, and
-        // adding it changes no agent node's derivation (it feeds context-IN only).
-        // Feature (coordinator.yaml) still terminates via its `pr` node; Manager
-        // (main-coordinator.yaml) still stands via its only `coordinator` agent.
+        // `assert_recipe_derivation` checks EVERY node, so it also pins non-agent
+        // nodes (triggers, artifacts, instructions) to false: without an
+        // agent_config a node can never derive long-running.
         let db = test_db().await;
 
         let shipping: &[(&str, &str)] = &[
@@ -1822,16 +1900,22 @@ mod artifact_present_tests {
             assert_recipe_derivation(&db, name, snapshot_from_yaml(yaml), None).await;
         }
 
-        // main-coordinator: the one standing recipe — no terminal action node.
-        // Its `coordinator` agent node is the single node that derives
+        // The Coordinator transformed to the base branch target is the standing
+        // shape: the transform prunes its `pr` node, leaving no terminal action
+        // node, so its `coordinator` agent node is the single node that derives
         // long-running (the board artifact and trigger nodes do not).
-        assert_recipe_derivation(
-            &db,
-            "main-coordinator",
-            snapshot_from_yaml(include_str!("../../../../../recipes/main-coordinator.yaml")),
-            Some("coordinator"),
+        let mut standing =
+            snapshot_from_yaml(include_str!("../../../../../recipes/coordinator.yaml"));
+        crate::execution::branch_target::apply_branch_target(
+            &mut standing,
+            crate::models::BranchTarget::Base,
+            &[
+                crate::models::BranchTarget::New,
+                crate::models::BranchTarget::Base,
+            ],
         )
-        .await;
+        .unwrap();
+        assert_recipe_derivation(&db, "coordinator (base)", standing, Some("coordinator")).await;
     }
 
     #[tokio::test]
@@ -2237,6 +2321,7 @@ mod port_gate_tests {
     /// ctx-self `notes` doc the planner owns.
     fn snapshot_json() -> String {
         let snap = ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),
@@ -2396,6 +2481,7 @@ mod port_gate_tests {
             crate::execution::delegation::resolve_delegated_output_contract(None).unwrap();
         let artifact_name = contract.artifact_name();
         let mut snap = ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "R".to_string(),

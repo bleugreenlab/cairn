@@ -15,28 +15,17 @@
 //! archived node never blocks, triggers, or wedges the execution.
 //!
 //! The DB half (validate + cancel) is a pure, testable connection-level routine.
-//! Filesystem teardown of any worktree a cancelled job exclusively owned is
-//! handed back to the caller as a set of [`TeardownTarget`]s and performed
-//! through [`crate::execution::teardown::teardown_removed_node_worktrees`],
-//! since the worktree removal needs host git/fs services and must run outside
-//! the DB transaction. Branches are preserved (worktrees are disposable; commit
-//! history is not).
+//! Branch coordinates and transcript history remain durable; lifetime executor
+//! resources are reclaimed by their canonical owners.
 
 use super::*;
-use crate::execution::teardown::TeardownTarget;
-use std::collections::BTreeMap;
 
-/// Outcome of reconciling removed nodes: the job rows archived (cancelled) and
-/// the worktree paths now owned by nobody (eligible for filesystem teardown).
+/// Outcome of reconciling removed nodes: the job rows archived (cancelled).
 #[derive(Debug, Default, Clone)]
 pub struct RemovedNodesReconcile {
     /// Ids of the jobs flipped to `cancelled` for removed nodes. Their rows and
     /// transcript history are preserved.
     pub cancelled_job_ids: Vec<String>,
-    /// Worktree paths exclusively owned by the cancelled jobs. A path still
-    /// referenced by a surviving job is never included (inheritance fan-out /
-    /// shared worktrees stay intact).
-    pub worktree_targets: Vec<TeardownTarget>,
 }
 
 impl RemovedNodesReconcile {
@@ -49,17 +38,13 @@ struct ExecutionJobRow {
     id: String,
     recipe_node_id: Option<String>,
     status: String,
-    worktree_path: Option<String>,
-    branch: Option<String>,
-    project_id: String,
 }
 
 /// Validate and archive jobs whose recipe nodes were removed from the snapshot.
 ///
 /// Rejects (returns `Err`, before any mutation) when a removed node's job is
 /// `running` or `complete`. Pending, failed, and blocked jobs are archivable:
-/// each is flipped to `cancelled` with its transcript preserved, and any
-/// worktree it exclusively owned is returned for filesystem teardown.
+/// each is flipped to `cancelled` with its transcript and branch coordinate preserved.
 pub(crate) async fn reconcile_removed_nodes_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
@@ -71,7 +56,7 @@ pub(crate) async fn reconcile_removed_nodes_conn(
 
     let mut rows = conn
         .query(
-            "SELECT id, recipe_node_id, status, worktree_path, branch, project_id
+            "SELECT id, recipe_node_id, status
              FROM jobs
              WHERE execution_id = ?1",
             (execution_id,),
@@ -83,28 +68,17 @@ pub(crate) async fn reconcile_removed_nodes_conn(
             id: row.text(0)?,
             recipe_node_id: row.opt_text(1)?,
             status: row.text(2)?,
-            worktree_path: row.opt_text(3)?,
-            branch: row.opt_text(4)?,
-            project_id: row.text(5)?,
         });
     }
 
-    // Partition into the jobs being removed and the worktree paths still held by
-    // surviving jobs (so a shared/inherited path is never torn down).
-    let mut removed: Vec<&ExecutionJobRow> = Vec::new();
-    let mut surviving_paths: HashSet<String> = HashSet::new();
-    for job in &all_jobs {
-        let is_removed = job
-            .recipe_node_id
-            .as_deref()
-            .map(|node_id| removed_node_ids.contains(node_id))
-            .unwrap_or(false);
-        if is_removed {
-            removed.push(job);
-        } else if let Some(path) = &job.worktree_path {
-            surviving_paths.insert(path.clone());
-        }
-    }
+    let removed: Vec<&ExecutionJobRow> = all_jobs
+        .iter()
+        .filter(|job| {
+            job.recipe_node_id
+                .as_deref()
+                .is_some_and(|node_id| removed_node_ids.contains(node_id))
+        })
+        .collect();
 
     // Server-side immutability: running and complete nodes can never be dropped,
     // whatever the editor allowed. Reject before mutating anything.
@@ -118,46 +92,13 @@ pub(crate) async fn reconcile_removed_nodes_conn(
         }
     }
 
-    // Group orphaned worktree paths into teardown targets, then archive the jobs.
-    let mut path_groups: BTreeMap<String, (Option<String>, String, Vec<String>)> = BTreeMap::new();
-    let mut cancelled_job_ids = Vec::with_capacity(removed.len());
-    for job in &removed {
-        cancelled_job_ids.push(job.id.clone());
-        if let Some(path) = &job.worktree_path {
-            if !surviving_paths.contains(path) {
-                let repo_path = project_repo_path_conn(conn, &job.project_id).await?;
-                let entry = path_groups
-                    .entry(path.clone())
-                    .or_insert_with(|| (job.branch.clone(), repo_path, Vec::new()));
-                if entry.0.is_none() {
-                    entry.0 = job.branch.clone();
-                }
-                entry.2.push(job.id.clone());
-            }
-        }
-    }
-
+    let cancelled_job_ids = removed.iter().map(|job| job.id.clone()).collect();
     let now = chrono::Utc::now().timestamp();
     for job in &removed {
         cancel_job_conn(conn, &job.id, now).await?;
     }
 
-    let worktree_targets = path_groups
-        .into_iter()
-        .map(
-            |(worktree_path, (branch, repo_path, job_ids))| TeardownTarget {
-                worktree_path,
-                branch,
-                repo_path,
-                job_ids,
-            },
-        )
-        .collect();
-
-    Ok(RemovedNodesReconcile {
-        cancelled_job_ids,
-        worktree_targets,
-    })
+    Ok(RemovedNodesReconcile { cancelled_job_ids })
 }
 
 /// Blocking wrapper over [`reconcile_removed_nodes_conn`] for host command paths.
@@ -181,21 +122,6 @@ pub fn reconcile_removed_nodes(
     })
 }
 
-async fn project_repo_path_conn(
-    conn: &cairn_db::turso::Connection,
-    project_id: &str,
-) -> DbResult<String> {
-    let mut rows = conn
-        .query(
-            "SELECT repo_path FROM projects WHERE id = ?1",
-            (project_id,),
-        )
-        .await?;
-    Ok(crate::storage::next_text(&mut rows, 0)
-        .await?
-        .unwrap_or_default())
-}
-
 /// Archive a job: flip it to `cancelled` and close any open session, leaving the
 /// transcript (runs, events, turns, sessions, artifacts) intact for history.
 ///
@@ -203,7 +129,11 @@ async fn project_repo_path_conn(
 /// it (see `recompute`), so this single write is durable. Closing the open
 /// session (without deleting it) keeps the resume/warm-process machinery from
 /// treating an archived job as live work while preserving its record.
-async fn cancel_job_conn(
+///
+/// Two callers share it: removing a node from a live snapshot, and confirming a
+/// terminal issue resolution, which cancels the DAG entries that never started
+/// (`issues::status`).
+pub(crate) async fn cancel_job_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     now: i64,
@@ -326,14 +256,14 @@ mod tests {
         id: &str,
         node_id: &str,
         status: &str,
-        worktree_path: Option<&str>,
+        _coordinate_hint: Option<&str>,
         with_session: bool,
     ) {
         conn.execute(
             "INSERT INTO jobs (id, execution_id, recipe_node_id, status, project_id, issue_id,
-                 worktree_path, created_at, updated_at)
-             VALUES (?1,'exec-1',?2,?3,'proj-1','issue-1',?4,1,1)",
-            params![id, node_id, status, worktree_path],
+                 created_at, updated_at)
+             VALUES (?1,'exec-1',?2,?3,'proj-1','issue-1',1,1)",
+            params![id, node_id, status],
         )
         .await
         .unwrap();
@@ -421,10 +351,6 @@ mod tests {
                     .unwrap();
 
                 assert_eq!(outcome.cancelled_job_ids, vec!["job-drop".to_string()]);
-                assert!(
-                    outcome.worktree_targets.is_empty(),
-                    "pending job has no worktree"
-                );
                 // Archived, not erased: the job and its whole transcript remain.
                 assert_eq!(
                     job_status(conn, "job-drop").await.as_deref(),
@@ -592,7 +518,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn reports_orphaned_worktree_but_keeps_shared_path() {
+    async fn reports_orphaned_job_but_keeps_shared_coordinate() {
         let db = migrated_db().await;
         db.write(|conn| {
             Box::pin(async move {
@@ -606,7 +532,7 @@ mod tests {
                     vec![control_edge("e1", "trigger", "keep")],
                 );
                 seed_project_issue_execution(conn, &snap).await;
-                // Surviving job holds /tmp/wt-shared.
+                // Surviving job uses its own branch coordinate.
                 seed_job(
                     conn,
                     "job-keep",
@@ -616,7 +542,7 @@ mod tests {
                     true,
                 )
                 .await;
-                // Removed failed job owns its own worktree exclusively.
+                // Removed failed job retains its historical branch coordinate.
                 seed_job(
                     conn,
                     "job-own",
@@ -626,7 +552,7 @@ mod tests {
                     true,
                 )
                 .await;
-                // Removed blocked job shares the surviving job's worktree path.
+                // Removed blocked job is archived independently of physical paths.
                 seed_job(
                     conn,
                     "job-shared",
@@ -645,14 +571,9 @@ mod tests {
                     .unwrap();
 
                 assert_eq!(
-                    outcome.worktree_targets.len(),
-                    1,
-                    "only the exclusively-owned path"
+                    outcome.cancelled_job_ids,
+                    vec!["job-own".to_string(), "job-shared".to_string()]
                 );
-                let target = &outcome.worktree_targets[0];
-                assert_eq!(target.worktree_path, "/tmp/wt-own");
-                assert_eq!(target.repo_path, "/tmp/repo");
-                assert_eq!(target.job_ids, vec!["job-own".to_string()]);
                 // Both removed jobs are archived (cancelled), not deleted.
                 assert_eq!(
                     job_status(conn, "job-own").await.as_deref(),

@@ -19,24 +19,24 @@ impl GitAuthor {
 }
 
 fn run_git_output(
-    worktree_path: &Path,
+    repository_path: &Path,
     args: &[&str],
     failure_context: &str,
 ) -> Result<Output, String> {
     crate::env::git()
         .args(args)
-        .current_dir(worktree_path)
+        .current_dir(repository_path)
         .output()
         .map_err(|e| format!("{failure_context}: {e}"))
 }
 
 fn git_stdout(
-    worktree_path: &Path,
+    repository_path: &Path,
     args: &[&str],
     failure_context: &str,
     command_name: &str,
 ) -> Result<String, String> {
-    let output = run_git_output(worktree_path, args, failure_context)?;
+    let output = run_git_output(repository_path, args, failure_context)?;
     if !output.status.success() {
         return Err(format!(
             "{command_name} failed: {}",
@@ -59,18 +59,18 @@ pub struct CommitResult {
     pub(crate) amend_note: Option<String>,
 }
 
-pub fn current_commit(worktree_path: &Path) -> Result<String, String> {
+pub fn current_commit(repository_path: &Path) -> Result<String, String> {
     git_stdout(
-        worktree_path,
+        repository_path,
         &["rev-parse", "HEAD"],
         "Failed to run git rev-parse HEAD",
         "git rev-parse HEAD",
     )
 }
 
-pub fn current_branch(worktree_path: &Path) -> Result<String, String> {
+pub fn current_branch(repository_path: &Path) -> Result<String, String> {
     git_stdout(
-        worktree_path,
+        repository_path,
         &["rev-parse", "--abbrev-ref", "HEAD"],
         "Failed to run git rev-parse --abbrev-ref HEAD",
         "git rev-parse --abbrev-ref HEAD",
@@ -78,10 +78,10 @@ pub fn current_branch(worktree_path: &Path) -> Result<String, String> {
 }
 
 /// Return true when the worktree has a configured, non-empty `origin` remote.
-pub(crate) fn has_remote(worktree_path: &Path) -> bool {
+pub(crate) fn has_remote(repository_path: &Path) -> bool {
     crate::env::git()
         .args(["remote", "get-url", "origin"])
-        .current_dir(worktree_path)
+        .current_dir(repository_path)
         .output()
         .ok()
         .filter(|output| output.status.success())

@@ -2,10 +2,9 @@
 //! code navigation, backed by the in-process ast-grep engine (`crate::symbols`).
 //!
 //! The node-scoped resource (`cairn://p/PROJ/N/EXEC/NODE/symbols[/<symbol>]`)
-//! queries the node's worktree; the project-scoped fallback
-//! (`cairn://p/PROJ/symbols[/<symbol>]`) roots at the project's main checkout.
-//! Both parse files on demand — no language server, no index, no per-worktree
-//! warmup. The read view layer adds the canonical `=== uri ===` header.
+//! resolves the node's authenticated branch coordinate; the project-scoped
+//! fallback (`cairn://p/PROJ/symbols[/<symbol>]`) roots at the user's explicit
+//! live checkout. Both parse files on demand with no language-server index.
 
 use std::path::{Path, PathBuf};
 
@@ -52,14 +51,50 @@ pub(crate) async fn read_node_symbols(
         Ok(job) => job,
         Err(error) => return format!("Error loading node job: {error}"),
     };
-    let worktree = match job.worktree_path.as_deref() {
-        Some(path) if Path::new(path).exists() => PathBuf::from(path),
-        _ => {
-            return "instance unavailable — worktree for this node is gone (it may have been cleaned up)"
-                .to_string()
-        }
+    let Some(branch) = job.branch.as_deref() else {
+        return "instance unavailable — node has no branch".to_string();
     };
-    dispatch(&worktree, symbol, params)
+    let run_id = match latest_run_id_for_job(&db, &job.id).await {
+        Ok(run_id) => run_id,
+        Err(error) => return error,
+    };
+    let request = crate::mcp::types::McpCallbackRequest {
+        thread_id: None,
+        cwd: String::new(),
+        run_id: Some(run_id),
+        tool: "read".into(),
+        payload: serde_json::Value::Null,
+        tool_use_id: None,
+    };
+    let resolution =
+        match crate::mcp::handlers::branch::resolve_for_read(orch, &request, branch).await {
+            Ok(resolution) => resolution,
+            Err(error) => return error.to_string(),
+        };
+    let service = match crate::mcp::handlers::read::object_read::ObjectReadService::new(
+        resolution.object_repository_path.clone(),
+        resolution.commit_id,
+        String::new(),
+    ) {
+        Ok(service) => service,
+        Err(error) => return error,
+    };
+    let files = match orch.project_overlays.files(
+        &resolution.project_id,
+        &resolution.object_repository_path,
+        &resolution.default_commit_id,
+        service.commit_id(),
+        "",
+        service.limits(),
+    ) {
+        Ok(files) => files,
+        Err(error) => return error.to_string(),
+    };
+    let texts = files
+        .into_iter()
+        .filter_map(|(path, bytes)| String::from_utf8(bytes).ok().map(|text| (path, text)))
+        .collect::<Vec<_>>();
+    dispatch_texts(&texts, symbol, params)
 }
 
 pub(crate) async fn read_project_symbols(
@@ -88,6 +123,28 @@ pub(crate) async fn read_project_symbols(
     dispatch(&worktree, symbol, params)
 }
 
+async fn latest_run_id_for_job(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+) -> Result<String, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn.query(
+            "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            (job_id.as_str(),),
+        ).await?;
+            rows.next()
+                .await?
+                .map(|row| row.text(0))
+                .transpose()?
+                .ok_or_else(|| crate::storage::DbError::internal("run for node job not found"))
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 async fn project_repo_path(
     conn: &cairn_db::turso::Connection,
     project_key: &str,
@@ -110,6 +167,42 @@ async fn project_repo_path(
             .map_err(|error| format!("Failed to decode project: {error}")),
         None => Err(format!("No project found with key '{key}'")),
     }
+}
+
+fn parse_query(
+    params: &[QueryParam],
+) -> Result<(Option<SymbolOp>, Option<String>, NavProjection), String> {
+    if let Some(unsupported) = params
+        .iter()
+        .find(|param| !SYMBOL_KEYS.contains(&param.key.as_str()))
+    {
+        return Err(format!(
+            "Unsupported query parameter '{}' for symbol resources (supported: {})",
+            unsupported.key,
+            SYMBOL_KEYS.join(", ")
+        ));
+    }
+    let glob = find_query_value(params, "in").map(str::to_string);
+    let op = match find_query_value(params, "op") {
+        None | Some("") => None,
+        Some(name) => Some(SymbolOp::from_name(name).ok_or_else(|| format!("Unknown symbol op '{name}' (definition|references|callers|implementations; absent op = overview)"))?),
+    };
+    Ok((op, glob, build_projection(params)?))
+}
+
+fn dispatch_texts(
+    files: &[(String, String)],
+    symbol: Option<&str>,
+    params: &[QueryParam],
+) -> String {
+    let Some(symbol) = symbol else {
+        return "append a symbol name, e.g. `/IssueStatus`".to_string();
+    };
+    let (op, glob, projection) = match parse_query(params) {
+        Ok(query) => query,
+        Err(error) => return error,
+    };
+    crate::symbols::nav::query_texts(files, op, symbol, glob.as_deref(), &projection).body
 }
 
 fn dispatch(worktree: &Path, symbol: Option<&str>, params: &[QueryParam]) -> String {

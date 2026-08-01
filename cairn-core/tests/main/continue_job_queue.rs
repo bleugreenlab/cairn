@@ -120,6 +120,90 @@ async fn queued_rows(db: &LocalDb, job_id: &str) -> Vec<(String, String)> {
     .unwrap()
 }
 
+/// (key, wake) of every catch-up push addressed to `recipient`.
+async fn catchup_pushes(db: &LocalDb, recipient: &str) -> Vec<(String, String)> {
+    let recipient = recipient.to_string();
+    db.read(|conn| {
+        let recipient = recipient.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT key, wake FROM attention_pushes
+                     WHERE recipient = ?1 AND key LIKE 'catchup:%' ORDER BY created_at ASC",
+                    params![recipient.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push((row.text(0)?, row.text(1)?));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// Parent the seeded issue under a new issue driven by a coordinator job, so the
+/// child has a derived watcher.
+async fn seed_coordinating_parent(db: &LocalDb) {
+    db.write(|conn| {
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+                 VALUES ('parent-issue', 'proj-1', 41, 'parent issue', 1, 1)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "UPDATE issues SET parent_issue_id = 'parent-issue' WHERE id = 'issue-1'",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO jobs (id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+                 VALUES ('coordinator', 'proj-1', 'parent-issue', 'running', 'session-c', 1, 1)",
+                (),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+/// CAIRN-3342: the desktop composer is where operator→child messages actually
+/// enter the system, and until this it produced nothing for the jobs watching
+/// the child — so the person with the most authority to change a child's scope
+/// was the one participant a coordinator never heard from. A queued send now
+/// leaves the coordinator a passive catch-up row, and only a passive one: an
+/// operator conversation must not cost a coordinator turn per message.
+///
+/// This pins the composer seam — that the push is created at all, which is the
+/// half that was dead. What that push carries, including the busy-child ordering
+/// where the text is still queued and not yet in the transcript, is proven by the
+/// digest tests in `orchestrator::attention_delivery`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_queued_operator_message_leaves_the_watching_coordinator_a_passive_catchup() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    seed_job(&orch.db.local, "running").await;
+    seed_coordinating_parent(&orch.db.local).await;
+
+    continue_job_or_enqueue(&orch, "job-1", Some("also ship the trusted producer"), None)
+        .expect("queued send must return Ok");
+
+    assert_eq!(
+        catchup_pushes(&orch.db.local, "coordinator").await,
+        vec![("catchup:job-1".to_string(), "passive".to_string())],
+        "the coordinating job gets one passive catch-up for the operator's message"
+    );
+    assert!(
+        catchup_pushes(&orch.db.local, "job-1").await.is_empty(),
+        "the addressed node never receives catch-up for its own chat"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn continue_job_or_enqueue_queues_when_head_turn_running() {
     let (_temp, orch) = common::test_orchestrator().await;

@@ -280,12 +280,17 @@ pub struct FinalizedStream {
     pub outbox_entries: Vec<OutboxEntry>,
 }
 
+/// A transcript event awaiting persistence.
+///
+/// Deliberately carries no `sequence`: the ordering key is allocated by
+/// [`insert_event_conn`] inside the same write transaction as the INSERT that
+/// consumes it, so no caller can hold, guess, or desynchronize one. See
+/// [`next_sequence_conn`].
 #[derive(Debug, Clone)]
 pub struct EventInsert {
     pub id: String,
     pub run_id: String,
     pub session_id: Option<String>,
-    pub sequence: i32,
     pub timestamp: i32,
     pub event_type: String,
     pub data: String,
@@ -307,18 +312,6 @@ pub struct EventInsert {
 struct EmbedEventPayload {
     event_id: String,
     data_json: String,
-}
-
-pub fn get_next_sequence(db: Arc<LocalDb>, run_id: &str) -> Result<i32, String> {
-    let run_id = run_id.to_string();
-    block_on_stream_db(async move {
-        db.read(|conn| {
-            let run_id = run_id.clone();
-            Box::pin(async move { get_next_sequence_conn(conn, &run_id).await })
-        })
-        .await
-        .map_err(|e| e.to_string())
-    })
 }
 
 pub fn insert_event(db: Arc<LocalDb>, event: EventInsert) -> Result<bool, String> {
@@ -527,7 +520,30 @@ async fn record_read_tokens_if_applicable(conn: &Connection, event: &EventInsert
     Ok(())
 }
 
+/// Insert a transcript event, allocating its `sequence` from the database in
+/// this same transaction.
+///
+/// This is the ONLY place a live transcript event's ordering key comes from.
+/// Allocating here — rather than from a counter a caller carries — is what makes
+/// `(run_id, sequence)` unique by construction: the read that computes the next
+/// value and the write that consumes it cannot be separated by another writer
+/// (CAIRN-3290).
 pub async fn insert_event_conn(conn: &Connection, event: &EventInsert) -> DbResult<u64> {
+    let sequence = next_sequence_conn(conn, &event.run_id).await?;
+    insert_event_at_conn(conn, event, sequence).await
+}
+
+/// Insert a transcript event at an already-reserved `sequence`.
+///
+/// The only legitimate reservation is a `message_streams` row: [`open_stream`]
+/// allocates the sequence when the message STARTS so the finalized event sorts
+/// where the message began rather than where it ended. [`next_sequence_conn`]
+/// counts open stream rows, so a reservation is never handed out twice.
+async fn insert_event_at_conn(
+    conn: &Connection,
+    event: &EventInsert,
+    sequence: i32,
+) -> DbResult<u64> {
     let count = conn
         .execute(
             "INSERT INTO events(
@@ -540,7 +556,7 @@ pub async fn insert_event_conn(conn: &Connection, event: &EventInsert) -> DbResu
                 event.id.as_str(),
                 event.run_id.as_str(),
                 event.session_id.as_deref(),
-                event.sequence,
+                sequence,
                 event.timestamp,
                 event.event_type.as_str(),
                 event.data.as_str(),
@@ -586,13 +602,17 @@ pub async fn insert_event_conn(conn: &Connection, event: &EventInsert) -> DbResu
     Ok(count)
 }
 
+/// Open a streaming message row, reserving its transcript `sequence` now.
+///
+/// The reservation is allocated inside this write transaction and is visible to
+/// [`next_sequence_conn`] for as long as the row exists, so events written while
+/// the message streams sort AFTER it instead of colliding with it (CAIRN-3290).
 pub fn open_stream(
     db: Arc<LocalDb>,
     run_id: &str,
     session_id: Option<&str>,
     turn_id: Option<&str>,
     backend: &str,
-    sequence: Option<i32>,
 ) -> Result<ActiveMessageStream, String> {
     let run_id = run_id.to_string();
     let session_id = session_id.map(str::to_string);
@@ -605,12 +625,11 @@ pub fn open_stream(
             let turn_id = turn_id.clone();
             let backend = backend.clone();
             Box::pin(async move {
-                let sequence = match sequence {
-                    Some(sequence) => sequence,
-                    None => get_next_sequence_conn(conn, &run_id).await?,
-                };
                 let now = chrono::Utc::now().timestamp() as i32;
                 abort_active_streams_for_run_conn(conn, &run_id, now, "superseded").await?;
+                // Allocated AFTER superseding orphans so an abandoned open row
+                // cannot hold the run's high-water mark past its own message.
+                let sequence = next_sequence_conn(conn, &run_id).await?;
 
                 let stream_id = Uuid::new_v4().to_string();
                 conn.execute(
@@ -851,13 +870,12 @@ pub fn finalize_stream(
                         .clone()
                         .unwrap_or_else(|| stream.id.clone());
                     if !event_exists_conn(conn, &event_id).await? {
-                        insert_event_conn(
+                        insert_event_at_conn(
                             conn,
                             &EventInsert {
                                 id: event_id.clone(),
                                 run_id: stream.run_id.clone(),
                                 session_id: stream.session_id.clone(),
-                                sequence: stream.sequence,
                                 timestamp: stream.created_at,
                                 event_type: final_event.event_type.clone(),
                                 data: data_json.clone(),
@@ -871,6 +889,7 @@ pub fn finalize_stream(
                                 turn_id: stream.turn_id.clone(),
                                 cost_usd: None,
                             },
+                            stream.sequence,
                         )
                         .await?;
                     }
@@ -1217,16 +1236,28 @@ async fn abort_stream_conn(
     Ok(())
 }
 
-async fn get_next_sequence_conn(conn: &Connection, run_id: &str) -> DbResult<i32> {
+/// The run's next free transcript `sequence`.
+///
+/// The high-water mark spans BOTH tables that hold one: persisted `events` and
+/// the `message_streams` rows that have reserved a slot but not yet finalized
+/// into an event. Reading only `events` is what let a reserved slot be handed
+/// out twice (CAIRN-3290).
+///
+/// Call this only from inside the write transaction that consumes the result.
+pub(crate) async fn next_sequence_conn(conn: &Connection, run_id: &str) -> DbResult<i32> {
     let event_max = max_sequence_conn(
         conn,
         "SELECT MAX(sequence) FROM events WHERE run_id = ?1",
         run_id,
     )
     .await?;
+    // Only a stream that can still become an event holds a live reservation. An
+    // aborted row never finalizes, so its slot is released rather than leaving a
+    // permanent hole; a finalized row's slot is already covered by its event.
     let stream_max = max_sequence_conn(
         conn,
-        "SELECT MAX(sequence) FROM message_streams WHERE run_id = ?1",
+        "SELECT MAX(sequence) FROM message_streams
+         WHERE run_id = ?1 AND status IN ('open', 'finalizing')",
         run_id,
     )
     .await?;
@@ -1589,19 +1620,134 @@ mod tests {
         .unwrap()
     }
 
+    fn test_event(id: &str, run_id: &str) -> EventInsert {
+        EventInsert {
+            id: id.to_string(),
+            run_id: run_id.to_string(),
+            session_id: Some("session-1".to_string()),
+            timestamp: 0,
+            event_type: "assistant".to_string(),
+            data: "{}".to_string(),
+            parent_tool_use_id: None,
+            created_at: 0,
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_create_tokens: None,
+            output_tokens: None,
+            thinking_tokens: None,
+            turn_id: None,
+            cost_usd: None,
+        }
+    }
+
+    async fn sequences(db: &LocalDb, run_id: &str) -> Vec<i64> {
+        let run_id = run_id.to_string();
+        db.query_all(
+            "SELECT sequence FROM events WHERE run_id = ?1 ORDER BY sequence ASC",
+            (run_id,),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// CAIRN-3290: the slot `open_stream` reserves belongs to the message that is
+    /// still streaming. An event written while it is open must take the NEXT
+    /// slot, so the finalized message keeps the position where it began.
+    ///
+    /// This is the exact collision behind the filed corruption: the reader stored
+    /// a `tool_result` at the same number the open stream was holding.
+    #[tokio::test]
+    async fn an_open_stream_holds_its_reserved_slot_against_other_events() {
+        let (_temp, db) = test_db().await;
+        insert_run(&db, "run-1").await;
+
+        assert!(insert_event(db.clone(), test_event("before", "run-1")).unwrap());
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
+        assert_eq!(
+            opened.stream.sequence, 1,
+            "the stream reserves the next slot"
+        );
+
+        assert!(insert_event(db.clone(), test_event("during", "run-1")).unwrap());
+        assert_eq!(
+            sequences(&db, "run-1").await,
+            vec![0, 2],
+            "an event written mid-stream must not take the reservation"
+        );
+
+        finalize_stream(
+            db.clone(),
+            db.clone(),
+            opened.stream_id(),
+            opened.version(),
+            None,
+            TokenCounts::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            sequences(&db, "run-1").await,
+            vec![0, 1, 2],
+            "the finalized message fills the slot it reserved when it started"
+        );
+    }
+
+    /// An aborted stream never becomes an event, so it must release its slot
+    /// instead of leaving the run's high-water mark permanently ahead.
+    #[tokio::test]
+    async fn an_aborted_stream_releases_its_reserved_slot() {
+        let (_temp, db) = test_db().await;
+        insert_run(&db, "run-1").await;
+
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
+        abort_stream(db.clone(), opened.stream_id(), opened.version(), "test").unwrap();
+
+        assert!(insert_event(db.clone(), test_event("after-abort", "run-1")).unwrap());
+        assert_eq!(sequences(&db, "run-1").await, vec![0]);
+    }
+
+    /// CAIRN-3290: concurrent writers on one run each get their own slot.
+    ///
+    /// The orchestrator writes attention briefings, user events and system
+    /// notices for a run that a backend reader is writing to at the same time.
+    /// While allocation was a read separated from its insert, those racing
+    /// writers landed on the same number — which is why duplicated slots span
+    /// `system:init`, `attention:briefing` and `system:message` and not just the
+    /// streaming path. Allocating inside the insert transaction makes the write
+    /// conflict visible to the engine, and the transaction retry re-allocates.
+    #[tokio::test]
+    async fn concurrent_writers_on_one_run_never_share_a_slot() {
+        const WRITERS: usize = 8;
+        let (_temp, db) = test_db().await;
+        insert_run(&db, "run-1").await;
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let db = db.clone();
+                tokio::task::spawn_blocking(move || {
+                    insert_event(db, test_event(&format!("evt-{i}"), "run-1"))
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(
+                handle.await.unwrap().unwrap(),
+                "every concurrent write must land"
+            );
+        }
+
+        assert_eq!(
+            sequences(&db, "run-1").await,
+            (0..WRITERS as i64).collect::<Vec<_>>(),
+            "concurrent writers must produce exactly 0..n"
+        );
+    }
+
     #[tokio::test]
     async fn stream_round_trip_and_reconstruct() {
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
-        let opened = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
         append_chunks(
             db.clone(),
             opened.stream_id(),
@@ -1625,15 +1771,7 @@ mod tests {
     async fn stale_append_is_rejected() {
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
-        let opened = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
         append_chunks(
             db.clone(),
             opened.stream_id(),
@@ -1663,7 +1801,6 @@ mod tests {
             id: "evt-1".to_string(),
             run_id: "run-1".to_string(),
             session_id: Some("session-1".to_string()),
-            sequence: 0,
             timestamp: 0,
             event_type: "assistant".to_string(),
             data: "{}".to_string(),
@@ -1706,15 +1843,7 @@ mod tests {
         let capturing = Arc::new(CapturingEmitter::new());
         let emitter: Arc<dyn crate::services::EventEmitter> = capturing.clone();
 
-        let opened = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
         let appended = append_chunks(
             db.clone(),
             opened.stream_id(),
@@ -1749,15 +1878,7 @@ mod tests {
     async fn finalize_is_idempotent() {
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
-        let opened = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
         let appended = append_chunks(
             db.clone(),
             opened.stream_id(),
@@ -1791,15 +1912,7 @@ mod tests {
     async fn append_chunks_persists_buffered_without_reconstruct() {
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
-        let opened = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
         // A single flush carries several buffered chunks at once.
         let result = append_chunks(
             db.clone(),
@@ -1828,15 +1941,7 @@ mod tests {
     async fn finalize_after_buffered_flush_has_full_content() {
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
-        let opened = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let opened = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
         let appended = append_chunks(
             db.clone(),
             opened.stream_id(),
@@ -1865,24 +1970,9 @@ mod tests {
         insert_run_with_session(&db, "run-zombie", "session-1").await;
         insert_run_with_session(&db, "run-live", "session-1").await;
 
-        let zombie = open_stream(
-            db.clone(),
-            "run-zombie",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
-        let live = open_stream(
-            db.clone(),
-            "run-live",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let zombie =
+            open_stream(db.clone(), "run-zombie", Some("session-1"), None, "claude").unwrap();
+        let live = open_stream(db.clone(), "run-live", Some("session-1"), None, "claude").unwrap();
 
         let active = find_active_stream_for_session(db.clone(), "session-1")
             .unwrap()
@@ -1896,24 +1986,8 @@ mod tests {
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
 
-        let zombie = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
-        let live = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(1),
-        )
-        .unwrap();
+        let zombie = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
+        let live = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
 
         assert_eq!(stream_status(&db, zombie.stream_id()).await, "aborted");
         let active = find_active_stream_for_run(db.clone(), "run-1")
@@ -1926,15 +2000,7 @@ mod tests {
     async fn startup_reconcile_aborts_orphaned_streams() {
         let (_temp, db) = test_db().await;
         insert_run(&db, "run-1").await;
-        let orphan = open_stream(
-            db.clone(),
-            "run-1",
-            Some("session-1"),
-            None,
-            "claude",
-            Some(0),
-        )
-        .unwrap();
+        let orphan = open_stream(db.clone(), "run-1", Some("session-1"), None, "claude").unwrap();
 
         let count = reconcile_orphaned_streams(db.clone(), "startup_reconcile").unwrap();
         assert_eq!(count, 1);
@@ -2026,7 +2092,6 @@ mod tests {
             Some("session-1"),
             None,
             "claude",
-            Some(0),
         )
         .unwrap();
         let appended = append_chunks(

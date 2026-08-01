@@ -8,13 +8,12 @@
 //! dispatched verb rather than an alias.
 
 use super::http::{build_provider_object, post_chat_completion};
-use super::wire::{ChatMessage, ChatResponse};
-use super::{
-    context, conversation, openrouter_api_key, OPENROUTER_BACKEND_KEY, OPENROUTER_BACKEND_NAME,
-};
+use super::{openrouter_api_key, OPENROUTER_BACKEND_KEY, OPENROUTER_BACKEND_NAME};
 use crate::backends::http_loop::{
-    render_tool_result, repair, Generation, TurnToolCall, WireAdapter,
+    render_tool_result, repair, Connection, Generation, TurnToolCall, WireAdapter,
 };
+use crate::backends::openai_compat::wire::{ChatContent, ChatMessage, ChatResponse};
+use crate::backends::openai_compat::{context, conversation};
 use crate::backends::SessionConfig;
 use crate::dispatch::DispatchOutput;
 use crate::orchestrator::Orchestrator;
@@ -54,8 +53,10 @@ impl WireAdapter for OpenRouterAdapter {
         "openrouter/auto"
     }
 
-    fn api_key(&self, orch: &Orchestrator) -> Option<String> {
+    fn connection(&self, orch: &Orchestrator) -> Result<Connection, String> {
         openrouter_api_key(orch)
+            .map(|api_key| Connection { api_key: Some(api_key) })
+            .ok_or_else(|| "OpenRouter API key not configured. Add an OpenRouter API key in Settings → Providers.".to_string())
     }
 
     fn build_conversation(
@@ -87,27 +88,28 @@ impl WireAdapter for OpenRouterAdapter {
         &self,
         orch: &Orchestrator,
         run_db: &Arc<LocalDb>,
-        api_key: &str,
+        connection: &Connection,
         model: &str,
         session_id: &str,
         outgoing: &[ChatMessage],
         config: &SessionConfig,
         run_id: &str,
         turn_id: Option<&str>,
-        sequence: i32,
         cancel: &Arc<AtomicBool>,
     ) -> Result<Generation<ChatMessage>, String> {
         let response = post_chat_completion(
             orch,
             run_db,
-            api_key,
+            connection
+                .api_key
+                .as_deref()
+                .ok_or_else(|| "OpenRouter connection missing API key".to_string())?,
             model,
             session_id,
             outgoing,
             config,
             run_id,
             turn_id,
-            sequence,
             &self.provider,
             cancel,
         )?;
@@ -156,7 +158,12 @@ fn into_generation(response: ChatResponse) -> Result<Generation<ChatMessage>, St
             }
         }
     }
-    let assistant_text = assistant_message.content.clone().unwrap_or_default();
+    let assistant_text = assistant_message
+        .content
+        .as_ref()
+        .and_then(ChatContent::as_text)
+        .unwrap_or_default()
+        .to_string();
     let tool_calls = assistant_message
         .tool_calls
         .as_ref()

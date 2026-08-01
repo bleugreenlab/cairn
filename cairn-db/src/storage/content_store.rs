@@ -22,8 +22,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
+use crate::storage::local_db::DbHandle;
 use crate::storage::LocalDb;
 use crate::storage::TeamId;
+use crate::turso::Value;
 
 /// Frame an execution's `(pack, pack_idx)` pair into ONE content-store object:
 /// `u64-LE len(pack) || pack || u64-LE len(idx) || idx`. The store key is the
@@ -53,9 +55,58 @@ pub trait ContentStore: Send + Sync {
     /// Store `bytes` under `hash`. Idempotent: content-addressed, so re-putting an
     /// existing key is a no-op (this is what makes cross-member dedup free).
     async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), String>;
-    /// Fetch the bytes for `hash`. `Ok(None)` means not found (reconstruction
-    /// degrades to a labeled stub); `Err` is a transport failure.
+    /// Fetch the bytes for `hash`. `Ok(None)` means not found.
     async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// Private-database content store backed by the durable `cas_cache` table.
+pub(crate) struct PrivateContentStore {
+    database: Arc<DbHandle>,
+}
+
+impl PrivateContentStore {
+    pub(super) fn new(database: Arc<DbHandle>) -> Self {
+        Self { database }
+    }
+
+    async fn connect(&self) -> Result<turso::Connection, String> {
+        match self.database.as_ref() {
+            DbHandle::Local(db) => db.connect().map_err(|error| error.to_string()),
+            DbHandle::Synced(db) => db.connect().await.map_err(|error| error.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl ContentStore for PrivateContentStore {
+    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
+        let connection = self.connect().await?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO cas_cache(hash, content, fetched_at) VALUES (?1, ?2, unixepoch())",
+                (hash.to_string(), Value::Blob(bytes.to_vec())),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        let connection = self.connect().await?;
+        let mut rows = connection
+            .query(
+                "SELECT content FROM cas_cache WHERE hash = ?1 LIMIT 1",
+                (hash.to_string(),),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
+            return Ok(None);
+        };
+        row.get::<Vec<u8>>(0)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// A team replica's intrinsic team identity plus its content store. Attached to a
@@ -64,7 +115,6 @@ pub trait ContentStore: Send + Sync {
 /// without any out-of-band team lookup — the handle knows its own scope.
 pub struct TeamReplicaContext {
     pub team_id: TeamId,
-    pub store: Arc<dyn ContentStore>,
     /// Private database for machine-local project route metadata. Team replicas
     /// use this to resolve `project_routes.local_repo_path` during reconstruction.
     pub private_db: Option<Arc<LocalDb>>,
@@ -74,7 +124,6 @@ impl std::fmt::Debug for TeamReplicaContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TeamReplicaContext")
             .field("team_id", &self.team_id)
-            .field("store", &"<dyn ContentStore>")
             .field("private_db", &self.private_db.as_ref().map(|_| "<LocalDb>"))
             .finish()
     }

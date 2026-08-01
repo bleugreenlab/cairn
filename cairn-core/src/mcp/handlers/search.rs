@@ -33,26 +33,30 @@ pub struct SearchPayload {
     limit: Option<usize>,
 }
 
-pub(crate) fn render_tree_grep(files: &[(String, Vec<u8>)], payload: &GrepPayload) -> String {
+/// Grep an in-memory file set (a branch's object tree or an overlay), rendering
+/// the same output the filesystem walker renders.
+///
+/// `Err` is a failure of the search itself — an unusable pattern, mode, glob, or
+/// file type. It is never a body: a caller that folded it into one would count
+/// the failure text as grep output and head it with a count, presenting an error
+/// as a result.
+pub fn render_tree_grep(
+    files: &[(String, Vec<u8>)],
+    payload: &GrepPayload,
+) -> Result<String, String> {
     let output_mode = payload
         .output_mode
         .as_deref()
         .unwrap_or("files_with_matches");
     if !matches!(output_mode, "files_with_matches" | "count" | "content") {
-        return format!(
+        return Err(format!(
             "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
             output_mode
-        );
+        ));
     }
-    let matcher = match build_grep_matcher(payload) {
-        Ok(matcher) => matcher,
-        Err(error) => return error,
-    };
+    let matcher = build_grep_matcher(payload)?;
     let glob = match payload.glob.as_deref() {
-        Some(pattern) => match cairn_symbols::search_util::build_glob_matcher(pattern) {
-            Ok(matcher) => Some(matcher),
-            Err(error) => return error,
-        },
+        Some(pattern) => Some(cairn_symbols::search_util::build_glob_matcher(pattern)?),
         None => None,
     };
     let file_types = match payload.file_type.as_deref() {
@@ -62,7 +66,7 @@ pub(crate) fn render_tree_grep(files: &[(String, Vec<u8>)], payload: &GrepPayloa
             builder.select(file_type);
             match builder.build() {
                 Ok(types) => Some(types),
-                Err(error) => return format!("Invalid file type '{}': {}", file_type, error),
+                Err(error) => return Err(format!("Invalid file type '{}': {}", file_type, error)),
             }
         }
         None => None,
@@ -86,7 +90,7 @@ pub(crate) fn render_tree_grep(files: &[(String, Vec<u8>)], payload: &GrepPayloa
             continue;
         }
         let mut searcher = build_grep_searcher(payload);
-        if let Err(error) = grep_collect_into(
+        grep_collect_into(
             &mut searcher,
             &matcher,
             path,
@@ -94,13 +98,11 @@ pub(crate) fn render_tree_grep(files: &[(String, Vec<u8>)], payload: &GrepPayloa
             output_mode,
             None,
             &mut collected,
-        ) {
-            return error;
-        }
+        )?;
     }
     let (before, after) = grep_context_window(payload);
 
-    finalize_grep_output(
+    Ok(finalize_grep_output(
         render_grep_lines(
             collected,
             output_mode,
@@ -111,7 +113,7 @@ pub(crate) fn render_tree_grep(files: &[(String, Vec<u8>)], payload: &GrepPayloa
         &payload.pattern,
         payload.offset.unwrap_or(0) as usize,
         payload.head_limit,
-    )
+    ))
 }
 
 fn should_walk_entry(entry_path: &Path, walk_root: &Path, deny_read: &[PathBuf]) -> bool {
@@ -215,12 +217,18 @@ fn resolve_search_dir(cwd: &str, path: Option<&str>) -> PathBuf {
     }
 }
 
-/// Default grep output mode for a target. Grepping a single file should print
-/// matching lines (you already named the file — echoing it back is useless and
-/// dead-ends agents into shelling out to grep), while grepping a directory
-/// lists which files matched.
-fn default_grep_output_mode(search_path: &Path) -> &'static str {
-    if search_path.is_file() {
+/// Default grep output mode for a target that has already been classified as
+/// one file or a tree. Grepping a single file should print matching lines (you
+/// already named the file — echoing it back is useless and dead-ends agents
+/// into shelling out to grep), while grepping a tree lists which files matched.
+///
+/// The classification is the caller's: a filesystem walk stats the path, and a
+/// logical project read classifies against the branch's object tree. Taking the
+/// decision rather than a path keeps a target that has no host path — every
+/// logical `file:` read — from being misclassified as a tree by a `stat` that
+/// was never going to find it.
+fn default_grep_output_mode(single_file: bool) -> &'static str {
+    if single_file {
         "content"
     } else {
         "files_with_matches"
@@ -233,16 +241,16 @@ fn default_grep_output_mode(search_path: &Path) -> &'static str {
 /// directory grep with `-C=N` would otherwise silently drop both the context
 /// and the matched lines. With no override and no context request, fall back to
 /// the target-aware default (see `default_grep_output_mode`).
-pub(crate) fn resolve_grep_output_mode<'a>(
-    explicit: Option<&'a str>,
+pub(crate) fn resolve_grep_output_mode(
+    explicit: Option<&str>,
     requested_context: bool,
-    search_path: &Path,
-) -> &'a str {
+    single_file: bool,
+) -> &str {
     explicit.unwrap_or_else(|| {
         if requested_context {
             "content"
         } else {
-            default_grep_output_mode(search_path)
+            default_grep_output_mode(single_file)
         }
     })
 }
@@ -270,21 +278,9 @@ pub(crate) async fn glob_matched_paths(
         search_dir.display()
     );
 
-    // Validate with Cairn's exact matcher before the warm-index attempt so
-    // invalid-glob errors stay identical whether the index is warm or cold.
     build_glob_matcher(&payload.pattern)?;
 
     let deny_read = orch.sandbox_deny_read();
-    if let Some(paths) =
-        try_worktree_index_glob(orch, request, &search_dir, &payload.pattern, &deny_read).await
-    {
-        return Ok(GlobMatches {
-            search_dir,
-            pattern: payload.pattern,
-            paths,
-            timed_out: false,
-        });
-    }
 
     let pattern = payload.pattern.clone();
     let search_dir_for_walk = search_dir.clone();
@@ -358,7 +354,7 @@ pub(crate) fn glob_matched_paths_walk(
         }
     }
 
-    matches.sort_by(|a, b| b.1.cmp(&a.1));
+    matches.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     Ok((matches.into_iter().map(|(p, _)| p).collect(), timed_out))
 }
 
@@ -371,45 +367,24 @@ pub(crate) fn glob_timeout_warning() -> String {
     )
 }
 
-/// Handle glob tool call — pattern-match files with path scoping.
-pub(crate) async fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let GlobMatches {
-        search_dir,
-        pattern,
-        paths,
-        timed_out,
-    } = match glob_matched_paths(orch, request).await {
-        Ok(matches) => matches,
-        Err(error) => return error,
-    };
-
-    if paths.is_empty() && !timed_out {
-        return format!(
-            "No files matched pattern '{}' in {}",
-            pattern,
-            search_dir.display()
-        );
-    }
-
-    let mut result: String = paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if timed_out {
-        result.push_str(&glob_timeout_warning());
-    }
-
-    result
+/// The body every glob entry point renders when a pattern matched nothing.
+///
+/// Shared so the live filesystem walk and the branch/overlay projection spell an
+/// absence identically — one message with one meaning, rather than two spellings
+/// neither of which a reader downstream can recognize.
+pub(crate) fn glob_no_matches_body(pattern: &str, location: impl std::fmt::Display) -> String {
+    format!("No files matched pattern '{pattern}' in {location}")
 }
 
-/// Handle grep tool call — in-process ripgrep search.
-pub(crate) async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: GrepPayload = match super::parse_payload(request) {
-        Ok(payload) => payload,
-        Err(error) => return error,
-    };
+/// Handle grep tool call — in-process ripgrep search over the host filesystem.
+///
+/// `Err` is a failed search (unusable payload/pattern/mode, a timeout, a worker
+/// failure), never a body — see [`render_tree_grep`].
+pub(crate) async fn handle_grep(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Result<String, String> {
+    let payload: GrepPayload = super::parse_payload(request)?;
 
     let search_path = resolve_search_dir(&request.cwd, payload.path.as_deref());
     log::info!(
@@ -428,13 +403,13 @@ pub(crate) async fn handle_grep(orch: &Orchestrator, request: &McpCallbackReques
     let output_mode = resolve_grep_output_mode(
         payload.output_mode.as_deref(),
         requested_context,
-        &search_path,
+        search_path.is_file(),
     );
     if !matches!(output_mode, "files_with_matches" | "count" | "content") {
-        return format!(
+        return Err(format!(
             "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
             output_mode
-        );
+        ));
     }
 
     let output_mode = output_mode.to_string();
@@ -443,27 +418,6 @@ pub(crate) async fn handle_grep(orch: &Orchestrator, request: &McpCallbackReques
     let head_limit = payload.head_limit;
     let pattern = payload.pattern.clone();
     let deny_read = orch.sandbox_deny_read();
-
-    // Warm-index fast path (CAIRN-2303): a worktree-root grep is served by the
-    // resident fff index instead of re-walking the tree. Eligible only for a
-    // plain line-wise grep whose root is exactly a known worktree and whose
-    // shape the index supports; every other case (sub-directory root, multiline
-    // regex, file-type walk, or an index still warming its first scan) falls
-    // through to the ripgrep walk below, which remains the universal correct
-    // answer.
-    if let Some(body) = try_worktree_index_grep(
-        orch,
-        request,
-        &search_path,
-        &payload,
-        &output_mode,
-        show_line_numbers,
-        &deny_read,
-    )
-    .await
-    {
-        return finalize_grep_output(body, &pattern, offset, head_limit);
-    }
 
     let result = tokio::time::timeout(
         GREP_TIMEOUT,
@@ -480,315 +434,11 @@ pub(crate) async fn handle_grep(orch: &Orchestrator, request: &McpCallbackReques
     .await;
 
     match result {
-        Ok(Ok(Ok(output))) => finalize_grep_output(output, &pattern, offset, head_limit),
-        Ok(Ok(Err(e))) => e,
-        Ok(Err(e)) => format!("grep task failed: {}", e),
-        Err(_) => format!("grep timed out after {:?}", GREP_TIMEOUT),
+        Ok(Ok(Ok(output))) => Ok(finalize_grep_output(output, &pattern, offset, head_limit)),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(e)) => Err(format!("grep task failed: {}", e)),
+        Err(_) => Err(format!("grep timed out after {:?}", GREP_TIMEOUT)),
     }
-}
-
-/// Attempt the warm-index glob fast path for a worktree-root or subdirectory
-/// target. Returns
-/// `Some(paths)` when the resident fff index served the query, or `None` to
-/// fall through to the canonical filesystem walk.
-async fn try_worktree_index_glob(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    search_path: &Path,
-    pattern: &str,
-    deny_read: &[PathBuf],
-) -> Option<Vec<PathBuf>> {
-    let (ctx, _db) = super::run_context::lookup_run_routed(&orch.db, request)
-        .await
-        .ok()?;
-    let worktree_raw = PathBuf::from(ctx.worktree_path?);
-    let scope = resolve_worktree_scope(orch, search_path, &worktree_raw)?;
-
-    let pattern = pattern.to_string();
-    let subdir_for_search = scope.subdir.clone();
-    let deny = deny_read.to_vec();
-    let paths = tokio::task::spawn_blocking(move || {
-        scope
-            .search
-            .try_glob(&pattern, subdir_for_search.as_deref(), &deny)
-    })
-    .await
-    .ok()??;
-    log::debug!(
-        "worktree_search: served glob for {} from warm index{}",
-        scope.worktree_canon.display(),
-        scope
-            .subdir
-            .as_deref()
-            .map(|rel| format!(" subdir={rel}"))
-            .unwrap_or_default()
-    );
-    Some(paths)
-}
-
-/// Attempt the warm-index grep fast path for a worktree-root or subdirectory
-/// target. Returns
-/// `Some(body)` (the joined, unwindowed output lines) when the resident fff
-/// index served the query, or `None` to fall through to the ripgrep walk. Every
-/// `None` is deliberate: an unsupported query shape, a run with no worktree, a
-/// root outside the worktree, a file target, or an index that has not finished
-/// its first background scan yet.
-async fn try_worktree_index_grep(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    search_path: &Path,
-    payload: &GrepPayload,
-    output_mode: &str,
-    show_line_numbers: bool,
-    deny_read: &[PathBuf],
-) -> Option<String> {
-    // Line-wise index only: multiline regex and file-type walks stay on ripgrep
-    // (fff greps line by line; its file-type constraint semantics differ from
-    // ripgrep's `--type`, so that walk is left untouched).
-    if payload.multiline == Some(true) || payload.file_type.is_some() {
-        return None;
-    }
-
-    // Resolve the run's worktree; project-level runs (no worktree) are skipped.
-    let (ctx, _db) = super::run_context::lookup_run_routed(&orch.db, request)
-        .await
-        .ok()?;
-    // Key the pool on the raw DB `worktree_path` so teardown's `drop_worktree`
-    // (which reads the same column) matches the entry created here.
-    let worktree_raw = PathBuf::from(ctx.worktree_path?);
-    try_worktree_index_grep_for_worktree(
-        orch,
-        IndexGrepRequest {
-            worktree_raw: &worktree_raw,
-            search_path,
-            payload,
-            output_mode,
-            show_line_numbers,
-            deny_read,
-            native_output: false,
-            globs: None,
-            max_per_file: None,
-            uncovered_timeout: GREP_TIMEOUT,
-        },
-    )
-    .await
-}
-
-/// One warm-index grep attempt, as issued by `read ?grep=` or a translated
-/// `run` search.
-pub(crate) struct IndexGrepRequest<'a> {
-    /// Raw DB `worktree_path`, which is also the index pool's key.
-    pub worktree_raw: &'a Path,
-    pub search_path: &'a Path,
-    pub payload: &'a GrepPayload,
-    pub output_mode: &'a str,
-    pub show_line_numbers: bool,
-    pub deny_read: &'a [PathBuf],
-    /// Render context lines in ripgrep's `path-N-text` form rather than
-    /// Cairn's `path:N-text`.
-    pub native_output: bool,
-    /// A translated run search's full glob list; `None` uses `payload.glob`.
-    pub globs: Option<&'a [String]>,
-    pub max_per_file: Option<usize>,
-    /// Budget for re-grepping whatever the index could not cover. Overrunning
-    /// it declines the query so the caller's own walk answers it in one pass.
-    pub uncovered_timeout: Duration,
-}
-
-/// Shared fff-first grep seam for `read ?grep=` and translated `run` searches.
-///
-/// The index answers what it can prove and names the files it could not cover;
-/// this greps those few files with the ripgrep walk, merges their lines into
-/// the index's, and renders once. `None` tells the caller the index could not
-/// contribute at all, so its own cancellation-aware walk should answer.
-pub(crate) async fn try_worktree_index_grep_for_worktree(
-    orch: &Orchestrator,
-    request: IndexGrepRequest<'_>,
-) -> Option<String> {
-    let IndexGrepRequest {
-        worktree_raw,
-        search_path,
-        payload,
-        output_mode,
-        show_line_numbers,
-        deny_read,
-        native_output,
-        globs,
-        max_per_file,
-        uncovered_timeout,
-    } = request;
-    if payload.multiline == Some(true) || payload.file_type.is_some() {
-        return None;
-    }
-    let scope = resolve_worktree_scope(orch, search_path, worktree_raw)?;
-    let worktree_canon = scope.worktree_canon.clone();
-    let subdir_label = scope
-        .subdir
-        .as_deref()
-        .map(|rel| format!(" subdir={rel}"))
-        .unwrap_or_default();
-
-    let (before_context, after_context) = grep_context_window(payload);
-    let params = crate::worktree_search::WorktreeGrepParams {
-        pattern: payload.pattern.clone(),
-        subdir: scope.subdir.clone(),
-        globs: globs
-            .map(<[String]>::to_vec)
-            .unwrap_or_else(|| payload.glob.clone().into_iter().collect()),
-        max_per_file,
-        output_mode: output_mode.to_string(),
-        case_insensitive: payload.case_insensitive,
-        before_context,
-        after_context,
-        show_line_numbers,
-    };
-    let deny = deny_read.to_vec();
-    let search = scope.search.clone();
-
-    // fff grep is CPU-bound (up to its time budget), so run it off the async
-    // runtime exactly like the ripgrep walk it replaces.
-    let outcome = tokio::task::spawn_blocking(move || search.try_grep(&params, &deny))
-        .await
-        .ok()??;
-
-    let mut lines = outcome.lines;
-    if !outcome.uncovered.is_empty() {
-        let uncovered = outcome.uncovered.clone();
-        let walk_payload = payload.clone();
-        let root = search_path.to_path_buf();
-        let mode = output_mode.to_string();
-        let covered = tokio::task::spawn_blocking(move || {
-            grep_uncovered_files(
-                &walk_payload,
-                &root,
-                &uncovered,
-                &mode,
-                max_per_file,
-                uncovered_timeout,
-            )
-        })
-        .await
-        .ok()?;
-        match covered {
-            Ok(extra) => lines.extend(extra),
-            Err(error) => {
-                log::debug!(
-                    "worktree_search: could not cover {} residual file(s) for {} ({error}); \
-                     falling through to the full walk",
-                    outcome.uncovered.len(),
-                    worktree_canon.display()
-                );
-                return None;
-            }
-        }
-    }
-
-    log::debug!(
-        "worktree_search: served grep for {}{subdir_label} from warm index ({} file(s) re-grepped)",
-        worktree_canon.display(),
-        outcome.uncovered.len()
-    );
-    Some(render_grep_lines(
-        lines,
-        output_mode,
-        show_line_numbers,
-        native_output,
-        before_context > 0 || after_context > 0,
-    ))
-}
-
-/// Grep the files the warm index could not cover, each as an explicit
-/// single-file target so no directory is traversed twice. An error means the
-/// budget ran out, and the caller answers the whole query with its own walk
-/// rather than returning a knowingly incomplete result.
-pub(crate) fn grep_uncovered_files(
-    payload: &GrepPayload,
-    search_root: &Path,
-    uncovered: &[String],
-    output_mode: &str,
-    max_per_file: Option<usize>,
-    timeout: Duration,
-) -> Result<Vec<GrepLine>, String> {
-    let matcher = build_grep_matcher(payload)?;
-    let mut searcher = build_grep_searcher(payload);
-    let (_, after) = grep_context_window(payload);
-    let cap = GrepCap::new(max_per_file, after);
-    let deadline = Instant::now() + timeout;
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let mut lines = Vec::new();
-    for relative in uncovered {
-        if Instant::now() >= deadline {
-            return Err(format!("covering the residual files exceeded {timeout:?}"));
-        }
-        let path = search_root.join(relative);
-        // The watcher may have removed the file since the index listed it.
-        if !path.is_file() {
-            continue;
-        }
-        let control = SearchControl {
-            deadline,
-            cancelled: cancelled.clone(),
-        };
-        grep_collect_into(
-            &mut searcher,
-            &matcher,
-            relative,
-            GrepSource::Path(&path, control),
-            output_mode,
-            cap,
-            &mut lines,
-        )?;
-    }
-    Ok(lines)
-}
-
-pub(crate) struct WorktreeIndexScope {
-    pub(crate) search: Arc<crate::worktree_search::WorktreeSearch>,
-    pub(crate) subdir: Option<String>,
-    worktree_canon: PathBuf,
-}
-
-/// Resolve a candidate search root to a resident worktree index plus optional
-/// worktree-relative subdirectory. This is the shared canonical gate for warm
-/// `?grep=`, `?glob=`, and translated `run()` search commands: file targets,
-/// paths outside the run worktree, missing/cold worktrees, and vanished paths all
-/// return `None` so the caller can use its canonical fallback.
-pub(crate) fn resolve_worktree_scope(
-    orch: &Orchestrator,
-    search_path: &Path,
-    worktree_raw: &Path,
-) -> Option<WorktreeIndexScope> {
-    // Compare canonicalized paths so `.`/symlink/cwd spellings still match.
-    // Single-file greps stay on the byte-parity walk; subdirectories are served
-    // by prefix-filtering and rebasing worktree-relative index paths.
-    let search_canon = std::fs::canonicalize(search_path).ok()?;
-    let worktree_canon = std::fs::canonicalize(worktree_raw).ok()?;
-    let subdir = worktree_index_search_subdir(&search_canon, &worktree_canon)?;
-    let search = orch.worktree_search.get_or_create(worktree_raw)?;
-    Some(WorktreeIndexScope {
-        search,
-        subdir,
-        worktree_canon,
-    })
-}
-
-fn worktree_index_search_subdir(
-    search_canon: &Path,
-    worktree_canon: &Path,
-) -> Option<Option<String>> {
-    if !search_canon.is_dir() {
-        return None;
-    }
-    if search_canon == worktree_canon {
-        return Some(None);
-    }
-    let rel = search_canon.strip_prefix(worktree_canon).ok()?;
-    let rel = rel
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
-    (!rel.is_empty()).then_some(Some(rel))
 }
 
 struct SearchControl {
@@ -1055,6 +705,15 @@ fn grep_collect_into(
     Ok(())
 }
 
+/// The body every grep entry point renders when a search produced nothing.
+///
+/// Exported so the header-count projection can recognize an empty result in any
+/// output mode: a `files_with_matches` body is otherwise one line per matched
+/// file, and this message would count as a file.
+pub(crate) fn grep_no_matches_body(pattern: &str) -> String {
+    format!("No matches found for pattern '{}'", pattern)
+}
+
 /// Apply the post-search finalization shared by the directory grep and the
 /// single-file bytes renderer: the empty-result message, then the
 /// `offset`/`head_limit` match-window slice.
@@ -1065,7 +724,7 @@ fn finalize_grep_output(
     head_limit: Option<u32>,
 ) -> String {
     if output.is_empty() {
-        return format!("No matches found for pattern '{}'", pattern);
+        return grep_no_matches_body(pattern);
     }
 
     let lines: Vec<&str> = output.lines().collect();
@@ -1092,27 +751,30 @@ fn finalize_grep_output(
 /// directory/glob/file-type walks stay in `grep_search`. Both paths share this
 /// module's matcher, searcher, per-file collection, and finalization helpers, so
 /// there is no frozen second copy of the grep-rendering logic.
-pub(crate) fn render_single_file_grep(bytes: &[u8], label: &str, payload: &GrepPayload) -> String {
+///
+/// `Err` is a failed search, never a body — see [`render_tree_grep`].
+pub(crate) fn render_single_file_grep(
+    bytes: &[u8],
+    label: &str,
+    payload: &GrepPayload,
+) -> Result<String, String> {
     let output_mode = payload.output_mode.as_deref().unwrap_or("content");
     if !matches!(output_mode, "files_with_matches" | "count" | "content") {
-        return format!(
+        return Err(format!(
             "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
             output_mode
-        );
+        ));
     }
 
     let show_line_numbers = payload.line_numbers.unwrap_or(true);
     let offset = payload.offset.unwrap_or(0) as usize;
     let head_limit = payload.head_limit;
 
-    let matcher = match build_grep_matcher(payload) {
-        Ok(matcher) => matcher,
-        Err(error) => return error,
-    };
+    let matcher = build_grep_matcher(payload)?;
     let mut searcher = build_grep_searcher(payload);
 
     let mut collected: Vec<GrepLine> = Vec::new();
-    if let Err(error) = grep_collect_into(
+    grep_collect_into(
         &mut searcher,
         &matcher,
         label,
@@ -1120,12 +782,10 @@ pub(crate) fn render_single_file_grep(bytes: &[u8], label: &str, payload: &GrepP
         output_mode,
         None,
         &mut collected,
-    ) {
-        return error;
-    }
+    )?;
 
     let (before, after) = grep_context_window(payload);
-    finalize_grep_output(
+    Ok(finalize_grep_output(
         render_grep_lines(
             collected,
             output_mode,
@@ -1136,7 +796,7 @@ pub(crate) fn render_single_file_grep(bytes: &[u8], label: &str, payload: &GrepP
         &payload.pattern,
         offset,
         head_limit,
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,10 +937,13 @@ pub(crate) fn body_grep_payload(
 /// the produced text with the same matcher/searcher/finalizer the single-file
 /// path uses (path-less output), then count real matches. Returns the rendered
 /// grep body and its match count.
-pub(crate) fn grep_materialized_body(body: &str, payload: &GrepPayload) -> (String, usize) {
-    let rendered = render_single_file_grep(body.as_bytes(), "", payload);
+pub(crate) fn grep_materialized_body(
+    body: &str,
+    payload: &GrepPayload,
+) -> Result<(String, usize), String> {
+    let rendered = render_single_file_grep(body.as_bytes(), "", payload)?;
     let (matches, _files) = crate::mcp::handlers::read::grep_counts(&rendered);
-    (rendered, matches)
+    Ok((rendered, matches))
 }
 
 /// Engine-level bounds for one filesystem grep walk that the agent-facing
@@ -1289,6 +952,7 @@ pub(crate) fn grep_materialized_body(body: &str, payload: &GrepPayload) -> (Stri
 /// produces), rg's `-m N` per-file match cap, and the deadline plus shared
 /// cancel flag an outer timeout uses to stop a walk that is already inside one
 /// large file.
+#[derive(Clone)]
 pub(crate) struct GrepWalkLimits {
     pub globs: Vec<String>,
     pub max_per_file: Option<usize>,
@@ -1352,6 +1016,114 @@ pub(crate) fn grep_search_native(
     )
 }
 
+/// The glob override set a search applies to candidate paths. Both content
+/// sources build it here so `--glob` means exactly the same thing whether the
+/// bytes came off the filesystem or out of the object store. `root` is what
+/// candidate paths are matched relative to: the walk root for a filesystem
+/// walk, the empty path for store entries, which are already repo-relative.
+fn build_walk_overrides(
+    root: &Path,
+    globs: &[String],
+) -> Result<Option<ignore::overrides::Override>, String> {
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let mut overrides = ignore::overrides::OverrideBuilder::new(root);
+    for glob in globs {
+        overrides
+            .add(glob)
+            .map_err(|error| format!("Invalid glob '{}': {}", glob, error))?;
+    }
+    overrides
+        .build()
+        .map(Some)
+        .map_err(|error| format!("Failed to build glob override: {}", error))
+}
+
+/// The `-t`/`--type` filter, shared by both content sources for the same reason
+/// [`build_walk_overrides`] is.
+fn build_walk_types(file_type: Option<&str>) -> Result<Option<ignore::types::Types>, String> {
+    let Some(file_type) = file_type else {
+        return Ok(None);
+    };
+    let mut types = ignore::types::TypesBuilder::new();
+    types.add_defaults();
+    types
+        .select(file_type)
+        .build()
+        .map(Some)
+        .map_err(|error| format!("Invalid file type '{}': {}", file_type, error))
+}
+
+/// Whether one candidate path survives the glob and file-type filters. The
+/// filesystem walk gets this from `ignore`'s walker; entries handed over as
+/// bytes never touch a walker, so they are filtered against the same matchers
+/// here rather than against a second, drifting interpretation of the flags.
+fn entry_admitted(
+    path: &Path,
+    overrides: Option<&ignore::overrides::Override>,
+    types: Option<&ignore::types::Types>,
+) -> bool {
+    if overrides.is_some_and(|overrides| overrides.matched(path, false).is_ignore()) {
+        return false;
+    }
+    !types.is_some_and(|types| !types.matched(path, false).is_whitelist())
+}
+
+/// The native (ripgrep-shaped) render of a grep over content supplied as bytes
+/// instead of read from a filesystem walk.
+///
+/// This is the store-native content source behind an intercepted `run` search:
+/// the project overlay hands over `(repo-relative path, bytes)` at the job's
+/// head coordinate, and from there the matcher, the per-file collector, and the
+/// renderer are the ones [`grep_search_with_format`] uses. Only where the files
+/// come from differs, which is what lets the two agree byte for byte.
+///
+/// [`render_grep_lines`] sorts by path, so the order entries arrive in cannot
+/// affect the output.
+pub(crate) fn grep_search_native_entries(
+    payload: &GrepPayload,
+    files: &[(String, Vec<u8>)],
+    output_mode: &str,
+    show_line_numbers: bool,
+    limits: &GrepWalkLimits,
+) -> Result<String, String> {
+    let matcher = build_grep_matcher(payload)?;
+    let overrides = build_walk_overrides(Path::new(""), &limits.globs)?;
+    let types = build_walk_types(payload.file_type.as_deref())?;
+    let (before, after) = grep_context_window(payload);
+    let cap = GrepCap::new(limits.max_per_file, after);
+    let deadline = Instant::now() + limits.timeout;
+
+    let mut collected: Vec<GrepLine> = Vec::new();
+    for (relative, bytes) in files {
+        if limits.cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(format!("grep timed out after {:?}", limits.timeout));
+        }
+        if !entry_admitted(Path::new(relative), overrides.as_ref(), types.as_ref()) {
+            continue;
+        }
+        let mut searcher = build_grep_searcher(payload);
+        grep_collect_into(
+            &mut searcher,
+            &matcher,
+            relative,
+            GrepSource::Bytes(bytes),
+            output_mode,
+            cap,
+            &mut collected,
+        )?;
+    }
+
+    Ok(render_grep_lines(
+        collected,
+        output_mode,
+        show_line_numbers,
+        true,
+        before > 0 || after > 0,
+    ))
+}
+
 fn grep_search_with_format(
     payload: GrepPayload,
     search_path: &Path,
@@ -1361,8 +1133,6 @@ fn grep_search_with_format(
     native_output: bool,
     limits: GrepWalkLimits,
 ) -> Result<String, String> {
-    use ignore::overrides::OverrideBuilder;
-    use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
 
     let matcher = build_grep_matcher(&payload)?;
@@ -1383,30 +1153,12 @@ fn grep_search_with_format(
         .git_exclude(true)
         .filter_entry(move |entry| should_walk_entry(entry.path(), &filter_root, &deny_read));
 
-    if let Some(ref ft) = payload.file_type {
-        let mut types = TypesBuilder::new();
-        types.add_defaults();
-        types
-            .select(ft)
-            .build()
-            .map_err(|e| format!("Invalid file type '{}': {}", ft, e))
-            .map(|t| {
-                walker_builder.types(t);
-            })?;
+    if let Some(types) = build_walk_types(payload.file_type.as_deref())? {
+        walker_builder.types(types);
     }
 
-    if !limits.globs.is_empty() {
-        let mut overrides = OverrideBuilder::new(walk_root);
-        for glob in &limits.globs {
-            overrides
-                .add(glob)
-                .map_err(|e| format!("Invalid glob '{}': {}", glob, e))?;
-        }
-        walker_builder.overrides(
-            overrides
-                .build()
-                .map_err(|e| format!("Failed to build glob override: {}", e))?,
-        );
+    if let Some(overrides) = build_walk_overrides(walk_root, &limits.globs)? {
+        walker_builder.overrides(overrides);
     }
 
     let mut searcher = build_grep_searcher(&payload);
@@ -1625,59 +1377,36 @@ mod tests {
     }
 
     #[test]
-    fn worktree_index_search_subdir_accepts_root_and_subdir_but_not_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let src = root.join("src");
-        let file = src.join("main.rs");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(&file, "fn main() {}\n").unwrap();
-
-        let worktree_canon = std::fs::canonicalize(root).unwrap();
-        let src_canon = std::fs::canonicalize(&src).unwrap();
-        let file_canon = std::fs::canonicalize(&file).unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside_canon = std::fs::canonicalize(outside.path()).unwrap();
-
-        assert_eq!(
-            worktree_index_search_subdir(&worktree_canon, &worktree_canon),
-            Some(None)
-        );
-        assert_eq!(
-            worktree_index_search_subdir(&src_canon, &worktree_canon),
-            Some(Some("src".to_string()))
-        );
-        assert_eq!(
-            worktree_index_search_subdir(&file_canon, &worktree_canon),
-            None
-        );
-        assert_eq!(
-            worktree_index_search_subdir(&outside_canon, &worktree_canon),
-            None
-        );
+    fn grep_default_mode_is_content_for_a_single_file() {
+        assert_eq!(default_grep_output_mode(true), "content");
     }
 
     #[test]
-    fn grep_default_mode_is_content_for_a_single_file() {
+    fn grep_default_mode_is_files_with_matches_for_a_tree() {
+        assert_eq!(default_grep_output_mode(false), "files_with_matches");
+    }
+
+    #[test]
+    fn filesystem_grep_classifies_by_stat_at_the_call_site() {
+        // `handle_grep` walks the host filesystem, so it is the caller that
+        // stats — this is the composition it performs. A real file prints its
+        // matching lines; a path that is not a file there (missing, or a
+        // directory) falls back to the tree default. A logical project read
+        // never reaches this stat: it classifies against the branch's object
+        // tree, where its bare repository-relative path would never be found.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("needle.txt");
         std::fs::write(&file, "hay\nneedle\nhay\n").unwrap();
-
-        assert_eq!(default_grep_output_mode(&file), "content");
-    }
-
-    #[test]
-    fn grep_default_mode_is_files_with_matches_for_a_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(default_grep_output_mode(dir.path()), "files_with_matches");
-    }
-
-    #[test]
-    fn grep_default_mode_treats_missing_path_as_a_directory() {
-        // A nonexistent path isn't a file, so it falls back to the
-        // directory-style default rather than printing per-line content.
         let missing = Path::new("/this/path/does/not/exist/anywhere");
-        assert_eq!(default_grep_output_mode(missing), "files_with_matches");
+
+        assert_eq!(
+            resolve_grep_output_mode(None, false, file.is_file()),
+            "content"
+        );
+        assert_eq!(
+            resolve_grep_output_mode(None, false, missing.is_file()),
+            "files_with_matches"
+        );
     }
 
     #[test]
@@ -1781,7 +1510,7 @@ mod tests {
         let payload = body_grep_payload(&[qp("grep", "needle")], false)
             .unwrap()
             .unwrap();
-        let (rendered, matches) = grep_materialized_body(body, &payload);
+        let (rendered, matches) = grep_materialized_body(body, &payload).unwrap();
         assert_eq!(matches, 2);
         // Path-less, line-number-prefixed match lines.
         assert!(rendered.contains("2:needle one"), "{rendered}");
@@ -1792,9 +1521,16 @@ mod tests {
         let payload = body_grep_payload(&[qp("grep", "zzz")], false)
             .unwrap()
             .unwrap();
-        let (rendered, matches) = grep_materialized_body(body, &payload);
+        let (rendered, matches) = grep_materialized_body(body, &payload).unwrap();
         assert_eq!(matches, 0);
         assert_eq!(rendered, "No matches found for pattern 'zzz'");
+
+        // An unusable pattern is a failed search, not a body: it must never
+        // reach a caller as text that a header would then count.
+        let mut invalid = payload.clone();
+        invalid.pattern = "(unclosed".to_string();
+        let error = grep_materialized_body(body, &invalid).unwrap_err();
+        assert!(error.contains("Invalid regex pattern"), "{error}");
     }
 
     #[test]
@@ -1802,15 +1538,13 @@ mod tests {
         // A directory grep that asks for context but names no output_mode must
         // default to `content`, not `files_with_matches` — otherwise both the
         // requested context and the matched lines are silently dropped.
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(resolve_grep_output_mode(None, true, dir.path()), "content");
+        assert_eq!(resolve_grep_output_mode(None, true, false), "content");
     }
 
     #[test]
     fn grep_directory_without_context_stays_files_with_matches() {
-        let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_grep_output_mode(None, false, dir.path()),
+            resolve_grep_output_mode(None, false, false),
             "files_with_matches"
         );
     }
@@ -1818,9 +1552,8 @@ mod tests {
     #[test]
     fn grep_explicit_output_mode_wins_over_context_flag() {
         // An explicit output_mode is honored even when context flags are set.
-        let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_grep_output_mode(Some("files_with_matches"), true, dir.path()),
+            resolve_grep_output_mode(Some("files_with_matches"), true, false),
             "files_with_matches"
         );
     }
@@ -1834,7 +1567,7 @@ mod tests {
         let file = dir.path().join("ctx.txt");
         std::fs::write(&file, "alpha\nbeta\nNEEDLE\ngamma\ndelta\n").unwrap();
 
-        let mode = resolve_grep_output_mode(None, true, dir.path());
+        let mode = resolve_grep_output_mode(None, true, false);
         assert_eq!(mode, "content");
 
         let payload = GrepPayload {
@@ -1889,7 +1622,11 @@ mod tests {
     /// `render_single_file_grep` must reproduce byte-for-byte from in-memory
     /// bytes. Both paths share this module's matcher/searcher/collect/finalize
     /// helpers, so this asserts the two entry points stay in lockstep.
-    fn fs_single_file_grep(content: &str, label: &str, payload: &GrepPayload) -> String {
+    fn fs_single_file_grep(
+        content: &str,
+        label: &str,
+        payload: &GrepPayload,
+    ) -> Result<String, String> {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(label);
         std::fs::write(&file, content).unwrap();
@@ -1898,13 +1635,21 @@ mod tests {
             || payload.context_alias.is_some()
             || payload.after_context.is_some()
             || payload.before_context.is_some();
-        let mode =
-            resolve_grep_output_mode(payload.output_mode.as_deref(), requested_context, &file)
-                .to_string();
+        let mode = resolve_grep_output_mode(
+            payload.output_mode.as_deref(),
+            requested_context,
+            file.is_file(),
+        )
+        .to_string();
         let show = payload.line_numbers.unwrap_or(true);
         let offset = payload.offset.unwrap_or(0) as usize;
-        let raw = grep_search(payload.clone(), &file, &mode, show, Vec::new()).unwrap();
-        finalize_grep_output(raw, &payload.pattern, offset, payload.head_limit)
+        let raw = grep_search(payload.clone(), &file, &mode, show, Vec::new())?;
+        Ok(finalize_grep_output(
+            raw,
+            &payload.pattern,
+            offset,
+            payload.head_limit,
+        ))
     }
 
     fn assert_single_file_grep_matches(content: &str, label: &str, payload: &GrepPayload) {
@@ -1928,7 +1673,7 @@ mod tests {
         payload.context_alias = Some(1);
         payload.glob = Some("*.rs".to_string());
         payload.head_limit = Some(3);
-        let output = render_tree_grep(&files, &payload);
+        let output = render_tree_grep(&files, &payload).unwrap();
         assert!(output.contains("src/a.rs:3:NEEDLE"), "{output}");
         assert!(output.contains("src/a.rs:2-context"), "{output}");
         assert!(output.contains("src/a.rs:4-after"), "{output}");
@@ -1984,14 +1729,187 @@ mod tests {
         assert_single_file_grep_matches("NEEDLE\nhay\n", "f.txt", &payload);
     }
 
+    /// The fixture the two content sources and real ripgrep all search.
+    fn parity_fixture() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("alpha.rs", "fn one() {}\nlet needle = 1;\nfn two() {}\n"),
+            (
+                "src/beta.rs",
+                "use std;\n// NEEDLE here\nlet x = 2;\nneedle again\n",
+            ),
+            ("src/deep/gamma.txt", "nothing\nneedle in text\ntail\n"),
+            ("delta.md", "no hits at all\n"),
+        ]
+    }
+
+    fn write_fixture(dir: &std::path::Path, files: &[(&str, &str)]) {
+        for (path, content) in files {
+            let full = dir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, content).unwrap();
+        }
+    }
+
+    fn parity_limits(globs: &[&str], max_per_file: Option<usize>) -> GrepWalkLimits {
+        GrepWalkLimits {
+            globs: globs.iter().map(|glob| (*glob).to_string()).collect(),
+            max_per_file,
+            timeout: Duration::from_secs(30),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The store-native content source must agree with the filesystem walk on
+    /// every shape. An agent receives whichever one the router picked and must
+    /// not be able to tell which answered.
+    fn assert_entries_match_walk(
+        payload: &GrepPayload,
+        output_mode: &str,
+        globs: &[&str],
+        max_per_file: Option<usize>,
+    ) {
+        let files = parity_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &files);
+        let show_line_numbers = payload.line_numbers.unwrap_or(true);
+
+        let walked = grep_search_native(
+            payload.clone(),
+            dir.path(),
+            output_mode,
+            show_line_numbers,
+            Vec::new(),
+            parity_limits(globs, max_per_file),
+        )
+        .expect("filesystem walk");
+
+        let entries: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|(path, content)| ((*path).to_string(), content.as_bytes().to_vec()))
+            .collect();
+        let served = grep_search_native_entries(
+            payload,
+            &entries,
+            output_mode,
+            show_line_numbers,
+            &parity_limits(globs, max_per_file),
+        )
+        .expect("store-native grep");
+
+        assert_eq!(
+            served, walked,
+            "store-native grep diverged from the filesystem walk \
+             (mode={output_mode}, globs={globs:?}, max_per_file={max_per_file:?})"
+        );
+    }
+
+    #[test]
+    fn store_native_grep_matches_the_walk_across_flag_shapes() {
+        let base = grep_payload("needle");
+
+        // Plain content with line numbers: `rg -n needle`.
+        assert_entries_match_walk(&base, "content", &[], None);
+        // `-l` and `-c` projections.
+        assert_entries_match_walk(&base, "files_with_matches", &[], None);
+        assert_entries_match_walk(&base, "count", &[], None);
+        // `rg needle` without line numbers.
+        let mut no_numbers = base.clone();
+        no_numbers.line_numbers = Some(false);
+        assert_entries_match_walk(&no_numbers, "content", &[], None);
+        // `-i`, which must pick up the uppercase NEEDLE.
+        let mut insensitive = base.clone();
+        insensitive.case_insensitive = Some(true);
+        assert_entries_match_walk(&insensitive, "content", &[], None);
+        assert_entries_match_walk(&insensitive, "files_with_matches", &[], None);
+        // `-A`, `-B`, and `-C`, including the `--` group separators.
+        let mut after = base.clone();
+        after.after_context = Some(1);
+        assert_entries_match_walk(&after, "content", &[], None);
+        let mut before = base.clone();
+        before.before_context = Some(1);
+        assert_entries_match_walk(&before, "content", &[], None);
+        let mut around = base.clone();
+        around.context = Some(1);
+        assert_entries_match_walk(&around, "content", &[], None);
+        // `--glob`, positive and negated.
+        assert_entries_match_walk(&base, "content", &["*.rs"], None);
+        assert_entries_match_walk(&base, "content", &["!*.rs"], None);
+        assert_entries_match_walk(&base, "content", &["**/*.txt"], None);
+        assert_entries_match_walk(&base, "files_with_matches", &["*.rs", "*.txt"], None);
+        // Slash-bearing globs are anchored at the search root, and store entries
+        // are matched against an empty root rather than an absolute walk root.
+        assert_entries_match_walk(&base, "files_with_matches", &["src/*.rs"], None);
+        assert_entries_match_walk(&base, "files_with_matches", &["src/**"], None);
+        assert_entries_match_walk(&base, "files_with_matches", &["!src/**"], None);
+        assert_entries_match_walk(&base, "content", &["*.rs", "!src/**"], None);
+        // `-m`, whose after-context window has its own rendering rule.
+        assert_entries_match_walk(&base, "content", &[], Some(1));
+        assert_entries_match_walk(&after, "content", &[], Some(1));
+        assert_entries_match_walk(&base, "count", &[], Some(1));
+        // A pattern nothing matches: both sources must render empty, which is
+        // what the caller turns into ripgrep's exit 1.
+        assert_entries_match_walk(&grep_payload("absent_pattern"), "content", &[], None);
+    }
+
+    /// The anchor for the whole contract: what the walk renders is what real
+    /// ripgrep renders. The test above chains the store-native source to this
+    /// one, so together they pin served output to the genuine article.
+    #[test]
+    fn native_grep_output_matches_real_ripgrep() {
+        let files = parity_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &files);
+
+        let Ok(real) = std::process::Command::new("rg")
+            .args(["-n", "--no-heading", "--color", "never", "needle", "."])
+            .current_dir(dir.path())
+            .output()
+        else {
+            eprintln!("skipping ripgrep parity: rg is not installed");
+            return;
+        };
+
+        // ripgrep prints `./`-prefixed paths for an explicit `.` root and does
+        // not order its output; the renderer sorts by path. Normalize both.
+        let mut expected: Vec<String> = String::from_utf8_lossy(&real.stdout)
+            .lines()
+            .map(|line| line.trim_start_matches("./").to_string())
+            .collect();
+        expected.sort();
+
+        let payload = grep_payload("needle");
+        let served = grep_search_native_entries(
+            &payload,
+            &files
+                .iter()
+                .map(|(path, content)| ((*path).to_string(), content.as_bytes().to_vec()))
+                .collect::<Vec<_>>(),
+            "content",
+            true,
+            &parity_limits(&[], None),
+        )
+        .expect("store-native grep");
+        let mut actual: Vec<String> = served.lines().map(str::to_string).collect();
+        actual.sort();
+
+        assert!(
+            !expected.is_empty(),
+            "ripgrep found nothing; the fixture no longer exercises the comparison"
+        );
+        assert_eq!(
+            actual, expected,
+            "store-native grep is not byte-faithful to real ripgrep"
+        );
+    }
+
     #[test]
     fn render_single_file_grep_no_matches_reports_no_matches() {
         let payload = grep_payload("absent");
-        let rendered = render_single_file_grep(b"alpha\nbeta\n", "f.txt", &payload);
+        let rendered = render_single_file_grep(b"alpha\nbeta\n", "f.txt", &payload).unwrap();
         assert_eq!(rendered, "No matches found for pattern 'absent'");
         assert_eq!(
             rendered,
-            fs_single_file_grep("alpha\nbeta\n", "f.txt", &payload)
+            fs_single_file_grep("alpha\nbeta\n", "f.txt", &payload).unwrap()
         );
     }
 }

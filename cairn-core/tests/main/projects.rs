@@ -4,7 +4,6 @@ use cairn_core::internal::services::Clock;
 use cairn_core::models::CreateProject;
 use cairn_core::projects::crud;
 use cairn_core::CairnError;
-use cairn_db::turso::params;
 
 struct FixedClock(i64);
 
@@ -144,70 +143,4 @@ async fn delete_db_removes_project_and_reports_missing_project() {
             ..
         }
     ));
-}
-
-#[tokio::test]
-async fn repo_path_and_worktree_paths_are_project_scoped() {
-    let (_temp, db) = common::migrated_db().await;
-    crud::create_db(
-        &db,
-        &FixedClock(1_700_000_000),
-        &create_input("project-1", "Project", "PROJ", "/tmp/project"),
-    )
-    .await
-    .unwrap();
-    crud::create_db(
-        &db,
-        &FixedClock(1_700_000_000),
-        &create_input("project-2", "Other Project", "OTHER", "/tmp/other"),
-    )
-    .await
-    .unwrap();
-
-    db.write(|conn| {
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
-                 VALUES ('issue-1', 'project-1', 1, 'Issue one', 1, 1)",
-                (),
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
-                 VALUES ('issue-2', 'project-2', 1, 'Issue two', 1, 1)",
-                (),
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO jobs(id, project_id, issue_id, worktree_path, created_at, updated_at)
-                 VALUES (?1, 'project-1', 'issue-1', ?2, 1, 1)",
-                params!["job-1", "/tmp/project/.worktrees/job-1"],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO jobs(id, project_id, issue_id, worktree_path, created_at, updated_at)
-                 VALUES (?1, 'project-1', 'issue-1', NULL, 1, 1)",
-                params!["job-2"],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO jobs(id, project_id, issue_id, worktree_path, created_at, updated_at)
-                 VALUES (?1, 'project-2', 'issue-2', ?2, 1, 1)",
-                params!["job-3", "/tmp/other/.worktrees/job-3"],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .unwrap();
-
-    assert_eq!(
-        crud::repo_path(&db, "project-1").await.unwrap().as_deref(),
-        Some("/tmp/project")
-    );
-    assert_eq!(
-        crud::worktree_paths(&db, "project-1").await.unwrap(),
-        vec!["/tmp/project/.worktrees/job-1".to_string()]
-    );
 }

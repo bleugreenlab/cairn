@@ -5,34 +5,21 @@
 //! (CAIRN-2126): it exercises `LocalDb::open_synced` + `push`/`pull` end to end
 //! against a real sync server.
 //!
-//! ## A skip is NOT a pass — these tests MUST be run unfenced
+//! These tests run in every lane, fenced or not. Each needs a sync server:
+//! `CAIRN_TEST_SYNC_URL` is honored first, otherwise a `tursodb --sync-server`
+//! subprocess is spawned from PATH. Spawning that process, binding loopback, and
+//! writing temp files are all permitted inside the worktree fence, so nothing
+//! here self-skips, and an unreachable server FAILS rather than passing vacuously
+//! (`common::sync_server::SyncServer::require`).
 //!
-//! Every test here self-skips inside the worktree fence: when the
-//! `CAIRN_CALLBACK_URL` / `CAIRN_RUN_ID` / `CAIRN_WORKTREE` trio is present
-//! (`common::skip_if_fenced`), each returns early. So a fenced `bun run
-//! test:rust` SKIPS them and still reads green — that green says NOTHING about
-//! whether they pass. (This masking is exactly what hid a whole class of FK
-//! failures in the routed-create tests until they were finally run unfenced.) To
-//! exercise them for real, run UNFENCED (the trio unset) with `tursodb` on PATH,
-//! e.g. from `src-tauri/`:
-//!
-//! ```text
-//! cargo test -p cairn-core --features test-utils --test main --no-run
-//! env -u CAIRN_SANDBOXED -u CAIRN_CALLBACK_URL -u CAIRN_RUN_ID -u CAIRN_WORKTREE \
-//!     ./target/debug/deps/main-* turso_sync_roundtrip --test-threads=1
-//! ```
-//!
-//! Self-skips inside the worktree fence (`common::skip_if_fenced`) and when no
-//! sync server is reachable -- `CAIRN_TEST_SYNC_URL` is honored first, otherwise
-//! a `tursodb --sync-server` subprocess is spawned when the binary is on PATH.
-//! So `bun run test:rust` stays green in the fence while unfenced CI or a
-//! provisioned box runs it for real.
+//! That distinction is load-bearing: while this suite self-skipped under the
+//! fence, its green hid a whole class of FK failures in the routed-create tests
+//! until someone ran it unfenced by hand (CAIRN-2170, CAIRN-3164).
 
-use crate::common;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::common::sync_server::SyncServer;
+use crate::common::sync_server::{skip_if_team_schema_unavailable, SyncServer};
 
 use cairn_core::internal::db::{DbState, TeamConfig};
 use cairn_core::internal::mcp::handlers::{comments_artifacts, issues, messages};
@@ -63,13 +50,7 @@ async fn open_replica(path: &Path, url: &str) -> LocalDb {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turso_sync_write_push_pull_read_roundtrip() {
-    if common::skip_if_fenced("turso_sync_write_push_pull_read_roundtrip") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!(
-            "skipping turso_sync_write_push_pull_read_roundtrip: no CAIRN_TEST_SYNC_URL and no tursodb on PATH"
-        );
+    let Some(server) = SyncServer::require("turso_sync_write_push_pull_read_roundtrip") else {
         return;
     };
     let url = server.url();
@@ -141,15 +122,19 @@ async fn turso_sync_write_push_pull_read_roundtrip() {
 /// triggers never fire on the receiver) is a deferred follow-up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn team_schema_trigger_row_syncs_without_refiring_on_receiver() {
-    if common::skip_if_fenced("team_schema_trigger_row_syncs_without_refiring_on_receiver") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!(
-            "skipping team_schema_trigger_row_syncs_without_refiring_on_receiver: no CAIRN_TEST_SYNC_URL and no tursodb on PATH"
-        );
+    let Some(server) =
+        SyncServer::require("team_schema_trigger_row_syncs_without_refiring_on_receiver")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "team_schema_trigger_row_syncs_without_refiring_on_receiver",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
 
     let dir = tempdir().unwrap();
@@ -256,15 +241,18 @@ async fn private_db_state(dir: &Path, name: &str) -> Arc<DbState> {
 /// `.github/workflows/sync-tests.yml`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn for_project_routes_writes_to_the_team_db_and_syncs() {
-    if common::skip_if_fenced("for_project_routes_writes_to_the_team_db_and_syncs") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!(
-            "skipping for_project_routes_writes_to_the_team_db_and_syncs: no CAIRN_TEST_SYNC_URL and no tursodb on PATH"
-        );
+    let Some(server) = SyncServer::require("for_project_routes_writes_to_the_team_db_and_syncs")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "for_project_routes_writes_to_the_team_db_and_syncs",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -391,190 +379,6 @@ fn create_project_input(id: &str, key: &str, repo: &Path, team_id: Option<&str>)
     }
 }
 
-/// A [`ContentStoreFactory`](cairn_core::internal::storage::ContentStoreFactory) that hands
-/// every team the SAME shared store, so what host A offloads, host B fetches.
-struct SharedStoreFactory(std::sync::Arc<dyn cairn_core::internal::storage::ContentStore>);
-
-impl cairn_core::internal::storage::ContentStoreFactory for SharedStoreFactory {
-    fn store_for(
-        &self,
-        _team_id: &cairn_core::internal::db::TeamId,
-    ) -> std::sync::Arc<dyn cairn_core::internal::storage::ContentStore> {
-        self.0.clone()
-    }
-}
-
-/// §7e (CAIRN-2188) reconstruct-coherence via the shared content store. A
-/// torn-down team run offloads its archival blobs to the per-team content store
-/// and keeps only rows + hash pointers on the synced replica; a SECOND host
-/// bootstraps the run from sync and reconstructs it byte-identically by fetching
-/// the blob bytes from the shared store BY HASH — never from an `archival_blobs`
-/// table (absent on a team replica) and never from an originating worktree.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn team_run_archival_offloads_to_store_and_reconstructs_on_a_second_replica() {
-    if common::skip_if_fenced(
-        "team_run_archival_offloads_to_store_and_reconstructs_on_a_second_replica",
-    ) {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping team_run_archival_offloads_to_store_...: no sync server");
-        return;
-    };
-    let url = server.url();
-    let dir = tempdir().unwrap();
-
-    // One shared content store stands in for the brokered S3-backed store, wired
-    // into BOTH hosts' factories. `store` (typed) is kept for assertions; `shared`
-    // is the same instance behind the trait object the factories hand out.
-    let store = cairn_core::internal::storage::InMemoryContentStore::new();
-    let shared: std::sync::Arc<dyn cairn_core::internal::storage::ContentStore> =
-        std::sync::Arc::new(store.clone());
-
-    // ---- Host A: routed team project + a system:prompt event, then archive. ----
-    let dbs_a = private_db_state(dir.path(), "private-a.db").await;
-    dbs_a
-        .set_content_store_factory(std::sync::Arc::new(SharedStoreFactory(shared.clone())))
-        .await;
-    let replica_a = dir.path().join("team-a.db");
-    seed_team_registry(&dbs_a, "team-1", url, &replica_a).await;
-    let team_a = dbs_a
-        .open_team(TeamConfig {
-            team_id: "team-1".to_string(),
-            team_name: "Team".to_string(),
-            sync_url: url.to_string(),
-            auth_token: None,
-            replica_path: replica_a,
-        })
-        .await
-        .unwrap();
-    assert!(
-        team_a.content_store().is_some(),
-        "the opened team replica carries the content store"
-    );
-
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    crud::create_routed(
-        &dbs_a,
-        &RealClock,
-        create_project_input("p", "TEAMP", &repo, Some("team-1")),
-        None,
-    )
-    .await
-    .expect("create routed team project");
-
-    // Seed the execution skeleton (shared tables) directly into the team replica.
-    let worktree = repo.to_string_lossy().to_string();
-    team_a
-        .execute(
-            "INSERT INTO executions(id, recipe_id, status, started_at) VALUES ('exec','r','running',1)",
-            (),
-        )
-        .await
-        .unwrap();
-    team_a
-        .execute(
-            "INSERT INTO jobs(id, execution_id, project_id, status, worktree_path, created_at, updated_at)
-             VALUES ('job','exec','p','complete',?1,1,1)",
-            (worktree.clone(),),
-        )
-        .await
-        .unwrap();
-    team_a
-        .execute(
-            "INSERT INTO runs(id, job_id, project_id, status, created_at, updated_at)
-             VALUES ('run','job','p','exited',1,1)",
-            (),
-        )
-        .await
-        .unwrap();
-
-    // A system:prompt event: its static segments archive to content-addressed
-    // blobs (no git eligibility needed), which the team offload path PUTs to the
-    // shared store. `CLAUDE-BASE` is a static segment, so it leaves the inline row.
-    let backend_base = "CLAUDE-BASE ".repeat(800);
-    let cairn = format!("\n\n{}", "CAIRN-PROMPT ".repeat(700));
-    let workspace = "\n\n## Workspace Instructions\n\nworkspace doctrine".to_string();
-    let agent = "\n\n<agent_role>\nbuilder role body".to_string();
-    let (data, _content) = cairn_core::internal::storage::event_fixture::system_prompt(&[
-        ("backend_base", &backend_base),
-        ("cairn", &cairn),
-        ("workspace", &workspace),
-        ("agent", &agent),
-        (
-            "dynamic",
-            "\n\n## Orientation\n\ncwd=/work/run\n</agent_role>",
-        ),
-    ]);
-    team_a
-        .execute(
-            "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
-             VALUES ('sp1','run',1,1,'system:prompt',?1,1)",
-            (data,),
-        )
-        .await
-        .unwrap();
-
-    let summary = cairn_core::archival::archive_target(
-        &team_a,
-        &worktree,
-        &worktree,
-        &["job".to_string()],
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(summary.system_prompt, 1, "the system prompt is archived");
-    assert!(
-        store.len().await >= 1,
-        "the static segments were offloaded to the shared store"
-    );
-
-    team_a.push().await.unwrap();
-
-    // ---- Host B: bootstrap from sync, reconstruct from the shared store. ----
-    let dbs_b = private_db_state(dir.path(), "private-b.db").await;
-    dbs_b
-        .set_content_store_factory(std::sync::Arc::new(SharedStoreFactory(shared.clone())))
-        .await;
-    let team_b = dbs_b
-        .open_team(TeamConfig {
-            team_id: "team-1".to_string(),
-            team_name: "Team".to_string(),
-            sync_url: url.to_string(),
-            auth_token: None,
-            replica_path: dir.path().join("team-b.db"),
-        })
-        .await
-        .expect("second host opens the team");
-
-    // The synced replica row is a STUB: the heavy static bytes are NOT on the
-    // replica (they live only in the shared store).
-    let raw = team_b
-        .query_text("SELECT data FROM events WHERE id = 'sp1'", ())
-        .await
-        .unwrap()
-        .expect("the system:prompt event row synced to host B");
-    assert!(
-        !raw.contains("CLAUDE-BASE"),
-        "the synced replica carries only a stub, never the offloaded segment bytes"
-    );
-
-    // Reconstruction on host B fetches the blob bytes from the shared store by
-    // hash and restores the prompt — no archival_blobs table on this replica, no
-    // originating worktree.
-    let events = cairn_core::runs::queries::list_events(team_b.clone(), "run").unwrap();
-    let sp = events
-        .iter()
-        .find(|e| e.id == "sp1")
-        .expect("the system:prompt event is present after reconstruction");
-    assert!(
-        sp.data.contains("CLAUDE-BASE"),
-        "host B reconstructs the static segment bytes fetched from the shared store"
-    );
-}
-
 /// CAIRN-2180 regression: the REAL provisioning sequence — `open_team` on a raw,
 /// freshly provisioned replica, then `create_routed` the FIRST project into the
 /// team — must NOT fail the `projects.team_id` FOREIGN KEY. The team's `projects`
@@ -588,13 +392,19 @@ async fn team_run_archival_offloads_to_store_and_reconstructs_on_a_second_replic
 /// and that it (with the project) syncs through to a SECOND replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_team_seeds_team_root_so_first_create_routed_succeeds() {
-    if common::skip_if_fenced("open_team_seeds_team_root_so_first_create_routed_succeeds") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping open_team_seeds_team_root_...: no sync server");
+    let Some(server) =
+        SyncServer::require("open_team_seeds_team_root_so_first_create_routed_succeeds")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "open_team_seeds_team_root_so_first_create_routed_succeeds",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -679,17 +489,19 @@ async fn open_team_seeds_team_root_so_first_create_routed_succeeds() {
 /// PRIVATE database; a local create keeps both the row and a NULL route private.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_routed_writes_project_row_to_team_db_and_route_stub_to_private() {
-    if common::skip_if_fenced(
+    let Some(server) = SyncServer::require(
         "create_routed_writes_project_row_to_team_db_and_route_stub_to_private",
-    ) {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!(
-            "skipping create_routed_writes_...: no CAIRN_TEST_SYNC_URL and no tursodb on PATH"
-        );
+    ) else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "create_routed_writes_project_row_to_team_db_and_route_stub_to_private",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -793,13 +605,19 @@ async fn create_routed_writes_project_row_to_team_db_and_route_stub_to_private()
 /// routed domain write both sync to a second host's replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_routed_project_and_routed_write_sync_to_a_second_replica() {
-    if common::skip_if_fenced("create_routed_project_and_routed_write_sync_to_a_second_replica") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping create_routed_project_and_routed_write_sync_...: no sync server");
+    let Some(server) =
+        SyncServer::require("create_routed_project_and_routed_write_sync_to_a_second_replica")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "create_routed_project_and_routed_write_sync_to_a_second_replica",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -877,13 +695,14 @@ async fn create_routed_project_and_routed_write_sync_to_a_second_replica() {
 /// proving schema-aware `list_db` reads the team replica's re-rooted `projects`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_dbs_list_unions_local_and_team_projects() {
-    if common::skip_if_fenced("all_dbs_list_unions_local_and_team_projects") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping all_dbs_list_unions_...: no sync server");
+    let Some(server) = SyncServer::require("all_dbs_list_unions_local_and_team_projects") else {
         return;
     };
+    if skip_if_team_schema_unavailable("all_dbs_list_unions_local_and_team_projects", server.url())
+        .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
     let dbs = private_db_state(dir.path(), "private.db").await;
@@ -942,13 +761,18 @@ async fn all_dbs_list_unions_local_and_team_projects() {
 /// unit tests in `cairn_core::execution::routing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_lifecycle_mutations_hit_the_team_db_and_sync() {
-    if common::skip_if_fenced("routed_lifecycle_mutations_hit_the_team_db_and_sync") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping routed_lifecycle_mutations_...: no sync server");
+    let Some(server) = SyncServer::require("routed_lifecycle_mutations_hit_the_team_db_and_sync")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "routed_lifecycle_mutations_hit_the_team_db_and_sync",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
     let dbs = private_db_state(dir.path(), "private.db").await;
@@ -1060,13 +884,19 @@ fn external_request(cwd: &Path) -> McpCallbackRequest {
 /// replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
-    if common::skip_if_fenced("issue_content_handlers_route_writes_to_team_db_and_sync") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping issue_content_handlers_route_...: no sync server");
+    let Some(server) =
+        SyncServer::require("issue_content_handlers_route_writes_to_team_db_and_sync")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "issue_content_handlers_route_writes_to_team_db_and_sync",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -1104,7 +934,6 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
         "TEAMP",
         "Routed issue".to_string(),
         Some("body".to_string()),
-        None,
         None,
         None,
         None,
@@ -1359,13 +1188,18 @@ async fn insert_full_event(db: &LocalDb, run: &str, content: &str) {
 /// host (a full event is self-contained, so reconstruction is identity).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_execution_writes_hit_the_team_db_and_sync() {
-    if common::skip_if_fenced("routed_execution_writes_hit_the_team_db_and_sync") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping routed_execution_writes_...: no sync server");
+    let Some(server) = SyncServer::require("routed_execution_writes_hit_the_team_db_and_sync")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "routed_execution_writes_hit_the_team_db_and_sync",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -1500,13 +1334,19 @@ async fn routed_execution_writes_hit_the_team_db_and_sync() {
 /// class). A team run's writes must never land in private.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fail_closed_execution_routing_when_team_replica_not_open() {
-    if common::skip_if_fenced("fail_closed_execution_routing_when_team_replica_not_open") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping fail_closed_execution_routing_...: no sync server");
+    let Some(server) =
+        SyncServer::require("fail_closed_execution_routing_when_team_replica_not_open")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "fail_closed_execution_routing_when_team_replica_not_open",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -1661,13 +1501,19 @@ async fn seed_local_run_with_events(db: &LocalDb) {
 /// and the local-only no-op proving a private-DB run resolves to `self.local`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_run_reads_resolve_to_team_replica_and_local_to_private() {
-    if common::skip_if_fenced("routed_run_reads_resolve_to_team_replica_and_local_to_private") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping routed_run_reads_resolve_...: no sync server");
+    let Some(server) =
+        SyncServer::require("routed_run_reads_resolve_to_team_replica_and_local_to_private")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "routed_run_reads_resolve_to_team_replica_and_local_to_private",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -1864,15 +1710,19 @@ async fn seed_local_run_and_permission(db: &LocalDb) {
 /// private-DB request resolves to `self.local` and is answered there unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_permission_response_resolves_to_team_replica_and_local_to_private() {
-    if common::skip_if_fenced(
+    let Some(server) = SyncServer::require(
         "routed_permission_response_resolves_to_team_replica_and_local_to_private",
-    ) {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping routed_permission_response_resolve_...: no sync server");
+    ) else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "routed_permission_response_resolves_to_team_replica_and_local_to_private",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url();
     let dir = tempdir().unwrap();
 
@@ -2054,14 +1904,19 @@ async fn routed_permission_response_resolves_to_team_replica_and_local_to_privat
 /// the private DB byte-for-byte unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
-    if common::skip_if_fenced("routed_question_flow_resolves_to_team_replica_and_local_to_private")
+    let Some(server) =
+        SyncServer::require("routed_question_flow_resolves_to_team_replica_and_local_to_private")
+    else {
+        return;
+    };
+    if skip_if_team_schema_unavailable(
+        "routed_question_flow_resolves_to_team_replica_and_local_to_private",
+        server.url(),
+    )
+    .await
     {
         return;
     }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping routed_question_flow_resolves_...: no sync server");
-        return;
-    };
     let url = server.url();
     let dir = tempdir().unwrap();
 

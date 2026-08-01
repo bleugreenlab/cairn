@@ -11,6 +11,21 @@ pub enum PrNodeResolution {
     Close,
 }
 
+/// Read a `merge_requests` row's pull-request number, treating a non-positive
+/// value as no binding at all.
+///
+/// A `0` in this column is not a pull request; it is the residue of a failed
+/// open that recorded a sentinel. Left as `Some(0)` it survives every refresh,
+/// renders as "#0", and makes every downstream path trust a record over reality
+/// — including the issue-resolution guard, which then refuses to mark the issue
+/// merged because a pull request that does not exist is not merged.
+fn bound_pr_number(row: &cairn_db::turso::Row, index: usize) -> DbResult<Option<i32>> {
+    Ok(row
+        .opt_i64(index)?
+        .filter(|value| *value > 0)
+        .map(|value| value as i32))
+}
+
 /// PR context resolved from a producing job's `merge_requests` row.
 #[derive(Debug, Clone)]
 pub struct MrContext {
@@ -73,7 +88,7 @@ pub async fn query_mr_context_for_job(
             Ok(MrContext {
                 mr_id: row.text(0)?,
                 pr_url: row.opt_text(1)?.unwrap_or_default(),
-                github_pr_number: row.opt_i64(2)?.map(|value| value as i32),
+                github_pr_number: bound_pr_number(&row, 2)?,
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
@@ -165,7 +180,7 @@ async fn query_pr_node_mr_context_for_artifact_job(
             return Ok(Some(MrContext {
                 mr_id: row.text(0)?,
                 pr_url: row.opt_text(1)?.unwrap_or_default(),
-                github_pr_number: row.opt_i64(2)?.map(|value| value as i32),
+                github_pr_number: bound_pr_number(&row, 2)?,
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
@@ -203,7 +218,7 @@ async fn query_mr_context_for_action_run_parent(
             Ok(MrContext {
                 mr_id: row.text(0)?,
                 pr_url: row.opt_text(1)?.unwrap_or_default(),
-                github_pr_number: row.opt_i64(2)?.map(|value| value as i32),
+                github_pr_number: bound_pr_number(&row, 2)?,
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,

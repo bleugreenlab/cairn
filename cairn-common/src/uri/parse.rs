@@ -2,7 +2,8 @@
 
 use super::build::canonical_project;
 use super::types::{
-    is_reserved_node_segment, CairnResource, CairnResourceUri, DEFAULT_BROWSER_SLUG, PROJECT_SCOPE,
+    is_reserved_node_segment, CairnResource, CairnResourceUri, ImageRef, DEFAULT_BROWSER_SLUG,
+    PROJECT_SCOPE,
 };
 use crate::query::parse_query_params;
 
@@ -12,6 +13,22 @@ fn valid_opaque_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+}
+
+fn valid_content_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// The public executor name a `cairn://executors/{name}` segment addresses.
+///
+/// One helper shared with placement and enrollment: a URI that normalizes
+/// differently from the selector that names the same machine would make a
+/// resource an agent can read but not target.
+fn cairn_executor_name(segment: &str) -> Option<String> {
+    crate::executor_protocol::normalize_executor_name(segment)
 }
 
 fn parse_positive_i32(value: &str) -> Option<i32> {
@@ -79,6 +96,13 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["dev", "db"] => Some(CairnResource::DevDb),
         ["dev", "pid"] => Some(CairnResource::DevPid),
         ["logs"] => Some(CairnResource::Logs),
+        ["executors"] => Some(CairnResource::Executors),
+        // Names are normalized on the way in so the address an agent reads out
+        // of `cairn://executors` and the label an operator typed reach the same
+        // machine.
+        ["executors", name] => {
+            cairn_executor_name(name).map(|name| CairnResource::Executor { name })
+        }
         ["bug"] => Some(CairnResource::Bug),
         ["help"] => Some(CairnResource::Help),
         ["websearch"] => Some(CairnResource::WebSearch),
@@ -86,6 +110,33 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["skills", skill_id, rest @ ..] => Some(CairnResource::Skill {
             skill_id: (*skill_id).to_string(),
             path: rest.iter().map(|segment| (*segment).to_string()).collect(),
+        }),
+        // A stored image, in each of the three forms that address one. The hash
+        // arm must come first: a 64-hex string is never a valid ordinal, but
+        // testing it explicitly keeps the permalink form unambiguous.
+        [PROJECT_SCOPE, project, "check-results", revision] if !revision.is_empty() => {
+            Some(CairnResource::ProjectCheckResults {
+                project: canonical_project(project),
+                revision: (*revision).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "images", hash] if valid_content_hash(hash) => {
+            Some(CairnResource::ProjectImage {
+                project: canonical_project(project),
+                reference: ImageRef::Hash((*hash).to_string()),
+            })
+        }
+        // The collection arms precede their member arms so a bare `images`
+        // segment is never read as an ordinal (or, at issue scope, as a node).
+        [PROJECT_SCOPE, project, "images"] => Some(CairnResource::ProjectImages {
+            project: canonical_project(project),
+            issue: None,
+        }),
+        [PROJECT_SCOPE, project, "images", ordinal] => Some(CairnResource::ProjectImage {
+            project: canonical_project(project),
+            reference: ImageRef::Project {
+                ordinal: parse_positive_i32(ordinal)?,
+            },
         }),
         [PROJECT_SCOPE, project, "skills"] => Some(CairnResource::ProjectSkills {
             project: canonical_project(project),
@@ -249,6 +300,20 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             })
         }
         // MUST precede the Node arm: both are 5-segment shapes, but a literal
+        // `images` in the 4th position names an image minted inside this issue,
+        // not a node whose exec_seq happens to parse here.
+        [PROJECT_SCOPE, project, number, "images"] => Some(CairnResource::ProjectImages {
+            project: canonical_project(project),
+            issue: Some(parse_positive_i32(number)?),
+        }),
+        [PROJECT_SCOPE, project, number, "images", ordinal] => Some(CairnResource::ProjectImage {
+            project: canonical_project(project),
+            reference: ImageRef::Issue {
+                number: parse_positive_i32(number)?,
+                ordinal: parse_positive_i32(ordinal)?,
+            },
+        }),
+        // MUST precede the Node arm: both are 5-segment shapes, but a literal
         // `executions` in the 4th position names a single execution snapshot,
         // not a node whose exec_seq happens to parse here.
         [PROJECT_SCOPE, project, number, "executions", exec_seq] => {
@@ -310,6 +375,14 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "diff"] => {
             Some(CairnResource::NodeDiff {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "rebase"] => {
+            Some(CairnResource::NodeRebase {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,

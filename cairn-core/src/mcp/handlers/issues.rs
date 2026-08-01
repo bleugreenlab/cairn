@@ -8,7 +8,7 @@ use super::ProjectContext;
 use crate::issues::relations;
 use crate::labels::attach;
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{Issue, IssueAttention, IssueProgress, IssueStatus};
+use crate::models::{Issue, IssueAttention, IssueProgress, IssueStatus, Label};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 // ============================================================================
@@ -37,7 +37,6 @@ async fn insert_issue_with_context(
     description: Option<String>,
     parent_uri: Option<String>,
     labels: Option<Vec<String>>,
-    caller_run_id: Option<String>,
 ) -> Result<Issue, String> {
     let services = &orch.services;
     let embed_text = description.clone().unwrap_or_default();
@@ -45,34 +44,22 @@ async fn insert_issue_with_context(
     // replica for a team project, the private DB for a local one), resolved by
     // the caller via `for_project` so the row lands in the same DB it is read
     // back from (CAIRN-2181).
-    let issue = create_issue_row(
+    let (issue, created_labels) = create_issue_row(
         owning_db,
         &ctx.project_id,
         title,
         description,
         parent_uri,
         labels,
-        caller_run_id,
     )
     .await
     .map_err(|e| format!("Failed to create issue: {}", e))?;
 
+    // Nothing is minted here for child attention. A parented child's attention
+    // is routed to whichever node is driving the parent issue at the moment the
+    // fact occurs, derived live from `parent_issue_id`
+    // (`wakes::coordinating_job_for_child_issue`).
     let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
-    // content→execution boundary (CAIRN-2181): the child-subscription wake seed is
-    // job/run-keyed and stays private until CAIRN-2182.
-    if let Err(error) = crate::orchestrator::wakes::seed_default_child_subscription_for_issue(
-        &orch.db.local,
-        &issue.id,
-        &issue_uri,
-    )
-    .await
-    {
-        log::warn!(
-            "failed to seed wake subscription for created child issue {}: {}",
-            issue_uri,
-            error
-        );
-    }
     orch.enqueue_resource_embed(&issue_uri, embed_text);
 
     if let Err(e) = services.emitter.emit(
@@ -81,6 +68,7 @@ async fn insert_issue_with_context(
     ) {
         log::error!("Failed to emit db-change event: {}", e);
     }
+    emit_labels_created(orch, &created_labels);
     if !issue.labels.is_empty() {
         if let Err(e) = services.emitter.emit(
             "db-change",
@@ -96,6 +84,20 @@ async fn insert_issue_with_context(
     }
 
     Ok(issue)
+}
+
+/// Announce labels an issue write minted on the fly so the workspace
+/// vocabulary in the UI picks them up, not just the issue's own chips.
+fn emit_labels_created(orch: &Orchestrator, created: &[Label]) {
+    if created.is_empty() {
+        return;
+    }
+    if let Err(e) = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "labels", "action": "insert"}),
+    ) {
+        log::error!("Failed to emit db-change event: {}", e);
+    }
 }
 
 fn created_issue_summary(ctx: &ProjectContext, issue: &Issue) -> String {
@@ -126,7 +128,6 @@ pub async fn create_issue_in_project(
     labels: Option<Vec<String>>,
     execution: Option<CreateExecutionSpec>,
     parent_uri: Option<String>,
-    caller_run_id: Option<String>,
 ) -> Result<CreatedIssueOutcome, String> {
     let owning_db = orch.db.for_project(project_key).await;
     let ctx = lookup_project_by_key(&owning_db, project_key).await?;
@@ -138,7 +139,6 @@ pub async fn create_issue_in_project(
         description,
         parent_uri,
         labels,
-        caller_run_id,
     )
     .await?;
     let summary = created_issue_summary(&ctx, &issue);
@@ -161,6 +161,7 @@ pub async fn create_issue_in_project(
             issue.number,
             spec.recipe.as_deref(),
             spec.backend.as_deref(),
+            None,
         )
         .await
         {
@@ -247,83 +248,8 @@ async fn lookup_project_context(
         .await
         .map_err(|e| e.to_string())
     } else {
-        let cwd = request.cwd.clone();
-        db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT p.id, p.key
-                        FROM runs r
-                        JOIN jobs j ON r.job_id = j.id
-                        JOIN projects p ON j.project_id = p.id
-                        WHERE r.status IN ('starting', 'live')
-                          AND (j.worktree_path = ?1 OR (p.repo_path = ?1 AND j.issue_id IS NULL))
-                        ORDER BY
-                            CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
-                            r.created_at DESC
-                        LIMIT 1
-                        ",
-                        (cwd.as_str(),),
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        Ok::<_, DbError>(ProjectContext {
-                            project_id: row.text(0)?,
-                            project_key: row.text(1)?,
-                        })
-                    })
-                    .transpose()?
-                    .ok_or_else(|| DbError::Row(format!("No active run found for path '{}'", cwd)))
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
+        Err("Missing authenticated run identity for project-scoped issue operation".to_string())
     }
-}
-
-/// Resolve the root job of a run's job tree: the run's job walked up
-/// `parent_job_id` until a recipe-root (`parent_job_id IS NULL`). Recording
-/// this root as a child issue's spawner means a delegated sub-task that spawns
-/// the child still points the wake at the owning coordinator, not its own
-/// (possibly completed) job. Returns `None` when the run has no job.
-async fn root_job_for_run(
-    conn: &cairn_db::turso::Connection,
-    run_id: &str,
-) -> DbResult<Option<String>> {
-    let mut rows = conn
-        .query(
-            "SELECT job_id FROM runs WHERE id = ?1 LIMIT 1",
-            params![run_id],
-        )
-        .await?;
-    let Some(mut job_id) = (match rows.next().await? {
-        Some(row) => row.opt_text(0)?,
-        None => None,
-    }) else {
-        return Ok(None);
-    };
-
-    // Walk up to the root. Bounded by tree depth; the guard defends against a
-    // cycle in malformed data rather than ever being hit in practice.
-    for _ in 0..64 {
-        let mut prows = conn
-            .query(
-                "SELECT parent_job_id FROM jobs WHERE id = ?1 LIMIT 1",
-                params![job_id.as_str()],
-            )
-            .await?;
-        match prows.next().await? {
-            Some(row) => match row.opt_text(0)? {
-                Some(parent_id) => job_id = parent_id,
-                None => break,
-            },
-            None => break,
-        }
-    }
-    Ok(Some(job_id))
 }
 
 async fn create_issue_row(
@@ -333,8 +259,7 @@ async fn create_issue_row(
     description: Option<String>,
     parent_uri: Option<String>,
     labels: Option<Vec<String>>,
-    caller_run_id: Option<String>,
-) -> DbResult<Issue> {
+) -> DbResult<(Issue, Vec<Label>)> {
     let project_id = project_id.to_string();
     db.write(|conn| {
         let project_id = project_id.clone();
@@ -342,7 +267,6 @@ async fn create_issue_row(
         let description = description.clone();
         let parent_uri = parent_uri.clone();
         let labels = labels.clone();
-        let caller_run_id = caller_run_id.clone();
         Box::pin(async move {
             let parent_issue_id = if let Some(parent_uri) = parent_uri.as_deref() {
                 let resolved = relations::resolve_issue_uri(conn, parent_uri)
@@ -369,26 +293,6 @@ async fn create_issue_row(
                 None
             };
 
-            // Record the spawning coordinator job for a child issue so
-            // child-attention wakes resume it directly. We record the ROOT of
-            // the caller's job tree (the coordinator / recipe-root), not the
-            // literal caller job: if a delegated sub-task spawns the child
-            // issue, the wake target must still be the coordinator, never the
-            // sub-task's own job (which may be a completed job that retains its
-            // session). Only set when an agent (a run bound to a job) created
-            // the issue under a parent.
-            //
-            // content→execution boundary (CAIRN-2181): this reads runs/jobs from
-            // whatever DB the insert targets. The user-driven create has no
-            // caller_run_id so it never fires; an agent spawning a child into a
-            // team project hits an empty runs table in the replica and degrades
-            // to parent_job_id = NULL (wake routing falls back) — cross-DB job
-            // resolution is execution-slice work for CAIRN-2182.
-            let parent_job_id = match (parent_issue_id.as_deref(), caller_run_id.as_deref()) {
-                (Some(_), Some(run_id)) => root_job_for_run(conn, run_id).await?,
-                _ => None,
-            };
-
             let mut rows = conn
                 .query(
                     "SELECT next_issue_number FROM projects WHERE id = ?1",
@@ -413,10 +317,9 @@ async fn create_issue_row(
                 "
                 INSERT INTO issues (
                     id, project_id, number, title, description, status, progress,
-                    attention, priority, created_at, updated_at, model, parent_issue_id,
-                    parent_job_id
+                    attention, priority, created_at, updated_at, model, parent_issue_id
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, NULL, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, NULL, ?7)
                 ",
                 params![
                     id.as_str(),
@@ -425,45 +328,44 @@ async fn create_issue_row(
                     title.as_str(),
                     description.as_deref(),
                     now,
-                    parent_issue_id.as_deref(),
-                    parent_job_id.as_deref()
+                    parent_issue_id.as_deref()
                 ],
             )
             .await?;
 
-            if let Some(labels) = labels {
-                attach::replace_issue_labels(conn, &id, &labels, now as i64)
+            let created_labels = match labels {
+                Some(labels) => attach::replace_issue_labels(conn, &id, &labels, now as i64)
                     .await
-                    .map_err(DbError::Row)?;
-            }
+                    .map_err(DbError::Row)?,
+                None => Vec::new(),
+            };
 
-            crate::issues::crud::load_conn(conn, &id)
+            let issue = crate::issues::crud::load_conn(conn, &id)
                 .await
-                .or_else(|_| {
-                    Ok(Issue {
-                        id,
-                        project_id,
-                        number,
-                        title,
-                        description: description.unwrap_or_default(),
-                        status: IssueStatus::Backlog,
-                        progress: IssueProgress::Backlog,
-                        attention: IssueAttention::None,
-                        priority: 0,
-                        completed_at: None,
-                        dismissed_at: None,
-                        created_at: now as i64,
-                        updated_at: now as i64,
-                        backend_override: None,
-                        merged_at: None,
-                        closed_at: None,
-                        parent_issue_id,
-                        unmet_dependency_count: 0,
-                        depends_on: Vec::new(),
-                        unmet_depends_on: Vec::new(),
-                        labels: Vec::new(),
-                    })
-                })
+                .unwrap_or_else(|_| Issue {
+                    id,
+                    project_id,
+                    number,
+                    title,
+                    description: description.unwrap_or_default(),
+                    status: IssueStatus::Backlog,
+                    progress: IssueProgress::Backlog,
+                    attention: IssueAttention::None,
+                    priority: 0,
+                    completed_at: None,
+                    dismissed_at: None,
+                    created_at: now as i64,
+                    updated_at: now as i64,
+                    backend_override: None,
+                    merged_at: None,
+                    closed_at: None,
+                    parent_issue_id,
+                    unmet_dependency_count: 0,
+                    depends_on: Vec::new(),
+                    unmet_depends_on: Vec::new(),
+                    labels: Vec::new(),
+                });
+            Ok((issue, created_labels))
         })
     })
     .await
@@ -478,6 +380,10 @@ pub(crate) struct IssuePatchFields {
     /// `merged`/`closed` are accepted at the URI layer; callers validate before
     /// setting this. `None` leaves the resolution untouched.
     pub(crate) status: Option<String>,
+    /// Whether the caller confirmed stopping the work still live on the issue.
+    /// Only meaningful with `status`; the first unconfirmed resolution of an
+    /// issue with live work is refused and names this key (CAIRN-3212).
+    pub(crate) confirm: bool,
     /// Re-parenting. `None` leaves parent untouched; `Some(None)` orphans the
     /// issue (clears parent); `Some(Some(uri))` adopts under the given canonical
     /// issue URI. The URI is resolved to an issue id, validated same-project, and
@@ -490,8 +396,7 @@ async fn update_issue_row(
     project_id: &str,
     issue_num: i32,
     patch: IssuePatchFields,
-    caller_run_id: Option<String>,
-) -> DbResult<Option<Issue>> {
+) -> DbResult<Option<(Issue, Vec<Label>)>> {
     let project_id = project_id.to_string();
     db.write(|conn| {
         let project_id = project_id.clone();
@@ -500,7 +405,6 @@ async fn update_issue_row(
         let depends_on = patch.depends_on.clone();
         let labels = patch.labels.clone();
         let parent = patch.parent.clone();
-        let caller_run_id = caller_run_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
@@ -536,20 +440,22 @@ async fn update_issue_row(
                     .await
                     .map_err(DbError::Row)?;
             }
-            if let Some(labels) = labels {
-                attach::replace_issue_labels(conn, &issue_id, &labels, now as i64)
+            let created_labels = match labels {
+                Some(labels) => attach::replace_issue_labels(conn, &issue_id, &labels, now as i64)
                     .await
-                    .map_err(DbError::Row)?;
-            }
+                    .map_err(DbError::Row)?,
+                None => Vec::new(),
+            };
 
             match parent {
                 // Parent left untouched.
                 None => {}
-                // Orphan: clear parent and its stale spawner. A parent_job_id
-                // without a parent_issue_id is meaningless to wake routing.
+                // Orphan: clear the parent edge. With no parent issue there is
+                // no coordinator to derive, so the child's attention stops
+                // routing anywhere but its own watchers.
                 Some(None) => {
                     conn.execute(
-                        "UPDATE issues SET parent_issue_id = NULL, parent_job_id = NULL, updated_at = ?1 WHERE id = ?2",
+                        "UPDATE issues SET parent_issue_id = NULL, updated_at = ?1 WHERE id = ?2",
                         params![now, issue_id.as_str()],
                     )
                     .await?;
@@ -586,28 +492,20 @@ async fn update_issue_row(
                     relations::validate_no_parent_cycle(conn, &issue_id, &resolved.issue_id)
                         .await
                         .map_err(DbError::Row)?;
-                    // Mirror create: record the adopting coordinator's root job
-                    // for wake routing. When the caller is not a job-bound run,
-                    // leave it NULL and let parent-wake fall back to the parent
-                    // issue's root coordinator job.
-                    let parent_job_id = match caller_run_id.as_deref() {
-                        Some(run_id) => root_job_for_run(conn, run_id).await?,
-                        None => None,
-                    };
+                    // Adopting an issue re-points its attention by itself: the
+                    // recipient is whoever drives this parent when a child fact
+                    // next occurs, so there is nothing to record here.
                     conn.execute(
-                        "UPDATE issues SET parent_issue_id = ?1, parent_job_id = ?2, updated_at = ?3 WHERE id = ?4",
-                        params![
-                            resolved.issue_id.as_str(),
-                            parent_job_id.as_deref(),
-                            now,
-                            issue_id.as_str()
-                        ],
+                        "UPDATE issues SET parent_issue_id = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![resolved.issue_id.as_str(), now, issue_id.as_str()],
                     )
                     .await?;
                 }
             }
 
-            crate::issues::crud::load_conn(conn, &issue_id).await.map(Some)
+            crate::issues::crud::load_conn(conn, &issue_id)
+                .await
+                .map(|issue| Some((issue, created_labels)))
         })
     })
     .await
@@ -632,12 +530,12 @@ pub(crate) async fn update_issue_by_project_number(
 
     // Resolve the owning DB by key (CAIRN-2181): a team project's issue row lives
     // in its team replica, so the field/parent/dependency/label writes must
-    // target the same DB the row is read from. Without a key, the run/cwd context
-    // resolves against the PRIVATE DB (runs/jobs are private), then routes by key.
+    // target the same DB the row is read from. Without a key, authenticated run
+    // identity selects the owning replica; ambient callers must supply project context.
     let (owning_db, ctx) = if project_key.is_empty() {
         // A team run's run/job rows live in its replica (CAIRN-2182): route the
         // run-id context lookup to the owning DB so it doesn't error `No run
-        // found` against the private DB. The cwd path stays on the private DB.
+        // found` against the private DB. An ambient request stays on the private DB.
         let lookup_db = match request.run_id.as_deref() {
             Some(run_id) => crate::execution::routing::routing_db_for_id(&orch.db, run_id)
                 .await
@@ -655,18 +553,37 @@ pub(crate) async fn update_issue_by_project_number(
 
     let embed_description = patch.description.clone();
     let labels_changed = patch.labels.is_some();
-    let parent_changed = patch.parent.is_some();
     let status = patch.status.clone();
-    let issue = update_issue_row(
-        &owning_db,
-        &ctx.project_id,
-        issue_num,
-        patch,
-        request.run_id.clone(),
-    )
-    .await
-    .map_err(|e| format!("Failed to update issue: {e}"))?
-    .ok_or_else(|| format!("Issue {}-{} not found", ctx.project_key, issue_num))?;
+    let confirm = patch.confirm;
+
+    // A resolution is checked before any field of this write is applied. The
+    // resolution itself is applied last (see below), so checking it there too
+    // would let a refused `{title, status}` patch rename the issue and then
+    // report that it changed nothing — and a caller retrying "the same write"
+    // would repeat the rename.
+    if let Some(status) = status.as_deref() {
+        let issue_id = crate::issues::relations::issue_id_for_project_number(
+            &owning_db,
+            &ctx.project_key,
+            issue_num,
+        )
+        .await
+        .map_err(|e| format!("Failed to resolve issue: {e}"))?
+        .ok_or_else(|| format!("Issue {}-{} not found", ctx.project_key, issue_num))?;
+        crate::issues::status::check_resolution(
+            orch,
+            &issue_id,
+            status,
+            crate::issues::status::ResolutionActor::Agent,
+            crate::issues::status::Confirmation::from_flag(confirm),
+        )
+        .await
+        .map_err(|refusal| refusal.to_string())?;
+    }
+    let (issue, created_labels) = update_issue_row(&owning_db, &ctx.project_id, issue_num, patch)
+        .await
+        .map_err(|e| format!("Failed to update issue: {e}"))?
+        .ok_or_else(|| format!("Issue {}-{} not found", ctx.project_key, issue_num))?;
 
     // Re-embed only when the description was part of this update; a title-only
     // or dependency-only patch leaves the stored description untouched.
@@ -675,31 +592,13 @@ pub(crate) async fn update_issue_by_project_number(
         orch.enqueue_resource_embed(&issue_uri, description);
     }
 
-    if parent_changed {
-        // content→execution boundary (CAIRN-2181): wake reconcile is job-keyed and
-        // stays private until CAIRN-2182.
-        if let Err(error) =
-            crate::orchestrator::wakes::reconcile_default_child_subscription_for_issue(
-                &orch.db.local,
-                &issue.id,
-                &issue_uri,
-            )
-            .await
-        {
-            log::warn!(
-                "failed to reconcile wake subscription for patched child issue {}: {}",
-                issue_uri,
-                error
-            );
-        }
-    }
-
     if let Err(e) = orch.services.emitter.emit(
         "db-change",
         crate::notify::issue_db_change(&issue, "update"),
     ) {
         log::error!("Failed to emit db-change event: {}", e);
     }
+    emit_labels_created(orch, &created_labels);
     if labels_changed {
         if let Err(e) = orch.services.emitter.emit(
             "db-change",
@@ -723,8 +622,10 @@ pub(crate) async fn update_issue_by_project_number(
             &issue.id,
             status,
             crate::issues::status::ResolutionActor::Agent,
+            crate::issues::status::Confirmation::from_flag(confirm),
         )
-        .await?;
+        .await
+        .map_err(|refusal| refusal.to_string())?;
     }
 
     Ok(format!(
@@ -794,18 +695,10 @@ mod tests {
         }
     }
 
-    async fn root_job(db: &LocalDb, run_id: &str) -> Option<String> {
-        let run_id = run_id.to_string();
-        db.read(|conn| {
-            let run_id = run_id.clone();
-            Box::pin(async move { root_job_for_run(conn, &run_id).await })
-        })
-        .await
-        .unwrap()
-    }
-
+    /// Adopting and orphaning an issue moves its attention with the parent edge
+    /// alone — no subscription row is minted, reconciled, or left behind.
     #[tokio::test]
-    async fn parent_patch_reconciles_default_child_subscription() {
+    async fn parent_patch_repoints_child_attention_without_minting_rows() {
         let db = migrated_db().await;
         db.execute_script(
             "
@@ -841,20 +734,27 @@ mod tests {
                 depends_on: None,
                 labels: None,
                 status: None,
+                confirm: false,
                 parent: Some(Some("cairn://p/PROJ/1".to_string())),
             },
         )
         .await
         .unwrap();
 
-        let coord_subs =
+        // The adopting coordinator watches the child immediately, with nothing
+        // persisted on its behalf.
+        assert_eq!(
+            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/PROJ/2")
+                .await
+                .unwrap(),
+            vec!["manual".to_string(), "coord".to_string()]
+        );
+        assert!(
             crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "coord")
                 .await
-                .unwrap();
-        assert_eq!(coord_subs.len(), 1);
-        assert_eq!(
-            coord_subs[0].source_ref.as_deref(),
-            Some("cairn://p/PROJ/2")
+                .unwrap()
+                .is_empty(),
+            "the derived watch must not materialize a row"
         );
 
         update_issue_by_project_number(
@@ -868,56 +768,22 @@ mod tests {
                 depends_on: None,
                 labels: None,
                 status: None,
+                confirm: false,
                 parent: Some(None),
             },
         )
         .await
         .unwrap();
 
-        assert!(
-            crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "coord")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // Orphaned: the derived watch is gone with the parent edge, and the
+        // manual watcher is untouched.
         assert_eq!(
-            crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "manual")
+            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/PROJ/2")
                 .await
-                .unwrap()
-                .len(),
-            1,
-            "orphaning must not remove manual watchers"
+                .unwrap(),
+            vec!["manual".to_string()],
+            "orphaning drops the derived watch and keeps manual watchers"
         );
-    }
-
-    #[tokio::test]
-    async fn root_job_for_run_returns_self_for_coordinator() {
-        let db = migrated_db().await;
-        seed_jobs(&db).await;
-        assert_eq!(root_job(&db, "run-coord").await.as_deref(), Some("coord"));
-    }
-
-    /// A child issue spawned by a delegated sub-task must record the owning
-    /// coordinator, not the sub-task's own (completed-with-session) job.
-    #[tokio::test]
-    async fn root_job_for_run_walks_subtask_up_to_coordinator() {
-        let db = migrated_db().await;
-        seed_jobs(&db).await;
-        assert_eq!(root_job(&db, "run-subtask").await.as_deref(), Some("coord"));
-    }
-
-    #[tokio::test]
-    async fn root_job_for_run_none_when_run_has_no_job() {
-        let db = migrated_db().await;
-        seed_jobs(&db).await;
-        db.execute(
-            "INSERT INTO runs(id, job_id, status, created_at, updated_at)
-             VALUES('run-orphan', NULL, 'running', 3, 3)",
-            (),
-        )
-        .await
-        .unwrap();
-        assert_eq!(root_job(&db, "run-orphan").await, None);
     }
 
     /// A local project (no team route) still creates its issue in the PRIVATE
@@ -934,7 +800,6 @@ mod tests {
             "PROJ",
             "Local issue".to_string(),
             Some("body".to_string()),
-            None,
             None,
             None,
             None,

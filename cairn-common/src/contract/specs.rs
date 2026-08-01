@@ -70,6 +70,8 @@ pub const BROWSER_ACTIONS: &[&str] = &[
     "reload",
     "click",
     "type",
+    "select",
+    "drag",
     "scroll",
     "waitFor",
     "waitForNavigation",
@@ -79,7 +81,7 @@ pub const BROWSER_ACTIONS: &[&str] = &[
 pub(crate) const BROWSER_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "back|forward|reload (history); click (needs selector|text|handle); type (needs value + selector|text|handle); scroll (needs selector|text|handle|to|by); waitFor (needs selector); waitForNavigation|waitForLoad (await the next navigation/page-load, optional timeoutMs); clearData (clears website data — default cookies+cache, or kinds). Interaction args below.",
+    "back|forward|reload (history); click (needs selector|text|handle); type (needs value + selector|text|handle); select (picks a <select> option: needs value + selector|text|handle); drag (needs a source selector|text|handle + a destination toSelector|toText|toHandle); scroll (needs selector|text|handle|to|by); waitFor (needs selector); waitForNavigation|waitForLoad (await the next navigation/page-load, optional timeoutMs); clearData (clears website data — default cookies+cache, or kinds). Interaction args below.",
 );
 pub(crate) const BROWSER_SELECTOR: KeySpec = KeySpec::new(
     "selector",
@@ -94,7 +96,39 @@ pub(crate) const BROWSER_TEXT: KeySpec = KeySpec::new(
 pub(crate) const BROWSER_VALUE: KeySpec = KeySpec::new(
     "value",
     KeyType::Str,
-    "text to type; required by type (may be empty to clear the field)",
+    "text to type (type; may be empty to clear the field), or the option label/value to pick (select); required by both",
+);
+pub(crate) const BROWSER_TO_SELECTOR: KeySpec = KeySpec::new(
+    "toSelector",
+    KeyType::Str,
+    "CSS selector for a drag destination",
+);
+pub(crate) const BROWSER_TO_TEXT: KeySpec = KeySpec::new(
+    "toText",
+    KeyType::Str,
+    "visible-text drag destination (alternative to toSelector)",
+);
+pub(crate) const BROWSER_TO_HANDLE: KeySpec = KeySpec::with_aliases(
+    "toHandle",
+    &["toRef"],
+    KeyType::Str,
+    "element handle (ref e1..eN) for a drag destination",
+);
+pub(crate) const BROWSER_MODE: KeySpec = KeySpec::new(
+    "mode",
+    KeyType::Str,
+    "drag event family: auto (default; html5 when the source is draggable, else pointer) | pointer | html5",
+);
+pub(crate) const BROWSER_STEPS: KeySpec = KeySpec::new(
+    "steps",
+    KeyType::Int,
+    "interpolated drag moves (default 10, max 60)",
+);
+pub(crate) const BROWSER_DELAY_MS: KeySpec = KeySpec::with_aliases(
+    "delayMs",
+    &["delay_ms"],
+    KeyType::Int,
+    "pause between drag moves in ms (default 16, max 200)",
 );
 pub(crate) const BROWSER_SUBMIT: KeySpec =
     KeySpec::new("submit", KeyType::Bool, "press Enter after typing (type)");
@@ -177,6 +211,16 @@ pub(crate) const NODE_ACTION: KeySpec = KeySpec::new(
     KeyType::Str,
     "stop|merge|close|refresh — stop interrupts the node's active turn and parks the session warm (resumable, not a kill; cascades to child runs); merge|close|refresh operate on the PR a `pr` action node produced (mutually exclusive with confirmed)",
 );
+pub(crate) const REBASE_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "replay — ask the store to replay this branch onto the base named by the session",
+);
+pub(crate) const REBASE_FINGERPRINT: KeySpec = KeySpec::new(
+    "fingerprint",
+    KeyType::Str,
+    "the session fingerprint you read; a request naming a stale one is refused with a fresh diagnostic",
+);
 pub(crate) const UPDATES: KeySpec = KeySpec::new("updates", KeyType::Array, "");
 pub(crate) const SKILL_NAME: KeySpec = KeySpec::new("name", KeyType::Str, "");
 pub(crate) const SKILL_PROMPT: KeySpec = KeySpec::new("prompt", KeyType::Str, "SKILL.md body");
@@ -208,7 +252,7 @@ pub(crate) const MEMORY_REASON: KeySpec = KeySpec::new(
 pub(crate) const MEMORY_NEW_SCOPE: KeySpec = KeySpec::new(
     "newScope",
     KeyType::Object,
-    "optional for defer: {scope,value}; re-pools as pending in corrected scope",
+    "optional for defer: {scope,value} (project key or role name); re-pools as pending",
 );
 pub(crate) const LABEL_NAME: KeySpec = KeySpec::new(
     "name",
@@ -223,7 +267,7 @@ pub(crate) const LABEL_COLOR: KeySpec = KeySpec::new(
 pub(crate) const LABELS: KeySpec = KeySpec::new(
     "labels",
     KeyType::Array,
-    "full replacement label refs by name or slug",
+    "full replacement label refs by name or slug; a name the workspace vocabulary lacks is created",
 );
 pub(crate) const SUBAGENT_TYPE: KeySpec = KeySpec::with_aliases(
     "subagentType",
@@ -591,9 +635,9 @@ pub(crate) const PS_TERMINAL_COMMANDS: KeySpec = KeySpec::with_aliases(
     KeyType::Array,
     "[{name,command}]",
 );
-pub(crate) const PS_WORKTREE_POPULATE: KeySpec = KeySpec::with_aliases(
-    "worktreePopulate",
-    &["worktree_populate"],
+pub(crate) const PS_MATERIALIZATION_POPULATE: KeySpec = KeySpec::with_aliases(
+    "materializationPopulate",
+    &["materialization_populate"],
     KeyType::Object,
     "{copy[],symlink[]} gitignored-path populate rules",
 );

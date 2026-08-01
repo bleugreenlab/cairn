@@ -18,17 +18,8 @@ const CAIRN_SYSTEM_PROMPT: &str = include_str!("agent_process/system_prompt.md")
 /// of the section body.
 const VERSION_CONTROL_MARKER: &str = "<!--TIER:VERSION_CONTROL-->\n";
 
-/// Authoring-tier Version Control section: a worktree-backed job that authors
-/// commits on its own branch. Byte-identical to the section that lived inline in
-/// `system_prompt.md` before tiering, so substituting it for the marker
-/// reproduces the pre-tiering prompt exactly and keeps its prompt-cache lineage.
+/// Version-control contract for virtual agent residence.
 const VERSION_CONTROL_AUTHORING: &str = include_str!("agent_process/version_control_authoring.md");
-
-/// Ambient-tier Version Control section: a no-worktree job that runs on the
-/// project's live checkout, observing and orchestrating rather than authoring.
-/// Substituted in when the run is ambient; routes code changes through child
-/// issues since it has no branch of its own to land on.
-const VERSION_CONTROL_AMBIENT: &str = include_str!("agent_process/version_control_ambient.md");
 
 /// The default provider-agnostic workspace character prompt (compiled into the
 /// binary). Seeded once to `~/.cairn/AGENTS.md` on a fresh install; from there
@@ -134,16 +125,17 @@ spans resources rather than belonging to any single one:
   exactly where resource-target keys live.
 - `commit_msg: "Add X"` commits the batch's file-target changes as a new commit.
 - `commit_msg: "^"` amends the previous commit (for multi-file atomic changes).
-- Invariant: the worktree equals HEAD between tool calls. `write` requires a
-  `commit_msg` for file-target edits; a successful worktree-bound `run` that
-  dirties the tree without one is reverted to HEAD, entry dirt included. Commit
-  work you want kept in the same call that creates it.
-- When a base advance auto-rebases your workspace and records a conflict, the
-  conflict markers materialize in your files; resolve them and re-seal on your
-  next `write`/`run` with a normal `commit_msg`. No manual rebase or force-push.
-- While a worktree-bound agent tree is dirty, every tool result includes a
-  `<system-reminder>` telling the agent to commit or discard the changes; it
-  clears automatically once the working copy is clean.
+- Your branch is the only durable record. `write` requires a `commit_msg` for
+  file-target edits, and a mutating `run` commits to the same branch; without a
+  `commit_msg`, a run's changes are undone.
+- When the base branch advances, Cairn rebases your branch onto it. Resolve any
+  reported conflict with ordinary file writes; do not rebase or force-push by
+  hand.
+- Relative `file:` targets address the project root, and repository commands
+  execute through `run`. Your `run` batches, terminals, and REPLs share one
+  working directory, so a command validated with `run` behaves identically in a
+  terminal. Installed packages and `$TMPDIR` persist there as on any machine —
+  convenient, never durable storage; only committed work keeps.
 - `preview: true` validates and computes the change report without side effects
   and needs no `commit_msg`, returning an `apply_uri`; land it by re-submitting a
   single item with `mode: "apply"`, that URI, and the `commit_msg` that commits
@@ -195,19 +187,63 @@ pub(crate) fn cairn_help() -> String {
 /// `cairn://help`.
 ///
 /// Composed by capability tier: the `<!--TIER:VERSION_CONTROL-->` marker in
-/// `system_prompt.md` is substituted with the authoring Version Control section
-/// (worktree-backed job) or the ambient one (no worktree, runs on the project's
-/// live checkout). `ambient == false` reproduces the pre-tiering bytes exactly,
+/// `system_prompt.md` is substituted with the single virtual-residence version-
+/// control contract. The retained `ambient` argument cannot select a physical
+/// agent-checkout implementation,
 /// so the authoring variant stays byte-identical for provider prompt-cache
 /// reuse; the ambient variant is a second content-addressable variant that
 /// dedups cleanly within its tier.
-pub(crate) fn cairn_system_prompt(ambient: bool) -> String {
-    let version_control = if ambient {
-        VERSION_CONTROL_AMBIENT
-    } else {
-        VERSION_CONTROL_AUTHORING
-    };
-    CAIRN_SYSTEM_PROMPT.replace(VERSION_CONTROL_MARKER, version_control)
+pub(crate) fn cairn_system_prompt(_ambient: bool) -> String {
+    CAIRN_SYSTEM_PROMPT.replace(VERSION_CONTROL_MARKER, VERSION_CONTROL_AUTHORING)
+}
+
+/// Substrate vocabulary that must never reach agent-facing text.
+///
+/// The normalcy invariant (`docs/execution-fabric.md`) is that an agent behaving
+/// as if its working directory is an ordinary repository checkout must never be
+/// wrong. These words are correct internally and wrong in anything an agent
+/// reads, because each one names a mechanism the agent cannot act on. Shared by
+/// the prompt and orientation-block guards.
+#[cfg(test)]
+pub(crate) const SUBSTRATE_VOCABULARY: &[&str] = &[
+    "cell",
+    "cells",
+    "lease",
+    "leases",
+    "coordinate",
+    "coordinates",
+    "materialization",
+    "materializations",
+    "occupancy",
+    "occupant",
+    "epoch",
+    "incarnation",
+    "residence",
+    "residency",
+    "residencies",
+];
+
+/// Whole-word, case-insensitive containment. Substring matching would flag
+/// "please" for `lease` and "excellent" for `cell`.
+#[cfg(test)]
+pub(crate) fn contains_substrate_word(haystack: &str, word: &str) -> bool {
+    let haystack = haystack.to_lowercase();
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+    haystack.match_indices(word).any(|(at, _)| {
+        boundary(haystack[..at].chars().next_back())
+            && boundary(haystack[at + word.len()..].chars().next())
+    })
+}
+
+/// Assert a piece of agent-facing text carries no substrate vocabulary.
+#[cfg(test)]
+pub(crate) fn assert_no_substrate_vocabulary(label: &str, text: &str) {
+    for word in SUBSTRATE_VOCABULARY {
+        assert!(
+            !contains_substrate_word(text, word),
+            "{label} leaks substrate vocabulary `{word}`: an agent cannot act on it"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -215,30 +251,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authoring_tier_carries_worktree_doctrine() {
+    fn prompt_carries_one_version_control_contract() {
         let prompt = cairn_system_prompt(false);
-        // The authoring doctrine is present.
-        assert!(prompt.contains("the workspace always equals HEAD"));
         assert!(prompt.contains("must carry a `commit_msg`"));
-        // No ambient phrasing leaks into the authoring variant.
-        assert!(!prompt.contains("do not author"));
-        assert!(!prompt.contains("rejected by design"));
+        assert!(prompt.contains("never rebase or force-push by hand"));
         // No marker residue survives substitution.
         assert!(!prompt.contains("<!--"));
         assert!(!prompt.contains("TIER:VERSION_CONTROL"));
     }
 
     #[test]
-    fn ambient_tier_carries_no_author_doctrine_exactly_once() {
+    fn legacy_tier_argument_does_not_change_virtual_contract() {
         let prompt = cairn_system_prompt(true);
-        assert!(prompt.contains("do not author"));
-        assert!(prompt.contains("child issue"));
-        assert!(prompt.contains("rejected by design"));
-        // The Version Control section appears exactly once (replaced, not appended).
+        assert!(prompt.contains("must carry a `commit_msg`"));
         assert_eq!(prompt.matches("## Version Control").count(), 1);
-        // The authoring doctrine is fully gone, not stacked underneath.
-        assert!(!prompt.contains("the workspace always equals HEAD"));
         assert!(!prompt.contains("<!--"));
+    }
+
+    #[test]
+    fn system_prompt_carries_no_substrate_vocabulary() {
+        for ambient in [false, true] {
+            assert_no_substrate_vocabulary("system prompt", &cairn_system_prompt(ambient));
+        }
+    }
+
+    #[test]
+    fn substrate_word_match_respects_word_boundaries() {
+        assert!(contains_substrate_word("one lease, renewed", "lease"));
+        assert!(contains_substrate_word("A Cell.", "cell"));
+        assert!(!contains_substrate_word("please retry", "lease"));
+        assert!(!contains_substrate_word("excellent work", "cell"));
+        assert!(!contains_substrate_word("cancelled", "cell"));
     }
 
     #[test]
@@ -257,16 +300,34 @@ mod tests {
     }
 
     #[test]
-    fn tiers_are_two_deterministic_variants() {
-        // Exactly two variants, each deterministic (content-addressable) per call.
-        assert_ne!(cairn_system_prompt(false), cairn_system_prompt(true));
+    fn virtual_residence_prompt_is_one_deterministic_contract() {
+        // Agent jobs have one version-control contract. The legacy ambient flag
+        // cannot select a second agent-workspace implementation.
+        assert_eq!(cairn_system_prompt(false), cairn_system_prompt(true));
         assert_eq!(cairn_system_prompt(false), cairn_system_prompt(false));
-        assert_eq!(cairn_system_prompt(true), cairn_system_prompt(true));
         // Authoring byte-identity guard: the marker is fully consumed and the
         // section heading appears exactly once.
         let authoring = cairn_system_prompt(false);
         assert!(!authoring.contains(VERSION_CONTROL_MARKER));
         assert_eq!(authoring.matches("## Version Control").count(), 1);
+    }
+
+    /// A capability only exists for an agent that can find it at the moment it
+    /// needs it. `branch` is reached for while asking "is this failure mine, or
+    /// already on the base?", so the prompt carries the worked call for that
+    /// question rather than leaving it to the tool schema.
+    #[test]
+    fn every_tier_shows_how_to_run_a_check_against_another_branch() {
+        for ambient in [false, true] {
+            let prompt = cairn_system_prompt(ambient);
+            assert!(prompt.contains(r#"run({commands:[{command:"bun run test"}], branch:"main"})"#));
+            assert!(prompt.contains(r#"read({paths:["file:src/lib.rs?branch=main"]})"#));
+            assert!(prompt.contains("cannot be combined with `commit_msg`"));
+            // `run` presents shell, inline code, MCP tools, and REPL sends as
+            // peer item classes, so an unqualified description invites
+            // attaching `branch` to a class the handler rejects.
+            assert!(prompt.contains("an MCP-tool or REPL batch executes on the host"));
+        }
     }
 
     #[test]

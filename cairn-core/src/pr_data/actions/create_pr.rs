@@ -63,12 +63,54 @@ async fn edit_github_pr_title_body(
     ))
 }
 
-/// Sync edited `create-pr` artifact prose into the already-open PR it produced.
+/// The branch a merge-request row publishes from.
+async fn source_branch_for_merge_request(db: &LocalDb, mr_id: &str) -> Result<String, String> {
+    db.query_text(
+        "SELECT source_branch FROM merge_requests WHERE id = ?1",
+        (mr_id.to_string(),),
+    )
+    .await
+    .map_err(|error| format!("Failed to resolve merge request source branch: {error}"))?
+    .filter(|branch| !branch.trim().is_empty())
+    .ok_or_else(|| format!("merge request {mr_id} has no source branch to publish"))
+}
+
+/// Publish the branch behind an already-open PR before its prose is re-synced.
+///
+/// Re-writing a `create-pr` artifact is the sanctioned trigger for publishing a
+/// builder's branch, and the affordance docs tell agents so. Without this the
+/// artifact edit moved only the PR's title and body: a builder that pushed
+/// review fixes and re-saved its artifact left the PR presenting the pre-fix
+/// tree as its reviewable, mergeable version, and a coordinator merging on first
+/// sight of the artifact ships code the review already invalidated.
+///
+/// Fails closed. This is external state other people and agents act on, so
+/// "could not publish" must not be reported as a completed sync.
+async fn publish_branch_for_artifact_sync(
+    orch: &Orchestrator,
+    repo_path: &str,
+    mr_id: &str,
+) -> Result<(), String> {
+    let branch = source_branch_for_merge_request(&orch.db.local, mr_id).await?;
+    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path));
+    crate::orchestrator::base_advance::publish_managed_branch(orch, &store, &branch)
+        .await
+        .map_err(|error| {
+            format!(
+            "Failed to publish `{branch}` before syncing the create-pr artifact: {error}. The pull \
+             request still presents its previous head, so the artifact was not synced."
+        )
+        })
+}
+
+/// Sync an edited `create-pr` artifact into the already-open PR it produced:
+/// publish the branch, then update the prose.
 ///
 /// A builder can rewrite its `create-pr` artifact after a PR node/action has
 /// opened the live PR. In that case the artifact is the source of truth the
-/// reviewer should see, so update both GitHub and the local `merge_requests`
-/// cache instead of leaving PR resources stale.
+/// reviewer should see — both its *tree* and its prose — so the branch is
+/// published to origin first and only then are GitHub and the local
+/// `merge_requests` cache updated.
 pub(crate) async fn sync_create_pr_artifact_for_job(
     orch: &Orchestrator,
     job_id: &str,
@@ -91,7 +133,10 @@ pub(crate) async fn sync_create_pr_artifact_for_job(
         return Ok(false);
     };
 
+    // Only a bound remote PR has a head to advance; a local-only change has no
+    // origin to publish to and nothing external reading it.
     if let Some(pr_number) = mr_context.github_pr_number {
+        publish_branch_for_artifact_sync(orch, &mr_context.repo_path, &mr_context.mr_id).await?;
         edit_github_pr_title_body(&mr_context.repo_path, pr_number, title, body).await?;
     }
 
@@ -109,7 +154,7 @@ mod tests {
     use super::*;
     use crate::pr_data::actions::test_support::{
         migrated_db, seed_local_open_merge_request, seed_pr_node_merge_request_for_artifact_job,
-        test_orchestrator,
+        seed_remote_open_merge_request, test_orchestrator,
     };
     use crate::services::testing::MockGitClient;
     use crate::storage::RowExt;
@@ -202,6 +247,32 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, "New PR-node title");
         assert_eq!(row.1, "New PR-node body");
+    }
+
+    /// Re-saving the artifact is the sanctioned trigger for publishing a
+    /// builder's branch, so a sync that cannot publish must NOT report success.
+    /// Reporting `Ok` here is how two pull requests came to present their
+    /// pre-review trees as the reviewable version while their branches carried
+    /// the fixes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_create_pr_artifact_fails_closed_when_the_branch_cannot_be_published() {
+        let db = migrated_db().await;
+        let repo = tempfile::tempdir().unwrap();
+        seed_remote_open_merge_request(&db, "owner-job", &repo.path().to_string_lossy()).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        let error = sync_create_pr_artifact_for_job(&orch, "owner-job", "Title", Some("Body"))
+            .await
+            .expect_err("an unpublishable branch must not report a completed sync");
+
+        assert!(
+            error.contains("Failed to publish") && error.contains("agent/PROJ-4-builder-0"),
+            "the failure must name the branch it could not publish: {error}"
+        );
+        assert!(
+            error.contains("was not synced"),
+            "the failure must say the artifact did not land: {error}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

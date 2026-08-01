@@ -14,22 +14,24 @@ use std::path::{Path, PathBuf};
 use crate::models::{Preset, TerminalCommand};
 use crate::references::ProjectReference;
 
-/// Worktree behavior settings.
+/// Executor materialization settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct WorktreeSettings {
+pub struct MaterializationSettings {
     /// Legacy field — deserialized for migration but not re-serialized.
     #[serde(default, skip_serializing)]
     seed_ignored: Option<bool>,
-    /// Rules for populating gitignored paths into new worktrees, grouped by strategy.
+    /// Rules for populating gitignored paths into executor materializations, grouped by strategy.
     #[serde(default, skip_serializing_if = "PopulateConfig::is_empty")]
     pub populate: PopulateConfig,
 }
 
-// The check/worktree-populate config value types now live in `models::project`
+// The check/materialization-populate config value types now live in `models::project`
 // (pure serde data, no upward dependency on config). Re-exported here so every
 // `project_settings::CheckCommand`-style path keeps resolving.
-pub use crate::models::{CheckCommand, CheckPolicy, CheckResourceClass, CheckWhen, PopulateConfig};
+pub use crate::models::{
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, PopulateConfig,
+};
 
 /// Project settings as stored in YAML file.
 /// All fields are optional - missing fields use defaults.
@@ -42,12 +44,19 @@ pub struct ProjectSettingsFile {
     pub terminal_commands: Option<Vec<TerminalCommand>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<HashMap<String, CheckCommand>>,
+    /// Inputs of a dependency-graph NODE that no manifest edge expresses, keyed
+    /// by the same `rust:<crate>` / `ts:<package>` token a check's `scope` uses.
+    /// Attaching them to the node rather than to a check makes them compose
+    /// transitively: the SQL a crate `include_str!`s becomes an input of every
+    /// check whose closure reaches that crate. See docs/checks.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_inputs: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<Vec<ProjectReference>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<WorktreeSettings>,
+    pub materialization: Option<MaterializationSettings>,
     /// Project-level override for active backend
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) active_backend: Option<String>,
@@ -63,10 +72,10 @@ pub struct ProjectSettingsFile {
 }
 
 impl ProjectSettingsFile {
-    /// Get the populate config for worktrees.
+    /// Get the populate config for executor materializations.
     /// Returns the configured PopulateConfig, or empty (skip-all) by default.
     pub fn populate_config(&self) -> PopulateConfig {
-        self.worktree
+        self.materialization
             .as_ref()
             .map(|w| w.populate.clone())
             .unwrap_or_default()
@@ -89,11 +98,13 @@ struct LegacyProjectSettingsFile {
     #[serde(default)]
     checks: Option<HashMap<String, CheckCommand>>,
     #[serde(default)]
+    extra_inputs: Option<HashMap<String, Vec<String>>>,
+    #[serde(default)]
     default_branch: Option<String>,
     #[serde(default)]
     references: Option<Vec<ProjectReference>>,
     #[serde(default)]
-    worktree: Option<WorktreeSettings>,
+    materialization: Option<MaterializationSettings>,
     // Preset fields — must be present so they survive the legacy parse path
     #[serde(default)]
     active_backend: Option<String>,
@@ -113,10 +124,6 @@ struct LegacyTerminalCommand {
     command: String,
     #[serde(default)]
     persistent: bool,
-    // Carried through the always-run legacy parse so a `write` carveout on a
-    // terminal command is not dropped during migration. See `TerminalCommand`.
-    #[serde(default)]
-    write: Vec<String>,
 }
 
 /// Get the path to the project config file (\[project\]/.cairn/config.yaml)
@@ -157,8 +164,8 @@ pub fn load_project_settings(project_path: &Path) -> ProjectSettingsFile {
 ///
 /// Precedence: an explicit `defaultBranch` in the project's `.cairn/config.yaml`
 /// wins, then the value stored on the project row, then the hard fallback
-/// `"main"`. Both the UI projection and worktree creation resolve through this
-/// helper so they always agree on which branch worktrees are based on.
+/// `"main"`. Both the UI projection and branch-coordinate creation resolve
+/// through this helper so they always agree on the durable base.
 pub fn resolve_default_branch(
     config: &ProjectSettingsFile,
     stored_default_branch: Option<&str>,
@@ -181,9 +188,21 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
 
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read project config file: {}", e))?;
+    parse_project_settings(&content)
+}
 
+/// Parse `.cairn/config.yaml` CONTENT into settings, independent of where those
+/// bytes came from. The filesystem loader reads a checkout; the check cadences
+/// read the same file out of the immutable commit they are evaluating. Both go
+/// through this one parser so a commit-sourced contract and a checkout-sourced
+/// contract can never diverge in how they interpret the same bytes.
+///
+/// Returns (settings, needs_migration) where needs_migration is true if legacy
+/// fields were found. A commit-sourced caller ignores the migration flag: a
+/// sealed commit is not something to rewrite.
+pub(crate) fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, bool), String> {
     // First try to parse as legacy format to detect deprecated fields
-    let legacy: LegacyProjectSettingsFile = serde_yaml::from_str(&content)
+    let legacy: LegacyProjectSettingsFile = serde_yaml::from_str(content)
         .map_err(|e| format!("Failed to parse project config file: {}", e))?;
 
     // Check if migration is needed
@@ -192,7 +211,7 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
     if let Some(ref files) = legacy.copy_files {
         log::warn!(
             "Removing deprecated copyFiles from project config: {:?}. \
-             Use worktree.populate.copy patterns instead.",
+             Use materialization.populate.copy patterns instead.",
             files
         );
     }
@@ -203,7 +222,7 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
         .unwrap_or(false);
     // Legacy seedIgnored field triggers migration to clear it from the file
     let has_legacy_seed_ignored = legacy
-        .worktree
+        .materialization
         .as_ref()
         .and_then(|w| w.seed_ignored)
         .is_some();
@@ -218,14 +237,14 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
                 .map(|c| TerminalCommand {
                     name: c.name,
                     command: c.command,
-                    write: c.write,
                 })
                 .collect()
         }),
         checks: legacy.checks,
+        extra_inputs: legacy.extra_inputs,
         default_branch: legacy.default_branch,
         references: legacy.references,
-        worktree: legacy.worktree,
+        materialization: legacy.materialization,
         active_backend: legacy.active_backend,
         backends: legacy.backends,
         mcp_servers: legacy.mcp_servers,
@@ -243,15 +262,14 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
 ///
 /// Reads `[project_path]/.cairn/config.yaml` directly without the migration
 /// rewrite that `load_project_settings` performs, so it is safe on the hot
-/// worktree-fence policy-build path (it reads each terminal command's `write`
-/// carveout). Returns an empty list when the file is absent or invalid.
+/// logical-fence policy-build path. Returns an empty list when absent or invalid.
 pub(crate) fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::TerminalCommand> {
     load_project_settings_file(project_path)
         .map(|(file, _)| file.terminal_commands.unwrap_or_default())
         .unwrap_or_default()
 }
 
-/// Load the project's canonical worktree setup commands without rewriting config.
+/// Load the project's canonical executor setup commands without rewriting config.
 ///
 /// Build-slot submission uses this against the live primary checkout. Unlike
 /// [`load_project_settings`], errors remain visible so an unreadable or invalid
@@ -267,7 +285,7 @@ pub(crate) fn load_execution_project_policy(
 ) -> Result<ExecutionProjectPolicy, String> {
     load_project_settings_file(project_path).map(|(file, _)| ExecutionProjectPolicy {
         setup_commands: file.setup_commands.unwrap_or_default(),
-        populate: file.worktree.unwrap_or_default().populate,
+        populate: file.materialization.unwrap_or_default().populate,
     })
 }
 
@@ -285,9 +303,42 @@ pub fn load_setup_commands(project_path: &Path) -> Result<Vec<String>, String> {
 /// run would be surprising. Returns `None` when the file is absent, invalid, or
 /// declares no checks.
 pub(crate) fn load_checks(project_path: &Path) -> Option<HashMap<String, CheckCommand>> {
-    load_project_settings_file(project_path)
-        .ok()
-        .and_then(|(file, _)| file.checks)
+    load_checks_contract(project_path).map(|contract| contract.checks)
+}
+
+/// A project's checks contract: the checks themselves plus the node-level extra
+/// inputs their `scope` closures compose in. They travel together because the
+/// input selector cannot be resolved from either half alone.
+#[derive(Debug, Clone, Default)]
+pub struct ChecksContract {
+    pub checks: HashMap<String, CheckCommand>,
+    pub extra_inputs: HashMap<String, Vec<String>>,
+}
+
+/// Load the checks contract from a CHECKOUT without migrating. See [`load_checks`]
+/// for why this path must stay side-effect free. Returns `None` when the file is
+/// absent, invalid, or declares no checks.
+///
+/// This is the PROJECT-LEVEL read: the Settings editor and the project-wide
+/// display of "what checks does this project declare". It is deliberately NOT
+/// the source for a cadence — a cadence's contract comes from the commit it is
+/// evaluating (`crate::execution::checks::checks_contract_at_commit`), because a
+/// project-sourced contract is what let one branch's config edit rewrite every
+/// sibling job's checks (CAIRN-3333).
+pub(crate) fn load_checks_contract(project_path: &Path) -> Option<ChecksContract> {
+    let (file, _) = load_project_settings_file(project_path).ok()?;
+    checks_contract_from(file)
+}
+
+/// The checks contract carried by already-parsed settings. `None` when the file
+/// declares no `checks` at all, which every caller treats as "this project has no
+/// checks" rather than "an empty set of checks".
+pub(crate) fn checks_contract_from(file: ProjectSettingsFile) -> Option<ChecksContract> {
+    let checks = file.checks?;
+    Some(ChecksContract {
+        checks,
+        extra_inputs: file.extra_inputs.unwrap_or_default(),
+    })
 }
 
 /// Managed top-level config keys: the current schema fields plus the legacy keys
@@ -297,6 +348,7 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "setupCommands",
     "terminalCommands",
     "checks",
+    "extraInputs",
     "defaultBranch",
     "references",
     "worktree",
@@ -400,7 +452,7 @@ pub(crate) fn create_default_project_config(project_path: &Path) -> Result<(), S
 # Paths matching 'symlink' patterns are symlinked to the main repo.
 # Unmatched paths are skipped — setup commands handle the rest.
 #
-# worktree:
+# materialization:
 #   populate:
 #     copy:
 #       - ".env"
@@ -491,7 +543,6 @@ checks:
             terminal_commands: Some(vec![TerminalCommand {
                 name: "Dev Server".to_string(),
                 command: "npm run dev".to_string(),
-                write: vec![],
             }]),
             default_branch: Some("develop".to_string()),
             ..Default::default()
@@ -516,6 +567,9 @@ checks:
       - packages/ui/**
     policy: gate
     when: idle
+    verdictEnvironment:
+      - FEATURE_FLAG
+      - SERVICE_TOKEN
     executor: build-slot
   typecheck:
     command: tsc --noEmit
@@ -529,6 +583,10 @@ checks:
         // cadence (see `CheckWhen`).
         assert_eq!(frontend.when, CheckWhen::Review);
         assert_eq!(
+            frontend.verdict_environment,
+            vec!["FEATURE_FLAG".to_string(), "SERVICE_TOKEN".to_string()]
+        );
+        assert_eq!(
             frontend.impact.as_deref(),
             Some(&["src/**".to_string(), "packages/ui/**".to_string()][..])
         );
@@ -537,6 +595,7 @@ checks:
         assert_eq!(typecheck.command, "tsc --noEmit");
         assert_eq!(typecheck.policy, CheckPolicy::Advisory);
         assert_eq!(typecheck.when, CheckWhen::Write);
+        assert!(typecheck.verdict_environment.is_empty());
 
         let serialized = serde_yaml::to_string(&settings).unwrap();
         let reparsed: ProjectSettingsFile = serde_yaml::from_str(&serialized).unwrap();
@@ -734,16 +793,19 @@ defaultBranch: main
     }
 
     #[test]
-    fn test_worktree_legacy_seed_ignored_parsed() {
+    fn test_materialization_legacy_seed_ignored_parsed() {
         let yaml = r#"
-worktree:
+materialization:
   seedIgnored: false
 "#;
         let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
 
         // Legacy field is deserialized as Option<bool>
         assert_eq!(
-            settings.worktree.as_ref().and_then(|w| w.seed_ignored),
+            settings
+                .materialization
+                .as_ref()
+                .and_then(|w| w.seed_ignored),
             Some(false)
         );
         // But populate_config is still empty (legacy field doesn't populate anything)
@@ -751,9 +813,9 @@ worktree:
     }
 
     #[test]
-    fn test_worktree_populate_config() {
+    fn test_materialization_populate_config() {
         let yaml = r#"
-worktree:
+materialization:
   populate:
     copy:
       - ".env"
@@ -923,7 +985,7 @@ copyFiles:
         let project_path = temp.path();
 
         let settings = ProjectSettingsFile {
-            worktree: Some(WorktreeSettings {
+            materialization: Some(MaterializationSettings {
                 seed_ignored: None,
                 populate: PopulateConfig {
                     copy: vec![".env".to_string(), ".env.*".to_string()],
@@ -952,14 +1014,14 @@ copyFiles:
 
     #[test]
     fn test_legacy_seed_populate_config_is_ignored() {
-        // The `seed` worktree-populate mechanism was removed (CAIRN-2622): the
+        // The `seed` materialization-populate mechanism was removed (CAIRN-2622): the
         // clone source was a live dev-instance target dir and could capture a
         // torn snapshot; sccache is the canonical cross-worktree compile cache.
         // A pre-existing config that still carries a `seed:` block must keep
         // deserializing — the key is now an ignored unknown field, and the
         // surviving copy/symlink rules are honored.
         let raw = r#"
-worktree:
+materialization:
   populate:
     copy:
       - ".env"
@@ -1162,20 +1224,17 @@ backends:
     }
 
     #[test]
-    fn terminal_command_write_parses_and_survives_migration() {
+    fn terminal_commands_do_not_serialize_repository_filesystem_capabilities() {
         let temp = TempDir::new().unwrap();
         let project_path = temp.path();
-
-        // ciCommands forces the legacy migration rewrite; a terminal command's
-        // `write` carveout must ride through it (the always-run legacy parse).
         let content = r#"
 ciCommands:
   - npm test
 terminalCommands:
   - name: Dev
-    command: "bun run build:cmd && bun dev:instance"
+    command: "bun dev:instance --seed empty"
     write:
-      - "~/.cairn-dev-*"
+      - "~/.aws"
 "#;
         let config_path = get_project_config_path(project_path);
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
@@ -1184,13 +1243,12 @@ terminalCommands:
         let loaded = load_terminal_commands(project_path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "Dev");
-        assert_eq!(loaded[0].write, vec!["~/.cairn-dev-*"]);
+        assert_eq!(loaded[0].command, "bun dev:instance --seed empty");
 
-        // After the migration rewrite the carveout is still present on disk.
         load_project_settings(project_path);
-        let after = load_terminal_commands(project_path);
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].write, vec!["~/.cairn-dev-*"]);
+        let rewritten = std::fs::read_to_string(config_path).unwrap();
+        assert!(!rewritten.contains("write:"));
+        assert!(!rewritten.contains(".aws"));
     }
 
     #[test]
@@ -1210,7 +1268,7 @@ ciCommands:
   - npm test
 setupCommands:
   - npm install
-worktree:
+materialization:
   seedIgnored: false
 activeBackend: codex
 "#;
@@ -1289,7 +1347,7 @@ activeBackend: codex
         let temp = TempDir::new().unwrap();
         let config_path = get_project_config_path(temp.path());
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        let content = "ciCommands:\n  - old\nsetupCommands:\n  - bun install\nworktree:\n  populate:\n    copy: [.env]\n    symlink: [cache/]\n";
+        let content = "ciCommands:\n  - old\nsetupCommands:\n  - bun install\nmaterialization:\n  populate:\n    copy: [.env]\n    symlink: [cache/]\n";
         std::fs::write(&config_path, content).unwrap();
 
         let policy = load_execution_project_policy(temp.path()).unwrap();

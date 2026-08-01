@@ -2,29 +2,18 @@
 //! concurrency-safety, route reconcile from a synced-in replica, and the
 //! rotating sync-token callback.
 //!
-//! ## A skip is NOT a pass — the server-backed tests MUST be run unfenced
-//!
-//! Every server-backed test here self-skips inside the worktree fence
-//! (`common::skip_if_fenced`) and when no sync server is reachable. So a fenced
-//! `bun run test:rust` SKIPS them and still reads green — that green says NOTHING
-//! about whether they pass. To exercise them for real, run UNFENCED (the
-//! `CAIRN_CALLBACK_URL`/`CAIRN_RUN_ID`/`CAIRN_WORKTREE` trio unset) with
-//! `tursodb` on PATH, e.g. from `src-tauri/`:
-//!
-//! ```text
-//! cargo test -p cairn-core --features test-utils --test main --no-run
-//! env -u CAIRN_SANDBOXED -u CAIRN_CALLBACK_URL -u CAIRN_RUN_ID -u CAIRN_WORKTREE \
-//!     ./target/debug/deps/main-* team_connect --test-threads=1
-//! ```
-
-use crate::common;
+//! These tests run in every lane, fenced or not. Each server-backed test needs a
+//! sync server: `tursodb` on PATH, or a `CAIRN_TEST_SYNC_URL`. Spawning that
+//! process, binding loopback, and writing temp files are all permitted inside the
+//! worktree fence, so nothing here self-skips, and an unreachable server FAILS
+//! rather than passing vacuously (`common::sync_server::SyncServer::require`).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::common::sync_server::SyncServer;
+use crate::common::sync_server::{skip_if_team_schema_unavailable, SyncServer};
 use cairn_core::account::TeamTokenMinter;
 use cairn_core::internal::db::{DbState, SyncRuntime, TeamConfig};
 use cairn_core::internal::services::testing::CapturingEmitter;
@@ -127,13 +116,13 @@ async fn wait_for_team_name(db: &LocalDb, id: &str, expected: &str, timeout: Dur
 /// pair — the double-checked single-flight under the open-gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_open_team_is_single_flight() {
-    if common::skip_if_fenced("concurrent_open_team_is_single_flight") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(server) = SyncServer::require("concurrent_open_team_is_single_flight") else {
         return;
     };
+    if skip_if_team_schema_unavailable("concurrent_open_team_is_single_flight", server.url()).await
+    {
+        return;
+    }
     let url = server.url().to_string();
     let dir = tempdir().unwrap();
 
@@ -169,13 +158,17 @@ async fn concurrent_open_team_is_single_flight() {
 /// `project_routes` row and routes that key to the replica — NOT `local`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_team_reconciles_synced_in_project_routes() {
-    if common::skip_if_fenced("open_team_reconciles_synced_in_project_routes") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(server) = SyncServer::require("open_team_reconciles_synced_in_project_routes") else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "open_team_reconciles_synced_in_project_routes",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url().to_string();
     let dir = tempdir().unwrap();
 
@@ -234,13 +227,17 @@ async fn open_team_reconciles_synced_in_project_routes() {
 /// Rotation: the rotating-token callback is invoked when a minter is installed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_team_invokes_the_rotating_token_callback() {
-    if common::skip_if_fenced("open_team_invokes_the_rotating_token_callback") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(server) = SyncServer::require("open_team_invokes_the_rotating_token_callback") else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "open_team_invokes_the_rotating_token_callback",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url().to_string();
     let dir = tempdir().unwrap();
 
@@ -269,13 +266,12 @@ async fn open_team_invokes_the_rotating_token_callback() {
 /// (never crashes); when it recovers, the backed-off commit lands on a peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn push_recovers_after_a_minter_outage() {
-    if common::skip_if_fenced("push_recovers_after_a_minter_outage") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(server) = SyncServer::require("push_recovers_after_a_minter_outage") else {
         return;
     };
+    if skip_if_team_schema_unavailable("push_recovers_after_a_minter_outage", server.url()).await {
+        return;
+    }
     let url = server.url().to_string();
     let dir = tempdir().unwrap();
 

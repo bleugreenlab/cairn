@@ -122,6 +122,18 @@ pub(super) fn payload_trimmed_non_empty_str<'a>(
         .filter(|value| !value.is_empty())
 }
 
+/// Compose the acknowledgement an agent reads after creating a config resource.
+///
+/// The address is the resource's canonical `cairn://` URI, never a filesystem
+/// path. A project-scoped skill, recipe, or agent is written into whichever
+/// checkout is materialized for the caller at the time, so an absolute path
+/// names a location that is neither stable across executions nor addressable by
+/// the reader. The URI is both, and it is the address a follow-up read or patch
+/// actually takes.
+pub(super) fn created_resource_ack(kind: &str, id: &str, uri: &str) -> String {
+    format!("Created {kind} '{id}' at {uri}")
+}
+
 async fn scope_project_path(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -169,6 +181,42 @@ pub(super) async fn target_resource_for_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn created_resource_ack_addresses_the_resource_by_uri() {
+        let ack = created_resource_ack(
+            "skill",
+            "rust-dev",
+            &cairn_common::uri::build_project_skill_uri("CAIRN", "rust-dev", &[]),
+        );
+        assert_eq!(
+            ack,
+            "Created skill 'rust-dev' at cairn://p/CAIRN/skills/rust-dev"
+        );
+    }
+
+    /// The ack is agent-facing text, so its address must stay a URI: a
+    /// materialization path would name the current checkout, which is neither
+    /// stable nor something the reader can address.
+    #[test]
+    fn created_resource_ack_never_carries_a_filesystem_path() {
+        for uri in [
+            cairn_common::uri::build_skill_uri("local", &[]),
+            cairn_common::uri::build_project_recipe_uri("CAIRN", "coordinator"),
+            cairn_common::uri::build_agent_uri("build"),
+            cairn_common::uri::build_project_agent_uri("CAIRN", "build"),
+        ] {
+            let ack = created_resource_ack("resource", "id", &uri);
+            let address = ack
+                .split(" at ")
+                .nth(1)
+                .expect("ack names an address after ' at '");
+            assert!(
+                address.starts_with("cairn://"),
+                "ack must address the resource by URI, got: {ack}"
+            );
+        }
+    }
 
     #[test]
     fn payload_string_helpers_handle_aliases_and_trimming() {

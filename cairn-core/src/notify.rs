@@ -79,6 +79,58 @@ pub fn job_db_change(job: &models::Job, action: &str) -> Value {
     )
 }
 
+/// Load the authoritative job scope after a write and build its payload.
+///
+/// The counterpart to [`run_db_change_for_id`] for call sites that hold only a
+/// job id. A job row that has vanished degrades to the documented bare sweep
+/// rather than emitting a partially-scoped payload, which the frontend would
+/// mis-invalidate (see [`job_db_change_ids`]).
+pub(crate) async fn job_db_change_for_id(db: &LocalDb, job_id: &str, action: &str) -> Value {
+    let job_id_owned = job_id.to_string();
+    let scope = db
+        .read(|conn| {
+            let job_id = job_id_owned.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT issue_id, execution_id, parent_job_id, parent_tool_use_id, project_id
+                         FROM jobs WHERE id = ?1 LIMIT 1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((
+                        row.opt_text(0)?,
+                        row.opt_text(1)?,
+                        row.opt_text(2)?,
+                        row.opt_text(3)?,
+                        row.opt_text(4)?,
+                    ))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await;
+    match scope {
+        Ok(Some((issue_id, execution_id, parent_job_id, parent_tool_use_id, Some(project_id)))) => {
+            job_db_change_ids(
+                action,
+                job_id,
+                issue_id.as_deref(),
+                execution_id.as_deref(),
+                parent_job_id.as_deref(),
+                parent_tool_use_id.as_deref(),
+                &project_id,
+            )
+        }
+        Ok(_) => json!({"table": "jobs", "action": action}),
+        Err(error) => {
+            log::warn!("Failed to load job scope for db-change {job_id}: {error}");
+            json!({"table": "jobs", "action": action})
+        }
+    }
+}
+
 /// Build a fully-scoped `runs` db-change payload.
 pub(crate) fn run_db_change_ids(
     action: &str,
@@ -605,9 +657,7 @@ mod tests {
             execution_id: Some("exec-1".into()),
             recipe_node_id: None,
             parent_job_id: Some("parent-1".into()),
-            worktree_path: None,
             branch: None,
-            base_commit: None,
             pack_anchor: None,
             current_session_id: None,
             status: models::JobStatus::Running,

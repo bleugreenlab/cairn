@@ -6,6 +6,7 @@ pub struct DbSession {
     pub job_id: Option<String>,
     pub chat_id: Option<String>,
     pub backend: String,
+    pub account_id: Option<String>,
     pub status: String,
     pub parent_session_id: Option<String>,
     pub replaced_by_id: Option<String>,

@@ -191,7 +191,7 @@ async fn summaries_for_action_runs_preserve_action_run_id() {
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].id, merge_request);
     assert_eq!(summaries[0].action_run_id, Some(action_run));
-    assert_eq!(summaries[0].pr_number, 12);
+    assert_eq!(summaries[0].pr_number, Some(12));
 }
 
 #[tokio::test]
@@ -224,7 +224,7 @@ async fn get_by_action_run_id_accepts_action_run_or_job_id() {
 
     assert_eq!(via_action.id, merge_request);
     assert_eq!(via_job.id, via_action.id);
-    assert_eq!(via_action.pr_number, 33);
+    assert_eq!(via_action.pr_number, Some(33));
 }
 
 #[tokio::test]

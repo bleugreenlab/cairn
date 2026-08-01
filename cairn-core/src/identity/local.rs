@@ -91,6 +91,12 @@ struct AccountFile {
     created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_used_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    health: Option<super::ProviderAccountHealth>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,8 +106,12 @@ enum AuthFile {
     ApiKey { encrypted: String },
     #[serde(rename = "oauth_token", alias = "o_auth_token")]
     OAuthToken { encrypted: String },
+    #[serde(rename = "base_url")]
+    BaseUrl { url: String },
     #[serde(rename = "local_cli")]
     LocalCli,
+    #[serde(rename = "claude_profile")]
+    ClaudeProfile,
 }
 
 /// Intermediate struct to detect format version during load.
@@ -191,28 +201,12 @@ pub fn identity_exists(config_dir: &Path) -> bool {
     config_dir.join(IDENTITY_FILENAME).exists()
 }
 
-/// Detect locally installed CLIs and return ephemeral accounts.
+/// Return ephemeral ambient accounts.
 ///
-/// These are NOT persisted — they're merged at load time with sort_order
-/// after all configured accounts (lowest priority by default).
+/// Ambient CLI accounts are intentionally not synthesized: managed provider
+/// profiles are the canonical authentication path for agent sessions.
 pub fn detect_local_accounts() -> Vec<ProviderAccount> {
-    let mut accounts = Vec::new();
-
-    if crate::env::find_binary("claude").is_ok() {
-        accounts.push(ProviderAccount {
-            id: "local_cli_anthropic".to_string(),
-            label: "Local CLI".to_string(),
-            api_provider: ApiProvider::Anthropic,
-            source: AccountSource::LocalCli,
-            auth: ProviderAuth::LocalCli,
-            project_id: None,
-            sort_order: 1000, // Low priority — after all configured accounts
-            created_at: 0,
-            last_used_at: None,
-        });
-    }
-
-    accounts
+    Vec::new()
 }
 
 /// Auto-populate a new identity store from git config (for first-run).
@@ -279,6 +273,7 @@ pub fn save_local_identity(config_dir: &Path, identity: &UserIdentity) -> Result
         identity.claude_auth.as_ref().map(|a| match a {
             ClaudeAuth::OAuthToken(v) => ProviderAuth::OAuthToken { value: v.clone() },
             ClaudeAuth::ApiKey(v) => ProviderAuth::ApiKey { value: v.clone() },
+            ClaudeAuth::ConfigDir(_) => ProviderAuth::ClaudeProfile,
         }),
     );
 
@@ -337,6 +332,9 @@ fn update_account_from_auth(
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
+                email: None,
+                plan: None,
+                health: None,
             });
         }
         (None, None) => {} // Nothing to do
@@ -367,6 +365,9 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             sort_order: 0,
             created_at: now,
             last_used_at: None,
+            email: None,
+            plan: None,
+            health: None,
         });
     }
 
@@ -390,6 +391,9 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             sort_order: 0,
             created_at: now,
             last_used_at: None,
+            email: None,
+            plan: None,
+            health: None,
         });
     }
 
@@ -406,6 +410,9 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             sort_order: 0,
             created_at: now,
             last_used_at: None,
+            email: None,
+            plan: None,
+            health: None,
         });
     }
 
@@ -434,7 +441,9 @@ fn store_from_v2_file(file: IdentityStoreFile, machine_id: &str) -> Result<Ident
             AuthFile::OAuthToken { encrypted } => ProviderAuth::OAuthToken {
                 value: decrypt_credential(&encrypted, machine_id)?,
             },
+            AuthFile::BaseUrl { url } => ProviderAuth::BaseUrl { url },
             AuthFile::LocalCli => ProviderAuth::LocalCli,
+            AuthFile::ClaudeProfile => ProviderAuth::ClaudeProfile,
         };
         if acc_file.api_provider == ApiProvider::OpenAI
             && acc_file.source == AccountSource::LocalCli
@@ -451,6 +460,9 @@ fn store_from_v2_file(file: IdentityStoreFile, machine_id: &str) -> Result<Ident
             sort_order: acc_file.sort_order,
             created_at: acc_file.created_at,
             last_used_at: acc_file.last_used_at,
+            email: acc_file.email,
+            plan: acc_file.plan,
+            health: acc_file.health,
         });
     }
 
@@ -496,7 +508,9 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
             ProviderAuth::OAuthToken { value } => AuthFile::OAuthToken {
                 encrypted: encrypt_credential(value, machine_id)?,
             },
+            ProviderAuth::BaseUrl { url } => AuthFile::BaseUrl { url: url.clone() },
             ProviderAuth::LocalCli => AuthFile::LocalCli,
+            ProviderAuth::ClaudeProfile => AuthFile::ClaudeProfile,
         };
 
         accounts.push(AccountFile {
@@ -509,6 +523,9 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
             sort_order: account.sort_order,
             created_at: account.created_at,
             last_used_at: account.last_used_at,
+            email: account.email.clone(),
+            plan: account.plan.clone(),
+            health: account.health.clone(),
         });
     }
 
@@ -585,6 +602,9 @@ mod tests {
             sort_order,
             created_at,
             last_used_at,
+            email: None,
+            plan: None,
+            health: None,
         }
     }
 
@@ -648,6 +668,9 @@ mod tests {
             sort_order,
             created_at: 0,
             last_used_at: None,
+            email: None,
+            plan: None,
+            health: None,
         }
     }
 
@@ -740,6 +763,42 @@ mod tests {
         }
         assert_eq!(loaded.git_identities.len(), 1);
         assert_eq!(loaded.git_identities[0].name, "Test User");
+    }
+
+    #[test]
+    fn test_v2_base_url_roundtrip_is_plaintext() {
+        let dir = TempDir::new().unwrap();
+        let url = "http://localhost:11434";
+        let store = identity_store(
+            "local-ollama",
+            vec![configured_account(
+                "acc_ollama",
+                "Local Ollama",
+                ApiProvider::Ollama,
+                ProviderAuth::BaseUrl {
+                    url: url.to_string(),
+                },
+                0,
+                1000,
+                None,
+            )],
+            vec![],
+        );
+
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
+        assert!(matches!(
+            &loaded.accounts[0].auth,
+            ProviderAuth::BaseUrl { url: loaded_url } if loaded_url == url
+        ));
+
+        let raw = std::fs::read_to_string(dir.path().join(IDENTITY_FILENAME)).unwrap();
+        assert!(raw.contains("type: base_url"), "got: {raw}");
+        assert!(raw.contains("url: http://localhost:11434"), "got: {raw}");
+        assert!(!raw.contains("encrypted:"), "got: {raw}");
     }
 
     #[test]

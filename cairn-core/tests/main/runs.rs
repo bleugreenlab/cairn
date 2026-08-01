@@ -1,6 +1,7 @@
 use crate::common;
 use std::sync::Arc;
 
+use cairn_core::internal::agent_process::orphan::RecordingProcessTable;
 use cairn_core::internal::services::EventEmitter;
 use cairn_core::internal::storage::LocalDb;
 use cairn_core::models::{RunStartMode, RunStatus};
@@ -528,6 +529,19 @@ async fn link_session_rotation(db: &LocalDb, old: &str, new: &str) {
     .unwrap();
 }
 
+// Stamp a job's active session, the pointer every node-keyed transcript read
+// resolves through.
+async fn set_current_session(db: &LocalDb, job_id: &str, session_id: &str) {
+    let job_id = job_id.to_string();
+    let session_id = session_id.to_string();
+    db.execute(
+        "UPDATE jobs SET current_session_id = ?1 WHERE id = ?2",
+        params![session_id.as_str(), job_id.as_str()],
+    )
+    .await
+    .unwrap();
+}
+
 // Point a session at a parent WITHOUT marking the parent replaced_by it — the
 // shape a delegated child job's forked session has.
 async fn set_session_parent(db: &LocalDb, id: &str, parent: &str) {
@@ -616,10 +630,10 @@ async fn list_events_for_session_spans_reseed_rotation_lineage() {
         vec!["old-user", "old-assistant", "new-seed", "new-user"]
     );
 
-    // The initial delta load carries the same full lineage.
-    let delta =
-        queries::list_events_for_job_session_delta(db.clone(), "job-1", "session-new", None)
-            .unwrap();
+    // The initial delta load carries the same full lineage, resolved from the
+    // node alone — no caller names a session.
+    set_current_session(&db, "job-1", "session-new").await;
+    let delta = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
     assert_eq!(
         delta
             .events
@@ -719,13 +733,10 @@ async fn list_events_for_session_excludes_cross_job_fork_parent() {
     )
     .await;
 
-    let parent = queries::list_events_for_job_session_delta(
-        db.clone(),
-        "job-parent",
-        "parent-session",
-        None,
-    )
-    .unwrap();
+    set_current_session(&db, "job-parent", "parent-session").await;
+    set_current_session(&db, "job-child", "fork-session").await;
+
+    let parent = queries::list_events_for_job_delta(db.clone(), "job-parent", None).unwrap();
     assert_eq!(
         parent
             .events
@@ -735,9 +746,9 @@ async fn list_events_for_session_excludes_cross_job_fork_parent() {
         vec!["parent-ev"]
     );
 
-    let child =
-        queries::list_events_for_job_session_delta(db.clone(), "job-child", "fork-session", None)
-            .unwrap();
+    // The child's forked transcript stays its own: each node resolves its own
+    // session, so no request can reach across the fork in either direction.
+    let child = queries::list_events_for_job_delta(db, "job-child", None).unwrap();
     assert_eq!(
         child
             .events
@@ -746,13 +757,174 @@ async fn list_events_for_session_excludes_cross_job_fork_parent() {
             .collect::<Vec<_>>(),
         vec!["fork-ev"]
     );
+}
 
-    let error = queries::list_events_for_job_session_delta(db, "job-parent", "fork-session", None)
-        .unwrap_err();
+#[tokio::test]
+async fn job_transcript_delta_follows_a_session_reconstruction() {
+    // Resuming a node from digest rotates it onto a NEW session under the same
+    // node. A view holding a cursor from before the rotation must keep
+    // receiving events — the successor's rows arrive as an ordinary delta, not
+    // as a re-keyed reload (CAIRN-3262).
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+
+    let project_id = common::create_project(&db, "RESUME").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_session(&db, "session-old", "job-1", 1).await;
+    set_current_session(&db, "job-1", "session-old").await;
+    insert_run(
+        &db,
+        "run-old",
+        None,
+        None,
+        Some("job-1"),
+        None,
+        "complete",
+        Some("session-old"),
+        100,
+    )
+    .await;
+    insert_event(
+        &db,
+        "old-assistant",
+        "run-old",
+        Some("session-old"),
+        None,
+        1,
+        "assistant",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // The open view's position after its initial load.
+    let initial = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
+    assert_eq!(initial.events.len(), 1);
+    let cursor = initial.last_rowid.expect("initial load yields a cursor");
+
+    // The reseed lands: a fresh session, marked as replacing the old one, and
+    // stamped as the node's current session.
+    insert_session(&db, "session-new", "job-1", 2).await;
+    link_session_rotation(&db, "session-old", "session-new").await;
+    set_current_session(&db, "job-1", "session-new").await;
+
+    // A rotated node with no events yet on its successor still hands back a
+    // usable cursor; a session-scoped MAX(rowid) would return null here and the
+    // caller's append-only merge would duplicate the whole prior transcript.
+    let rotated = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
     assert_eq!(
-        error.to_string(),
-        "session fork-session belongs to job job-child, not requested job job-parent"
+        rotated
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["old-assistant"]
     );
+    assert_eq!(rotated.last_rowid, Some(cursor));
+
+    insert_run(
+        &db,
+        "run-new",
+        None,
+        None,
+        Some("job-1"),
+        None,
+        "running",
+        Some("session-new"),
+        200,
+    )
+    .await;
+    insert_event(
+        &db,
+        "new-assistant",
+        "run-new",
+        Some("session-new"),
+        None,
+        1,
+        "assistant",
+        200,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // The pre-rotation cursor keeps working: the successor's event arrives as a
+    // plain delta on the same node key.
+    let delta = queries::list_events_for_job_delta(db.clone(), "job-1", Some(cursor)).unwrap();
+    assert_eq!(
+        delta
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["new-assistant"]
+    );
+    assert!(delta.last_rowid.unwrap() > cursor);
+}
+
+#[tokio::test]
+async fn job_transcript_delta_resolves_the_newest_run_before_a_session_is_stamped() {
+    // A new chat runs before `jobs.current_session_id` is populated. The node
+    // key still resolves a transcript, so there is no second client-side
+    // loading path for that window.
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+
+    let project_id = common::create_project(&db, "NEWCHAT").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_session(&db, "session-1", "job-1", 1).await;
+    insert_run(
+        &db,
+        "run-1",
+        None,
+        None,
+        Some("job-1"),
+        None,
+        "running",
+        Some("session-1"),
+        100,
+    )
+    .await;
+    insert_event(
+        &db,
+        "first",
+        "run-1",
+        Some("session-1"),
+        None,
+        1,
+        "assistant",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let delta = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
+    assert_eq!(
+        delta
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first"]
+    );
+
+    // A node that has never opened a session reads as an empty transcript, not
+    // an error, and holds the caller's position.
+    insert_job(&db, "job-empty", &project_id, None).await;
+    let empty = queries::list_events_for_job_delta(db, "job-empty", Some(7)).unwrap();
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.last_rowid, Some(7));
 }
 
 #[tokio::test]
@@ -1072,7 +1244,6 @@ async fn session_events_delta_returns_streaming_placeholder_separately() {
         Some("session-1"),
         Some("turn-1"),
         "codex",
-        Some(1),
     )
     .unwrap();
     let active = append_chunks(
@@ -1167,7 +1338,6 @@ async fn active_streams_append_after_existing_events() {
         Some("session-1"),
         Some("turn-1"),
         "codex",
-        Some(1),
     )
     .unwrap();
     append_chunks(
@@ -1326,8 +1496,29 @@ async fn reconcile_stale_runs_marks_process_and_turn_terminal() {
     )
     .await;
 
-    queries::reconcile_stale_runs(db.clone(), &NoopEmitter);
+    // No process on the machine names this run's session, so nothing is stopped
+    // and the row records an assumed death.
+    let processes = RecordingProcessTable::new(vec![(
+        4242,
+        "/bin/claude --session-id some-other-session".to_string(),
+    )]);
+    queries::reconcile_stale_runs_with(db.clone(), &NoopEmitter, STALE_BOOT_AT, &processes);
 
+    assert!(
+        processes.stopped().is_empty(),
+        "an unrelated process must never be signalled"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-live"
+        )
+        .await
+        .as_deref(),
+        Some("crash"),
+        "a death this sweep did not cause stays an assumed crash"
+    );
     assert_eq!(
         common::scalar_text_by_id(&db, "SELECT status FROM runs WHERE id = ?1", "run-live")
             .await
@@ -1345,5 +1536,366 @@ async fn reconcile_stale_runs_marks_process_and_turn_terminal() {
             .await
             .as_deref(),
         Some("exited")
+    );
+}
+
+/// CAIRN-3287: a runner that died without cleaning up leaves its agents running.
+/// The startup sweep stops the survivor identified by the session UUID in its
+/// argv — and only that one — and records that it was stopped rather than
+/// inventing a crash it never confirmed.
+#[tokio::test]
+async fn reconcile_stale_runs_reaps_the_orphan_that_names_a_stale_session() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "ORPHAN").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_run(
+        &db,
+        "run-orphaned",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "live",
+        Some("934d794a-orphan"),
+        1,
+    )
+    .await;
+    insert_run(
+        &db,
+        "run-vanished",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "live",
+        Some("4fac7e94-vanished"),
+        1,
+    )
+    .await;
+
+    // A surviving agent for the first run, an unrelated tool, and this test's own
+    // runner-shaped process. Only the first may be signalled.
+    let processes = RecordingProcessTable::new(vec![
+        (
+            5001,
+            "/bin/claude --session-id 934d794a-orphan --print".to_string(),
+        ),
+        (5002, "/usr/bin/rg --files".to_string()),
+        (5003, "cairn-runner run --port 3849".to_string()),
+    ]);
+
+    queries::reconcile_stale_runs_with(db.clone(), &NoopEmitter, STALE_BOOT_AT, &processes);
+
+    assert_eq!(
+        processes.stopped(),
+        vec![5001],
+        "only the process naming a stale session may be signalled"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-orphaned"
+        )
+        .await
+        .as_deref(),
+        Some(queries::ORPHAN_REAPED_EXIT_REASON),
+        "a run whose process WE stopped must say so"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-vanished"
+        )
+        .await
+        .as_deref(),
+        Some("crash"),
+        "a run with no surviving process is still only presumed dead"
+    );
+}
+
+/// A host boot far in the future of the fixtures' epoch timestamps, so a seeded run
+/// reads as a predecessor's leftover. Tests needing the other side of the boundary
+/// seed a run past it instead.
+const STALE_BOOT_AT: i64 = 1_000_000;
+
+async fn set_run_timestamps(db: &LocalDb, run_id: &str, started_at: i64, created_at: i64) {
+    let run_id = run_id.to_string();
+    db.write(move |conn| {
+        let run_id = run_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE runs SET started_at = ?1, created_at = ?2 WHERE id = ?3",
+                params![started_at, created_at, run_id.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+/// The dangerous direction of the CAIRN-3287 sweep, and the reason it takes a boot
+/// boundary at all.
+///
+/// Startup recovery runs AFTER the transport begins serving, so a run can be created
+/// while the sweep is in flight. Such a run is non-terminal and its session id is
+/// visible in `ps` — exactly what the sweep matches on — so an unscoped sweep would
+/// SIGTERM an agent this very host had just spawned and then mark its run crashed.
+/// It must be left entirely alone: not signalled, not rewritten.
+#[tokio::test]
+async fn reconcile_stale_runs_never_touches_a_run_this_host_spawned() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "OWNED").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_run(
+        &db,
+        "run-just-spawned",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "live",
+        Some("fresh-session-uuid"),
+        1,
+    )
+    .await;
+    // Spawned one second into this host's life, mid-recovery.
+    set_run_timestamps(
+        &db,
+        "run-just-spawned",
+        STALE_BOOT_AT + 1,
+        STALE_BOOT_AT + 1,
+    )
+    .await;
+    insert_turn(
+        &db,
+        "turn-running",
+        "fresh-session-uuid",
+        "run-just-spawned",
+        Some("job-1"),
+        1,
+        "running",
+    )
+    .await;
+
+    // Its agent is running and would match on session id if it were a candidate.
+    let processes = RecordingProcessTable::new(vec![(
+        6001,
+        "/bin/claude --session-id fresh-session-uuid --print".to_string(),
+    )]);
+
+    queries::reconcile_stale_runs_with(db.clone(), &NoopEmitter, STALE_BOOT_AT, &processes);
+
+    assert!(
+        processes.stopped().is_empty(),
+        "the sweep must never signal an agent this host spawned, got {:?}",
+        processes.stopped()
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-just-spawned"
+        )
+        .await
+        .as_deref(),
+        Some("live"),
+        "a run this host owns stays live"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-just-spawned"
+        )
+        .await,
+        None,
+        "and gains no exit reason"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(&db, "SELECT state FROM turns WHERE id = ?1", "turn-running")
+            .await
+            .as_deref(),
+        Some("running"),
+        "nor is its in-flight turn interrupted"
+    );
+}
+
+/// The boundary is strict, matching the tool-serving fence: a run stamped exactly at
+/// boot belongs to this host. Whole-second timestamps make this the common case for
+/// the first run after a restart, not a curiosity.
+#[tokio::test]
+async fn reconcile_stale_runs_leaves_a_run_stamped_at_the_boot_second_alone() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "BOUND").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_run(
+        &db,
+        "run-boot-second",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "live",
+        Some("boot-second-session"),
+        1,
+    )
+    .await;
+    set_run_timestamps(&db, "run-boot-second", STALE_BOOT_AT, STALE_BOOT_AT).await;
+
+    let processes = RecordingProcessTable::new(vec![(
+        6002,
+        "/bin/claude --session-id boot-second-session".to_string(),
+    )]);
+
+    queries::reconcile_stale_runs_with(db.clone(), &NoopEmitter, STALE_BOOT_AT, &processes);
+
+    assert!(processes.stopped().is_empty());
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-boot-second"
+        )
+        .await
+        .as_deref(),
+        Some("live")
+    );
+}
+
+/// A run that finalizes between the sweep's read and its write keeps its real
+/// outcome. Signalling a process can take up to a second, so that gap is wide
+/// enough to matter, and the invented `crash` must not overwrite the truth.
+#[tokio::test]
+async fn reconcile_stale_runs_does_not_overwrite_a_run_that_finalized_meanwhile() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "RACE").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_run(
+        &db,
+        "run-finalizing",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "live",
+        Some("racing-session"),
+        1,
+    )
+    .await;
+
+    // Stand in for the concurrent finalizer by having the process table finalize
+    // the run at the moment the sweep signals it: that call happens between the
+    // candidate read and the terminal write, which is precisely the window.
+    struct FinalizeOnStop {
+        db: Arc<LocalDb>,
+    }
+    impl cairn_core::internal::agent_process::orphan::ProcessTable for FinalizeOnStop {
+        fn list(&self) -> Vec<(u32, String)> {
+            vec![(6003, "/bin/claude --session-id racing-session".to_string())]
+        }
+
+        fn stop(&self, _pid: u32) -> bool {
+            let db = self.db.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        db.execute(
+                            "UPDATE runs
+                             SET status = 'exited', exit_reason = 'user_stop'
+                             WHERE id = 'run-finalizing'",
+                            (),
+                        )
+                        .await
+                        .unwrap();
+                    })
+            })
+            .join()
+            .unwrap();
+            true
+        }
+    }
+
+    queries::reconcile_stale_runs_with(
+        db.clone(),
+        &NoopEmitter,
+        STALE_BOOT_AT,
+        &FinalizeOnStop { db: db.clone() },
+    );
+
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-finalizing"
+        )
+        .await
+        .as_deref(),
+        Some("user_stop"),
+        "a real outcome recorded during the sweep must survive it"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-finalizing"
+        )
+        .await
+        .as_deref(),
+        Some("exited")
+    );
+}
+
+/// The sweep tried to stop a survivor and could not (no permission, or it outlived
+/// escalation). The run is still marked crashed — its host is gone — but it must NOT
+/// claim `orphan_reaped`, because nothing was confirmed stopped and the zombie may
+/// still be alive.
+#[tokio::test]
+async fn reconcile_stale_runs_does_not_claim_a_reap_it_could_not_confirm() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "UNSTOP").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_run(
+        &db,
+        "run-unstoppable",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "live",
+        Some("stubborn-session"),
+        1,
+    )
+    .await;
+
+    let processes = RecordingProcessTable::unable_to_stop(vec![(
+        6004,
+        "/bin/claude --session-id stubborn-session".to_string(),
+    )]);
+
+    queries::reconcile_stale_runs_with(db.clone(), &NoopEmitter, STALE_BOOT_AT, &processes);
+
+    assert_eq!(processes.stopped(), vec![6004], "the stop is attempted");
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-unstoppable"
+        )
+        .await
+        .as_deref(),
+        Some("crash"),
+        "an unconfirmed stop stays an assumed death, never orphan_reaped"
     );
 }

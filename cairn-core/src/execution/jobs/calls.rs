@@ -8,11 +8,11 @@ use crate::models::{ConfirmPolicy, OutputSchemaInfo};
 
 /// Create an ephemeral agent-call run: a node-less job+session+run started
 /// directly (never via DAG advancement), carrying a per-run output contract and
-/// running either in the caller's inherited worktree or a fresh scratch dir.
+/// carrying either the caller's inherited branch coordinate or no branch.
 ///
 /// This is the call-primitive sibling of [`create_child_task`] (CAIRN-2481): the
 /// same real-run shape (job, session, run, event stream, backend session), but
-/// with a per-call worktree mode, an enforced output schema, and durable
+/// with a per-call branch policy, an enforced output schema, and durable
 /// workflow tags. The spawn pipeline persists a pre-materialized `CallTool`
 /// packet around it so the delegated-task wait/suspend/resume machinery is
 /// reused unchanged.
@@ -144,56 +144,27 @@ pub(crate) fn prepare_call_run(
     agent_config.selection = Some(selection);
     agent_config.extras = Some(extras);
 
-    // ---- Resolve the worktree mode --------------------------------------
-    // `inherit` shares the caller's worktree (mutating calls are first-class);
-    // `none` runs in a fresh scratch dir under $TMPDIR (sandbox-writable) with no
-    // project-tree binding, so the call cannot read or mutate the caller's tree.
-    let (worktree_path, working_dir, base_commit, ephemeral_branch, owns_ephemeral_worktree) =
-        match super::worktrees::resolve_call_worktree_plan(
-            input.worktree,
-            parent_job.worktree_path.as_deref(),
-            parent_job.base_branch.as_deref(),
-        ) {
-            // A worktree-backed parent shares its worktree with the call.
-            super::worktrees::CallWorktreePlan::Share { path } => {
-                let base = worktree_head_commit(orch, Path::new(&path));
-                (Some(path.clone()), path, base, None, false)
-            }
-            // An ambient (Branch: main / no-worktree) parent has none to inherit,
-            // so the call gets its own ephemeral worktree off the parent's base
-            // branch — isolation from the user's live checkout, reclaimed when the
-            // call job terminalizes. Mirrors the child-task precedent (CAIRN-2476).
-            super::worktrees::CallWorktreePlan::MintEphemeral { base_ref } => {
-                let repo_path = project_path
-                    .as_ref()
-                    .ok_or("Project has no repo path for ephemeral call worktree")?
-                    .to_string_lossy()
-                    .to_string();
-                let (path, branch) = super::worktrees::ensure_ephemeral_task_worktree(
-                    orch,
-                    &repo_path,
-                    &project_id,
-                    &job_id,
-                    issue_id.clone(),
-                    &base_ref,
-                )?;
-                let base = worktree_head_commit(orch, Path::new(&path));
-                (Some(path.clone()), path, base, Some(branch), true)
-            }
-            super::worktrees::CallWorktreePlan::Scratch => {
-                let scratch = std::env::temp_dir().join(format!("cairn-call-{run_id}"));
-                std::fs::create_dir_all(&scratch)
-                    .map_err(|e| format!("Failed to create call scratch dir: {e}"))?;
-                (
-                    None,
-                    scratch.to_string_lossy().into_owned(),
-                    None,
-                    None,
-                    false,
+    // A call never owns a checkout. Inherit carries the parent's durable branch;
+    // None remains branchless. The session layer creates the job scratch
+    // residence independently of this coordinate.
+    //
+    // The parent's recorded base rides along as bookkeeping under either policy.
+    // It is not a coordinate anything resolves against — a call owns no checkout
+    // to place — so an unrecorded one is carried as `None` rather than refusing
+    // the call. The branch, which the caller genuinely asked to inherit, is still
+    // required.
+    let (branch, base_commit) = match input.branch_policy {
+        CallBranchPolicy::Inherit => (
+            Some(parent_job.branch.clone().ok_or_else(|| {
+                format!(
+                    "Cannot inherit the caller's branch: parent job {} has no branch",
+                    input.parent_job_id
                 )
-            }
-        };
-
+            })?),
+            parent_job.base_commit.clone(),
+        ),
+        CallBranchPolicy::None => (None, parent_job.base_commit.clone()),
+    };
     // ---- Persist job + session + run ------------------------------------
     let output_contract_json = serde_json::to_string(&input.output_contract)
         .map_err(|e| format!("Failed to serialize call output contract: {e}"))?;
@@ -205,13 +176,7 @@ pub(crate) fn prepare_call_run(
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             parent_job_id: Some(input.parent_job_id.clone()),
-            worktree_path: worktree_path.clone(),
-            // A call shares the parent's worktree (inherit from a worktree-backed
-            // parent) or runs in a scratch dir (none mode) — branch None; or it
-            // owns an ephemeral worktree minted off the parent's base (inherit
-            // from an ambient parent) — recorded here so teardown can forget and
-            // delete that jj bookmark.
-            branch: ephemeral_branch,
+            branch,
             agent_config_id: agent_config.id.clone(),
             project_id: project_id.clone(),
             issue_id: issue_id.clone(),
@@ -219,7 +184,6 @@ pub(crate) fn prepare_call_run(
             description: input.description.clone(),
             model: selected_model.as_ref().map(|m| m.to_string()),
             base_commit,
-            owns_ephemeral_worktree,
             output_contract: Some(output_contract_json),
             label: input.label.clone(),
             phase: input.phase.clone(),
@@ -267,7 +231,7 @@ pub(crate) fn prepare_call_run(
     }
 
     // ---- Seed the transcript --------------------------------------------
-    store_user_event(orch, &run_id, &session_id, &input.prompt, now, -1)?;
+    store_user_event(orch, &run_id, &session_id, &input.prompt, now)?;
 
     // The prompt's output-artifact instruction is built from the SAME contract
     // that resolve_artifact_contract validates against, so they cannot drift.
@@ -285,37 +249,10 @@ pub(crate) fn prepare_call_run(
         session_id,
         agent_config,
         selected_model,
-        working_dir,
         prompt: input.prompt,
         output_schema,
         execution_id,
-        worktree_path,
-        owns_ephemeral_worktree,
     })
-}
-
-/// Reclaim the ephemeral worktree an Inherit call from an ambient parent minted
-/// in [`prepare_call_run`], when the call fails to fully start (packet persist or
-/// session start). On such a failure the call job never terminalizes, so neither
-/// the finalize reclaim nor the terminal-status GC fires — discard it here so a
-/// failed spawn cannot strand a worktree + branch. No-op for a shared/inherited
-/// or scratch-dir call. Mirrors the child-task startup-failure cleanup.
-pub(crate) async fn reclaim_ephemeral_call_worktree(
-    orch: &Orchestrator,
-    prepared: &PreparedCallRun,
-) {
-    if !prepared.owns_ephemeral_worktree {
-        return;
-    }
-    if let Err(e) = crate::execution::teardown::teardown_worktrees(
-        orch,
-        crate::execution::teardown::TeardownScope::Job(prepared.job_id.clone()),
-        crate::execution::teardown::TeardownReason::Discarded,
-    )
-    .await
-    {
-        log::warn!("failed to reclaim ephemeral call worktree after start failure: {e}");
-    }
 }
 
 /// Start (or queue) a prepared call run. Split from [`prepare_call_run`] so the
@@ -442,7 +379,6 @@ fn start_call_run_now(orch: &Orchestrator, prepared: &PreparedCallRun) -> Result
         orch,
         &prepared.run_id,
         &prepared.prompt,
-        &prepared.working_dir,
         crate::backends::SessionStart::New {
             session_id: prepared.session_id.clone(),
         },
@@ -716,18 +652,6 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
     let run_id = ids::mint_child(call_job_id);
     let session_id = ids::mint_session_id().into_string();
 
-    // Worktree: inherit the persisted path, else a fresh scratch dir (a `none`
-    // call was created that way).
-    let working_dir = match job.worktree_path.clone() {
-        Some(path) => path,
-        None => {
-            let scratch = std::env::temp_dir().join(format!("cairn-call-{run_id}"));
-            std::fs::create_dir_all(&scratch)
-                .map_err(|e| format!("Failed to create call scratch dir: {e}"))?;
-            scratch.to_string_lossy().into_owned()
-        }
-    };
-
     let now = chrono::Utc::now().timestamp() as i32;
 
     // 1. New session+run under the SAME job (starting -> newest -> latest run),
@@ -753,7 +677,7 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
             Some(&job.project_id),
         ),
     );
-    store_user_event(orch, &run_id, &session_id, &prompt, now, -1)?;
+    store_user_event(orch, &run_id, &session_id, &prompt, now)?;
 
     // 2. Move the journal link to the new run BEFORE killing the old run, so the
     //    old run's finalize finds no link and journals nothing.
@@ -782,15 +706,9 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
         session_id,
         agent_config,
         selected_model,
-        working_dir,
         prompt,
         output_schema,
         execution_id: job.execution_id.clone(),
-        worktree_path: job.worktree_path.clone(),
-        // A restart reuses the persisted job's worktree — it mints nothing, so it
-        // is not responsible for startup-failure reclaim; the original job's
-        // terminalization owns the worktree's lifecycle.
-        owns_ephemeral_worktree: false,
     };
     start_call_run(orch, &prepared)?;
 
@@ -1003,7 +921,6 @@ mod admission_backend_tests {
             job_id: "j".into(),
             run_id: "r".into(),
             session_id: "s".into(),
-            owns_ephemeral_worktree: false,
             agent_config: AgentConfig {
                 id: "Explore".into(),
                 name: "Explore".into(),
@@ -1024,7 +941,6 @@ mod admission_backend_tests {
                 extras: None,
             },
             selected_model: model.map(Model::new),
-            working_dir: "/tmp".into(),
             prompt: String::new(),
             output_schema: OutputSchemaInfo {
                 schema: OutputSchema::Preset("return".into()),
@@ -1034,7 +950,6 @@ mod admission_backend_tests {
                 description: None,
             },
             execution_id: None,
-            worktree_path: None,
         }
     }
 

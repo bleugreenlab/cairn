@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+use cairn_common::uri::{build_project_recipe_uri, build_recipe_uri};
+
 use crate::config::recipes::{self as config_recipes, FileRecipe};
 use crate::config::slugify;
 use crate::mcp::types::McpCallbackRequest;
@@ -93,7 +95,11 @@ pub(super) async fn apply_recipe_create(
         std::slice::from_ref(&path),
         &format!("cairn: create recipe {id}"),
     );
-    Ok(format!("Created recipe '{id}' at {}", path.display()))
+    let recipe_uri = match explicit_project {
+        Some(project) => build_project_recipe_uri(project, &id),
+        None => build_recipe_uri(&id),
+    };
+    Ok(super::created_resource_ack("recipe", &id, &recipe_uri))
 }
 
 /// Patch a recipe. Two forms are accepted:

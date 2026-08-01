@@ -24,7 +24,7 @@ use cairn_core::internal::storage::{
     DbError, DbResult, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
 };
 use cairn_db::turso::params;
-use cairn_executor::{ExecutorRuntime, Fleet as ExecutorPool};
+use cairn_executor::{AdmissionLimits, ExecutorRuntime, Fleet as ExecutorPool};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tokio::sync::mpsc;
@@ -41,11 +41,26 @@ pub async fn migrated_db() -> (TempDir, LocalDb) {
     (temp, db)
 }
 
+/// A fixture orchestrator that owns every run in its database.
+///
+/// `boot_at(0)` is what makes that true: fixtures seed `runs` rows with epoch
+/// timestamps, and the CAIRN-3287 ownership fence refuses tool calls for runs
+/// that predate the host's boot. A test orchestrator boots at the epoch, so its
+/// seeded runs are its own. Tests OF the fence build their own orchestrator with
+/// an explicit `boot_at` (see `run_ownership_fence`).
 pub fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
+    orchestrator_booted_at(temp, db, 0)
+}
+
+/// [`orchestrator`] with an explicit host boot time, for placing seeded runs on
+/// either side of the ownership fence.
+pub fn orchestrator_booted_at(temp: &TempDir, db: Arc<LocalDb>, boot_at: i64) -> Orchestrator {
     let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db, search_index));
     let services = Arc::new(TestServicesBuilder::new().build());
-    Orchestrator::builder(db_state, services, temp.path().join("config")).build()
+    Orchestrator::builder(db_state, services, temp.path().join("config"))
+        .boot_at(boot_at)
+        .build()
 }
 
 /// Attach the production executor runtime through the same advertised-message
@@ -62,6 +77,30 @@ pub fn attach_test_executor(orch: &Orchestrator) {
         true,
         "test-executor",
         Vec::new(),
+        AdmissionLimits::default(),
+    );
+}
+
+/// Attach an executor with room for only `concurrency_units` commands at once
+/// and `max_queue_entries` waiting behind them, so a test can genuinely fill the
+/// machine and watch what a batch with nowhere to run does about it.
+pub fn attach_capacity_limited_test_executor(
+    orch: &Orchestrator,
+    concurrency_units: u32,
+    max_queue_entries: usize,
+) {
+    attach_executor(
+        orch,
+        attached_executor_home(orch),
+        None,
+        true,
+        "test-executor",
+        Vec::new(),
+        AdmissionLimits {
+            concurrency_units,
+            max_queue_entries,
+            ..AdmissionLimits::default()
+        },
     );
 }
 
@@ -94,6 +133,7 @@ pub fn attach_isolated_test_executor(
         false,
         EXECUTOR_ID,
         vec![project_id],
+        AdmissionLimits::default(),
     );
 }
 
@@ -104,6 +144,7 @@ fn attach_executor(
     colocated: bool,
     executor_id: &'static str,
     projects_served: Vec<String>,
+    admission: AdmissionLimits,
 ) {
     let projects_served = Arc::new(projects_served);
     let core_pool = orch.fleet.clone();
@@ -112,8 +153,8 @@ fn attach_executor(
     let snapshot_generation = generation.clone();
     let callback_pool = core_pool.clone();
     let callback_orch = orch.clone();
-    let lifetime_event_pool = core_pool.clone();
-    let lifetime_event_generation = generation.clone();
+    let resident_event_pool = core_pool.clone();
+    let resident_event_generation = generation.clone();
     let runtime = ExecutorRuntime::new(executor_home)
         .with_snapshot_callback(move |snapshot, health| {
             snapshot_pool.handle_executor_message(
@@ -127,18 +168,18 @@ fn attach_executor(
             let orch = callback_orch.clone();
             Box::pin(async move { pool.handle_runner_callback(&orch, callback).await })
         })
-        .with_lifetime_process_event_callback(move |event| {
-            let pool = lifetime_event_pool.clone();
-            let generation = lifetime_event_generation.clone();
+        .with_resident_process_event_callback(move |event| {
+            let pool = resident_event_pool.clone();
+            let generation = resident_event_generation.clone();
             Box::pin(async move {
                 pool.handle_executor_message(
                     executor_id,
                     generation.load(Ordering::Acquire),
-                    ExecutorMessage::LifetimeProcessEvent { event },
+                    ExecutorMessage::ResidentProcessEvent { event },
                 );
             })
         });
-    let executor_pool = ExecutorPool::new(runtime);
+    let executor_pool = ExecutorPool::new(runtime.with_admission_limits(admission));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let attached_generation = core_pool.attach_advertised_executor(
         ExecutorAdvertisement {
@@ -169,6 +210,7 @@ fn attach_executor(
             current_load: 0,
             warm_roots: Vec::new(),
             observed_at_unix_ms: 0,
+            liveness_observed_at_unix_ms: None,
         },
         tx,
         colocated,
@@ -237,6 +279,7 @@ fn attach_executor(
                                     current_load: 0,
                                     warm_roots: executor_pool.warm_roots(),
                                     observed_at_unix_ms: unix_time_ms(),
+                                    liveness_observed_at_unix_ms: None,
                                 },
                             },
                         );
@@ -248,18 +291,18 @@ fn attach_executor(
                 ExecutorMessage::CancelJob { job_id } => {
                     executor_pool.cancel_job_requests(&job_id);
                 }
-                ExecutorMessage::LifetimeLeaseRequest {
+                ExecutorMessage::ResidencyRequest {
                     correlation_id,
                     operation,
                 } => {
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
                     tokio::spawn(async move {
-                        let result = executor_pool.operate_lifetime_lease(operation).await;
+                        let result = executor_pool.operate_residency(operation).await;
                         core_pool.handle_executor_message(
                             executor_id,
                             attached_generation,
-                            ExecutorMessage::LifetimeLeaseResponse {
+                            ExecutorMessage::ResidencyResponse {
                                 correlation_id,
                                 result,
                             },
@@ -284,7 +327,7 @@ fn attach_executor(
     });
 }
 
-fn unix_time_ms() -> u64 {
+pub fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -475,11 +518,6 @@ pub async fn create_job(
     id
 }
 
-/// True when this test process is itself confined by a Cairn worktree fence
-/// (`CAIRN_SANDBOXED=1`, set on every fenced `run`). Integration tests that
-/// spawn a real `sandbox-exec` or depend on an undisturbed subprocess lifecycle
-/// cannot run nested inside the agent fence, so they call this to skip rather
-/// than fail. Unfenced CI still runs them for real coverage.
 /// The jj binary for the test, or `None` to self-skip when jj is unavailable.
 /// jj-backed integration tests gate on this and print a skip note rather than
 /// fail when jj cannot be resolved (honoring `CAIRN_JJ_BIN` when set).
@@ -606,48 +644,41 @@ pub fn stale_sibling_advance(
     jj::rebase_branch_onto(&jj, &store, primary_branch, sibling_branch).unwrap();
 }
 
-/// True when the unfenced sync CI lane has demanded these tests actually RUN.
-/// Set via `CAIRN_REQUIRE_SYNC_TESTS=1` by `.github/workflows/sync-tests.yml`.
-/// In that mode a would-be skip — a fenced process (here) or a missing `tursodb`
-/// (see `sync_server::SyncServer::locate_or_spawn`) — is a HARD FAILURE rather
-/// than a vacuous green, because the whole point of that lane is to exercise the
-/// Turso-sync integration tests for real. (CAIRN-2170: these self-skips are
-/// exactly how a sync misdiagnosis stood unrefuted — a skip is NOT a pass.)
-pub fn sync_tests_required() -> bool {
-    std::env::var_os("CAIRN_REQUIRE_SYNC_TESTS").is_some()
-}
-
+/// True when this process carries the Cairn worktree fence's marker
+/// (`CAIRN_SANDBOXED=1`, set on every fenced spawn), in which case a test that
+/// needs an undisturbed subprocess or execution-cell lifecycle records a
+/// declared skip instead of running.
+///
+/// This is a narrow last resort, not a resolution. The fence permits spawning a
+/// child, binding loopback, and writing temp files, so a test doing only those
+/// belongs in the ordinary lane; the remaining callers need a *nested* execution
+/// cell, which CAIRN-3112 owns. Every skip recorded here must be declared in
+/// `src-tauri/skip-manifest.toml` — `scripts/test-rust.ts` fails the run, and
+/// therefore the `rust-full` verdict, on one that is not.
+///
+/// The marker is the ONLY trigger. An earlier version also inferred confinement
+/// from the MCP run-tool envelope (`CAIRN_CALLBACK_URL` + `CAIRN_RUN_ID` +
+/// `CAIRN_WORKTREE` all present), which is false in an agent terminal: it
+/// silently skipped a whole cross-surface suite that, once run for real,
+/// immediately failed on a genuine defect its green had hidden (CAIRN-3112). An
+/// inference that costs coverage and buys none is deleted rather than deprecated.
 pub fn skip_if_fenced(test: &str) -> bool {
-    let explicitly_sandboxed = std::env::var_os("CAIRN_SANDBOXED").is_some();
-    // Cargo can be launched from an agent run-tool without preserving the
-    // explicit sandbox marker into the test process. The MCP run-tool envelope is
-    // still enough evidence that this process is nested under the worktree fence.
-    let run_tool_context = std::env::var_os("CAIRN_CALLBACK_URL").is_some()
-        && std::env::var_os("CAIRN_RUN_ID").is_some()
-        && std::env::var_os("CAIRN_WORKTREE").is_some();
-
-    if explicitly_sandboxed || run_tool_context {
-        // In the unfenced sync lane a fenced process can't run these tests, so
-        // skipping would read green while proving nothing — fail loudly instead.
-        assert!(
-            !sync_tests_required(),
-            "{test}: CAIRN_REQUIRE_SYNC_TESTS is set but this process is fenced — the \
-             unfenced sync lane must run with the CAIRN_SANDBOXED / CAIRN_CALLBACK_URL / \
-             CAIRN_RUN_ID / CAIRN_WORKTREE fence vars UNSET. A skip is NOT a pass."
-        );
-        eprintln!("skipping {test}: cannot run nested inside a Cairn worktree fence");
-        record_fence_skip(test);
-        true
-    } else {
-        false
+    if std::env::var_os("CAIRN_SANDBOXED").is_none() {
+        return false;
     }
+    eprintln!("skipping {test}: cannot run nested inside a Cairn worktree fence");
+    record_skip(test, "worktree-fence");
+    true
 }
 
-// Best-effort: append a self-skipped test name to `$CAIRN_SKIP_LOG` (set by
-// `scripts/test-rust.ts`) so the runner can report how many tests skipped under
-// the fence. libtest swallows the skip message of a passing test, so without
-// this the skip is indistinguishable from a real pass. (#157)
-pub fn record_fence_skip(test: &str) {
+/// Best-effort: append `name<TAB>reason` to `$CAIRN_SKIP_LOG` (set by
+/// `scripts/test-rust.ts`) so the runner moves this test out of `passed` and
+/// checks it against `src-tauri/skip-manifest.toml`. libtest counts an early
+/// return as a pass and swallows its message, so without this record the skip is
+/// indistinguishable from real coverage (#157). `reason` comes from the
+/// manifest's closed vocabulary, which is what lets the runner tell a declared
+/// capability gap from an inherited habit.
+pub fn record_skip(test: &str, reason: &str) {
     if let Some(log) = std::env::var_os("CAIRN_SKIP_LOG") {
         use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -657,7 +688,7 @@ pub fn record_fence_skip(test: &str) {
         {
             // One write_all (vs writeln!'s multiple syscalls) keeps the append
             // atomic when parallel test threads all skip at once.
-            let _ = f.write_all(format!("{test}\n").as_bytes());
+            let _ = f.write_all(format!("{test}\t{reason}\n").as_bytes());
         }
     }
 }

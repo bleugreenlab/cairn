@@ -41,12 +41,42 @@ pub(crate) struct BrowserInteractionArgs {
     /// Element handle (ref e1..eN) from the last ?interactive read; a third
     /// locator for click/type/scroll, resolved via the durable anchor.
     pub handle: Option<String>,
+    /// Destination locators for `drag`. The `to` prefix reuses the source
+    /// locator shapes verbatim, so neither end has a locator kind to guess.
+    pub to_selector: Option<String>,
+    pub to_text: Option<String>,
+    pub to_handle: Option<String>,
+    /// Drag event family: `auto` (default), `pointer`, or `html5`.
+    pub mode: Option<String>,
+    /// Interpolated move count and inter-move pause for `drag`.
+    pub steps: Option<u32>,
+    pub delay_ms: Option<u64>,
     pub value: Option<String>,
     pub to: Option<String>,
     pub by: Option<i64>,
     pub timeout_ms: Option<u64>,
     pub submit: Option<bool>,
     pub kinds: Option<Vec<String>>,
+}
+
+/// Default interpolated move count for `drag`, mirrored from the content script
+/// so the host's await budget covers the pacing the page will actually apply.
+const DEFAULT_DRAG_STEPS: u32 = 10;
+
+/// Default pause between interpolated moves (about one animation frame).
+const DEFAULT_DRAG_DELAY_MS: u64 = 16;
+
+/// Human name for one end of an interaction, for the result message.
+fn locator_label(
+    handle: &Option<String>,
+    selector: &Option<String>,
+    text: &Option<String>,
+) -> String {
+    handle
+        .clone()
+        .or_else(|| selector.clone())
+        .or_else(|| text.as_ref().map(|text| format!("\"{text}\"")))
+        .unwrap_or_else(|| "element".to_string())
 }
 
 fn emit_db_change(orch: &Orchestrator, action: &str) {
@@ -156,7 +186,7 @@ pub(crate) async fn apply_browser_action(
             );
             Ok(format!("Browser '{slug}': reload"))
         }
-        "click" | "type" | "scroll" | "waitFor" => {
+        "click" | "type" | "select" | "drag" | "scroll" | "waitFor" => {
             run_browser_interaction(orch, &browser, &slug, &action, args).await
         }
         // Host-observed waits: no content-script op, just await the nav channel.
@@ -173,7 +203,7 @@ pub(crate) async fn apply_browser_action(
             Ok(format!("Browser '{slug}': cleared {summary}"))
         }
         other => Err(format!(
-            "unknown browser action '{other}'; expected back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad|clearData"
+            "unknown browser action '{other}'; expected back|forward|reload|click|type|select|drag|scroll|waitFor|waitForNavigation|waitForLoad|clearData"
         )),
     }
 }
@@ -218,6 +248,63 @@ fn build_interaction_request(
                     submit: args.submit,
                 },
                 BRIDGE_TIMEOUT,
+            ))
+        }
+        "select" => {
+            let value = args
+                .value
+                .ok_or_else(|| "select requires value (an option label or value)".to_string())?;
+            if args.selector.is_none() && args.text.is_none() && args.handle.is_none() {
+                return Err(
+                    "select requires selector, text, or handle to locate the dropdown".to_string(),
+                );
+            }
+            Ok((
+                BridgeRequest::Select {
+                    selector: args.selector,
+                    text: args.text,
+                    handle: args.handle,
+                    value,
+                },
+                BRIDGE_TIMEOUT,
+            ))
+        }
+        "drag" => {
+            if args.selector.is_none() && args.text.is_none() && args.handle.is_none() {
+                return Err("drag requires selector, text, or handle for the source".to_string());
+            }
+            if args.to_selector.is_none() && args.to_text.is_none() && args.to_handle.is_none() {
+                return Err(
+                    "drag requires toSelector, toText, or toHandle for the destination".to_string(),
+                );
+            }
+            if let Some(mode) = &args.mode {
+                if mode != "auto" && mode != "pointer" && mode != "html5" {
+                    return Err(format!(
+                        "drag mode must be auto, pointer, or html5, got '{mode}'"
+                    ));
+                }
+            }
+            // A paced drag must not be cut off by its own pacing: the budget
+            // covers the page-side movement time on top of the bridge timeout.
+            let steps = args.steps.unwrap_or(DEFAULT_DRAG_STEPS).clamp(1, 60);
+            let delay_ms = args.delay_ms.unwrap_or(DEFAULT_DRAG_DELAY_MS).min(200);
+            let budget = BRIDGE_TIMEOUT
+                + Duration::from_millis(u64::from(steps) * delay_ms)
+                + Duration::from_secs(1);
+            Ok((
+                BridgeRequest::Drag {
+                    selector: args.selector,
+                    text: args.text,
+                    handle: args.handle,
+                    to_selector: args.to_selector,
+                    to_text: args.to_text,
+                    to_handle: args.to_handle,
+                    mode: args.mode,
+                    steps: args.steps,
+                    delay_ms: args.delay_ms,
+                },
+                budget,
             ))
         }
         "scroll" => {
@@ -278,15 +365,44 @@ async fn run_browser_interaction(
     let expects_nav = action == "click" || (action == "type" && args.submit == Some(true));
     let mut nav_rx = expects_nav.then(|| orch.browser_nav_events.subscribe());
 
+    // Name both ends before the args are consumed, so a drag result can say what
+    // it moved where rather than just that something happened.
+    let drag_ends = (action == "drag").then(|| {
+        (
+            locator_label(&args.handle, &args.selector, &args.text),
+            locator_label(&args.to_handle, &args.to_selector, &args.to_text),
+        )
+    });
+
     let (request, timeout) = build_interaction_request(action, args)?;
     let response = browser_bridge_roundtrip(orch, &browser.id, &request, timeout).await?;
     if response.ok {
         let detail = match action {
-            "waitFor" => "element appeared",
-            "click" => "clicked",
-            "type" => "typed",
-            "scroll" => "scrolled",
-            _ => "ok",
+            "waitFor" => "element appeared".to_string(),
+            "click" => "clicked".to_string(),
+            "type" => "typed".to_string(),
+            "scroll" => "scrolled".to_string(),
+            "select" => match response.label.as_deref() {
+                Some(label) => format!("selected \"{label}\""),
+                None => "selected".to_string(),
+            },
+            "drag" => {
+                let (from, to) = drag_ends.unwrap_or_default();
+                let mode = response.mode.as_deref().unwrap_or("pointer");
+                // `accepted` is the HTML5 signal that a drop handler took the
+                // payload. Reporting a rejected drop turns a silent no-op into a
+                // diagnosis, the same reason "no navigation occurred" exists.
+                let outcome = match response.accepted {
+                    Some(true) => "drop accepted".to_string(),
+                    Some(false) => {
+                        "drop target did not accept (no dragover handler called preventDefault)"
+                            .to_string()
+                    }
+                    None => "verify the result with a read".to_string(),
+                };
+                format!("dragged {from} onto {to} ({mode}); {outcome}")
+            }
+            _ => "ok".to_string(),
         };
         if let Some(rx) = nav_rx.as_mut() {
             return Ok(
@@ -388,6 +504,131 @@ mod tests {
                 text: None,
                 handle: None
             }
+        );
+    }
+
+    #[test]
+    fn select_requires_a_value_and_a_locator() {
+        let err = build_interaction_request(
+            "select",
+            BrowserInteractionArgs {
+                selector: Some("#group".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("select requires value"), "{err}");
+        let err = build_interaction_request(
+            "select",
+            BrowserInteractionArgs {
+                value: Some("Admins".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("locate the dropdown"), "{err}");
+        let (request, budget) = build_interaction_request(
+            "select",
+            BrowserInteractionArgs {
+                handle: Some("e3".into()),
+                value: Some("Admins".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            request,
+            BridgeRequest::Select {
+                selector: None,
+                text: None,
+                handle: Some("e3".into()),
+                value: "Admins".into(),
+            }
+        );
+        assert_eq!(budget, BRIDGE_TIMEOUT);
+    }
+
+    #[test]
+    fn drag_requires_both_ends() {
+        let err = build_interaction_request(
+            "drag",
+            BrowserInteractionArgs {
+                to_handle: Some("e9".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("for the source"), "{err}");
+        let err = build_interaction_request(
+            "drag",
+            BrowserInteractionArgs {
+                handle: Some("e1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("for the destination"), "{err}");
+        let err = build_interaction_request(
+            "drag",
+            BrowserInteractionArgs {
+                handle: Some("e1".into()),
+                to_handle: Some("e9".into()),
+                mode: Some("telekinesis".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("auto, pointer, or html5"), "{err}");
+    }
+
+    #[test]
+    fn drag_budget_covers_its_own_pacing() {
+        // A paced drag must not be cut off by the pacing it asked for: the
+        // budget adds the page-side movement time to the bridge timeout.
+        let (request, budget) = build_interaction_request(
+            "drag",
+            BrowserInteractionArgs {
+                handle: Some("e1".into()),
+                to_selector: Some("#zone".into()),
+                steps: Some(40),
+                delay_ms: Some(50),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            request,
+            BridgeRequest::Drag {
+                selector: None,
+                text: None,
+                handle: Some("e1".into()),
+                to_selector: Some("#zone".into()),
+                to_text: None,
+                to_handle: None,
+                mode: None,
+                steps: Some(40),
+                delay_ms: Some(50),
+            }
+        );
+        assert_eq!(
+            budget,
+            BRIDGE_TIMEOUT + Duration::from_millis(2000) + Duration::from_secs(1)
+        );
+        // Out-of-range pacing is clamped to what the page will actually apply.
+        let (_, clamped) = build_interaction_request(
+            "drag",
+            BrowserInteractionArgs {
+                handle: Some("e1".into()),
+                to_handle: Some("e2".into()),
+                steps: Some(9000),
+                delay_ms: Some(9000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            clamped,
+            BRIDGE_TIMEOUT + Duration::from_millis(60 * 200) + Duration::from_secs(1)
         );
     }
 

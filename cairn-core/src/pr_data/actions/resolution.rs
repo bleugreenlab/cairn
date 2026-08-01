@@ -9,11 +9,12 @@ use cairn_db::turso::params;
 use super::context::{db_error, resolve_merge_mr_context_for_job, PrNodeResolution};
 
 async fn mark_merge_request_closed_and_resolve_issue(
+    orch: &Orchestrator,
     db: &LocalDb,
     mr_id: &str,
     issue_id: Option<&str>,
     now: i64,
-) -> Result<Vec<String>, String> {
+) -> Result<(), String> {
     let mr_id = mr_id.to_string();
     db.write(|conn| {
         let mr_id = mr_id.clone();
@@ -32,16 +33,34 @@ async fn mark_merge_request_closed_and_resolve_issue(
     .map_err(|e| db_error("Failed to update merge request", e))?;
 
     let Some(issue_id) = issue_id else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    crate::issues::crud::resolve(
+    resolve_issue_for_pr(orch, db, issue_id, Resolution::Closed).await
+}
+
+/// Resolve the PR's issue through the one terminal cascade.
+///
+/// The PR has already been merged or closed for real by the time this runs — on
+/// GitHub, or as a fold landed in the shared store — so the resolution cannot be
+/// refused back out; [`StopFailure::Escalates`] says so. Everything else is the
+/// same cascade the status-patch path runs: the issue's live work is stopped
+/// through the canonical node stop before the rows move, so no session is closed
+/// over a running turn and no batch outlives the issue that owns it.
+async fn resolve_issue_for_pr(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+    resolution: Resolution,
+) -> Result<(), String> {
+    crate::issues::status::resolve_terminal(
+        orch,
         db,
-        &crate::services::RealClock,
         issue_id,
-        Resolution::Closed,
+        resolution,
+        crate::issues::status::StopFailure::Escalates,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|refusal| refusal.to_string())
 }
 
 /// Resolve a `pr` node by its owner id (`merge_requests.job_id`): the producing
@@ -50,7 +69,7 @@ pub async fn resolve_pr_node(
     orch: &Orchestrator,
     owner_id: &str,
     resolution: PrNodeResolution,
-) -> Result<Vec<String>, String> {
+) -> Result<(), String> {
     // Route to the database that owns this PR's producing job (team replica or
     // private DB). Every row this resolution reads or writes — the merge_requests
     // status transition, the issue resolution, the pr action_run completion, and
@@ -64,9 +83,14 @@ pub async fn resolve_pr_node(
     let merge_context = resolve_merge_mr_context_for_job(&db, owner_id).await?;
     let mr_id = merge_context.mr.mr_id.clone();
     let now = chrono::Utc::now().timestamp();
-    let closed_sessions = match resolution {
+    // Marking the PR resolved resolves its issue, and resolving an issue runs
+    // the terminal cascade: the issue's live work is stopped, its queued work is
+    // cancelled, its sessions close, and any in-flight turn-end review suite is
+    // quit (CAIRN-2648, CAIRN-3253).
+    match resolution {
         PrNodeResolution::Merge => {
             mark_merge_request_merged_and_resolve_issue(
+                orch,
                 &db,
                 &mr_id,
                 merge_context.issue_id.as_deref(),
@@ -77,6 +101,7 @@ pub async fn resolve_pr_node(
         }
         PrNodeResolution::Close => {
             mark_merge_request_closed_and_resolve_issue(
+                orch,
                 &db,
                 &mr_id,
                 merge_context.issue_id.as_deref(),
@@ -84,14 +109,6 @@ pub async fn resolve_pr_node(
             )
             .await?
         }
-    };
-
-    // The PR is now merged/closed — quit any in-flight turn-end review suite for
-    // this issue so a minutes-long run does not keep burning CPU validating a tree
-    // that will never be reviewed again (CAIRN-2648).
-    if let Some(issue_id) = merge_context.issue_id.as_deref() {
-        crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(orch, &db, issue_id)
-            .await;
     }
 
     if let Some(issue_id) = merge_context.issue_id.as_deref() {
@@ -235,7 +252,7 @@ pub async fn resolve_pr_node(
         );
     }
 
-    Ok(closed_sessions)
+    Ok(())
 }
 
 /// If `owner_id` is a producing job with a blocked `pr` action_run child, mark
@@ -407,12 +424,13 @@ pub(super) async fn persist_merged_commit(
 }
 
 async fn mark_merge_request_merged_and_resolve_issue(
+    orch: &Orchestrator,
     db: &LocalDb,
     mr_id: &str,
     issue_id: Option<&str>,
     merged_commit: Option<&str>,
     now: i64,
-) -> Result<Vec<String>, String> {
+) -> Result<(), String> {
     let mr_id = mr_id.to_string();
     let _source_branch = db
         .read(|conn| {
@@ -449,24 +467,230 @@ async fn mark_merge_request_merged_and_resolve_issue(
     .map_err(|e| db_error("Failed to update merge request", e))?;
 
     let Some(issue_id) = issue_id else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    crate::issues::crud::resolve(
-        db,
-        &crate::services::RealClock,
-        issue_id,
-        Resolution::Merged,
-    )
-    .await
-    .map_err(|e| e.to_string())
+    resolve_issue_for_pr(orch, db, issue_id, Resolution::Merged).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pr_data::actions::test_support::{
-        migrated_db, seed_pr_node_merge_request_for_artifact_job,
+        migrated_db, seed_pr_node_merge_request_for_artifact_job, test_orchestrator,
     };
+    use crate::services::testing::MockGitClient;
+
+    /// Another job on the PR node fixture's issue. `recipe_node_id` stays NULL so
+    /// it is extra work on the issue rather than a second claimant of a snapshot
+    /// node.
+    async fn seed_issue_job(db: &LocalDb, job_id: &str, node_name: &str, status: &str) {
+        let job_id = job_id.to_string();
+        let node_name = node_name.to_string();
+        let status = status.to_string();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, node_name, status, issue_id, project_id, created_at, updated_at)
+             VALUES (?1, 'exec-pr-node', ?2, ?3, 'issue-pr-node', 'proj-pr-node', 2, 2)",
+            params![job_id.as_str(), node_name.as_str(), status.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Give an existing job the session, run, and running turn a live agent holds
+    /// — the shape the canonical stop acts on.
+    async fn attach_live_session(db: &LocalDb, job_id: &str) {
+        let job_id = job_id.to_string();
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let session_id = format!("session-{job_id}");
+                let run_id = format!("run-{job_id}");
+                let turn_id = format!("turn-{job_id}");
+                conn.execute(
+                    "INSERT INTO sessions (id, job_id, status, created_at, updated_at)
+                     VALUES (?1, ?2, 'open', 1, 1)",
+                    params![session_id.as_str(), job_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs (id, project_id, job_id, chat_id, status, session_id, created_at, updated_at, start_mode)
+                     VALUES (?1, 'proj-pr-node', ?2, NULL, 'live', ?3, 1, 1, 'resume')",
+                    params![run_id.as_str(), job_id.as_str(), session_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 1, 'running', 1, 1)",
+                    params![
+                        turn_id.as_str(),
+                        session_id.as_str(),
+                        run_id.as_str(),
+                        job_id.as_str()
+                    ],
+                )
+                .await?;
+                conn.execute(
+                    "UPDATE jobs SET current_session_id = ?1, current_turn_id = ?2 WHERE id = ?3",
+                    params![session_id.as_str(), turn_id.as_str(), job_id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn scalar(db: &LocalDb, sql: &str, id: &str) -> Option<String> {
+        db.query_opt_text(sql, params![id]).await.unwrap()
+    }
+
+    async fn live_run_count(db: &LocalDb) -> i64 {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM runs WHERE status IN ('starting', 'live')",
+                        (),
+                    )
+                    .await?;
+                rows.next().await?.expect("count row").i64(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The PR merge is the door CAIRN-3241 came through: the PR merged, the issue
+    /// row flipped, and the builder went on running test suites against a merged
+    /// issue — because this path resolved the issue directly instead of running
+    /// the cascade the confirmed-close path already had. It runs the same one now.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merging_a_pr_stops_the_issues_live_work() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        seed_issue_job(&db, "live-builder", "builder", "running").await;
+        attach_live_session(&db, "live-builder").await;
+        seed_issue_job(&db, "queued-reviewer", "reviewer", "pending").await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = &orch.db.local;
+
+        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge)
+            .await
+            .expect("the merge resolution lands");
+
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM issues WHERE id = ?1",
+                "issue-pr-node"
+            )
+            .await,
+            Some("merged".to_string())
+        );
+
+        // The running builder went through the canonical node stop: its turn is
+        // interrupted and its run settled as a stop, not left executing.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT state FROM turns WHERE id = ?1",
+                "turn-live-builder"
+            )
+            .await,
+            Some("interrupted".to_string())
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM runs WHERE id = ?1",
+                "run-live-builder"
+            )
+            .await,
+            Some("exited".to_string())
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT exit_reason FROM runs WHERE id = ?1",
+                "run-live-builder"
+            )
+            .await,
+            Some("user_stop".to_string())
+        );
+
+        // Work that never started is cancelled rather than left queued against a
+        // merged issue.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM jobs WHERE id = ?1",
+                "queued-reviewer"
+            )
+            .await,
+            Some("cancelled".to_string())
+        );
+
+        // And the session closes over stopped work, not running work.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM sessions WHERE id = ?1",
+                "session-live-builder"
+            )
+            .await,
+            Some("closed".to_string())
+        );
+        assert_eq!(
+            live_run_count(db).await,
+            0,
+            "no run keeps executing against a merged issue"
+        );
+    }
+
+    /// The half-dead state must be unrepresentable: a session that refuses to
+    /// continue while its own runs keep going.
+    ///
+    /// The cascade's enumeration reads the `jobs` table, so a job that is not
+    /// itself live work slips past it — here one already marked `complete` while
+    /// still holding an open session and a running turn, which is also what a
+    /// turn started between the enumeration and the close looks like. The
+    /// postcondition is what closes that gap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_session_is_never_left_with_a_turn_in_flight() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        // `builder-job` is `complete`, so it is not enumerated as live work.
+        attach_live_session(&db, "builder-job").await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = &orch.db.local;
+
+        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge)
+            .await
+            .expect("the merge resolution lands");
+
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM sessions WHERE id = ?1",
+                "session-builder-job"
+            )
+            .await,
+            Some("closed".to_string()),
+            "the resolution closes the session"
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT state FROM turns WHERE id = ?1",
+                "turn-builder-job"
+            )
+            .await,
+            Some("interrupted".to_string()),
+            "and nothing it closed is left with a turn in flight"
+        );
+        assert_eq!(live_run_count(db).await, 0);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn pr_resolution_completes_pr_action_run_for_producing_job_owner() {

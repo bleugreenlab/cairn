@@ -2,12 +2,12 @@ use crate::execution::delegation::{
     DelegatedCallPayload, DelegatedTaskPayload, DelegatedTaskSessionMode, SpawnCallPacketsInput,
     SpawnTaskPacketsInput,
 };
-use crate::execution::jobs::{CallWorktree, CreateChildTaskInput};
+use crate::execution::jobs::{CallBranchPolicy, CreateChildTaskInput};
 #[cfg(test)]
-use crate::mcp::handlers::tool_use_correlation::find_tool_use_id;
-use crate::mcp::handlers::tool_use_correlation::resolve_tool_use_id;
+use crate::mcp::handlers::tool_use_correlation::claim_from_events;
+use crate::mcp::handlers::tool_use_correlation::{claim_tool_use_id, Claim};
 use crate::mcp::types::{
-    AskUserPayload, CallPayload, CallWorktreeMode, ChangeItem, ChangeMode, McpCallbackRequest,
+    AskUserPayload, CallBranchMode, CallPayload, ChangeItem, ChangeMode, McpCallbackRequest,
     TaskPayload, TaskSessionMode,
 };
 use crate::orchestrator::Orchestrator;
@@ -102,7 +102,7 @@ pub(crate) async fn run_blocking_group(
                 Err(e) => return format!("Invalid question append payload: {e}"),
             };
             let resolved_tool_use_id = match request.run_id.as_deref() {
-                Some(run_id) => resolve_change_tool_use_id(orch, run_id, "/questions").await,
+                Some(run_id) => claim_change_tool_use_id(orch, run_id, "/questions").await,
                 None => None,
             };
             let tool_use_id = request
@@ -146,7 +146,7 @@ enum TaskRoute {
     /// task-packet pipeline (batching, inline wait, durable suspend, background).
     SelfNode,
     /// Every append targets a different node: each spawns a detached child task
-    /// under that node via `create_child_task`, inheriting its worktree.
+    /// under that node via `create_child_task`, inheriting its branch coordinate.
     CrossNode,
     /// A mix of self and cross-node targets in one call — rejected, because self
     /// may block/suspend while cross-node returns immediately (incompatible
@@ -213,25 +213,15 @@ async fn run_tasks_group(
     // including self-targeted ones, which resolve back to `caller_job_id`.
     // A team run's job/run rows live in its replica (CAIRN-2182): resolve the
     // caller's owning DB by run id so `lookup_caller_job_id` and the target-node
-    // lookups read the database the rows actually live in. Without a run id the
-    // cwd path stays on the private DB.
-    let routing_db = match request.run_id.as_deref() {
-        Some(run_id) => {
-            match crate::execution::routing::routing_db_for_id(&orch.db, run_id).await {
-                Ok(db) => db,
-                Err(e) => return format!("Failed to resolve caller node for task spawn: {e}"),
-            }
-        }
-        None => orch.db.local.clone(),
+    // lookups read the database the rows actually live in.
+    let Some(run_id) = request.run_id.as_deref() else {
+        return "Failed to resolve caller node for task spawn: authenticated agent request is missing its run ID".to_string();
     };
-    let routing = match resolve_task_routing(
-        &routing_db,
-        request.run_id.as_deref(),
-        &request.cwd,
-        &coords,
-    )
-    .await
-    {
+    let routing_db = match crate::execution::routing::routing_db_for_id(&orch.db, run_id).await {
+        Ok(db) => db,
+        Err(e) => return format!("Failed to resolve caller node for task spawn: {e}"),
+    };
+    let routing = match resolve_task_routing(&routing_db, run_id, &coords).await {
         Ok(routing) => routing,
         // Surface caller-resolution / "Node '…' not found" errors rather than
         // spawning under the caller.
@@ -252,7 +242,7 @@ async fn run_tasks_group(
 /// Run a validated calls-append group (CAIRN-2481). Calls are always self-spawned
 /// under the caller (never cross-node), so this parses each item, enforces a
 /// shared background disposition, and hands the batch to `spawn_call_packets` —
-/// the caller is resolved from the run id / cwd, not the addressed node.
+/// the caller is resolved from its authenticated run ID, not the addressed node or process cwd.
 async fn run_calls_group(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -279,9 +269,8 @@ async fn run_calls_group(
         calls.push(delegated_call_payload(call));
     }
 
-    let group_id = uuid::Uuid::new_v4().to_string();
     let resolved_tool_use_id = match request.run_id.as_deref() {
-        Some(run_id) => resolve_change_tool_use_id(orch, run_id, "/calls").await,
+        Some(run_id) => claim_change_tool_use_id(orch, run_id, "/calls").await,
         None => None,
     };
     let parent_tool_use_id = request
@@ -292,9 +281,7 @@ async fn run_calls_group(
         orch,
         SpawnCallPacketsInput {
             run_id: request.run_id.as_deref(),
-            cwd: &request.cwd,
             payloads: &calls,
-            group_id: &group_id,
             parent_tool_use_id,
             background: background.unwrap_or(false),
         },
@@ -307,9 +294,9 @@ async fn run_calls_group(
 /// applying the `Explore` default worker and deriving a display title from the
 /// description, label, or a prompt prefix.
 fn delegated_call_payload(call: CallPayload) -> DelegatedCallPayload {
-    let worktree = match call.worktree.unwrap_or_default() {
-        CallWorktreeMode::Inherit => CallWorktree::Inherit,
-        CallWorktreeMode::None => CallWorktree::None,
+    let branch_policy = match call.branch.unwrap_or_default() {
+        CallBranchMode::Inherit => CallBranchPolicy::Inherit,
+        CallBranchMode::None => CallBranchPolicy::None,
     };
     let description = call
         .description
@@ -333,7 +320,7 @@ fn delegated_call_payload(call: CallPayload) -> DelegatedCallPayload {
         tier: call.tier,
         backend_preference: call.backend_preference,
         output_schema: call.output_schema,
-        worktree,
+        branch_policy,
         label: call.label,
         phase: call.phase,
         task_index: call.task_index,
@@ -356,11 +343,10 @@ struct TaskRouting {
 /// the core of the cross-node fix — is exercised against a real DB in tests.
 async fn resolve_task_routing(
     db: &LocalDb,
-    run_id: Option<&str>,
-    cwd: &str,
+    run_id: &str,
     coords: &[NodeTasksCoords],
 ) -> Result<TaskRouting, String> {
-    let caller_job_id = crate::execution::delegation::lookup_caller_job_id(db, run_id, cwd)
+    let caller_job_id = crate::execution::delegation::lookup_caller_job_id(db, run_id)
         .await
         .map_err(|e| format!("Failed to resolve caller node for task spawn: {e}"))?;
     let mut target_job_ids: Vec<String> = Vec::with_capacity(coords.len());
@@ -397,13 +383,12 @@ async fn run_self_task_spawn(
         }
         payloads.push(delegated_task_payload(task.clone()));
     }
-    let group_id = uuid::Uuid::new_v4().to_string();
     // cairn-cmd forwards no tool-use id on the callback, so correlate the
     // originating `write` tool-use id from the run transcript (the same
     // approach the preview→apply path uses). This is the id the frontend
     // links child jobs by; without it the live task windows can't resolve.
     let resolved_tool_use_id = match request.run_id.as_deref() {
-        Some(run_id) => resolve_change_tool_use_id(orch, run_id, "/tasks").await,
+        Some(run_id) => claim_change_tool_use_id(orch, run_id, "/tasks").await,
         None => None,
     };
     let parent_tool_use_id = request
@@ -416,7 +401,6 @@ async fn run_self_task_spawn(
             run_id: request.run_id.as_deref(),
             cwd: &request.cwd,
             payloads: &payloads,
-            group_id: &group_id,
             parent_tool_use_id,
             background: background.unwrap_or(false),
         },
@@ -426,7 +410,7 @@ async fn run_self_task_spawn(
 }
 
 /// Spawn each task as a detached child under its addressed node via
-/// `create_child_task`, inheriting that node's worktree (the rescue/injection
+/// `create_child_task`, inheriting that node's branch coordinate (the rescue/injection
 /// path). Cross-node spawns never suspend the caller, so they return
 /// immediately regardless of any `background` flag.
 /// Cross-node (rescue) task jobs are bare child jobs with no recipe node, so the
@@ -482,7 +466,7 @@ async fn run_cross_node_task_spawn(
                         .await;
                 lines.push(format!("- {} ({})", uri, task.description));
             }
-            // Surface clear errors (e.g. target node has no worktree) rather than
+            // Surface clear errors (e.g. target node has no branch coordinate) rather than
             // silently spawning under the caller.
             Err(e) => {
                 return format!(
@@ -493,7 +477,7 @@ async fn run_cross_node_task_spawn(
         }
     }
     let mut result = format!(
-        "Spawned {} cross-node task(s) under the addressed node(s); each runs in that node's worktree and is detached (the caller is not suspended). Results will appear at:\n{}",
+        "Spawned {} cross-node task(s) under the addressed node(s); each works on that node's branch and is detached (the caller is not suspended). Results will appear at:\n{}",
         tasks.len(),
         lines.join("\n")
     );
@@ -557,25 +541,56 @@ fn change_matches_collection(
             .unwrap_or(false)
 }
 
+/// The matcher above applied to raw assistant-event blobs, so the shape rules
+/// can be pinned without a database behind them.
 #[cfg(test)]
-fn find_change_tool_id(event_data: &[String], collection_suffix: &str) -> Option<String> {
-    find_tool_use_id(event_data, |name, input| {
-        change_matches_collection(name, input, collection_suffix)
-    })
+fn claim_change_tool_id(event_data: &[String], collection_suffix: &str) -> Claim {
+    claim_from_events(
+        event_data,
+        &std::collections::HashSet::new(),
+        |name, input| change_matches_collection(name, input, collection_suffix),
+    )
 }
 
-/// Correlate the originating `write` tool-use id from the run's transcript.
-/// Briefly retries because the assistant event carrying the tool call may not be
+/// Claim the originating `write` tool-use id from the run's transcript. Briefly
+/// retries because the assistant event carrying the tool call may not be
 /// persisted at the instant the MCP callback fires.
-async fn resolve_change_tool_use_id(
+///
+/// This is the id the frontend links spawned child jobs by and the id a blocking
+/// append's result is later attributed to, so it must name THIS call rather than
+/// the newest one that looks like it. Two `write` calls in one assistant event
+/// appending to the same collection are indistinguishable at this boundary;
+/// taking the newest would hang one call's live task window off the other's
+/// children, so a tie is refused instead (CAIRN-3232).
+///
+/// Refusing costs that append its parent linkage — a visible degradation, and a
+/// much smaller one than attributing work to the wrong call. Every spawn path
+/// already handles `None`.
+///
+/// It is scoped to the CURRENT TURN, where the earlier recency lookup searched
+/// the whole run. A `write` recorded by an earlier turn is never the call this
+/// callback came from, and including it only widened what could be mistaken for
+/// one.
+async fn claim_change_tool_use_id(
     orch: &Orchestrator,
     run_id: &str,
     collection_suffix: &str,
 ) -> Option<String> {
-    resolve_tool_use_id(&orch.db.local, run_id, None, |name, input| {
+    let turn_id = orch.process_state.get_current_turn_id(run_id)?;
+    match claim_tool_use_id(&orch.db.local, run_id, &turn_id, |name, input| {
         change_matches_collection(name, input, collection_suffix)
     })
     .await
+    {
+        Claim::One(id) => Some(id),
+        Claim::None => None,
+        Claim::Ambiguous(count) => {
+            log::warn!(
+                "a blocking {collection_suffix} append on run {run_id} matches {count} indistinguishable open write calls, so it cannot claim one without risking another call's linkage"
+            );
+            None
+        }
+    }
 }
 
 fn delegated_task_payload(task: TaskPayload) -> DelegatedTaskPayload {
@@ -687,7 +702,7 @@ mod blocking_group_tests {
             tier: None,
             backend_preference: None,
             output_schema: None,
-            worktree: None,
+            branch: None,
             label: None,
             phase: None,
             run_in_background: None,
@@ -700,18 +715,18 @@ mod blocking_group_tests {
     fn call_payload_defaults_explore_and_inherit() {
         let d = delegated_call_payload(call_payload("Summarize the parser"));
         assert_eq!(d.subagent_type, "Explore");
-        assert_eq!(d.worktree, CallWorktree::Inherit);
+        assert_eq!(d.branch_policy, CallBranchPolicy::Inherit);
         // Description derives from the prompt when none is given.
         assert_eq!(d.description, "Summarize the parser");
     }
 
     #[test]
-    fn call_payload_none_worktree_and_label_title() {
+    fn call_payload_none_branch_and_label_title() {
         let mut c = call_payload("do it");
-        c.worktree = Some(CallWorktreeMode::None);
+        c.branch = Some(CallBranchMode::None);
         c.label = Some("verifier".to_string());
         let d = delegated_call_payload(c);
-        assert_eq!(d.worktree, CallWorktree::None);
+        assert_eq!(d.branch_policy, CallBranchPolicy::None);
         // Description falls back to the label before the prompt.
         assert_eq!(d.description, "verifier");
     }
@@ -856,18 +871,18 @@ mod blocking_group_tests {
              VALUES ('exec-1', 'recipe', 'issue-1', 'proj-1', 'running', 1, 1)",
         )
         .await;
-        // Target node: carries a worktree the cross-node child would inherit.
+        // Target node carries the durable branch the cross-node child inherits.
         exec(
             &db,
-            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, worktree_path)
-             VALUES ('job-builder', 'exec-1', 'issue-1', 'proj-1', 'Builder', 'running', 1, 1, 'builder', '/tmp/repo-builder')",
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch)
+             VALUES ('job-builder', 'exec-1', 'issue-1', 'proj-1', 'Builder', 'running', 1, 1, 'builder', 'agent/builder')",
         )
         .await;
         // Caller node.
         exec(
             &db,
-            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, worktree_path)
-             VALUES ('job-coord', 'exec-1', 'issue-1', 'proj-1', 'Coordinator', 'running', 1, 1, 'coordinator', '/tmp/repo-coord')",
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch)
+             VALUES ('job-coord', 'exec-1', 'issue-1', 'proj-1', 'Coordinator', 'running', 1, 1, 'coordinator', 'agent/coordinator')",
         )
         .await;
         exec(
@@ -882,42 +897,31 @@ mod blocking_group_tests {
 
         // Cross-node: the builder URI, issued by the coordinator caller, resolves
         // to the BUILDER's job (the fix) and routes cross-node — i.e. it would
-        // spawn under the builder, inheriting its worktree, not the caller's.
-        let cross =
-            resolve_task_routing(&db, Some("run-coord"), "", std::slice::from_ref(&builder))
-                .await
-                .unwrap();
+        // spawn under the builder, inheriting its branch coordinate, not the caller's.
+        let cross = resolve_task_routing(&db, "run-coord", std::slice::from_ref(&builder))
+            .await
+            .unwrap();
         assert_eq!(cross.target_job_ids, vec!["job-builder".to_string()]);
         assert_eq!(cross.route, TaskRoute::CrossNode);
 
         // Self: the coordinator URI resolves back to the caller's own job, so the
         // existing delegated pipeline handles it unchanged.
-        let self_route = resolve_task_routing(
-            &db,
-            Some("run-coord"),
-            "",
-            std::slice::from_ref(&coordinator),
-        )
-        .await
-        .unwrap();
+        let self_route = resolve_task_routing(&db, "run-coord", std::slice::from_ref(&coordinator))
+            .await
+            .unwrap();
         assert_eq!(self_route.target_job_ids, vec!["job-coord".to_string()]);
         assert_eq!(self_route.route, TaskRoute::SelfNode);
 
         // Mixed self + cross-node in one batch is rejected.
-        let mixed = resolve_task_routing(
-            &db,
-            Some("run-coord"),
-            "",
-            &[coordinator.clone(), builder.clone()],
-        )
-        .await
-        .unwrap();
+        let mixed = resolve_task_routing(&db, "run-coord", &[coordinator.clone(), builder.clone()])
+            .await
+            .unwrap();
         assert_eq!(mixed.route, TaskRoute::Mixed);
 
         // A nonexistent target surfaces a clear error rather than a silent
         // fallback to the caller's node.
         let ghost = node_tasks_coords("cairn://p/MCP/1/1/ghost/tasks").unwrap();
-        let err = resolve_task_routing(&db, Some("run-coord"), "", std::slice::from_ref(&ghost))
+        let err = resolve_task_routing(&db, "run-coord", std::slice::from_ref(&ghost))
             .await
             .unwrap_err();
         assert!(err.contains("not found"), "unexpected error: {err}");
@@ -941,8 +945,8 @@ mod blocking_group_tests {
         })
         .to_string();
         assert_eq!(
-            find_change_tool_id(&[newest, older], "/tasks"),
-            Some("toolu_change_abc".to_string())
+            claim_change_tool_id(&[newest, older], "/tasks"),
+            Claim::One("toolu_change_abc".to_string())
         );
     }
 
@@ -960,8 +964,8 @@ mod blocking_group_tests {
         .to_string();
 
         assert_eq!(
-            find_change_tool_id(&[newest], "/questions"),
-            Some("toolu_question_abc".to_string())
+            claim_change_tool_id(&[newest], "/questions"),
+            Claim::One("toolu_question_abc".to_string())
         );
     }
 
@@ -978,7 +982,7 @@ mod blocking_group_tests {
             }]
         })
         .to_string();
-        assert_eq!(find_change_tool_id(&[file_change], "/tasks"), None);
+        assert_eq!(claim_change_tool_id(&[file_change], "/tasks"), Claim::None);
     }
 
     #[test]
@@ -993,7 +997,10 @@ mod blocking_group_tests {
             }]
         })
         .to_string();
-        assert_eq!(find_change_tool_id(&[question_change], "/tasks"), None);
+        assert_eq!(
+            claim_change_tool_id(&[question_change], "/tasks"),
+            Claim::None
+        );
     }
 
     #[test]
@@ -1011,8 +1018,8 @@ mod blocking_group_tests {
         })
         .to_string();
         assert_eq!(
-            find_change_tool_id(&[newest], "/tasks"),
-            Some("toolu_task_write".to_string())
+            claim_change_tool_id(&[newest], "/tasks"),
+            Claim::One("toolu_task_write".to_string())
         );
     }
 }

@@ -36,6 +36,7 @@ const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "progress",
     "annotations",
     "symbols",
+    "rebase",
 ];
 
 /// True when `segment` is a reserved node/task sub-resource keyword (see
@@ -61,6 +62,31 @@ impl CairnResourceUri {
     }
 }
 
+/// How a stored image is addressed.
+///
+/// The sha256 that keys the blob in the content store is the image's *storage
+/// identity*: it is what makes dedup and integrity verification work, and it
+/// stays. It is not the image's public address. A content hash in front of a
+/// reader says nothing about where the image came from, so a public URI instead
+/// names a short ordinal scoped to where the image entered the system, and a
+/// reference row maps that ordinal to the blob.
+///
+/// [`ImageRef::Issue`] and [`ImageRef::Project`] are the friendly forms; every
+/// new mint produces one of them. [`ImageRef::Hash`] is the original form,
+/// burned into transcripts and message bodies that cannot be rewritten. It
+/// resolves forever as a permalink and is never minted again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageRef {
+    /// `cairn://p/{PROJECT}/{issue}/images/{ordinal}` — the overwhelmingly
+    /// common case: pastes and agent image reads happen inside an issue.
+    Issue { number: i32, ordinal: i32 },
+    /// `cairn://p/{PROJECT}/images/{ordinal}` — the fallback for contexts that
+    /// genuinely have no issue, such as a paste into an issue not yet created.
+    Project { ordinal: i32 },
+    /// `cairn://p/{PROJECT}/images/{sha256}` — immutable history only.
+    Hash(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CairnResource {
     Project {
@@ -68,6 +94,26 @@ pub enum CairnResource {
     },
     ProjectIssues {
         project: String,
+    },
+    /// Immutable check observations addressed by a revision coordinate.
+    ProjectCheckResults {
+        project: String,
+        revision: String,
+    },
+    /// Every stored image minted in one scope, in ordinal order.
+    ///
+    /// The ordinal in an image address is a navigable index, not decoration:
+    /// seeing `images/5` tells an agent four siblings exist and lets it
+    /// construct their addresses directly. This collection is what makes that
+    /// guess checkable — and enumerable when the guess is not worth making.
+    ProjectImages {
+        project: String,
+        /// The issue whose images these are; `None` for the project-wide scope.
+        issue: Option<i32>,
+    },
+    ProjectImage {
+        project: String,
+        reference: ImageRef,
     },
     Issue {
         project: String,
@@ -409,6 +455,13 @@ pub enum CairnResource {
         exec_seq: i32,
         node_id: String,
     },
+    /// The active conflict resolution session for this node's branch.
+    NodeRebase {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
     ProjectTerminal {
         project: String,
         slug: String,
@@ -559,6 +612,16 @@ pub enum CairnResource {
     /// Read-only projection of the running app's JSONL log entries
     /// (URI parity with the in-app Logs viewer).
     Logs,
+    /// Workspace-level fleet collection: every enrolled executor by public name.
+    ///
+    /// Machines are machine-scoped rather than project-scoped, so the family
+    /// sits beside `cairn://skills` at the workspace root rather than under a
+    /// project.
+    Executors,
+    /// One enrolled executor addressed by its public name.
+    Executor {
+        name: String,
+    },
     /// Global bug report sink.
     Bug,
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
@@ -591,6 +654,9 @@ impl CairnResource {
             Self::ProjectSettings { .. } => ResourceKind::ProjectSettings,
             Self::Project { .. } => ResourceKind::Project,
             Self::ProjectIssues { .. } => ResourceKind::ProjectIssues,
+            Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
+            Self::ProjectImage { .. } => ResourceKind::ProjectImage,
+            Self::ProjectImages { .. } => ResourceKind::ProjectImages,
             Self::ProjectMessages { .. } => ResourceKind::ProjectMessages,
             Self::ProjectTerminal { .. } => ResourceKind::ProjectTerminal,
             Self::ProjectBrowser { .. } => ResourceKind::ProjectBrowser,
@@ -612,6 +678,7 @@ impl CairnResource {
             Self::NodeChatEvent { .. } => ResourceKind::NodeChatEvent,
             Self::NodeArtifact { .. } => ResourceKind::NodeArtifact,
             Self::NodeDiff { .. } => ResourceKind::NodeDiff,
+            Self::NodeRebase { .. } => ResourceKind::NodeRebase,
             Self::NodeTerminal { .. } => ResourceKind::NodeTerminal,
             Self::NodeRepl { .. } => ResourceKind::NodeRepl,
             Self::TaskTerminal { .. } => ResourceKind::TaskTerminal,
@@ -642,6 +709,8 @@ impl CairnResource {
             Self::DevDb => ResourceKind::DevDb,
             Self::DevPid => ResourceKind::DevPid,
             Self::Logs => ResourceKind::Logs,
+            Self::Executors => ResourceKind::Executors,
+            Self::Executor { .. } => ResourceKind::Executor,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,

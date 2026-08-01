@@ -1,4 +1,4 @@
-//! Worktree fence: the single primitive that gates out-of-worktree file reads,
+//! Logical namespace fence: the single primitive that gates sensitive host reads,
 //! file writes, and shell commands for a fenced agent.
 //!
 //! All three verb handlers (`read`/`write`/`run`) detect a crossing and call
@@ -22,7 +22,7 @@
 //! resolution, on the *same* boundary the `run` sandbox enforces: a `read` is
 //! gated only when its path is in the sensitive denylist (reads are otherwise
 //! broad, matching `run`); a `write` is gated when its target escapes the
-//! worktree. See `docs/worktree-fence.md`.
+//! logical project namespace. See `docs/worktree-fence.md`.
 
 use std::path::Path;
 
@@ -33,8 +33,8 @@ use crate::orchestrator::Orchestrator;
 use super::permission::{await_permission_decision, resolve_fence_policy, PermissionWait};
 
 /// Resolve the canonical run and its fence policy for a verb request, looking
-/// the run up by id or, failing that, by cwd. Returns `None` when there is no
-/// active run or the cwd is unknown — no fence applies.
+/// the run up exclusively by its authenticated id. Returns `None` when the
+/// request has no resolvable run identity.
 pub(crate) async fn resolve_run_fence(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -55,8 +55,8 @@ pub(crate) async fn resolve_run_fence(
 /// What kind of boundary crossing was detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossingKind {
-    ReadOutsideWorktree,
-    WriteOutsideWorktree,
+    SensitiveHostRead,
+    ExternalHostWrite,
     ShellEscape,
 }
 
@@ -65,8 +65,8 @@ impl CrossingKind {
     /// `tool_input` never parses as a crossing by accident).
     fn tag(self) -> &'static str {
         match self {
-            CrossingKind::ReadOutsideWorktree => "read_outside_worktree",
-            CrossingKind::WriteOutsideWorktree => "write_outside_worktree",
+            CrossingKind::SensitiveHostRead => "sensitive_host_read",
+            CrossingKind::ExternalHostWrite => "external_host_write",
             CrossingKind::ShellEscape => "shell_escape",
         }
     }
@@ -91,7 +91,7 @@ impl Crossing {
     pub fn read_denied(path: &Path) -> Self {
         let descriptor = path.display().to_string();
         Crossing {
-            kind: CrossingKind::ReadOutsideWorktree,
+            kind: CrossingKind::SensitiveHostRead,
             verb: "read",
             summary: format!("read a sensitive denied path: {descriptor}"),
             descriptor,
@@ -101,14 +101,14 @@ impl Crossing {
     pub(crate) fn write_outside(path: &Path) -> Self {
         let descriptor = path.display().to_string();
         Crossing {
-            kind: CrossingKind::WriteOutsideWorktree,
+            kind: CrossingKind::ExternalHostWrite,
             verb: "write",
-            summary: format!("write a file outside the worktree: {descriptor}"),
+            summary: format!("write an external host path: {descriptor}"),
             descriptor,
         }
     }
 
-    /// Shell crossing from an out-of-worktree path token. The descriptor is the
+    /// Shell crossing from a path token outside the admitted executor projection. The descriptor is the
     /// resolved path, so a session grant generalizes across commands touching it
     /// (parity with read/write crossings) rather than keying on the exact
     /// command bytes.
@@ -117,7 +117,7 @@ impl Crossing {
             kind: CrossingKind::ShellEscape,
             verb: "run",
             descriptor: resolved.display().to_string(),
-            summary: format!("command references a path outside the worktree: {token}"),
+            summary: format!("command references an external host path: {token}"),
         }
     }
 
@@ -200,7 +200,7 @@ pub async fn raise_fence(
                         FenceDecision::Allow
                     } else {
                         FenceDecision::Deny(format!(
-                            "Denied by worktree fence: {}",
+                            "Denied by logical namespace fence: {}",
                             crossing.summary
                         ))
                     }

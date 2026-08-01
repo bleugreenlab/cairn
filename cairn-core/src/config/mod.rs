@@ -102,7 +102,7 @@ pub async fn get_project_path(db: &LocalDb, project_id: &str) -> Result<PathBuf,
 ///
 /// Project resource mutations (`write cairn://p/PROJECT/skills/...` and friends)
 /// and read-path config migrations rewrite files under `[project]/.cairn/`. Those
-/// edits land in the user's canonical repo — not an agent worktree — so without
+/// edits land in the user's canonical repo — not the runner logical head — so without
 /// committing them they float as uncommitted dirty state in the user's repo.
 ///
 /// Stages only the `.cairn` tree (leaving unrelated dirty state untouched) and

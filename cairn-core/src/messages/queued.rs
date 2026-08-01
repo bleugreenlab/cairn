@@ -80,36 +80,54 @@ pub(crate) async fn enqueue_async(
     let content = content.to_string();
     let now = chrono::Utc::now().timestamp();
 
-    db.write(|conn| {
-        let id = id.clone();
-        let job_id = job_id.clone();
-        let content = content.clone();
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO queued_messages
+    let enqueued = db
+        .write(|conn| {
+            let id = id.clone();
+            let job_id = job_id.clone();
+            let content = content.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO queued_messages
                  (id, job_id, content, delivery, created_at, delivered_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                params![
-                    id.as_str(),
-                    job_id.as_str(),
-                    content.as_str(),
-                    delivery.as_str(),
-                    now
-                ],
-            )
-            .await?;
-            Ok(QueuedMessage {
-                id,
-                job_id,
-                content,
-                delivery,
-                created_at: now,
-                delivered_at: None,
+                    params![
+                        id.as_str(),
+                        job_id.as_str(),
+                        content.as_str(),
+                        delivery.as_str(),
+                        now
+                    ],
+                )
+                .await?;
+                Ok(QueuedMessage {
+                    id,
+                    job_id,
+                    content,
+                    delivery,
+                    created_at: now,
+                    delivered_at: None,
+                })
             })
         })
-    })
-    .await
-    .map_err(|error| format!("Failed to enqueue message: {error}"))
+        .await
+        .map_err(|error| format!("Failed to enqueue message: {error}"));
+
+    // Every row in this table is composer text the operator typed at a job, so
+    // this is one of the two places an operator message enters the core (the
+    // other being the idle-child resume in `continue_job_or_enqueue`). Give the
+    // jobs watching that node's issue their passive catch-up copy (CAIRN-3342);
+    // without it the operator is the one participant whose interventions a
+    // coordinator never sees. Best-effort — a failure here must not lose the
+    // operator's message.
+    if enqueued.is_ok() {
+        if let Err(error) =
+            crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(db, &job_id)
+                .await
+        {
+            log::warn!("catch-up push creation for queued message failed: {error}");
+        }
+    }
+    enqueued
 }
 
 /// Pending (undelivered) queued messages for a job, oldest first.

@@ -8,9 +8,9 @@ use std::sync::Arc;
 use cairn_core::internal::execution::creation::create_jobs_for_execution;
 use cairn_core::internal::storage::LocalDb;
 use cairn_core::models::{
-    AgentGitConfig, AgentNodeConfig, ExecutionSnapshot, Job, JobStatus, NodePosition, RecipeEdge,
-    RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger, TriggerContext,
-    TriggerType, WorktreeMode,
+    AgentGitConfig, AgentNodeConfig, BranchMode, ExecutionSnapshot, Job, JobStatus, NodePosition,
+    RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger,
+    TriggerContext, TriggerType,
 };
 use cairn_db::turso::params;
 
@@ -41,7 +41,8 @@ fn inherited_agent(id: &str, agent_config_id: &str) -> RecipeNode {
             agent_config_id: Some(agent_config_id.to_string()),
             output_schema: None,
             git_config: Some(AgentGitConfig {
-                worktree_mode: WorktreeMode::Inherit,
+                require_parent_head: false,
+                branch_mode: BranchMode::Inherit,
             }),
         }),
         ..node(id, RecipeNodeType::Agent, None)

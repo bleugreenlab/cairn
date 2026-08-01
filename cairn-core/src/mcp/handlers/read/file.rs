@@ -1,7 +1,7 @@
 //! File target producers and the legacy single-target `read` callback.
 
 use crate::mcp::file_targets::validate_read_path;
-use crate::mcp::handlers::read::{error_segment, grep_counts, Produced};
+use crate::mcp::handlers::read::{error_segment, grep_body_counts, grep_counts, Produced};
 use crate::mcp::handlers::target::invalid_target_error;
 use crate::mcp::types::{IssueHistoryMode, McpCallbackRequest, ReadFilePayload};
 use crate::orchestrator::Orchestrator;
@@ -122,6 +122,188 @@ struct BranchReadContext {
     default_commit_id: String,
 }
 
+struct IgnoredMaterializationRead {
+    project_id: String,
+    repo_path: String,
+    commit_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchGrepTarget {
+    SingleFile,
+    Tree,
+}
+
+fn classify_branch_grep_target(context: &BranchReadContext) -> Result<BranchGrepTarget, String> {
+    match object_target_kind(
+        &context.service,
+        context.service.commit_id(),
+        &context.repo_path,
+    ) {
+        Ok(BranchTargetKind::File) => Ok(BranchGrepTarget::SingleFile),
+        Ok(BranchTargetKind::Directory) => Ok(BranchGrepTarget::Tree),
+        Err(object_error) => {
+            if context
+                .service
+                .is_ignored_path(&context.repo_path)
+                .map_err(|error| error.to_string())?
+            {
+                // An ignored logical target is necessarily a direct materialization
+                // projection here. Its runner-side path is deliberately absent, so
+                // consulting process cwd would incorrectly turn it into a tree grep.
+                Ok(BranchGrepTarget::SingleFile)
+            } else {
+                Err(object_error.to_string())
+            }
+        }
+    }
+}
+
+/// Classify a grep target as one file or a tree, and resolve the output mode
+/// that classification implies.
+///
+/// One classification drives both answers. A logical project target resolves
+/// through the branch's object tree, and its `full_path` is a bare
+/// repository-relative path that never exists under the process cwd — so
+/// stat-ing it would call every logical single-file grep a tree and default it
+/// to `files_with_matches`, rendering the bare filename the caller already
+/// typed where the matched lines belong. The filesystem is consulted only when
+/// there is no branch classification to consult. A `glob`/`type` push-down
+/// always means a multi-file walk, whatever the target is.
+fn resolve_grep_target_mode(
+    branch_target: Option<BranchGrepTarget>,
+    full_path: &std::path::Path,
+    payload: &crate::mcp::handlers::search::GrepPayload,
+) -> (bool, String) {
+    let single_file = branch_target
+        .map(|target| target == BranchGrepTarget::SingleFile)
+        .unwrap_or_else(|| full_path.is_file())
+        && payload.glob.is_none()
+        && payload.file_type.is_none();
+    let requested_context = payload.context.is_some()
+        || payload.context_alias.is_some()
+        || payload.after_context.is_some()
+        || payload.before_context.is_some();
+    let mode = crate::mcp::handlers::search::resolve_grep_output_mode(
+        payload.output_mode.as_deref(),
+        requested_context,
+        single_file,
+    )
+    .to_string();
+    (single_file, mode)
+}
+
+fn classify_branch_direct_read(
+    context: &BranchReadContext,
+) -> Result<Result<Vec<u8>, IgnoredMaterializationRead>, String> {
+    match context.service.bytes() {
+        Ok(bytes) => Ok(Ok(bytes)),
+        Err(object_error) => {
+            if !context
+                .service
+                .is_ignored_path(&context.repo_path)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(object_error.to_string());
+            }
+            Ok(Err(IgnoredMaterializationRead {
+                project_id: context.project_id.clone(),
+                repo_path: context.repo_path.clone(),
+                commit_id: context.service.commit_id().to_string(),
+            }))
+        }
+    }
+}
+
+async fn resolve_branch_direct_read(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    classified: Result<Result<Vec<u8>, IgnoredMaterializationRead>, String>,
+) -> Result<Vec<u8>, String> {
+    match classified? {
+        Ok(bytes) => Ok(bytes),
+        Err(plan) => read_ignored_materialization(orch, request, plan).await,
+    }
+}
+
+/// Read one ignored project path's bytes from the live materialization.
+///
+/// This is the CAIRN-3048 contract, reached by name so an intercepted `run`
+/// search over an ignored path routes exactly where the equivalent read routes,
+/// rather than growing a second interpretation of where ignored content lives.
+pub(crate) async fn read_ignored_path(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project_id: &str,
+    repo_path: &str,
+    commit_id: &str,
+) -> Result<Vec<u8>, String> {
+    read_ignored_materialization(
+        orch,
+        request,
+        IgnoredMaterializationRead {
+            project_id: project_id.to_string(),
+            repo_path: repo_path.to_string(),
+            commit_id: commit_id.to_string(),
+        },
+    )
+    .await
+}
+
+async fn read_ignored_materialization(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    plan: IgnoredMaterializationRead,
+) -> Result<Vec<u8>, String> {
+    let (run, _) = super::super::run_context::lookup_run_routed(&orch.db, request).await?;
+    if run.project_id != plan.project_id {
+        return Err("This file belongs to a different project than this run.".into());
+    }
+    let repository = cairn_common::executor_protocol::RepositoryIdentity {
+        project_id: plan.project_id.clone(),
+        repository_id: plan.project_id.clone(),
+        object_format: cairn_common::executor_protocol::GitObjectFormat::Sha1,
+    };
+    let candidate = orch
+        .fleet
+        .select_materialization_read_candidate(
+            &run.run_id,
+            &run.job_id,
+            &run.project_id,
+            &repository,
+            &plan.commit_id,
+        )
+        .map_err(|kind| format!("{kind:?}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let result = orch
+        .fleet
+        .read_resident_materialization(
+            &candidate.executor_id,
+            candidate.generation,
+            cairn_common::executor_protocol::MaterializationReadRequest {
+                fence: candidate.fence,
+                cell_id: candidate.cell_id,
+                project_id: run.project_id,
+                repository,
+                base_commit: plan.commit_id,
+                materialization_generation: candidate.materialization_generation,
+                path: plan.repo_path,
+                deadline_unix_ms: now.saturating_add(30_000),
+                byte_cap: 32 * 1024 * 1024,
+            },
+        )
+        .await;
+    match result {
+        cairn_common::executor_protocol::MaterializationReadResult::Bytes { bytes } => Ok(bytes),
+        cairn_common::executor_protocol::MaterializationReadResult::Failed { kind, diagnostic } => {
+            Err(format!("{kind:?}: {diagnostic}"))
+        }
+    }
+}
+
 fn overlay_entries(
     orch: &Orchestrator,
     context: &BranchReadContext,
@@ -153,6 +335,27 @@ fn load_overlay_entries(
         .map_err(|error| error.to_string())
 }
 
+/// A rendered glob projection body paired with the number of files it stands for.
+///
+/// The count comes from the matched-path list the projection sliced, never from
+/// the rendered string. A body is not a file list in general: an empty result is
+/// one line of prose, a timed-out walk carries a trailing warning, and `content`
+/// spans many lines per file. Counting lines back out of any of those reports a
+/// file count the projection never had — most visibly an absence headed
+/// `[1 files]`.
+struct GlobProjection {
+    body: String,
+    /// Files rendered in `body`, after `offset`/`limit` slicing.
+    files: usize,
+}
+
+/// The rejection every glob projection returns for an unexpected `output_mode`.
+/// `parse_file_projection` validates the mode up front, so this is defensive
+/// against a value that reached a projection without passing through it.
+fn invalid_glob_output_mode(mode: &str) -> String {
+    format!("Invalid output_mode '{mode}'. Must be 'content', 'files_with_matches', or 'count'.")
+}
+
 fn run_overlay_glob_projection(
     files: Vec<super::object_read::ContentEntry>,
     prefix: &str,
@@ -161,7 +364,7 @@ fn run_overlay_glob_projection(
     limit: Option<usize>,
     output_mode: Option<&str>,
     load: impl FnOnce(&[super::object_read::ContentEntry]) -> Result<Vec<(String, Vec<u8>)>, String>,
-) -> Result<String, String> {
+) -> Result<GlobProjection, String> {
     let matcher = cairn_symbols::search_util::build_glob_matcher(pattern)?;
     let mut files: Vec<_> = files
         .into_iter()
@@ -174,10 +377,10 @@ fn run_overlay_glob_projection(
         .collect();
     files.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
     if files.is_empty() {
-        return Ok(format!(
-            "No files matched pattern '{}' in {}",
-            pattern, prefix
-        ));
+        return Ok(GlobProjection {
+            body: crate::mcp::handlers::search::glob_no_matches_body(pattern, prefix),
+            files: 0,
+        });
     }
 
     let start = resolve_offset(offset, files.len());
@@ -186,7 +389,8 @@ fn run_overlay_glob_projection(
         .skip(start)
         .take(limit.unwrap_or(usize::MAX))
         .collect();
-    Ok(match output_mode.unwrap_or("files_with_matches") {
+    let matched = files.len();
+    let body = match output_mode.unwrap_or("files_with_matches") {
         "files_with_matches" => files
             .iter()
             .map(|entry| entry.path.as_str())
@@ -213,12 +417,11 @@ fn run_overlay_glob_projection(
             })
             .collect::<Vec<_>>()
             .join("\n\n"),
-        other => {
-            return Err(format!(
-                "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
-                other
-            ))
-        }
+        other => return Err(invalid_glob_output_mode(other)),
+    };
+    Ok(GlobProjection {
+        body,
+        files: matched,
     })
 }
 
@@ -356,10 +559,9 @@ fn run_object_glob_projection(
         .collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
     if files.is_empty() {
-        return Ok(format!(
-            "No files matched pattern '{}' in {}",
+        return Ok(crate::mcp::handlers::search::glob_no_matches_body(
             pattern,
-            service.prefix()
+            service.prefix(),
         ));
     }
     let start = resolve_offset(offset, files.len());
@@ -388,12 +590,7 @@ fn run_object_glob_projection(
             })
             .collect::<Vec<_>>()
             .join("\n\n"),
-        other => {
-            return Err(format!(
-                "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
-                other
-            ))
-        }
+        other => return Err(invalid_glob_output_mode(other)),
     })
 }
 
@@ -490,7 +687,9 @@ fn parse_issue_history_query(value: Option<&str>) -> Result<Option<IssueHistoryM
 
 fn branch_repo_path(relative_path: &str) -> Result<&str, String> {
     if std::path::Path::new(relative_path).is_absolute() || relative_path.contains("..") {
-        return Err("?branch is only supported for worktree-relative file: targets".to_string());
+        return Err(
+            "?branch is only supported for repository-relative logical file: targets".to_string(),
+        );
     }
     Ok(relative_path)
 }
@@ -714,33 +913,36 @@ pub(crate) fn produce_archived_file_segment(
                         .to_string(),
                 );
             }
-            // Pin the effective output mode exactly as the live producer does for a
-            // single file ([`produce_file_segment`]): an explicit mode wins;
-            // otherwise the default is `content` (context flags also force
-            // `content`). The blob is a file by construction, so the live
-            // `default_grep_output_mode` would have returned `content` here too —
-            // resolved without touching disk, since the path need not exist during
-            // reconstruction.
-            let effective_mode = grep_payload
-                .output_mode
-                .clone()
-                .unwrap_or_else(|| "content".to_string());
+            // Resolve the effective output mode through the very function the
+            // live producer uses, with the classification a blob makes certain:
+            // one file. It touches no disk, so the path need not exist during
+            // reconstruction, and the two can never drift apart.
+            let (_single_file, effective_mode) =
+                resolve_grep_target_mode(Some(BranchGrepTarget::SingleFile), path, &grep_payload);
             grep_payload.output_mode = Some(effective_mode.clone());
 
             let label = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let body =
-                crate::mcp::handlers::search::render_single_file_grep(bytes, &label, &grep_payload);
-            let (matches, _files) = grep_counts(&body);
+            // A failed search reconstructs as the same error segment the live
+            // read rendered, not as an ineligible target: the coordinate is
+            // faithfully addressable, the search itself is what failed.
+            let body = match crate::mcp::handlers::search::render_single_file_grep(
+                bytes,
+                &label,
+                &grep_payload,
+            ) {
+                Ok(body) => body,
+                Err(error) => return Ok(error_segment(uri, error)),
+            };
+            let (match_count, file_count) =
+                grep_body_counts(&body, &effective_mode, &grep_payload.pattern);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            if effective_mode != "files_with_matches" {
-                meta.match_count = Some(matches);
-            }
-            // Single file: no file dimension (mirrors the live producer leaving
-            // file_count None on the single-file grep arm).
-            meta.file_count = None;
+            meta.match_count = match_count;
+            // Mirrors the live producer's single-file grep arm: no file dimension
+            // except under `files_with_matches`, whose body is the file list.
+            meta.file_count = (effective_mode == "files_with_matches").then_some(file_count);
             Ok(ReadSegment::text(body, meta))
         }
         ReadProjection::None => {
@@ -751,10 +953,7 @@ pub(crate) fn produce_archived_file_segment(
                     String::new(),
                     SegmentMeta::new(uri, SegmentKind::Image, NaturalUnit::Line),
                 );
-                segment.images.push(ImageBlock {
-                    mime_type: mime_type.to_string(),
-                    data,
-                });
+                segment.images.push(ImageBlock::inline(mime_type, data));
                 Ok(segment)
             } else if let Some(summary) = render_mat_file_summary(path, bytes) {
                 let body =
@@ -782,17 +981,6 @@ pub(crate) fn produce_archived_file_segment(
             }
         }
     }
-}
-
-fn slice_lines(output: String, offset: Option<i64>, limit: Option<usize>) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    let start = resolve_offset(offset, lines.len());
-    let iter = lines.iter().skip(start);
-    let sliced: Vec<&str> = match limit {
-        Some(limit) => iter.take(limit).copied().collect(),
-        None => iter.copied().collect(),
-    };
-    sliced.join("\n")
 }
 
 fn parse_file_projection(
@@ -963,77 +1151,70 @@ fn parse_file_projection(
 ///   `path:count` shape consistent with grep and the `/changed` projection.
 /// - `content`: the contents of the matched files (sliced by offset/limit),
 ///   each under a `=== <path> ===` header, with oversized files elided.
+///
+/// Every mode renders from the one matched-path list, so the projection reports
+/// its own file count, and a failed walk returns `Err` rather than folding its
+/// message into a body the header would then count as a result.
 async fn run_glob_projection(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     offset: Option<i64>,
     limit: Option<usize>,
     output_mode: Option<&str>,
-) -> String {
-    use crate::mcp::handlers::search::{glob_matched_paths, glob_timeout_warning, handle_glob};
+) -> Result<GlobProjection, String> {
+    use crate::mcp::handlers::search::{
+        glob_matched_paths, glob_no_matches_body, glob_timeout_warning,
+    };
 
-    match output_mode {
-        None | Some("files_with_matches") => {
-            slice_lines(handle_glob(orch, request).await, offset, limit)
+    let matches = glob_matched_paths(orch, request).await?;
+
+    // Nothing matched at all: say so, once, in the shared wording. A window that
+    // overshoots a non-empty match set is a different thing and renders empty.
+    if matches.paths.is_empty() {
+        let mut body = glob_no_matches_body(&matches.pattern, matches.search_dir.display());
+        if matches.timed_out {
+            body.push_str(&glob_timeout_warning());
         }
-        Some("count") => match glob_matched_paths(orch, request).await {
-            Ok(matches) => {
-                let start = resolve_offset(offset, matches.paths.len());
-                matches
-                    .paths
-                    .iter()
-                    .skip(start)
-                    .take(limit.unwrap_or(usize::MAX))
-                    .map(|rel| format!("{}:1", rel.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-            Err(error) => error,
-        },
-        Some("content") => {
-            let matches = match glob_matched_paths(orch, request).await {
-                Ok(matches) => matches,
-                Err(error) => return error,
-            };
-            if matches.paths.is_empty() {
-                let body = format!(
-                    "No files matched pattern '{}' in {}",
-                    matches.pattern,
-                    matches.search_dir.display()
-                );
-                return if matches.timed_out {
-                    format!("{}{}", body, glob_timeout_warning())
-                } else {
-                    body
-                };
-            }
-
-            let start = resolve_offset(offset, matches.paths.len());
-            let take = limit.unwrap_or(usize::MAX);
-            let sections = matches
-                .paths
-                .iter()
-                .skip(start)
-                .take(take)
-                .map(|rel| {
-                    let body = read_glob_content_file(&matches.search_dir.join(rel));
-                    format!("=== {} ===\n{}", rel.display(), body)
-                })
-                .collect::<Vec<_>>();
-
-            let mut result = sections.join("\n\n");
-            if matches.timed_out {
-                result.push_str(&glob_timeout_warning());
-            }
-            result
-        }
-        // parse_file_projection validates output_mode up front; this arm is
-        // defensive against an unexpected value reaching the executor.
-        Some(other) => format!(
-            "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
-            other
-        ),
+        return Ok(GlobProjection { body, files: 0 });
     }
+
+    let start = resolve_offset(offset, matches.paths.len());
+    let window: Vec<&std::path::PathBuf> = matches
+        .paths
+        .iter()
+        .skip(start)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    let mut body = match output_mode.unwrap_or("files_with_matches") {
+        "files_with_matches" => window
+            .iter()
+            .map(|rel| rel.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "count" => window
+            .iter()
+            .map(|rel| format!("{}:1", rel.display()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "content" => window
+            .iter()
+            .map(|rel| {
+                let body = read_glob_content_file(&matches.search_dir.join(rel));
+                format!("=== {} ===\n{}", rel.display(), body)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        other => return Err(invalid_glob_output_mode(other)),
+    };
+    if matches.timed_out {
+        body.push_str(&glob_timeout_warning());
+    }
+
+    Ok(GlobProjection {
+        body,
+        files: window.len(),
+    })
 }
 
 /// Read one file for a glob `content` projection, eliding files past the
@@ -1152,11 +1333,11 @@ pub(crate) async fn produce_file_segment(
 
     let worktree = std::path::Path::new(&request.cwd);
 
-    // Worktree fence (reads): a denylisted target outside the worktree is gated
-    // before existence validation, on a leniently-resolved path.
+    // Explicit host crossings are gated before existence validation. Logical
+    // relative targets never derive authority from process cwd.
     if let Ok(full) = crate::mcp::file_targets::resolve_file_path_lenient(worktree, &split.identity)
     {
-        if crate::mcp::file_targets::path_escapes_worktree(worktree, &full)
+        if crate::mcp::file_targets::target_crosses_logical_root(&split.identity).unwrap_or(true)
             && crate::mcp::file_targets::path_within_any(&full, &orch.sandbox_deny_read())
         {
             use crate::mcp::handlers::fence;
@@ -1176,7 +1357,7 @@ pub(crate) async fn produce_file_segment(
                     }
                     fence::FenceDecision::Suspended => {
                         return Produced::Suspended(
-                            "Read suspended pending worktree fence approval; resume will \
+                            "Read suspended pending logical namespace approval; resume will \
                              continue once it is answered."
                                 .to_string(),
                         );
@@ -1186,14 +1367,13 @@ pub(crate) async fn produce_file_segment(
         }
     }
 
-    let logical_project_target =
-        crate::mcp::file_targets::resolve_file_path_lenient(worktree, &split.identity)
-            .is_ok_and(|path| !crate::mcp::file_targets::path_escapes_worktree(worktree, &path))
-            && super::super::run_context::lookup_run(&orch.db.local, request)
-                .await
-                .is_ok();
+    let logical_target = crate::mcp::file_targets::resolve_logical_file_target(&split.identity);
+    let logical_project_target = logical_target.is_ok()
+        && super::super::run_context::lookup_run_routed(&orch.db, request)
+            .await
+            .is_ok();
     let resolved_target = match if branch.is_some() || logical_project_target {
-        crate::mcp::file_targets::resolve_read_target_lenient(worktree, &split.identity)
+        logical_target
     } else {
         validate_read_path(worktree, &split.identity)
     } {
@@ -1243,8 +1423,8 @@ pub(crate) async fn produce_file_segment(
             limit,
             output_mode,
         } => {
-            if let Some(context) = branch_context.as_ref() {
-                let body = match overlay_entries(orch, context).and_then(|files| {
+            let projection = if let Some(context) = branch_context.as_ref() {
+                overlay_entries(orch, context).and_then(|files| {
                     run_overlay_glob_projection(
                         files,
                         context.service.prefix(),
@@ -1254,15 +1434,7 @@ pub(crate) async fn produce_file_segment(
                         output_mode.as_deref(),
                         |entries| load_overlay_entries(orch, context, entries),
                     )
-                }) {
-                    Ok(body) => body,
-                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
-                };
-                let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
-                if output_mode.as_deref().unwrap_or("files_with_matches") == "files_with_matches" {
-                    meta.file_count = Some(body.lines().filter(|line| !line.is_empty()).count());
-                }
-                Produced::Segment(ReadSegment::text(body, meta))
+                })
             } else {
                 let glob_request = McpCallbackRequest {
                     thread_id: None,
@@ -1275,50 +1447,49 @@ pub(crate) async fn produce_file_segment(
                     }),
                     tool_use_id: request.tool_use_id.clone(),
                 };
-                let body =
-                    run_glob_projection(orch, &glob_request, offset, limit, output_mode.as_deref())
-                        .await;
-                let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
-                if output_mode.as_deref().unwrap_or("files_with_matches") == "files_with_matches" {
-                    meta.file_count = Some(body.lines().filter(|line| !line.is_empty()).count());
-                }
-                Produced::Segment(ReadSegment::text(body, meta))
+                run_glob_projection(orch, &glob_request, offset, limit, output_mode.as_deref())
+                    .await
+            };
+            let projection = match projection {
+                Ok(projection) => projection,
+                Err(error) => return Produced::Segment(error_segment(uri, error)),
+            };
+            let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
+            // `[N files]` describes a body that *is* the file list, so only
+            // `files_with_matches` carries it; a `count` tally or `content` dump
+            // reports no suffix. The count is the projection's own, so a pattern
+            // that matched nothing reads `[0 files]` rather than counting the one
+            // line of prose that says so.
+            if output_mode.as_deref().unwrap_or("files_with_matches") == "files_with_matches" {
+                meta.file_count = Some(projection.files);
             }
+            Produced::Segment(ReadSegment::text(projection.body, meta))
         }
         ReadProjection::Grep(mut grep_payload) => {
             let full_path = &resolved_target.full_path;
-            let branch_kind = if let Some(context) = branch_context.as_ref() {
-                match object_target_kind(
-                    &context.service,
-                    context.service.commit_id(),
-                    &context.repo_path,
-                ) {
-                    Ok(kind) => Some(kind),
-                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+            let branch_target = if let Some(context) = branch_context.as_ref() {
+                match classify_branch_grep_target(context) {
+                    Ok(target) => Some(target),
+                    Err(error) => return Produced::Segment(error_segment(uri, error)),
                 }
             } else {
                 None
             };
-            let single_file = branch_kind
-                .map(|kind| kind == BranchTargetKind::File)
-                .unwrap_or_else(|| full_path.is_file())
-                && grep_payload.glob.is_none()
-                && grep_payload.file_type.is_none();
-            let requested_context = grep_payload.context.is_some()
-                || grep_payload.context_alias.is_some()
-                || grep_payload.after_context.is_some()
-                || grep_payload.before_context.is_some();
-            let effective_mode = crate::mcp::handlers::search::resolve_grep_output_mode(
-                grep_payload.output_mode.as_deref(),
-                requested_context,
-                full_path,
-            )
-            .to_string();
+            let (single_file, effective_mode) =
+                resolve_grep_target_mode(branch_target, full_path, &grep_payload);
             grep_payload.output_mode = Some(effective_mode.clone());
 
-            let body = if let Some(context) = branch_context.as_ref() {
+            // Every producer below returns `Err` for a failed search rather than
+            // folding the failure text into its body, so an error can never reach
+            // the count/header projection and be presented as a result.
+            let rendered = if let Some(context) = branch_context.as_ref() {
                 if single_file {
-                    match context.service.bytes() {
+                    let bytes = match classify_branch_direct_read(context) {
+                        Ok(Ok(bytes)) => Ok(bytes),
+                        Ok(Err(plan)) => read_ignored_materialization(orch, request, plan).await,
+                        Err(error) => Err(error),
+                    };
+                    match bytes {
                         Ok(bytes) => {
                             let label = full_path
                                 .file_name()
@@ -1376,14 +1547,20 @@ pub(crate) async fn produce_file_segment(
                 };
                 crate::mcp::handlers::search::handle_grep(orch, &grep_request).await
             };
-            let (matches, files) = grep_counts(&body);
+            let body = match rendered {
+                Ok(body) => body,
+                Err(error) => return Produced::Segment(error_segment(uri, error)),
+            };
+            let (match_count, file_count) =
+                grep_body_counts(&body, &effective_mode, &grep_payload.pattern);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            if effective_mode != "files_with_matches" {
-                meta.match_count = Some(matches);
-            }
-            if !single_file {
-                meta.file_count = Some(files);
-            }
+            meta.match_count = match_count;
+            // A `content`/`count` body over one named file has no useful file
+            // dimension — the caller named the file. A `files_with_matches` body
+            // *is* the file dimension, so it always reports one, and a match is
+            // never rendered as a bare filename with no count beside it.
+            meta.file_count =
+                (!single_file || effective_mode == "files_with_matches").then_some(file_count);
             Produced::Segment(ReadSegment::text(body, meta))
         }
         ReadProjection::Ast { pattern, glob } => {
@@ -1474,6 +1651,14 @@ pub(crate) async fn produce_file_segment(
                     &context.repo_path,
                 ) {
                     Ok(kind) => Some(kind),
+                    Err(_)
+                        if context
+                            .service
+                            .is_ignored_path(&context.repo_path)
+                            .unwrap_or(false) =>
+                    {
+                        None
+                    }
                     Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
                 }
             } else {
@@ -1502,11 +1687,15 @@ pub(crate) async fn produce_file_segment(
 
             if let Some(mime_type) = get_image_mime_type(full_path) {
                 let bytes = if let Some(context) = branch_context.as_ref() {
-                    match context.service.bytes() {
+                    match resolve_branch_direct_read(
+                        orch,
+                        request,
+                        classify_branch_direct_read(context),
+                    )
+                    .await
+                    {
                         Ok(bytes) => bytes,
-                        Err(error) => {
-                            return Produced::Segment(error_segment(uri, error.to_string()))
-                        }
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
                     }
                 } else {
                     match std::fs::read(full_path) {
@@ -1525,17 +1714,20 @@ pub(crate) async fn produce_file_segment(
                     String::new(),
                     SegmentMeta::new(uri, SegmentKind::Image, NaturalUnit::Line),
                 );
-                segment.images.push(ImageBlock {
-                    mime_type: mime_type.to_string(),
-                    data,
-                });
+                segment.images.push(ImageBlock::inline(mime_type, data));
                 return Produced::Segment(segment);
             }
 
             let bytes = if let Some(context) = branch_context.as_ref() {
-                match context.service.bytes() {
+                match resolve_branch_direct_read(
+                    orch,
+                    request,
+                    classify_branch_direct_read(context),
+                )
+                .await
+                {
                     Ok(bytes) => bytes,
-                    Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
+                    Err(error) => return Produced::Segment(error_segment(uri, error)),
                 }
             } else {
                 match std::fs::read(full_path) {
@@ -1900,6 +2092,103 @@ mod tests {
     }
 
     #[test]
+    fn overlay_glob_projection_reports_zero_files_when_nothing_matched() {
+        // A pattern that matches nothing renders one line of prose. Counting the
+        // rendered body's lines would head that absence `[1 files]`.
+        let (dir, service, base) = projection_fixture();
+        let registry = super::super::overlay::ProjectOverlayRegistry::default();
+        let entries = registry
+            .entries(
+                "project",
+                dir.path(),
+                &base,
+                service.commit_id(),
+                "fixture",
+                service.limits(),
+            )
+            .unwrap();
+
+        for mode in ["files_with_matches", "count", "content"] {
+            let projection = run_overlay_glob_projection(
+                entries.clone(),
+                service.prefix(),
+                "render*",
+                None,
+                None,
+                Some(mode),
+                |_| Ok(Vec::new()),
+            )
+            .unwrap();
+            assert_eq!(projection.files, 0, "mode {mode}");
+            assert_eq!(
+                projection.body, "No files matched pattern 'render*' in fixture",
+                "mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_direct_grep_routes_materialization_bytes_as_a_single_file() {
+        let (dir, service, _) = projection_fixture();
+        let ignored_path = "fixture/ignored/generated.log";
+        assert!(
+            !dir.path().join(ignored_path).exists(),
+            "the runner filesystem must not provide the ignored artifact"
+        );
+        let context = BranchReadContext {
+            service: super::super::object_read::ObjectReadService::new(
+                dir.path().to_path_buf(),
+                service.commit_id().to_string(),
+                ignored_path.to_string(),
+            )
+            .unwrap(),
+            repo_path: ignored_path.to_string(),
+            project_id: "project".into(),
+            repository_path: dir.path().to_path_buf(),
+            default_commit_id: service.commit_id().to_string(),
+        };
+
+        assert_eq!(
+            classify_branch_grep_target(&context).unwrap(),
+            BranchGrepTarget::SingleFile
+        );
+        let plan = classify_branch_direct_read(&context)
+            .unwrap()
+            .expect_err("ignored object-absent path must request a live materialization read");
+        assert_eq!(plan.repo_path, ignored_path);
+
+        // Model the bounded executor response. Rendering these bytes as one file is
+        // the observable contract; a tree grep would exclude this ignored path.
+        let fake_materialization_bytes = b"before\nerror: generated failure\nafter\n";
+        let grep = crate::mcp::handlers::search::GrepPayload {
+            pattern: "error".into(),
+            path: None,
+            glob: None,
+            file_type: None,
+            output_mode: Some("content".into()),
+            context: None,
+            after_context: None,
+            before_context: None,
+            context_alias: None,
+            case_insensitive: None,
+            line_numbers: Some(true),
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        };
+        let rendered = crate::mcp::handlers::search::render_single_file_grep(
+            fake_materialization_bytes,
+            "generated.log",
+            &grep,
+        )
+        .unwrap();
+        assert!(
+            rendered.contains("2:error: generated failure"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn store_native_branch_projections_match_materialized_filesystem() {
         let (dir, service, base) = projection_fixture();
         let root = dir.path().join("fixture");
@@ -1987,16 +2276,20 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                overlay,
+                overlay.body,
                 run_object_glob_projection(&service, "*.txt", Some(0), Some(8), Some(mode))
                     .unwrap(),
                 "overlay glob mode {mode}"
             );
             assert_eq!(
-                overlay,
+                overlay.body,
                 legacy_glob_projection(&root, "*.txt", Some(0), Some(8), Some(mode)),
                 "glob mode {mode}"
             );
+            // Every mode projects the same matched set (notes.txt, large.txt),
+            // so the count the header reports must not vary with the shape the
+            // body happened to be written in.
+            assert_eq!(overlay.files, 2, "overlay glob file count, mode {mode}");
         }
 
         let grep = crate::mcp::handlers::search::GrepPayload {
@@ -2016,10 +2309,11 @@ mod tests {
             multiline: None,
         };
         let files = service.files().unwrap();
-        let object_grep = crate::mcp::handlers::search::render_tree_grep(&overlay_files, &grep);
+        let object_grep =
+            crate::mcp::handlers::search::render_tree_grep(&overlay_files, &grep).unwrap();
         assert_eq!(
             object_grep,
-            crate::mcp::handlers::search::render_tree_grep(&files, &grep)
+            crate::mcp::handlers::search::render_tree_grep(&files, &grep).unwrap()
         );
         let filesystem_grep = crate::mcp::handlers::search::grep_search(
             grep.clone(),
@@ -2082,32 +2376,12 @@ mod tests {
             .map(|offset| context + offset)
             .unwrap();
         let source = &whole_source[dispatch..];
-        for (start, end, object_marker) in [
-            (
-                "ReadProjection::Glob",
-                "ReadProjection::Grep",
-                "run_overlay_glob_projection",
-            ),
-            (
-                "ReadProjection::Grep",
-                "ReadProjection::Ast",
-                "context.service.bytes()",
-            ),
-            (
-                "ReadProjection::Ast",
-                "ReadProjection::Outline",
-                "search_texts",
-            ),
-            (
-                "ReadProjection::Outline",
-                "ReadProjection::None",
-                "outline_texts",
-            ),
-            (
-                "ReadProjection::None",
-                "struct FileIssueHistoryRow",
-                "context.service.bytes()",
-            ),
+        for (start, end) in [
+            ("ReadProjection::Glob", "ReadProjection::Grep"),
+            ("ReadProjection::Grep", "ReadProjection::Ast"),
+            ("ReadProjection::Ast", "ReadProjection::Outline"),
+            ("ReadProjection::Outline", "ReadProjection::None"),
+            ("ReadProjection::None", "struct FileIssueHistoryRow"),
         ] {
             let start = source.find(start).unwrap();
             let end = source[start..]
@@ -2116,8 +2390,12 @@ mod tests {
                 .unwrap();
             let arm = &source[start..end];
             assert!(arm.contains("branch_context.as_ref()"), "{start}");
-            assert!(arm.contains(object_marker), "{start}: {object_marker}");
         }
+        assert!(source.contains("run_overlay_glob_projection"));
+        assert!(source.contains("overlay_files(orch, context)"));
+        assert!(source.contains("search_texts"));
+        assert!(source.contains("outline_texts"));
+        assert!(source.contains("read_ignored_materialization"));
     }
 
     fn payload() -> ReadFilePayload {
@@ -2510,6 +2788,50 @@ mod tests {
         assert_eq!(seg.meta.match_count, None);
     }
 
+    /// The reported regression: a logical project target has no host path, so
+    /// its `full_path` is a bare repository-relative path that never stats as a
+    /// file. Resolving the output mode from that stat classified every logical
+    /// single-file grep as a tree and defaulted it to `files_with_matches`,
+    /// rendering the filename the caller already typed — a hit that reads like a
+    /// miss. The branch classification, not the filesystem, decides.
+    #[test]
+    fn logical_single_file_grep_defaults_to_content_without_a_host_path() {
+        let payload = grep_projection("grep=needle");
+        let logical = std::path::Path::new("src/does/not/exist/on/this/host.rs");
+        assert!(!logical.is_file());
+
+        assert_eq!(
+            resolve_grep_target_mode(Some(BranchGrepTarget::SingleFile), logical, &payload),
+            (true, "content".to_string())
+        );
+        assert_eq!(
+            resolve_grep_target_mode(Some(BranchGrepTarget::Tree), logical, &payload),
+            (false, "files_with_matches".to_string())
+        );
+    }
+
+    /// A `glob`/`type` push-down is a multi-file walk even against a single-file
+    /// target, so it keeps the tree default.
+    #[test]
+    fn grep_with_a_glob_pushdown_is_never_a_single_file() {
+        let payload = grep_projection("grep=needle&glob=*.rs");
+        assert_eq!(
+            resolve_grep_target_mode(
+                Some(BranchGrepTarget::SingleFile),
+                std::path::Path::new("src/lib.rs"),
+                &payload
+            ),
+            (false, "files_with_matches".to_string())
+        );
+    }
+
+    fn grep_projection(query: &str) -> crate::mcp::handlers::search::GrepPayload {
+        match project(query).unwrap().0 {
+            ReadProjection::Grep(payload) => payload,
+            other => panic!("expected grep projection, got {other:?}"),
+        }
+    }
+
     /// A single-file grep with no explicit output_mode defaults to content — the
     /// pre-existing single-file behavior is unchanged by the fix.
     #[tokio::test]
@@ -2531,6 +2853,99 @@ mod tests {
         assert_eq!(seg.meta.match_count, Some(1));
         // A single-file grep does not carry a file count (you named the file).
         assert_eq!(seg.meta.file_count, None);
+    }
+
+    /// Every grep mode's header must agree with the body it labels. A
+    /// `files_with_matches` body is the file list, so it counts files; a `count`
+    /// body is `path:N` tallies, which read as zero matches under the content
+    /// shape and rendered `[0 matches]` over a body full of them.
+    #[tokio::test]
+    async fn grep_header_counts_follow_the_output_mode() {
+        let (orch, worktree) = grep_test_orch().await;
+        std::fs::create_dir(worktree.path().join("d")).unwrap();
+        std::fs::write(worktree.path().join("d/a.txt"), "NEEDLE\nx\nNEEDLE\n").unwrap();
+        std::fs::write(worktree.path().join("d/b.txt"), "y\nNEEDLE\n").unwrap();
+
+        let tree_files = grep_segment(&orch, worktree.path(), "file:d?grep=NEEDLE").await;
+        assert_eq!(tree_files.meta.match_count, None);
+        assert_eq!(tree_files.meta.file_count, Some(2), "{}", tree_files.body);
+
+        let tree_count = grep_segment(
+            &orch,
+            worktree.path(),
+            "file:d?grep=NEEDLE&output_mode=count",
+        )
+        .await;
+        assert_eq!(tree_count.meta.match_count, Some(3), "{}", tree_count.body);
+        assert_eq!(tree_count.meta.file_count, Some(2));
+
+        let file_files = grep_segment(
+            &orch,
+            worktree.path(),
+            "file:d/a.txt?grep=NEEDLE&output_mode=files_with_matches",
+        )
+        .await;
+        assert_eq!(file_files.meta.match_count, None);
+        assert_eq!(file_files.meta.file_count, Some(1), "{}", file_files.body);
+
+        let file_count = grep_segment(
+            &orch,
+            worktree.path(),
+            "file:d/a.txt?grep=NEEDLE&output_mode=count",
+        )
+        .await;
+        assert_eq!(file_count.meta.match_count, Some(2), "{}", file_count.body);
+        assert_eq!(file_count.meta.file_count, None);
+    }
+
+    /// A failed search is an error, never a counted result. The failure text is
+    /// an ordinary string, so folding it into the body would have let the
+    /// files-with-matches count read one line of error prose as one matched
+    /// file and head it `[1 files]` — asserting a match that never happened.
+    #[tokio::test]
+    async fn grep_failure_is_an_error_segment_not_a_counted_result() {
+        let (orch, worktree) = grep_test_orch().await;
+        std::fs::create_dir(worktree.path().join("d")).unwrap();
+        std::fs::write(worktree.path().join("d/a.txt"), "NEEDLE\n").unwrap();
+
+        // Default tree mode — the files_with_matches path the header now counts.
+        let tree = grep_segment(&orch, worktree.path(), "file:d?grep=(unclosed").await;
+        assert_eq!(tree.meta.kind, SegmentKind::Error, "{}", tree.body);
+        assert_eq!(tree.meta.match_count, None);
+        assert_eq!(tree.meta.file_count, None);
+        assert!(tree.body.contains("Invalid regex pattern"), "{}", tree.body);
+
+        // And on the single-file path, in every mode it can reach.
+        for target in [
+            "file:d/a.txt?grep=(unclosed",
+            "file:d/a.txt?grep=(unclosed&output_mode=files_with_matches",
+            "file:d/a.txt?grep=(unclosed&output_mode=count",
+        ] {
+            let segment = grep_segment(&orch, worktree.path(), target).await;
+            assert_eq!(segment.meta.kind, SegmentKind::Error, "{target}");
+            assert_eq!(segment.meta.match_count, None, "{target}");
+            assert_eq!(segment.meta.file_count, None, "{target}");
+        }
+    }
+
+    /// An empty result stays empty in every mode: the no-match body is prose,
+    /// and counting its single line as a matched file would render an absence as
+    /// `[1 files]`.
+    #[tokio::test]
+    async fn grep_with_no_matches_reports_zero_in_every_mode() {
+        let (orch, worktree) = grep_test_orch().await;
+        std::fs::create_dir(worktree.path().join("d")).unwrap();
+        std::fs::write(worktree.path().join("d/a.txt"), "alpha\nbeta\n").unwrap();
+
+        let tree = grep_segment(&orch, worktree.path(), "file:d?grep=ABSENT").await;
+        assert!(tree.body.starts_with("No matches found"), "{}", tree.body);
+        assert_eq!(tree.meta.match_count, None);
+        assert_eq!(tree.meta.file_count, Some(0));
+
+        let file = grep_segment(&orch, worktree.path(), "file:d/a.txt?grep=ABSENT").await;
+        assert!(file.body.starts_with("No matches found"), "{}", file.body);
+        assert_eq!(file.meta.match_count, Some(0));
+        assert_eq!(file.meta.file_count, None);
     }
 
     #[test]

@@ -16,7 +16,8 @@ use cairn_core::internal::services::testing::{
 use cairn_core::internal::services::GitOutput;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use cairn_core::models::{
-    ExecutionSnapshot, IssueStatus, NodePosition, RecipeNode, RecipeNodeType, RecipeSnapshot,
+    AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, ExecutionSnapshot, IssueStatus,
+    NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
     RecipeTrigger, RunStatus, TriggerContext, TriggerType,
 };
 use cairn_db::turso::params;
@@ -51,7 +52,9 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> (Orchestrator, RecordingPro
     )
 }
 
-async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
+/// The coordinator half: the project, the parent issue, and the idle coordinator
+/// job that watches its children. Shared by every child shape below.
+async fn seed_coordinator(db: &LocalDb, root: &std::path::Path) {
     let root = root.to_string_lossy().to_string();
     let snapshot = ExecutionSnapshot::new(
         RecipeSnapshot {
@@ -75,6 +78,41 @@ async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
     .to_json()
     .unwrap()
     .replace('\'', "''");
+    db.execute_script(&format!(
+        "
+        INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES('project','default','Coordinator','COORD','{root}',1,1);
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+          VALUES('parent','project',1,'Parent','active','active','none',1,1);
+        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+          VALUES('parent-exec','coordinator','parent','project','running',1,1,'{snapshot}');
+        INSERT INTO jobs(id, execution_id, project_id, issue_id, status,
+                         uri_segment, node_name, current_session_id, created_at, updated_at)
+          VALUES('coordinator','parent-exec','project','parent','complete',
+                 'coordinator','Coordinator','coord-session',1,1);
+        INSERT INTO sessions(id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+          VALUES('coord-session','coordinator','claude','claude-session','open',1,2000000000,2000000000);
+        INSERT INTO runs(id, project_id, issue_id, job_id, session_id, status, created_at, updated_at, start_mode)
+          VALUES('coord-run','project','parent','coordinator','coord-session','complete',1,1,'resume');
+        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+          VALUES('coord-turn','coord-session','coord-run','coordinator',1,'complete','initial',1,1);
+        UPDATE jobs SET current_turn_id='coord-turn' WHERE id='coordinator';
+
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                           parent_issue_id, parent_job_id, created_at, updated_at)
+          VALUES('child','project',2,'Child','active','waiting','none',
+                 'parent','coordinator',1,1);
+        INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state,
+                                       created_by, created_at, updated_at, one_shot)
+          VALUES('child-sub','coordinator','issue','{CHILD_URI}','active','system',1,1,0);
+        "
+    ))
+    .await
+    .unwrap();
+}
+
+async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
+    seed_coordinator(db, root).await;
     let child_snapshot = ExecutionSnapshot::new(
         RecipeSnapshot {
             id: "build".to_string(),
@@ -112,34 +150,12 @@ async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
     .replace('\'', "''");
     db.execute_script(&format!(
         "
-        INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-          VALUES('project','default','Coordinator','COORD','{root}',1,1);
-        INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
-          VALUES('parent','project',1,'Parent','active','active','none',1,1);
-        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
-          VALUES('parent-exec','coordinator','parent','project','running',1,1,'{snapshot}');
-        INSERT INTO jobs(id, execution_id, project_id, issue_id, status,
-                         uri_segment, node_name, worktree_path, current_session_id, created_at, updated_at)
-          VALUES('coordinator','parent-exec','project','parent','complete',
-                 'coordinator','Coordinator','{root}','coord-session',1,1);
-        INSERT INTO sessions(id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
-          VALUES('coord-session','coordinator','claude','claude-session','open',1,2000000000,2000000000);
-        INSERT INTO runs(id, project_id, issue_id, job_id, session_id, status, created_at, updated_at, start_mode)
-          VALUES('coord-run','project','parent','coordinator','coord-session','complete',1,1,'resume');
-        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
-          VALUES('coord-turn','coord-session','coord-run','coordinator',1,'complete','initial',1,1);
-        UPDATE jobs SET current_turn_id='coord-turn' WHERE id='coordinator';
-
-        INSERT INTO issues(id, project_id, number, title, status, progress, attention,
-                           parent_issue_id, parent_job_id, created_at, updated_at)
-          VALUES('child','project',2,'Child','active','waiting','none',
-                 'parent','coordinator',1,1);
         INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
           VALUES('child-exec','build','child','project','running',1,1,'{child_snapshot}');
         INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
-                         uri_segment, node_name, branch, worktree_path, created_at, updated_at)
+                         uri_segment, node_name, branch, created_at, updated_at)
           VALUES('child-builder','child-exec','builder','project','child','complete',
-                 'builder','Builder','child-branch','{root}',1,1);
+                 'builder','Builder','child-branch',1,1);
         INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at)
           VALUES('child-run','project','child','child-builder','complete',1,1);
         INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
@@ -148,13 +164,151 @@ async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
                                    target_branch, status, head_sha, opened_at, updated_at)
           VALUES('child-pr','child-builder','project','child','Child PR','child-branch',
                  'main','open','child-head',1,1);
-        INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state,
-                                       created_by, created_at, updated_at, one_shot)
-          VALUES('child-sub','coordinator','issue','{CHILD_URI}','active','system',1,1,0);
         "
     ))
     .await
     .unwrap();
+}
+
+fn agent_node(id: &str) -> RecipeNode {
+    RecipeNode {
+        id: id.to_string(),
+        node_type: RecipeNodeType::Agent,
+        name: id.to_string(),
+        position: NodePosition { x: 0.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config: Some(AgentNodeConfig {
+            agent_config_id: Some(id.to_string()),
+            output_schema: None,
+            git_config: None,
+        }),
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: None,
+        condition_config: None,
+        context_config: None,
+    }
+}
+
+fn artifact_node(id: &str, name: &str, policy: ConfirmPolicy) -> RecipeNode {
+    RecipeNode {
+        id: id.to_string(),
+        node_type: RecipeNodeType::Artifact,
+        name: id.to_string(),
+        position: NodePosition { x: 0.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config: None,
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: Some(ArtifactNodeConfig {
+            name: name.to_string(),
+            schema: Some(serde_json::json!({"type": "object"})),
+            confirm_policy: policy,
+            content: None,
+        }),
+        condition_config: None,
+        context_config: None,
+    }
+}
+
+fn ctx_edge(id: &str, from: &str, to: &str) -> RecipeEdge {
+    RecipeEdge {
+        id: id.to_string(),
+        edge_type: RecipeEdgeType::Context,
+        source_node_id: from.to_string(),
+        source_handle: "context-out".to_string(),
+        target_node_id: to.to_string(),
+        target_handle: "context-in".to_string(),
+    }
+}
+
+/// A planbuild child parked at its plan gate:
+/// `planner --context-out-> plan(user) --context-out-> builder`, with the
+/// planner's plan artifact written but unconfirmed, its builder still pending,
+/// and no PR anywhere.
+///
+/// This is the topology that made CAIRN-3347 invisible. The planner's
+/// `context-out` terminates in an artifact consumed by the builder, so its branch
+/// ships no PR and the turn-end check cadence skips it; no PR exists, so the
+/// PR-open edge cannot fire either. The recompute review-readiness hook is the
+/// only edge left, and the planner's turn ends by deriving **Blocked** under the
+/// `user` confirm gate rather than any terminal status.
+///
+/// The builder job is seeded exactly as a real execution leaves it — `pending`,
+/// no turn, not DAG-ready behind the blocked planner — so it contributes no
+/// status change of its own. That matters: any sibling transition into a status
+/// the hook already accepted would mask the gate and make this test pass against
+/// the bug.
+async fn seed_plan_gate_child(db: &LocalDb) {
+    let snapshot = ExecutionSnapshot::new(
+        RecipeSnapshot {
+            id: "planbuild".to_string(),
+            name: "Plan Build".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: vec![
+                agent_node("planner"),
+                artifact_node("plan-node", "plan", ConfirmPolicy::User),
+                agent_node("builder"),
+            ],
+            edges: vec![
+                ctx_edge("e1", "planner", "plan-node"),
+                ctx_edge("e2", "plan-node", "builder"),
+            ],
+        },
+        HashMap::new(),
+        HashMap::new(),
+        TriggerContext {
+            issue_id: Some("child".to_string()),
+            project_id: "project".to_string(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    )
+    .to_json()
+    .unwrap()
+    .replace('\'', "''");
+    db.execute_script(&format!(
+        "
+        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+          VALUES('child-exec','planbuild','child','project','running',1,1,'{snapshot}');
+        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
+                         uri_segment, node_name, created_at, updated_at)
+          VALUES('child-planner','child-exec','planner','project','child','running',
+                 'planner','Planner',1,1);
+        INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at)
+          VALUES('child-plan-run','project','child','child-planner','complete',1,1);
+        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
+                          created_at, ended_at, updated_at)
+          VALUES('child-plan-turn','child-plan-session','child-plan-run','child-planner',1,
+                 'complete','initial',1,2,2);
+        INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
+                              output_name, created_at, updated_at)
+          VALUES('child-plan','child-planner','plan',0,'{{}}',1,'plan',1,1);
+        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
+                         uri_segment, node_name, created_at, updated_at)
+          VALUES('child-builder','child-exec','builder','project','child','pending',
+                 'builder','Builder',1,1);
+        "
+    ))
+    .await
+    .unwrap();
+}
+
+/// Poll for the pushes under `key`. The review-readiness hook is detached from
+/// the recompute sweep, so the wake lands shortly after `recompute_job` returns.
+async fn await_push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
+    for _ in 0..100 {
+        let rows = push_rows(db, key).await;
+        if !rows.is_empty() {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no attention push was created for {key} within the wait window");
 }
 
 async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
@@ -238,6 +392,68 @@ async fn settled_child_review_wakes_idle_coordinator_while_checks_are_running() 
         push_rows(&db, &format!("review:{CHILD_URI}")).await.len(),
         1,
         "later check completion must not duplicate an unchanged review"
+    );
+}
+
+/// A child reaching a confirmation gate must wake its coordinator (CAIRN-3347).
+///
+/// The planner writes its plan and its turn ends; the recompute sweep derives
+/// **Blocked** (plan present, unconfirmed, `user` confirm policy) and the
+/// review-readiness hook must treat that transition as settling. Before the fix
+/// the hook only reacted to `Complete`/`Failed`/`Idle`, so every plan gate was
+/// silent: no push was minted for anyone, and coordinators slept through the one
+/// event they exist to arbitrate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_plan_gate_wakes_idle_coordinator() {
+    let (temp, db) = common::migrated_db().await;
+    seed_coordinator(&db, temp.path()).await;
+    seed_plan_gate_child(&db).await;
+    let db = Arc::new(db);
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+
+    // The production edge: the planner's turn has ended, so its status is
+    // recomputed. Nothing else is invoked — no check cadence, no PR.
+    cairn_core::internal::execution::advancement::recompute_job(&orch, "child-planner").unwrap();
+
+    assert_eq!(
+        common::scalar_text_by_id(&db, "SELECT status FROM jobs WHERE id=?1", "child-planner")
+            .await,
+        Some("blocked".to_string()),
+        "a written-but-unconfirmed plan under a user gate derives Blocked"
+    );
+
+    let rows = await_push_rows(&db, &format!("review:{CHILD_URI}")).await;
+    assert_eq!(rows.len(), 1, "one review wake per gated plan");
+    assert_eq!(rows[0].0, "coordinator");
+    assert_eq!(
+        rows[0].1, "wake",
+        "a gate blocks the child on the coordinator's judgment, so it rouses"
+    );
+
+    let content_ref = common::scalar_text_by_id(
+        &db,
+        "SELECT content_ref FROM attention_pushes WHERE recipient=?1 ORDER BY created_at DESC LIMIT 1",
+        "coordinator",
+    )
+    .await
+    .expect("the review push carries a content_ref");
+    assert!(
+        content_ref.ends_with("/planner/plan"),
+        "the coordinator is pointed at the plan awaiting its confirmation, got {content_ref}"
+    );
+
+    // The nudge trails push creation inside the same detached evaluation, so give
+    // it the same bounded window the push itself got.
+    for _ in 0..100 {
+        if recorder.spawn_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        recorder.spawn_count(),
+        1,
+        "the idle coordinator must actually be resumed, not merely have a row written"
     );
 }
 

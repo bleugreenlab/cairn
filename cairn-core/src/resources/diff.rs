@@ -1,6 +1,8 @@
 //! Layered node workspace diff resource.
 
-use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use cairn_common::query::QueryParam;
 use globset::GlobBuilder;
@@ -35,11 +37,12 @@ struct DiffRequest<'a> {
 
 #[derive(Debug)]
 struct DiffCoords {
-    worktree_path: Option<String>,
     execution_id: Option<String>,
     repo_path: String,
+    /// The branch this node's work merges into, as recorded by `base_branch`:
+    /// the parent issue's branch for a stacked child, the project default
+    /// otherwise. The live fork point is computed against its current head.
     base_branch: String,
-    base_commit: Option<String>,
     branch: Option<String>,
 }
 
@@ -66,6 +69,7 @@ struct CheckData {
 }
 
 enum DiffContentSource {
+    #[cfg(test)]
     Live {
         worktree: PathBuf,
     },
@@ -80,6 +84,7 @@ enum DiffContentSource {
 }
 
 enum DiffContentReader<'a> {
+    #[cfg(test)]
     Live {
         worktree: &'a Path,
     },
@@ -95,6 +100,7 @@ enum DiffContentReader<'a> {
 impl DiffContentSource {
     fn reader(&self) -> DiffContentReader<'_> {
         match self {
+            #[cfg(test)]
             Self::Live { worktree } => DiffContentReader::Live { worktree },
             Self::Archived {
                 repo_path,
@@ -119,6 +125,7 @@ impl DiffContentSource {
 impl DiffContentReader<'_> {
     fn read_path(&self, path: &str) -> Result<Vec<u8>, String> {
         match self {
+            #[cfg(test)]
             Self::Live { worktree } => {
                 let relative = Path::new(path);
                 if relative.as_os_str().is_empty()
@@ -139,7 +146,7 @@ impl DiffContentReader<'_> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn read_live_source_no_follow(worktree: &Path, relative: &Path) -> Result<Vec<u8>, String> {
     use std::ffi::CString;
     use std::fs::File;
@@ -211,7 +218,7 @@ fn read_live_source_no_follow(worktree: &Path, relative: &Path) -> Result<Vec<u8
     Err("invalid empty changed path".to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn read_live_source_no_follow(_worktree: &Path, _relative: &Path) -> Result<Vec<u8>, String> {
     Err("atomic no-follow live source reads are unavailable on this platform".to_string())
 }
@@ -220,7 +227,9 @@ struct DiffData {
     source_note: Option<String>,
     content_source: DiffContentSource,
     base_branch: String,
-    base_commit: Option<String>,
+    /// The commit this diff is rendered against: the live fork point of the
+    /// branch and its integration target, or an archived range's recorded base.
+    fork_point: Option<String>,
     current_revision: Option<String>,
     branch: Option<String>,
     commits_ahead: Option<i32>,
@@ -346,7 +355,7 @@ async fn load_diff_coords(
 ) -> Result<DiffCoords, String> {
     let mut rows = conn
         .query(
-            "SELECT j.worktree_path, j.execution_id, p.repo_path,
+            "SELECT j.execution_id, p.repo_path,
                     COALESCE(j.base_branch, p.default_branch, 'main'), j.branch
              FROM jobs j JOIN projects p ON j.project_id = p.id
              WHERE j.id = ?1 LIMIT 1",
@@ -359,140 +368,95 @@ async fn load_diff_coords(
         .await
         .map_err(|error| format!("Failed to load node diff coordinates: {error}"))?
         .ok_or_else(|| "Node diff coordinates were not found".to_string())?;
-    let worktree_path = row
+    let execution_id = row
         .opt_text(0)
         .ok()
         .flatten()
         .filter(|value| !value.is_empty());
-    let execution_id = row
-        .opt_text(1)
+    let branch = row
+        .opt_text(3)
         .ok()
         .flatten()
         .filter(|value| !value.is_empty());
-    let base_commit = match (&worktree_path, &execution_id) {
-        (Some(worktree), Some(execution)) => {
-            let mut anchors = conn
-                .query(
-                    "SELECT base_commit, pack_anchor FROM jobs
-                     WHERE execution_id = ?1 AND worktree_path = ?2
-                     ORDER BY created_at ASC LIMIT 1",
-                    (execution.as_str(), worktree.as_str()),
-                )
-                .await
-                .map_err(|error| format!("Failed to load node diff base anchor: {error}"))?;
-            anchors
-                .next()
-                .await
-                .map_err(|error| format!("Failed to load node diff base anchor: {error}"))?
-                .and_then(|anchor| {
-                    anchor
-                        .opt_text(1)
-                        .ok()
-                        .flatten()
-                        .or_else(|| anchor.opt_text(0).ok().flatten())
-                })
-                .filter(|value| !value.is_empty())
-        }
-        _ => None,
-    };
     Ok(DiffCoords {
-        worktree_path,
         execution_id,
         repo_path: row
-            .text(2)
+            .text(1)
             .map_err(|error| format!("Invalid node diff repo path: {error}"))?,
         base_branch: row
-            .text(3)
+            .text(2)
             .map_err(|error| format!("Invalid node diff base branch: {error}"))?,
-        base_commit,
-        branch: row
-            .opt_text(4)
-            .ok()
-            .flatten()
-            .filter(|value| !value.is_empty()),
+        branch,
     })
 }
 
 async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<DiffData> {
-    let worktree = PathBuf::from(coords.worktree_path.as_deref()?);
-    if !worktree.exists() || !crate::jj::is_jj_dir(&worktree) {
-        return None;
-    }
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let fork = crate::jj::resolve_node_fork_point(
-        &jj,
-        &worktree,
-        Some(&coords.base_branch),
-        coords.base_commit.as_deref(),
-    )?;
-    let patch = crate::jj::node_range_patch(
-        &jj,
-        &worktree,
-        Some(&coords.base_branch),
-        coords.base_commit.as_deref(),
-    )?;
-    let rows = crate::jj::parse_git_patch(&patch)
+    let branch = coords.branch.as_deref()?;
+    let repo = Path::new(&coords.repo_path);
+    let range =
+        match crate::diff::live_branch_range(&orch.config_dir, repo, branch, &coords.base_branch)
+            .await
+        {
+            Ok(range) => range,
+            Err(error) => {
+                log::debug!("node diff has no live range: {error}");
+                return None;
+            }
+        };
+    let (base, tip) = (range.base, range.tip);
+    let store = ObjectStore::new(repo, None).ok()?;
+    let patch = render_range_diff(&store, &base, &tip).ok()?;
+    let file_diffs = render_range_file_diffs(&store, &base, &tip).ok()?;
+    let rows = file_diffs
         .into_iter()
-        .map(|change| {
+        .map(|file| {
             (
-                change.path,
-                change.status,
-                Some(change.additions),
-                Some(change.deletions),
-                change.previous_path,
+                file.path,
+                file.status,
+                Some(file.additions as i32),
+                Some(file.deletions as i32),
+                file.previous_path,
             )
         })
         .collect::<Vec<_>>();
-    let dirty_paths = crate::jj::working_copy_dirty_paths(&jj, &worktree).unwrap_or_default();
-    let conflicted_files = crate::jj::conflicted_files(&jj, &worktree);
-    let range = format!("{fork}..@");
-    let conflicted_commits = crate::jj::conflicted_commits(&jj, &worktree, &range);
-    let commits = crate::jj::range_commits(&jj, &worktree, &fork)
+    let commits = list_range_commits(&store, &base, &tip)
         .unwrap_or_default()
         .into_iter()
         .map(|commit| DisplayCommit {
-            commit_id: commit.commit_id,
-            change_id: Some(commit.change_id),
-            description: commit.description,
+            commit_id: commit.sha,
+            change_id: None,
+            description: commit.summary,
             author: commit.author,
-            timestamp: commit.timestamp,
-            working_copy: commit.working_copy,
+            timestamp: commit.timestamp.to_string(),
+            working_copy: false,
         })
         .collect::<Vec<_>>();
-    let commits_ahead = commits.iter().filter(|commit| !commit.working_copy).count() as i32;
-    let current_revision = crate::jj::head_commit(&jj, &worktree)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let (marker_findings, marker_total) = scan_workspace_markers(&worktree, &rows, FINDING_CAP);
+    let (marker_findings, marker_total) = scan_added_lines(&patch, ScanKind::Marker, FINDING_CAP);
     let (whitespace_findings, whitespace_total) =
         scan_added_lines(&patch, ScanKind::Whitespace, FINDING_CAP);
+    let commits_ahead = count_commits_ahead(&store, &base, &tip);
     Some(DiffData {
         source_note: None,
-        content_source: DiffContentSource::Live {
-            worktree: worktree.clone(),
+        content_source: DiffContentSource::Archived {
+            repo_path: repo.to_path_buf(),
+            pack: None,
+            tip_sha: tip.clone(),
         },
         base_branch: coords.base_branch.clone(),
-        base_commit: Some(fork),
-        current_revision,
+        fork_point: Some(base),
+        current_revision: Some(tip),
         branch: coords.branch.clone(),
         commits_ahead: Some(commits_ahead),
         rows,
         patch: Some(patch),
         commits: Some(commits),
         check: CheckData {
-            workspace_state: if dirty_paths.is_empty() {
-                "clean".to_string()
-            } else {
-                format!("{} loose edited paths", dirty_paths.len())
-            },
-            dirty_paths,
-            conflicted_files,
-            conflicted_commits,
+            workspace_state: "runner logical head".to_string(),
             marker_findings,
             marker_total,
             whitespace_findings,
             whitespace_total,
+            ..CheckData::default()
         },
     })
 }
@@ -561,7 +525,7 @@ async fn load_archived_data(
         ),
         content_source,
         base_branch: coords.base_branch.clone(),
-        base_commit: Some(base.clone()),
+        fork_point: Some(base.clone()),
         current_revision: Some(tip.clone()),
         branch: coords.branch.clone(),
         commits_ahead: Some(commits_ahead),
@@ -593,7 +557,7 @@ async fn load_cache_data(
             reason: "legacy cache records changed paths and counts but no file content".to_string(),
         },
         base_branch: coords.base_branch.clone(),
-        base_commit: coords.base_commit.clone(),
+        fork_point: None,
         current_revision: None,
         branch: coords.branch.clone(),
         commits_ahead: None,
@@ -631,7 +595,7 @@ fn render_summary(
     out.push_str(&format!(
         "- Base: `{}` at `{}`\n",
         data.base_branch,
-        short(data.base_commit.as_deref())
+        short(data.fork_point.as_deref())
     ));
     out.push_str(&format!(
         "- Current: `@- {}`",
@@ -966,48 +930,6 @@ fn split_patch_sections(patch: &str) -> Vec<&str> {
         .collect()
 }
 
-fn scan_workspace_markers(
-    workspace: &Path,
-    rows: &[FileChangeRow],
-    cap: usize,
-) -> (Vec<LineFinding>, usize) {
-    let mut findings = Vec::new();
-    let mut total = 0;
-    for row in rows {
-        let path = workspace.join(&row.0);
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        if bytes.contains(&0) {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        let (file_findings, file_total) =
-            scan_conflict_markers(&row.0, &text, cap.saturating_sub(findings.len()));
-        total += file_total;
-        findings.extend(file_findings);
-    }
-    (findings, total)
-}
-
-fn scan_conflict_markers(path: &str, text: &str, cap: usize) -> (Vec<LineFinding>, usize) {
-    let mut findings = Vec::new();
-    let mut total = 0;
-    for (index, line) in text.lines().enumerate() {
-        if let Some(marker) = marker_at_line_start(line) {
-            total += 1;
-            if findings.len() < cap {
-                findings.push(LineFinding {
-                    path: path.to_string(),
-                    line: index + 1,
-                    detail: marker.to_string(),
-                });
-            }
-        }
-    }
-    (findings, total)
-}
-
 fn marker_at_line_start(line: &str) -> Option<&'static str> {
     ["<<<<<<<", "=======", ">>>>>>>"]
         .into_iter()
@@ -1086,7 +1008,7 @@ mod tests {
             source_note: None,
             content_source,
             base_branch: "main".to_string(),
-            base_commit: Some("0123456789abcdef".to_string()),
+            fork_point: Some("0123456789abcdef".to_string()),
             current_revision: Some("fedcba9876543210".to_string()),
             branch: Some("agent/CAIRN-42-builder".to_string()),
             commits_ahead: Some(1),
@@ -1438,32 +1360,152 @@ mod tests {
         assert!(scoped.contains("b/b.txt"));
     }
 
-    #[test]
-    fn marker_scanner_only_matches_line_start_and_binary_is_skipped() {
-        let (findings, total) = scan_conflict_markers(
-            "x.txt",
-            "<<<<<<< ours\nprefix =======\n=======\n>>>>>>> theirs\n",
-            100,
-        );
-        assert_eq!(total, 3);
-        assert_eq!(
-            findings
-                .iter()
-                .map(|finding| finding.line)
-                .collect::<Vec<_>>(),
-            vec![1, 3, 4]
-        );
+    /// The MCP resource seam over a real store, in the shape that inflated it:
+    /// the branch was cut from main@A, main advanced to B with unrelated landed
+    /// work, and the branch was then rebased onto B. The recorded branch-cut
+    /// coordinate now sits below that landed work; the rendered summary must
+    /// still be the branch's own single file.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn node_diff_resource_renders_only_the_branch_work_after_a_rebase() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            eprintln!(
+                "skipping node_diff_resource_renders_only_the_branch_work: jj not resolvable"
+            );
+            return;
+        };
+        let home = tempfile::tempdir().unwrap().keep();
+        let project = tempfile::tempdir().unwrap();
+        let workspaces = tempfile::tempdir().unwrap();
+        crate::jj::tests::init_project(project.path());
+        let jj = crate::jj::JjEnv::resolve(&bin, &home);
+        let store = crate::jj::project_store_dir(&home, project.path());
+        crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
+        let branch = "agent/CAIRN-3150-builder";
 
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("binary"), b"\0<<<<<<< nope").unwrap();
-        let rows = vec![(
-            "binary".to_string(),
-            "modified".to_string(),
-            None,
-            None,
-            None,
-        )];
-        assert_eq!(scan_workspace_markers(temp.path(), &rows, 100).1, 0);
+        let node = workspaces.path().join("node");
+        crate::jj::add_workspace(&jj, &store, &node, branch, "main", None).unwrap();
+        std::fs::write(node.join("branch.rs"), "branch work\n").unwrap();
+        crate::jj::seal(&jj, &node, "branch work", None).unwrap();
+
+        let advancing = workspaces.path().join("advancing");
+        crate::jj::add_workspace(&jj, &store, &advancing, "agent/advance", "main", None).unwrap();
+        let bulk: String = (0..400).map(|line| format!("landed {line}\n")).collect();
+        std::fs::write(advancing.join("unrelated.rs"), bulk).unwrap();
+        crate::jj::seal(&jj, &advancing, "unrelated landed work", None).unwrap();
+        let advanced = crate::jj::head_commit(&jj, &advancing).unwrap();
+        jj.run(
+            &store,
+            &[
+                "bookmark",
+                "set",
+                "main",
+                "-r",
+                &advanced,
+                "--allow-backwards",
+            ],
+            "advance main under a live branch",
+        )
+        .unwrap();
+        jj.run(
+            &store,
+            &[
+                "rebase",
+                "-b",
+                branch,
+                "-d",
+                "main",
+                "--ignore-working-copy",
+            ],
+            "rebase the branch onto the advanced base",
+        )
+        .unwrap();
+
+        let orch = diff_orchestrator(home).await;
+        seed_node(&orch, project.path().to_str().unwrap(), branch).await;
+
+        let summary = read_node_diff(&orch, "P", 1, 1, "builder", &[]).await;
+        assert!(
+            summary.contains("**1 files, +1 -0**"),
+            "the summary must be the branch's own work, not the base's landed traffic: {summary}"
+        );
+        assert!(summary.contains("branch.rs"), "{summary}");
+        assert!(!summary.contains("unrelated.rs"), "{summary}");
+
+        // File-scoped patch content is unaffected by the base change.
+        let params = parse_query_params("view=patch&file=branch.rs").unwrap();
+        let patch = read_node_diff(&orch, "P", 1, 1, "builder", &params).await;
+        assert!(patch.contains("+branch work"), "{patch}");
+        assert!(!patch.contains("unrelated.rs"), "{patch}");
+    }
+
+    async fn diff_orchestrator(config_dir: std::path::PathBuf) -> Orchestrator {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use std::sync::Arc;
+
+        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("diff.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        OrchestratorBuilder::new(db, Arc::new(TestServicesBuilder::new().build()), config_dir)
+            .build()
+    }
+
+    /// Seed the project → issue → execution → job chain the `/diff` resource
+    /// resolves through, with `main` as the node's integration target.
+    async fn seed_node(orch: &Orchestrator, repo_path: &str, branch: &str) {
+        let repo_path = repo_path.to_string();
+        let branch = branch.to_string();
+        orch.db
+            .local
+            .write(move |conn| {
+                let repo_path = repo_path.clone();
+                let branch = branch.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                         VALUES ('proj','ws','p','P',?1,'main',1,1)",
+                        (repo_path.as_str(),),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+                         VALUES ('issue','proj',1,'Diff','active',1,1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                         VALUES ('exec','r','issue','proj','running',1,1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment,
+                                          branch, base_branch, status, created_at, updated_at)
+                         VALUES ('job','exec','issue','proj','Builder','builder',?1,'main','running',1,1)",
+                        (branch.as_str(),),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
     }
 
     #[test]

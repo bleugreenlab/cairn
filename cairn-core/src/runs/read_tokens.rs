@@ -160,6 +160,34 @@ fn is_batch_truncated(line: &str) -> bool {
     line.starts_with("--- batch truncated: ") && line.ends_with(" ---")
 }
 
+/// The markdown reference the read composer appends for a promoted image
+/// (`storage::render::image_reference_trailer`): a whole line that is exactly one
+/// markdown image whose target is a stored image. Requiring the whole line keeps
+/// ordinary prose containing a markdown image link from being mistaken for one,
+/// and the URI itself is recognized by the canonical parser rather than a second
+/// spelling of the URI grammar here.
+fn image_reference_line_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^!\[[^\]]*\]\(([^)\s]+)\)$").expect("image reference regex compiles")
+    })
+}
+
+/// The durable image this section's read promoted, when it read one. Lifted onto
+/// the segment metadata because the list projection strips read bodies: without
+/// it a read row has no way to render the image it just made durable.
+fn stored_image_uri(body: &str) -> Option<String> {
+    image_reference_line_re()
+        .captures_iter(body)
+        .map(|caps| caps[1].to_string())
+        .find(|uri| {
+            matches!(
+                cairn_common::uri::parse_uri(uri),
+                Some(cairn_common::uri::CairnResource::ProjectImage { .. })
+            )
+        })
+}
+
 /// Mirror of the frontend `extractOutput` for the cases a read body hits: an
 /// MCP `[{type:"text", text}]` array is unwrapped and joined; anything else
 /// (the common composed-batch text) is returned as-is.
@@ -193,19 +221,20 @@ pub(crate) fn read_segment_tokens(
     expected: &[String],
 ) -> Vec<ReadSegmentTokens> {
     let output = extract_output(result_body);
-    if !is_framed(&output, expected) {
-        return vec![ReadSegmentTokens {
+    let whole = || {
+        vec![ReadSegmentTokens {
             target: expected.first().cloned().unwrap_or_default(),
             tokens: count_tokens(&output) as i64,
-        }];
+            image_uri: stored_image_uri(&output),
+        }]
+    };
+    if !is_framed(&output, expected) {
+        return whole();
     }
 
     let sections = split_framed_sections(&output, expected);
     if sections.is_empty() {
-        return vec![ReadSegmentTokens {
-            target: expected.first().cloned().unwrap_or_default(),
-            tokens: count_tokens(&output) as i64,
-        }];
+        return whole();
     }
 
     let positional = !expected.is_empty() && sections.len() == expected.len();
@@ -225,6 +254,7 @@ pub(crate) fn read_segment_tokens(
             ReadSegmentTokens {
                 target,
                 tokens: count_tokens(&body) as i64,
+                image_uri: stored_image_uri(&body),
             }
         })
         .collect()
@@ -344,6 +374,38 @@ mod tests {
         let segs = read_segment_tokens(body, &["file:a.rs".into()]);
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].target, "file:a.rs");
+    }
+
+    const STORED: &str =
+        "cairn://p/CAIRN/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn image_reference_is_lifted_onto_the_segment_that_read_it() {
+        // The list projection strips read bodies, so the reference has to reach
+        // the row through the segment metadata or the image is invisible again.
+        let body =
+            format!("=== file:a.rs ===\nfn a() {{}}\n=== file:plot.png ===\n![plot.png]({STORED})");
+        let segs = read_segment_tokens(&body, &["file:a.rs".into(), "file:plot.png".into()]);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].image_uri, None);
+        assert_eq!(segs[1].image_uri.as_deref(), Some(STORED));
+    }
+
+    #[test]
+    fn unframed_single_image_read_carries_its_reference() {
+        let segs = read_segment_tokens(&format!("![fig.png]({STORED})"), &["file:fig.png".into()]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].image_uri.as_deref(), Some(STORED));
+    }
+
+    #[test]
+    fn a_markdown_image_in_file_content_is_not_a_durable_reference() {
+        // Reading a README full of markdown image links must not make the row
+        // claim it read an image; only the anchored stable-URI shape counts.
+        let body =
+            "=== file:README.md ===\n![logo](docs/logo.png)\n![remote](https://example.com/x.png)";
+        let segs = read_segment_tokens(body, &["file:README.md".into()]);
+        assert_eq!(segs[0].image_uri, None);
     }
 
     #[test]

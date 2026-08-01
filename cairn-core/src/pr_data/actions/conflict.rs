@@ -204,16 +204,16 @@ mod tests {
         std::fs::write(store.join("shared.rs"), "integration-advanced\n").unwrap();
         jj_cfg(&store, &["describe", "-m", "advance"]);
         jj_cfg(&store, &["bookmark", "set", int, "-r", "@"]);
-        crate::jj::reconcile_siblings(
-            &jj,
+        crate::jj::reconcile_siblings(&jj, &store, int, &[clean.to_string()]).unwrap();
+        // The overlapping sibling's conflicted commit is built with a raw rebase.
+        // A Cairn reconcile no longer produces one — it rolls a conflicting rebase
+        // back — but this READ-side gate still has to report on branches that
+        // carry conflicted commits from older stores or from `jj` run outside
+        // Cairn, which is exactly the shape being constructed here.
+        jj_cfg(
             &store,
-            int,
-            &[
-                (overlap.to_string(), ws_o.clone()),
-                (clean.to_string(), ws_c.clone()),
-            ],
-        )
-        .unwrap();
+            &["rebase", "-b", overlap, "-o", int, "--ignore-working-copy"],
+        );
 
         let proj_path = proj.path().to_string_lossy().to_string();
         let report = source_conflict_report(&bin, home.path(), &proj_path, overlap, Some(int))

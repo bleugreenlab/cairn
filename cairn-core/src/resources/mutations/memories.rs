@@ -60,7 +60,16 @@ fn parse_triage_action(raw: &str) -> Result<MemoryTriageDecision, String> {
         .map_err(|_| "payload.action must be one of promote, discard, defer".to_string())
 }
 
-fn parse_deferred_scope(
+/// Parse and resolve `payload.newScope` for a `defer` decision.
+///
+/// A project defer's stored value must be a `projects.id`: applying the decision
+/// writes it to both the memory's `scope_value` (a project pool is keyed by id)
+/// and its `project_id`, which is an enforced foreign key. Agents name projects by
+/// key (`CAIRN`), so a key is resolved here and a reference naming no project is
+/// rejected at the crossing — rather than becoming a row that only fails, much
+/// later, when the merged batch tries to finalize (CAIRN-3289).
+async fn parse_deferred_scope(
+    db: &crate::storage::LocalDb,
     payload: &serde_json::Value,
 ) -> Result<(Option<MemoryScope>, Option<String>), String> {
     let Some(new_scope) = payload.get("newScope").or_else(|| payload.get("new_scope")) else {
@@ -85,10 +94,19 @@ fn parse_deferred_scope(
             MemoryScope::Workspace => Some("workspace".to_string()),
             _ => None,
         });
-    if value.is_none() {
+    let Some(value) = value else {
         return Err("payload.newScope.value is required for project and role defers".to_string());
-    }
-    Ok((Some(scope), value))
+    };
+    let value = match scope {
+        MemoryScope::Project => crate::memories::db::project_id_for_reference(db, &value)
+            .await
+            .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!("payload.newScope.value '{value}' does not name a project (use its project key, e.g. CAIRN)")
+        })?,
+        MemoryScope::Role | MemoryScope::Workspace => value,
+    };
+    Ok((Some(scope), Some(value)))
 }
 
 /// Build the provenance URI for the turn that is currently executing this write.
@@ -278,7 +296,7 @@ pub(super) async fn apply_memory_triage_action(
     }
 
     let (deferred_scope, deferred_scope_value) = if decision == MemoryTriageDecision::Defer {
-        parse_deferred_scope(payload)?
+        parse_deferred_scope(&orch.db.local, payload).await?
     } else {
         (None, None)
     };
@@ -309,4 +327,96 @@ pub(super) async fn apply_memory_triage_action(
         format!("Recorded {decision} decision for memory at {memory_uri}"),
         promoted,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_deferred_scope;
+    use crate::models::MemoryScope;
+    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use serde_json::json;
+
+    async fn db_with_project() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("defer-scope-test.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) \
+             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    /// Agents name projects by key, and the stored value becomes the memory's
+    /// `project_id` — an enforced foreign key. The key is resolved to the id here,
+    /// at the crossing, instead of failing when the batch finalizes (CAIRN-3289).
+    #[tokio::test]
+    async fn project_defer_stores_the_project_id_for_a_key() {
+        let db = db_with_project().await;
+
+        let (scope, value) = parse_deferred_scope(
+            &db,
+            &json!({"newScope": {"scope": "project", "value": "PRJ"}}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scope, Some(MemoryScope::Project));
+        assert_eq!(value.as_deref(), Some("project-1"));
+    }
+
+    #[tokio::test]
+    async fn project_defer_rejects_a_value_that_names_no_project() {
+        let db = db_with_project().await;
+
+        let error = parse_deferred_scope(
+            &db,
+            &json!({"newScope": {"scope": "project", "value": "NOPE"}}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("does not name a project"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn role_and_workspace_defers_keep_their_own_scope_values() {
+        let db = db_with_project().await;
+
+        let (scope, value) = parse_deferred_scope(
+            &db,
+            &json!({"newScope": {"scope": "role", "value": "builder"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scope, Some(MemoryScope::Role));
+        assert_eq!(value.as_deref(), Some("builder"));
+
+        let (scope, value) =
+            parse_deferred_scope(&db, &json!({"newScope": {"scope": "workspace"}}))
+                .await
+                .unwrap();
+        assert_eq!(scope, Some(MemoryScope::Workspace));
+        assert_eq!(value.as_deref(), Some("workspace"));
+    }
+
+    #[tokio::test]
+    async fn a_held_defer_records_no_scope() {
+        let db = db_with_project().await;
+
+        let (scope, value) = parse_deferred_scope(&db, &json!({"reason": "not yet"}))
+            .await
+            .unwrap();
+
+        assert_eq!(scope, None);
+        assert_eq!(value, None);
+    }
 }

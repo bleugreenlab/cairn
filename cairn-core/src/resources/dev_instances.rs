@@ -1,8 +1,9 @@
 //! Resolve and introspect running `dev:instance`s for the `cairn://dev`
 //! collection (`cairn://dev/db` and `cairn://dev/pid`).
 //!
-//! `bun run dev:instance` (scripts/dev-instance.ts) launches a branch-keyed dev
-//! build whose home is `~/.cairn-dev-<key>` (key = slugified branch), database at
+//! `bun run dev:instance` is an attached client of a runner-resolved,
+//! executor-materialized immutable branch head. A branch-keyed instance keeps its
+//! persistent home at `~/.cairn-dev-<key>` (key = slugified branch), database at
 //! `<home>/cairn.db`, and — since the runner-daemon cutover — a `cairn-runner`
 //! that owns that database and hosts the `/api/mcp` callback route on the runner
 //! transport port `3849 + slot`, where the slot is persisted per branch in
@@ -67,7 +68,7 @@ pub(crate) enum ResolveError {
 impl ResolveError {
     pub fn message(&self) -> String {
         match self {
-            ResolveError::NoInstances => "No dev instance is registered. Launch one from a worktree with `bun run dev:instance`, then query it with cairn://dev/db?sql=<read-only SQL>.".to_string(),
+            ResolveError::NoInstances => "No dev instance is registered. Launch one with `bun run dev:instance`, then query it with cairn://dev/db?sql=<read-only SQL>.".to_string(),
             ResolveError::NotFound { selector, available } => {
                 if available.is_empty() {
                     format!("No dev instance matches '{selector}', and none are registered. Launch one with `bun run dev:instance --branch {selector}`.")
@@ -283,7 +284,7 @@ pub(crate) async fn query_db(
         .await
         .map_err(|error| {
             format!(
-                "Dev instance '{}' is not reachable on runner port {} ({error}). Start it from its worktree with `bun run dev:instance`, or pick another with cairn://dev/db?at=<key>.",
+                "Dev instance '{}' is not reachable on runner port {} ({error}). Start it with `bun run dev:instance`, or pick another with cairn://dev/db?at=<key>.",
                 instance.key, instance.runner_port
             )
         })?;
@@ -422,10 +423,12 @@ pub(crate) async fn render_collection() -> String {
     let (live, stopped) = partition_live().await;
     let mut lines = Vec::new();
     if live.is_empty() && stopped == 0 {
-        lines.push("No dev instances are registered. Launch one from a worktree with `bun run dev:instance`.".to_string());
+        lines.push(
+            "No dev instances are registered. Launch one with `bun run dev:instance`.".to_string(),
+        );
     } else if live.is_empty() {
         lines.push(format!(
-            "No dev instances are running ({stopped} registered but stopped). Start one from its worktree with `bun run dev:instance`."
+            "No dev instances are running ({stopped} registered but stopped). Start one with `bun run dev:instance`."
         ));
     } else {
         lines.push(format!(
@@ -455,11 +458,11 @@ pub(crate) async fn render_collection() -> String {
 pub(crate) async fn render_listing() -> String {
     let (live, stopped) = partition_live().await;
     if live.is_empty() && stopped == 0 {
-        return "No dev instances are registered. Launch one from a worktree with `bun run dev:instance`, then query it with cairn://dev/db?sql=<read-only SQL>.".to_string();
+        return "No dev instances are registered. Launch one with `bun run dev:instance`, then query it with cairn://dev/db?sql=<read-only SQL>.".to_string();
     }
     if live.is_empty() {
         return format!(
-            "No dev instances are running ({stopped} registered but stopped). Start one from its worktree with `bun run dev:instance`, then query cairn://dev/db?sql=<read-only SQL>."
+            "No dev instances are running ({stopped} registered but stopped). Start one with `bun run dev:instance`, then query cairn://dev/db?sql=<read-only SQL>."
         );
     }
     let mut lines = vec![format!(
@@ -488,7 +491,7 @@ pub(crate) async fn render_listing() -> String {
 pub(crate) async fn render_pids(selector: Option<&str>) -> String {
     let instances = discover_instances();
     if instances.is_empty() {
-        return "No dev instance is registered. Launch one from a worktree with `bun run dev:instance`, then read cairn://dev/pid.".to_string();
+        return "No dev instance is registered. Launch one with `bun run dev:instance`, then read cairn://dev/pid.".to_string();
     }
     if let Some(sel) = selector {
         return match select_by_key(instances, sel) {
@@ -503,7 +506,7 @@ pub(crate) async fn render_pids(selector: Option<&str>) -> String {
         .collect();
     if live.is_empty() {
         return format!(
-            "No dev instances are running ({} registered but stopped). Start one from its worktree with `bun run dev:instance`, then read cairn://dev/pid.",
+            "No dev instances are running ({} registered but stopped). Start one with `bun run dev:instance`, then read cairn://dev/pid.",
             instances.len()
         );
     }

@@ -1,6 +1,6 @@
 //! `build_*` URI constructors and the `CairnResource::to_uri` serializer.
 
-use super::types::{CairnResource, PROJECT_SCOPE};
+use super::types::{CairnResource, ImageRef, PROJECT_SCOPE};
 
 pub(super) fn canonical_project(project: &str) -> String {
     project.to_uppercase()
@@ -8,6 +8,50 @@ pub(super) fn canonical_project(project: &str) -> String {
 
 pub fn build_project_uri(project: &str) -> String {
     format!("cairn://{}/{}", PROJECT_SCOPE, canonical_project(project))
+}
+
+/// The public URI for a stored image, in whichever form addresses it.
+///
+/// The friendly forms carry their own scope, so they render as themselves
+/// everywhere; only the legacy hash form needs a display substitute.
+pub fn build_project_image_uri(project: &str, reference: &ImageRef) -> String {
+    let base = build_project_uri(project);
+    match reference {
+        ImageRef::Issue { number, ordinal } => format!("{base}/{number}/images/{ordinal}"),
+        ImageRef::Project { ordinal } => format!("{base}/images/{ordinal}"),
+        ImageRef::Hash(hash) => format!("{base}/images/{hash}"),
+    }
+}
+
+/// The collection of images minted in one scope. Its members are exactly
+/// `‹this›/1..N`, so an agent can construct a member address from the collection
+/// and vice versa without a lookup.
+pub fn build_project_images_uri(project: &str, issue: Option<i32>) -> String {
+    let base = build_project_uri(project);
+    match issue {
+        Some(number) => format!("{base}/{number}/images"),
+        None => format!("{base}/images"),
+    }
+}
+
+/// The friendly URI for an image minted inside an issue's world.
+pub fn build_issue_image_uri(project: &str, number: i32, ordinal: i32) -> String {
+    build_project_image_uri(project, &ImageRef::Issue { number, ordinal })
+}
+
+/// The friendly URI for an image minted with no issue context.
+pub fn build_project_image_ordinal_uri(project: &str, ordinal: i32) -> String {
+    build_project_image_uri(project, &ImageRef::Project { ordinal })
+}
+
+/// The permalink URI for a stored image addressed by its content hash. Only
+/// immutable history writes this form; nothing mints it.
+pub fn build_project_image_hash_uri(project: &str, hash: &str) -> String {
+    build_project_image_uri(project, &ImageRef::Hash(hash.to_string()))
+}
+
+pub fn build_project_check_results_uri(project: &str, revision: &str) -> String {
+    format!("{}/check-results/{}", build_project_uri(project), revision)
 }
 
 pub fn build_project_issues_uri(project: &str) -> String {
@@ -593,6 +637,13 @@ impl CairnResource {
         match self {
             Self::Project { project } => build_project_uri(project),
             Self::ProjectIssues { project } => build_project_issues_uri(project),
+            Self::ProjectCheckResults { project, revision } => {
+                build_project_check_results_uri(project, revision)
+            }
+            Self::ProjectImages { project, issue } => build_project_images_uri(project, *issue),
+            Self::ProjectImage { project, reference } => {
+                build_project_image_uri(project, reference)
+            }
             Self::Issue { project, number } => build_issue_uri(project, *number),
             Self::Node {
                 project,
@@ -894,6 +945,12 @@ impl CairnResource {
                 exec_seq,
                 node_id,
             } => build_node_diff_uri(project, *number, *exec_seq, node_id),
+            Self::NodeRebase {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_subresource_uri(project, *number, *exec_seq, node_id, "rebase"),
             Self::ProjectTerminal { project, slug } => build_project_terminal_uri(project, slug),
             Self::ProjectBrowser { project, slug } => build_project_browser_uri(project, slug),
             Self::ProjectBrowserNetworkRequest {
@@ -916,6 +973,8 @@ impl CairnResource {
             Self::DevDb => "cairn://dev/db".to_string(),
             Self::DevPid => "cairn://dev/pid".to_string(),
             Self::Logs => "cairn://logs".to_string(),
+            Self::Executors => "cairn://executors".to_string(),
+            Self::Executor { name } => format!("cairn://executors/{name}"),
             Self::Bug => "cairn://bug".to_string(),
             Self::Help => "cairn://help".to_string(),
             Self::WebSearch => "cairn://websearch".to_string(),

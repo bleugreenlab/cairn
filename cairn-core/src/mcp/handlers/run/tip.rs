@@ -57,10 +57,8 @@ fn tip_for_command(command: &str) -> Option<&'static str> {
                     return Some(PYTHON_TIP);
                 }
             }
-            "bun" | "node" => {
-                if next == "-e" {
-                    return Some(TS_TIP);
-                }
+            "bun" | "node" if next == "-e" => {
+                return Some(TS_TIP);
             }
             _ => {}
         }

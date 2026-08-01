@@ -2,17 +2,19 @@
 //! (`write`/`read`/`run`), the HTTP callback plumbing, and the `ServerHandler`
 //! implementation (tool listing, resource reads).
 use rmcp::{
-    handler::server::tool::{Parameters, ToolCallContext, ToolRouter},
+    handler::server::{
+        tool::{ToolCallContext, ToolRouter},
+        wrapper::Parameters,
+    },
     model::{
-        CallToolRequestParam, CallToolResult, Content, Implementation, ListToolsResult,
-        PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam, ReadResourceResult,
-        ResourceContents, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool, tool_router, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
-use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use cairn_common::protocol::{CallbackRequest, CallbackResponse};
@@ -30,9 +32,9 @@ use crate::timeouts::callback_timeout;
 #[derive(Clone)]
 pub(crate) struct CairnCmd {
     callback_url: Arc<String>,
-    /// Current working directory - used by backend to identify the active run
+    /// Process residence forwarded for diagnostics and explicit host operations.
     pub(crate) cwd: Arc<String>,
-    /// Run ID - preferred method to identify the active run (avoids cwd ambiguity)
+    /// Authenticated run identity for project-scoped agent operations.
     pub(crate) run_id: Option<Arc<String>>,
     /// Shared secret (base64-encoded string from env var, sent directly as bearer token)
     mcp_secret: Option<Arc<String>>,
@@ -102,7 +104,7 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
     pub(crate) async fn write(
         &self,
         params: Parameters<ChangeInput>,
-        meta: rmcp::model::Meta,
+        meta: rmcp::model::RequestMetaObject,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
         // Pooled Codex call (CAIRN-2549): Codex injects the originating thread as
@@ -131,12 +133,12 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
         if !validation_errors.is_empty() {
             let text =
                 cairn_common::change_validation::render_validation_errors(&validation_errors);
-            return Ok(CallToolResult::success(vec![Content::text(text)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
         }
 
         let rewritten = match self.rewrite_change_targets_with(&input, pooled) {
             Ok(rewritten) => rewritten,
-            Err(message) => return Ok(CallToolResult::success(vec![Content::text(message)])),
+            Err(message) => return Ok(CallToolResult::success(vec![ContentBlock::text(message)])),
         };
 
         let request = CallbackRequest {
@@ -158,17 +160,19 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
 
     /// Read one or more files, directories, or Cairn resources in a single call.
     #[tool(
-        description = r#"Read one or more files, directories, or Cairn resources in a single call. `paths` is an ordered, non-empty array of target URIs; results return in order, each under a `=== <uri> [suffix] ===` header (the optional bracketed suffix is a terse count drawn from a small closed vocabulary: `lines A–B of T`, `N matches[ in M files]`, `M files`, or `truncated`).
+        description = r#"Read one or more files, directories, or Cairn resources in a single call. `paths` is an ordered, non-empty array of target URIs; results return in order, each under a `=== <uri> [suffix] ===` header.
 
 Targets (mix freely within one call):
 - File: `file:` (worktree root), `file:src/lib.rs` (worktree-relative), `file:/abs/path` (absolute / global)
 - Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` plus collections `/issues`, `/messages`, issue `/changed`, node `/diff`, `/references`, and `/references/NAME`. `cairn:~/...` resolves against the run home.
-- Web/PDF: `http(s)://...` URLs and local `.pdf` paths return markdown via the active web-fetch provider (raw capped markdown; no extraction prompt). The default built-in provider is a plain HTTP fetch (HTML→markdown); PDF extraction needs a configured provider such as `bmd`. Providers are configured in Settings → Web Services.
-- Web search: `cairn://websearch?q=QUERY` runs the query through the active web-search provider (configured in Settings → Web Services) and returns ranked results as markdown; everything after `q=` is the literal query, so spaces are fine.
+- Web/PDF: `http(s)://...` URLs and local `.pdf` paths return markdown via the active web-fetch provider (the built-in default is a plain HTTP fetch; PDF extraction needs a configured provider such as `bmd`).
+- Web search: `cairn://websearch?q=QUERY` runs the query through the active web-search provider and returns ranked results as markdown; everything after `q=` is the literal query, so spaces are fine.
+- Fleet: `cairn://executors` lists every machine enrolled with this runner by the public name that addresses it, and `cairn://executors/{name}` shows one machine in full — platform, toolchains, link and build state, timestamped placement telemetry (or a named gap where a reading is unavailable), admission and queues, and the work resident on it. These names are exactly what the run tool's `executor` selector accepts, so what you can read is what you can target. Served from cached fleet state; a read never probes a machine.
+- Images: reading an image (an image file, `cairn:~/browser?screenshot`, a stored image URI) shows it to BOTH of you in one step — you see the image, and a durable `![label](cairn://p/PROJECT/ISSUE/images/N)` reference renders in the transcript; paste that reference into a message, issue, or artifact to carry the image forward. Image addresses are ordinal and scoped, so `images/4` addresses a sibling directly and reading `cairn://p/PROJECT/ISSUE/images` lists an issue's images.
 
 Per-target scoping rides in each URI's query string — append `?key=value&...`:
 - Files: `offset=N` skips N leading lines (0-based — line N is at `offset N−1`); `limit=N` returns N lines; `offset=-N` returns the last N lines (tail). `branch=REF` reads file content from a jj-resolved bookmark, commit/change id, or node URI without checking out that branch; it is per-target only and applies only to `file:` targets. `glob=PATTERN` selects matched files (`output_mode=files_with_matches|content|count`; a directory grep defaults to `files_with_matches`, a single-file grep to `content`). `issue_history=true|verbose` appends issues that touched the file.
-- Grep is universal: `grep=REGEX` matches over ANY target's rendered text. A file tree greps with ripgrep and labels each line `path:N:text`; a single file or any rendered resource/web body greps in memory and drops the path prefix (`N:text`). Modifiers: `-i` (case-insensitive), `-A=N`/`-B=N`/`-C=N`/`context=N` (context lines), `head_limit=N` to cap matches (`limit=N` aliases it under grep). `offset` is NOT allowed with grep — paginate matches with `head_limit`. The header suffix counts real matches: `[N matches]` for one body, `[N matches in M files]` for a tree.
+- Grep is universal: `grep=REGEX` matches over ANY target's rendered text. A file tree greps with ripgrep and labels each line `path:N:text`; a single file or any rendered resource/web body greps in memory and drops the path prefix (`N:text`). Modifiers: `-i` (case-insensitive), `-A=N`/`-B=N`/`-C=N`/`context=N` (context lines), `head_limit=N` to cap matches (`limit=N` aliases it under grep). `offset` is NOT allowed with grep — paginate matches with `head_limit`.
 - Structural code: `ast=PATTERN` runs an ast-grep pattern over any file/dir target and renders the same `path:N:line` rows as grep (composes with `glob`). A pattern is real code with metavariables — `$VAR` matches one node, `$$$` a run — e.g. `ast=fn $NAME($$$) { $$$ }` (Rust) or `ast=console.log($$$)` (TS); it is NOT a tree-sitter node-kind name like `function_declaration`. `outline` (bare flag) renders a file/dir signature skeleton. Symbol navigation lives on the `symbols` resource: `cairn://p/PROJECT/NUMBER/EXEC/NODE/symbols/{name}?op=definition|references|callers|implementations` (node-scoped) or `cairn://p/PROJECT/symbols/{name}` (project-checkout fallback); absent `op` is an overview (definition site + signature + reference count), `in=GLOB` scopes it.
 - Escaping: `&` and `+` are literal inside a value (so `grep=&mut self` and `grep=\d+` work as written); use `%26` for a literal `&` that immediately precedes a recognized key token
 - Resources: `offset=N` skips rendered resource lines client-side; `limit=N` is resource-specific unless reading a single transcript event, where it is a client-side line count
@@ -182,13 +186,13 @@ Partial failures never abort: a target that errors shows its message inline as t
     pub(crate) async fn read(
         &self,
         params: Parameters<ReadFileInput>,
-        meta: rmcp::model::Meta,
+        meta: rmcp::model::RequestMetaObject,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
         let thread_id = Self::thread_id_from_meta(&meta);
         let pooled = thread_id.is_some();
         if input.paths.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "read requires a non-empty `paths` array (one or more target URIs).".to_string(),
             )]));
         }
@@ -228,7 +232,7 @@ Partial failures never abort: a target that errors shows its message inline as t
             Ok(envelope) => envelope,
             Err(_) => {
                 // Transport/parse failure: surface the raw result as text.
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     self.relativize_cairn_uris_in_text(&outcome.result),
                 )]));
             }
@@ -236,10 +240,10 @@ Partial failures never abort: a target that errors shows its message inline as t
         let text = self.relativize_cairn_uris_in_text(&envelope.text);
         let text = assemble_reminders(text, &outcome.reminders);
 
-        let mut blocks: Vec<Content> = Vec::with_capacity(1 + envelope.images.len());
-        blocks.push(Content::text(text));
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
+        blocks.push(ContentBlock::text(text));
         for image in envelope.images {
-            blocks.push(Content::image(image.data, image.mime_type));
+            blocks.push(ContentBlock::image(image.data, image.mime_type));
         }
         Ok(CallToolResult::success(blocks))
     }
@@ -248,18 +252,18 @@ Partial failures never abort: a target that errors shows its message inline as t
     /// invocations, synchronously. Parallel by default; `sequential: true` runs
     /// in order. Long-running terminals are managed by `write` on terminals.
     #[tool(
-        description = "Suspend this turn without polling with a sole wait item: `{waitFor:{duration:\"3m\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/tests\",on:\"exit\"}}`, or `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/dev\",on:\"output\",phrase:\"ready\"}}`. The pending run call resumes when the condition fires. Otherwise, execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (e.g. `{code:\"console.log(1)\", interpreter:\"typescript\"}`). Inline `code` is the default way to run code that isn't a CLI invocation: the interpreter execs the source directly, so there is no shell and no quoting. `typescript`/`ts` and `javascript`/`js` run via bun with the worktree `node_modules` and zero-config `@cairn/sdk` importable; `python`/`py` runs through the bundled `uv`, so a PEP 723 `# /// script` dependency block resolves into a cached environment and a worktree `pyproject.toml`/`uv.lock` project env is picked up automatically (falling back to plain `python3` when uv is absent); `matlab` runs a fresh `matlab -batch` process, with macOS application discovery when it is absent from PATH. Add `repl:<slug>` to an inline `code` item to evaluate it in a stateful REPL session — create it first with `write cairn:~/repl/<slug> {interpreter:python|typescript}` — so variables, imports, and defs persist across `run` calls (its state is lost if the REPL dies). Prefer inline code over wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`. Keep inline code synchronous and run-to-completion; long-running or background code belongs to terminal resources (and durable workflow scripts). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <header> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. `branch` resolves the ref to its head commit and runs the batch in a leased verdict-only build slot; it cannot be combined with `commit_msg`. Not for long-lived/background processes — use a terminal resource via `write` for those. Each item's `timeout` (ms, default 120000, max 600000) is honored by the host: when an item exceeds it, that item is terminated and its result block reports the timeout with whatever output it produced so far — the batch is never aborted with no output. Outer layers (the callback transport and the agent's own tool timeout) are sized strictly above the host budget, so a legal batch always runs to completion: sequential batches get the sum of per-item timeouts, parallel batches the max."
+        description = "Suspend this turn without polling with a sole wait item: `{waitFor:{duration:\"3m\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/tests\",on:\"exit\"}}`, or `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/dev\",on:\"output\",phrase:\"ready\"}}`. The pending run call resumes when the condition fires. Otherwise, execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (e.g. `{code:\"console.log(1)\", interpreter:\"typescript\"}`). Inline `code` is the default way to run code that isn't a CLI invocation: the interpreter execs the source directly, so there is no shell and no quoting. `typescript`/`ts` and `javascript`/`js` run via bun with the worktree `node_modules` and zero-config `@cairn/sdk` importable; `python`/`py` runs through the bundled `uv` (a PEP 723 `# /// script` dependency block resolves into a cached environment, and a worktree `pyproject.toml`/`uv.lock` project env is picked up automatically); `matlab` runs via `matlab -batch`. Add `repl:<slug>` to an inline `code` item to evaluate it in a stateful REPL session — create it first with `write cairn:~/repl/<slug> {interpreter:\"python\", deps:[\"pandas\"]}` — so variables, imports, and defs persist across `run` calls (its state is lost if the REPL dies). Prefer inline code over wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`. Keep inline code synchronous and run-to-completion; long-running or background code belongs to terminal resources (and durable workflow scripts). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <header> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — instead of your own, which is how you tell a real regression from a failure already on the base (`run({commands:[{command:\"bun run test\"}], branch:\"main\"})`); it is verdict-only, so tracked writes are discarded, and `commit_msg`, MCP, and REPL items are rejected. `executor` states which machine runs the batch — `{name:\"bglab-ub\"}` for one machine by its public name or `{os:\"linux\"}` for any machine on that platform, either optionally refined by `requiredToolchains`; `name` and `os` are mutually exclusive, and read `cairn://executors` for the names, platforms, and toolchains available. Omit it and the batch runs on the runner's own machine. Not for long-lived/background processes — use a terminal resource via `write` for those. One call in, one final result out: a batch runs to completion, and if it takes longer than 120 seconds this call suspends and resumes with the finished result rather than reporting progress. An item's `timeout` (ms) is a kill bound, not a call bound: the item terminates at the bound and its result block reports the timeout with whatever output it produced — the batch is never aborted with no output. Omitting it lets a shell, code, or skill-script item run to completion, capped only by the 6-hour ceiling on a batch (a command meant to keep running belongs in a terminal); an MCP-tool or REPL item is capped at the 120-second synchronous window."
     )]
     async fn run(
         &self,
         params: Parameters<RunInput>,
-        meta: rmcp::model::Meta,
+        meta: rmcp::model::RequestMetaObject,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
         let thread_id = Self::thread_id_from_meta(&meta);
 
         if let Err(msg) = validate_run_input(&input) {
-            return Ok(CallToolResult::error(vec![Content::text(msg)]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]));
         }
 
         let first = input
@@ -297,10 +301,10 @@ Partial failures never abort: a target that errors shows its message inline as t
                 }
             });
         let text = assemble_reminders(cap_run_result(&envelope.text), &outcome.reminders);
-        let mut blocks: Vec<Content> = Vec::with_capacity(1 + envelope.images.len());
-        blocks.push(Content::text(text));
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
+        blocks.push(ContentBlock::text(text));
         for image in envelope.images {
-            blocks.push(Content::image(image.data, image.mime_type));
+            blocks.push(ContentBlock::image(image.data, image.mime_type));
         }
         Ok(CallToolResult::success(blocks))
     }
@@ -311,7 +315,7 @@ impl CairnCmd {
     /// (CAIRN-2549). Codex injects it under the `"threadId"` key for every tool
     /// call from a pooled app-server thread; other callers send no such meta and
     /// this returns `None`.
-    fn thread_id_from_meta(meta: &rmcp::model::Meta) -> Option<String> {
+    fn thread_id_from_meta(meta: &rmcp::model::RequestMetaObject) -> Option<String> {
         meta.get("threadId")
             .and_then(|v| v.as_str())
             .map(str::to_string)
@@ -405,15 +409,12 @@ impl CairnCmd {
 
 impl ServerHandler for CairnCmd {
     fn get_info(&self) -> ServerInfo {
-        let mut instructions = "Cairn MCP server for agent orchestration.\n\n\
-             Issue tools:\n\
-             - read: Read issue and node resources (cairn://p/PROJECT/NUMBER, cairn://p/PROJECT/NUMBER/EXEC/NODE/chat)\n\n\
-             Implementation tools:\n\
-             - read: Read file contents, directory listings, canonical cairn://p/... resources, and read-query projections such as `src?glob=**/*.rs`, `src?grep=foo&glob=*.ts`, or `cairn://p/CAIRN?search=uri&limit=5`\n\\
-
-             - write: Apply ordered file and cairn:// resource mutations — files, terminals, delegated tasks (append to a node's tasks collection), ephemeral agent calls (append to a node's calls collection — one prompt in, schema-validated JSON out), user questions (append to a node's questions collection), and output artifacts (write/patch your node's artifact via cairn:~/<name>)\n\
-             - run: Execute an ordered batch of synchronous shell commands, inline code (`{code, interpreter}` — typescript/javascript via bun, python via bundled uv, or MATLAB via `matlab -batch`), and skill-script targets (parallel by default; `sequential` for ordered). Add `repl:<slug>` to an inline code item to persist state across calls in a stateful REPL (create via `write cairn:~/repl/<slug>`). If a successful worktree-bound run dirties the tree, pass `commit_msg` to commit it (`^` amends). Without a commit_msg, a run that dirties the worktree is restored to HEAD.\n\n\
-             Output artifact: when your node declares an output schema, write your result with `write` to `cairn:~/<name>` (mode create, then mode patch to revise). The payload is validated against the schema server-side. Do this as the last action of your turn; the write pauses the run for user review, and the session resumes on their reply."
+        let mut instructions = "Cairn MCP server for agent orchestration. Three batch verbs: \
+             `read` (files, directories, cairn:// resources, and web targets, with per-target \
+             `?query` scoping), `write` (ordered file and cairn:// resource mutations; \
+             `commit_msg` commits file edits), and `run` (shell commands, inline code, and \
+             skill scripts). Each tool's description carries its full contract; reading a \
+             cairn:// resource returns its affordances inline."
             .to_string();
 
         // Add available agents to instructions
@@ -426,23 +427,19 @@ impl ServerHandler for CairnCmd {
             }
         }
 
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .build(),
-            server_info: Implementation {
-                name: "cairn-cmd".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            instructions: Some(instructions),
-        }
+        let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
+        info.server_info = Implementation::new("cairn-cmd", env!("CARGO_PKG_VERSION"));
+        info.instructions = Some(instructions);
+        info
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
         // Get static tools from the router
@@ -473,9 +470,9 @@ impl ServerHandler for CairnCmd {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         // Delegate to router for static tools
         let tcc = ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -483,9 +480,9 @@ impl ServerHandler for CairnCmd {
 
     async fn read_resource(
         &self,
-        request: ReadResourceRequestParam,
+        request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
         let uri = &request.uri;
         let thread_id = Self::thread_id_from_meta(&context.meta);
         tracing::info!("read_resource called: uri={}", uri);
@@ -539,7 +536,7 @@ impl ServerHandler for CairnCmd {
                     let rendered = self.relativize_cairn_uris_in_text(&terminal_result.output);
                     let rendered = assemble_reminders(rendered, &response.reminders);
                     let contents = vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
-                    return Ok(ReadResourceResult { contents });
+                    return Ok(ReadResourceResult::new(contents).into());
                 }
                 Err(e) => {
                     tracing::error!(
@@ -556,7 +553,7 @@ impl ServerHandler for CairnCmd {
         let rendered = self.relativize_cairn_uris_in_text(&response.result);
         let rendered = assemble_reminders(rendered, &response.reminders);
         let contents = vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
-        Ok(ReadResourceResult { contents })
+        Ok(ReadResourceResult::new(contents).into())
     }
 }
 
@@ -655,6 +652,99 @@ mod tests {
             "Instructions should not mention agents when none available"
         );
     }
+    /// The `run` tool's advertised timeout contract is prose in two places — the
+    /// tool description and the `RunItemInput.timeout` schema description — while
+    /// the bound is enforced in cairn-core. They drifted once already: both
+    /// surfaces promised a 600,000 ms maximum that no layer enforced, so an agent
+    /// asking for an hour had no way to know whether it would get one. Bind the
+    /// advertised text to the shared constant so it cannot silently rot again.
+    #[test]
+    fn the_advertised_run_timeout_contract_matches_the_enforced_ceiling() {
+        use cairn_common::run_contract::{RUN_BATCH_CEILING_HOURS, RUN_GRACE_WINDOW_MS};
+
+        let mcp = CairnCmd::new(
+            "http://localhost:3847".to_string(),
+            "/test/path".to_string(),
+            None,
+            None,
+            vec![],
+        );
+        let run = mcp
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "run")
+            .expect("run tool should exist");
+
+        let ceiling = format!("{RUN_BATCH_CEILING_HOURS}-hour");
+        // Both surfaces must name the grace window, but prose reads it either as
+        // "120 seconds" or "120-second" depending on position. Normalize the
+        // hyphen so the assertion pins the number and unit, not the grammar.
+        let grace = format!("{} second", RUN_GRACE_WINDOW_MS / 1_000);
+        let normalize = |text: &str| text.replace('-', " ");
+        let description = run
+            .description
+            .as_ref()
+            .expect("run tool should be described")
+            .to_string();
+        assert!(
+            description.contains(&ceiling),
+            "the run description must name the enforced ceiling ({ceiling}): {description}"
+        );
+        assert!(
+            normalize(&description).contains(&grace),
+            "the run description must name the grace window ({grace}): {description}"
+        );
+
+        let schema = serde_json::Value::Object((*run.input_schema).clone());
+        let timeout = run_item_timeout_description(&schema);
+        assert!(
+            timeout.contains(&ceiling),
+            "RunItemInput.timeout must name the enforced ceiling ({ceiling}): {timeout}"
+        );
+        assert!(
+            timeout.to_lowercase().contains("omit"),
+            "RunItemInput.timeout must say what omitting it means: {timeout}"
+        );
+
+        // Host-executed items (MCP tool calls, REPL sends) never enter the
+        // suspendable routed path, so the ceiling above them is the grace window,
+        // not the batch ceiling. Advertising one generic bound over both classes
+        // is what made the contract describe states the system cannot reach.
+        for surface in [&description, &timeout] {
+            assert!(
+                normalize(surface).contains(&grace),
+                "the host-item bound ({grace}) must be advertised alongside the batch ceiling: {surface}"
+            );
+        }
+
+        // The retired maximum. Any layer re-advertising it is advertising a bound
+        // nothing enforces, which is the exact defect being fixed here.
+        for surface in [&description, &timeout] {
+            assert!(
+                !surface.contains("600000") && !surface.contains("600,000"),
+                "the retired 600000 ms maximum must not be advertised: {surface}"
+            );
+        }
+    }
+
+    /// Pull `RunItemInput.timeout`'s description out of the generated schema,
+    /// tolerating either schemars definition key. A panic here means the schema
+    /// shape moved and the assertion above stopped covering anything.
+    fn run_item_timeout_description(schema: &serde_json::Value) -> String {
+        for defs in ["definitions", "$defs"] {
+            if let Some(description) = schema
+                .pointer(&format!(
+                    "/{defs}/RunItemInput/properties/timeout/description"
+                ))
+                .and_then(|value| value.as_str())
+            {
+                return description.to_string();
+            }
+        }
+        panic!("RunItemInput.timeout description missing from the run tool schema: {schema}");
+    }
+
     #[test]
     fn test_unified_edit_tool_visible() {
         let mcp = CairnCmd::new(
@@ -693,7 +783,7 @@ mod tests {
     fn thread_id_from_meta_reads_thread_id_key() {
         // Codex injects `_meta.threadId` on every pooled tool call (CAIRN-2549);
         // other callers send no such key.
-        let mut meta = rmcp::model::Meta::default();
+        let mut meta = rmcp::model::RequestMetaObject::default();
         assert_eq!(CairnCmd::thread_id_from_meta(&meta), None);
         meta.insert(
             "threadId".to_string(),
@@ -711,7 +801,7 @@ mod tests {
         let result = mcp
             .read(
                 Parameters(ReadFileInput { paths: vec![] }),
-                rmcp::model::Meta::default(),
+                rmcp::model::RequestMetaObject::default(),
             )
             .await
             .unwrap();

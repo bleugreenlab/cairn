@@ -55,6 +55,7 @@ pub(crate) async fn start_execution_from_collection(
     number: i32,
     recipe: Option<&str>,
     backend: Option<&str>,
+    branch_target: Option<crate::models::BranchTarget>,
 ) -> Result<String, String> {
     // Route the issue lookup to the database that OWNS the project: a team
     // project's issue rows live wholly in its synced replica (CAIRN-2181), so
@@ -71,6 +72,7 @@ pub(crate) async fn start_execution_from_collection(
         &project_id,
         backend,
         Some("external"),
+        branch_target,
         crate::models::TriggerType::Manual,
     )?;
 
@@ -491,20 +493,20 @@ mod snapshot_edit_guard_tests {
         .await;
         exec(
             db,
-            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, started_at, created_at, updated_at, uri_segment, worktree_path)
-             VALUES ('job-builder','exec-1','issue-1','proj-1','Builder','builder','running',1,1,1,'builder','/tmp/repo-builder')",
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, started_at, created_at, updated_at, uri_segment, branch)
+             VALUES ('job-builder','exec-1','issue-1','proj-1','Builder','builder','running',1,1,1,'builder','agent/builder')",
         )
         .await;
         exec(
             db,
-            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, started_at, created_at, updated_at, uri_segment, worktree_path)
-             VALUES ('job-planner','exec-1','issue-1','proj-1','Planner','planner','running',1,1,1,'planner','/tmp/repo-planner')",
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, started_at, created_at, updated_at, uri_segment, branch)
+             VALUES ('job-planner','exec-1','issue-1','proj-1','Planner','planner','running',1,1,1,'planner','agent/planner')",
         )
         .await;
         exec(
             db,
-            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, started_at, created_at, updated_at, uri_segment, worktree_path)
-             VALUES ('job-other','exec-2','issue-1','proj-1','Builder','builder','running',1,1,1,'builder','/tmp/repo-other')",
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, started_at, created_at, updated_at, uri_segment, branch)
+             VALUES ('job-other','exec-2','issue-1','proj-1','Builder','builder','running',1,1,1,'builder','agent/other')",
         )
         .await;
         exec(

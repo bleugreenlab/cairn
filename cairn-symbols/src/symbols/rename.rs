@@ -98,7 +98,7 @@ pub fn compute_plan_from_files(
     if file_edits.is_empty() {
         return Err(format!("no symbol named `{name}` found to rename"));
     }
-    file_edits.sort_by(|a, b| a.worktree_path.cmp(&b.worktree_path));
+    file_edits.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(RenamePlan { file_edits })
 }
 
@@ -107,8 +107,8 @@ pub fn compute_plan_from_files(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEdit {
     /// Worktree-absolute path of the file the edit reads from.
-    pub worktree_path: PathBuf,
-    /// The full post-edit content to write. `None` means delete `worktree_path`.
+    pub path: PathBuf,
+    /// The full post-edit content to write. `None` means delete `path`.
     pub new_content: Option<String>,
     /// Destination path when the symbol's file is renamed/moved (unused by the
     /// structural engine today; kept for the plan/apply contract).
@@ -166,7 +166,7 @@ pub fn compute_plan(
     if file_edits.is_empty() {
         return Err(format!("no symbol named `{name}` found to rename"));
     }
-    file_edits.sort_by(|a, b| a.worktree_path.cmp(&b.worktree_path));
+    file_edits.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(RenamePlan { file_edits })
 }
 
@@ -244,13 +244,13 @@ fn rename_in_content(
         return None;
     }
     // Apply right-to-left so earlier byte ranges stay valid as the string shifts.
-    sites.sort_by(|a, b| b.start.cmp(&a.start));
+    sites.sort_by_key(|site| std::cmp::Reverse(site.start));
     let mut content = src.to_string();
     for site in &sites {
         content.replace_range(site.clone(), new_name);
     }
     Some(FileEdit {
-        worktree_path: path.to_path_buf(),
+        path: path.to_path_buf(),
         new_content: Some(content),
         move_to: None,
         site_count: sites.len(),

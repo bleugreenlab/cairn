@@ -17,11 +17,14 @@ use axum::{Json, Router};
 use base64::Engine;
 use cairn_common::executor_protocol::{
     CatalogFetchResponse, CatalogPackDescriptor, CellCommandClass, CellOutcome, CellPriority,
-    CellRequest, CloudObjectGrant, CloudObjectGrantRequest, CloudObjectOperation,
-    DeltaUploadReceipt, MutationDeltaUploadRequest, MutationPolicy, ObjectTransferCoordinate,
-    PlacementConstraints, RepositoryLocator, CLOUD_OBJECT_GRANT_VERSION,
+    CellRequest, CellUnavailableReason, CloudObjectGrant, CloudObjectGrantRequest,
+    CloudObjectOperation, DeltaUploadReceipt, MutationDeltaUploadRequest, MutationPolicy,
+    ObjectInfrastructureStage, ObjectTransferCoordinate, RepositoryLocator,
+    CLOUD_OBJECT_GRANT_VERSION,
 };
-use cairn_core::internal::orchestrator::object_plane::content_sha256;
+use cairn_core::internal::orchestrator::object_plane::{
+    build_local_reachable_pack, content_sha256,
+};
 use cairn_core::internal::orchestrator::Orchestrator;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -223,19 +226,23 @@ async fn catalog(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some((pack, index)) = cairn_codec::transfer::build_reachable_pack(
+    // Production pack construction. Only the storage around it is simulated: a
+    // second implementation of what a runner actually serves would let this
+    // fixture stay green while the real route drifted.
+    let Ok(Some(built)) = build_local_reachable_pack(
         &state.repository,
-        std::slice::from_ref(&request.want_commit),
+        &request.want_commit,
         &request.have_commits,
-    )
-    .unwrap() else {
+    ) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let validated =
-        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
-            .unwrap();
-    assert_eq!(validated.index, index);
-    let framed = cairn_codec::transfer::frame_pack(&pack, &index);
+    let index = cairn_codec::transfer::validate_pack(
+        &built.pack,
+        cairn_codec::transfer::PackLimits::default(),
+    )
+    .unwrap()
+    .index;
+    let framed = cairn_codec::transfer::frame_pack(&built.pack, &index);
     let hash = content_sha256(&framed);
     state
         .cloud
@@ -247,7 +254,7 @@ async fn catalog(
         catalog_id: format!("acceptance:{hash}"),
         content_hash: hash.clone(),
         byte_count: framed.len() as u64,
-        pack_checksum: validated.manifest.pack_checksum,
+        pack_checksum: built.pack_checksum,
         base_commit: None,
         tip_commit: request.want_commit.clone(),
         grant: grant(hash, CloudObjectOperation::Get, url),
@@ -501,6 +508,19 @@ fn request(
     command: impl Into<String>,
     mutation_policy: MutationPolicy,
 ) -> CellRequest {
+    let base = fixture.base.clone();
+    request_at(fixture, suffix, command, mutation_policy, &base)
+}
+
+/// A request for one exact commit, which is the only thing a managed executor is
+/// ever allowed to run against.
+fn request_at(
+    fixture: &Fixture,
+    suffix: &str,
+    command: impl Into<String>,
+    mutation_policy: MutationPolicy,
+    base_commit: &str,
+) -> CellRequest {
     let command = command.into();
     CellRequest {
         request_id: format!("cas-{suffix}"),
@@ -511,22 +531,22 @@ fn request(
             repository_id: fixture.repository_id.clone(),
             absolute_path: fixture.state.repository.display().to_string(),
         },
-        base_commit: fixture.base.clone(),
+        base_commit: base_commit.to_owned(),
         command_class: CellCommandClass::classify(&command),
         command,
         owner: None,
         cwd: String::new(),
         env: Vec::new(),
         priority: CellPriority::AgentInteractive,
-        deadline_unix_ms: u64::MAX,
+        wait_horizon_unix_ms: u64::MAX,
+        waiting_since_unix_ms: 0,
         timeout_ms: 30_000,
         mutation_policy,
         requesting_job_id: None,
         affinity_key: Some("cas-acceptance".into()),
-        constraints: Some(PlacementConstraints {
-            executor_id: Some("isolated-test-executor".into()),
-            ..PlacementConstraints::default()
-        }),
+        executor: None,
+        pinned_executor_id: Some("isolated-test-executor".into()),
+        placement_mobility: Default::default(),
         command_resource_identity: None,
         resource_reservation: Default::default(),
         learned_estimate: None,
@@ -554,31 +574,34 @@ async fn fetch(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some((pack, _)) = cairn_codec::transfer::build_reachable_pack(
+    // Production pack construction, and production's own answer for a commit
+    // this runner cannot resolve: a want it has no objects for is unprocessable,
+    // not a silently empty success.
+    let built = match build_local_reachable_pack(
         &state.repository,
-        &[request.want_commit],
+        &request.want_commit,
         &request.have_commits,
-    )
-    .unwrap() else {
+    ) {
+        Ok(built) => built,
+        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    let Some(built) = built else {
         return StatusCode::NO_CONTENT.into_response();
     };
     if state.interrupt_fetch.swap(false, Ordering::SeqCst) {
         return (StatusCode::OK, Bytes::from_static(b"PACK interrupted")).into_response();
     }
-    let validated =
-        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
-            .unwrap();
     state
         .runner_object_bytes
-        .fetch_add(pack.len(), Ordering::SeqCst);
-    let mut response = Response::new(Body::from(pack));
+        .fetch_add(built.pack.len(), Ordering::SeqCst);
+    let mut response = Response::new(Body::from(built.pack.clone()));
     response.headers_mut().insert(
         "x-cairn-content-sha256",
-        HeaderValue::from_str(&content_sha256(&validated.pack)).unwrap(),
+        HeaderValue::from_str(&content_sha256(&built.pack)).unwrap(),
     );
     response.headers_mut().insert(
         "x-cairn-pack-checksum",
-        HeaderValue::from_str(&validated.manifest.pack_checksum).unwrap(),
+        HeaderValue::from_str(&built.pack_checksum).unwrap(),
     );
     response
 }
@@ -657,6 +680,184 @@ fn assert_completed(outcome: &CellOutcome, expected: &str) {
     }
 }
 
+/// Advance the runner's object store to a commit no ref points at.
+///
+/// This is the shape of an agent's logical head: it exists in the store, on no
+/// branch and no remote, which is precisely the content a remote executor could
+/// not obtain before this path existed.
+fn advance_runner_head(fixture: &Fixture, marker: &str) -> String {
+    let repository = &fixture.state.repository;
+    std::fs::write(repository.join("exact-head.txt"), format!("{marker}\n")).unwrap();
+    git(repository, &["add", "."]);
+    git(repository, &["commit", "-m", "logical head"]);
+    let head = git(repository, &["rev-parse", "HEAD"]);
+    git(repository, &["reset", "--hard", &fixture.base]);
+    assert_eq!(
+        git(repository, &["for-each-ref", "--points-at", &head]),
+        "",
+        "the fixture head must be reachable from no ref at all"
+    );
+    head
+}
+
+fn sidecar(fixture: &Fixture) -> serde_json::Value {
+    let mut sidecars = Vec::new();
+    files_named(
+        &fixture.executor_home,
+        "cairn-build-slot.json",
+        &mut sidecars,
+    );
+    assert_eq!(sidecars.len(), 1, "expected one managed cell sidecar");
+    serde_json::from_slice(&std::fs::read(&sidecars[0]).unwrap()).unwrap()
+}
+
+/// The whole point of the object plane, end to end: an unpushed logical head
+/// materializes on a cold, physically separate executor and the verdict it
+/// returns is computed against THAT head's content.
+///
+/// The command reads a file only the requested commit introduces, so a run
+/// against any other tree — the base, an origin ref, a warm stale cache — fails
+/// instead of passing quietly.
+#[tokio::test]
+async fn an_unpushed_exact_head_materializes_cold_and_its_verdict_reads_that_head() {
+    if common::skip_if_fenced(
+        "an_unpushed_exact_head_materializes_cold_and_its_verdict_reads_that_head",
+    ) {
+        return;
+    }
+    let fixture = fixture().await;
+    assert_ne!(fixture.executor_home, fixture.orch.config_dir);
+    let head = advance_runner_head(&fixture, "exact-head-marker");
+    assert_ne!(head, fixture.base);
+    assert_eq!(
+        git(&fixture.state.repository, &["remote"]),
+        "",
+        "this repository has no origin to push to, so origin cannot be the source"
+    );
+    assert!(
+        !fixture.executor_home.join("managed-objects").exists(),
+        "the executor must start with no objects for this repository at all"
+    );
+
+    let outcome = submit(
+        &fixture,
+        request_at(
+            &fixture,
+            "exact-head",
+            "cat exact-head.txt",
+            MutationPolicy::PureVerdict,
+            &head,
+        ),
+    )
+    .await;
+    assert_completed(&outcome, "exact-head-marker");
+
+    assert_eq!(fixture.state.fetches.load(Ordering::SeqCst), 1);
+    assert!(
+        fixture.state.runner_object_bytes.load(Ordering::SeqCst) > 0,
+        "the exact head must arrive by direct runner object transfer"
+    );
+    assert_eq!(fixture.state.cloud_gets.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.cloud_puts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.github_operations.load(Ordering::SeqCst), 0);
+
+    let sidecar = sidecar(&fixture);
+    let cell = PathBuf::from(sidecar["path"].as_str().unwrap());
+    assert_eq!(
+        git(&cell, &["rev-parse", "HEAD"]),
+        head,
+        "the checkout that produced the verdict must be the requested commit"
+    );
+    let managed_repository = PathBuf::from(sidecar["repository"].as_str().unwrap());
+    let refs = std::process::Command::new("git")
+        .args(["show-ref"])
+        .current_dir(&managed_repository)
+        .output()
+        .unwrap();
+    assert!(
+        refs.stdout.is_empty(),
+        "an exact head is addressed by object identity, never by a synthesized ref"
+    );
+    assert_eq!(
+        git(&managed_repository, &["remote"]),
+        "",
+        "the managed repository must have no remote to fetch from"
+    );
+}
+
+/// The fail-closed boundary. When the requested head cannot be proven present,
+/// the placement refuses with a typed object-infrastructure reason: no verdict
+/// is fabricated, no command runs, and nothing lands in the executable cache.
+///
+/// This is the guard against the failure this whole path exists to prevent — a
+/// green result computed against whatever tree the executor happened to have.
+///
+/// The refusal is also the operator's whole view of a remote placement that
+/// went nowhere, so it has to name the execution coordinate: which job, which
+/// executor, and which commit could not be materialized.
+#[tokio::test]
+async fn an_unavailable_exact_head_refuses_structurally_without_running_anything() {
+    if common::skip_if_fenced(
+        "an_unavailable_exact_head_refuses_structurally_without_running_anything",
+    ) {
+        return;
+    }
+    let fixture = fixture().await;
+    let marker = fixture._temp.path().join("must-not-execute");
+    // Well-formed, and resolvable in no object store anywhere.
+    let absent = format!("{}1", "0".repeat(39));
+
+    let mut request = request_at(
+        &fixture,
+        "absent-head",
+        format!("printf ran >> '{}'", marker.display()),
+        MutationPolicy::PureVerdict,
+        &absent,
+    );
+    request.requesting_job_id = Some("job-awaiting-absent-head".into());
+    let outcome = submit(&fixture, request).await;
+    let (stage, diagnostic) = match &outcome {
+        CellOutcome::Unavailable {
+            reason: CellUnavailableReason::ObjectInfrastructure(stage),
+            diagnostic,
+        } => (stage.clone(), diagnostic.clone()),
+        other => panic!("an unavailable exact head must refuse structurally, got {other:?}"),
+    };
+    assert!(
+        matches!(
+            stage,
+            ObjectInfrastructureStage::FetchInterrupted
+                | ObjectInfrastructureStage::IncompleteClosure
+        ),
+        "{stage:?}"
+    );
+    // The placement half comes from the runner, which is the only side that
+    // knows where the work was sent; the job and commit come from the executor.
+    // Asserting both halves keeps either from silently dropping out.
+    for named in [
+        "on executor isolated-test-executor generation",
+        "job-awaiting-absent-head",
+        absent.as_str(),
+    ] {
+        assert!(
+            diagnostic.contains(named),
+            "a refusal must name {named}: {diagnostic}"
+        );
+    }
+    assert!(
+        !marker.exists(),
+        "a batch whose head cannot be materialized must never execute"
+    );
+    assert_eq!(fixture.state.runner_object_bytes.load(Ordering::SeqCst), 0);
+
+    let mut published_packs = Vec::new();
+    files_named(&fixture.executor_home, ".pack", &mut published_packs);
+    assert!(
+        published_packs.is_empty(),
+        "an unresolvable head must leave no objects behind: {published_packs:?}"
+    );
+}
+
 #[tokio::test]
 async fn cold_fetch_materializes_verdict_then_warm_run_avoids_object_io() {
     if common::skip_if_fenced("cold_fetch_materializes_verdict_then_warm_run_avoids_object_io") {
@@ -710,7 +911,7 @@ async fn colocated_execution_performs_zero_object_operations() {
         "git cat-file -e HEAD^{commit} && printf colocated-ok",
         MutationPolicy::PureVerdict,
     );
-    colocated.constraints = None;
+    colocated.pinned_executor_id = None;
     let outcome = submit(&fixture, colocated).await;
     assert_completed(&outcome, "colocated-ok");
     assert_eq!(fixture.state.fetches.load(Ordering::SeqCst), 0);

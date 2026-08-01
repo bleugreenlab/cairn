@@ -115,5 +115,6 @@ pub(super) fn load_agent_config(
     Ok(agent)
 }
 
-pub(super) const SESSION_COLUMNS: &str = "id, job_id, chat_id, backend, status, parent_session_id,
+pub(super) const SESSION_COLUMNS: &str =
+    "id, job_id, chat_id, backend, account_id, status, parent_session_id,
     replaced_by_id, terminal_reason, sequence, created_at, closed_at, updated_at, backend_id";

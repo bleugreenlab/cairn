@@ -1,9 +1,6 @@
-//! Small, dependency-light path/glob/format helpers shared by the two search
-//! engines this crate holds — the structural (`symbols`) walk and the warm fff
-//! (`worktree_search`) index — and re-exported back into cairn-core so its
-//! ripgrep grep handler formats and filters identically. One canonical copy,
-//! never a fork: the warm-vs-cold parity the whole design rests on depends on
-//! these being the same functions.
+//! Small, dependency-light path/glob/format helpers shared by structural and
+//! logical project search, and re-exported into cairn-core so every renderer
+//! formats and filters identically.
 
 use std::path::{Path, PathBuf};
 

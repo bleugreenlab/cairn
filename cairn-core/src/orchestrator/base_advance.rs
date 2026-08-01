@@ -25,10 +25,54 @@ use crate::messages::delivery::{
 };
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::ExecutionSnapshot;
+use crate::orchestrator::conflict_session::{
+    close_open_sessions_for_branch, record_conflict_session, record_marker_state,
+    supersede_stale_sessions, IncomingIdentity, MarkerState,
+};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use cairn_common::executor_protocol::{LifetimeLeaseOperation, LifetimeLeaseResult};
+use cairn_common::executor_protocol::{ResidencyOperation, ResidencyResult};
 use cairn_db::turso::params;
+
+/// Publish a managed store-authoritative branch, recovering exactly once when jj
+/// proves origin moved unexpectedly. Network transfer occurs without the store
+/// mutex; import and graph convergence occur under it; the verified retry is
+/// again outside it. This boundary prevents slow network I/O from blocking store
+/// writers while ensuring no jj mutation can fork the operation log.
+pub(crate) async fn publish_managed_branch(
+    orch: &Orchestrator,
+    store: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    match crate::jj::publish_branch_to_origin(&jj, store, branch).await {
+        Ok(()) => return Ok(()),
+        Err(crate::jj::StoreBookmarkPushError::Failed(error)) => return Err(error),
+        Err(crate::jj::StoreBookmarkPushError::StaleRemote(error)) => {
+            log::warn!("publish `{branch}` found stale origin state; fetching and converging once: {error}");
+        }
+    }
+
+    let fetch_store = store.to_path_buf();
+    let fetch_branch = branch.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::jj::fetch_remote_branch_via_git(&fetch_store, "origin", &fetch_branch)
+    })
+    .await
+    .map_err(|error| format!("stale publication fetch worker failed: {error}"))??;
+
+    {
+        let guard = orch
+            .acquire_jj_store_lock(store, format!("stale publication recovery: {branch}"))
+            .await;
+        let _phase = guard.phase(format!("import and converge branch={branch}"));
+        crate::jj::converge_managed_branch_after_remote_rewrite(&jj, store, branch)?;
+    }
+
+    crate::jj::publish_branch_to_origin(&jj, store, branch)
+        .await
+        .map_err(|error| format!("stale publication retry failed: {error}"))
+}
 
 #[derive(Debug)]
 struct MergedJob {
@@ -36,7 +80,6 @@ struct MergedJob {
     project_id: String,
     issue_id: Option<String>,
     base_branch: Option<String>,
-    worktree_path: Option<String>,
 }
 
 struct DurableReconcileWork {
@@ -233,7 +276,6 @@ async fn mark_reconcile_delivered(db: &LocalDb, intent_id: &str) -> Result<(), S
 #[derive(Debug)]
 struct SiblingJob {
     id: String,
-    worktree_path: String,
     branch: Option<String>,
     base_commit: Option<String>,
 }
@@ -252,6 +294,10 @@ struct IssueInfo {
 struct BaseAdvanceNotes {
     conflict: String,
     clean: String,
+    /// What advanced the base, carried through to the durable resolution session
+    /// so `cairn:~/rebase` can name the incoming change instead of describing an
+    /// anonymous "the base moved".
+    incoming: IncomingIdentity,
 }
 
 #[derive(Debug)]
@@ -312,80 +358,146 @@ pub(crate) async fn notify_downstream_of_base_advance(
     .await
 }
 
-/// Sentinel for `load_sibling_jobs` when there is no merged job to exclude — an
-/// external default-branch advance has no Cairn-tracked owner, so every in-flight
-/// sibling on the branch is a reconcile candidate. No job row carries an empty
-/// id, so `j.id != ''` excludes nothing.
+/// Sentinel for sibling selection when no merged job should be excluded.
 const EXCLUDE_NONE: &str = "";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct BranchAdvanceOutcome {
+struct BranchAdvanceOutcome {
     eligible: usize,
     rebased_clean: usize,
     conflicted: usize,
     failed: usize,
 }
 
-/// Canonical propagation seam for a managed branch whose local bookmark advanced.
-/// The destination is pinned to the observed commit so a later bookmark movement
-/// cannot silently change the base being adopted by downstream jobs.
-pub(crate) async fn reconcile_managed_branch_advance(
+/// Project conflict markers into every live checkout holding this branch, and
+/// report back only what the executor CONFIRMED.
+///
+/// The return value is the marker state to persist. It is deliberately
+/// pessimistic: with no live checkout there is nothing to mark, and an executor
+/// that could not be reached leaves the session `Pending` so the retry pass picks
+/// it up rather than a wake claiming markers exist.
+async fn materialize_markers_for_branch(
     orch: &Orchestrator,
+    db: &LocalDb,
     project_id: &str,
-    repo_path: &str,
-    advanced_branch: &str,
-    new_tip: &str,
-    source_job_to_exclude: Option<&str>,
-) -> Result<BranchAdvanceOutcome, String> {
-    let db = owning_db_for_project(&orch.db, project_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    {
-        let store_guard = orch
-            .acquire_jj_store_lock(
-                &store,
-                format!("managed branch {advanced_branch} on-branch advance to {new_tip}"),
+    branch: &str,
+    diagnostic: &crate::jj::ConflictDiagnostic,
+) -> (MarkerState, Option<String>, Vec<(String, String)>) {
+    let paths = diagnostic.conflicting_paths();
+    if paths.is_empty() {
+        return (
+            MarkerState::NotMaterialized,
+            Some("the rebase named no conflicting paths".to_string()),
+            Vec::new(),
+        );
+    }
+    let (Some(ours), Some(theirs)) = (diagnostic.ours.as_deref(), diagnostic.theirs.as_deref())
+    else {
+        return (
+            MarkerState::NotMaterialized,
+            Some("the conflict did not record both merge sides".to_string()),
+            Vec::new(),
+        );
+    };
+    let Ok(leases) = load_live_terminal_leases(db, project_id, branch).await else {
+        return (
+            MarkerState::Pending,
+            Some("could not enumerate this branch's live checkouts".to_string()),
+            Vec::new(),
+        );
+    };
+    if leases.is_empty() {
+        return (
+            MarkerState::NotMaterialized,
+            Some("this branch has no live checkout to project markers into".to_string()),
+            Vec::new(),
+        );
+    }
+
+    let mut confirmed: Vec<(String, String)> = Vec::new();
+    let mut last_error = None;
+    let mut confirmations = 0usize;
+    let mut attempts = 0usize;
+    let mut retryable = false;
+    for (residency_holder, incarnation_id, cell_epoch, _job_id) in leases {
+        attempts += 1;
+        let Some(holder) =
+            cairn_common::executor_protocol::ResidencyHolder::parse_storage_key(&residency_holder)
+        else {
+            last_error = Some(format!(
+                "unreadable execution environment {residency_holder}"
+            ));
+            continue;
+        };
+        let result = orch
+            .fleet
+            .operate_residency(
+                orch,
+                ResidencyOperation::MaterializeConflict {
+                    fence: cairn_common::executor_protocol::ResidencyFence {
+                        holder,
+                        incarnation_id,
+                        cell_epoch,
+                    },
+                    request: cairn_common::executor_protocol::ConflictMaterializationRequest {
+                        expected_head: ours.to_string(),
+                        base_commit: diagnostic.base.clone(),
+                        ours_commit: ours.to_string(),
+                        theirs_commit: theirs.to_string(),
+                        paths: paths.clone(),
+                    },
+                },
             )
             .await;
-        let _phase = store_guard.phase("on-branch workspace advance");
-        advance_on_branch_workspaces(orch, &db, project_id, advanced_branch, repo_path).await;
+        match result {
+            ResidencyResult::ConflictMaterialized { outcome, .. } => {
+                confirmations += 1;
+                for path in outcome.paths {
+                    confirmed.push((path.path, path.disposition.as_str().to_string()));
+                }
+            }
+            ResidencyResult::Failed {
+                kind, diagnostic, ..
+            } => {
+                // An unreachable executor is a fact about the link, not about
+                // this branch: keep the request alive for the retry pass.
+                retryable |= matches!(
+                    kind,
+                    cairn_common::executor_protocol::ResidencyFailureKind::Unavailable
+                );
+                last_error = Some(diagnostic);
+            }
+            other => last_error = Some(format!("unexpected materialization reply: {other:?}")),
+        }
     }
-    let siblings = load_sibling_jobs(
-        &db,
-        project_id,
-        advanced_branch,
-        source_job_to_exclude.unwrap_or(EXCLUDE_NONE),
-    )
-    .await?;
-    let eligible = siblings.len();
-    let mut outcome = if siblings.is_empty() {
-        BranchAdvanceOutcome::default()
-    } else {
-        let notes = BaseAdvanceNotes {
-            conflict: build_jj_conflict_note(advanced_branch, None, None),
-            clean: build_jj_clean_note(advanced_branch, None, None),
-        };
-        reconcile_base_advance(
-            orch,
-            &db,
-            project_id,
-            &format!("managed branch {advanced_branch} advanced to {new_tip}"),
-            repo_path,
-            advanced_branch,
-            new_tip,
-            siblings,
-            notes,
+
+    // Marker state is stored once per branch, but materialization happens per
+    // CHECKOUT. So a partial success cannot be recorded as `Materialized`: the
+    // resource would then tell an agent whose checkout got nothing that markers
+    // are present in it, which is precisely the false claim this whole design
+    // exists to prevent. Only unanimity is confirmation; anything short of it
+    // stays retryable and reads as "not confirmed".
+    if confirmations == attempts && confirmations > 0 {
+        (MarkerState::Materialized, last_error, confirmed)
+    } else if confirmations > 0 {
+        (
+            MarkerState::Pending,
+            Some(format!(
+                "markers landed in {confirmations} of {attempts} live checkouts{}",
+                last_error
+                    .map(|error| format!("; last failure: {error}"))
+                    .unwrap_or_default()
+            )),
+            confirmed,
         )
-        .await?
-    };
-    outcome.eligible = eligible;
-    outcome.failed +=
-        refresh_terminal_leases_for_branch(orch, &db, project_id, advanced_branch, new_tip).await;
-    Ok(outcome)
+    } else if retryable {
+        (MarkerState::Pending, last_error, Vec::new())
+    } else {
+        (MarkerState::Failed, last_error, Vec::new())
+    }
 }
 
-async fn refresh_terminal_leases_for_branch(
+async fn refresh_residencies_for_branch(
     orch: &Orchestrator,
     db: &LocalDb,
     project_id: &str,
@@ -394,54 +506,59 @@ async fn refresh_terminal_leases_for_branch(
 ) -> usize {
     let rows = load_live_terminal_leases(db, project_id, branch).await;
     let Ok(leases) = rows else {
-        log::error!("committed branch advance could not enumerate terminal leases: {rows:?}");
+        log::error!("committed branch advance could not enumerate residencies: {rows:?}");
         return 1;
     };
     let mut failed = 0;
-    for (lease_id, incarnation_id, lease_epoch, job_id) in leases {
+    for (residency_holder, incarnation_id, cell_epoch, job_id) in leases {
+        let Some(holder) =
+            cairn_common::executor_protocol::ResidencyHolder::parse_storage_key(&residency_holder)
+        else {
+            failed += 1;
+            log::error!(
+                "terminal row records an unreadable execution environment {residency_holder}"
+            );
+            continue;
+        };
         let result = orch
             .fleet
-            .operate_lifetime_lease(
+            .operate_residency(
                 orch,
-                LifetimeLeaseOperation::RefreshCheckout {
-                    fence: cairn_common::executor_protocol::LifetimeLeaseFence {
-                        lease_id: lease_id.clone(),
-                        owner: cairn_common::executor_protocol::LifetimeLeaseOwner {
-                            kind: cairn_common::executor_protocol::LifetimeLeaseOwnerKind::Terminal,
-                            owner_id: job_id.clone(),
-                        },
+                ResidencyOperation::RefreshCheckout {
+                    fence: cairn_common::executor_protocol::ResidencyFence {
+                        holder,
                         incarnation_id: incarnation_id.clone(),
-                        lease_epoch,
+                        cell_epoch,
                     },
                     base_commit: new_tip.to_string(),
                 },
             )
             .await;
-        if let LifetimeLeaseResult::Failed {
+        if let ResidencyResult::Failed {
             kind, diagnostic, ..
         } = result
         {
-            if kind == cairn_common::executor_protocol::LifetimeLeaseFailureKind::Unavailable {
+            if kind == cairn_common::executor_protocol::ResidencyFailureKind::Unavailable {
                 failed += 1;
                 log::warn!(
-                    "terminal lease {lease_id} could not be refreshed while its executor is disconnected: {diagnostic}"
+                    "terminal lease {residency_holder} could not be refreshed while its executor is disconnected: {diagnostic}"
                 );
                 continue;
             }
-            if kind == cairn_common::executor_protocol::LifetimeLeaseFailureKind::NotFound {
+            if kind == cairn_common::executor_protocol::ResidencyFailureKind::NotFound {
                 match crate::terminal_host::resolve_missing_terminal_lease(
                     db,
-                    &lease_id,
+                    &residency_holder,
                     &incarnation_id,
-                    lease_epoch,
+                    cell_epoch,
                 )
                 .await
                 {
                     Ok(true) => {
-                        log::warn!("terminal lease {lease_id} no longer exists on an executor; cleared its persisted fence");
+                        log::warn!("terminal lease {residency_holder} no longer exists on an executor; cleared its persisted fence");
                         if let Some(run_id) = latest_run_for_job(db, &job_id) {
                             let note = format!(
-                                "[Terminal ended] Cairn's executor no longer reports terminal lease {lease_id}. Its stale lease binding was cleared; restart the terminal to acquire a fresh checkout."
+                                "[Terminal ended] Cairn's executor no longer reports terminal lease {residency_holder}. Its stale lease binding was cleared; restart the terminal to acquire a fresh checkout."
                             );
                             if let Err(error) =
                                 queue_system_direct(orch, &run_id, &note, DeliveryUrgency::Passive)
@@ -453,16 +570,18 @@ async fn refresh_terminal_leases_for_branch(
                     Ok(false) => {}
                     Err(error) => {
                         failed += 1;
-                        log::error!("could not clear missing terminal lease {lease_id}: {error}");
+                        log::error!(
+                            "could not clear missing terminal lease {residency_holder}: {error}"
+                        );
                     }
                 }
                 continue;
             }
             failed += 1;
-            log::error!("committed branch advance could not refresh terminal lease {lease_id}: {diagnostic}");
+            log::error!("committed branch advance could not refresh terminal lease {residency_holder}: {diagnostic}");
             if let Some(run_id) = latest_run_for_job(db, &job_id) {
                 let note = format!(
-                    "⛔ BLOCKING [Terminal head reconciliation] The branch commit succeeded, but Cairn could not advance terminal lease {lease_id} to {new_tip}. The committed branch was not rolled back. Exact executor diagnostic: {diagnostic}"
+                    "⛔ BLOCKING [Terminal head reconciliation] The branch commit succeeded, but Cairn could not advance terminal lease {residency_holder} to {new_tip}. The committed branch was not rolled back. Exact executor diagnostic: {diagnostic}"
                 );
                 if let Err(error) =
                     queue_system_direct(orch, &run_id, &note, DeliveryUrgency::Steer)
@@ -488,10 +607,10 @@ async fn load_live_terminal_leases(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT DISTINCT t.lease_id, t.lease_incarnation_id, t.lease_epoch, t.job_id
+                    "SELECT DISTINCT t.residency_holder, t.residency_incarnation_id, t.cell_epoch, t.job_id
              FROM job_terminals t JOIN jobs j ON j.id = t.job_id
              WHERE j.project_id = ?1 AND j.branch = ?2
-               AND t.status = 'running' AND t.lease_id IS NOT NULL",
+               AND t.status = 'running' AND t.residency_holder IS NOT NULL",
                     (project_id.as_str(), branch.as_str()),
                 )
                 .await?;
@@ -531,21 +650,46 @@ async fn reconcile_jj_downstream(
     // overlap, so the durable intent lease coalesces them while the shared mutex
     // remains the sole jj/ref/history writer.
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    // Advance the workspace that sits ON the merged branch (a Coordinator on its
-    // integration bookmark) onto the freshly-folded tip. This is asymmetric to
-    // the sibling reconcile below: `reconcile_siblings` rebases the *children*
-    // (branched FROM the branch); nobody otherwise re-parents the workspace whose
-    // branch IS the branch, so the fold moves the bookmark out from under its `@`
-    // and a later edit+seal would orphan off the advanced branch. Runs
-    // independently of (and before) the sibling reconcile — a coordinator must be
-    // advanced even when it has no other in-flight siblings.
+    // Validate the advanced integration bookmark and refresh any authorized
+    // held cells on that exact coordinate before reconciling descendants.
     {
         let guard = orch
             .acquire_jj_store_lock(&store, format!("jj on-branch advance for {merged_job_id}"))
             .await;
-        let _phase = guard.phase("on-branch workspace advance");
-        advance_on_branch_workspaces(orch, db, &merged_job.project_id, base_branch, repo_path)
+        let _phase = guard.phase("on-branch coordinate advance");
+        refresh_advanced_branch_cells(orch, db, &merged_job.project_id, base_branch, repo_path)
             .await;
+    }
+
+    // The store owns the LOCAL fold, but it does not own what origin did with the
+    // pull request. An operator squash-merging on GitHub mints a commit id the
+    // store has never seen, so origin moves and the store's local default
+    // bookmark does not — and this path used to neither fetch nor import, on the
+    // reasoning that a Cairn-driven fold needs neither. That reasoning holds for
+    // the fold and fails for the merge, which is why nearly every merge left the
+    // bookmark to conflict. Reconcile before the sibling gate, and fetch first so
+    // the commit origin holds is actually in the store to reconcile onto.
+    if branch_is_project_default(db, &merged_job.project_id, base_branch).await {
+        let repo = Path::new(repo_path);
+        if project_has_origin(orch, repo) {
+            let ctx = format!("merged job {}", merged_job.id);
+            match fetch_origin_outside_store_lock(orch, repo).await {
+                Ok(()) => {
+                    reconcile_store_default_bookmark(
+                        orch,
+                        db,
+                        &merged_job.project_id,
+                        repo,
+                        base_branch,
+                        &ctx,
+                    )
+                    .await
+                }
+                Err(error) => log::warn!(
+                    "{ctx}: git fetch origin failed; skipping default bookmark reconcile: {error}"
+                ),
+            }
+        }
     }
 
     let siblings =
@@ -560,7 +704,7 @@ async fn reconcile_jj_downstream(
 
     // The store already owns the merge (the child's commit was folded into the
     // integration bookmark), so the rebase dest is the bare local integration
-    // bookmark — no fetch needed.
+    // bookmark.
     let issue_info = match merged_job.issue_id.as_deref() {
         Some(issue_id) => load_issue_info(db, issue_id).await?,
         None => None,
@@ -571,6 +715,13 @@ async fn reconcile_jj_downstream(
     let notes = BaseAdvanceNotes {
         conflict: build_jj_conflict_note(base_branch, pr_number, issue_info.as_ref()),
         clean: build_jj_clean_note(base_branch, pr_number, issue_info.as_ref()),
+        incoming: IncomingIdentity {
+            base_branch: base_branch.to_string(),
+            pr_number,
+            issue: issue_info
+                .as_ref()
+                .map(|issue| format!("{}-{}", issue.project_key, issue.number)),
+        },
     };
     reconcile_base_advance(
         orch,
@@ -589,6 +740,57 @@ async fn reconcile_jj_downstream(
 
 fn remote_default_revset(default_branch: &str) -> String {
     format!("{default_branch}@origin")
+}
+
+/// Bring the store's local bookmark for the project's default branch back into
+/// agreement with origin, under the per-store lock.
+///
+/// Every caller runs this BEFORE deciding whether any sibling needs rebasing.
+/// That ordering is the whole point: the import and repair used to be reachable
+/// only through store provisioning, downstream of an `if siblings.is_empty()`
+/// return, so the overwhelmingly common shape — a PR merges with nothing else in
+/// flight — reconciled nothing at all and left the tracked bookmark to conflict
+/// on the next operation that touched it. Reconciliation is not a step the
+/// sibling rebase needs; it is what keeps the store able to answer for the
+/// default branch.
+///
+/// The backward repair is gated HERE rather than at each call site, so no caller
+/// can reach it with a branch origin does not own. `branch` must be the
+/// project's configured default branch; an integration or agent branch
+/// legitimately holds sealed work origin has not seen and is left untouched.
+///
+/// Non-fatal end to end. A reconciliation failure is operator-facing diagnostic
+/// output; it never becomes a message to an agent and never fails the caller.
+async fn reconcile_store_default_bookmark(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    repo_path: &Path,
+    branch: &str,
+    ctx: &str,
+) {
+    if !branch_is_project_default(db, project_id, branch).await {
+        log::debug!(
+            "{ctx}: `{branch}` is not project {project_id}'s default branch; not reconciling it onto origin"
+        );
+        return;
+    }
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
+    let guard = orch
+        .acquire_jj_store_lock(&store, format!("default bookmark reconcile: {ctx}"))
+        .await;
+    let _phase = guard.phase("default bookmark reconcile");
+    if let Err(error) = crate::jj::ensure_store_initialized(&jj, &store, repo_path) {
+        log::warn!("{ctx}: ensure jj store failed; skipping default bookmark reconcile: {error}");
+        return;
+    }
+    match crate::jj::reconcile_tracked_bookmark(&jj, &store, branch) {
+        Ok(outcome) => log::debug!("{ctx}: default bookmark `{branch}` reconcile: {outcome:?}"),
+        Err(error) => log::error!(
+            "{ctx}: default bookmark `{branch}` did not reconcile against origin: {error}"
+        ),
+    }
 }
 
 async fn fetch_origin_outside_store_lock(
@@ -623,7 +825,7 @@ pub(crate) async fn reconcile_external_default_advance(
 /// cleanly-rebased one (the before/after commit-id guard in
 /// `reconcile_base_advance` gates both). Runs regardless of the project's
 /// `pull_on_merge` setting: that gates the user's main-checkout pull, not
-/// agent-workspace reconciliation. Non-fatal end to end — every failure is logged
+/// agent branch reconciliation. Non-fatal end to end — every failure is logged
 /// and swallowed so the webhook handler does not error on it.
 async fn reconcile_default_advance(
     orch: &Orchestrator,
@@ -642,16 +844,9 @@ async fn reconcile_default_advance(
         log::debug!("Skipping external advance reconcile: no repo_path for project {project_id}");
         return Ok(());
     };
-    let siblings = load_sibling_jobs(&db, project_id, default_branch, EXCLUDE_NONE).await?;
-    if siblings.is_empty() {
-        log::debug!("external advance on {default_branch}: no in-flight siblings to reconcile");
-        return Ok(());
-    }
-
-    // Bring the advanced tip into the shared store. `ensure_project_store` runs
-    // `jj git import`, which imports the backing git's refs — including the local
-    // `<default>` ref a local-only advance or a manual `git pull` moved — so the
-    // rebase dest resolves regardless of which branch the main checkout sits on.
+    // Bring the advanced tip into the shared store and reconcile the default
+    // bookmark onto it — BEFORE looking at siblings, because this is owed whether
+    // or not anything downstream needs rebasing.
     let repo_path_path = Path::new(&repo_path);
     // Transfer objects and update the ordinary Git repository's origin-tracking
     // refs before entering the jj critical section. Git object writes are
@@ -661,10 +856,12 @@ async fn reconcile_default_advance(
         log::warn!("external advance on {default_branch}: git fetch origin failed: {error}");
         return Ok(());
     }
-
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, repo_path_path);
+    // Provision and import the store before anything downstream depends on it
+    // resolving. A store that cannot be provisioned aborts the whole reconcile
+    // rather than letting the sibling pass fail on an unresolvable dest.
     {
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, repo_path_path);
         let store_guard = orch
             .acquire_jj_store_lock(&store, format!("external import on {default_branch}"))
             .await;
@@ -674,10 +871,29 @@ async fn reconcile_default_advance(
             return Ok(());
         }
     }
+    reconcile_store_default_bookmark(
+        orch,
+        &db,
+        project_id,
+        repo_path_path,
+        default_branch,
+        &format!("external advance on {default_branch}"),
+    )
+    .await;
+
+    let siblings = load_sibling_jobs(&db, project_id, default_branch, EXCLUDE_NONE).await?;
+    if siblings.is_empty() {
+        log::debug!("external advance on {default_branch}: no in-flight siblings to reconcile");
+        return Ok(());
+    }
 
     let notes = BaseAdvanceNotes {
         conflict: build_external_advance_conflict_note(default_branch),
         clean: build_external_advance_clean_note(default_branch),
+        incoming: IncomingIdentity {
+            base_branch: default_branch.to_string(),
+            ..IncomingIdentity::default()
+        },
     };
     reconcile_base_advance(
         orch,
@@ -729,20 +945,11 @@ async fn reconcile_startup_remote_default_advance(
     db: &LocalDb,
     project: &DefaultReconcileProject,
 ) -> Result<(), String> {
-    let siblings =
-        load_sibling_jobs(db, &project.id, &project.default_branch, EXCLUDE_NONE).await?;
-    if siblings.is_empty() {
-        log::debug!(
-            "startup remote advance on {}: no in-flight siblings to reconcile",
-            project.default_branch
-        );
-        return Ok(());
-    }
-
     let repo_path = Path::new(&project.repo_path);
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
     let remote_default = remote_default_revset(&project.default_branch);
+    let ctx = format!("startup remote advance on {}", project.default_branch);
     let before = {
         let _store_guard = orch
             .acquire_jj_store_lock(
@@ -754,61 +961,67 @@ async fn reconcile_startup_remote_default_advance(
             )
             .await;
         if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path) {
-            log::warn!(
-                "startup remote advance on {}: ensure store failed: {error}",
-                project.default_branch
-            );
+            log::warn!("{ctx}: ensure store failed: {error}");
             return Ok(());
         }
         crate::jj::revset_commit(&jj, &store, &remote_default)
     };
 
     if let Err(error) = fetch_origin_outside_store_lock(orch, repo_path).await {
-        log::warn!(
-            "startup remote advance on {}: git fetch origin failed: {error}",
-            project.default_branch
-        );
+        log::warn!("{ctx}: git fetch origin failed: {error}");
         return Ok(());
     }
 
+    // Reconcile the default bookmark unconditionally on the way through. A
+    // restart is exactly when the store is most likely to be holding a bookmark
+    // that conflicts with what origin did while Cairn was closed, and the old
+    // shape — gated on in-flight siblings, gated again on the tip having moved —
+    // meant a restart could not heal it either.
+    reconcile_store_default_bookmark(
+        orch,
+        db,
+        &project.id,
+        repo_path,
+        &project.default_branch,
+        &ctx,
+    )
+    .await;
+
     let after = {
-        let store_guard = orch
+        let _store_guard = orch
             .acquire_jj_store_lock(
                 &store,
                 format!(
-                    "startup remote advance import on {}",
+                    "startup remote advance snapshot on {}",
                     project.default_branch
                 ),
             )
             .await;
-        let _phase = store_guard.phase("git ref import");
-        if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path) {
-            log::warn!(
-                "startup remote advance on {}: ensure store failed after fetch: {error}",
-                project.default_branch
-            );
-            return Ok(());
-        }
         crate::jj::revset_commit(&jj, &store, &remote_default)
     };
     if before == after {
-        log::debug!(
-            "startup remote advance on {}: origin tip unchanged; skipping sibling reconcile",
-            project.default_branch
-        );
+        log::debug!("{ctx}: origin tip unchanged; skipping sibling reconcile");
         return Ok(());
     }
     if after.is_none() {
-        log::debug!(
-            "startup remote advance on {}: origin tip did not resolve after fetch; skipping",
-            project.default_branch
-        );
+        log::debug!("{ctx}: origin tip did not resolve after fetch; skipping");
+        return Ok(());
+    }
+
+    let siblings =
+        load_sibling_jobs(db, &project.id, &project.default_branch, EXCLUDE_NONE).await?;
+    if siblings.is_empty() {
+        log::debug!("{ctx}: no in-flight siblings to reconcile");
         return Ok(());
     }
 
     let notes = BaseAdvanceNotes {
         conflict: build_external_advance_conflict_note(&project.default_branch),
         clean: build_external_advance_clean_note(&project.default_branch),
+        incoming: IncomingIdentity {
+            base_branch: project.default_branch.clone(),
+            ..IncomingIdentity::default()
+        },
     };
     reconcile_base_advance(
         orch,
@@ -834,7 +1047,7 @@ fn project_has_origin(orch: &Orchestrator, repo_path: &Path) -> bool {
 }
 
 /// Shared reconcile body for both base-advance paths (Cairn merge and external
-/// default-branch advance): build the `(branch, workspace)` specs, snapshot each
+/// default-branch advance): build the branch specs, snapshot each
 /// sibling's pre-reconcile commit id, run the non-blocking auto-rebase onto
 /// `rebase_dest`, then notify each sibling this reconcile actually rewrote — a
 /// **waking** `Steer` note for a conflicted sibling (resolve the markers), a
@@ -948,18 +1161,10 @@ async fn execute_durable_reconcile_work(
     let siblings = load_sibling_jobs(db, &project_id, &work.target_branch, EXCLUDE_NONE).await?;
     let specs = siblings
         .iter()
-        .filter_map(|sibling| {
-            Some((
-                sibling_branch(sibling)?,
-                std::path::PathBuf::from(&sibling.worktree_path),
-            ))
-        })
+        .filter_map(sibling_branch)
         .collect::<Vec<_>>();
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let candidate_names = specs
-        .iter()
-        .map(|(branch, _)| branch.clone())
-        .collect::<Vec<_>>();
+    let candidate_names = specs.to_vec();
     let existing_bookmarks =
         crate::jj::query_local_bookmarks(&jj, &work.store, &candidate_names).ok();
     let external = work
@@ -974,6 +1179,13 @@ async fn execute_durable_reconcile_work(
     let notes = BaseAdvanceNotes {
         conflict: build_jj_conflict_note(&work.target_branch, None, None),
         clean: build_jj_clean_note(&work.target_branch, None, None),
+        // A durable retry resumes work whose original trigger is no longer in
+        // hand, so the session records the base it is landing on and nothing it
+        // cannot vouch for.
+        incoming: IncomingIdentity {
+            base_branch: work.target_branch.clone(),
+            ..IncomingIdentity::default()
+        },
     };
     let label = format!("durable retry on {}", work.target_branch);
     execute_reconcile_claim(
@@ -1019,7 +1231,93 @@ pub(crate) async fn sweep_reconcile_intents(orch: &Orchestrator) {
                 break;
             }
         }
+        retry_pending_materializations(orch, &db).await;
     }
+}
+
+/// Re-attempt marker materializations left pending, typically because the
+/// executor holding the checkout was unreachable at conflict time.
+///
+/// Pending is deliberately a state rather than a silent failure: the wake told
+/// the agent markers were not confirmed, and this is what eventually makes that
+/// sentence change. A session whose markers land here is not re-notified — the
+/// agent already has the coordinates and the resource — so this only upgrades
+/// what `cairn:~/rebase` reports.
+async fn retry_pending_materializations(orch: &Orchestrator, db: &LocalDb) {
+    let pending = match load_pending_materializations(db).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            log::warn!("could not enumerate pending marker materializations: {error}");
+            return;
+        }
+    };
+    for (intent_id, bookmark) in pending {
+        let session =
+            match crate::orchestrator::conflict_session::load_active_session(db, &bookmark).await {
+                Ok(Some(session)) if session.intent_id == intent_id => session,
+                // The session closed or was superseded while this was queued. There
+                // is nothing left to mark, and marking it would be scaffolding for a
+                // merge nobody will perform.
+                Ok(_) => continue,
+                Err(error) => {
+                    log::warn!("could not reload pending session for {bookmark}: {error}");
+                    continue;
+                }
+            };
+        let diagnostic = crate::jj::ConflictDiagnostic {
+            base: session.base.clone(),
+            ours: session.ours.clone(),
+            theirs: session.theirs.clone(),
+            conflicted_tip: session.conflicted_tip.clone(),
+            condition: Default::default(),
+            incoming: session
+                .files
+                .iter()
+                .filter(|file| file.is_conflicting())
+                .map(|file| crate::jj::IncomingFile {
+                    path: file.path.clone(),
+                    status: file.status.clone(),
+                    classification: crate::jj::IncomingClassification::Conflicting,
+                })
+                .collect(),
+        };
+        let (state, marker_diagnostic, dispositions) =
+            materialize_markers_for_branch(orch, db, &session.project_id, &bookmark, &diagnostic)
+                .await;
+        if let Err(error) = record_marker_state(
+            db,
+            &intent_id,
+            &bookmark,
+            state,
+            marker_diagnostic.as_deref(),
+            &dispositions,
+        )
+        .await
+        {
+            log::warn!("could not record retried marker state for {bookmark}: {error}");
+        }
+    }
+}
+
+async fn load_pending_materializations(db: &LocalDb) -> Result<Vec<(String, String)>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT intent_id, bookmark FROM jj_reconcile_items
+                     WHERE marker_state = 'pending' AND resolution_state = 'open'",
+                    (),
+                )
+                .await?;
+            let mut pending = Vec::new();
+            while let Some(row) = rows.next().await? {
+                pending.push((row.text(0)?, row.text(1)?));
+            }
+            Ok(pending)
+        })
+    })
+    .await
+    .map_err(|error| format!("load pending materializations: {error}"))
 }
 
 async fn claim_reconcile_intent(
@@ -1181,7 +1479,6 @@ async fn reconcile_item_status(
 struct ReconcileItemUpdate<'a> {
     intent_id: &'a str,
     bookmark: &'a str,
-    workspace_path: &'a Path,
     observed_tip: Option<&'a str>,
     status: &'a str,
     failure_kind: Option<&'a str>,
@@ -1193,11 +1490,10 @@ struct ReconcileItemUpdate<'a> {
 async fn persist_reconcile_item(db: &LocalDb, item: ReconcileItemUpdate<'_>) -> Result<(), String> {
     db.execute(
         "INSERT INTO jj_reconcile_items
-         (intent_id, bookmark, workspace_path, observed_tip, status, failure_kind,
+         (intent_id, bookmark, observed_tip, status, failure_kind,
           outcome_kind, suppression_fingerprint, last_diagnostic, attempt_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)
          ON CONFLICT(intent_id, bookmark) DO UPDATE SET
-           workspace_path = excluded.workspace_path,
            observed_tip = excluded.observed_tip,
            status = excluded.status,
            failure_kind = excluded.failure_kind,
@@ -1209,7 +1505,6 @@ async fn persist_reconcile_item(db: &LocalDb, item: ReconcileItemUpdate<'_>) -> 
         params![
             item.intent_id,
             item.bookmark,
-            item.workspace_path.to_string_lossy().as_ref(),
             item.observed_tip,
             item.status,
             item.failure_kind,
@@ -1258,13 +1553,7 @@ async fn reconcile_base_advance(
     siblings: Vec<SiblingJob>,
     notes: BaseAdvanceNotes,
 ) -> Result<BranchAdvanceOutcome, String> {
-    let specs: Vec<(String, std::path::PathBuf)> = siblings
-        .iter()
-        .filter_map(|sibling| {
-            let branch = sibling_branch(sibling)?;
-            Some((branch, std::path::PathBuf::from(&sibling.worktree_path)))
-        })
-        .collect();
+    let specs: Vec<String> = siblings.iter().filter_map(sibling_branch).collect();
     if specs.is_empty() {
         log::debug!("jj base advance ({label}): no in-flight siblings with a branch to reconcile");
         return Ok(BranchAdvanceOutcome::default());
@@ -1284,10 +1573,7 @@ async fn reconcile_base_advance(
         let pinned_dest = crate::jj::revset_commit(&jj, &store, rebase_dest).ok_or_else(|| {
             format!("jj base advance ({label}): destination `{rebase_dest}` did not resolve")
         })?;
-        let candidate_names = specs
-            .iter()
-            .map(|(branch, _)| branch.clone())
-            .collect::<Vec<_>>();
+        let candidate_names = specs.to_vec();
         // Failure deliberately falls back to processing every candidate so a
         // read optimization can never become a liveness gate.
         let bookmarks = crate::jj::query_local_bookmarks(&jj, &store, &candidate_names).ok();
@@ -1355,6 +1641,171 @@ async fn reconcile_base_advance(
     })
 }
 
+/// The sanctioned store-side replay: ask the shared jj store to move one
+/// branch's ancestry onto the base it is supposed to sit on.
+///
+/// This is the only surface that can do it. An agent's slot is a plain git
+/// worktree whose refs are downstream EXPORTS of the runner's private jj store,
+/// so no ref move made there survives — which is why the request is enqueued as
+/// durable reconcile work rather than run in the caller's slot. It reuses the
+/// whole existing path: per-store lock, pinned-destination validation, intent
+/// lease, rollback on conflict, verified export, residency refresh.
+///
+/// It is needed after EVERY content conflict, not only under a base-drift
+/// classification. Resolving the conflicting files with ordinary writes fixes the
+/// branch's content; its ancestry is still rooted at the old base, because the
+/// rebase was rolled back and nothing replays it afterwards.
+pub(crate) async fn request_branch_replay(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    branch: &str,
+    expected_fingerprint: Option<&str>,
+) -> Result<String, String> {
+    let session = crate::orchestrator::conflict_session::load_active_session(db, branch)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "There is no open rebase session for `{branch}`, so there is nothing to replay."
+            )
+        })?;
+    // A request quoting coordinates that have since moved was composed against a
+    // view of the world that no longer holds. Refuse and hand back the current
+    // one rather than acting on the stale intent.
+    if let Some(expected) = expected_fingerprint {
+        let current = session.fingerprint();
+        if expected != current {
+            return Err(format!(
+                "This rebase session has moved on: you named fingerprint `{expected}`, but it is \
+                 now `{current}`. Re-read cairn:~/rebase and request the replay again."
+            ));
+        }
+    }
+
+    let project = load_replay_project(db, job_id).await?;
+    let base_branch = if session.incoming.base_branch.is_empty() {
+        session.target_branch.clone()
+    } else {
+        session.incoming.base_branch.clone()
+    };
+    let siblings = vec![SiblingJob {
+        id: job_id.to_string(),
+        branch: Some(branch.to_string()),
+        base_commit: project.base_commit.clone(),
+    }];
+
+    // Resolve the CURRENT head of the base, not the destination this session was
+    // opened against: the request is to land on the base as it is now.
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&project.repo_path));
+    let destination = {
+        let guard = orch
+            .acquire_jj_store_lock(&store, format!("replay request for {branch}"))
+            .await;
+        let _phase = guard.phase(format!("resolve replay destination branch={branch}"));
+        crate::jj::revset_commit(&jj, &store, &base_branch)
+            .ok_or_else(|| format!("Base `{base_branch}` did not resolve to a commit."))?
+    };
+    reopen_reconcile_intent(db, &store, &base_branch, &destination, branch).await?;
+
+    let notes = BaseAdvanceNotes {
+        conflict: build_jj_conflict_note(&base_branch, session.incoming.pr_number, None),
+        clean: build_jj_clean_note(&base_branch, session.incoming.pr_number, None),
+        incoming: session.incoming.clone(),
+    };
+    reconcile_base_advance(
+        orch,
+        db,
+        &project.id,
+        &format!("replay requested for {branch}"),
+        &project.repo_path,
+        &base_branch,
+        &base_branch,
+        siblings,
+        notes,
+    )
+    .await?;
+
+    Ok(format!(
+        "Queued a store-side replay of `{branch}` onto `{base_branch}` at `{destination}`. The \
+         durable reconcile worker performs it under the store lock; nothing runs in your slot. A \
+         clean replay publishes your branch, refreshes your checkout, and closes this session. A \
+         replay that still conflicts leaves your branch untouched and refreshes cairn:~/rebase \
+         with fresh coordinates."
+    ))
+}
+
+struct ReplayProject {
+    id: String,
+    repo_path: String,
+    base_commit: Option<String>,
+}
+
+async fn load_replay_project(db: &LocalDb, job_id: &str) -> Result<ReplayProject, String> {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT p.id, p.repo_path, j.base_commit
+                     FROM jobs j JOIN projects p ON j.project_id = p.id
+                     WHERE j.id = ?1 LIMIT 1",
+                    params![job_id],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            Ok(Some(ReplayProject {
+                id: row.text(0)?,
+                repo_path: row.text(1)?,
+                base_commit: row.opt_text(2)?,
+            }))
+        })
+    })
+    .await
+    .map_err(|error| format!("load replay project: {error}"))?
+    .ok_or_else(|| "This node has no project repository to replay against.".to_string())
+}
+
+/// Re-open an intent an earlier pass already finished, so an explicitly
+/// requested replay is not swallowed as a duplicate.
+///
+/// Coalescing exists to stop AUTOMATIC work piling up at one destination. An
+/// agent asking for a replay is not that: it is a new fact about the branch —
+/// usually that a content conflict has just been resolved — and landing on the
+/// same destination is exactly the point.
+async fn reopen_reconcile_intent(
+    db: &LocalDb,
+    store: &Path,
+    target_branch: &str,
+    destination: &str,
+    bookmark: &str,
+) -> Result<(), String> {
+    let store = store.to_string_lossy().into_owned();
+    db.execute(
+        "UPDATE jj_reconcile_intents
+         SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL
+         WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3
+           AND status = 'completed'",
+        params![store.as_str(), target_branch, destination],
+    )
+    .await
+    .map_err(|error| format!("reopen reconcile intent: {error}"))?;
+    db.execute(
+        "UPDATE jj_reconcile_items SET status = 'pending', notification_sent = 0
+         WHERE bookmark = ?1 AND intent_id IN (
+             SELECT id FROM jj_reconcile_intents
+             WHERE store_path = ?2 AND target_branch = ?3 AND destination_commit = ?4
+         )",
+        params![bookmark, store.as_str(), target_branch, destination],
+    )
+    .await
+    .map_err(|error| format!("reopen reconcile item: {error}"))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_reconcile_claim(
     orch: &Orchestrator,
@@ -1365,7 +1816,7 @@ async fn execute_reconcile_claim(
     rebase_dest: &str,
     siblings: Vec<SiblingJob>,
     notes: BaseAdvanceNotes,
-    specs: Vec<(String, std::path::PathBuf)>,
+    specs: Vec<String>,
     existing_bookmarks: Option<std::collections::HashSet<String>>,
     pinned_dest: String,
     claim: ReconcileClaim,
@@ -1387,13 +1838,13 @@ async fn execute_reconcile_claim(
     }
 
     let mut ambiguous: Vec<AmbiguousDivergence> = Vec::new();
+    let mut marker_states: HashMap<String, MarkerState> = HashMap::new();
     let mut pending_quarantines: Vec<PendingReconcileQuarantine> = Vec::new();
     let mut before: HashMap<String, String> = HashMap::new();
     let mut after: HashMap<String, String> = HashMap::new();
     let mut report = crate::jj::ReconcileReport::default();
-    let origin_presence = crate::jj::discover_origin_presence(&jj, &store);
 
-    for (branch, workspace_path) in &specs {
+    for branch in &specs {
         heartbeat_reconcile_intent(db, &claim).await?;
         let progress = reconcile_item_status(db, intent_id, branch).await?;
         if progress.as_ref().is_some_and(|progress| {
@@ -1433,7 +1884,6 @@ async fn execute_reconcile_claim(
                     ReconcileItemUpdate {
                         intent_id,
                         bookmark: branch,
-                        workspace_path,
                         observed_tip: current_tip.as_deref(),
                         status: "suppressed",
                         failure_kind: Some(&existing.failure_kind),
@@ -1477,11 +1927,9 @@ async fn execute_reconcile_claim(
             match progress.outcome_kind.as_deref() {
                 Some("conflicted") => resumed.conflicted.push(branch.clone()),
                 Some("rebased_clean") => resumed.rebased_clean.push(branch.clone()),
-                Some("preserved_dirty") => resumed.preserved_dirty.push(branch.clone()),
                 Some("silent") => resumed.silent.push(branch.clone()),
                 Some("failed") => resumed.failed.push(crate::jj::ReconcileFailure {
                     branch: branch.clone(),
-                    workspace_path: workspace_path.clone(),
                     error: progress
                         .failure_kind
                         .clone()
@@ -1539,7 +1987,7 @@ async fn execute_reconcile_claim(
             let item_report = if ambiguous_item.is_some() {
                 crate::jj::ReconcileReport::default()
             } else {
-                let item = vec![(branch.clone(), workspace_path.clone())];
+                let item = vec![branch.clone()];
                 crate::jj::reconcile_siblings_without_publication(&jj, &store, &pinned_dest, &item)
                     .map_err(|error| format!("jj sibling reconcile ({label}) failed: {error}"))?
             };
@@ -1572,7 +2020,6 @@ async fn execute_reconcile_claim(
                 ReconcileItemUpdate {
                     intent_id,
                     bookmark: branch,
-                    workspace_path,
                     observed_tip: current_tip.as_deref(),
                     status: "suppressed",
                     failure_kind: Some("ambiguous_divergence"),
@@ -1596,61 +2043,48 @@ async fn execute_reconcile_claim(
 
         // Origin transfer and durable lineage persistence are deliberately
         // outside the jj mutex.
-        let publish = (item_report.rebased_clean.contains(branch)
-            || item_report.preserved_dirty.contains(branch))
-            && !item_report.silent.contains(branch);
+        let publish =
+            item_report.rebased_clean.contains(branch) && !item_report.silent.contains(branch);
         if publish {
-            if let Err(error) =
-                crate::jj::publish_reconciled_bookmark(&jj, &store, branch, origin_presence)
-            {
+            if let Err(error) = publish_managed_branch(orch, &store, branch).await {
                 item_report
                     .rebased_clean
                     .retain(|candidate| candidate != branch);
-                item_report
-                    .preserved_dirty
-                    .retain(|candidate| candidate != branch);
                 item_report.failed.push(crate::jj::ReconcileFailure {
                     branch: branch.clone(),
-                    workspace_path: workspace_path.clone(),
                     error: format!("origin push failed: {error}"),
                 });
             }
         }
-        let touched = item_report.rebased_clean.contains(branch)
-            || item_report.conflicted.contains(branch)
-            || item_report.preserved_dirty.contains(branch);
+        // Bookkeeping that could not be persisted does not change what the
+        // graph did. The branch keeps its real classification and its agent
+        // keeps whatever notification that classification earned; the
+        // unpersisted coordinate is recorded on the reconcile item and logged
+        // for the operator, and reaches nobody else.
+        let mut internal_diagnostic: Option<String> = None;
+        let touched =
+            item_report.rebased_clean.contains(branch) || item_report.conflicted.contains(branch);
         if touched {
             if let Some(sibling) = siblings
                 .iter()
                 .find(|candidate| sibling_branch(candidate).as_deref() == Some(branch.as_str()))
             {
-                if let Err(error) =
-                    advance_sibling_durable_base(db, &jj, &store, sibling, &pinned_dest).await
-                {
-                    item_report
-                        .rebased_clean
-                        .retain(|candidate| candidate != branch);
-                    item_report
-                        .conflicted
-                        .retain(|candidate| candidate != branch);
-                    item_report
-                        .preserved_dirty
-                        .retain(|candidate| candidate != branch);
-                    item_report.silent.retain(|candidate| candidate != branch);
-                    item_report.failed.push(crate::jj::ReconcileFailure {
-                        branch: branch.clone(),
-                        workspace_path: workspace_path.clone(),
-                        error: format!("durable base advancement failed: {error}"),
-                    });
+                if let Err(error) = advance_sibling_durable_base(db, sibling, &pinned_dest).await {
+                    log::warn!(
+                        "jj reconcile ({label}): durable base advancement for {branch} did not \
+                         persist: {error}"
+                    );
+                    internal_diagnostic = Some(format!("durable base advancement failed: {error}"));
                 }
             }
         }
 
-        let item_diagnostic = item_report
+        let reported_failure = item_report
             .failed
             .iter()
             .find(|failure| failure.branch == *branch)
             .map(|failure| failure.error.as_str());
+        let item_diagnostic = reported_failure.or(internal_diagnostic.as_deref());
         let failure_kind = item_diagnostic.map(crate::jj::reconcile_failure_kind);
         let permanent = failure_kind.is_some_and(crate::jj::reconcile_failure_is_permanent);
         let quarantine_fingerprint = after
@@ -1677,14 +2111,12 @@ async fn execute_reconcile_claim(
                 failure_kind.unwrap_or("unknown")
             )
         });
-        let outcome_kind = if item_diagnostic.is_some() {
+        let outcome_kind = if reported_failure.is_some() {
             "failed"
         } else if item_report.conflicted.contains(branch) {
             "conflicted"
         } else if item_report.rebased_clean.contains(branch) {
             "rebased_clean"
-        } else if item_report.preserved_dirty.contains(branch) {
-            "preserved_dirty"
         } else if item_report.silent.contains(branch) {
             "silent"
         } else {
@@ -1695,7 +2127,6 @@ async fn execute_reconcile_claim(
             ReconcileItemUpdate {
                 intent_id,
                 bookmark: branch,
-                workspace_path,
                 observed_tip: after
                     .get(branch)
                     .or_else(|| before.get(branch))
@@ -1715,14 +2146,43 @@ async fn execute_reconcile_claim(
         )
         .await?;
 
+        // A conflicted branch opens (or refreshes) a durable resolution session,
+        // then — and only then — markers are projected into its checkout. The
+        // order matters: the session row must exist before the diagnostic can
+        // land on it, and the marker state must be recorded from what the
+        // executor confirmed before any wake is composed.
+        if let Some(diagnostic) = item_report.conflict_diagnostics.get(branch) {
+            record_conflict_session(db, intent_id, branch, diagnostic, &notes.incoming).await?;
+            supersede_stale_sessions(db, branch, intent_id).await?;
+            let (state, marker_diagnostic, dispositions) =
+                materialize_markers_for_branch(orch, db, &claim.project_id, branch, diagnostic)
+                    .await;
+            record_marker_state(
+                db,
+                intent_id,
+                branch,
+                state,
+                marker_diagnostic.as_deref(),
+                &dispositions,
+            )
+            .await?;
+            marker_states.insert(branch.clone(), state);
+        } else if item_report.rebased_clean.contains(branch) {
+            // The branch absorbed the incoming change, so whatever session it had
+            // is genuinely finished. This is the only truthful close: an ordinary
+            // commit resolves CONTENT, but a branch is not reconciled until its
+            // ancestry actually moves, which is exactly what just happened.
+            close_open_sessions_for_branch(db, branch).await?;
+        }
+
         report.rebased_clean.append(&mut item_report.rebased_clean);
         report.conflicted.append(&mut item_report.conflicted);
-        report
-            .preserved_dirty
-            .append(&mut item_report.preserved_dirty);
         report.silent.append(&mut item_report.silent);
         report.held.append(&mut item_report.held);
         report.failed.append(&mut item_report.failed);
+        report
+            .conflict_diagnostics
+            .extend(std::mem::take(&mut item_report.conflict_diagnostics));
         heartbeat_reconcile_intent(db, &claim).await?;
         tokio::task::yield_now().await;
     }
@@ -1758,46 +2218,57 @@ async fn execute_reconcile_claim(
     )
     .await?;
 
-    // Re-read each touched sibling's commit id AFTER the rebase — conflicted and
-    // cleanly-rebased alike — so we notify only the ones whose commit actually
-    // changed (a no-op double-fire leaves it equal).
+    // Re-read each cleanly-rebased sibling's commit id AFTER the rebase, so we
+    // notify only the ones whose commit actually changed (a no-op double-fire
+    // leaves it equal). Conflicted siblings are deliberately absent: their rebase
+    // was rolled back, so their commit is unchanged BY DESIGN and the same test
+    // would mean the opposite thing.
     let after: HashMap<String, String> = report
-        .conflicted
+        .rebased_clean
         .iter()
-        .chain(report.rebased_clean.iter())
         .filter_map(|branch| {
             crate::jj::bookmark_commit(&jj, &store, branch).map(|commit| (branch.clone(), commit))
         })
         .collect();
 
-    // Conflicted siblings: a conflicted commit can never push, so the sibling
-    // is steered to resolve the markers and re-seal. Idle recipients wake;
-    // active recipients receive it at the next tool boundary without cancellation.
-    let conflicted_rewritten = siblings_rewritten(&report.conflicted, &before, &after);
-    if conflicted_rewritten.is_empty() {
-        log::debug!("jj reconcile ({label}): conflicts unchanged since a prior reconcile; no redundant wake");
+    // Conflicted siblings are notified WITHOUT the rewritten filter, deliberately.
+    // A conflicting rebase is now rolled back, so the branch's commit is exactly
+    // what it was — the very condition `siblings_rewritten` reads as "nothing
+    // happened". Filtering here would silence every conflict this reconcile found.
+    // Redundancy is instead handled where it belongs: the delivery key is scoped
+    // to this intent, so a resumed or double-fired reconcile at the same dest
+    // cannot re-wake the agent, while a genuinely new base advance (a new intent)
+    // correctly does.
+    if report.conflicted.is_empty() {
+        log::debug!("jj reconcile ({label}): no sibling conflicted with the advanced base");
     } else {
-        // Enumerate the conflicting files per branch here, where the jj env and
-        // store are already resolved and each sibling's worktree path is in hand.
-        // Keeping the jj call out of `notify_conflicted_siblings` leaves that
-        // function pure and unit-testable with a synthetic file map.
-        let files_by_branch: HashMap<String, Vec<String>> = conflicted_rewritten
-            .iter()
-            .filter_map(|branch| {
-                let sibling = siblings
-                    .iter()
-                    .find(|sibling| sibling_branch(sibling).as_deref() == Some(branch.as_str()))?;
-                let files = crate::jj::conflicted_files(&jj, Path::new(&sibling.worktree_path));
-                Some((branch.clone(), files))
-            })
-            .collect();
+        // The conflicting files come from the reconcile report, captured inside
+        // the rebase before it was rolled back. Nothing can enumerate them here:
+        // the branch is clean again by now, so a fresh probe would report none.
+        // (The old probe was worse than useless — `conflicted_files` runs
+        // `jj resolve --list`, which is working-copy scoped, so aimed at the bare
+        // store it answered for the store's scratch `@` rather than the sibling.)
+        let evidence = ConflictEvidence {
+            diagnostics: report
+                .conflicted
+                .iter()
+                .filter_map(|branch| {
+                    siblings.iter().find(|sibling| {
+                        sibling_branch(sibling).as_deref() == Some(branch.as_str())
+                    })?;
+                    let diagnostic = report.conflict_diagnostics.get(branch).cloned()?;
+                    Some((branch.clone(), diagnostic))
+                })
+                .collect(),
+            marker_states,
+        };
         notify_conflicted_siblings(
             orch,
             db,
             &siblings,
-            &conflicted_rewritten,
+            &report.conflicted,
             &notes.conflict,
-            &files_by_branch,
+            &evidence,
             intent_id,
         )?;
     }
@@ -1824,18 +2295,19 @@ async fn execute_reconcile_claim(
     mark_reconcile_delivered(db, intent_id).await?;
 
     let retry_transient = reconcile_has_transient_failures(&report.failed);
-    // Fan a terminal-checkout refresh out to every sibling this reconcile actually
-    // rewrote. A running terminal on a rebased job branch must follow its workspace
-    // to the new tip (conflicted or clean alike) or it keeps serving pre-rebase
-    // source. This is the sibling analogue of the advanced-branch fan-out
-    // `reconcile_managed_branch_advance` performs, and it reaches every caller of
+    // Fan a lifetime-cell refresh out to every sibling this reconcile actually
+    // rewrote. A running cell on a rebased job branch must follow the logical
+    // coordinate to the new tip or it keeps serving pre-rebase source. This is the
+    // sibling analogue of the advanced-branch fan-out, and reaches every caller of
     // this shared body — including the external and startup default-advance paths
     // that previously skipped it. The store lock is released by now.
+    // Only cleanly-rebased siblings moved; a conflicted sibling was rolled back to
+    // the coordinate its cells already hold, so there is nothing to follow.
     let mut terminal_failed = 0;
-    for branch in conflicted_rewritten.iter().chain(clean_rewritten.iter()) {
+    for branch in clean_rewritten.iter() {
         if let Some(new_tip) = after.get(branch) {
             terminal_failed +=
-                refresh_terminal_leases_for_branch(orch, db, project_id, branch, new_tip).await;
+                refresh_residencies_for_branch(orch, db, project_id, branch, new_tip).await;
         }
     }
 
@@ -1843,7 +2315,7 @@ async fn execute_reconcile_claim(
     Ok(BranchAdvanceOutcome {
         eligible: siblings.len(),
         rebased_clean: clean_rewritten.len(),
-        conflicted: conflicted_rewritten.len(),
+        conflicted: report.conflicted.len(),
         failed: report.failed.len() + terminal_failed,
     })
 }
@@ -1854,160 +2326,59 @@ async fn execute_reconcile_claim(
 /// so the commit id is unchanged → the branch is filtered out and not re-notified
 /// (conflicted or clean). When either snapshot is missing (an unexpected resolve
 /// failure), notify conservatively rather than silently dropping a real change.
+/// Record where a sibling's branch now sits after this reconcile rebased it.
+///
+/// `jobs.base_commit` is a **record of where a branch was last anchored**, not a
+/// coordinate any surface resolves against: every reader that presents or acts
+/// on a base coordinate derives it live from the store (CAIRN-3224). What is
+/// left of the row is archival — a seed for `pack_anchor` and a degraded
+/// fallback — and archival values do not need ordering.
+///
+/// This deliberately does not compare-and-swap, because the CAS it replaces
+/// never provided ordering to begin with (CAIRN-3226). Its lost-race branch
+/// re-read the row and then swapped against whatever it found, writing this
+/// call's value unconditionally: two reconciles racing on one job always ended
+/// with the later writer's value, exactly as a plain write does. The ceremony
+/// bought nothing and cost two real things — a null row aborted the write with a
+/// manufactured error, and a doubly-lost race produced an operator-facing
+/// diagnostic for a non-event, the same shape that turned zero-delta planner
+/// branches into ⛔ BLOCKING directs (CAIRN-3094 comment #4).
+///
+/// A write that matches no row means the job was deleted mid-reconcile. That is
+/// the graph moving on, not a failure of this bookkeeping, so it is logged and
+/// swallowed.
 async fn advance_sibling_durable_base(
     db: &LocalDb,
-    jj: &crate::jj::JjEnv,
-    store: &Path,
     sibling: &SiblingJob,
     new_base: &str,
 ) -> Result<(), String> {
-    let mut recorded_base = sibling.base_commit.clone().ok_or_else(|| {
-        format!(
-            "job {} has no recorded base_commit; cannot advance to {new_base}",
-            sibling.id
-        )
-    })?;
-    let worktree = Path::new(&sibling.worktree_path);
-    let mut marker = crate::jj::read_workspace_identity(worktree).ok_or_else(|| {
-        format!(
-            "workspace {} has no .jj/cairn-workspace-identity marker (recorded base {recorded_base}, new base {new_base})",
-            sibling.worktree_path
-        )
-    })?;
-    if marker.project_id.is_empty() || marker.worktree_path != worktree {
-        return Err(format!(
-            "workspace identity coordinate mismatch for job {}: marker owner={}, path={}; expected path={}; refused base {new_base}",
-            sibling.id,
-            marker.owner_job_id,
-            marker.worktree_path.display(),
-            sibling.worktree_path,
-        ));
-    }
-
-    // A pending marker is authoritative. Complete it before considering a
-    // finalized mismatch, including a normalization interrupted before the later
-    // transition to this invocation's target.
-    if let Some(pending) = marker.pending_base_transition.clone() {
-        if marker.base_commit != pending.old_base && marker.base_commit != pending.new_base {
-            return Err(format!(
-                "pending base transition {} -> {} disagrees with marker base {}",
-                pending.old_base, pending.new_base, marker.base_commit
-            ));
-        }
-        if recorded_base != pending.old_base && recorded_base != pending.new_base {
-            return Err(format!(
-                "database base {recorded_base} is neither endpoint of pending base transition {} -> {}",
-                pending.old_base, pending.new_base
-            ));
-        }
-        crate::execution::jobs::workspace_identity::apply_base_transition(
-            db,
-            worktree,
-            &mut marker,
-            &pending.old_base,
-            &pending.new_base,
-        )
-        .await?;
-        recorded_base = pending.new_base;
-    }
-
-    if marker.base_commit != recorded_base {
-        let lineage = crate::jj::classify_durable_base_lineage(
-            jj,
-            store,
-            &marker.base_commit,
-            &recorded_base,
-            new_base,
-        );
-        if !lineage.repairable() {
-            return Err(durable_base_mismatch_diagnostic(
-                sibling,
-                &marker.owner_job_id,
-                &marker.base_commit,
-                &recorded_base,
-                new_base,
-                &lineage,
-            ));
-        }
-        let chosen = lineage.newer_base.clone().ok_or_else(|| {
-            durable_base_mismatch_diagnostic(
-                sibling,
-                &marker.owner_job_id,
-                &marker.base_commit,
-                &recorded_base,
-                new_base,
-                &lineage,
-            )
-        })?;
-        log::warn!(
-            "self-healing durable base mismatch: workspace={}, owner_job={}, marker_base={}, database_base={}, resolved_marker={}, resolved_database={}, chosen_base={}, target={}, relationship={}",
-            sibling.worktree_path,
-            sibling.id,
-            marker.base_commit,
-            recorded_base,
-            lineage.marker_resolved().unwrap_or("unresolved"),
-            lineage.database_resolved().unwrap_or("unresolved"),
-            chosen,
-            new_base,
-            lineage.relationship.label(),
-        );
-
-        if marker.base_commit != chosen {
-            marker.pending_base_transition = Some(crate::jj::WorkspaceBaseTransition {
-                old_base: marker.base_commit.clone(),
-                new_base: chosen.clone(),
-            });
-            crate::jj::write_workspace_identity(worktree, &marker)?;
-            marker.base_commit = chosen.clone();
-            marker.pending_base_transition = None;
-            crate::jj::write_workspace_identity(worktree, &marker)?;
-        }
-        if recorded_base != chosen {
-            crate::execution::jobs::workspace_identity::apply_base_transition(
-                db,
-                worktree,
-                &mut marker,
-                &recorded_base,
-                &chosen,
-            )
-            .await?;
-        }
-        recorded_base = chosen;
-    }
-
-    if recorded_base == new_base && marker.base_commit == new_base {
+    if sibling.base_commit.as_deref() == Some(new_base) {
         return Ok(());
     }
-    crate::execution::jobs::workspace_identity::apply_base_transition(
-        db,
-        worktree,
-        &mut marker,
-        &recorded_base,
-        new_base,
-    )
-    .await
-}
-
-fn durable_base_mismatch_diagnostic(
-    sibling: &SiblingJob,
-    owner_job_id: &str,
-    marker_base: &str,
-    database_base: &str,
-    target: &str,
-    lineage: &crate::jj::DurableBaseLineage,
-) -> String {
-    let resolution = |resolved: Option<&str>, on_target: bool| match resolved {
-        Some(commit) => format!("resolved={commit}, ancestor_or_equal_to_target={on_target}"),
-        None => "resolved=false, ancestor_or_equal_to_target=false".to_string(),
-    };
-    format!(
-        "durable base lineage mismatch for managed workspace {} (owner job {}): marker={marker_base} [{}]; database={database_base} [{}]; target={target}; relationship={}. Inspect these commits and confirm the workspace assignment, then run `cairn:~/workspace-recovery action=rebind` for this workspace. Do not force-push or use a destructive reset; all workspace files were preserved.",
-        sibling.worktree_path,
-        owner_job_id,
-        resolution(lineage.marker_resolved(), lineage.marker_on_target),
-        resolution(lineage.database_resolved(), lineage.database_on_target),
-        lineage.relationship.label(),
-    )
+    let changed = db
+        .execute(
+            "UPDATE jobs SET base_commit = ?2, updated_at = ?3 WHERE id = ?1",
+            params![
+                sibling.id.as_str(),
+                new_base,
+                chrono::Utc::now().timestamp()
+            ],
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "record durable base coordinate for job {}: {error}",
+                sibling.id
+            )
+        })?;
+    if changed == 0 {
+        log::debug!(
+            "jj reconcile: job {} no longer exists; its durable base record was not updated to \
+             {new_base}",
+            sibling.id
+        );
+    }
+    Ok(())
 }
 
 fn siblings_rewritten(
@@ -2036,36 +2407,45 @@ fn siblings_rewritten(
 /// bookmark list failed) disables the filter: proceed with all, liveness over
 /// strictness.
 fn retain_present_siblings(
-    specs: Vec<(String, std::path::PathBuf)>,
+    specs: Vec<String>,
     existing: Option<&std::collections::HashSet<String>>,
-) -> (Vec<(String, std::path::PathBuf)>, usize) {
+) -> (Vec<String>, usize) {
     let Some(existing) = existing else {
         return (specs, 0);
     };
     let total = specs.len();
     let retained: Vec<_> = specs
         .into_iter()
-        .filter(|(branch, _)| existing.contains(branch))
+        .filter(|branch| existing.contains(branch))
         .collect();
     let dropped = total - retained.len();
     (retained, dropped)
 }
 
-/// The sibling's jj bookmark: the job row's `branch`, or the workspace marker.
+/// The sibling's runner-owned logical bookmark.
 fn sibling_branch(sibling: &SiblingJob) -> Option<String> {
-    sibling
-        .branch
-        .clone()
-        .or_else(|| crate::jj::read_branch_marker(Path::new(&sibling.worktree_path)))
+    sibling.branch.clone()
 }
 
-/// The note for a sibling whose auto-rebase recorded a conflict. It carries no
-/// rebase commands — the rebase already happened over the shared store; the agent
-/// only resolves the materialized conflict markers in its workspace, then lets it
-/// re-seal/push. A recorded conflict is STOP-THE-LINE: jj refuses to push or merge
-/// a conflicted commit, so this branch is wedged until it is resolved. Delivered
-/// via a `Steer` system direct that wakes idle agents and lands at the next tool
-/// boundary without stopping an active turn (see `notify_conflicted_siblings`).
+/// The IDENTITY half of the note for a sibling whose auto-rebase could not be
+/// applied cleanly: which base advanced, which PR and issue carried it, and the
+/// fact that the rebase was rolled back.
+///
+/// It deliberately stops short of telling the agent what to do. What to do
+/// depends on the condition the rebase actually found — a content conflict and
+/// base drift call for opposite actions — and that is
+/// [`append_conflict_diagnostic`]'s to say, from evidence, per branch. This half
+/// is the part that is true regardless.
+///
+/// The branch was NOT rebased: a conflicting rebase is rolled back before it can
+/// reach git, so the branch still sits on its own content at its own base, and no
+/// conflict markers exist anywhere — not in the store, not in any cell. That is
+/// what makes this actionable, and it is why the note never asks the agent to
+/// "resolve markers" that were never materialized. It is still STOP-THE-LINE:
+/// until the branch carries the new
+/// base's content, its merge will keep being refused. Delivered via a `Steer`
+/// system direct that wakes idle agents and lands at the next tool boundary
+/// without stopping an active turn (see `notify_conflicted_siblings`).
 fn build_jj_conflict_note(
     base_branch: &str,
     pr_number: Option<i64>,
@@ -2078,7 +2458,7 @@ fn build_jj_conflict_note(
         .map(|issue| format!(" (cairn://p/{}/{})", issue.project_key, issue.number))
         .unwrap_or_default();
     format!(
-        "⛔ BLOCKING [Base branch update] Your base branch `{base_branch}` advanced — {pr_fragment}{issue_fragment}. Your work was auto-rebased onto the new tip over the shared store and the rebase recorded a conflict. This branch cannot push or merge until you resolve it — jj refuses to push a conflicted commit. Resolve the conflict markers in your workspace now, verify build + tests, and re-seal before continuing other work."
+        "⛔ BLOCKING [Base branch update] Your base branch `{base_branch}` advanced — {pr_fragment}{issue_fragment}. The automatic rebase could not be applied cleanly, so it was rolled back: your branch is untouched, on its own content, and nothing was lost. Your work cannot merge until it carries the new base."
     )
 }
 
@@ -2103,38 +2483,24 @@ fn build_jj_clean_note(
     )
 }
 
-/// Advance the workspace(s) ON the merged branch (the Coordinator on its
-/// integration bookmark) onto the freshly-folded tip. The merge fold
-/// (`merge_into_bookmark`) advanced the integration bookmark out from under the
-/// coordinator's `@`; `reconcile_siblings` only rebases the *children* (branched
-/// FROM integration), never the coordinator (whose branch IS integration). Each
-/// matching workspace has its `@` re-parented onto the new tip via
-/// `crate::jj::advance_workspace_onto`. Best-effort and idempotent: a no-op when
-/// `@` already sits on the tip, so it is safe under the merge/webhook
-/// double-fire. A recorded conflict (effectively impossible for an idle
-/// coordinator's empty `@`, but handled defensively) wakes the workspace with a
-/// non-blocking note rather than leaving it idle on a conflicted `@`.
-///
-/// `branch == default_branch` needs no handling here: the workspace on the
-/// default branch is the user's main checkout, refreshed by the default-branch
-/// merge reconcile, and no agent job carries `branch = <default>` (jobs always
-/// branch as `agent/...`), so the on-branch query returns nothing for it.
-async fn advance_on_branch_workspaces(
+/// Validate the runner-owned bookmark that advanced and refresh matching
+/// held cells. Agent jobs have no follower workspace to update.
+async fn refresh_advanced_branch_cells(
     orch: &Orchestrator,
     db: &LocalDb,
     project_id: &str,
     branch: &str,
     repo_path: &str,
 ) {
-    let on_branch = match load_on_branch_workspaces(db, project_id, branch).await {
-        Ok(workspaces) => workspaces,
+    let on_branch = match load_on_branch_jobs(db, project_id, branch).await {
+        Ok(jobs) => jobs,
         Err(error) => {
-            log::warn!("on-branch advance: failed to load workspaces on {branch}: {error}");
+            log::warn!("on-branch advance: failed to load jobs on {branch}: {error}");
             return;
         }
     };
     if on_branch.is_empty() {
-        log::debug!("on-branch advance on {branch}: no in-flight workspace sits on the branch");
+        log::debug!("on-branch advance on {branch}: no in-flight job uses the branch");
         return;
     }
 
@@ -2142,12 +2508,9 @@ async fn advance_on_branch_workspaces(
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
 
     // Collapse a pre-existing divergent twin on the integration bookmark ITSELF
-    // before re-parenting the on-branch coordinator onto it. A divergent dest is
-    // exactly what makes the coordinator's own re-seal trip `sealed_commit_is_lost`,
-    // and `reconcile_siblings` only ever heals the *children*, never the bookmark
-    // the coordinator sits on. A deterministic tangle self-heals; an ambiguous one
-    // interrupts every on-branch workspace and skips the advance — we must not
-    // advance onto an unresolved divergence. Runs under the per-store lock the
+    // before refreshing cells on that coordinate. A deterministic tangle
+    // self-heals; an ambiguous one interrupts every on-branch job and skips the
+    // refresh. Runs under the per-store lock the
     // caller (`reconcile_jj_downstream`) holds across this call.
     match crate::jj::collapse_divergent_bookmark(&jj, &store, branch) {
         Ok(crate::jj::CollapseOutcome::NotDivergent) => {
@@ -2187,12 +2550,12 @@ async fn advance_on_branch_workspaces(
                 return;
             }
             log::warn!(
-                "jj collapse (on-branch {branch}): divergent change {change_id} is ambiguous (twins {}); interrupting the on-branch workspace and skipping the advance",
+                "jj collapse (on-branch {branch}): divergent change {change_id} is ambiguous (twins {}); interrupting on-branch jobs and skipping the refresh",
                 twins.join(", ")
             );
             let mut all_notified = true;
-            for workspace in &on_branch {
-                let Some(run_id) = latest_run_for_job(db, &workspace.id) else {
+            for job in &on_branch {
+                let Some(run_id) = latest_run_for_job(db, &job.id) else {
                     all_notified = false;
                     continue;
                 };
@@ -2212,7 +2575,7 @@ async fn advance_on_branch_workspaces(
                         all_notified = false;
                         log::warn!(
                             "on-branch advance: failed to interrupt {} for ambiguous divergence: {error}",
-                            workspace.id
+                            job.id
                         );
                     }
                 }
@@ -2242,110 +2605,13 @@ async fn advance_on_branch_workspaces(
         return;
     };
 
-    let mut seen = std::collections::HashSet::new();
-    for workspace in &on_branch {
-        // Inheritance fan-out: several jobs can share one worktree path. Advance
-        // each physical workspace once.
-        if !seen.insert(workspace.worktree_path.clone()) {
-            continue;
-        }
-        let Some(ws_branch) = sibling_branch(workspace) else {
-            continue;
-        };
-        // Snapshot the workspace `@` before the advance: `advance_workspace_onto`
-        // is idempotent (a no-op when `@` already sits on the tip), so a
-        // merge/webhook double-fire leaves the commit id unchanged. We notify the
-        // clean case only when `@` actually moved.
-        let before_at = crate::jj::workspace_head_commit(&jj, &store, &ws_branch);
-        match crate::jj::advance_workspace_onto(
-            &jj,
-            &store,
-            Path::new(&workspace.worktree_path),
-            &ws_branch,
-            &dest,
-        ) {
-            Ok(false) => {
-                let after_at = crate::jj::workspace_head_commit(&jj, &store, &ws_branch);
-                // Notify only on a genuine move. A missing snapshot (resolve
-                // failure) falls toward notifying rather than silently dropping it.
-                let moved = match (&before_at, &after_at) {
-                    (Some(b), Some(a)) => b != a,
-                    _ => true,
-                };
-                if moved {
-                    log::info!(
-                        "Advanced on-branch workspace {} onto the {} tip",
-                        workspace.worktree_path,
-                        branch
-                    );
-                    if let Some(run_id) = latest_run_for_job(db, &workspace.id) {
-                        let note = build_on_branch_advance_clean_note(branch);
-                        if let Err(error) =
-                            queue_system_direct(orch, &run_id, &note, DeliveryUrgency::Passive)
-                        {
-                            log::warn!(
-                                "on-branch advance: failed to notify {}: {error}",
-                                workspace.id
-                            );
-                        }
-                    }
-                } else {
-                    log::debug!(
-                        "on-branch advance: workspace {} already on the {} tip; no-op",
-                        workspace.worktree_path,
-                        branch
-                    );
-                }
-            }
-            Ok(true) => {
-                log::warn!(
-                    "on-branch advance of {} recorded a conflict; steering it",
-                    workspace.worktree_path
-                );
-                if let Some(run_id) = latest_run_for_job(db, &workspace.id) {
-                    let note = build_on_branch_advance_conflict_note(branch);
-                    let files =
-                        crate::jj::conflicted_files(&jj, Path::new(&workspace.worktree_path));
-                    let message = append_conflicting_files(&note, Some(&files));
-                    if let Err(error) =
-                        queue_system_direct(orch, &run_id, &message, DeliveryUrgency::Steer)
-                    {
-                        log::warn!(
-                            "on-branch advance: failed to steer {}: {error}",
-                            workspace.id
-                        );
-                    }
-                }
-            }
-            Err(error) => log::warn!(
-                "on-branch advance of {} failed: {error}",
-                workspace.worktree_path
-            ),
-        }
+    let refresh_failures =
+        refresh_residencies_for_branch(orch, db, project_id, branch, &dest).await;
+    if refresh_failures > 0 {
+        log::warn!(
+            "on-branch advance: {refresh_failures} held cell(s) failed to refresh for {branch}"
+        );
     }
-}
-
-/// The note for a workspace ON the advanced branch (the Coordinator) whose
-/// re-parent onto the folded tip recorded a conflict. Like the sibling note it
-/// carries no rebase commands — the advance already happened over the shared
-/// store; the agent only resolves the materialized markers in its workspace. A
-/// recorded conflict is STOP-THE-LINE (jj refuses to push or merge it), delivered
-/// via a `Steer` system direct that wakes idle agents and lands at the next tool
-/// boundary without stopping an active turn.
-fn build_on_branch_advance_conflict_note(branch: &str) -> String {
-    format!(
-        "⛔ BLOCKING [Base branch update] Your branch `{branch}` advanced — a child merged into it. Your workspace was advanced onto the new tip over the shared store and the re-parent recorded a conflict. This branch cannot push or merge until you resolve it — jj refuses to push a conflicted commit. Resolve the conflict markers in your workspace now, verify build + tests, and re-seal before continuing other work."
-    )
-}
-
-/// The clean-advance counterpart to `build_on_branch_advance_conflict_note`: the
-/// workspace ON the advanced branch (the Coordinator) was re-parented onto the
-/// folded tip with no conflict. Needs no action; delivered passively so it rides
-/// along into the agent's next natural run.
-fn build_on_branch_advance_clean_note(branch: &str) -> String {
-    format!(
-        "[Base branch update] Your branch `{branch}` advanced — a child merged into it. Your workspace was advanced cleanly onto the new tip; nothing to resolve. No manual rebase or force-push is needed."
-    )
 }
 
 /// The note for a sibling whose auto-rebase recorded a conflict after the default
@@ -2354,7 +2620,7 @@ fn build_on_branch_advance_clean_note(branch: &str) -> String {
 /// carries no PR number — there is no Cairn-tracked owner for the advance.
 fn build_external_advance_conflict_note(default_branch: &str) -> String {
     format!(
-        "⛔ BLOCKING [Base branch update] Your base branch `{default_branch}` advanced (changes landed outside Cairn). Your work was auto-rebased onto the new tip over the shared store and the rebase recorded a conflict. This branch cannot push or merge until you resolve it — jj refuses to push a conflicted commit. Resolve the conflict markers in your workspace now, verify build + tests, and re-seal before continuing other work."
+        "⛔ BLOCKING [Base branch update] Your base branch `{default_branch}` advanced (changes landed outside Cairn). The automatic rebase could not be applied cleanly, so it was rolled back: your branch is untouched, on its own content, and nothing was lost. Your work cannot merge until it carries the new base."
     )
 }
 
@@ -2368,16 +2634,131 @@ fn build_external_advance_clean_note(default_branch: &str) -> String {
     )
 }
 
-/// Append a `Conflicting files: a, b, c.` line to a conflict note when the file
-/// list is non-empty. An empty or absent list (the enumeration failed or jj
-/// reported none) leaves the note unchanged — the file list is advisory detail.
-fn append_conflicting_files(note: &str, files: Option<&Vec<String>>) -> String {
-    match files {
-        Some(files) if !files.is_empty() => {
-            format!("{note}\nConflicting files: {}.", files.join(", "))
-        }
-        _ => note.to_string(),
+/// How many incoming files a wake lists by name before summarizing the rest. A
+/// base advance can legitimately carry hundreds; the point is to make the shape
+/// of the incoming change obvious, not to paste a manifest into a message.
+const MAX_LISTED_INCOMING: usize = 40;
+
+/// Render one classification's file list, capped and counted.
+fn render_incoming_group(label: &str, paths: &[String]) -> String {
+    if paths.is_empty() {
+        return String::new();
     }
+    let listed: Vec<&str> = paths
+        .iter()
+        .take(MAX_LISTED_INCOMING)
+        .map(String::as_str)
+        .collect();
+    let elided = paths.len().saturating_sub(listed.len());
+    let more = if elided > 0 {
+        format!(" (and {elided} more)")
+    } else {
+        String::new()
+    };
+    format!("\n{label} ({}): {}{more}", paths.len(), listed.join(", "))
+}
+
+/// Append the conflict diagnostic to a base-advance note: the incoming change's
+/// whole file set, the immutable three-way coordinates, and guidance specific to
+/// the condition that was actually found.
+///
+/// The two lists are the point. A merged PR is one coordinated change across
+/// many files, and a report naming only the conflicting subset is how an agent
+/// comes to resolve the file it was told about, stop compiling, and have no idea
+/// why (CAIRN-3337). Naming the clean-on-retry siblings makes it visible that
+/// the tree is mid-change.
+///
+/// No patch text goes in here. The coordinates are immutable objects, so both
+/// sides of the merge are recomputable on demand and a wake stays a wake.
+/// What the agent may be told about markers, given only what was confirmed.
+///
+/// The standing rule is that machinery never instructs an agent to act on state
+/// it has not made true. A wake saying "resolve the markers" when none exist is a
+/// defect, so every branch here is keyed to the executor's own answer.
+/// The condition decides whether editing files is even the right instruction, so
+/// it is threaded in: under base drift the two sides already agree, and telling
+/// that agent to "write the merged result" is the exact wasted round CAIRN-3327
+/// and CAIRN-3328 each burned.
+fn marker_guidance(state: MarkerState, condition: crate::jj::ConflictCondition) -> &'static str {
+    let drift = condition == crate::jj::ConflictCondition::BaseDrift;
+    match state {
+        MarkerState::Materialized if drift => {
+            "\nAny marker-bearing file in your checkout is scaffolding from this diagnostic, not \
+             work to do: the two sides already agree. Request the replay above."
+        }
+        MarkerState::Materialized => {
+            "\nConflict markers have been written into your checkout for the conflicting files \
+             above. Resolve them with ordinary file writes; a file still containing marker syntax \
+             cannot be committed, so nothing half-resolved can reach history."
+        }
+        MarkerState::Pending => {
+            "\nMarkers were requested but are NOT confirmed present yet, so do not go looking for \
+             them. Read both sides of the merge through `cairn:~/rebase` instead; it says so when \
+             they land."
+        }
+        _ if drift => {
+            "\nThere are no conflict markers in your checkout, and there is nothing to merge into \
+             one. `cairn:~/rebase` carries the coordinates if you want to confirm that for \
+             yourself."
+        }
+        _ => {
+            "\nThere are no conflict markers in your checkout. Read both sides of the merge \
+             through `cairn:~/rebase` and write the merged result yourself."
+        }
+    }
+}
+
+fn append_conflict_diagnostic(
+    note: &str,
+    diagnostic: Option<&crate::jj::ConflictDiagnostic>,
+    marker_state: MarkerState,
+) -> String {
+    let Some(diagnostic) = diagnostic else {
+        return note.to_string();
+    };
+    let conflicting = diagnostic.conflicting_paths();
+    let clean = diagnostic.clean_on_retry_paths();
+
+    let coordinates = match (
+        diagnostic.base.as_deref(),
+        diagnostic.ours.as_deref(),
+        diagnostic.theirs.as_deref(),
+    ) {
+        (Some(base), Some(ours), Some(theirs)) => format!(
+            "\nThree-way coordinates — base {base}, yours {ours}, incoming {theirs}. These are \
+             immutable commits: read any file as of either side with `?branch=<commit>` to see \
+             both versions without reconstructing them by hand."
+        ),
+        _ => String::new(),
+    };
+
+    let guidance = match diagnostic.condition {
+        crate::jj::ConflictCondition::ContentConflict => {
+            "\nThis is a CONTENT CONFLICT: the two sides genuinely disagree. Read both versions of \
+             each conflicting file, write the merged result with ordinary edits, and commit it on \
+             your branch. Pull the clean-on-retry files across too if your resolution depends on \
+             them — they are part of the same coordinated change and your branch will not compile \
+             without them. Never rebase or force-push by hand."
+        }
+        crate::jj::ConflictCondition::BaseDrift => {
+            "\nThis is BASE DRIFT, not a content conflict: every conflicting file is already \
+             byte-identical between your branch and the new base, so there is nothing to merge and \
+             editing will not clear it. What is stale is your branch's ANCESTRY, and you cannot \
+             repair that from here — your checkout is a plain git worktree whose refs are \
+             downstream exports of the runner's private jj store, so no local ref move survives. \
+             Ask the store to replay your branch instead: \
+             write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\"}}]})."
+        }
+    };
+
+    format!(
+        "{note}{}{}{coordinates}{guidance}{}\nThe complete session — both sides of the merge as \
+         browsable patches, the whole incoming file set, and the sanctioned replay action — is at \
+         `cairn:~/rebase`.",
+        render_incoming_group("Conflicting files, yours to merge", &conflicting),
+        render_incoming_group("Also arriving with this change, cleanly on retry", &clean),
+        marker_guidance(marker_state, diagnostic.condition),
+    )
 }
 
 /// Steer every sibling whose auto-rebase recorded a conflict: a conflicted
@@ -2434,6 +2815,21 @@ where
         else {
             continue;
         };
+        // Runner-internal bookkeeping never addresses an agent. The
+        // `persistence` kind covers the durable-base compare-and-swap and
+        // genuine database persist errors; an agent can act on neither. The CAS
+        // path already declines to report these as failures at all — this is the
+        // backstop that keeps any future internal error from reaching a builder.
+        let failure_kind = crate::jj::reconcile_failure_kind(&failure.error);
+        if failure_kind == "persistence" {
+            log::warn!(
+                "jj reconcile: internal {failure_kind} failure on {} withheld from job {}: {}",
+                failure.branch,
+                sibling.id,
+                failure.error
+            );
+            continue;
+        }
         let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
             log::debug!(
                 "jj reconcile: no run for failed sibling {} to steer",
@@ -2441,23 +2837,22 @@ where
             );
             continue;
         };
-        let failure_kind = crate::jj::reconcile_failure_kind(&failure.error);
         let quarantine_note = if crate::jj::reconcile_failure_is_permanent(failure_kind) {
             let guidance = match failure_kind {
-                "immutable_commit" => "The bookmark points at an immutable (typically already-merged) commit. If this work already landed, close the PR/issue so the workspace retires; otherwise move the bookmark onto a mutable head.",
-                "conflicted_bookmark" => "The bookmark name itself is conflicted in jj; resolve it with `jj bookmark` in the workspace.",
-                "missing_bookmark" => "Re-create or move the missing bookmark onto the workspace's intended mutable head.",
-                _ => "Repair the bookmark state described by the diagnostic.",
+                "immutable_commit" => "This branch points at a commit that can no longer be changed, which usually means the work already landed. If it did, close the PR and the issue; otherwise report the diagnostic above.",
+                "conflicted_bookmark" => "This branch's name is in a conflicted state and needs a maintainer; report the diagnostic above.",
+                "missing_bookmark" => "This branch no longer exists and needs to be re-created; report the diagnostic above.",
+                _ => "Report the diagnostic above.",
             };
             format!(
-                "\nThis branch is now quarantined from base-advance reconciliation. Future advances will skip it silently until the branch changes. {guidance}"
+                "\nFuture base-branch updates will skip this branch until it changes. {guidance}"
             )
         } else {
             String::new()
         };
         let note = format!(
-            "⛔ BLOCKING [Base branch update] Cairn failed to reconcile the agent's managed jj workspace after the base advanced ({label}).\nManaged workspace: `{}`\nExact reconciliation diagnostic:\n{}\nYour work was preserved. Follow the diagnostic's named recovery action only after confirming the workspace assignment; do not force-push or use a destructive reset.{quarantine_note}",
-            failure.workspace_path.display(),
+            "⛔ BLOCKING [Base branch update] Cairn could not update branch `{}` after the base branch advanced ({label}).\nDiagnostic:\n{}\nYour commits are intact. Do not force-push or reset; this branch needs repair before it can move.{quarantine_note}",
+            failure.branch,
             failure.error
         );
         let key = format!("{delivery_scope}:{}:failed", failure.branch);
@@ -2475,13 +2870,22 @@ where
     Ok(notified)
 }
 
+/// What the reconcile pass learned about each conflicted branch: the diagnostic
+/// captured before its rollback, and the marker state an executor confirmed.
+/// They travel together because a wake is only truthful when composed from both.
+#[derive(Default)]
+struct ConflictEvidence {
+    diagnostics: HashMap<String, crate::jj::ConflictDiagnostic>,
+    marker_states: HashMap<String, MarkerState>,
+}
+
 fn notify_conflicted_siblings(
     orch: &Orchestrator,
     db: &LocalDb,
     siblings: &[SiblingJob],
     conflicted: &[String],
     note: &str,
-    files_by_branch: &HashMap<String, Vec<String>>,
+    evidence: &ConflictEvidence,
     delivery_scope: &str,
 ) -> Result<(), String> {
     for sibling in siblings {
@@ -2498,8 +2902,25 @@ fn notify_conflicted_siblings(
             );
             continue;
         };
-        let message = append_conflicting_files(note, files_by_branch.get(&branch));
-        let key = format!("{delivery_scope}:{branch}:conflicted");
+        let diagnostic = evidence.diagnostics.get(&branch);
+        let marker_state = evidence
+            .marker_states
+            .get(&branch)
+            .copied()
+            .unwrap_or_default();
+        let message = append_conflict_diagnostic(note, diagnostic, marker_state);
+        // The delivery key carries the diagnostic's fingerprint, so a resumed or
+        // double-fired reconcile at the SAME base cannot re-wake the agent, while
+        // a genuinely new base advance — different coordinates — correctly does.
+        // Without it, a second advance arriving inside one intent would be
+        // silently swallowed as a duplicate of the first.
+        let key = match diagnostic {
+            Some(diagnostic) => format!(
+                "{delivery_scope}:{branch}:conflicted:{}",
+                diagnostic.fingerprint()
+            ),
+            None => format!("{delivery_scope}:{branch}:conflicted"),
+        };
         queue_system_direct_once(orch, &run_id, &message, DeliveryUrgency::Steer, &key)?;
         log::info!(
             "Steered jj sibling job {} to resolve a recorded conflict",
@@ -2526,7 +2947,7 @@ struct AmbiguousDivergence {
 /// over by pushing a hand-picked twin.
 fn build_ambiguous_divergence_note(branch: &str, change_id: &str, twins: &[String]) -> String {
     format!(
-        "⛔ BLOCKING [Divergent change] Your bookmark `{branch}` carries a divergent change `{change_id}` with multiple visible commits ({}) that Cairn could not safely collapse automatically — either every copy still conflicts or more than one carries edits, so picking one could lose work. Resolve it by hand over the shared store (keep the correct commit, abandon the rest), then verify build + tests. Do NOT force-push; if you cannot resolve it cleanly, escalate to a human.",
+        "⛔ BLOCKING [Divergent history] Your branch `{branch}` has more than one version of the same change ({}) that Cairn could not reconcile automatically — either every copy still conflicts or more than one carries edits, so choosing for you could lose work. Sort it out by hand (keep the correct commit, discard the rest), then verify the build and tests. Do NOT force-push; if you cannot resolve it cleanly, escalate to a human. Change id: `{change_id}`.",
         twins.join(", ")
     )
 }
@@ -2636,7 +3057,7 @@ async fn load_merged_job_for_owner(
 
     if let Some(parent_job_id) = action_run.parent_job_id.as_deref() {
         if let Some(job) = load_job_by_id(db, parent_job_id).await? {
-            if job.worktree_path.is_some() && job.base_branch.is_some() {
+            if job.base_branch.is_some() {
                 return Ok(Some(job));
             }
         }
@@ -2674,7 +3095,7 @@ async fn load_job_by_id_conn(
 ) -> DbResult<Option<MergedJob>> {
     let mut rows = conn
         .query(
-            "SELECT id, project_id, issue_id, base_branch, worktree_path
+            "SELECT id, project_id, issue_id, base_branch
              FROM jobs
              WHERE id = ?1",
             params![job_id],
@@ -2688,7 +3109,6 @@ async fn load_job_by_id_conn(
                 project_id: row.text(1)?,
                 issue_id: row.opt_text(2)?,
                 base_branch: row.opt_text(3)?,
-                worktree_path: row.opt_text(4)?,
             })
         })
         .transpose()
@@ -2743,11 +3163,10 @@ async fn find_context_source_job(
             }) {
                 let mut rows = conn
                     .query(
-                        "SELECT id, project_id, issue_id, base_branch, worktree_path
+                        "SELECT id, project_id, issue_id, base_branch
                              FROM jobs
                              WHERE execution_id = ?1
                                AND recipe_node_id = ?2
-                               AND worktree_path IS NOT NULL
                                AND branch IS NOT NULL
                                AND status <> 'cancelled'
                              ORDER BY created_at DESC
@@ -2761,7 +3180,6 @@ async fn find_context_source_job(
                         project_id: row.text(1)?,
                         issue_id: row.opt_text(2)?,
                         base_branch: row.opt_text(3)?,
-                        worktree_path: row.opt_text(4)?,
                     }));
                 }
             }
@@ -2782,10 +3200,9 @@ async fn latest_complete_implementation_job(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, project_id, issue_id, base_branch, worktree_path
+                    "SELECT id, project_id, issue_id, base_branch
                          FROM jobs
                          WHERE execution_id = ?1
-                           AND worktree_path IS NOT NULL
                            AND branch IS NOT NULL
                            AND status = 'complete'
                          ORDER BY completed_at DESC, updated_at DESC
@@ -2801,7 +3218,6 @@ async fn latest_complete_implementation_job(
                         project_id: row.text(1)?,
                         issue_id: row.opt_text(2)?,
                         base_branch: row.opt_text(3)?,
-                        worktree_path: row.opt_text(4)?,
                     })
                 })
                 .transpose()
@@ -2852,12 +3268,11 @@ async fn load_sibling_jobs(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.id, j.worktree_path, j.branch, j.base_commit
+                    "SELECT j.id, j.branch, j.base_commit
                          FROM jobs j
                          WHERE j.project_id = ?1
                            AND j.base_branch = ?2
                            AND j.id != ?3
-                           AND j.worktree_path IS NOT NULL
                            AND NOT EXISTS (
                              SELECT 1 FROM issues i
                              WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed')
@@ -2880,9 +3295,8 @@ async fn load_sibling_jobs(
             while let Some(row) = rows.next().await? {
                 siblings.push(SiblingJob {
                     id: row.text(0)?,
-                    worktree_path: row.text(1)?,
-                    branch: row.opt_text(2)?,
-                    base_commit: row.opt_text(3)?,
+                    branch: row.opt_text(1)?,
+                    base_commit: row.opt_text(2)?,
                 });
             }
             Ok(siblings)
@@ -2892,15 +3306,8 @@ async fn load_sibling_jobs(
     .map_err(|error| error.to_string())
 }
 
-/// The active workspace(s) whose `branch` *is* `branch` itself — the Coordinator
-/// sitting ON its integration bookmark, as opposed to the siblings branched
-/// *from* it that [`load_sibling_jobs`] returns. After a child folds into the
-/// branch, the bookmark advances out from under this workspace's `@`; the sibling
-/// auto-rebase never touches it (it rebases branches based ON this one), so it
-/// must be advanced explicitly. Same in-flight predicate as `load_sibling_jobs`
-/// (still running, or completed with an open PR). Callers dedup by
-/// `worktree_path` for the inheritance fan-out.
-async fn load_on_branch_workspaces(
+/// Active jobs whose durable branch is the branch that just advanced.
+async fn load_on_branch_jobs(
     db: &LocalDb,
     project_id: &str,
     branch: &str,
@@ -2913,11 +3320,10 @@ async fn load_on_branch_workspaces(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.id, j.worktree_path, j.branch, j.base_commit
+                    "SELECT j.id, j.branch, j.base_commit
                          FROM jobs j
                          WHERE j.project_id = ?1
                            AND j.branch = ?2
-                           AND j.worktree_path IS NOT NULL
                            AND NOT EXISTS (
                              SELECT 1 FROM issues i
                              WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed')
@@ -2932,16 +3338,15 @@ async fn load_on_branch_workspaces(
                     params![project_id.as_str(), branch.as_str()],
                 )
                 .await?;
-            let mut workspaces = Vec::new();
+            let mut jobs = Vec::new();
             while let Some(row) = rows.next().await? {
-                workspaces.push(SiblingJob {
+                jobs.push(SiblingJob {
                     id: row.text(0)?,
-                    worktree_path: row.text(1)?,
-                    branch: row.opt_text(2)?,
-                    base_commit: row.opt_text(3)?,
+                    branch: row.opt_text(1)?,
+                    base_commit: row.opt_text(2)?,
                 });
             }
-            Ok(workspaces)
+            Ok(jobs)
         })
     })
     .await
@@ -2977,6 +3382,51 @@ async fn load_merge_request_info(
                     })
                 })
                 .transpose()
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Whether `branch` is the project's configured default branch, and so the one
+/// branch for which origin is the sole authority.
+///
+/// The gate on the backward repair in `reconcile_tracked_bookmark`: a Coordinator
+/// integration branch or an agent branch legitimately holds sealed work origin
+/// has not seen, and must never be reset onto origin. An unreadable project row
+/// answers `false` — declining to reconcile is always safe, resetting the wrong
+/// branch is not.
+async fn branch_is_project_default(db: &LocalDb, project_id: &str, branch: &str) -> bool {
+    match load_project_default_branch(db, project_id).await {
+        Ok(Some(default_branch)) => default_branch == branch,
+        Ok(None) => false,
+        Err(error) => {
+            log::warn!(
+                "could not read default_branch for project {project_id}; skipping default bookmark reconcile: {error}"
+            );
+            false
+        }
+    }
+}
+
+async fn load_project_default_branch(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<Option<String>, String> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT default_branch FROM projects WHERE id = ?1",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.get::<Option<String>>(0)?.filter(|s| !s.is_empty())),
+                None => Ok(None),
+            }
         })
     })
     .await
@@ -3079,15 +3529,9 @@ mod tests {
     /// store-wide list failed) disables the filter and proceeds with all.
     #[test]
     fn retain_present_siblings_drops_missing_and_honors_none() {
-        let live = (
-            "agent/CAIRN-1-builder-0".to_string(),
-            std::path::PathBuf::from("/w/live"),
-        );
-        let ghost = (
-            "agent/CAIRN-1-ghost-0".to_string(),
-            std::path::PathBuf::from("/w/ghost"),
-        );
-        let existing: std::collections::HashSet<String> = [live.0.clone()].into_iter().collect();
+        let live = "agent/CAIRN-1-builder-0".to_string();
+        let ghost = "agent/CAIRN-1-ghost-0".to_string();
+        let existing: std::collections::HashSet<String> = [live.clone()].into_iter().collect();
 
         let (retained, dropped) =
             retain_present_siblings(vec![live.clone(), ghost.clone()], Some(&existing));
@@ -3107,128 +3551,181 @@ mod tests {
     use crate::services::testing::{MockGitClient, TestServicesBuilder};
     use crate::storage::{LocalDb, SearchIndex};
     use std::path::PathBuf;
-    use std::process::Command;
     use std::sync::Arc;
-    use tempfile::TempDir;
-
-    fn run_test_git(repo: &Path, args: &[&str]) -> bool {
-        crate::env::git()
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-
-    fn jj_test_env() -> Option<(TempDir, TempDir, TempDir, crate::jj::JjEnv, PathBuf)> {
-        let bin = std::env::var("CAIRN_JJ_BIN")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                Command::new("which")
-                    .arg("jj")
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            })?;
-        let home = TempDir::new().unwrap();
-        let project = TempDir::new().unwrap();
-        let workspaces = TempDir::new().unwrap();
-        for args in [
-            vec!["init", "-q", "-b", "main"],
-            vec!["config", "user.email", "base-advance@cairn.test"],
-            vec!["config", "user.name", "Base Advance Test"],
-        ] {
-            assert!(run_test_git(project.path(), &args));
-        }
-        std::fs::write(project.path().join("base.txt"), "base\n").unwrap();
-        assert!(run_test_git(project.path(), &["add", "."]));
-        assert!(run_test_git(
-            project.path(),
-            &["commit", "-q", "-m", "base"]
-        ));
-        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
-        let store = home.path().join("store");
-        crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
-        Some((home, project, workspaces, jj, store))
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn managed_workspace_reconcile_fresh_workspace_is_unchanged() {
-        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
-            return;
-        };
-        let branch = "agent/PROJ-2817-builder-0";
-        let workspace = workspaces.path().join("fresh");
-        crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
-        let outcome =
-            crate::jj::reconcile_managed_workspace(&jj, &store, &workspace, branch, None).unwrap();
-        assert_eq!(
-            outcome,
-            crate::jj::ManagedWorkspaceReconcileOutcome::Unchanged
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn managed_workspace_reconcile_preserves_dirty_local_work() {
-        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
-            return;
-        };
-        let branch = "agent/PROJ-2817-builder-1";
-        let workspace = workspaces.path().join("dirty");
-        crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
-        std::fs::write(workspace.join("wip.txt"), "local work\n").unwrap();
-        let outcome =
-            crate::jj::reconcile_managed_workspace(&jj, &store, &workspace, branch, None).unwrap();
-        assert_eq!(
-            outcome,
-            crate::jj::ManagedWorkspaceReconcileOutcome::PreservedDirty
-        );
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("wip.txt")).unwrap(),
-            "local work\n"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn managed_workspace_reconcile_advances_clean_behind_workspace() {
-        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
-            return;
-        };
-        let branch = "agent/PROJ-2817-builder-2";
-        let workspace = workspaces.path().join("behind");
-        crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
-        jj.run(&store, &["new", branch], "advance test branch")
+    /// The diagnostic exists only inside the rebase, between the recorded
+    /// conflict and the rollback. If it does not survive that window in storage,
+    /// nothing downstream can ever show it: the branch is clean again and a later
+    /// probe finds nothing. So the round-trip is the whole feature.
+    #[tokio::test]
+    async fn a_conflict_diagnostic_outlives_the_rollback_that_erased_it() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let store = Path::new("/store");
+        let claim = claim_reconcile_intent(&db, "/repo", store, "main", "dest-a", "local_merge")
+            .await
+            .unwrap()
             .unwrap();
-        std::fs::write(store.join("advanced.txt"), "advanced\n").unwrap();
-        jj.run(&store, &["describe", "-m", "advance"], "describe advance")
-            .unwrap();
-        jj.run(
-            &store,
-            &[
-                "bookmark",
-                "set",
-                branch,
-                "-r",
-                "@",
-                "--ignore-working-copy",
-            ],
-            "advance bookmark",
+        let branch = "agent/test";
+        persist_reconcile_item(
+            &db,
+            ReconcileItemUpdate {
+                intent_id: &claim.id,
+                bookmark: branch,
+                observed_tip: Some("tip"),
+                status: "graph_moved",
+                failure_kind: None,
+                outcome_kind: Some("conflicted"),
+                fingerprint: None,
+                diagnostic: None,
+            },
         )
+        .await
         .unwrap();
-        let tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
-        let outcome =
-            crate::jj::reconcile_managed_workspace(&jj, &store, &workspace, branch, Some(&tip))
-                .unwrap();
+
+        let diagnostic = crate::jj::ConflictDiagnostic {
+            base: Some("b".repeat(40)),
+            ours: Some("o".repeat(40)),
+            theirs: Some("t".repeat(40)),
+            conflicted_tip: Some("c".repeat(40)),
+            condition: crate::jj::ConflictCondition::ContentConflict,
+            incoming: vec![
+                crate::jj::IncomingFile {
+                    path: "shared.rs".to_string(),
+                    status: "M".to_string(),
+                    classification: crate::jj::IncomingClassification::Conflicting,
+                },
+                crate::jj::IncomingFile {
+                    path: "storage.rs".to_string(),
+                    status: "D".to_string(),
+                    classification: crate::jj::IncomingClassification::CleanOnRetry,
+                },
+            ],
+        };
+        let incoming = IncomingIdentity {
+            base_branch: "main".to_string(),
+            pr_number: Some(2893),
+            issue: Some("CAIRN-3337".to_string()),
+        };
+        record_conflict_session(&db, &claim.id, branch, &diagnostic, &incoming)
+            .await
+            .unwrap();
+
+        let session = crate::orchestrator::conflict_session::load_active_session(&db, branch)
+            .await
+            .unwrap()
+            .expect("the session survives the pass that recorded it");
+
+        assert_eq!(session.base.as_deref(), Some("b".repeat(40).as_str()));
+        assert_eq!(session.theirs.as_deref(), Some("t".repeat(40).as_str()));
         assert_eq!(
-            outcome,
-            crate::jj::ManagedWorkspaceReconcileOutcome::AdvancedClean
+            session.fingerprint(),
+            diagnostic.fingerprint(),
+            "the stored fingerprint is the one the wake deduplicated on"
         );
-        assert!(workspace.join("advanced.txt").exists());
+        assert_eq!(session.incoming.pr_number, Some(2893));
+        assert_eq!(session.incoming.issue.as_deref(), Some("CAIRN-3337"));
+
+        // The cross-file trap: a report naming only the conflicting path lets a
+        // coordinated change land half-applied, so the clean-on-retry sibling
+        // must be stored too, distinguishably.
+        let conflicting: Vec<&str> = session.conflicting().map(|f| f.path.as_str()).collect();
+        let clean: Vec<&str> = session.clean_on_retry().map(|f| f.path.as_str()).collect();
+        assert_eq!(conflicting, vec!["shared.rs"]);
+        assert_eq!(clean, vec!["storage.rs"]);
+        assert_eq!(
+            session
+                .files
+                .iter()
+                .find(|f| f.path == "storage.rs")
+                .unwrap()
+                .status,
+            "D",
+            "an add/delete/rename is distinguishable, not flattened to 'changed'"
+        );
+
+        // Markers start unclaimed. Nothing may say otherwise until an executor does.
+        assert_eq!(session.marker_state, MarkerState::NotMaterialized);
+    }
+
+    /// A base that advances twice leaves the first session describing a merge
+    /// nobody will perform again. Exactly one session is active, and closing on a
+    /// clean rebase is what ends it.
+    #[tokio::test]
+    async fn a_newer_session_supersedes_the_old_and_a_clean_rebase_closes_it() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let store = Path::new("/store");
+        let branch = "agent/test";
+
+        let mut fingerprints = Vec::new();
+        for dest in ["dest-a", "dest-b"] {
+            let claim = claim_reconcile_intent(&db, "/repo", store, "main", dest, "local_merge")
+                .await
+                .unwrap()
+                .unwrap();
+            persist_reconcile_item(
+                &db,
+                ReconcileItemUpdate {
+                    intent_id: &claim.id,
+                    bookmark: branch,
+                    observed_tip: Some("tip"),
+                    status: "graph_moved",
+                    failure_kind: None,
+                    outcome_kind: Some("conflicted"),
+                    fingerprint: None,
+                    diagnostic: None,
+                },
+            )
+            .await
+            .unwrap();
+            let diagnostic = crate::jj::ConflictDiagnostic {
+                base: Some("b".repeat(40)),
+                ours: Some("o".repeat(40)),
+                theirs: Some(dest.to_string()),
+                conflicted_tip: None,
+                condition: crate::jj::ConflictCondition::ContentConflict,
+                incoming: Vec::new(),
+            };
+            fingerprints.push(diagnostic.fingerprint());
+            record_conflict_session(
+                &db,
+                &claim.id,
+                branch,
+                &diagnostic,
+                &IncomingIdentity::default(),
+            )
+            .await
+            .unwrap();
+            supersede_stale_sessions(&db, branch, &claim.id)
+                .await
+                .unwrap();
+            // Mark it claimed so the next destination is not coalesced away.
+            db.execute(
+                "UPDATE jj_reconcile_intents SET status = 'completed' WHERE id = ?1",
+                (claim.id.as_str(),),
+            )
+            .await
+            .unwrap();
+        }
+
+        let session = crate::orchestrator::conflict_session::load_active_session(&db, branch)
+            .await
+            .unwrap()
+            .expect("one session is active");
+        assert_eq!(
+            session.fingerprint(),
+            fingerprints[1],
+            "the active session describes the CURRENT merge, not the superseded one"
+        );
+
+        close_open_sessions_for_branch(&db, branch).await.unwrap();
+        assert!(
+            crate::orchestrator::conflict_session::load_active_session(&db, branch)
+                .await
+                .unwrap()
+                .is_none(),
+            "absorbing the base closes the session"
+        );
     }
 
     #[tokio::test]
@@ -3270,7 +3767,6 @@ mod tests {
             ReconcileItemUpdate {
                 intent_id: &resumed.id,
                 bookmark: "agent/test",
-                workspace_path: Path::new("/worktree"),
                 observed_tip: Some("tip"),
                 status: "graph_moved",
                 failure_kind: None,
@@ -3374,16 +3870,16 @@ mod tests {
                     )
                     .await?;
                 }
-                for (job, exec, issue, status, worktree) in [
-                    ("job-merged", "exec-1", "issue-1", "complete", "/wt/merged"),
-                    ("job-overlap", "exec-2", "issue-2", "running", "/wt/overlap"),
-                    ("job-clean", "exec-3", "issue-3", "running", "/wt/clean"),
-                    ("job-complete", "exec-4", "issue-4", "complete", "/wt/complete"),
+                for (job, exec, issue, status, branch) in [
+                    ("job-merged", "exec-1", "issue-1", "complete", "agent/merged"),
+                    ("job-overlap", "exec-2", "issue-2", "running", "agent/overlap"),
+                    ("job-clean", "exec-3", "issue-3", "running", "agent/clean"),
+                    ("job-complete", "exec-4", "issue-4", "complete", "agent/complete"),
                 ] {
                     conn.execute(
-                        "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, base_branch, created_at, updated_at)
+                        "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
                          VALUES (?1, ?2, 'node', ?3, 'proj-1', ?4, ?5, 'integration', 1, 1)",
-                        params![job, exec, issue, status, worktree],
+                        params![job, exec, issue, status, branch],
                     )
                     .await?;
                     conn.execute(
@@ -3470,13 +3966,11 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let siblings = vec![SiblingJob {
             id: "job-overlap".to_string(),
-            worktree_path: "/wt/overlap".to_string(),
             branch: Some("agent/test".to_string()),
             base_commit: None,
         }];
         let failures = vec![crate::jj::ReconcileFailure {
             branch: "agent/test".to_string(),
-            workspace_path: "/wt/overlap".into(),
             error: "commit is immutable".to_string(),
         }];
 
@@ -3530,6 +4024,200 @@ mod tests {
         );
     }
 
+    /// The durable base record this reconcile leaves on a job.
+    async fn recorded_durable_base(db: &LocalDb, job_id: &str) -> Option<String> {
+        db.query_opt_text(
+            "SELECT base_commit FROM jobs WHERE id = ?1",
+            (job_id.to_string(),),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A concurrent reconcile that wrote the same value is agreement.
+    ///
+    /// `load_sibling_jobs` snapshots every sibling's coordinate once at the top
+    /// of a reconcile, so a later branch routinely finds a row another reconcile
+    /// has already advanced to exactly this target. The row holds what the call
+    /// wanted to put there; calling that a failure is what turned zero-delta
+    /// planner branches into ⛔ BLOCKING directs that resumed deliberately
+    /// parked sessions (CAIRN-3094 comment #4).
+    #[tokio::test]
+    async fn a_durable_base_already_at_the_target_is_agreement() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        db.execute(
+            "UPDATE jobs SET base_commit = 'new-tip' WHERE id = 'job-overlap'",
+            (),
+        )
+        .await
+        .unwrap();
+        let sibling = SiblingJob {
+            id: "job-overlap".to_string(),
+            branch: Some("agent/overlap".to_string()),
+            base_commit: Some("stale-snapshot".to_string()),
+        };
+
+        advance_sibling_durable_base(&db, &sibling, "new-tip")
+            .await
+            .expect("a row already holding the target is not a lost race");
+
+        assert_eq!(
+            recorded_durable_base(&db, "job-overlap").await.as_deref(),
+            Some("new-tip")
+        );
+    }
+
+    /// A snapshot that lost to a writer heading somewhere ELSE still lands on
+    /// this reconcile's target.
+    ///
+    /// This is the assertion the retired compare-and-swap also made, and making
+    /// it identically against a plain write is the evidence that the CAS never
+    /// ordered anything (CAIRN-3226): its retry swapped against the freshly read
+    /// value and wrote this call's target regardless of what it found.
+    #[tokio::test]
+    async fn a_stale_snapshot_still_records_this_reconciles_target() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        db.execute(
+            "UPDATE jobs SET base_commit = 'somebody-elses-tip' WHERE id = 'job-overlap'",
+            (),
+        )
+        .await
+        .unwrap();
+        let sibling = SiblingJob {
+            id: "job-overlap".to_string(),
+            branch: Some("agent/overlap".to_string()),
+            base_commit: Some("stale-snapshot".to_string()),
+        };
+
+        advance_sibling_durable_base(&db, &sibling, "new-tip")
+            .await
+            .expect("a stale snapshot does not block the record");
+
+        assert_eq!(
+            recorded_durable_base(&db, "job-overlap").await.as_deref(),
+            Some("new-tip")
+        );
+    }
+
+    /// A job with no recorded base is recorded, not refused.
+    ///
+    /// The retired CAS needed a non-null expected value and aborted with a
+    /// manufactured error without one, so a job whose bookkeeping had never been
+    /// written could never acquire it — substrate state failing a step that has
+    /// nothing to fail about.
+    #[tokio::test]
+    async fn a_job_with_no_recorded_base_is_recorded_not_refused() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        db.execute(
+            "UPDATE jobs SET base_commit = NULL WHERE id = 'job-overlap'",
+            (),
+        )
+        .await
+        .unwrap();
+        let sibling = SiblingJob {
+            id: "job-overlap".to_string(),
+            branch: Some("agent/overlap".to_string()),
+            base_commit: None,
+        };
+
+        advance_sibling_durable_base(&db, &sibling, "new-tip")
+            .await
+            .expect("an unrecorded base is not a reason to refuse the record");
+
+        assert_eq!(
+            recorded_durable_base(&db, "job-overlap").await.as_deref(),
+            Some("new-tip")
+        );
+    }
+
+    /// A job deleted mid-reconcile is the graph moving on, not a failure of this
+    /// bookkeeping.
+    #[tokio::test]
+    async fn a_vanished_job_does_not_fail_the_record() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let sibling = SiblingJob {
+            id: "job-that-was-deleted".to_string(),
+            branch: Some("agent/gone".to_string()),
+            base_commit: Some("stale-snapshot".to_string()),
+        };
+
+        advance_sibling_durable_base(&db, &sibling, "new-tip")
+            .await
+            .expect("a missing job row is logged, not raised");
+    }
+
+    /// Runner-internal bookkeeping never addresses an agent, and the control
+    /// half proves the filter is narrow: a genuine reconcile failure still
+    /// steers the branch's job.
+    #[tokio::test]
+    async fn a_persistence_failure_is_withheld_while_a_real_one_still_steers() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let siblings = vec![SiblingJob {
+            id: "job-overlap".to_string(),
+            branch: Some("agent/overlap".to_string()),
+            base_commit: None,
+        }];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let enqueue = |_: &Orchestrator, _: &str, _: &str, _: DeliveryUrgency, _: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(DirectQueueDisposition::QueuedOrPresent)
+        };
+
+        let internal = vec![crate::jj::ReconcileFailure {
+            branch: "agent/overlap".to_string(),
+            error: "durable base advancement failed: durable base coordinate for job \
+                    job-overlap changed concurrently twice (last observed abc); refused to \
+                    overwrite it"
+                .to_string(),
+        }];
+        let notified = notify_failed_siblings_with(
+            &orch,
+            &orch.db.local,
+            &siblings,
+            &internal,
+            "test",
+            "intent-1",
+            enqueue,
+        )
+        .unwrap();
+        assert!(
+            notified.is_empty(),
+            "an unpersisted coordinate is not something an agent can act on"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and nothing may even be enqueued for it"
+        );
+
+        let genuine = vec![crate::jj::ReconcileFailure {
+            branch: "agent/overlap".to_string(),
+            error: "origin push failed: connection reset".to_string(),
+        }];
+        let notified = notify_failed_siblings_with(
+            &orch,
+            &orch.db.local,
+            &siblings,
+            &genuine,
+            "test",
+            "intent-2",
+            enqueue,
+        )
+        .unwrap();
+        assert_eq!(
+            notified,
+            vec!["agent/overlap".to_string()],
+            "a branch that genuinely cannot move still wakes its agent"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn divergence_quarantine_fingerprint_is_order_independent() {
         assert_eq!(
@@ -3577,7 +4265,7 @@ mod tests {
         assert_eq!(
             count_messages().await,
             Some(2),
-            "each on-branch workspace receives its own direct"
+            "each on-branch job receives its own direct"
         );
 
         for run_id in recipients {
@@ -3602,13 +4290,16 @@ mod tests {
     fn only_transient_failures_keep_an_intent_pending() {
         let failure = |error: &str| crate::jj::ReconcileFailure {
             branch: "agent/test".to_string(),
-            workspace_path: PathBuf::from("/worktree"),
             error: error.to_string(),
         };
         assert!(!reconcile_has_transient_failures(&[failure(
             "commit is immutable"
         )]));
-        assert!(!reconcile_has_transient_failures(&[failure(
+        // A conflicted bookmark is now TRANSIENT, and deliberately so: it is a
+        // reconciliation TODO the next base advance repairs, not a terminal
+        // state. Holding it as permanent meant it was never retried and never
+        // repaired, which is the agent-unreachable dead end this arc forbids.
+        assert!(reconcile_has_transient_failures(&[failure(
             "bookmark name is conflicted"
         )]));
         assert!(reconcile_has_transient_failures(&[failure(
@@ -3624,10 +4315,10 @@ mod tests {
             "UPDATE issues SET status = 'merged' WHERE id = 'issue-2';
              INSERT INTO jobs
                (id, execution_id, recipe_node_id, issue_id, project_id, status,
-                worktree_path, branch, base_branch, created_at, updated_at)
+                branch, base_branch, created_at, updated_at)
              VALUES
                ('job-no-issue', NULL, 'node', NULL, 'proj-1', 'running',
-                '/wt/no-issue', 'agent/PROJ-null-builder-0', 'integration', 1, 1);",
+                'agent/PROJ-null-builder-0', 'integration', 1, 1);",
         )
         .await
         .unwrap();
@@ -3649,7 +4340,7 @@ mod tests {
             "UPDATE jobs SET branch = 'agent/PROJ-2-builder-0' WHERE id = 'job-overlap';
              INSERT INTO job_terminals
                  (id, job_id, session_id, command, status, created_at, slug,
-                  lease_id, lease_incarnation_id, lease_epoch)
+                  residency_holder, residency_incarnation_id, cell_epoch)
              VALUES
                  ('live-terminal', 'job-overlap', 'live-session', 'true', 'running', 1, 'live', 'live-lease', 'live-inc', 7),
                  ('exited-terminal', 'job-overlap', 'exited-session', 'true', 'exited', 1, 'exited', 'exited-lease', 'exited-inc', 8);",
@@ -3715,8 +4406,8 @@ mod tests {
         .await
         .unwrap();
         db.execute(
-            "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, base_branch, uri_segment, created_at, updated_at)
-             VALUES (?1, ?2, 'node', ?3, ?4, 'running', '/wt/team-overlap', 'agent/TEAM-9-builder-0', 'integration', 'builder', 1, 1)",
+            "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+             VALUES (?1, ?2, 'node', ?3, ?4, 'running', 'agent/TEAM-9-builder-0', 'integration', 'builder', 1, 1)",
             params![job_id, execution_id.as_str(), issue_id.as_str(), project_id.as_str()],
         )
         .await
@@ -3736,6 +4427,170 @@ mod tests {
             .unwrap()
     }
 
+    /// The two conditions must give OPPOSITE advice, and the base-drift branch
+    /// must not send an agent to edit files that already agree — the exact round
+    /// CAIRN-3327 and CAIRN-3328 each burned.
+    #[test]
+    fn base_drift_and_content_conflict_give_opposite_guidance() {
+        let note = build_jj_conflict_note("main", Some(42), None);
+        let incoming = vec![crate::jj::IncomingFile {
+            path: "shared.rs".to_string(),
+            status: "M".to_string(),
+            classification: crate::jj::IncomingClassification::Conflicting,
+        }];
+
+        let drift = append_conflict_diagnostic(
+            &note,
+            Some(&crate::jj::ConflictDiagnostic {
+                base: Some("b".repeat(40)),
+                ours: Some("o".repeat(40)),
+                theirs: Some("t".repeat(40)),
+                conflicted_tip: None,
+                condition: crate::jj::ConflictCondition::BaseDrift,
+                incoming: incoming.clone(),
+            }),
+            MarkerState::NotMaterialized,
+        );
+        assert!(drift.contains("BASE DRIFT"), "{drift}");
+        assert!(
+            drift.contains("nothing to merge"),
+            "drift must say the content work may already be done: {drift}"
+        );
+        assert!(
+            drift.contains("downstream exports"),
+            "drift must explain why a local ref move cannot stick: {drift}"
+        );
+        assert!(
+            !drift.contains("write the merged result"),
+            "drift must NOT ask for content edits: {drift}"
+        );
+
+        let content = append_conflict_diagnostic(
+            &note,
+            Some(&crate::jj::ConflictDiagnostic {
+                base: Some("b".repeat(40)),
+                ours: Some("o".repeat(40)),
+                theirs: Some("t".repeat(40)),
+                conflicted_tip: None,
+                condition: crate::jj::ConflictCondition::ContentConflict,
+                incoming,
+            }),
+            MarkerState::NotMaterialized,
+        );
+        assert!(content.contains("CONTENT CONFLICT"), "{content}");
+        assert!(content.contains("write the merged result"), "{content}");
+        assert!(
+            !content.contains("BASE DRIFT"),
+            "the two conditions never both appear: {content}"
+        );
+
+        // Neither may ever authorize the one action that cannot be undone, and
+        // each must name the route it DOES sanction — the drift branch by handing
+        // over the replay request verbatim, the content branch by forbidding a
+        // hand rebase while pointing at the session.
+        for message in [&drift, &content] {
+            assert!(
+                message.contains("cairn:~/rebase"),
+                "each condition routes to the session: {message}"
+            );
+            assert!(!message.contains("git rebase"), "{message}");
+        }
+        assert!(
+            drift.contains("action:\"replay\""),
+            "drift hands over the exact request rather than describing it: {drift}"
+        );
+        assert!(
+            content.contains("force-push"),
+            "the content branch still forbids hand-rebasing: {content}"
+        );
+    }
+
+    /// The standing rule: machinery never instructs an agent to act on state it
+    /// has not made true. Only a CONFIRMED materialization may put "resolve the
+    /// markers" in front of an agent; every other state has to say plainly that
+    /// there is nothing on disk to resolve, and point at the session instead.
+    #[test]
+    fn only_a_confirmed_materialization_tells_the_agent_to_resolve_markers() {
+        let note = build_jj_conflict_note("main", Some(42), None);
+        let diagnostic = crate::jj::ConflictDiagnostic {
+            base: Some("b".repeat(40)),
+            ours: Some("o".repeat(40)),
+            theirs: Some("t".repeat(40)),
+            conflicted_tip: None,
+            condition: crate::jj::ConflictCondition::ContentConflict,
+            incoming: vec![crate::jj::IncomingFile {
+                path: "shared.rs".to_string(),
+                status: "M".to_string(),
+                classification: crate::jj::IncomingClassification::Conflicting,
+            }],
+        };
+
+        let confirmed =
+            append_conflict_diagnostic(&note, Some(&diagnostic), MarkerState::Materialized);
+        assert!(
+            confirmed.contains("Conflict markers have been written into your checkout"),
+            "{confirmed}"
+        );
+
+        for state in [
+            MarkerState::NotMaterialized,
+            MarkerState::Pending,
+            MarkerState::Failed,
+        ] {
+            let message = append_conflict_diagnostic(&note, Some(&diagnostic), state);
+            assert!(
+                !message.contains("Conflict markers have been written"),
+                "{state:?} must not claim markers exist: {message}"
+            );
+            assert!(
+                message.contains("cairn:~/rebase"),
+                "{state:?} must route the agent to both sides of the merge: {message}"
+            );
+        }
+
+        // Pending is specifically NOT the same as absent: an agent told markers
+        // are absent would stop looking, while the retry may still land them.
+        let pending = append_conflict_diagnostic(&note, Some(&diagnostic), MarkerState::Pending);
+        assert!(pending.contains("NOT confirmed present"), "{pending}");
+        let absent =
+            append_conflict_diagnostic(&note, Some(&diagnostic), MarkerState::NotMaterialized);
+        assert!(
+            absent.contains("no conflict markers in your checkout"),
+            "{absent}"
+        );
+
+        // Under base drift the two sides already agree, so no marker state may
+        // ever produce "write the merged result" — including the confirmed one,
+        // where any marker on disk is scaffolding rather than work to do.
+        let drift = crate::jj::ConflictDiagnostic {
+            condition: crate::jj::ConflictCondition::BaseDrift,
+            ..diagnostic.clone()
+        };
+        for state in [
+            MarkerState::NotMaterialized,
+            MarkerState::Pending,
+            MarkerState::Materialized,
+            MarkerState::Failed,
+        ] {
+            let message = append_conflict_diagnostic(&note, Some(&drift), state);
+            assert!(
+                !message.contains("write the merged result"),
+                "{state:?} must not send a drifted branch to edit agreeing files: {message}"
+            );
+        }
+    }
+
+    /// A wake that carries no diagnostic (nothing enumerated) degrades to the
+    /// identity half rather than rendering an empty file table.
+    #[test]
+    fn a_wake_without_a_diagnostic_is_left_unchanged() {
+        let note = build_jj_conflict_note("main", Some(42), None);
+        assert_eq!(
+            append_conflict_diagnostic(&note, None, MarkerState::NotMaterialized),
+            note
+        );
+    }
+
     #[test]
     fn jj_conflict_note_carries_no_rebase_commands() {
         let issue = IssueInfo {
@@ -3746,10 +4601,17 @@ mod tests {
         assert!(note.contains("[Base branch update]"));
         assert!(note.contains("PR #42 merged"));
         assert!(note.contains("cairn://p/PROJ/7"));
-        assert!(note.contains("auto-rebased"));
         // Stop-the-line: the note names the conflict as blocking, not optional.
         assert!(note.contains("BLOCKING"));
-        assert!(note.contains("cannot push or merge"));
+        // The rebase was ROLLED BACK, and saying so is what makes the note
+        // actionable — the agent is being asked to merge into an untouched
+        // branch, not to repair a rewritten one.
+        assert!(note.contains("rolled back"), "{note}");
+        assert!(note.contains("untouched"), "{note}");
+        // Agents hold detached git worktrees, so conflict markers are never
+        // materialized anywhere. A note that points at them is unanswerable.
+        assert!(!note.to_lowercase().contains("marker"), "{note}");
+        assert!(!note.contains("resolve them"), "{note}");
         // The note must not instruct a manual rebase/force-push.
         assert!(!note.contains("git rebase"));
         assert!(!note.contains("git fetch"));
@@ -3826,26 +4688,26 @@ mod tests {
              VALUES ('issue-coord', 'proj-1', 5, 'Coord', 'active', 1, 1);
              INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
              VALUES ('exec-coord', 'recipe-default', 'issue-coord', 'proj-1', 'running', 1, 1);
-             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, base_branch, created_at, updated_at)
-             VALUES ('job-coord', 'exec-coord', 'node', 'issue-coord', 'proj-1', 'running', '/wt/coord', 'integration', 'main', 1, 1);",
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('job-coord', 'exec-coord', 'node', 'issue-coord', 'proj-1', 'running', 'integration', 'main', 1, 1);",
         )
         .await
         .unwrap();
         let orch = test_orchestrator(db, MockGitClient::new());
 
-        let on_branch = load_on_branch_workspaces(&orch.db.local, "proj-1", "integration")
+        let on_branch = load_on_branch_jobs(&orch.db.local, "proj-1", "integration")
             .await
             .unwrap();
         let on_ids: std::collections::HashSet<&str> =
             on_branch.iter().map(|s| s.id.as_str()).collect();
         assert!(
             on_ids.contains("job-coord"),
-            "the workspace ON the integration branch (the coordinator) is selected"
+            "the job ON the integration branch (the coordinator) is selected"
         );
         assert_eq!(
             on_ids.len(),
             1,
-            "only the on-branch workspace; children branched FROM it are excluded"
+            "only the on-branch job; children branched FROM it are excluded"
         );
 
         // The sibling query (branches based ON integration) must NOT include it.
@@ -3862,33 +4724,6 @@ mod tests {
             sib_ids.contains("job-overlap"),
             "siblings are still the children branched from integration"
         );
-    }
-
-    #[test]
-    fn on_branch_advance_note_carries_no_rebase_commands() {
-        let note = build_on_branch_advance_conflict_note("agent/CAIRN-1987-coordinator-0");
-        assert!(note.contains("[Base branch update]"));
-        assert!(note.contains("agent/CAIRN-1987-coordinator-0"));
-        assert!(note.contains("a child merged into it"));
-        // Stop-the-line: the note names the conflict as blocking, not optional.
-        assert!(note.contains("BLOCKING"));
-        assert!(note.contains("cannot push or merge"));
-        // The advance already happened over the store; no manual rebase commands.
-        assert!(!note.contains("git rebase"));
-        assert!(!note.contains("git fetch"));
-    }
-
-    #[test]
-    fn on_branch_advance_clean_note_carries_no_rebase_commands() {
-        let note = build_on_branch_advance_clean_note("agent/CAIRN-1987-coordinator-0");
-        assert!(note.contains("[Base branch update]"));
-        assert!(note.contains("agent/CAIRN-1987-coordinator-0"));
-        assert!(note.contains("a child merged into it"));
-        assert!(note.contains("cleanly"));
-        assert!(note.contains("nothing to resolve"));
-        assert!(!note.contains("git rebase"));
-        assert!(!note.contains("git fetch"));
-        assert!(note.contains("No manual rebase or force-push is needed"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3937,436 +4772,19 @@ mod tests {
             "a completed job without an open PR is not a reconcile candidate"
         );
     }
-
-    fn advance_test_commit(
-        jj: &crate::jj::JjEnv,
-        store: &Path,
-        parent: &str,
-        name: &str,
-    ) -> String {
-        jj.run(store, &["new", parent], "create durable-base test commit")
-            .unwrap();
-        std::fs::write(store.join(format!("{name}.txt")), format!("{name}\n")).unwrap();
-        jj.run(
-            store,
-            &["describe", "-m", name],
-            "describe durable-base test commit",
-        )
-        .unwrap();
-        crate::jj::revset_commit(jj, store, "@").unwrap()
-    }
-
-    async fn durable_base_fixture(
-        db: &LocalDb,
-        workspace: &Path,
-        database_base: &str,
-        marker_base: &str,
-    ) -> SiblingJob {
-        let workspace_path = workspace.to_string_lossy().to_string();
-        db.execute(
-            "UPDATE jobs SET worktree_path = ?1, base_commit = ?2 WHERE id = 'job-overlap'",
-            params![workspace_path.as_str(), database_base],
-        )
-        .await
-        .unwrap();
-        std::fs::create_dir_all(workspace.join(".jj")).unwrap();
-        let identity = crate::jj::WorkspaceIdentity::new(
-            "job-overlap",
-            "job-overlap",
-            "proj-1",
-            PathBuf::from("/repo"),
-            workspace.to_path_buf(),
-            "branch-overlap",
-            "branch-overlap",
-            marker_base,
-        );
-        crate::jj::write_workspace_identity(workspace, &identity).unwrap();
-        SiblingJob {
-            id: "job-overlap".to_string(),
-            worktree_path: workspace_path,
-            branch: Some("branch-overlap".to_string()),
-            base_commit: Some(database_base.to_string()),
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(jj)]
-    async fn two_consecutive_durable_advances_converge_without_pending_state() {
-        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
-            return;
-        };
-        let a = crate::jj::revset_commit(&jj, &store, "main").unwrap();
-        let b = advance_test_commit(&jj, &store, &a, "consecutive-b");
-        let c = advance_test_commit(&jj, &store, &b, "consecutive-c");
-        let db = migrated_db().await;
-        seed_base_advance_fixture(&db).await;
-        let workspace = workspaces.path().join("consecutive");
-        let sibling_a = durable_base_fixture(&db, &workspace, &a, &a).await;
-
-        advance_sibling_durable_base(&db, &jj, &store, &sibling_a, &b)
-            .await
-            .unwrap();
-        let sibling_b = SiblingJob {
-            base_commit: Some(b.clone()),
-            ..sibling_a
-        };
-        advance_sibling_durable_base(&db, &jj, &store, &sibling_b, &c)
-            .await
-            .unwrap();
-
-        let marker = loop {
-            let marker = crate::jj::read_workspace_identity(&workspace).unwrap();
-            if marker.base_commit == c && marker.pending_base_transition.is_none() {
-                break marker;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
-        assert_eq!(marker.base_commit, c);
-        assert!(marker.pending_base_transition.is_none());
-        assert_eq!(
-            db.query_text("SELECT base_commit FROM jobs WHERE id = 'job-overlap'", ())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(c.as_str())
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(jj)]
-    async fn consecutive_external_advances_with_preflight_preserve_dirty_bytes() {
-        let Some((home, project, workspaces, _, _)) = jj_test_env() else {
-            return;
-        };
-        let remote = TempDir::new().unwrap();
-        assert!(crate::env::git()
-            .args(["init", "--bare", "-q"])
-            .arg(remote.path())
-            .status()
-            .is_ok_and(|status| status.success()));
-        assert!(run_test_git(
-            project.path(),
-            &["remote", "add", "origin", &remote.path().to_string_lossy()]
-        ));
-        assert!(run_test_git(
-            project.path(),
-            &["push", "-q", "-u", "origin", "main"]
-        ));
-
-        let db = migrated_db().await;
-        seed_base_advance_fixture(&db).await;
-        let mut git = MockGitClient::new();
-        git.expect_fetch_origin().times(2).returning(|repo| {
-            run_test_git(repo, &["fetch", "-q", "origin"])
-                .then_some(())
-                .ok_or_else(|| "test git fetch failed".to_string())
-        });
-        let mut orch = test_orchestrator(db, git);
-        let bin = std::env::var("CAIRN_JJ_BIN")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                Command::new("which")
-                    .arg("jj")
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            })
-            .unwrap();
-        orch.jj_binary_path = bin.clone();
-        let repo_path = project.path().to_string_lossy().to_string();
-        orch.db
-            .local
-            .execute(
-                "UPDATE projects SET repo_path = ?1 WHERE id = 'proj-1'",
-                params![repo_path.as_str()],
-            )
-            .await
-            .unwrap();
-
-        let jj = crate::jj::JjEnv::resolve(&bin, &orch.config_dir);
-        let store = crate::jj::project_store_dir(&orch.config_dir, project.path());
-        crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
-        let workspace = workspaces.path().join("external-interleaving");
-        let branch = "agent/PROJ-2-builder-0";
-        crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
-        let a = crate::jj::revset_commit(&jj, &store, "main").unwrap();
-        let workspace_path = workspace.to_string_lossy().to_string();
-        orch.db
-            .local
-            .execute(
-                "UPDATE jobs SET worktree_path = ?1, branch = ?2, base_commit = ?3, base_branch = 'main' WHERE id = 'job-overlap'",
-                params![workspace_path.as_str(), branch, a.as_str()],
-            )
-            .await
-            .unwrap();
-        crate::jj::write_project_root_marker(&workspace, project.path()).unwrap();
-        let identity = crate::jj::WorkspaceIdentity::new(
-            "job-overlap",
-            "job-overlap",
-            "proj-1",
-            project.path().to_path_buf(),
-            workspace.clone(),
-            branch,
-            crate::jj::workspace_name_for_branch(branch),
-            a,
-        );
-        crate::jj::write_workspace_identity(&workspace, &identity).unwrap();
-
-        std::fs::write(project.path().join("base.txt"), "base b\n").unwrap();
-        assert!(run_test_git(project.path(), &["add", "."]));
-        assert!(run_test_git(
-            project.path(),
-            &["commit", "-q", "-m", "base b"]
-        ));
-        assert!(run_test_git(
-            project.path(),
-            &["push", "-q", "origin", "main"]
-        ));
-        reconcile_external_default_advance(&orch, "proj-1", "main")
-            .await
-            .unwrap();
-        let b = crate::jj::revset_commit(&jj, &store, "main@origin").unwrap();
-
-        let local_bytes = b"exact local bytes\n\0not text\n";
-        std::fs::write(workspace.join("local.bin"), local_bytes).unwrap();
-        let request = cairn_common::protocol::CallbackRequest {
-            thread_id: None,
-            cwd: workspace_path.clone(),
-            run_id: Some("run-job-overlap".to_string()),
-            tool: "run".to_string(),
-            payload: serde_json::json!({}),
-            tool_use_id: None,
-        };
-        crate::mcp::vcs::prepare_managed_workspace(&orch, &request)
-            .await
-            .unwrap()
-            .expect("managed workspace preflight");
-        assert_eq!(
-            std::fs::read(workspace.join("local.bin")).unwrap(),
-            local_bytes
-        );
-
-        std::fs::write(project.path().join("base.txt"), "base c\n").unwrap();
-        assert!(run_test_git(project.path(), &["add", "."]));
-        assert!(run_test_git(
-            project.path(),
-            &["commit", "-q", "-m", "base c"]
-        ));
-        assert!(run_test_git(
-            project.path(),
-            &["push", "-q", "origin", "main"]
-        ));
-        reconcile_external_default_advance(&orch, "proj-1", "main")
-            .await
-            .unwrap();
-        let c = crate::jj::revset_commit(&jj, &store, "main@origin").unwrap();
-        assert_ne!(b, c);
-
-        assert_eq!(
-            std::fs::read(workspace.join("local.bin")).unwrap(),
-            local_bytes
-        );
-        let marker = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let marker = crate::jj::read_workspace_identity(&workspace).unwrap();
-                if marker.base_commit == c && marker.pending_base_transition.is_none() {
-                    break marker;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("reconcile worker advances durable base");
-        assert_eq!(marker.base_commit, c);
-        assert!(marker.pending_base_transition.is_none());
-        let active_bases = orch
-            .db
-            .local
-            .read(|conn| {
-                let workspace_path = workspace_path.clone();
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT base_commit FROM jobs WHERE worktree_path = ?1 AND status IN ('pending', 'running', 'blocked', 'idle')",
-                            params![workspace_path.as_str()],
-                        )
-                        .await?;
-                    let mut bases = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        bases.push(row.text(0)?);
-                    }
-                    Ok::<_, DbError>(bases)
-                })
-            })
-            .await
-            .unwrap();
-        assert!(!active_bases.is_empty());
-        assert!(active_bases.iter().all(|base| base == &c));
-        let failures = orch
-            .db
-            .local
-            .query_opt_i64(
-                "SELECT COUNT(*) FROM messages WHERE content LIKE '%durable base advancement failed%'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(failures, Some(0));
-        drop(home);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(jj)]
-    async fn finalized_on_lineage_mismatches_normalize_forward() {
-        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
-            return;
-        };
-        let a = crate::jj::revset_commit(&jj, &store, "main").unwrap();
-        let b = advance_test_commit(&jj, &store, &a, "base-b");
-        let c = advance_test_commit(&jj, &store, &b, "base-c");
-
-        for (name, marker_base, database_base) in [
-            ("database-ahead", a.as_str(), b.as_str()),
-            ("marker-ahead", b.as_str(), a.as_str()),
-        ] {
-            let db = migrated_db().await;
-            seed_base_advance_fixture(&db).await;
-            let workspace = workspaces.path().join(name);
-            let sibling = durable_base_fixture(&db, &workspace, database_base, marker_base).await;
-            advance_sibling_durable_base(&db, &jj, &store, &sibling, &c)
-                .await
-                .unwrap();
-
-            let marker = crate::jj::read_workspace_identity(&workspace).unwrap();
-            assert_eq!(marker.base_commit, c);
-            assert!(marker.pending_base_transition.is_none());
-            assert_eq!(
-                db.query_text("SELECT base_commit FROM jobs WHERE id = 'job-overlap'", (),)
-                    .await
-                    .unwrap()
-                    .as_deref(),
-                Some(c.as_str())
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(jj)]
-    async fn incomparable_finalized_mismatch_refuses_without_mutation() {
-        let Some((_home, _project, workspaces, jj, store)) = jj_test_env() else {
-            return;
-        };
-        let a = crate::jj::revset_commit(&jj, &store, "main").unwrap();
-        let marker_branch = advance_test_commit(&jj, &store, &a, "marker-branch");
-        let database_branch = advance_test_commit(&jj, &store, &a, "database-branch");
-        jj.run(
-            &store,
-            &["new", &marker_branch, &database_branch],
-            "create incomparable merge target",
-        )
-        .unwrap();
-        std::fs::write(store.join("target.txt"), "target\n").unwrap();
-        jj.run(
-            &store,
-            &["describe", "-m", "target"],
-            "describe incomparable merge target",
-        )
-        .unwrap();
-        let target = crate::jj::revset_commit(&jj, &store, "@").unwrap();
-        let db = migrated_db().await;
-        seed_base_advance_fixture(&db).await;
-        let workspace = workspaces.path().join("incomparable");
-        let sibling = durable_base_fixture(&db, &workspace, &database_branch, &marker_branch).await;
-        std::fs::write(workspace.join("local.txt"), "preserved bytes\n").unwrap();
-
-        let error = advance_sibling_durable_base(&db, &jj, &store, &sibling, &target)
-            .await
-            .unwrap_err();
-        assert!(error.contains(&marker_branch), "{error}");
-        assert!(error.contains(&database_branch), "{error}");
-        assert!(error.contains(&target), "{error}");
-        assert!(
-            error.contains("off-target") || error.contains("divergent/incomparable"),
-            "{error}"
-        );
-        assert!(
-            error.contains("cairn:~/workspace-recovery action=rebind"),
-            "{error}"
-        );
-        assert!(error.contains("Do not force-push"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("local.txt")).unwrap(),
-            "preserved bytes\n"
-        );
-        let marker = crate::jj::read_workspace_identity(&workspace).unwrap();
-        assert_eq!(marker.base_commit, marker_branch);
-        assert!(marker.pending_base_transition.is_none());
-        assert_eq!(
-            db.query_text("SELECT base_commit FROM jobs WHERE id = 'job-overlap'", (),)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(database_branch.as_str())
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pending_base_transition_completes_after_database_cas_interruption() {
-        let db = migrated_db().await;
-        seed_base_advance_fixture(&db).await;
-        let workspace = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(workspace.path().join(".jj")).unwrap();
-        let workspace_path = workspace.path().to_string_lossy().to_string();
-        db.execute(
-            "UPDATE jobs SET worktree_path = ?1, base_commit = 'new-base' WHERE id = 'job-overlap'",
-            params![workspace_path.as_str()],
-        )
-        .await
-        .unwrap();
-        let mut identity = crate::jj::WorkspaceIdentity::new(
-            "job-overlap",
-            "job-overlap",
-            "proj-1",
-            std::path::PathBuf::from("/repo"),
-            workspace.path().to_path_buf(),
-            "branch-overlap",
-            "branch-overlap",
-            "old-base",
-        );
-        identity.pending_base_transition = Some(crate::jj::WorkspaceBaseTransition {
-            old_base: "old-base".to_string(),
-            new_base: "new-base".to_string(),
-        });
-        crate::jj::write_workspace_identity(workspace.path(), &identity).unwrap();
-
-        let sibling = SiblingJob {
-            id: "job-overlap".to_string(),
-            worktree_path: workspace_path,
-            branch: Some("branch-overlap".to_string()),
-            base_commit: Some("new-base".to_string()),
-        };
-        let jj = crate::jj::JjEnv::resolve("", workspace.path());
-        advance_sibling_durable_base(&db, &jj, workspace.path(), &sibling, "new-base")
-            .await
-            .unwrap();
-
-        let finalized = crate::jj::read_workspace_identity(workspace.path()).unwrap();
-        assert_eq!(finalized.base_commit, "new-base");
-        assert!(finalized.pending_base_transition.is_none());
-    }
-
     #[test]
     fn external_advance_note_carries_no_pr_or_rebase_commands() {
         let note = build_external_advance_conflict_note("main");
         assert!(note.contains("[Base branch update]"));
         assert!(note.contains("`main`"));
         assert!(note.contains("outside Cairn"));
-        assert!(note.contains("auto-rebased"));
         // Stop-the-line: the note names the conflict as blocking, not optional.
         assert!(note.contains("BLOCKING"));
-        assert!(note.contains("cannot push or merge"));
+        // Same contract as the Cairn-owned advance: rolled back, untouched, and
+        // no markers to point at.
+        assert!(note.contains("rolled back"), "{note}");
+        assert!(note.contains("untouched"), "{note}");
+        assert!(!note.to_lowercase().contains("marker"), "{note}");
         // No Cairn-tracked owner: the note must not reference a PR number.
         assert!(!note.contains("PR #"));
         // The note must not instruct a manual rebase/force-push/fetch.
@@ -4435,14 +4853,12 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let siblings = vec![SiblingJob {
             id: "job-overlap".to_string(),
-            worktree_path: "/wt/overlap".to_string(),
             branch: Some("agent/PROJ-2-builder-0".to_string()),
             base_commit: None,
         }];
         let failed = vec![crate::jj::ReconcileFailure {
             branch: "agent/PROJ-2-builder-0".to_string(),
-            workspace_path: "/wt/overlap".into(),
-            error: "jj workspace update-stale failed: exact stderr".to_string(),
+            error: "jj bookmark rebase failed: exact stderr".to_string(),
         }];
 
         notify_failed_siblings(
@@ -4473,12 +4889,12 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(content.contains("agent's managed jj workspace"));
-        assert!(content.contains("/wt/overlap"));
-        assert!(content.contains("jj workspace update-stale failed: exact stderr"));
-        assert!(content.contains("Your work was preserved"));
+        // The agent is told its work is safe and what not to do; the exact
+        // reconciliation stderr rides along for the human who repairs it.
+        assert!(content.contains("Your commits are intact"));
+        assert!(content.contains("jj bookmark rebase failed: exact stderr"));
         assert!(!content.to_lowercase().contains("retry"));
-        assert!(content.contains("do not force-push"));
+        assert!(content.to_lowercase().contains("do not force-push"));
         assert_eq!(wake, "wake");
     }
 
@@ -4491,23 +4907,48 @@ mod tests {
         let siblings = vec![
             SiblingJob {
                 id: "job-overlap".to_string(),
-                worktree_path: "/wt/overlap".to_string(),
                 branch: Some("agent/PROJ-2-builder-0".to_string()),
                 base_commit: None,
             },
             SiblingJob {
                 id: "job-clean".to_string(),
-                worktree_path: "/wt/clean".to_string(),
                 branch: Some("agent/PROJ-3-builder-0".to_string()),
                 base_commit: None,
             },
         ];
         let conflicted = vec!["agent/PROJ-2-builder-0".to_string()];
         let note = build_jj_conflict_note("integration", Some(42), None);
-        let mut files_by_branch: HashMap<String, Vec<String>> = HashMap::new();
-        files_by_branch.insert(
+        // The cross-file trap this diagnostic exists for: the incoming change
+        // conflicts on two files and ALSO carries a third that arrives cleanly.
+        // An agent told only about the first two resolves them, stops compiling,
+        // and has no idea why (CAIRN-3337).
+        let mut diagnostics: HashMap<String, crate::jj::ConflictDiagnostic> = HashMap::new();
+        diagnostics.insert(
             "agent/PROJ-2-builder-0".to_string(),
-            vec!["shared.rs".to_string(), "lib.rs".to_string()],
+            crate::jj::ConflictDiagnostic {
+                base: Some("b".repeat(40)),
+                ours: Some("o".repeat(40)),
+                theirs: Some("t".repeat(40)),
+                conflicted_tip: None,
+                condition: crate::jj::ConflictCondition::ContentConflict,
+                incoming: vec![
+                    crate::jj::IncomingFile {
+                        path: "shared.rs".to_string(),
+                        status: "M".to_string(),
+                        classification: crate::jj::IncomingClassification::Conflicting,
+                    },
+                    crate::jj::IncomingFile {
+                        path: "lib.rs".to_string(),
+                        status: "M".to_string(),
+                        classification: crate::jj::IncomingClassification::Conflicting,
+                    },
+                    crate::jj::IncomingFile {
+                        path: "storage.rs".to_string(),
+                        status: "M".to_string(),
+                        classification: crate::jj::IncomingClassification::CleanOnRetry,
+                    },
+                ],
+            },
         );
 
         notify_conflicted_siblings(
@@ -4516,7 +4957,10 @@ mod tests {
             &siblings,
             &conflicted,
             &note,
-            &files_by_branch,
+            &ConflictEvidence {
+                diagnostics,
+                ..ConflictEvidence::default()
+            },
             "test-conflicted",
         )
         .unwrap();
@@ -4550,12 +4994,41 @@ mod tests {
             "only the conflicted sibling is messaged; the cleanly-rebased one is not"
         );
         assert_eq!(messages[0].0, "run-job-overlap");
+        let wake = &messages[0].1;
         assert!(
-            messages[0]
-                .1
-                .contains("Conflicting files: shared.rs, lib.rs."),
-            "the conflict note names the conflicting files: {}",
-            messages[0].1
+            wake.contains("Conflicting files, yours to merge (2): shared.rs, lib.rs"),
+            "the note names the conflicting files: {wake}"
+        );
+        // The load-bearing half: the sibling file that is NOT conflicting still
+        // has to be named, or the agent resolves two files and ships a branch
+        // that does not compile.
+        assert!(
+            wake.contains("cleanly on retry (1): storage.rs"),
+            "the note names the incoming change's clean-on-retry siblings: {wake}"
+        );
+        assert!(
+            wake.contains("CONTENT CONFLICT"),
+            "the note names which condition this is: {wake}"
+        );
+        assert!(
+            wake.contains(&"t".repeat(40)) && wake.contains(&"b".repeat(40)),
+            "the immutable three-way coordinates ride out, so both sides are recomputable: {wake}"
+        );
+        // Markers were not confirmed for this branch, so the wake must say they
+        // are absent rather than tell the agent to resolve state nothing made
+        // true. It may still MENTION markers — saying "there are none" is the
+        // honest thing — but never in the imperative.
+        assert!(
+            wake.contains("no conflict markers in your checkout"),
+            "an unconfirmed materialization must say markers are absent: {wake}"
+        );
+        assert!(
+            !wake.contains("Conflict markers have been written"),
+            "the wake must never claim markers exist without confirmation: {wake}"
+        );
+        assert!(
+            wake.contains("cairn:~/rebase"),
+            "the wake links the session that carries both sides of the merge: {wake}"
         );
 
         // The push is waking but non-interrupting: it steers the agent at the next
@@ -4604,16 +5077,15 @@ mod tests {
 
         let siblings = vec![SiblingJob {
             id: job_id.to_string(),
-            worktree_path: "/wt/team-overlap".to_string(),
             branch: Some("agent/TEAM-9-builder-0".to_string()),
             base_commit: None,
         }];
         let conflicted = vec!["agent/TEAM-9-builder-0".to_string()];
         let note = build_jj_conflict_note("integration", Some(42), None);
-        let mut files_by_branch: HashMap<String, Vec<String>> = HashMap::new();
-        files_by_branch.insert(
+        let mut diagnostics: HashMap<String, crate::jj::ConflictDiagnostic> = HashMap::new();
+        diagnostics.insert(
             "agent/TEAM-9-builder-0".to_string(),
-            vec!["team.rs".to_string()],
+            crate::jj::ConflictDiagnostic::from_paths(vec!["team.rs".to_string()]),
         );
 
         notify_conflicted_siblings(
@@ -4622,7 +5094,10 @@ mod tests {
             &siblings,
             &conflicted,
             &note,
-            &files_by_branch,
+            &ConflictEvidence {
+                diagnostics,
+                ..ConflictEvidence::default()
+            },
             "test-team-conflicted",
         )
         .unwrap();
@@ -4660,13 +5135,11 @@ mod tests {
         let siblings = vec![
             SiblingJob {
                 id: "job-overlap".to_string(),
-                worktree_path: "/wt/overlap".to_string(),
                 branch: Some("agent/PROJ-2-builder-0".to_string()),
                 base_commit: None,
             },
             SiblingJob {
                 id: "job-clean".to_string(),
-                worktree_path: "/wt/clean".to_string(),
                 branch: Some("agent/PROJ-3-builder-0".to_string()),
                 base_commit: None,
             },
@@ -4759,7 +5232,6 @@ mod tests {
 
         let siblings = vec![SiblingJob {
             id: "job-clean".to_string(),
-            worktree_path: "/wt/clean".to_string(),
             branch: Some("agent/PROJ-3-builder-0".to_string()),
             base_commit: None,
         }];
@@ -4882,6 +5354,131 @@ mod tests {
 
         release_tx.send(()).unwrap();
         reconcile.await.unwrap().unwrap();
+    }
+
+    /// THE REGRESSION. A merge lands on origin with NOTHING else in flight, which
+    /// is the overwhelmingly common shape. Every base-advance path used to return
+    /// early on `siblings.is_empty()` BEFORE it imported anything, so the store's
+    /// default bookmark was never reconciled and was left holding a target that
+    /// no longer agreed with origin — which the next operation to touch it
+    /// reported as a conflicted name, killing every `main`-resolving verb.
+    ///
+    /// This asserts the store converges on origin with zero siblings. It fails on
+    /// the code this change replaces, for the reason the whole slice exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_bookmark_reconciles_with_zero_in_flight_siblings() {
+        let Some(_bin) = crate::jj::tests::jj_bin() else {
+            eprintln!("skipping default_bookmark_reconciles_with_zero_siblings: jj not resolvable");
+            return;
+        };
+        use crate::jj::tests::{git, git_stdout, init_project};
+
+        let origin = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        init_project(proj.path());
+        git(
+            proj.path(),
+            &["remote", "add", "origin", &origin.path().to_string_lossy()],
+        );
+        git(proj.path(), &["push", "-q", "origin", "main"]);
+        let repo_path = proj.path().to_string_lossy().into_owned();
+
+        let db = migrated_db().await;
+        let seed_repo = repo_path.clone();
+        db.write(|conn| {
+            let seed_repo = seed_repo.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-jj', 'default', 'Project', 'PJJ', ?1, 'main', 1, 1)",
+                    params![seed_repo.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let mut git_client = MockGitClient::new();
+        git_client.expect_fetch_origin().returning(|repo| {
+            crate::env::git()
+                .args(["fetch", "-q", "origin"])
+                .current_dir(repo)
+                .status()
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        let orch = test_orchestrator(db, git_client);
+
+        // The store is provisioned and tracking origin, exactly as a live project's is.
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+        crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path)).unwrap();
+
+        // A PR merges on GitHub: origin's default branch advances onto a commit
+        // the store has never seen. No sibling job exists anywhere.
+        git(proj.path(), &["checkout", "-q", "--detach"]);
+        std::fs::write(proj.path().join("merged.rs"), "landed\n").unwrap();
+        git(proj.path(), &["add", "-A"]);
+        git(proj.path(), &["commit", "-q", "-m", "squash merge (#1)"]);
+        let landed = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+        git(proj.path(), &["push", "-q", "-f", "origin", "HEAD:main"]);
+
+        reconcile_external_default_advance(&orch, "proj-jj", "main")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::jj::bookmark_commit(&jj, &store, "main").as_deref(),
+            Some(landed.as_str()),
+            "the store's default bookmark must equal origin after a merge, with no siblings in flight and no human in the loop"
+        );
+        assert_eq!(
+            git_stdout(proj.path(), &["rev-parse", "refs/heads/main"]),
+            landed,
+            "the backing git ref must follow, or the next import re-conflicts the bookmark"
+        );
+
+        // A `?branch=main` read resolves the name and returns the merged content.
+        // Resolving to the right commit id is not the same as being readable: the
+        // conflicted-name state fails at resolution, so this is the assertion that
+        // the branch is actually usable again.
+        let content = crate::jj::file_show(&jj, &store, "main", "merged.rs")
+            .expect("a read at `main` must resolve once the bookmark is reconciled");
+        assert_eq!(String::from_utf8_lossy(&content), "landed\n");
+
+        // And a fresh job provisions off it — the verb a conflicted `main` kills.
+        let wts = tempfile::tempdir().unwrap();
+        crate::jj::add_workspace(
+            &jj,
+            &store,
+            &wts.path().join("job"),
+            "agent/CAIRN-3192-builder-0",
+            "main",
+            None,
+        )
+        .expect("a fresh job must spawn off `main` with no human in the loop");
+    }
+
+    /// A branch that is NOT the project default is never reset onto origin: a
+    /// Coordinator integration branch and an agent branch legitimately hold sealed
+    /// work origin has not seen. The gate lives in the reconciler so no call site
+    /// can bypass it — the GitHub-merge caller passes a PR's target branch and
+    /// only asserted in a comment that it is always the default.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_default_branch_is_never_reconciled_onto_origin() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+
+        assert!(branch_is_project_default(&db, "proj-1", "main").await);
+        assert!(!branch_is_project_default(&db, "proj-1", "integration").await);
+        assert!(!branch_is_project_default(&db, "proj-1", "agent/CAIRN-1-builder-0").await);
+        assert!(
+            !branch_is_project_default(&db, "no-such-project", "main").await,
+            "an unreadable project must decline to reconcile rather than guess"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

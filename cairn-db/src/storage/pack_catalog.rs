@@ -15,7 +15,7 @@ pub enum PackKind {
 /// Each invocation handles a bounded batch so team-open latency is capped; later
 /// opens continue where the prior pass stopped.
 pub async fn backfill_execution_pack_catalog(db: &LocalDb, limit: usize) -> DbResult<usize> {
-    let Some(store) = db.content_store().cloned() else {
+    let Some(store) = db.team_id().map(|_| db.content_store().clone()) else {
         return Ok(0);
     };
     let rows = db

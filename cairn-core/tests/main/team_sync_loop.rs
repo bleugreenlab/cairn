@@ -2,34 +2,23 @@
 //! between members through the LOOP — the push task on the writer and the pull
 //! task on the reader — with NO manual `push()`/`pull()`.
 //!
-//! ## A skip is NOT a pass — these tests MUST be run unfenced
+//! These tests run in every lane, fenced or not. Each server-backed test needs a
+//! sync server (`tursodb` on PATH, or a `CAIRN_TEST_SYNC_URL`); spawning that
+//! process, binding loopback, and writing temp files are all permitted inside the
+//! worktree fence, so nothing here self-skips, and an unreachable server FAILS
+//! rather than passing vacuously (`common::sync_server::SyncServer::require`).
 //!
-//! Every server-backed test here self-skips inside the worktree fence: when the
-//! `CAIRN_CALLBACK_URL` / `CAIRN_RUN_ID` / `CAIRN_WORKTREE` trio is present
-//! (`common::skip_if_fenced`), each returns early. So a fenced `bun run
-//! test:rust` SKIPS them and still reads green — a skip carries no signal about
-//! correctness. To exercise them for real, run UNFENCED (the trio unset) with
-//! `tursodb` on PATH, e.g. from `src-tauri/`:
-//!
-//! ```text
-//! cargo test -p cairn-core --features test-utils --test main --no-run
-//! env -u CAIRN_SANDBOXED -u CAIRN_CALLBACK_URL -u CAIRN_RUN_ID -u CAIRN_WORKTREE \
-//!     ./target/debug/deps/main-* team_sync_loop --test-threads=1
-//! ```
-//!
-//! Self-skips inside the worktree fence (`common::skip_if_fenced`) and when no
-//! sync server is reachable. Unfenced, each server-backed test enables the loop
-//! via `DbState::enable_team_sync` and asserts propagation end to end. The
-//! dormancy test needs no server and runs everywhere, proving the loop is inert
-//! with no team configured.
-
-use crate::common;
+//! Each server-backed test enables the loop via `DbState::enable_team_sync` and
+//! asserts propagation end to end. The outage tests additionally need a server
+//! this process OWNS, since they kill and restart it (`require_owned`). The
+//! dormancy test needs no server at all, proving the loop is inert with no team
+//! configured.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::common::sync_server::SyncServer;
+use crate::common::sync_server::{skip_if_team_schema_unavailable, SyncServer};
 use cairn_core::internal::db::{DbState, SyncRuntime, TeamConfig};
 use cairn_core::internal::services::testing::CapturingEmitter;
 use cairn_core::internal::storage::{
@@ -111,13 +100,18 @@ async fn insert_team_row(db: &LocalDb, id: &str, name: &str) {
 /// host B with no manual push — A's push task and B's pull task carry it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_on_host_a_propagates_to_host_b_through_the_loop() {
-    if common::skip_if_fenced("write_on_host_a_propagates_to_host_b_through_the_loop") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(server) = SyncServer::require("write_on_host_a_propagates_to_host_b_through_the_loop")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "write_on_host_a_propagates_to_host_b_through_the_loop",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url().to_string();
     let dir = tempdir().unwrap();
 
@@ -155,15 +149,17 @@ async fn write_on_host_a_propagates_to_host_b_through_the_loop() {
 /// none lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn push_recovers_after_a_transient_outage_with_no_lost_commits() {
-    if common::skip_if_fenced("push_recovers_after_a_transient_outage_with_no_lost_commits") {
-        return;
-    }
-    let Some(mut server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(mut server) =
+        SyncServer::require_owned("push_recovers_after_a_transient_outage_with_no_lost_commits")
+    else {
         return;
     };
-    if !server.is_owned() {
-        eprintln!("skipping: needs an owned tursodb (cannot restart an external server)");
+    if skip_if_team_schema_unavailable(
+        "push_recovers_after_a_transient_outage_with_no_lost_commits",
+        server.url(),
+    )
+    .await
+    {
         return;
     }
     let url = server.url().to_string();
@@ -227,21 +223,23 @@ async fn push_recovers_after_a_transient_outage_with_no_lost_commits() {
 /// without stalling a healthy team's propagation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unreachable_team_does_not_stall_a_healthy_team() {
-    if common::skip_if_fenced("an_unreachable_team_does_not_stall_a_healthy_team") {
-        return;
-    }
-    let Some(good) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(good) = SyncServer::require_owned("an_unreachable_team_does_not_stall_a_healthy_team")
+    else {
         return;
     };
-    let Some(mut bad) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: needs a second tursodb instance");
-        return;
-    };
-    if !good.is_owned() || !bad.is_owned() {
-        eprintln!("skipping: needs two owned tursodb instances (cannot kill an external server)");
+    if skip_if_team_schema_unavailable(
+        "an_unreachable_team_does_not_stall_a_healthy_team",
+        good.url(),
+    )
+    .await
+    {
         return;
     }
+    let Some(mut bad) =
+        SyncServer::require_owned("an_unreachable_team_does_not_stall_a_healthy_team")
+    else {
+        return;
+    };
     let good_url = good.url().to_string();
     let bad_url = bad.url().to_string();
     let dir = tempdir().unwrap();
@@ -334,13 +332,18 @@ async fn dormant_with_no_team_configured() {
 /// genuine local transaction DOES fire it, proving the signal itself works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn applying_a_pull_does_not_fire_the_commit_signal() {
-    if common::skip_if_fenced("applying_a_pull_does_not_fire_the_commit_signal") {
-        return;
-    }
-    let Some(server) = SyncServer::locate_or_spawn() else {
-        eprintln!("skipping: no CAIRN_TEST_SYNC_URL and no tursodb on PATH");
+    let Some(server) = SyncServer::require("applying_a_pull_does_not_fire_the_commit_signal")
+    else {
         return;
     };
+    if skip_if_team_schema_unavailable(
+        "applying_a_pull_does_not_fire_the_commit_signal",
+        server.url(),
+    )
+    .await
+    {
+        return;
+    }
     let url = server.url().to_string();
     let dir = tempdir().unwrap();
 

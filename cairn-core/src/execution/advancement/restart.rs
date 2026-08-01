@@ -14,22 +14,19 @@
 //!
 //! 1. Archive every prior attempt for the node via [`reconcile_removed_nodes_conn`]
 //!    — it rejects running/complete nodes (immutable), flips the rest to
-//!    `Cancelled` with their transcripts preserved, and returns the worktree
-//!    paths now owned by nobody (for filesystem teardown by the caller).
+//!    `Cancelled` with their transcripts preserved. Branch coordinates remain durable.
 //! 2. Materialize a fresh `pending` job for the same node from the (edited)
 //!    snapshot via [`create_jobs_for_new_nodes_conn`]. It reads the concrete
-//!    `selection.model` from the snapshot and inserts a job with a NULL worktree
-//!    (allocated lazily at start), so “fresh worktree” comes for free while the
-//!    archived attempt's branch and commits are preserved on disk-by-git.
+//!    `selection.model` from the snapshot and inserts a job with a fresh durable
+//!    branch coordinate while the archived attempt's transcript is preserved.
 //!
-//! The caller (host command) then tears down the orphaned worktree and
-//! re-advances the DAG; once the node's live job is the fresh `pending` one,
+//! The caller then re-advances the DAG; once the node's live job is the fresh `pending` one,
 //! downstream cascade-failed descendants derive back to gated/pending and re-run.
 
 use super::*;
 
 /// Outcome of restarting a node: the archival reconcile result (cancelled job
-/// ids + orphaned worktree teardown targets) and the freshly created job(s).
+/// ids) and the freshly created job(s).
 #[derive(Debug)]
 pub struct RestartNodeOutcome {
     pub reconcile: RemovedNodesReconcile,
@@ -191,15 +188,15 @@ mod tests {
         id: &str,
         node_id: &str,
         status: &str,
-        worktree_path: Option<&str>,
+        _coordinate_hint: Option<&str>,
         with_session: bool,
         created_at: i64,
     ) {
         conn.execute(
             "INSERT INTO jobs (id, execution_id, recipe_node_id, status, project_id, issue_id,
-                 worktree_path, created_at, updated_at)
-             VALUES (?1,'exec-1',?2,?3,'proj-1','issue-1',?4,?5,?5)",
-            params![id, node_id, status, worktree_path, created_at],
+                 created_at, updated_at)
+             VALUES (?1,'exec-1',?2,?3,'proj-1','issue-1',?4,?4)",
+            params![id, node_id, status, created_at],
         )
         .await
         .unwrap();
@@ -298,10 +295,7 @@ mod tests {
                 let fresh = &outcome.created_jobs[0];
                 assert_ne!(fresh.id, "job-1");
                 assert_eq!(fresh.status, JobStatus::Pending);
-                assert!(
-                    fresh.worktree_path.is_none(),
-                    "fresh worktree allocated lazily"
-                );
+                assert!(fresh.branch.is_none(), "fresh branch is prepared on start");
 
                 // The live lookup now resolves to the fresh job, never the archive.
                 let live =

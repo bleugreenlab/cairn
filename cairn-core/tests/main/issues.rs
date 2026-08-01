@@ -4,7 +4,8 @@ use cairn_core::internal::services::Clock;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_core::issues::{comments, crud};
 use cairn_core::models::{
-    CommentSource, CreateComment, CreateIssue, Issue, IssueProgress, IssueStatus, UpdateIssue,
+    CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress, IssueStatus,
+    UpdateIssue,
 };
 use cairn_core::transitions::Resolution;
 use cairn_db::turso::params;
@@ -195,6 +196,34 @@ async fn resolve_and_unresolve_update_issue_and_close_open_sessions() {
     )
     .await;
     assert_eq!(session_status, 1);
+
+    // The merged variant records its own timestamp, clears attention, and closes
+    // the session with the matching reason. Only an OPEN session is closed, so
+    // reopen the one the close above already claimed.
+    db.execute(
+        "UPDATE sessions SET status = 'open', terminal_reason = NULL WHERE id = 'session-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    crud::resolve(&db, &FixedClock(650), &issue.id, Resolution::Merged)
+        .await
+        .unwrap();
+    let merged_issue = crud::get(&db, &issue.id).await.unwrap().unwrap();
+    assert_eq!(merged_issue.status, IssueStatus::Merged);
+    assert_eq!(merged_issue.progress, IssueProgress::Merged);
+    assert_eq!(merged_issue.merged_at, Some(650));
+    assert_eq!(merged_issue.attention, IssueAttention::None);
+    assert_eq!(merged_issue.completed_at, Some(650));
+    assert_eq!(
+        count_where(
+            &db,
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1 AND terminal_reason = 'issue_merged'",
+            "session-1",
+        )
+        .await,
+        1
+    );
 
     crud::unresolve(&db, &FixedClock(700), &issue.id)
         .await

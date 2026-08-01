@@ -408,6 +408,7 @@ mod tests {
 
     fn make_job_ended_recipe(name: &str, filter: Option<EventFilter>) -> Recipe {
         Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
             id: format!("recipe-{}", name),
             name: name.to_string(),
             description: None,
@@ -445,6 +446,7 @@ mod tests {
 
     fn make_skill_called_recipe(name: &str, filter: Option<EventFilter>) -> Recipe {
         Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
             id: format!("recipe-{}", name),
             name: name.to_string(),
             description: None,
@@ -517,6 +519,7 @@ mod tests {
         use std::collections::HashMap;
 
         let make_snapshot = |tt: TriggerType| ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "r".to_string(),
                 name: "R".to_string(),
@@ -824,6 +827,7 @@ mod tests {
     #[test]
     fn manual_recipe_never_matches_job_ended() {
         let recipe = Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
             id: "manual".to_string(),
             name: "Manual".to_string(),
             description: None,

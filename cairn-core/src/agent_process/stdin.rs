@@ -4,166 +4,182 @@
 //! when using `--input-format stream-json` mode.
 
 use base64::Engine;
-use regex::Regex;
 use serde_json::{json, Value};
 use std::io::Write;
-use std::path::Path;
 
-/// Resolver function that converts an image path to base64-encoded data.
-type Base64Resolver<'a> = Option<&'a dyn Fn(&Path) -> Option<String>>;
-
-/// Get MIME type for an image extension
-fn get_mime_type(ext: &str) -> &'static str {
-    match ext.to_lowercase().as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        _ => "application/octet-stream",
-    }
+/// Provider-neutral user message content. Image bytes are resolved from durable
+/// storage before a backend serializes the message; encoded bytes never enter a
+/// text part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageContent {
+    pub(crate) text: String,
+    pub(crate) images: Vec<MessageImage>,
 }
 
-/// Extract local file paths from text that look like images.
-/// Matches patterns like:
-/// - /absolute/path/to/image.png
-/// - ./relative/path/to/image.jpg
-/// - file:///path/to/image.png
-fn extract_image_paths(text: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-
-    // Match file:// URLs
-    let file_url_re = Regex::new(r"file://(/[^\s\)>\]]+\.(png|jpg|jpeg|gif|webp))").unwrap();
-    for cap in file_url_re.captures_iter(text) {
-        if let Some(path) = cap.get(1) {
-            paths.push(path.as_str().to_string());
-        }
-    }
-
-    // Match absolute paths (starting with /)
-    let abs_path_re =
-        Regex::new(r"(?:^|[\s\(\[<])(/[^\s\)>\]]+\.(png|jpg|jpeg|gif|webp))").unwrap();
-    for cap in abs_path_re.captures_iter(text) {
-        if let Some(path) = cap.get(1) {
-            let p = path.as_str().to_string();
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
-        }
-    }
-
-    // Match relative paths (starting with ./)
-    let rel_path_re =
-        Regex::new(r"(?:^|[\s\(\[<])(\./[^\s\)>\]]+\.(png|jpg|jpeg|gif|webp))").unwrap();
-    for cap in rel_path_re.captures_iter(text) {
-        if let Some(path) = cap.get(1) {
-            let p = path.as_str().to_string();
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
-        }
-    }
-
-    paths
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MessageImage {
+    pub(crate) mime_type: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
-/// Build message content with embedded images.
-/// Returns a content array if images are found, or a simple string if not.
-///
-/// If `resolve_base64` is provided, it will be called for each image path
-/// before falling back to reading from disk. This allows hosts to provide
-/// pre-computed base64 data (e.g. from a cache).
-pub(crate) fn build_message_content(
-    text: &str,
-    working_dir: Option<&str>,
-    resolve_base64: Base64Resolver<'_>,
-) -> Value {
-    let image_paths = extract_image_paths(text);
+#[cfg(test)]
+pub(crate) trait StableImageResolver {
+    fn resolve(&self, uri: &str) -> Result<MessageImage, String>;
+}
 
-    if image_paths.is_empty() {
-        // No images - return simple text content
-        return json!(text);
-    }
-
-    // Build content array with text and images
-    let mut content_blocks: Vec<Value> = Vec::new();
-
-    // Add text block first
-    content_blocks.push(json!({
-        "type": "text",
-        "text": text
-    }));
-
-    // Try to embed each image
-    for path_str in &image_paths {
-        let path = if let Some(relative) = path_str.strip_prefix("./") {
-            // Resolve relative path against working directory
-            if let Some(wd) = working_dir {
-                Path::new(wd).join(relative)
-            } else {
-                Path::new(path_str).to_path_buf()
-            }
-        } else {
-            Path::new(path_str).to_path_buf()
+pub(crate) async fn resolve_stable_images(
+    db: &crate::db::DbState,
+    authorized_project_id: &str,
+    authorized_project_key: &str,
+    text: impl Into<String>,
+) -> Result<MessageContent, String> {
+    let text = text.into();
+    let mut seen = std::collections::HashSet::new();
+    let mut images = Vec::new();
+    for found in cairn_common::uri::scan_stored_images(&text) {
+        let uri = found.uri;
+        if !seen.insert(uri.clone()) {
+            continue;
+        }
+        let cairn_common::uri::CairnResource::ProjectImage { project, reference } = found.resource
+        else {
+            continue;
         };
+        if !project.eq_ignore_ascii_case(authorized_project_key) {
+            return Err(format!(
+                "durable image {uri} is outside the authorized project"
+            ));
+        }
+        let owning_db = crate::projects::crud::owning_db(db, authorized_project_id).await?;
+        let authorized_project = crate::projects::crud::get_db(&owning_db, authorized_project_id)
+            .await?
+            .ok_or_else(|| format!("authorized project not found: {authorized_project_id}"))?;
+        if !authorized_project
+            .key
+            .eq_ignore_ascii_case(authorized_project_key)
+        {
+            return Err("durable image authority no longer matches the current project".into());
+        }
+        let image =
+            crate::images::fetch_image_by_reference(&owning_db, authorized_project_id, &reference)
+                .await
+                .map_err(|error| format!("failed to resolve durable image {uri}: {error}"))?;
+        images.push(MessageImage {
+            mime_type: image.mime_type.to_string(),
+            bytes: image.bytes,
+        });
+    }
+    Ok(MessageContent { text, images })
+}
 
-        if path.exists() {
-            // Try host-provided resolver first (e.g. cache), then fall back to disk read
-            let base64_data = resolve_base64.and_then(|f| f(&path)).or_else(|| {
-                // Fallback: read and encode from disk
-                std::fs::read(&path).ok().map(|data| {
-                    log::debug!(
-                        "Reading image from disk: {} ({} bytes)",
-                        path.display(),
-                        data.len()
-                    );
-                    base64::engine::general_purpose::STANDARD.encode(&data)
-                })
-            });
+impl MessageContent {
+    /// Whether this message would serialize to nothing a provider accepts: no
+    /// usable text and no images.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
 
-            if let Some(base64_data) = base64_data {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
-                let mime_type = get_mime_type(ext);
-
-                log::info!("Embedding image {} ({})", path.display(), mime_type);
-
-                content_blocks.push(json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime_type,
-                        "data": base64_data
-                    }
-                }));
-            } else {
-                log::warn!("Failed to read image {}", path.display());
-            }
-        } else {
-            log::debug!("Image path not found: {}", path.display());
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
         }
     }
 
-    // If we only have the text block (no images loaded), return simple string
-    if content_blocks.len() == 1 {
-        return json!(text);
+    pub(crate) fn with_text(&self, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: self.images.clone(),
+        }
     }
 
-    json!(content_blocks)
+    /// Resolve every unique stable project-image URI in textual order. Missing
+    /// or corrupt durable resources are errors; native delivery never silently
+    /// degrades to text-only.
+    #[cfg(test)]
+    pub(crate) fn resolve(
+        text: impl Into<String>,
+        resolver: &dyn StableImageResolver,
+    ) -> Result<Self, String> {
+        let text = text.into();
+        let mut seen = std::collections::HashSet::new();
+        let mut images = Vec::new();
+        for found in cairn_common::uri::scan_stored_images(&text) {
+            if seen.insert(found.uri.clone()) {
+                images.push(resolver.resolve(&found.uri)?);
+            }
+        }
+        Ok(Self { text, images })
+    }
 }
 
-/// Send a user message to Claude via stdin with image embedding.
-/// Images referenced in the content (markdown image syntax) will be embedded as base64.
-/// The working_dir is only needed for relative paths; absolute paths work without it.
-/// If `resolve_base64` is provided, it will be called for each image path before
-/// falling back to reading from disk.
-pub(crate) fn send_user_message_with_images(
+/// Why a wholly empty message is refused rather than serialized.
+const EMPTY_MESSAGE_REFUSAL: &str = "Refusing to send a user message with no text and no images: an empty text block is rejected by the provider, and a harness that persists one makes every later resume of the conversation fail the same way.";
+
+/// Serialize common content into Claude stream-json's native content blocks.
+///
+/// Never emits an empty text block. The provider refuses one outright (`text
+/// content blocks must be non-empty`), and a harness that persists it converts a
+/// single bad turn into a permanently unresumable session (CAIRN-3263), so blank
+/// text is dropped when images carry the message and refused when nothing else
+/// does.
+pub(crate) fn build_message_content(content: &MessageContent) -> Result<Value, String> {
+    let has_text = !content.text.trim().is_empty();
+    if !has_text && content.images.is_empty() {
+        return Err(EMPTY_MESSAGE_REFUSAL.to_string());
+    }
+    if content.images.is_empty() {
+        return Ok(json!(content.text));
+    }
+
+    let mut blocks = Vec::with_capacity(content.images.len() + 1);
+    if has_text {
+        blocks.push(json!({ "type": "text", "text": content.text }));
+    }
+    blocks.extend(content.images.iter().map(|image| {
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.mime_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+            }
+        })
+    }));
+    Ok(Value::Array(blocks))
+}
+
+/// Serialize common content into Codex app-server's verified `UserInput`
+/// schema. Codex accepts durable bytes as a data URL in a native image item.
+/// Empty text is elided or refused for the same reason as above.
+pub(crate) fn build_codex_input(content: &MessageContent) -> Result<Value, String> {
+    let has_text = !content.text.trim().is_empty();
+    if !has_text && content.images.is_empty() {
+        return Err(EMPTY_MESSAGE_REFUSAL.to_string());
+    }
+
+    let mut input = Vec::with_capacity(content.images.len() + 1);
+    if has_text {
+        input.push(json!({ "type": "text", "text": content.text }));
+    }
+    input.extend(content.images.iter().map(|image| {
+        let data = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+        json!({
+            "type": "image",
+            "url": format!("data:{};base64,{}", image.mime_type, data),
+        })
+    }));
+    Ok(Value::Array(input))
+}
+
+/// Send a user message to Claude via stdin using pre-resolved native parts.
+pub(crate) fn send_user_message(
     stdin: &mut dyn Write,
     session_id: &str,
-    content: &str,
+    content: &MessageContent,
     parent_tool_use_id: Option<&str>,
-    working_dir: Option<&str>,
-    resolve_base64: Base64Resolver<'_>,
 ) -> Result<(), String> {
-    let message_content = build_message_content(content, working_dir, resolve_base64);
+    let message_content = build_message_content(content)?;
 
     let message = json!({
         "type": "user",
@@ -183,7 +199,7 @@ pub(crate) fn send_user_message_with_images(
     log::info!(
         "Sent user message via stdin to session {}: {} chars",
         &session_id[..session_id.len().min(8)],
-        content.len()
+        content.text.len()
     );
 
     Ok(())
@@ -329,16 +345,122 @@ mod tests {
         serde_json::from_str(output.trim()).unwrap()
     }
 
+    struct FixtureResolver;
+
+    impl StableImageResolver for FixtureResolver {
+        fn resolve(&self, _uri: &str) -> Result<MessageImage, String> {
+            Ok(MessageImage {
+                mime_type: "image/png".to_string(),
+                bytes: b"native-image-payload".to_vec(),
+            })
+        }
+    }
+
+    fn assert_no_text_contains(value: &Value, needle: &str) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(text)) = map.get("text") {
+                    assert!(!text.contains(needle), "encoded image leaked into text");
+                }
+                map.values()
+                    .for_each(|v| assert_no_text_contains(v, needle));
+            }
+            Value::Array(values) => values
+                .iter()
+                .for_each(|v| assert_no_text_contains(v, needle)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn stable_uri_resolves_once_and_serializes_as_native_claude_image() {
+        let uri = format!("cairn://p/CAIRN/images/{}", "a".repeat(64));
+        let content =
+            MessageContent::resolve(format!("![one]({uri}) again {uri}"), &FixtureResolver)
+                .unwrap();
+        assert_eq!(content.images.len(), 1);
+
+        let serialized = build_message_content(&content).unwrap();
+        assert_eq!(serialized[1]["type"], "image");
+        assert_eq!(serialized[1]["source"]["media_type"], "image/png");
+        let encoded = serialized[1]["source"]["data"].as_str().unwrap();
+        assert_no_text_contains(&serialized, encoded);
+    }
+
+    #[test]
+    fn stable_uri_serializes_as_native_codex_image_without_base64_text() {
+        let content = MessageContent {
+            text: "inspect the attached image".to_string(),
+            images: vec![MessageImage {
+                mime_type: "image/png".to_string(),
+                bytes: b"native-image-payload".to_vec(),
+            }],
+        };
+        let serialized = build_codex_input(&content).unwrap();
+        assert_eq!(serialized[1]["type"], "image");
+        let data_url = serialized[1]["url"].as_str().unwrap();
+        assert!(data_url.starts_with("data:image/png;base64,"));
+        let encoded = data_url.split_once(',').unwrap().1;
+        assert_no_text_contains(&serialized, encoded);
+    }
+
+    #[test]
+    fn stable_uri_resolution_is_fail_closed() {
+        struct Missing;
+        impl StableImageResolver for Missing {
+            fn resolve(&self, uri: &str) -> Result<MessageImage, String> {
+                Err(format!("missing image: {uri}"))
+            }
+        }
+        let uri = format!("cairn://p/CAIRN/images/{}", "b".repeat(64));
+        assert!(MessageContent::resolve(uri, &Missing)
+            .unwrap_err()
+            .contains("missing image"));
+    }
+
+    #[test]
+    fn empty_message_is_refused_by_both_serializers_and_never_reaches_stdin() {
+        for blank in ["", "   ", "\n\t "] {
+            let content = MessageContent::text(blank);
+            assert!(build_message_content(&content).is_err());
+            assert!(build_codex_input(&content).is_err());
+
+            let mut buffer = Cursor::new(Vec::new());
+            assert!(send_user_message(&mut buffer, "session-123", &content, None).is_err());
+            assert!(
+                buffer.into_inner().is_empty(),
+                "a refused message must not be written"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_text_beside_an_image_serializes_as_the_image_alone() {
+        let content = MessageContent {
+            text: "  ".to_string(),
+            images: vec![MessageImage {
+                mime_type: "image/png".to_string(),
+                bytes: b"native-image-payload".to_vec(),
+            }],
+        };
+
+        let claude = build_message_content(&content).unwrap();
+        assert_eq!(claude.as_array().unwrap().len(), 1);
+        assert_eq!(claude[0]["type"], "image");
+
+        let codex = build_codex_input(&content).unwrap();
+        assert_eq!(codex.as_array().unwrap().len(), 1);
+        assert_eq!(codex[0]["type"], "image");
+    }
+
     #[test]
     fn test_send_user_message() {
         let mut buffer = Cursor::new(Vec::new());
 
-        send_user_message_with_images(
+        send_user_message(
             &mut buffer,
             "session-123",
-            "Hello, Claude!",
-            None,
-            None,
+            &MessageContent::text("Hello, Claude!"),
             None,
         )
         .unwrap();
@@ -356,13 +478,11 @@ mod tests {
     fn test_send_user_message_with_parent_tool_use_id() {
         let mut buffer = Cursor::new(Vec::new());
 
-        send_user_message_with_images(
+        send_user_message(
             &mut buffer,
             "session-456",
-            "Subagent message",
+            &MessageContent::text("Subagent message"),
             Some("toolu_abc123"),
-            None,
-            None,
         )
         .unwrap();
 

@@ -4,7 +4,7 @@ use crate::db::DbState;
 use crate::mcp::handlers::slug::slugify;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use cairn_common::executor_protocol::{CellOccupant, LifetimeLeaseFence};
+use cairn_common::executor_protocol::ResidencyFence;
 use cairn_db::turso::params;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -74,9 +74,9 @@ struct RecoverableTerminal {
     id: String,
     session_id: String,
     status: String,
-    lease_id: String,
+    residency_holder: String,
     incarnation_id: String,
-    lease_epoch: u64,
+    cell_epoch: u64,
     transition_started_at: Option<i64>,
 }
 
@@ -85,9 +85,9 @@ async fn recoverable_terminals(db: &LocalDb) -> DbResult<Vec<RecoverableTerminal
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, session_id, status, lease_id, lease_incarnation_id, lease_epoch, exited_at
+                    "SELECT id, session_id, status, residency_holder, residency_incarnation_id, cell_epoch, exited_at
              FROM job_terminals
-             WHERE status IN ('recovering', 'closing') AND lease_id IS NOT NULL",
+             WHERE status IN ('recovering', 'closing') AND residency_holder IS NOT NULL",
                     (),
                 )
                 .await?;
@@ -97,9 +97,9 @@ async fn recoverable_terminals(db: &LocalDb) -> DbResult<Vec<RecoverableTerminal
                     id: row.text(0)?,
                     session_id: row.text(1)?,
                     status: row.text(2)?,
-                    lease_id: row.text(3)?,
+                    residency_holder: row.text(3)?,
                     incarnation_id: row.text(4)?,
-                    lease_epoch: row.i64(5)? as u64,
+                    cell_epoch: row.i64(5)? as u64,
                     transition_started_at: row.opt_i64(6)?,
                 });
             }
@@ -117,13 +117,13 @@ async fn delete_closing_terminal(db: &LocalDb, terminal: &RecoverableTerminal) -
             Ok(conn
                 .execute(
                     "DELETE FROM job_terminals
-             WHERE id = ?1 AND status = 'closing' AND lease_id = ?2
-               AND lease_incarnation_id = ?3 AND lease_epoch = ?4",
+             WHERE id = ?1 AND status = 'closing' AND residency_holder = ?2
+               AND residency_incarnation_id = ?3 AND cell_epoch = ?4",
                     params![
                         terminal.id,
-                        terminal.lease_id,
+                        terminal.residency_holder,
                         terminal.incarnation_id,
-                        terminal.lease_epoch as i64
+                        terminal.cell_epoch as i64
                     ],
                 )
                 .await?
@@ -143,20 +143,20 @@ async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String
     let mut changed = 0;
     for row in rows {
         let fence = snapshot.cells.iter().find_map(|cell| {
-            let lease = cell.occupant.as_ref().and_then(CellOccupant::lifetime)?;
-            (lease.declaration.lease_id == row.lease_id
-                && lease.incarnation_id == row.incarnation_id
-                && cell.lease_epoch == row.lease_epoch)
-                .then(|| LifetimeLeaseFence {
-                    lease_id: row.lease_id.clone(),
-                    owner: lease.declaration.owner.clone(),
+            let residency = cell.residency.as_ref()?;
+            (residency.holder.storage_key() == row.residency_holder
+                && residency.incarnation_id == row.incarnation_id
+                && cell.cell_epoch == row.cell_epoch)
+                .then(|| ResidencyFence {
+                    holder: residency.holder.clone(),
                     incarnation_id: row.incarnation_id.clone(),
-                    lease_epoch: row.lease_epoch,
+                    cell_epoch: row.cell_epoch,
                 })
         });
         if row.status == "recovering" {
             if let Some(fence) = fence {
-                match crate::mcp::handlers::terminal::restart_terminal_lease(orch, fence).await {
+                match crate::mcp::handlers::terminal::restart_residency_terminals(orch, fence).await
+                {
                     Ok(_) => changed += 1,
                     Err(error) => {
                         tracing::warn!(terminal_id = %row.id, %error, "terminal recovery retry failed")
@@ -165,9 +165,9 @@ async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String
             } else if terminal_owner_recovery_window_elapsed()
                 && resolve_missing_terminal_lease(
                     &orch.db.local,
-                    &row.lease_id,
+                    &row.residency_holder,
                     &row.incarnation_id,
-                    row.lease_epoch,
+                    row.cell_epoch,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -228,7 +228,7 @@ mod tests {
         db.execute_script(
             "INSERT INTO job_terminals
                  (id, session_id, command, status, created_at, slug,
-                  lease_id, lease_incarnation_id, lease_epoch, process_generation)
+                  residency_holder, residency_incarnation_id, cell_epoch, process_generation)
              VALUES
                  ('exited', 's-exited', 'true', 'exited', 1, 'exited', 'lease-exited', 'inc-exited', 1, 4),
                  ('running', 's-running', 'true', 'running', 1, 'running', 'lease-running', 'inc-running', 2, 5);",
@@ -276,7 +276,7 @@ mod tests {
 
         let exited: (String, Option<String>) = db
             .query_one(
-                "SELECT status, lease_id FROM job_terminals WHERE id = 'exited'",
+                "SELECT status, residency_holder FROM job_terminals WHERE id = 'exited'",
                 (),
                 |row| Ok((row.text(0)?, row.opt_text(1)?)),
             )
@@ -284,7 +284,7 @@ mod tests {
             .unwrap();
         let running: (String, Option<String>) = db
             .query_one(
-                "SELECT status, lease_id FROM job_terminals WHERE id = 'running'",
+                "SELECT status, residency_holder FROM job_terminals WHERE id = 'running'",
                 (),
                 |row| Ok((row.text(0)?, row.opt_text(1)?)),
             )
@@ -319,17 +319,72 @@ mod tests {
                 .unwrap()
         );
 
-        let (status, lease_id, exited_at): (String, Option<String>, Option<i64>) = db
+        let (status, residency_holder, exited_at): (String, Option<String>, Option<i64>) = db
             .query_one(
-                "SELECT status, lease_id, exited_at FROM job_terminals WHERE id = 'running'",
+                "SELECT status, residency_holder, exited_at FROM job_terminals WHERE id = 'running'",
                 (),
                 |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_i64(2)?)),
             )
             .await
             .unwrap();
         assert_eq!(status, "exited");
-        assert_eq!(lease_id, None);
+        assert_eq!(residency_holder, None);
         assert!(exited_at.is_some());
+    }
+
+    /// The transition that makes recovery reachable at all. Before this, a
+    /// terminal whose executor went away was finalized as exited, so the
+    /// reconcile loop — which acts only on `recovering` rows — never saw it and
+    /// the restart had to be asked for by hand.
+    #[tokio::test]
+    async fn an_executor_loss_fences_a_running_terminal_into_recovery() {
+        let db = Arc::new(seeded_lease_db("terminal-host-mark-recovering.db").await);
+
+        assert_eq!(
+            mark_terminal_recovering(db.clone(), "s-running".into())
+                .await
+                .unwrap(),
+            TerminalRecovery::Fenced
+        );
+        // A second delivery of the same death moves nothing — but it must say
+        // that recovery already holds the terminal, not merely that this call
+        // changed no row. The caller releases the environment on the second
+        // answer and retains it on the first, so collapsing them costs the
+        // pending restart the cell it was going to start in.
+        assert_eq!(
+            mark_terminal_recovering(db.clone(), "s-running".into())
+                .await
+                .unwrap(),
+            TerminalRecovery::AlreadyRecovering
+        );
+        // A terminal that already ended is not dragged back into recovery, and
+        // is reported as something recovery does not hold.
+        assert_eq!(
+            mark_terminal_recovering(db.clone(), "s-exited".into())
+                .await
+                .unwrap(),
+            TerminalRecovery::NotRecoverable
+        );
+        // A session with no row at all is likewise nothing to recover.
+        assert_eq!(
+            mark_terminal_recovering(db.clone(), "s-absent".into())
+                .await
+                .unwrap(),
+            TerminalRecovery::NotRecoverable
+        );
+
+        let (status, holder): (String, Option<String>) = db
+            .query_one(
+                "SELECT status, residency_holder FROM job_terminals WHERE id = 'running'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, "recovering");
+        // The environment binding survives: it is what the restart starts into,
+        // and clearing it here would leave recovery with nowhere to go.
+        assert_eq!(holder, Some("lease-running".to_string()));
     }
 
     #[test]
@@ -393,11 +448,11 @@ pub fn schedule_exited_terminal_lease_recovery(orch: Orchestrator) {
             .cells
             .into_iter()
             .filter_map(|cell| {
-                let lease = cell.occupant.as_ref()?.lifetime()?;
+                let residency = cell.residency.as_ref()?;
                 Some((
-                    lease.declaration.lease_id.clone(),
-                    lease.incarnation_id.clone(),
-                    cell.lease_epoch,
+                    residency.holder.storage_key(),
+                    residency.incarnation_id.clone(),
+                    cell.cell_epoch,
                 ))
             })
             .collect();
@@ -421,9 +476,9 @@ async fn clear_unadvertised_exited_terminal_lease_bindings(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT lease_id, lease_incarnation_id, lease_epoch
+                    "SELECT residency_holder, residency_incarnation_id, cell_epoch
                      FROM job_terminals
-                     WHERE status = 'exited' AND lease_id IS NOT NULL",
+                     WHERE status = 'exited' AND residency_holder IS NOT NULL",
                     (),
                 )
                 .await?;
@@ -436,19 +491,81 @@ async fn clear_unadvertised_exited_terminal_lease_bindings(
             }
             drop(rows);
             let mut updated = 0;
-            for (lease_id, incarnation_id, lease_epoch) in stale {
+            for (residency_holder, incarnation_id, cell_epoch) in stale {
                 updated += conn
                     .execute(
                         "UPDATE job_terminals
-                         SET lease_id = NULL, lease_incarnation_id = NULL, lease_epoch = NULL,
+                         SET residency_holder = NULL, residency_incarnation_id = NULL, cell_epoch = NULL,
                              process_generation = NULL
-                         WHERE status = 'exited' AND lease_id = ?1
-                           AND lease_incarnation_id = ?2 AND lease_epoch = ?3",
-                        params![lease_id, incarnation_id, lease_epoch as i64],
+                         WHERE status = 'exited' AND residency_holder = ?1
+                           AND residency_incarnation_id = ?2 AND cell_epoch = ?3",
+                        params![residency_holder, incarnation_id, cell_epoch as i64],
                     )
                     .await?;
             }
             Ok(updated)
+        })
+    })
+    .await
+}
+
+/// What fencing a terminal into recovery found.
+///
+/// A terminal's death can be delivered more than once — the fleet synthesizes a
+/// process event from every snapshot that still carries the exited entry, and
+/// the executor reports the exit itself — so "did this call move the row" and
+/// "is this terminal recovery's" are different questions. Answering them
+/// together is what would let a second delivery of one death conclude that
+/// recovery had declined the terminal, and finalize it out from under the
+/// restart already pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalRecovery {
+    /// This call moved a live terminal into recovery. It is recovery's now.
+    Fenced,
+    /// The terminal was already in recovery: another delivery of the same death
+    /// got here first, and the restart it set up is still coming.
+    AlreadyRecovering,
+    /// No terminal of this session is in a state recovery can take — it settled
+    /// by some other path — so the caller finalizes as it would any exit.
+    NotRecoverable,
+}
+
+/// Fence a terminal whose executor went away into recovery, which is what makes
+/// [`reconcile_terminal_lifecycle`] start it again once an executor advertises
+/// the environment holding it.
+pub(crate) async fn mark_terminal_recovering(
+    db: Arc<LocalDb>,
+    session_id: String,
+) -> DbResult<TerminalRecovery> {
+    db.write(|conn| {
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            if conn
+                .execute(
+                    "UPDATE job_terminals SET status = 'recovering'
+                     WHERE session_id = ?1 AND status = 'running'",
+                    params![session_id.as_str()],
+                )
+                .await?
+                > 0
+            {
+                return Ok(TerminalRecovery::Fenced);
+            }
+            // Nothing moved, which means either recovery already holds this
+            // terminal or there is nothing here to recover. Only the first must
+            // stop the caller from finalizing, so the two are read apart rather
+            // than collapsed into one "no".
+            let mut rows = conn
+                .query(
+                    "SELECT status FROM job_terminals WHERE session_id = ?1 LIMIT 1",
+                    params![session_id.as_str()],
+                )
+                .await?;
+            let status = rows.next().await?.map(|row| row.text(0)).transpose()?;
+            Ok(match status.as_deref() {
+                Some("recovering") => TerminalRecovery::AlreadyRecovering,
+                _ => TerminalRecovery::NotRecoverable,
+            })
         })
     })
     .await
@@ -459,14 +576,14 @@ async fn clear_unadvertised_exited_terminal_lease_bindings(
 /// replacement incarnation acquired concurrently.
 pub(crate) async fn resolve_missing_terminal_lease(
     db: &LocalDb,
-    lease_id: &str,
+    residency_holder: &str,
     incarnation_id: &str,
-    lease_epoch: u64,
+    cell_epoch: u64,
 ) -> DbResult<bool> {
-    let lease_id = lease_id.to_string();
+    let residency_holder = residency_holder.to_string();
     let incarnation_id = incarnation_id.to_string();
     db.write(|conn| {
-        let lease_id = lease_id.clone();
+        let residency_holder = residency_holder.clone();
         let incarnation_id = incarnation_id.clone();
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp();
@@ -474,14 +591,14 @@ pub(crate) async fn resolve_missing_terminal_lease(
                 .execute(
                     "UPDATE job_terminals
                      SET status = 'exited', exited_at = COALESCE(exited_at, ?4),
-                         lease_id = NULL, lease_incarnation_id = NULL, lease_epoch = NULL,
+                         residency_holder = NULL, residency_incarnation_id = NULL, cell_epoch = NULL,
                          process_generation = NULL
-                     WHERE status = 'recovering' AND lease_id = ?1
-                       AND lease_incarnation_id = ?2 AND lease_epoch = ?3",
+                     WHERE status = 'recovering' AND residency_holder = ?1
+                       AND residency_incarnation_id = ?2 AND cell_epoch = ?3",
                     params![
-                        lease_id.as_str(),
+                        residency_holder.as_str(),
                         incarnation_id.as_str(),
-                        lease_epoch as i64,
+                        cell_epoch as i64,
                         now
                     ],
                 )
@@ -508,9 +625,9 @@ pub struct JobTerminal {
     created_at: i64,
     exited_at: Option<i64>,
     pub slug: Option<String>,
-    lease_id: Option<String>,
-    lease_incarnation_id: Option<String>,
-    lease_epoch: Option<u64>,
+    residency_holder: Option<String>,
+    residency_incarnation_id: Option<String>,
+    cell_epoch: Option<u64>,
     process_generation: Option<u64>,
 }
 
@@ -518,7 +635,6 @@ pub struct JobTerminal {
 #[serde(rename_all = "camelCase")]
 pub struct ActiveTerminal {
     id: String,
-    lease_id: Option<String>,
     session_id: String,
     command: String,
     job_id: Option<String>,
@@ -547,9 +663,9 @@ fn terminal_from_row(row: &cairn_db::turso::Row) -> DbResult<JobTerminal> {
         created_at: row.i64(10)?,
         exited_at: row.opt_i64(11)?,
         slug: row.opt_text(12)?,
-        lease_id: row.opt_text(13)?,
-        lease_incarnation_id: row.opt_text(14)?,
-        lease_epoch: row.opt_i64(15)?.map(|value| value as u64),
+        residency_holder: row.opt_text(13)?,
+        residency_incarnation_id: row.opt_text(14)?,
+        cell_epoch: row.opt_i64(15)?.map(|value| value as u64),
         process_generation: row.opt_i64(16)?.map(|value| value as u64),
     })
 }
@@ -557,7 +673,7 @@ fn terminal_from_row(row: &cairn_db::turso::Row) -> DbResult<JobTerminal> {
 const TERMINAL_SELECT: &str = "
     SELECT id, job_id, project_id, run_id, session_id, command, title,
            description, status, exit_code, created_at, exited_at, slug,
-           lease_id, lease_incarnation_id, lease_epoch, process_generation
+           residency_holder, residency_incarnation_id, cell_epoch, process_generation
     FROM job_terminals
 ";
 
@@ -578,7 +694,7 @@ pub async fn create_pty(
         None,
         "Terminal".to_string(),
         shell,
-        cairn_common::executor_protocol::LifetimePtySize {
+        cairn_common::executor_protocol::ResidentPtySize {
             rows,
             cols,
             pixel_width: 0,
@@ -588,12 +704,25 @@ pub async fn create_pty(
     .await
 }
 
+/// Deliver what an operator typed or pasted into the terminal pane.
+///
+/// This is command delivery into the same job residence an agent's append targets,
+/// so it takes the same alignment-aware path: pressing Enter after a logical write
+/// must execute against the new content, not against whatever the shell's checkout
+/// held when it spawned. The cost lands per delivered line rather than per
+/// keystroke, because the delimiter predicate gates it.
+///
+/// `submit: false` — the pane sends exactly what the user produced, including the
+/// `\r` an Enter key emits, and appending a newline here would submit a line the
+/// user had not finished.
 pub async fn write_pty(
     orch: &Orchestrator,
     session_id: String,
     data: String,
 ) -> Result<(), String> {
-    crate::mcp::handlers::terminal::write_terminal_input_by_session(orch, &session_id, &data).await
+    crate::mcp::handlers::terminal::deliver_terminal_input(orch, &session_id, &data, false)
+        .await
+        .map(|_| ())
 }
 
 pub async fn resize_pty(
@@ -801,7 +930,7 @@ pub async fn create_job_terminal(
         initial_command,
         title,
         None,
-        cairn_common::executor_protocol::LifetimePtySize {
+        cairn_common::executor_protocol::ResidentPtySize {
             rows: 24,
             cols: 80,
             pixel_width: 0,
@@ -881,15 +1010,15 @@ pub async fn close_job_terminal(orch: &Orchestrator, terminal_id: String) -> Res
 pub async fn get_running_terminals(db: &DbState) -> Result<Vec<ActiveTerminal>, String> {
     db.local.read(|conn| Box::pin(async move {
         let mut all = Vec::new();
-        let mut rows = conn.query("SELECT jt.id, jt.lease_id, jt.session_id, jt.command, jt.job_id, j.issue_id, i.number, i.project_id, jt.slug, j.node_name, e.seq, p.key, jt.created_at FROM job_terminals jt JOIN jobs j ON j.id = jt.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id LEFT JOIN executions e ON e.id = j.execution_id WHERE jt.status = 'running' AND jt.job_id IS NOT NULL ORDER BY jt.created_at DESC", ()).await?;
+        let mut rows = conn.query("SELECT jt.id, jt.session_id, jt.command, jt.job_id, j.issue_id, i.number, i.project_id, jt.slug, j.node_name, e.seq, p.key, jt.created_at FROM job_terminals jt JOIN jobs j ON j.id = jt.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id LEFT JOIN executions e ON e.id = j.execution_id WHERE jt.status = 'running' AND jt.job_id IS NOT NULL ORDER BY jt.created_at DESC", ()).await?;
         while let Some(row) = rows.next().await? {
-            all.push((row.i64(12)?, ActiveTerminal { id: row.text(0)?, lease_id: row.opt_text(1)?, session_id: row.text(2)?, command: row.text(3)?, job_id: row.opt_text(4)?, issue_id: row.opt_text(5)?, issue_number: row.opt_i64(6)?.map(|v| v as i32), project_id: row.text(7)?, slug: row.opt_text(8)?, node_name: row.opt_text(9)?, exec_seq: row.opt_i64(10)?.map(|v| v as i32), project_key: row.text(11)?, created_at: row.i64(12)? }));
+            all.push((row.i64(11)?, ActiveTerminal { id: row.text(0)?, session_id: row.text(1)?, command: row.text(2)?, job_id: row.opt_text(3)?, issue_id: row.opt_text(4)?, issue_number: row.opt_i64(5)?.map(|v| v as i32), project_id: row.text(6)?, slug: row.opt_text(7)?, node_name: row.opt_text(8)?, exec_seq: row.opt_i64(9)?.map(|v| v as i32), project_key: row.text(10)?, created_at: row.i64(11)? }));
         }
-        let mut rows = conn.query("SELECT jt.id, jt.lease_id, jt.session_id, jt.command, p.id, p.key, jt.slug, jt.created_at FROM job_terminals jt JOIN projects p ON p.id = jt.project_id WHERE jt.status = 'running' AND jt.project_id IS NOT NULL AND jt.job_id IS NULL ORDER BY jt.created_at DESC", ()).await?;
+        let mut rows = conn.query("SELECT jt.id, jt.session_id, jt.command, p.id, p.key, jt.slug, jt.created_at FROM job_terminals jt JOIN projects p ON p.id = jt.project_id WHERE jt.status = 'running' AND jt.project_id IS NOT NULL AND jt.job_id IS NULL ORDER BY jt.created_at DESC", ()).await?;
         while let Some(row) = rows.next().await? {
-            all.push((row.i64(7)?, ActiveTerminal { id: row.text(0)?, lease_id: row.opt_text(1)?, session_id: row.text(2)?, command: row.text(3)?, job_id: None, issue_id: None, issue_number: None, project_id: row.text(4)?, slug: row.opt_text(6)?, node_name: None, exec_seq: None, project_key: row.text(5)?, created_at: row.i64(7)? }));
+            all.push((row.i64(6)?, ActiveTerminal { id: row.text(0)?, session_id: row.text(1)?, command: row.text(2)?, job_id: None, issue_id: None, issue_number: None, project_id: row.text(3)?, slug: row.opt_text(5)?, node_name: None, exec_seq: None, project_key: row.text(4)?, created_at: row.i64(6)? }));
         }
-        all.sort_by(|a, b| b.0.cmp(&a.0));
+        all.sort_by_key(|(created_at, _)| std::cmp::Reverse(*created_at));
         Ok(all.into_iter().map(|(_, terminal)| terminal).collect())
     })).await.map_err(|error| error.to_string())
 }
@@ -919,7 +1048,7 @@ pub async fn create_project_terminal(
         initial_command,
         title,
         None,
-        cairn_common::executor_protocol::LifetimePtySize {
+        cairn_common::executor_protocol::ResidentPtySize {
             rows: 24,
             cols: 80,
             pixel_width: 0,

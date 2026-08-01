@@ -1,7 +1,7 @@
 //! Merge orchestration: the conflict gate, GitHub-vs-local routing, merge-method
 //! resolution, and post-merge reconciliation.
 
-use crate::execution::teardown::{teardown_worktrees, TeardownReason, TeardownScope};
+use crate::execution::teardown::{cleanup_issue_jobs, TeardownReason, TeardownScope};
 use crate::github::api;
 use crate::github::credentials::{get_credentials_for_owner, get_owner_repo};
 use crate::orchestrator::Orchestrator;
@@ -295,7 +295,7 @@ pub async fn reconcile_after_merge(
     //    the jj-native restoration of the old git "post-merge fast-forward of
     //    active worktrees". So there is no git worktree fast-forward step here.
 
-    // 4. Tear down worktrees and branches for the merged issue (issue-wide).
+    // 4. Release runtime resources and apply the established branch cleanup policy.
     //    Scoped to the merged PR's issue, so a Coordinator worktree on a
     //    different issue survives and the step-3 fast-forward sticks.
     if let Some(issue_id) = issue_id.as_deref() {
@@ -304,7 +304,7 @@ pub async fn reconcile_after_merge(
         // incorporated, so branches are cleaned up unconditionally. The
         // preserve-unlanded guard belongs on the record-only status path, not
         // here, where an ancestor test would misfire on a legitimate squash.
-        if let Err(e) = teardown_worktrees(
+        if let Err(e) = cleanup_issue_jobs(
             &orch,
             TeardownScope::Issue(issue_id.to_string()),
             TeardownReason::Discarded,
@@ -387,19 +387,45 @@ fn should_merge_via_github(ctx: &MergeMrContext) -> bool {
     should_route_to_github(ctx, &resolved_default)
 }
 
-/// Map a `github::api::merge_pr` failure to user-facing guidance. GitHub returns
-/// 405 ("not mergeable") or 409 (head changed / merge conflict) when it refuses
-/// the merge; in that case the source was clean *locally* (the conflict gate
+/// Map a `github::api::merge_pr` failure to user-facing guidance. GitHub refuses
+/// a merge with 405 or 409, and the source was clean *locally* (the conflict gate
 /// passed), so there are no local markers to point at — the guidance points at
 /// the PR instead, distinct from the local-fold conflict message.
+///
+/// The status alone is not the cause. GitHub returns 405 both for "Pull Request
+/// is not mergeable" and for "Merge already in progress", which call for opposite
+/// responses: the first wants the PR fixed and the merge retried, the second
+/// means somebody (or something) is already merging this very PR and the only
+/// correct move is to look again. Reporting the second as conflicts or failing
+/// checks sends the reader off to fix a PR that is in the middle of merging
+/// cleanly — which is exactly what happened when one wake produced two agent
+/// contexts and both tried to merge the same PR (CAIRN-3283). So the body text
+/// GitHub returned, carried verbatim in `error`, decides the message.
 fn map_github_merge_error(source_branch: &str, target_branch: &str, error: String) -> String {
-    if error.contains("PR: 405") || error.contains("PR: 409") {
-        format!(
-            "GitHub refused the merge of `{source_branch}` into `{target_branch}` — the PR has conflicts or failing required checks on GitHub's side. Resolve them on the PR, then retry the merge. (GitHub: {error})"
-        )
-    } else {
-        format!("Failed to merge `{source_branch}` into `{target_branch}` via GitHub: {error}")
+    let refused = error.contains("PR: 405") || error.contains("PR: 409");
+    if !refused {
+        return format!(
+            "Failed to merge `{source_branch}` into `{target_branch}` via GitHub: {error}"
+        );
     }
+    let body = error.to_lowercase();
+    // "Merge already in progress" (405): the merge this call asked for is
+    // happening. Nothing to fix and nothing to retry — read the PR's state.
+    if body.contains("already in progress") {
+        return format!(
+            "GitHub is already merging `{source_branch}` into `{target_branch}` — another merge of this PR is in flight, so this one was refused. Nothing is wrong with the PR; read its current state with action:\"refresh\" before doing anything else. (GitHub: {error})"
+        );
+    }
+    // 409, and 405 "Base branch was modified": the PR moved under this call.
+    // Refreshing picks up the new head; only then is a retry meaningful.
+    if error.contains("PR: 409") || body.contains("was modified") {
+        return format!(
+            "GitHub refused the merge of `{source_branch}` into `{target_branch}` because the PR moved while the merge was in flight. Re-read it with action:\"refresh\", then merge again. (GitHub: {error})"
+        );
+    }
+    format!(
+        "GitHub refused the merge of `{source_branch}` into `{target_branch}` — the PR has conflicts or failing required checks on GitHub's side. Resolve them on the PR, then retry the merge. (GitHub: {error})"
+    )
 }
 
 /// Merge a remote PR through GitHub's merge API, then reconcile locally.
@@ -447,10 +473,11 @@ async fn merge_remote_pr_via_github(
         github_started.elapsed()
     );
 
-    // GitHub merged: mark the merge request merged, resolve the issue, close
-    // sessions. Runs only after the GitHub call succeeded.
+    // GitHub merged: mark the merge request merged, then resolve the issue
+    // through the terminal cascade (live work stopped, sessions closed, warm
+    // processes evicted). Runs only after the GitHub call succeeded.
     let resolve_started = std::time::Instant::now();
-    let closed_sessions = resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
+    resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
         .await
         .map_err(|error| {
             log::error!(
@@ -462,9 +489,6 @@ async fn merge_remote_pr_via_github(
         "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
         resolve_started.elapsed()
     );
-    for session_id in &closed_sessions {
-        orch.process_state.remove_by_session(session_id);
-    }
 
     if let Some(issue_id) = issue_id.as_deref() {
         // Terminal transition — wake any in-flight `cairn watch` on this issue,
@@ -736,7 +760,7 @@ pub async fn merge_pr_for_job(
     }
 
     let resolve_started = std::time::Instant::now();
-    let closed_sessions = resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
+    resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
         .await
         .map_err(|error| {
             log::error!(
@@ -750,9 +774,6 @@ pub async fn merge_pr_for_job(
         "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
         resolve_started.elapsed()
     );
-    for session_id in &closed_sessions {
-        orch.process_state.remove_by_session(session_id);
-    }
 
     if let Some(issue_id) = issue_id.as_deref() {
         // Terminal transition — wake any in-flight `cairn watch` on this issue,
@@ -973,20 +994,17 @@ mod tests {
         let refusal = map_github_merge_error(
             "feature",
             "main",
-            "Failed to merge PR: 405 - not mergeable".to_string(),
+            "Failed to merge PR: 405 - {\"message\":\"Pull Request is not mergeable\"}".to_string(),
         );
         assert!(refusal.contains("GitHub refused"), "{refusal}");
+        assert!(
+            refusal.contains("conflicts or failing required checks"),
+            "{refusal}"
+        );
         assert!(
             refusal.contains("feature") && refusal.contains("main"),
             "{refusal}"
         );
-
-        let conflict = map_github_merge_error(
-            "feature",
-            "main",
-            "Failed to merge PR: 409 - head changed".to_string(),
-        );
-        assert!(conflict.contains("GitHub refused"), "{conflict}");
 
         let other = map_github_merge_error(
             "feature",
@@ -995,5 +1013,54 @@ mod tests {
         );
         assert!(!other.contains("GitHub refused"), "{other}");
         assert!(other.contains("via GitHub"), "{other}");
+    }
+
+    /// 405 carries two opposite causes. "Merge already in progress" means the
+    /// merge is happening — telling the reader to resolve conflicts and retry
+    /// sends them to fix a PR that is merging cleanly.
+    #[test]
+    fn a_merge_already_in_progress_is_not_reported_as_a_broken_pr() {
+        let in_progress = map_github_merge_error(
+            "feature",
+            "main",
+            "Failed to merge PR: 405 - {\"message\":\"Merge already in progress\"}".to_string(),
+        );
+
+        assert!(in_progress.contains("already merging"), "{in_progress}");
+        assert!(in_progress.contains("refresh"), "{in_progress}");
+        assert!(
+            !in_progress.contains("conflicts or failing required checks"),
+            "the cause must not be reported as the opposite one: {in_progress}"
+        );
+        assert!(
+            in_progress.contains("Merge already in progress"),
+            "GitHub's own words must survive the mapping: {in_progress}"
+        );
+    }
+
+    /// A PR that moved under the merge (409 head changed, 405 base modified)
+    /// needs a re-read before a retry means anything.
+    #[test]
+    fn a_pr_that_moved_asks_for_a_refresh_before_retrying() {
+        let head_changed = map_github_merge_error(
+            "feature",
+            "main",
+            "Failed to merge PR: 409 - {\"message\":\"Head branch was modified. Review and try the merge again.\"}".to_string(),
+        );
+        assert!(
+            head_changed.contains("moved while the merge was in flight"),
+            "{head_changed}"
+        );
+        assert!(head_changed.contains("refresh"), "{head_changed}");
+
+        let base_modified = map_github_merge_error(
+            "feature",
+            "main",
+            "Failed to merge PR: 405 - {\"message\":\"Base branch was modified. Review and try the merge again.\"}".to_string(),
+        );
+        assert!(
+            base_modified.contains("moved while the merge was in flight"),
+            "{base_modified}"
+        );
     }
 }

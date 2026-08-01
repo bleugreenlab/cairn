@@ -1,33 +1,14 @@
 //! Node-tab `diff` facet resolution, computed entirely from local state.
 //!
-//! Two signals drive the facet, both sourced without git polling:
+//! Two store-native signals drive the facet. Presence summaries aggregate
+//! `file_changes` across jobs sharing a durable branch coordinate. Patch bodies
+//! render the branch's own work — its fork point from its integration target up
+//! to its head, both resolved live from the store — with an archived range pack
+//! fallback from `execution_history`. Executor projections and process
+//! residences are never consulted.
 //!
-//! * **Presence / summary** ([`node_change_summary`], [`execution_change_summaries`])
-//!   aggregate the `file_changes` table across a worktree's change-group. The
-//!   distinct changed-path count is the icon's presence signal; it is available
-//!   the instant the first write lands (the row insert fires `worktree-changed`)
-//!   and survives worktree teardown because the rows persist.
-//!
-//! * **Patch body** ([`node_base_tip_diff`]) renders the cumulative `base..tip`
-//!   diff from the in-memory [`ObjectStore`]. For a live worktree the base is the
-//!   recorded `pack_anchor` (fork point) and the tip is the worktree's latest
-//!   sealed commit, resolved jj-natively (`@-`) because agent worktrees are
-//!   non-colocated jj workspaces (`.jj`, no `.git`) — a git read of HEAD inside
-//!   one walks up the tree and resolves an unrelated repo. Both commits live in
-//!   the shared repo object database. For a torn-down worktree the
-//!   base/tip and a layered range pack come from `execution_history`. One
-//!   renderer serves both, so the diff matches before, during, and after a PR,
-//!   and for local-only PRs.
-//!
-//! ## Change-group
-//!
-//! A worktree-owning node and its worktree-inheriting recipe children
-//! (Build/Documenter/Proctor) record their own `file_changes` rows under
-//! their own `job_id` but share one `worktree_path`. The change-group is thus
-//! every job in the execution sharing that path; an owner that delegated all of
-//! its writes has zero rows under its own `job_id`, so the aggregation must span
-//! the group. The cumulative patch body covers the children for free — they
-//! commit to the same branch, so `base..tip` already includes their commits.
+//! [`live_branch_range`] is the one place a rendered diff learns its base, and
+//! every diff surface in the app routes through it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -37,7 +18,7 @@ use serde::Serialize;
 use crate::storage::{count_commits_ahead, render_range_file_diffs, NodeDiffFile, ObjectStore};
 use crate::storage::{DbResult, LocalDb, RowExt};
 
-/// Aggregate change counts for a node's worktree change-group. `files_changed`
+/// Aggregate change counts for a node's branch-coordinate group. `files_changed`
 /// (distinct changed paths) is the facet's presence signal; the optional `+`/`-`
 /// totals are `None` when every contributing row recorded a NULL count (e.g. a
 /// binary change), matching the `file_changes` schema's nullable columns.
@@ -97,7 +78,7 @@ fn summarize(rows: &[ChangeRow]) -> ChangeSummary {
     }
 }
 
-/// Summarize the change-group for a single node (top-level worktree-owning job).
+/// Summarize the branch-coordinate group for a single node.
 pub async fn node_change_summary(db: &LocalDb, job_id: &str) -> DbResult<ChangeSummary> {
     let job_id = job_id.to_string();
     let rows = db
@@ -110,7 +91,7 @@ pub async fn node_change_summary(db: &LocalDb, job_id: &str) -> DbResult<ChangeS
                          FROM file_changes fc
                          JOIN jobs j ON fc.job_id = j.id
                          WHERE j.execution_id = (SELECT execution_id FROM jobs WHERE id = ?1)
-                           AND j.worktree_path = (SELECT worktree_path FROM jobs WHERE id = ?1)
+                           AND j.branch = (SELECT branch FROM jobs WHERE id = ?1)
                          ORDER BY fc.file_path ASC",
                         (job_id.as_str(),),
                     )
@@ -130,9 +111,8 @@ pub async fn node_change_summary(db: &LocalDb, job_id: &str) -> DbResult<ChangeS
     Ok(summarize(&rows))
 }
 
-/// Summarize every top-level worktree-owning node in an execution: one entry per
-/// job with `parent_job_id IS NULL AND worktree_path IS NOT NULL`, aggregated
-/// over its change-group. Drives the node-tab strip's diff icons.
+/// Summarize every top-level branch-owning node in an execution, aggregated over
+/// jobs sharing its branch coordinate. Drives the node-tab strip's diff icons.
 pub async fn execution_change_summaries(
     db: &LocalDb,
     execution_id: &str,
@@ -141,14 +121,13 @@ pub async fn execution_change_summaries(
     db.read(move |conn| {
         let execution_id = execution_id.clone();
         Box::pin(async move {
-            // Owner jobs and their worktree paths.
             let mut owners: Vec<(String, String)> = Vec::new();
             let mut rows = conn
                 .query(
-                    "SELECT id, worktree_path FROM jobs
+                    "SELECT id, branch FROM jobs
                      WHERE execution_id = ?1
                        AND parent_job_id IS NULL
-                       AND worktree_path IS NOT NULL",
+                       AND branch IS NOT NULL",
                     (execution_id.as_str(),),
                 )
                 .await?;
@@ -156,21 +135,20 @@ pub async fn execution_change_summaries(
                 owners.push((row.text(0)?, row.text(1)?));
             }
 
-            // All file changes in the execution, tagged by their job's worktree.
-            let mut by_worktree: HashMap<String, Vec<ChangeRow>> = HashMap::new();
+            let mut by_branch: HashMap<String, Vec<ChangeRow>> = HashMap::new();
             let mut rows = conn
                 .query(
-                    "SELECT j.worktree_path, fc.file_path, fc.additions, fc.deletions
+                    "SELECT j.branch, fc.file_path, fc.additions, fc.deletions
                      FROM file_changes fc
                      JOIN jobs j ON fc.job_id = j.id
-                     WHERE j.execution_id = ?1 AND j.worktree_path IS NOT NULL
+                     WHERE j.execution_id = ?1 AND j.branch IS NOT NULL
                      ORDER BY fc.file_path ASC",
                     (execution_id.as_str(),),
                 )
                 .await?;
             while let Some(row) = rows.next().await? {
-                let worktree = row.text(0)?;
-                by_worktree.entry(worktree).or_default().push((
+                let branch = row.text(0)?;
+                by_branch.entry(branch).or_default().push((
                     row.text(1)?,
                     row.opt_i64(2)?.map(|v| v as i32),
                     row.opt_i64(3)?.map(|v| v as i32),
@@ -178,9 +156,9 @@ pub async fn execution_change_summaries(
             }
 
             let mut out: HashMap<String, ChangeSummary> = HashMap::new();
-            for (job_id, worktree) in owners {
-                let summary = by_worktree
-                    .get(&worktree)
+            for (job_id, branch) in owners {
+                let summary = by_branch
+                    .get(&branch)
                     .map(|rows| summarize(rows))
                     .unwrap_or(ChangeSummary {
                         files_changed: 0,
@@ -195,14 +173,12 @@ pub async fn execution_change_summaries(
     .await
 }
 
-/// Job + project coordinates needed to resolve a node's base..tip diff.
+/// Job + project coordinates needed to resolve a node's diff range.
 struct DiffCoords {
-    worktree_path: Option<String>,
+    branch: Option<String>,
     execution_id: Option<String>,
     repo_path: String,
-    default_branch: String,
-    base_branch: Option<String>,
-    base_anchor: Option<String>,
+    integration_target: String,
 }
 
 async fn load_diff_coords(db: &LocalDb, job_id: &str) -> DbResult<Option<DiffCoords>> {
@@ -210,9 +186,12 @@ async fn load_diff_coords(db: &LocalDb, job_id: &str) -> DbResult<Option<DiffCoo
     db.read(move |conn| {
         let job_id = job_id.clone();
         Box::pin(async move {
+            // `base_branch` is the branch this node's work merges into: the parent
+            // issue's branch for a stacked child, the project default otherwise.
             let mut rows = conn
                 .query(
-                    "SELECT j.worktree_path, j.execution_id, p.repo_path, p.default_branch, j.base_branch
+                    "SELECT j.branch, j.execution_id, p.repo_path,
+                            COALESCE(j.base_branch, p.default_branch, 'main')
                      FROM jobs j JOIN projects p ON j.project_id = p.id
                      WHERE j.id = ?1 LIMIT 1",
                     (job_id.as_str(),),
@@ -221,44 +200,95 @@ async fn load_diff_coords(db: &LocalDb, job_id: &str) -> DbResult<Option<DiffCoo
             let Some(row) = rows.next().await? else {
                 return Ok(None);
             };
-            let worktree_path = row.opt_text(0)?;
-            let execution_id = row.opt_text(1)?;
-            let repo_path = row.text(2)?;
-            let default_branch = row.opt_text(3)?.unwrap_or_else(|| "main".to_string());
-            let base_branch = row.opt_text(4)?;
-
-            // Base anchor: the fork point recorded on the earliest job sharing
-            // this worktree (the inheriting children come later), mirroring how
-            // archival picks the anchor at teardown.
-            let base_anchor = match (&worktree_path, &execution_id) {
-                (Some(worktree), Some(execution)) => {
-                    let mut anchor_rows = conn
-                        .query(
-                            "SELECT base_commit, pack_anchor FROM jobs
-                             WHERE execution_id = ?1 AND worktree_path = ?2
-                             ORDER BY created_at ASC LIMIT 1",
-                            (execution.as_str(), worktree.as_str()),
-                        )
-                        .await?;
-                    match anchor_rows.next().await? {
-                        Some(r) => r.opt_text(1)?.or(r.opt_text(0)?),
-                        None => None,
-                    }
-                }
-                _ => None,
-            };
-
             Ok(Some(DiffCoords {
-                worktree_path,
-                execution_id,
-                repo_path,
-                default_branch,
-                base_branch,
-                base_anchor,
+                branch: row.opt_text(0)?,
+                execution_id: row.opt_text(1)?,
+                repo_path: row.text(2)?,
+                integration_target: row.text(3)?,
             }))
         })
     })
     .await
+}
+
+/// The live range a branch's own work occupies: its fork point from the
+/// integration target, and its current head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRange {
+    pub base: String,
+    pub tip: String,
+}
+
+/// Resolve what a branch itself changed, live from the store at read time.
+///
+/// Both endpoints are computed now: the branch bookmark's current commit, and
+/// its merge base with the integration target's current commit. That merge base
+/// is the branch's true fork point no matter how the target has moved.
+///
+/// The recorded alternatives — `jobs.base_commit` and `jobs.pack_anchor` — are
+/// the coordinate a branch was cut at, and they do not track a base advance.
+/// Diffing from a stale one absorbs every commit the target merged in the
+/// meantime, which is how a +350/-62 branch renders as +6k/-3k (CAIRN-3150). No
+/// rendered diff reads those rows; this function is the only base a diff gets.
+///
+/// `integration_target` is what `jobs.base_branch` records. An unresolvable
+/// endpoint is an error, never a silent fall back to a recorded coordinate.
+pub async fn live_branch_range(
+    config_dir: &Path,
+    repo_path: &Path,
+    branch: &str,
+    integration_target: &str,
+) -> Result<BranchRange, String> {
+    let managed_store = crate::jj::project_store_dir(config_dir, repo_path);
+    let repository = if crate::jj::is_jj_dir(&managed_store) {
+        managed_store
+    } else {
+        repo_path.to_path_buf()
+    };
+    let resolved = cairn_vcs::merge_base(&repository, branch, integration_target)
+        .await
+        .map_err(|error| format!("resolving '{branch}' against '{integration_target}': {error}"))?;
+    Ok(BranchRange {
+        base: resolved.base,
+        tip: resolved.left,
+    })
+}
+
+/// The live range a job's own work occupies, resolved from its durable row's
+/// *names* rather than its recorded commit.
+///
+/// This is the job-scoped form of [`live_branch_range`], and it is what every
+/// surface asking "what did this node change" resolves its base through: the
+/// rendered diff, the review-cadence impact gate, and the write-check impact
+/// gate. `jobs.branch` and `jobs.base_branch` are names, so they cannot go
+/// stale the way `jobs.base_commit` does; both endpoints are computed from the
+/// store now.
+///
+/// `Ok(None)` means the job has no branch of its own and therefore has no
+/// range. An unresolvable endpoint is an error, never a silent fall back to a
+/// recorded coordinate.
+pub async fn live_job_branch_range(
+    db: &LocalDb,
+    job_id: &str,
+    config_dir: &Path,
+) -> Result<Option<BranchRange>, String> {
+    let Some(coords) = load_diff_coords(db, job_id)
+        .await
+        .map_err(|error| format!("loading node diff coordinates: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let Some(branch) = coords.branch.as_deref() else {
+        return Ok(None);
+    };
+    live_branch_range(
+        config_dir,
+        Path::new(&coords.repo_path),
+        branch,
+        &coords.integration_target,
+    )
+    .await
+    .map(Some)
 }
 
 async fn load_execution_history(
@@ -291,14 +321,12 @@ async fn load_execution_history(
     .await
 }
 
-/// Resolve and render a node's cumulative `base..tip` diff. Returns `Ok(None)`
-/// when the node owns no worktree, or when neither a live worktree nor an
-/// archived `execution_history` row can supply a base/tip pair — the facet's
-/// presence signal (file_changes) still works in that case.
+/// Resolve and render a node's own work as a diff. Returns `Ok(None)` when
+/// neither the live store nor archived execution history supplies a coherent
+/// base/tip pair.
 pub async fn node_base_tip_diff(
     db: &LocalDb,
     job_id: &str,
-    jj_binary_path: &str,
     config_dir: &Path,
 ) -> Result<Option<NodeDiff>, String> {
     let Some(coords) = load_diff_coords(db, job_id)
@@ -307,63 +335,24 @@ pub async fn node_base_tip_diff(
     else {
         return Ok(None);
     };
-    let Some(worktree_path) = coords.worktree_path.clone() else {
-        return Ok(None);
-    };
-
-    let worktree_exists = Path::new(&worktree_path).exists();
     let repo = Path::new(&coords.repo_path);
-
-    let (store, base_hex, tip_hex) = if worktree_exists {
-        let wt = Path::new(&worktree_path);
-        // Agent worktrees are non-colocated jj workspaces (`.jj`, no `.git`); a
-        // git command run inside one resolves repo state against an unrelated
-        // repo up the directory tree. Resolve both base and tip jj-natively for
-        // those, and keep the git path only for genuine plain-git worktrees.
-        let is_jj = crate::jj::is_jj_dir(wt);
-        let jj = is_jj.then(|| crate::jj::JjEnv::resolve(jj_binary_path, config_dir));
-        let base = if let Some(jj) = jj.as_ref() {
-            crate::jj::resolve_node_fork_point(
-                jj,
-                wt,
-                coords.base_branch.as_deref().or(Some(coords.default_branch.as_str())),
-                coords.base_anchor.as_deref(),
-            )
-            .or_else(|| coords.base_anchor.clone())
-            .or_else(|| {
-                log::warn!(
-                    "node diff: jj workspace {worktree_path} has no resolvable fork point or recorded base anchor"
-                );
-                None
-            })
-        } else {
-            coords
-                .base_anchor
-                .clone()
-                .or_else(|| merge_base_fallback(&worktree_path, &coords.default_branch))
-        };
-        let Some(base) = base else {
-            return Ok(None);
-        };
-        let tip = if let Some(jj) = jj.as_ref() {
-            // `@-` is the latest sealed commit — the jj analogue of git HEAD.
-            match crate::jj::head_commit(jj, wt) {
-                Ok(sha) if !sha.trim().is_empty() => sha.trim().to_string(),
-                Ok(_) => return Ok(None),
-                Err(e) => {
-                    log::warn!("node diff: jj head_commit failed for {worktree_path}: {e}");
-                    return Ok(None);
+    let live = match coords.branch.as_deref() {
+        Some(branch) => {
+            match live_branch_range(config_dir, repo, branch, &coords.integration_target).await {
+                Ok(range) => Some(range),
+                Err(error) => {
+                    log::debug!("node {job_id} has no live diff range: {error}");
+                    None
                 }
             }
-        } else {
-            match git_head(&worktree_path) {
-                Some(sha) => sha,
-                None => return Ok(None),
-            }
-        };
-        let store =
-            ObjectStore::new(repo, None).map_err(|e| format!("building live object store: {e}"))?;
-        (store, base, tip)
+        }
+        None => None,
+    };
+
+    let (store, base_hex, tip_hex) = if let Some(range) = live {
+        let store = ObjectStore::new(repo, None)
+            .map_err(|e| format!("building logical object store: {e}"))?;
+        (store, range.base, range.tip)
     } else {
         let Some(execution_id) = coords.execution_id.clone() else {
             return Ok(None);
@@ -390,40 +379,6 @@ pub async fn node_base_tip_diff(
         total_additions,
         total_deletions,
     }))
-}
-
-fn git_head(worktree_path: &str) -> Option<String> {
-    let output = crate::env::git()
-        .args(["rev-parse", "HEAD"])
-        .current_dir(worktree_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Resolve a fork point against the default branch when no anchor was recorded.
-fn merge_base_fallback(worktree_path: &str, default_branch: &str) -> Option<String> {
-    for base_ref in [
-        format!("origin/{default_branch}"),
-        default_branch.to_string(),
-    ] {
-        let output = crate::env::git()
-            .args(["merge-base", &base_ref, "HEAD"])
-            .current_dir(worktree_path)
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !sha.is_empty() {
-                return Some(sha);
-            }
-        }
-    }
-    log::warn!("node diff: no base anchor or merge-base for worktree {worktree_path}");
-    None
 }
 
 #[cfg(test)]
@@ -465,7 +420,6 @@ mod tests {
 
     mod db {
         use super::super::*;
-        use crate::storage::events::testutil::{commit_all, git, init_repo, write_file};
         use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
         async fn migrated_db() -> LocalDb {
@@ -479,23 +433,15 @@ mod tests {
             db
         }
 
-        /// Seed a project/execution plus an owner job and an inheriting child job
-        /// sharing one worktree. `repo_path`/`worktree_path` and the base anchor
-        /// are caller-supplied so a test can point them at a real git repo.
-        #[allow(clippy::too_many_arguments)]
-        async fn seed_worktree_group(
-            db: &LocalDb,
-            repo_path: &str,
-            worktree_path: &str,
-            base_anchor: Option<&str>,
-        ) {
+        /// Seed a project/execution plus an owner job on `branch` and an
+        /// inheriting child job. The owner records `main` as its integration
+        /// target; the diff range is computed live against that branch.
+        async fn seed_worktree_group(db: &LocalDb, repo_path: &str, branch: &str) {
             let repo_path = repo_path.to_string();
-            let worktree_path = worktree_path.to_string();
-            let base_anchor = base_anchor.map(str::to_string);
+            let branch = branch.to_string();
             db.write(move |conn| {
                 let repo_path = repo_path.clone();
-                let worktree_path = worktree_path.clone();
-                let base_anchor = base_anchor.clone();
+                let branch = branch.clone();
                 Box::pin(async move {
                     conn.execute(
                         "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
@@ -513,18 +459,18 @@ mod tests {
                         (),
                     )
                     .await?;
-                    // Owner job: earliest created, holds the base anchor.
+                    // Owner job: earliest created, carries the integration target.
                     conn.execute(
-                        "INSERT INTO jobs(id, execution_id, project_id, parent_job_id, worktree_path, base_commit, pack_anchor, status, created_at, updated_at)
-                         VALUES ('owner','exec','proj',NULL,?1,?2,?2,'complete',1,1)",
-                        (worktree_path.as_str(), base_anchor.clone()),
+                        "INSERT INTO jobs(id, execution_id, project_id, parent_job_id, branch, base_branch, status, created_at, updated_at)
+                         VALUES ('owner','exec','proj',NULL,?1,'main','complete',1,1)",
+                        (branch.as_str(),),
                     )
                     .await?;
-                    // Inheriting child: shares the worktree, created later.
+                    // Inheriting child records its parent coordinate, created later.
                     conn.execute(
-                        "INSERT INTO jobs(id, execution_id, project_id, parent_job_id, worktree_path, status, created_at, updated_at)
+                        "INSERT INTO jobs(id, execution_id, project_id, parent_job_id, branch, status, created_at, updated_at)
                          VALUES ('child','exec','proj','owner',?1,'complete',2,2)",
-                        (worktree_path.as_str(),),
+                        (branch.as_str(),),
                     )
                     .await?;
                     Ok(())
@@ -564,9 +510,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn change_summary_aggregates_across_worktree_children() {
+        async fn change_summary_aggregates_across_branch_children() {
             let db = migrated_db().await;
-            seed_worktree_group(&db, "/repo", "/wt", Some("base")).await;
+            seed_worktree_group(&db, "/repo", "agent/test").await;
             // The owner delegated all writes: every row is under the child job.
             insert_file_change(&db, "fc1", "child", "a.rs", Some(5), Some(1)).await;
             insert_file_change(&db, "fc2", "child", "a.rs", Some(2), None).await;
@@ -581,7 +527,7 @@ mod tests {
         #[tokio::test]
         async fn execution_summaries_map_owner_when_only_child_wrote() {
             let db = migrated_db().await;
-            seed_worktree_group(&db, "/repo", "/wt", Some("base")).await;
+            seed_worktree_group(&db, "/repo", "agent/test").await;
             insert_file_change(&db, "fc1", "child", "a.rs", Some(3), Some(0)).await;
 
             let map = execution_change_summaries(&db, "exec").await.unwrap();
@@ -592,201 +538,258 @@ mod tests {
             assert!(!map.contains_key("child"), "children are not owner nodes");
         }
 
-        /// A live worktree resolves base = recorded anchor, tip = worktree HEAD,
-        /// and renders the cumulative diff straight from the repo object store.
         #[tokio::test]
-        async fn node_base_tip_diff_renders_live_worktree() {
-            let temp = tempfile::tempdir().unwrap();
-            let dir = temp.path();
-            init_repo(dir);
-            write_file(dir, "keep.txt", b"a\nb\n");
-            let base = commit_all(dir, "base");
-            write_file(dir, "keep.txt", b"a\nB\nc\n");
-            write_file(dir, "added.txt", b"new\n");
-            commit_all(dir, "work");
-
-            let repo = dir.to_str().unwrap();
+        async fn node_base_tip_diff_none_without_a_resolvable_store() {
             let db = migrated_db().await;
-            // repo and worktree are the same dir for the test; the worktree exists
-            // so the live path is taken.
-            seed_worktree_group(&db, repo, repo, Some(&base)).await;
-
-            let diff = node_base_tip_diff(&db, "owner", "jj", dir)
-                .await
-                .unwrap()
-                .expect("live diff present");
-            let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
-            assert_eq!(paths, vec!["added.txt", "keep.txt"]);
-            assert_eq!(diff.commits_ahead, 1);
-            assert!(diff.total_additions >= 2);
-        }
-
-        #[tokio::test]
-        async fn node_base_tip_diff_none_without_worktree() {
-            let db = migrated_db().await;
-            // Worktree path points nowhere on disk and there is no execution
-            // history, so the patch body can't resolve.
-            seed_worktree_group(&db, "/repo", "/nonexistent/wt", Some("base")).await;
-            let diff = node_base_tip_diff(&db, "owner", "jj", std::path::Path::new("/tmp"))
+            // The repository path points nowhere on disk and there is no
+            // execution history, so neither endpoint resolves and the surface
+            // reports the diff as unavailable rather than inventing a base.
+            seed_worktree_group(&db, "/nonexistent/repo", "agent/test").await;
+            let diff = node_base_tip_diff(&db, "owner", std::path::Path::new("/tmp"))
                 .await
                 .unwrap();
             assert!(diff.is_none());
         }
 
-        /// jj availability gate, mirroring the jj module tests: run only when a
-        /// jj binary is resolvable via `CAIRN_JJ_BIN` or PATH `jj`.
-        fn jj_bin() -> Option<String> {
-            let bin = std::env::var("CAIRN_JJ_BIN")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "jj".to_string());
-            crate::env::command(&bin)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-                .then_some(bin)
+        /// A real store in the shape that inflates a recorded-anchor diff: the
+        /// branch is cut from main@A and adds one line of its own, then main
+        /// advances to B with a few hundred lines of unrelated landed work.
+        /// Returns A — the coordinate a job row records at branch-cut time.
+        fn advance_base_under_branch(
+            jj: &crate::jj::JjEnv,
+            store: &std::path::Path,
+            project: &std::path::Path,
+            workspaces: &std::path::Path,
+            branch: &str,
+        ) -> String {
+            crate::jj::ensure_project_store(jj, store, project).unwrap();
+            let cut_coordinate = crate::jj::bookmark_commit(jj, store, "main").unwrap();
+
+            let node = workspaces.join("node");
+            crate::jj::add_workspace(jj, store, &node, branch, "main", None).unwrap();
+            std::fs::write(node.join("branch.rs"), "branch work\n").unwrap();
+            crate::jj::seal(jj, &node, "branch work", None).unwrap();
+
+            let advancing = workspaces.join("advancing");
+            crate::jj::add_workspace(jj, store, &advancing, "agent/advance", "main", None).unwrap();
+            let bulk: String = (0..400).map(|line| format!("landed {line}\n")).collect();
+            std::fs::write(advancing.join("unrelated.rs"), bulk).unwrap();
+            crate::jj::seal(jj, &advancing, "unrelated landed work", None).unwrap();
+            let advanced = crate::jj::head_commit(jj, &advancing).unwrap();
+            jj.run(
+                store,
+                &[
+                    "bookmark",
+                    "set",
+                    "main",
+                    "-r",
+                    &advanced,
+                    "--allow-backwards",
+                ],
+                "advance main under a live branch",
+            )
+            .unwrap();
+            cut_coordinate
         }
 
-        /// Regression for the git-in-jj-worktree hazard. A live NON-colocated jj
-        /// workspace (`.jj`, no `.git`) must resolve its tip jj-natively (`@-`),
-        /// not with `git rev-parse HEAD` run inside the worktree (which walks up
-        /// to an unrelated repo). The previous code took the git path: in a
-        /// `.jj`-only worktree that yields a foreign or unresolvable sha, so the
-        /// renderer can't find the tip and the commit walk spins to its cap. The
-        /// jj-native resolver renders the real `base..tip`.
+        /// The regression this module exists for (CAIRN-3150).
+        ///
+        /// A branch-cut coordinate and the true fork point agree right up until
+        /// the branch is rebased onto the advanced base. From then on the row
+        /// points below 400 lines of landed work the rebase carried into the
+        /// branch, and a diff rendered from it presents that work as the
+        /// branch's own. The live merge base moves with the rebase, so both
+        /// halves below render exactly the one line the branch actually wrote.
         #[tokio::test]
         #[serial_test::serial(jj)]
-        async fn node_base_tip_diff_renders_live_jj_workspace() {
-            let Some(bin) = jj_bin() else {
-                eprintln!("skipping node_base_tip_diff_renders_live_jj_workspace: jj not resolvable via CAIRN_JJ_BIN/PATH");
+        async fn node_diff_excludes_base_traffic_and_survives_a_rebase() {
+            let Some(bin) = crate::jj::tests::jj_bin() else {
+                eprintln!("skipping node_diff_excludes_base_traffic: jj not resolvable");
                 return;
             };
             let home = tempfile::tempdir().unwrap();
-            let proj = tempfile::tempdir().unwrap();
-            let wts = tempfile::tempdir().unwrap();
-
-            // Project git repo with a base commit — the ObjectStore backing.
-            init_repo(proj.path());
-            write_file(proj.path(), "shared.rs", b"base\n");
-            let base = commit_all(proj.path(), "base");
-
-            // Shared jj store over the project git, then a non-colocated workspace.
+            let project = tempfile::tempdir().unwrap();
+            let workspaces = tempfile::tempdir().unwrap();
+            crate::jj::tests::init_project(project.path());
             let jj = crate::jj::JjEnv::resolve(&bin, home.path());
-            let store = home.path().join("jj-stores").join("proj");
-            crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
-            let ws = wts.path().join("job");
-            crate::jj::add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None)
-                .unwrap();
-
-            // The invariant that broke the git path: `.jj` present, no `.git`.
-            assert!(ws.join(".jj").is_dir(), "workspace carries .jj");
-            assert!(
-                !ws.join(".git").exists(),
-                "workspace is non-colocated (no .git)"
-            );
-
-            // A fresh workspace's @- is the base; seal a change to advance the tip.
-            assert_eq!(crate::jj::head_commit(&jj, &ws).unwrap(), base);
-            std::fs::write(ws.join("added.rs"), "new\n").unwrap();
-            crate::jj::seal(&jj, &ws, "work", None).unwrap();
+            let store = crate::jj::project_store_dir(home.path(), project.path());
+            let branch = "agent/CAIRN-3150-builder";
+            let cut_coordinate =
+                advance_base_under_branch(&jj, &store, project.path(), workspaces.path(), branch);
 
             let db = migrated_db().await;
-            // repo_path is the project git (the store backing); the worktree is
-            // the live `.jj`-only workspace; the base anchor is the fork point.
-            seed_worktree_group(
-                &db,
-                proj.path().to_str().unwrap(),
-                ws.to_str().unwrap(),
-                Some(&base),
-            )
-            .await;
+            seed_worktree_group(&db, project.path().to_str().unwrap(), branch).await;
 
-            let diff = node_base_tip_diff(&db, "owner", &bin, home.path())
+            let diff = node_base_tip_diff(&db, "owner", home.path())
                 .await
                 .unwrap()
-                .expect("live jj diff present");
-            let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+                .expect("the live range resolves from the store");
+            let paths: Vec<&str> = diff.files.iter().map(|file| file.path.as_str()).collect();
             assert_eq!(
                 paths,
-                vec!["added.rs"],
-                "the sealed addition is in the diff"
+                ["branch.rs"],
+                "the diff is the branch's own work, not what main merged after the fork"
             );
-            assert_eq!(diff.commits_ahead, 1);
-            assert!(diff.total_additions >= 1);
-        }
+            assert_eq!((diff.total_additions, diff.total_deletions), (1, 0));
 
-        /// Regression for base-advance pollution in the two-tree PR/node diff.
-        /// The node is rebased onto an externally advanced `main@origin` that
-        /// deleted a base file; diffing from the live effective fork point must
-        /// show only the node's own addition, not that base deletion.
-        #[tokio::test]
-        #[serial_test::serial(jj)]
-        async fn node_base_tip_diff_excludes_rebased_external_base_deletion() {
-            let Some(bin) = jj_bin() else {
-                eprintln!("skipping node_base_tip_diff_excludes_rebased_external_base_deletion: jj not resolvable via CAIRN_JJ_BIN/PATH");
-                return;
-            };
-            let home = tempfile::tempdir().unwrap();
-            let origin = tempfile::tempdir().unwrap();
-            let proj = tempfile::tempdir().unwrap();
-            let wts = tempfile::tempdir().unwrap();
-
-            git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-            init_repo(proj.path());
-            write_file(proj.path(), "shared.rs", b"base\n");
-            write_file(proj.path(), "base-only.rs", b"base-only\n");
-            let base = commit_all(proj.path(), "base");
-            git(
-                proj.path(),
-                &["remote", "add", "origin", &origin.path().to_string_lossy()],
-            );
-            git(proj.path(), &["push", "-q", "origin", "main"]);
-
-            let jj = crate::jj::JjEnv::resolve(&bin, home.path());
-            let store = home.path().join("jj-stores").join("proj");
-            crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
-            let ws = wts.path().join("job");
-            let branch = "agent/CAIRN-1-builder-0";
-            crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-
-            std::fs::write(ws.join("node.rs"), "node\n").unwrap();
-            crate::jj::seal(&jj, &ws, "node work", None).unwrap();
-
-            std::fs::remove_file(proj.path().join("base-only.rs")).unwrap();
-            git(proj.path(), &["add", "-A"]);
-            git(
-                proj.path(),
-                &["commit", "-q", "-m", "external base deletion"],
-            );
-            git(proj.path(), &["push", "-q", "origin", "main"]);
-            crate::jj::fetch_remote(&jj, &store, "origin").unwrap();
-            crate::jj::reconcile_siblings(
-                &jj,
+            // Rebasing onto the advanced base moves the fork point with it, so
+            // the branch's rendered work is unchanged.
+            jj.run(
                 &store,
-                "main@origin",
-                &[(branch.to_string(), ws.clone())],
+                &[
+                    "rebase",
+                    "-b",
+                    branch,
+                    "-d",
+                    "main",
+                    "--ignore-working-copy",
+                ],
+                "rebase the branch onto the advanced base",
             )
             .unwrap();
 
-            let db = migrated_db().await;
-            seed_worktree_group(
-                &db,
-                proj.path().to_str().unwrap(),
-                ws.to_str().unwrap(),
-                Some(&base),
-            )
-            .await;
-
-            let diff = node_base_tip_diff(&db, "owner", &bin, home.path())
+            let rebased = node_base_tip_diff(&db, "owner", home.path())
                 .await
                 .unwrap()
-                .expect("live jj diff present");
-            let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+                .expect("the live range resolves after a rebase");
+            let rebased_paths: Vec<&str> = rebased
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect();
+            assert_eq!(rebased_paths, paths);
+            assert_eq!(
+                (rebased.total_additions, rebased.total_deletions),
+                (diff.total_additions, diff.total_deletions)
+            );
+
+            // Fixture integrity: the branch-cut coordinate a job row records is
+            // now BELOW the work the rebase carried in, so rendering from it
+            // inflates the diff. That inflation is the defect; if this ever goes
+            // clean the fixture has stopped reproducing it and the assertions
+            // above prove nothing.
+            let rebased_tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+            let objects = ObjectStore::new(project.path(), None).unwrap();
+            let from_recorded_row =
+                render_range_file_diffs(&objects, &cut_coordinate, &rebased_tip).unwrap();
+            assert!(
+                from_recorded_row
+                    .iter()
+                    .any(|file| file.path == "unrelated.rs"),
+                "the branch-cut coordinate must render the base's landed work as the branch's own"
+            );
+            assert!(
+                from_recorded_row
+                    .iter()
+                    .map(|file| file.additions)
+                    .sum::<u32>()
+                    > 100,
+                "and must inflate the counts well past the branch's own single line"
+            );
+        }
+
+        /// The impact gates' half of the same defect (CAIRN-3224).
+        ///
+        /// All three check gates — the review cadence, the write-check planner,
+        /// and the `/checks` status projection — now learn their base from
+        /// [`live_job_branch_range`]. This pins what that base is on a branch
+        /// whose recorded row has gone stale: the fork point the branch actually
+        /// sits on, and therefore a changed-file set containing only the branch's
+        /// own work. Selecting from the row instead is the phantom full-check
+        /// wave — 400 lines of landed traffic, three of them in files that would
+        /// pull in the whole Rust suite.
+        ///
+        /// The row is deliberately seeded stale rather than left NULL: the
+        /// assertion is that the gate does not read it, not that it has nothing
+        /// to read.
+        #[tokio::test]
+        #[serial_test::serial(jj)]
+        async fn the_impact_gate_base_is_the_live_fork_point_not_the_recorded_row() {
+            let Some(bin) = crate::jj::tests::jj_bin() else {
+                eprintln!(
+                    "skipping the_impact_gate_base_is_the_live_fork_point: jj not resolvable"
+                );
+                return;
+            };
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let workspaces = tempfile::tempdir().unwrap();
+            crate::jj::tests::init_project(project.path());
+            let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+            let store = crate::jj::project_store_dir(home.path(), project.path());
+            let branch = "agent/CAIRN-3224-builder";
+            let cut_coordinate =
+                advance_base_under_branch(&jj, &store, project.path(), workspaces.path(), branch);
+
+            let db = migrated_db().await;
+            seed_worktree_group(&db, project.path().to_str().unwrap(), branch).await;
+            let recorded = cut_coordinate.clone();
+            db.execute(
+                "UPDATE jobs SET base_commit = ?1 WHERE id = 'owner'",
+                (recorded.as_str(),),
+            )
+            .await
+            .unwrap();
+
+            let before = live_job_branch_range(&db, "owner", home.path())
+                .await
+                .unwrap()
+                .expect("the branch has a live range");
+            assert_eq!(
+                before.base, cut_coordinate,
+                "before a rebase the fork point and the branch-cut coordinate agree"
+            );
+
+            jj.run(
+                &store,
+                &[
+                    "rebase",
+                    "-b",
+                    branch,
+                    "-d",
+                    "main",
+                    "--ignore-working-copy",
+                ],
+                "rebase the branch onto the advanced base",
+            )
+            .unwrap();
+
+            let after = live_job_branch_range(&db, "owner", home.path())
+                .await
+                .unwrap()
+                .expect("the branch has a live range after the rebase");
+            assert_eq!(
+                after.base,
+                crate::jj::bookmark_commit(&jj, &store, "main").unwrap(),
+                "the fork point followed the rebase onto the advanced base"
+            );
+            assert_eq!(
+                after.tip,
+                crate::jj::bookmark_commit(&jj, &store, branch).unwrap(),
+                "and the head is the branch's current bookmark commit"
+            );
+            assert_ne!(
+                after.base, recorded,
+                "the recorded row still names the pre-advance coordinate; the gate must not use it"
+            );
+
+            // What the gates actually plan from, computed exactly as they do.
+            let changed = crate::jj::logical_changed_files(&jj, &store, &after.base, &after.tip)
+                .expect("the live range resolves a changed-file set");
+            let paths: Vec<&str> = changed.iter().map(|file| file.path.as_str()).collect();
             assert_eq!(
                 paths,
-                vec!["node.rs"],
-                "base deletion must be absent: {paths:?}"
+                ["branch.rs"],
+                "the impact gate sees the branch's own work and nothing the base merged"
+            );
+
+            // Fixture integrity: planning from the stale row is still inflated,
+            // so the assertion above is testing the fix and not the fixture.
+            let from_row = crate::jj::logical_changed_files(&jj, &store, &recorded, &after.tip)
+                .expect("the recorded coordinate still resolves");
+            assert!(
+                from_row.iter().any(|file| file.path == "unrelated.rs"),
+                "the recorded coordinate must still pull the base's landed work into the gate"
             );
         }
     }

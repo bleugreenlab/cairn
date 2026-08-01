@@ -55,6 +55,88 @@ pub fn current_executable_build_id() -> Result<String, String> {
     executable_build_id(&path)
 }
 
+/// Delimiters of the version stamp `sidecar_version_stamp!` embeds in every
+/// sidecar built from this workspace.
+///
+/// Content identity above answers "are these the same bytes"; the stamp answers
+/// "which version produced these bytes", which no hash can, because the expected
+/// hash exists only after a rebuild. Build tooling reads the stamp by scanning
+/// the file (`scripts/verify-bundle-sidecars.ts`) rather than running the binary:
+/// a release leg must be able to check a cross-compiled sidecar it cannot
+/// execute, and a build step must never hand argv to a daemon that could read an
+/// unrecognized flag as "start up and take ownership of shared state".
+pub const SIDECAR_VERSION_STAMP_OPEN: &str = "[cairn-sidecar-version:";
+pub const SIDECAR_VERSION_STAMP_CLOSE: &str = "]";
+
+/// Embed the invoking binary's package version where build tooling can find it
+/// by reading the file. Invoke once at the crate root of every sidecar staged
+/// into `src-tauri/binaries/`, then call `retain_sidecar_version_stamp()` from
+/// that binary's entry point.
+///
+/// `env!` expands against the invoking crate, so each sidecar stamps its own
+/// `CARGO_PKG_VERSION` — which every first-party crate inherits from
+/// `[workspace.package]`, making the stamp the release version of record.
+#[macro_export]
+macro_rules! sidecar_version_stamp {
+    () => {
+        /// `#[used]` keeps the compiler from discarding the stamp before linking.
+        /// The entry-point reference below is also required: MSVC's linker may
+        /// discard an otherwise unreferenced data section despite `#[used]`.
+        #[used]
+        static CAIRN_SIDECAR_VERSION_STAMP: &str =
+            concat!("[cairn-sidecar-version:", env!("CARGO_PKG_VERSION"), "]");
+
+        // `build-cmd.ts` supplies this tracked input. Its value changing makes
+        // Cargo rebuild stamped sidecars after a workspace version bump. The
+        // build script's schema-keyed target namespace handles artifacts compiled
+        // before this input existed. `option_env!` keeps ordinary cargo-only
+        // development and test builds valid.
+        #[used]
+        static CAIRN_SIDECAR_BUILD_VERSION_INPUT: Option<&str> =
+            option_env!("CAIRN_SIDECAR_BUILD_VERSION");
+
+        /// Make the stamp reachable from the executable entry point so every
+        /// supported linker retains its bytes. `black_box` prevents optimization
+        /// from proving that loading the static has no observable effect.
+        #[inline(always)]
+        fn retain_sidecar_version_stamp() {
+            std::hint::black_box(CAIRN_SIDECAR_VERSION_STAMP);
+            std::hint::black_box(CAIRN_SIDECAR_BUILD_VERSION_INPUT);
+        }
+    };
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    // Expand the stamp into this test binary. Build tooling reads these bytes out
+    // of a linked artifact, so proving the macro's text is right proves nothing;
+    // what has to hold is that the stamp survives compilation and linking.
+    crate::sidecar_version_stamp!();
+
+    #[test]
+    fn stamp_survives_into_the_linked_binary() {
+        retain_sidecar_version_stamp();
+        let exe = std::env::current_exe().expect("resolve test executable");
+        let bytes = std::fs::read(&exe).expect("read test executable");
+        let expected = format!(
+            "{}{}{}",
+            super::SIDECAR_VERSION_STAMP_OPEN,
+            env!("CARGO_PKG_VERSION"),
+            super::SIDECAR_VERSION_STAMP_CLOSE
+        );
+
+        assert!(
+            bytes
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes()),
+            "{} carries no {expected}; dead-data elimination reached the stamp, and \
+             scripts/verify-bundle-sidecars.ts can no longer establish what a staged \
+             sidecar was built from",
+            exe.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

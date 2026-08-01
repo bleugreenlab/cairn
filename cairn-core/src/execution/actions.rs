@@ -20,8 +20,6 @@ use cairn_common::ids;
 use cairn_db::turso::params;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use tokio::process::Command;
 
 fn parse_json_option(
     value: Option<String>,
@@ -301,13 +299,14 @@ async fn handle_pr_node(
 ) -> Result<String, String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
         .await?;
-    let (worktree_path, branch_name, base_branch) =
-        find_implementation_context(orch, action_run).await?;
+    let implementation = find_implementation_context(orch, action_run).await?;
+    let branch_name = implementation.branch;
+    let base_branch = implementation.base_branch;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
     let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
-    let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
+    let vcs = PrVcs::resolve(orch, &repo_path, &branch_name);
     let has_remote = vcs.has_remote();
     let effective_base = resolve_effective_pr_base(
         &db,
@@ -320,7 +319,7 @@ async fn handle_pr_node(
     .await?;
     let body = pr_body_with_effective_base_note(body.as_deref(), &effective_base);
 
-    commit_triage_ledger_if_needed(orch, action_run, &worktree_path, &repo_path).await?;
+    commit_triage_ledger_if_needed(orch, action_run, &repo_path).await?;
     let producing_job_id = action_run
         .parent_job_id
         .as_deref()
@@ -356,7 +355,6 @@ async fn handle_pr_node(
     let github = if has_remote {
         let pr_url = open_or_update_github_pr(
             &vcs,
-            &worktree_path,
             &branch_name,
             Some(effective_base.branch.as_str()),
             &title,
@@ -398,7 +396,6 @@ async fn handle_pr_node(
         orch,
         &db,
         &vcs,
-        &worktree_path,
         producing_job_id,
         action_run.issue_id.as_deref(),
         &branch_name,
@@ -423,7 +420,8 @@ async fn handle_pr_node(
         .unwrap_or_else(|| format!("local://{}", branch_name)))
 }
 
-/// Execute a custom shell action.
+/// Execute a custom shell action in a disposable executor cell and publish its
+/// delta through the runner-owned logical-head transaction.
 async fn execute_shell_action(
     orch: &Orchestrator,
     action_run: &ActionRun,
@@ -438,45 +436,54 @@ async fn execute_shell_action(
     let command = interpolate_template(template, &inputs);
     log::info!("Executing shell action: {}", command);
 
-    let cwd = get_action_working_dir(orch, action_run).await?;
-
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let implementation = find_implementation_context(orch, action_run).await?;
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
+    let job_id = implementation.job_id.clone();
+    let run_id = db
+        .query_text(
+            "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![job_id.as_str()],
+        )
         .await
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        log::error!("Action command failed: {}", stderr);
+        .map_err(|error| format!("Failed to resolve action run identity: {error}"))?
+        .ok_or_else(|| format!("Implementation job {job_id} has no authenticated run identity"))?;
+    let residence = crate::scratch::ensure_job_scratch_dir(&job_id, None);
+    let request = crate::mcp::types::McpCallbackRequest {
+        cwd: residence.to_string_lossy().into_owned(),
+        run_id: Some(run_id),
+        tool: "run".to_string(),
+        payload: serde_json::json!({
+            "commands": [{ "command": command }],
+            "sequential": true,
+            "commit_msg": format!("action: {}", config.name),
+        }),
+        tool_use_id: Some(format!("action:{}", action_run.id)),
+        thread_id: None,
+    };
+    let encoded = crate::mcp::handlers::run::handle_run(orch, &request).await;
+    let envelope: cairn_common::read::RunBatchEnvelope = serde_json::from_str(&encoded)
+        .map_err(|error| format!("Action executor returned an invalid result: {error}"))?;
+    let failure = envelope.text.lines().rev().find_map(|line| {
+        line.strip_prefix("Exit code: ")
+            .and_then(|code| code.trim().parse::<i32>().ok())
+            .filter(|code| *code != 0)
+    });
+    if let Some(exit_code) = failure {
         return Err(format!(
-            "Command failed with exit code {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr
+            "Action command failed with exit code {exit_code}: {}",
+            envelope.text
         ));
+    }
+    if crate::mcp::handlers::run::envelope_reports_run_failure(&envelope.text) {
+        return Err(envelope.text);
     }
 
     Ok(Some(serde_json::json!({
-        "stdout": stdout.trim(),
-        "stderr": stderr.trim(),
-        "exit_code": output.status.code().unwrap_or(0)
+        "stdout": envelope.text.trim(),
+        "stderr": "",
+        "exit_code": 0
     })))
-}
-
-/// Get the working directory for an action.
-async fn get_action_working_dir(
-    orch: &Orchestrator,
-    action_run: &ActionRun,
-) -> Result<String, String> {
-    find_implementation_context(orch, action_run)
-        .await
-        .map(|(wt, _, _)| wt)
 }
 
 /// Resolve input values for an action from context edges.
@@ -599,13 +606,12 @@ async fn resolve_action_inputs(
 // Built-in action handlers
 // ============================================================================
 
-/// Where PR-creation `gh`/`git` commands run. jj is the only substrate: a jj
-/// workspace is `.jj`-only with no `.git`, so gh/git resolve the repo and
-/// `origin` from the project checkout (`repo_path`), while push and head-sha
-/// reads run jj-side against the workspace.
+/// Where PR-creation `gh` commands run. GitHub resolves the remote from the
+/// user's project checkout, while branch publication and head resolution operate
+/// only on the runner-owned shared store.
 #[derive(Clone)]
 struct PrVcs {
-    /// cwd for `gh`/`git`: the project checkout (the workspace has no `.git`).
+    /// cwd for `gh`: the project checkout supplies remote configuration only.
     gh_cwd: PathBuf,
     /// The jj driver for the shared store.
     jj: crate::jj::JjEnv,
@@ -616,7 +622,7 @@ struct PrVcs {
 }
 
 impl PrVcs {
-    fn resolve(orch: &Orchestrator, _worktree: &str, repo_path: &str, branch: &str) -> Self {
+    fn resolve(orch: &Orchestrator, repo_path: &str, branch: &str) -> Self {
         Self {
             gh_cwd: PathBuf::from(repo_path),
             jj: crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir),
@@ -631,15 +637,24 @@ impl PrVcs {
         crate::mcp::git::has_remote(&self.gh_cwd)
     }
 
-    /// Push the job's bookmark to origin jj-side from the workspace.
-    fn push(&self, worktree: &str) {
-        if let Err(e) = crate::jj::push_to_origin(&self.jj, Path::new(worktree), &self.branch) {
-            log::warn!("jj push failed (PR action continues locally): {e}");
-        }
+    /// Publish the runner-owned bookmark to origin from the shared store.
+    ///
+    /// Fails closed. This push is a precondition of opening a pull request, not
+    /// a best-effort side errand: a swallowed failure here is how a create-pr
+    /// artifact came to describe a pull request over a branch that had never
+    /// reached GitHub. The push itself verifies that origin ended up holding
+    /// what was published, so a success here is a fact rather than an exit code.
+    fn push(&self) -> Result<(), String> {
+        let store = crate::jj::project_store_dir(&self.config_dir, &self.gh_cwd);
+        crate::jj::push_to_origin(&self.jj, &store, &self.branch).map_err(|error| {
+            format!(
+                "could not publish `{}` to GitHub, so no pull request was opened: {error}",
+                self.branch
+            )
+        })
     }
 
-    /// Resolve the runner-owned logical bookmark recorded as the merge request
-    /// head. The retained worktree may intentionally lag this coordinate.
+    /// Resolve the runner-owned logical bookmark recorded as the merge request head.
     async fn head_sha(&self) -> Result<String, String> {
         let store = crate::jj::project_store_dir(&self.config_dir, &self.gh_cwd);
         cairn_vcs::resolve_coordinate(&store, &self.branch)
@@ -668,7 +683,6 @@ fn triage_ledger_relative_path(issue_number: i32) -> String {
 async fn commit_triage_ledger_if_needed(
     orch: &Orchestrator,
     action_run: &ActionRun,
-    _worktree_path: &str,
     repo_path: &str,
 ) -> Result<(), String> {
     let Some(issue_id) = action_run.issue_id.as_deref() else {
@@ -677,7 +691,7 @@ async fn commit_triage_ledger_if_needed(
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
         .await?;
 
-    let memories = crate::memories::db::triage_batch_memories_for_issue(&db, issue_id)
+    let memories = crate::memories::db::claimed_batch_memories_for_issue(&db, issue_id)
         .await
         .map_err(|error| format!("Failed to load memory triage batch: {error}"))?;
     if memories.is_empty() {
@@ -737,25 +751,30 @@ async fn commit_triage_ledger_if_needed(
         return Ok(());
     }
     let commit_msg = format!("memory triage ledger: {scope}={scope_value}");
-    tokio::task::spawn_blocking(move || {
-        cairn_vcs::publish_logical_mutations(
-            &store,
-            &branch,
-            &expected,
-            vec![cairn_vcs::LogicalTreeMutation {
-                path: relative_path,
-                content: Some(rendered.into_bytes()),
-            }],
-            cairn_vcs::PublicationMode::Child {
-                description: commit_msg,
-                author: None,
-            },
-        )
-    })
+    let published = crate::jj::publish_logical_head_exported(
+        &crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir),
+        &store,
+        &branch,
+        &expected,
+        crate::jj::ProposedPublication::Mutations(vec![cairn_vcs::LogicalTreeMutation {
+            path: relative_path,
+            content: Some(rendered.into_bytes()),
+        }]),
+        // A triage ledger belongs to Cairn itself, not to any one user, so it is
+        // signed with the managed identity.
+        None,
+        cairn_vcs::PublicationMode::Child {
+            description: commit_msg,
+        },
+    )
     .await
-    .map_err(|error| format!("Memory triage publication worker failed: {error}"))?
-    .map(|_| ())
-    .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))
+    .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))?;
+    // The ledger's whole purpose is to be read from the branch by whatever opens
+    // the triage PR, so a commit that never reached the branch ref is a failure,
+    // not a warning.
+    published
+        .export
+        .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))
 }
 
 /// Load a project's repo checkout path (the git-backed checkout that carries
@@ -852,7 +871,11 @@ async fn resolve_effective_pr_base(
         });
     }
 
-    match live_origin_branch_exists(git, vcs.gh_cwd.as_path(), recorded_base) {
+    match crate::pr_data::publication::live_origin_branch_exists(
+        git,
+        vcs.gh_cwd.as_path(),
+        recorded_base,
+    ) {
         Ok(true) => Ok(EffectivePrBase {
             branch: recorded_base.to_string(),
             original: Some(recorded_base.to_string()),
@@ -874,30 +897,6 @@ async fn resolve_effective_pr_base(
             "Failed to check whether PR base branch `{recorded_base}` exists on origin: {error}"
         )),
     }
-}
-
-fn live_origin_branch_exists(
-    git: &dyn GitClient,
-    repo: &Path,
-    branch_name: &str,
-) -> Result<bool, String> {
-    let output = git.run(
-        repo,
-        vec![
-            "ls-remote".to_string(),
-            "--exit-code".to_string(),
-            "--heads".to_string(),
-            "origin".to_string(),
-            branch_name.to_string(),
-        ],
-    )?;
-    if output.success {
-        return Ok(true);
-    }
-    if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() {
-        return Ok(false);
-    }
-    Err(format!("git ls-remote failed: {}", output.stderr.trim()))
 }
 
 fn pr_base_substitution_note(original: &str, effective: &str) -> String {
@@ -951,7 +950,6 @@ async fn fire_pr_open_review(
     orch: &Orchestrator,
     db: &LocalDb,
     vcs: &PrVcs,
-    _worktree_path: &str,
     job_id: &str,
     issue_id: Option<&str>,
     branch_name: &str,
@@ -979,14 +977,15 @@ async fn handle_create_pr(
 ) -> Result<Option<serde_json::Value>, String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
         .await?;
-    let (worktree_path, branch_name, base_branch) =
-        find_implementation_context(orch, action_run).await?;
+    let implementation = find_implementation_context(orch, action_run).await?;
+    let branch_name = implementation.branch;
+    let base_branch = implementation.base_branch;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
 
     let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
-    let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
+    let vcs = PrVcs::resolve(orch, &repo_path, &branch_name);
     let has_remote = vcs.has_remote();
     let effective_base = resolve_effective_pr_base(
         &db,
@@ -1001,7 +1000,6 @@ async fn handle_create_pr(
     let github = if has_remote {
         let pr_url = open_or_update_github_pr(
             &vcs,
-            &worktree_path,
             &branch_name,
             Some(effective_base.branch.as_str()),
             &title,
@@ -1050,7 +1048,6 @@ async fn handle_create_pr(
         orch,
         &db,
         &vcs,
-        &worktree_path,
         parent_job_id,
         action_run.issue_id.as_deref(),
         &branch_name,
@@ -1103,21 +1100,19 @@ async fn handle_create_pr(
 
 async fn open_or_update_github_pr(
     vcs: &PrVcs,
-    worktree_path: &str,
     branch_name: &str,
     base_branch: Option<&str>,
     title: &str,
     body: Option<&str>,
 ) -> Result<String, String> {
     let vcs = vcs.clone();
-    let worktree_path = worktree_path.to_string();
     let branch_name = branch_name.to_string();
     let base_branch = base_branch.map(ToString::to_string);
     let title = title.to_string();
     let body = body.map(ToString::to_string);
     tokio::task::spawn_blocking(move || {
         log::info!("Creating PR for branch {}", branch_name);
-        vcs.push(&worktree_path);
+        vcs.push()?;
 
         if let Some(base) = base_branch.as_deref() {
             ensure_base_branch_on_origin(&vcs, base)?;
@@ -1238,23 +1233,29 @@ fn ensure_base_branch_on_origin(vcs: &PrVcs, base_branch: &str) -> Result<(), St
     crate::jj::ensure_bookmark_on_origin(&vcs.jj, &store, base_branch)
 }
 
-/// Refuse an automated terminal resolution while the resolved issue still has
-/// active work — e.g. a reviewer still running on a child issue a coordinator is
-/// about to merge. The user-driven UI path (`issues::status::update_status`)
-/// overrides by stopping that work; this guards only the recipe merge/close
-/// actions so an agent does not resolve an issue out from under a live reviewer.
+/// Refuse a recipe-driven terminal resolution while the resolved issue still has
+/// live work — e.g. a reviewer still running on a child issue a coordinator is
+/// about to merge. This stays a hard refusal: the coordinator's own next step
+/// reads that reviewer's result, so resolving out from under it is a mistake no
+/// confirmation makes right. A person or agent deciding to stop the work and
+/// close the issue anyway does so through `issues::status::update_status`, whose
+/// confirmation stops it cleanly.
 async fn ensure_resolution_not_blocked(
     orch: &Orchestrator,
     issue_id: &str,
     verb: &str,
 ) -> Result<(), String> {
-    let blockers = crate::issues::status::terminal_resolution_blockers(orch, issue_id).await?;
-    if blockers.is_empty() {
+    let live_work = crate::issues::status::live_work_for_issue(orch, issue_id).await?;
+    if live_work.is_empty() {
         return Ok(());
     }
+    let listed: Vec<String> = live_work
+        .iter()
+        .map(crate::issues::status::LiveJob::summary)
+        .collect();
     Err(format!(
-        "Refusing to mark issue {verb} while it still has {}; finish or stop the running work first.",
-        blockers.join(", ")
+        "Refusing to mark issue {verb} while it still has live work: {}. Finish or stop that work first.",
+        listed.join(", ")
     ))
 }
 
@@ -1272,7 +1273,7 @@ async fn handle_merge_pr(
         ensure_resolution_not_blocked(orch, issue_id, "merged").await?;
     }
 
-    let (_worktree_path, branch_name, _) = find_implementation_context(orch, action_run).await?;
+    let branch_name = find_implementation_context(orch, action_run).await?.branch;
     let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
@@ -1311,11 +1312,11 @@ async fn handle_close_pr(
 ) -> Result<Option<serde_json::Value>, String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
         .await?;
-    let (worktree_path, branch_name, _) = find_implementation_context(orch, action_run).await?;
+    let branch_name = find_implementation_context(orch, action_run).await?.branch;
     let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
-    let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
+    let vcs = PrVcs::resolve(orch, &repo_path, &branch_name);
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
     let pr_number = load_mr_pr_number(&db, &mr_job_id).await?;
 
@@ -1363,11 +1364,15 @@ async fn handle_close_issue(
 
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
         .await?;
-    crate::issues::crud::resolve(
+    // The same terminal cascade every other resolution door runs: the guard above
+    // has already refused a close over live work, so this normally has nothing to
+    // stop — but a job that started in between still cannot outlive the close.
+    crate::issues::status::resolve_terminal(
+        orch,
         &db,
-        &*orch.services.clock,
         issue_id,
         crate::transitions::Resolution::Closed,
+        crate::issues::status::StopFailure::Refuses,
     )
     .await
     .map_err(|e| format!("Failed to resolve issue as closed: {}", e))?;
@@ -1484,11 +1489,18 @@ async fn extract_pr_details(
     Err("Could not determine PR title - no inputs or issue found".to_string())
 }
 
-/// Find the implementation job's worktree and branch via context edges.
+#[derive(Debug, Clone)]
+struct ImplementationContext {
+    job_id: String,
+    branch: String,
+    base_branch: Option<String>,
+}
+
+/// Find the implementation job's durable branch coordinate via context edges.
 async fn find_implementation_context(
     orch: &Orchestrator,
     action_run: &ActionRun,
-) -> Result<(String, String, Option<String>), String> {
+) -> Result<ImplementationContext, String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
         .await?;
     // Load recipe data from execution snapshot
@@ -1505,11 +1517,11 @@ async fn find_implementation_context(
 
     // Look for source jobs with branches
     for edge in context_edges {
-        if let Some((wt, branch, base_branch)) =
+        if let Some(context) =
             implementation_job_for_node(&db, &action_run.execution_id, &edge.source_node_id).await?
         {
-            log::info!("Found implementation context: branch={}", branch);
-            return Ok((wt, branch, base_branch));
+            log::info!("Found implementation context: branch={}", context.branch);
+            return Ok(context);
         }
     }
 
@@ -1519,7 +1531,7 @@ async fn find_implementation_context(
         return Ok(context);
     }
 
-    Err("No implementation job found with worktree and branch".to_string())
+    Err("No implementation job found with a durable branch coordinate".to_string())
 }
 
 async fn load_execution_snapshot(
@@ -1867,7 +1879,7 @@ async fn implementation_job_for_node(
     db: &LocalDb,
     execution_id: &str,
     recipe_node_id: &str,
-) -> Result<Option<(String, String, Option<String>)>, String> {
+) -> Result<Option<ImplementationContext>, String> {
     let execution_id = execution_id.to_string();
     let recipe_node_id = recipe_node_id.to_string();
     db.read(|conn| {
@@ -1876,11 +1888,10 @@ async fn implementation_job_for_node(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT worktree_path, branch, base_branch
+                    "SELECT id, branch, base_branch
                      FROM jobs
                      WHERE execution_id = ?1
                        AND recipe_node_id = ?2
-                       AND worktree_path IS NOT NULL
                        AND branch IS NOT NULL
                        AND status <> 'cancelled'
                      ORDER BY created_at DESC
@@ -1890,7 +1901,13 @@ async fn implementation_job_for_node(
                 .await?;
             rows.next()
                 .await?
-                .map(|row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?)))
+                .map(|row| {
+                    Ok(ImplementationContext {
+                        job_id: row.text(0)?,
+                        branch: row.text(1)?,
+                        base_branch: row.opt_text(2)?,
+                    })
+                })
                 .transpose()
         })
     })
@@ -1901,17 +1918,16 @@ async fn implementation_job_for_node(
 async fn latest_complete_implementation_job(
     db: &LocalDb,
     execution_id: &str,
-) -> Result<Option<(String, String, Option<String>)>, String> {
+) -> Result<Option<ImplementationContext>, String> {
     let execution_id = execution_id.to_string();
     db.read(|conn| {
         let execution_id = execution_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT worktree_path, branch, base_branch
+                    "SELECT id, branch, base_branch
                      FROM jobs
                      WHERE execution_id = ?1
-                       AND worktree_path IS NOT NULL
                        AND branch IS NOT NULL
                        AND status = 'complete'
                      ORDER BY completed_at DESC
@@ -1921,7 +1937,13 @@ async fn latest_complete_implementation_job(
                 .await?;
             rows.next()
                 .await?
-                .map(|row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?)))
+                .map(|row| {
+                    Ok(ImplementationContext {
+                        job_id: row.text(0)?,
+                        branch: row.text(1)?,
+                        base_branch: row.opt_text(2)?,
+                    })
+                })
                 .transpose()
         })
     })
@@ -1997,6 +2019,12 @@ async fn upsert_merge_request_for_pr(
                         (Some(url.clone()), Some(*number), Some("OPEN".to_string()))
                     })
                     .unwrap_or((None, None, None));
+                // COALESCE, not assignment: this upsert runs twice per open —
+                // once to seed the row before the slow push, once to record the
+                // result. A plain assignment lets the seeding call erase a
+                // binding an earlier open established, so a retry whose open then
+                // fails strands an artifact that used to know its pull request.
+                // Publication facts are promoted here, never withdrawn.
                 conn.execute(
                     "UPDATE merge_requests
                      SET job_id = ?1,
@@ -2005,9 +2033,9 @@ async fn upsert_merge_request_for_pr(
                          source_branch = ?4,
                          target_branch = ?5,
                          status = 'open',
-                         github_pr_number = ?6,
-                         github_pr_url = ?7,
-                         github_state = ?8,
+                         github_pr_number = COALESCE(?6, github_pr_number),
+                         github_pr_url = COALESCE(?7, github_pr_url),
+                         github_state = COALESCE(?8, github_state),
                          is_local = ?9,
                          updated_at = ?10
                      WHERE id = ?11",
@@ -2316,23 +2344,31 @@ mod tests {
         );
     }
 
+    /// The canonical origin probe (`pr_data::publication::origin_branch_tip`)
+    /// asks for the fully-qualified ref and reads the answer out of stdout:
+    /// absence is a zero exit with no output, which keeps "origin does not have
+    /// this branch" distinct from "the probe could not run".
     fn expect_live_origin_probe(git: &mut MockGitClient, branch: &'static str, exists: bool) {
+        let stdout = if exists {
+            format!("1111111111111111111111111111111111111111\trefs/heads/{branch}\n")
+        } else {
+            String::new()
+        };
         git.expect_run()
             .withf(move |repo, args| {
                 repo == Path::new("/tmp/p")
                     && args
                         == &vec![
                             "ls-remote".to_string(),
-                            "--exit-code".to_string(),
                             "--heads".to_string(),
                             "origin".to_string(),
-                            branch.to_string(),
+                            format!("refs/heads/{branch}"),
                         ]
             })
             .return_once(move |_, _| {
                 Ok(GitOutput {
-                    success: exists,
-                    stdout: String::new(),
+                    success: true,
+                    stdout,
                     stderr: String::new(),
                 })
             });
@@ -2426,18 +2462,7 @@ mod tests {
         use crate::jj::JjEnv;
         use std::path::Path;
 
-        fn jj_bin() -> Option<String> {
-            let bin = std::env::var("CAIRN_JJ_BIN")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "jj".to_string());
-            crate::env::command(&bin)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-                .then_some(bin)
-        }
+        use crate::jj::tests::jj_bin;
         fn git(repo: &Path, args: &[&str]) {
             let ok = crate::env::git()
                 .args(args)
@@ -2967,18 +2992,7 @@ mod tests {
         use std::path::Path;
         use std::sync::Arc;
 
-        fn jj_bin() -> Option<String> {
-            let bin = std::env::var("CAIRN_JJ_BIN")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "jj".to_string());
-            crate::env::command(&bin)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-                .then_some(bin)
-        }
+        use crate::jj::tests::jj_bin;
         fn git(repo: &Path, args: &[&str]) {
             let ok = crate::env::git()
                 .args(args)
@@ -3035,11 +3049,9 @@ mod tests {
             .await
             .unwrap();
         let repo_path = project_repo.to_string_lossy().to_string();
-        let ws_path_db = ws_path.to_string_lossy().to_string();
         db_local
             .write(|conn| {
                 let repo_path = repo_path.clone();
-                let ws_path_db = ws_path_db.clone();
                 Box::pin(async move {
                     conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
                     conn.execute(
@@ -3048,7 +3060,7 @@ mod tests {
                     ).await?;
                     conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-7','p-1',7,'Memory triage: project=P (2 pending)','active','none',1,1)", ()).await?;
                     conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','memory-triage','i-7','p-1','running',1,1,'{}')", ()).await?;
-                    conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, branch, worktree_path, created_at, updated_at) VALUES ('job-x','e-1','i-7','p-1','complete','Integrator','integrator','agent/CAIRN-7-integrator-0',?1,1,1)", params![ws_path_db]).await?;
+                    conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, branch, created_at, updated_at) VALUES ('job-x','e-1','i-7','p-1','complete','Integrator','integrator','agent/CAIRN-7-integrator-0',1,1)", ()).await?;
                     let rows: [(&str, &str, Option<&str>); 2] =
                         [("m-1", "discard", None), ("m-2", "defer", Some("workspace"))];
                     for (seq, (id, decision, deferred)) in rows.iter().enumerate() {
@@ -3092,7 +3104,7 @@ mod tests {
             uri_segment: Some("pr".to_string()),
         };
 
-        commit_triage_ledger_if_needed(&orch, &action_run, ws_path.to_str().unwrap(), &repo_path)
+        commit_triage_ledger_if_needed(&orch, &action_run, &repo_path)
             .await
             .expect("no-promotion ledger seals cleanly");
 

@@ -248,7 +248,12 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         Err(_) => None,
     };
 
-    if let Some((Some(pr_number), Some(pr_url), pr_status)) = pr {
+    // A non-positive number is not a pull-request binding: rendering "PR: #0"
+    // here is what let a phantom binding pass for a real pull request on the
+    // issue's own summary. See `bound_pr_number` in `pr_data::actions::context`.
+    if let Some((Some(pr_number), Some(pr_url), pr_status)) =
+        pr.filter(|(number, _, _)| number.is_some_and(|number| number > 0))
+    {
         output.push_str(&format!("PR: #{} ({}) {}\n", pr_number, pr_status, pr_url));
     }
     output.push('\n');

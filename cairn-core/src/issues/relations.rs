@@ -325,34 +325,12 @@ pub async fn issue_key_for_messages(db: &LocalDb, issue_id: &str) -> DbResult<St
     Ok(uri.trim_start_matches("cairn://p/").to_string())
 }
 
-/// The integration branch a child issue's job should base off — the branch of
-/// the coordinator that spawned it — or `None` when there is none to use.
+/// The durable integration branch a child issue should inherit from its parent.
 ///
-/// Resolution order:
-///
-/// 1. The child's recorded spawner (`issues.parent_job_id`), but only when that
-///    job actually belongs to the declared `parent_issue_id`. `parent_job_id`
-///    is primarily a wake-routing pointer to the CALLER's root job, which is not
-///    always a job on the parent issue — a run on issue A can reparent a child
-///    under issue B, recording A's job. The `AND issue_id = parent_issue_id`
-///    guard keeps the branch authority tied to the declared parent so an adopted
-///    child branches from the parent it was placed under, not the caller. For a
-///    Feature coordinator this always matches: the coordinator runs on the
-///    parent issue in its own worktree, so its job carries the worktree-backed
-///    integration branch and the child inherits it directly. This path is not
-///    gated on the spawner still being non-terminal: the coordinator's branch
-///    stays the integration branch while the parent issue is open, even if the
-///    coordinator agent is between turns or has finished its last turn. The
-///    `worktree_path IS NOT NULL` guard is also load-bearing — a Manager
-///    (ambient) coordinator has `worktree_path = NULL` and `branch = NULL`, so
-///    it never matches and its children fall through to the default branch.
-/// 2. Otherwise, the newest live (non-terminal) worktree-backed job on the
-///    parent *issue*. This fallback covers manual adoption and older rows where
-///    `parent_job_id` was not recorded.
-///
-/// `None` is returned when the issue has no parent, or neither lookup finds a
-/// worktree-backed branch. Every consumer (child base-branch resolution, PR
-/// target, pack anchor) then routes the child onto the project default branch.
+/// The exact spawning job wins when it belongs to the declared parent issue,
+/// regardless of terminal state. Otherwise the newest live branch-bearing job on
+/// the parent issue is used. A missing branch falls back to the project default
+/// at the caller; filesystem residence is never part of branch authority.
 pub(crate) async fn resolve_parent_branch(
     conn: &cairn_db::turso::Connection,
     child_issue_id: &str,
@@ -371,9 +349,8 @@ pub(crate) async fn resolve_parent_branch(
     };
     let parent_job_id = parent_row.opt_text(1)?;
 
-    // 1. Prefer the exact spawning coordinator job. Its branch is the
-    //    integration branch regardless of the job's current status, as long as
-    //    it is worktree-backed (Feature coordinator, not ambient Manager).
+    // 1. Prefer the exact spawning coordinator job. Its durable branch remains
+    // authoritative regardless of the job's current status.
     if let Some(parent_job_id) = parent_job_id.as_deref() {
         let mut job_rows = conn
             .query(
@@ -383,7 +360,6 @@ pub(crate) async fn resolve_parent_branch(
                 WHERE id = ?1
                   AND issue_id = ?2
                   AND branch IS NOT NULL
-                  AND worktree_path IS NOT NULL
                 LIMIT 1
                 ",
                 params![parent_job_id, parent_issue_id.as_str()],
@@ -394,7 +370,7 @@ pub(crate) async fn resolve_parent_branch(
         }
     }
 
-    // 2. Fall back to the newest live worktree-backed job on the parent issue.
+    // 2. Fall back to the newest live branch-bearing job on the parent issue.
     let mut branch_rows = conn
         .query(
             "
@@ -402,7 +378,6 @@ pub(crate) async fn resolve_parent_branch(
             FROM jobs
             WHERE issue_id = ?1
               AND branch IS NOT NULL
-              AND worktree_path IS NOT NULL
               AND status NOT IN ('complete', 'failed')
             ORDER BY created_at DESC
             LIMIT 1
@@ -595,8 +570,8 @@ mod parent_tests {
         db.write(|conn| {
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO jobs(id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
-                     VALUES(?1, 'p', 'parent', 'blocked', 'agent/parent', '/tmp/parent', 10, 10)",
+                    "INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+                     VALUES(?1, 'p', 'parent', 'blocked', 'agent/parent', 10, 10)",
                     params!["parent-job"],
                 )
                 .await?;
@@ -621,8 +596,8 @@ mod parent_tests {
         db.write(|conn| {
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO jobs(id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
-                     VALUES(?1, 'p', 'parent', 'complete', 'agent/stale', '/tmp/parent', 10, 10)",
+                    "INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+                     VALUES(?1, 'p', 'parent', 'complete', 'agent/stale', 10, 10)",
                     params!["terminal-parent-job"],
                 )
                 .await?;
@@ -640,19 +615,17 @@ mod parent_tests {
     }
 
     #[tokio::test]
-    async fn resolve_parent_branch_none_when_parent_job_has_no_worktree() {
+    async fn resolve_parent_branch_uses_parent_coordinate_without_checkout() {
         let db = migrated_db().await;
         seed_parent_child(&db).await;
 
-        // An ambient (Branch: main / worktreeMode: none) coordinator's live job
-        // carries a branch but no worktree_path. The `worktree_path IS NOT NULL`
-        // filter excludes it, so the child routes to the default branch — the
-        // structural replacement for the deleted childBase mechanism.
+        // Filesystem residence is irrelevant: a branch-bearing parent job is a
+        // complete inheritance coordinate even when it has no checkout.
         db.write(|conn| {
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO jobs(id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
-                     VALUES(?1, 'p', 'parent', 'blocked', 'agent/parent', NULL, 10, 10)",
+                    "INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+                     VALUES(?1, 'p', 'parent', 'blocked', 'agent/parent', 10, 10)",
                     params!["ambient-parent-job"],
                 )
                 .await?;
@@ -666,7 +639,7 @@ mod parent_tests {
             .read(|conn| Box::pin(async move { resolve_parent_branch(conn, "child").await }))
             .await
             .unwrap();
-        assert!(branch.is_none());
+        assert_eq!(branch.as_deref(), Some("agent/parent"));
     }
 
     #[tokio::test]
@@ -676,8 +649,8 @@ mod parent_tests {
         // run on issue A can reparent a child under issue B, recording A's job.
         // The exact-job fast path must NOT hand the caller's (issue A's) branch to
         // a child declared under issue B — it is gated on the job's `issue_id`
-        // matching `parent_issue_id`. Here parent-b has no worktree-backed job, so
-        // the child correctly resolves to no integration branch (default fallback).
+        // matching `parent_issue_id`. Here parent-b has no branch-bearing job, so
+        // the child correctly resolves to no integration branch.
         let db = migrated_db().await;
         db.execute_script(
             "
@@ -688,8 +661,8 @@ mod parent_tests {
             VALUES('parent-a', 'p', 1, 'Parent A', 'backlog', 'backlog', 'none', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
             VALUES('parent-b', 'p', 2, 'Parent B', 'backlog', 'backlog', 'none', 2, 2);
-            INSERT INTO jobs(id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
-            VALUES('job-a', 'p', 'parent-a', 'blocked', 'agent/parent-a', '/tmp/parent-a', 10, 10);
+            INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+            VALUES('job-a', 'p', 'parent-a', 'blocked', 'agent/parent-a', 10, 10);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id, parent_job_id)
             VALUES('child', 'p', 3, 'Child', 'backlog', 'backlog', 'none', 3, 3, 'parent-b', 'job-a');
             ",
@@ -709,10 +682,14 @@ mod parent_tests {
 
     #[tokio::test]
     async fn resolve_parent_branch_uses_matching_parent_job_even_when_terminal() {
-        // The Feature coordinator case: the spawner job is on the parent issue
-        // itself. The child inherits its worktree-backed integration branch
-        // through `parent_job_id` even after that coordinator job goes terminal,
-        // which the non-terminal parent-issue fallback would miss.
+        // The coordinator-on-a-new-branch case: the spawner job is on the parent
+        // issue itself. The child inherits its durable integration branch through
+        // `parent_job_id` even after that coordinator job goes terminal,
+        // which the non-terminal parent-issue fallback would miss. Under the base
+        // branch target the coordinator job has no branch at all, so this lookup
+        // finds none and the child falls through to the project default — the
+        // whole child-branching difference between the two targets, with no
+        // branch-target-specific code anywhere in this resolver.
         let db = migrated_db().await;
         db.execute_script(
             "
@@ -721,8 +698,8 @@ mod parent_tests {
             VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
             VALUES('parent', 'p', 1, 'Parent', 'backlog', 'backlog', 'none', 1, 1);
-            INSERT INTO jobs(id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
-            VALUES('coord-job', 'p', 'parent', 'complete', 'agent/coord', '/tmp/coord', 10, 10);
+            INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
+            VALUES('coord-job', 'p', 'parent', 'complete', 'agent/coord', 10, 10);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id, parent_job_id)
             VALUES('child', 'p', 2, 'Child', 'backlog', 'backlog', 'none', 2, 2, 'parent', 'coord-job');
             ",

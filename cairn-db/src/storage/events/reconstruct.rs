@@ -67,7 +67,7 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
     // from the shared per-team store (the store read-through caches into the
     // private `cas_cache`, so repeat reconstructs are offline). The fetch happens
     // in this async phase, before the non-Send `ObjectStore` is built.
-    let store = db.content_store().cloned();
+    let store = db.team_id().map(|_| db.content_store().clone());
     let private_route_db = db.private_route_db().cloned();
     let coords = db
         .read(move |conn| {

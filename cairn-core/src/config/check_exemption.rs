@@ -11,17 +11,17 @@
 //!
 //! [`build_run_sandbox_policy`]: crate::mcp::handlers::run
 //!
-//! ## Trust source: the canonical main checkout, not the agent worktree
+//! ## Trust source: the canonical main checkout, not an executor projection
 //!
 //! The matcher's inputs — the `checks` contract and the project's package.json
 //! `scripts` — are the trust boundary: a command they name runs unconfined. They
 //! must therefore come from a source the running agent cannot mutate. The caller
 //! ([`build_run_sandbox_policy`]) loads both from the **live main checkout**
 //! (resolved via `resolve_local_repo_path_and_key`), exactly like the check
-//! cadences' `load_live_project_checks`, with the agent worktree used only as a
+//! cadences' `load_live_project_checks`, with the executor projection used only as a
 //! fallback when the project repo cannot be resolved. This closes the self-grant
 //! hole: a branch cannot add a `command: python escape.py` check or a
-//! `test:escape` package script to its own worktree config and have it run
+//! `test:escape` package script to the project config and have it run
 //! unconfined, because the matcher never sees the worktree's copy when the main
 //! checkout resolves.
 //!
@@ -79,7 +79,7 @@ const TARGETS: &str = "{targets}";
 /// project's `checks` contract, and the project's package.json script names.
 /// Both `checks` and `scripts` MUST be sourced from the canonical main checkout
 /// (see the module docs) so a branch cannot self-grant an unconfined command by
-/// editing its own worktree config.
+/// editing the project check config.
 pub(crate) fn is_exempt_check_command(
     command: &str,
     checks: &HashMap<String, CheckCommand>,
@@ -271,13 +271,16 @@ mod tests {
 
     fn check(command: &str) -> CheckCommand {
         CheckCommand {
+            scope: None,
             command: command.to_string(),
             impact: None,
             policy: CheckPolicy::Advisory,
             when: CheckWhen::Write,
             resource_class: crate::config::project_settings::CheckResourceClass::Shared,
             timeout: None,
-            constraints: None,
+            executor: None,
+            verdict_environment: Vec::new(),
+            fixes: false,
         }
     }
 

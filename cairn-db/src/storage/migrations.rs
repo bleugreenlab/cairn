@@ -1,3 +1,4 @@
+use super::migration::RebuildCheck;
 use super::Migration;
 
 /// Composes a migration lineage from its head migrations plus the shared tail.
@@ -26,6 +27,23 @@ macro_rules! shared_tail {
             "0084",
             "archival_pack_hash",
             include_str!("../../../../turso_migrations/0084_archival_pack_hash.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_virtual_reconcile_coordinates {
+    () => {
+        // `jobs` loses two columns in place via ALTER TABLE DROP COLUMN;
+        // `jj_reconcile_items` is copied whole out of its `_legacy` rename. Both
+        // carry every row.
+        Migration::rebuild_fk_off(
+            "0118",
+            "virtual_reconcile_coordinates",
+            include_str!("../../../../turso_migrations/0118_virtual_reconcile_coordinates.sql"),
+            &[
+                RebuildCheck::Conserved("jobs"),
+                RebuildCheck::Conserved("jj_reconcile_items"),
+            ],
         )
     };
 }
@@ -318,6 +336,205 @@ macro_rules! shared_tail_check_result_cache_provenance {
     };
 }
 
+/// CAIRN-3108: index the `(check_name, ran_at, tree_hash)` recency ranking that
+/// selects each check's latest verdict. The cache is shared project state, so
+/// this index-only migration is composed once into both lineages.
+macro_rules! shared_tail_check_result_cache_recency_index {
+    () => {
+        Migration::new(
+            "0121",
+            "check_result_cache_recency_index",
+            include_str!("../../../../turso_migrations/0121_check_result_cache_recency_index.sql"),
+        )
+    };
+}
+
+/// CAIRN-3167: pin a durable session to its selected provider account. Sessions
+/// are shared project state, so this additive migration reaches both lineages.
+macro_rules! shared_tail_session_account {
+    () => {
+        Migration::new(
+            "0122",
+            "session_account",
+            include_str!("../../../../turso_migrations/0122_session_account.sql"),
+        )
+    };
+}
+
+/// CAIRN-3152: the durable identity of a REPL. A REPL was registry-only
+/// in-memory state, which is why its GUI could not be invalidated and why a dead
+/// session became indistinguishable from one that never existed. The row makes it
+/// an entity with a lifecycle, and it is project-scoped shared state alongside
+/// the jobs it hangs off — so it is written once here and composed into both
+/// lineages, exactly like `job_terminals`.
+macro_rules! shared_tail_job_repls {
+    () => {
+        Migration::new(
+            "0123",
+            "job_repls",
+            include_str!("../../../../turso_migrations/0123_job_repls.sql"),
+        )
+    };
+}
+
+/// CAIRN-3152: the durable REPL transcript, replacing the in-memory 200-entry
+/// exchange ring. Project-scoped shared state hanging off `job_repls`, so it is
+/// composed into both lineages immediately after it.
+macro_rules! shared_tail_repl_exchanges {
+    () => {
+        Migration::new(
+            "0124",
+            "repl_exchanges",
+            include_str!("../../../../turso_migrations/0124_repl_exchanges.sql"),
+        )
+    };
+}
+
+/// CAIRN-3112: a terminal is a process inside an execution environment, so its
+/// durable fence becomes (holder, incarnation, cell epoch). `job_terminals` is
+/// carried by the synced team lineage, so this reaches both.
+macro_rules! shared_tail_rebind_terminals_to_residencies {
+    () => {
+        Migration::new(
+            "0125",
+            "rebind_terminals_to_residencies",
+            include_str!("../../../../turso_migrations/0125_rebind_terminals_to_residencies.sql"),
+        )
+    };
+}
+
+/// CAIRN-3232: re-key the active-suspension bound from the job to the call, so
+/// a turn can park every one of its concurrent long-running calls instead of
+/// only the first. `agent_waits` is project-scoped shared state, so this
+/// index-only migration is composed once here and reaches both lineages.
+macro_rules! shared_tail_agent_waits_concurrent_calls {
+    () => {
+        Migration::new(
+            "0126",
+            "agent_waits_concurrent_calls",
+            include_str!("../../../../turso_migrations/0126_agent_waits_concurrent_calls.sql"),
+        )
+    };
+}
+
+/// CAIRN-3242: the reference rows that give a stored image a human address. The
+/// blob's sha256 stays its storage identity in the content store; these rows map
+/// a scoped ordinal onto it. Project-scoped shared state — a teammate opening a
+/// synced issue must resolve the same image URIs — so it reaches both lineages.
+macro_rules! shared_tail_image_refs {
+    () => {
+        Migration::new(
+            "0127",
+            "image_refs",
+            include_str!("../../../../turso_migrations/0127_image_refs.sql"),
+        )
+    };
+}
+
+/// CAIRN-3264: the write-replay ledger, which makes a second delivery of one
+/// `write` call a no-op instead of a second application of its patch. Host-local
+/// delivery state, so it is a private-lineage migration rather than a shared
+/// tail — a teammate has no in-flight socket of ours to deduplicate.
+macro_rules! private_write_replay_ledger {
+    () => {
+        Migration::new(
+            "0128",
+            "write_replay_ledger",
+            include_str!("../../../../turso_migrations/0128_write_replay_ledger.sql"),
+        )
+    };
+}
+
+/// CAIRN-3265: ordinary prompt rows used for external MCP input carry an
+/// explicit durable-wait owner and one-time consumption marker. Both referenced
+/// tables are project-scoped shared state, so both lineages receive the column.
+macro_rules! shared_tail_mcp_continuation_prompts {
+    () => {
+        Migration::new(
+            "0129",
+            "mcp_continuation_prompts",
+            include_str!("../../../../turso_migrations/0129_mcp_continuation_prompts.sql"),
+        )
+    };
+}
+
+/// CAIRN-3293: delete the snapshotted child-attention subscriptions now that the
+/// recipient is derived from the parent edge. The table is shared schema, so both
+/// lineages converge on having none; it is a no-op wherever none were written.
+macro_rules! shared_tail_retire_snapshot_child_wakes {
+    () => {
+        Migration::new(
+            "0130",
+            "retire_snapshot_child_wakes",
+            include_str!("../../../../turso_migrations/0130_retire_snapshot_child_wakes.sql"),
+        )
+    };
+}
+
+/// CAIRN-3290: `events(run_id, sequence)` becomes UNIQUE. Repairs the duplicate
+/// slots that hand-rolled sequence counters wrote, then constrains the column so
+/// a regression fails loudly instead of silently corrupting transcript order.
+/// `events` is project-scoped shared state, so both lineages receive it.
+macro_rules! shared_tail_unique_event_sequence {
+    () => {
+        Migration::new(
+            "0131",
+            "unique_event_sequence",
+            include_str!("../../../../turso_migrations/0131_unique_event_sequence.sql"),
+        )
+    };
+}
+
+/// CAIRN-3245: bound the re-execution of an infrastructure-failing check. The
+/// consecutive-failure counter and its one-shot escalation stamp live on the
+/// cache row whose key is already the suppressed triple, so this is additive to
+/// shared project state and composed once into both lineages.
+macro_rules! shared_tail_check_result_cache_infra_suppression {
+    () => {
+        Migration::new(
+            "0132",
+            "check_result_cache_infra_suppression",
+            include_str!(
+                "../../../../turso_migrations/0132_check_result_cache_infra_suppression.sql"
+            ),
+        )
+    };
+}
+
+macro_rules! shared_tail_check_result_observations {
+    () => {
+        Migration::rebuild_fk_off(
+            "0134",
+            "check_result_observations",
+            include_str!("../../../../turso_migrations/0134_check_result_observations.sql"),
+            &[RebuildCheck::Conserved("check_result_cache")],
+        )
+    };
+}
+
+macro_rules! shared_tail_check_definition_provenance {
+    () => {
+        Migration::new(
+            "0135",
+            "check_definition_provenance",
+            include_str!("../../../../turso_migrations/0135_check_definition_provenance.sql"),
+        )
+    };
+}
+
+/// The conflict diagnostic captured before a rolled-back rebase, plus the
+/// incoming change's normalized file inventory. Shared because the reconcile
+/// tables it extends are shared; a team replica carries the same data model.
+macro_rules! shared_tail_conflict_resolution_sessions {
+    () => {
+        Migration::new(
+            "0136",
+            "conflict_resolution_sessions",
+            include_str!("../../../../turso_migrations/0136_conflict_resolution_sessions.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -344,6 +561,21 @@ macro_rules! team_lineage {
             shared_tail_jj_reconcile_intents!(),
             shared_tail_agent_waits!(),
             shared_tail_jj_reconcile_quarantines!(),
+            shared_tail_virtual_reconcile_coordinates!(),
+            shared_tail_check_result_cache_recency_index!(),
+            shared_tail_session_account!(),
+            shared_tail_job_repls!(),
+            shared_tail_repl_exchanges!(),
+            shared_tail_rebind_terminals_to_residencies!(),
+            shared_tail_agent_waits_concurrent_calls!(),
+            shared_tail_image_refs!(),
+            shared_tail_mcp_continuation_prompts!(),
+            shared_tail_retire_snapshot_child_wakes!(),
+            shared_tail_unique_event_sequence!(),
+            shared_tail_check_result_cache_infra_suppression!(),
+            shared_tail_check_result_observations!(),
+            shared_tail_check_definition_provenance!(),
+            shared_tail_conflict_resolution_sessions!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -407,6 +639,9 @@ macro_rules! private_lineage {
                 include_str!(
                     "../../../../turso_migrations/0091_drop_projects_server_id_and_servers.sql"
                 ),
+                // `servers` is dropped outright, not rebuilt; `projects` copies
+                // every row minus the `server_id` column.
+                &[RebuildCheck::Conserved("projects")],
             ),
             shared_tail_tool_invocation_durations!(),
             shared_tail_check_result_job_id!(),
@@ -494,6 +729,44 @@ macro_rules! private_lineage {
                 "workflow_executor_anchor",
                 include_str!("../../../../turso_migrations/0117_workflow_executor_anchor.sql"),
             ),
+            shared_tail_virtual_reconcile_coordinates!(),
+            Migration::new(
+                "0119",
+                "virtual_workflow_coordinates",
+                include_str!("../../../../turso_migrations/0119_virtual_workflow_coordinates.sql"),
+            ),
+            // CAIRN-3103: cadence marker for the whole-database integrity sweep,
+            // which replaced the per-migration integrity_check. Per-install
+            // runner-transient state (mirrors archival_backfill_state); never
+            // synced to a team replica.
+            Migration::new(
+                "0120",
+                "integrity_sweep_state",
+                include_str!("../../../../turso_migrations/0120_integrity_sweep_state.sql"),
+            ),
+            shared_tail_check_result_cache_recency_index!(),
+            shared_tail_session_account!(),
+            shared_tail_job_repls!(),
+            shared_tail_repl_exchanges!(),
+            shared_tail_rebind_terminals_to_residencies!(),
+            shared_tail_agent_waits_concurrent_calls!(),
+            shared_tail_image_refs!(),
+            private_write_replay_ledger!(),
+            shared_tail_mcp_continuation_prompts!(),
+            shared_tail_retire_snapshot_child_wakes!(),
+            shared_tail_unique_event_sequence!(),
+            shared_tail_check_result_cache_infra_suppression!(),
+            // The public name an executor answers to is host-local enrollment
+            // state, exactly like the credential beside it, and never
+            // collaboration data synced into a team replica.
+            Migration::new(
+                "0133",
+                "executor_enrollment_names",
+                include_str!("../../../../turso_migrations/0133_executor_enrollment_names.sql"),
+            ),
+            shared_tail_check_result_observations!(),
+            shared_tail_check_definition_provenance!(),
+            shared_tail_conflict_resolution_sessions!(),
         ]
     };
 }
@@ -623,6 +896,15 @@ pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
         "0025",
         "remove_managers",
         include_str!("../../../../turso_migrations/0025_remove_managers.sql"),
+        // Five unfiltered rebuilds dropping `manager_id`. The four manager tables
+        // are dropped, not rebuilt.
+        &[
+            RebuildCheck::Conserved("issues"),
+            RebuildCheck::Conserved("jobs"),
+            RebuildCheck::Conserved("turns"),
+            RebuildCheck::Conserved("messages"),
+            RebuildCheck::Conserved("merge_requests"),
+        ],
     ),
     Migration::new(
         "0026",
@@ -653,6 +935,12 @@ pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
         "0031",
         "drop_dead_chats_table",
         include_str!("../../../../turso_migrations/0031_drop_dead_chats_table.sql"),
+        // Only the FK reference to `chats` goes away; `chat_id` survives as a
+        // vestigial column and every row is copied.
+        &[
+            RebuildCheck::Conserved("runs"),
+            RebuildCheck::Conserved("sessions"),
+        ],
     ),
     Migration::new(
         "0032",
@@ -688,6 +976,9 @@ pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
         "0038",
         "drop_annotation_tables",
         include_str!("../../../../turso_migrations/0038_drop_annotation_tables.sql"),
+        // Three bare `DROP TABLE IF EXISTS`; nothing is rebuilt, so there is
+        // nothing to verify.
+        &[],
     ),
     Migration::new(
         "0039",
@@ -706,12 +997,14 @@ pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
             "../../../../turso_migrations/0041_memory_triage_batches_and_drop_when_to_use.sql"
         ),
     ),
+    // Column values transformed in place by CASE expressions; no WHERE filter.
     Migration::rebuild_fk_off(
         "0042",
         "memory_scope_node_id_and_status_lattice",
         include_str!(
             "../../../../turso_migrations/0042_memory_scope_node_id_and_status_lattice.sql"
         ),
+        &[RebuildCheck::Conserved("memories")],
     ),
     Migration::new(
         "0043",
@@ -727,11 +1020,16 @@ pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
         "0045",
         "memory_canon_v2_consolidation",
         include_str!("../../../../turso_migrations/0045_memory_canon_v2_consolidation.sql"),
+        // Deliberately lossy: pre-v2 rows are not copied at all (the new table is
+        // created empty) and `memory_triage_issue_memories` is emptied first.
+        &[RebuildCheck::Reshaped("memories")],
     ),
     Migration::rebuild_fk_off(
         "0046",
         "memory_review_sent_state",
         include_str!("../../../../turso_migrations/0046_memory_review_sent_state.sql"),
+        // `memory_review_state` value remapped; every row copied.
+        &[RebuildCheck::Conserved("jobs")],
     ),
     Migration::new(
         "0047",
@@ -1094,6 +1392,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("attention_pushes", TableScope::ProjectScoped),
     ("attention_read_cursors", TableScope::ProjectScoped),
     ("check_result_cache", TableScope::ProjectScoped),
+    ("check_result_commit_aliases", TableScope::ProjectScoped),
+    ("check_result_observations", TableScope::ProjectScoped),
+    ("check_test_results", TableScope::ProjectScoped),
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
     ("comments", TableScope::ProjectScoped),
@@ -1105,12 +1406,15 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("execution_trigger_sources", TableScope::ProjectScoped),
     ("executions", TableScope::ProjectScoped),
     ("file_changes", TableScope::ProjectScoped),
+    ("image_refs", TableScope::ProjectScoped),
     ("issue_dependencies", TableScope::ProjectScoped),
     ("issue_labels", TableScope::ProjectScoped),
     ("issue_workspaces", TableScope::ProjectScoped),
     ("issues", TableScope::ProjectScoped),
     ("job_browsers", TableScope::ProjectScoped),
+    ("job_repls", TableScope::ProjectScoped),
     ("job_terminals", TableScope::ProjectScoped),
+    ("jj_reconcile_incoming_files", TableScope::ProjectScoped),
     ("jj_reconcile_intents", TableScope::ProjectScoped),
     ("jj_reconcile_items", TableScope::ProjectScoped),
     ("jj_reconcile_quarantines", TableScope::ProjectScoped),
@@ -1130,6 +1434,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("projects", TableScope::ProjectScoped),
     ("prompts", TableScope::ProjectScoped),
     ("queued_messages", TableScope::ProjectScoped),
+    ("repl_exchanges", TableScope::ProjectScoped),
     ("resource_surfacings", TableScope::ProjectScoped),
     ("runs", TableScope::ProjectScoped),
     ("search_outbox", TableScope::ProjectScoped),
@@ -1220,6 +1525,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
+        "integrity_sweep_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
         "pending_injections",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
@@ -1237,6 +1546,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "workflow_call",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "write_replay_ledger",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // ── Private: rebuildable / refetchable caches ────────────────────────────
@@ -1331,6 +1644,18 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["project_id"],
     },
     RekeyTableManifest {
+        table: "check_result_commit_aliases",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "check_result_observations",
+        id_columns: &["id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "check_test_results",
+        id_columns: &["observation_id"],
+    },
+    RekeyTableManifest {
         table: "checkpoint_command_cache",
         id_columns: &["id", "job_id"],
     },
@@ -1379,6 +1704,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "job_id"],
     },
     RekeyTableManifest {
+        table: "image_refs",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
         table: "issue_dependencies",
         id_columns: &["issue_id"],
     },
@@ -1395,6 +1724,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "project_id", "parent_issue_id", "parent_job_id"],
     },
     RekeyTableManifest {
+        table: "jj_reconcile_incoming_files",
+        id_columns: &["intent_id"],
+    },
+    RekeyTableManifest {
         table: "jj_reconcile_intents",
         id_columns: &["id", "project_id"],
     },
@@ -1408,6 +1741,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "job_browsers",
+        id_columns: &["id", "job_id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "job_repls",
         id_columns: &["id", "job_id", "project_id"],
     },
     RekeyTableManifest {
@@ -1485,6 +1822,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "queued_messages",
         id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "repl_exchanges",
+        id_columns: &["id", "repl_id", "project_id"],
     },
     RekeyTableManifest {
         table: "resource_surfacings",
@@ -1712,9 +2053,223 @@ mod tests {
                 "0115_add_agent_waits".to_string(),
                 "0116_add_jj_reconcile_quarantines".to_string(),
                 "0117_workflow_executor_anchor".to_string(),
+                "0118_virtual_reconcile_coordinates".to_string(),
+                "0119_virtual_workflow_coordinates".to_string(),
+                "0120_integrity_sweep_state".to_string(),
+                "0121_check_result_cache_recency_index".to_string(),
+                "0122_session_account".to_string(),
+                "0123_job_repls".to_string(),
+                "0124_repl_exchanges".to_string(),
+                "0125_rebind_terminals_to_residencies".to_string(),
+                "0126_agent_waits_concurrent_calls".to_string(),
+                "0127_image_refs".to_string(),
+                "0128_write_replay_ledger".to_string(),
+                "0129_mcp_continuation_prompts".to_string(),
+                "0130_retire_snapshot_child_wakes".to_string(),
+                "0131_unique_event_sequence".to_string(),
+                "0132_check_result_cache_infra_suppression".to_string(),
+                "0133_executor_enrollment_names".to_string(),
+                "0134_check_result_observations".to_string(),
+                "0135_check_definition_provenance".to_string(),
+                "0136_conflict_resolution_sessions".to_string(),
             ]
         );
         Ok(db)
+    }
+
+    /// CAIRN-3293: the retirement removes every seeded child-attention default
+    /// that would keep a job in the watcher set — `active` and `muted` alike,
+    /// since a `muted` one still draws passive pushes for children the job may no
+    /// longer own. Rows that only ever suppress (`unsubscribed`), rows a node
+    /// created deliberately, and the non-derivable `user`/`peer`/`process` sources
+    /// all survive.
+    #[tokio::test]
+    async fn snapshot_child_wakes_are_retired_without_touching_deliberate_rows() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("retire-child-wakes.turso.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0130")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        const DEFAULT_KINDS: &str = r#"["message","permission","question","resolved","review"]"#;
+        db.execute_script(&format!(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO jobs (id, project_id, status, created_at, updated_at)
+             VALUES ('stale', 'project', 'complete', 1, 1), ('live', 'project', 'running', 2, 2);
+             INSERT INTO wake_subscriptions
+               (id, job_id, source_kind, source_ref, fact_kinds_json, state, created_by, created_at, updated_at, one_shot)
+             VALUES
+               ('seeded', 'stale', 'issue', 'cairn://p/PRJ/2', '{DEFAULT_KINDS}', 'active', 'system', 1, 1, 0),
+               ('muted-seed', 'stale', 'issue', 'cairn://p/PRJ/3', '{DEFAULT_KINDS}', 'muted', 'system', 1, 1, 0),
+               ('refused-seed', 'stale', 'issue', 'cairn://p/PRJ/5', '{DEFAULT_KINDS}', 'unsubscribed', 'system', 1, 1, 0),
+               ('agent-muted', 'live', 'issue', 'cairn://p/PRJ/6', NULL, 'muted', 'agent', 1, 1, 0),
+               ('agent-watch', 'live', 'issue', 'cairn://p/PRJ/4', NULL, 'active', 'agent', 1, 1, 0),
+               ('job-default', 'live', 'user', NULL, NULL, 'active', 'system', 1, 1, 0),
+               ('terminal', 'live', 'process', 'cairn://p/PRJ/4/1/builder/terminal/dev', '[\"terminal_exit\"]', 'active', 'system', 1, 1, 1);"
+        ))
+        .await
+        .unwrap();
+
+        let retirement = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == "0130")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MigrationRunner::new(retirement).run(&db).await.unwrap(),
+            vec!["0130_retire_snapshot_child_wakes".to_string()]
+        );
+
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM wake_subscriptions WHERE id IN ('seeded', 'muted-seed')"
+            )
+            .await
+            .unwrap(),
+            0,
+            "every snapshot default that would keep the job watching is gone, \
+             muted included"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM wake_subscriptions
+                 WHERE id IN ('refused-seed', 'agent-muted', 'agent-watch', 'job-default', 'terminal')"
+            )
+            .await
+            .unwrap(),
+            5,
+            "suppressing refusals, deliberate rows, and non-derivable sources survive"
+        );
+    }
+
+    /// CAIRN-3290: the duplicate repair separates colliding slots in place
+    /// without reordering or dropping anything, and leaves clean runs untouched.
+    ///
+    /// The `run-pinned` fixture is the row set observed on run
+    /// `3f68480e-fb40-4b05-831c-a216ff4d2672`: sequence 7 held twice (a finalized
+    /// `assistant` stamped with its stream's OPEN time, and the `tool_result`
+    /// that was actually inserted first), with 8 absent.
+    #[tokio::test]
+    async fn duplicate_event_sequences_are_separated_before_the_unique_index() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("unique-event-sequence.turso.db"))
+            .await
+            .unwrap();
+        let before_0131 = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version != "0131")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before_0131).run(&db).await.unwrap();
+
+        // (id, run, sequence, created_at)
+        let rows: &[(&str, &str, i64, i64)] = &[
+            ("p0", "run-pinned", 0, 100),
+            ("p1", "run-pinned", 1, 101),
+            // The finalized assistant carries its stream's open time, so it sorts
+            // first within the collided slot even though it landed second.
+            ("p7-assistant", "run-pinned", 7, 152),
+            ("p7-tool-result", "run-pinned", 7, 153),
+            ("p9", "run-pinned", 9, 160),
+            ("p12", "run-pinned", 12, 170),
+            // Three rows on one slot: every extra must find its own.
+            ("t0", "run-triple", 0, 200),
+            ("t1-a", "run-triple", 1, 201),
+            ("t1-b", "run-triple", 1, 202),
+            ("t1-c", "run-triple", 1, 203),
+            ("t2", "run-triple", 2, 204),
+            // A run with no collisions must come through byte-identical.
+            ("c0", "run-clean", 0, 300),
+            ("c5", "run-clean", 5, 301),
+        ];
+
+        let mut script = String::from(
+            "INSERT INTO runs(id, status, created_at, updated_at) VALUES
+             ('run-pinned','exited',1,1),('run-triple','exited',1,1),('run-clean','exited',1,1);",
+        );
+        for (id, run, sequence, created_at) in rows {
+            script.push_str(&format!(
+                "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+                 VALUES ('{id}','{run}',{sequence},{created_at},'assistant','{{}}',{created_at});"
+            ));
+        }
+        db.execute_script(&script).await.unwrap();
+
+        let repair = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == "0131")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MigrationRunner::new(repair).run(&db).await.unwrap(),
+            vec!["0131_unique_event_sequence".to_string()]
+        );
+
+        let sequence_of = |id: &'static str| {
+            let db = &db;
+            async move {
+                db.query_one("SELECT sequence FROM events WHERE id = ?1", (id,), |row| {
+                    row.i64(0)
+                })
+                .await
+                .unwrap()
+            }
+        };
+
+        // Order preserved, collision separated into the next slot, and the rows
+        // above it shift by exactly the number of extras below them.
+        assert_eq!(sequence_of("p0").await, 0);
+        assert_eq!(sequence_of("p1").await, 1);
+        assert_eq!(sequence_of("p7-assistant").await, 7);
+        assert_eq!(sequence_of("p7-tool-result").await, 8);
+        assert_eq!(sequence_of("p9").await, 10);
+        assert_eq!(sequence_of("p12").await, 13);
+
+        assert_eq!(sequence_of("t0").await, 0);
+        assert_eq!(sequence_of("t1-a").await, 1);
+        assert_eq!(sequence_of("t1-b").await, 2);
+        assert_eq!(sequence_of("t1-c").await, 3);
+        assert_eq!(sequence_of("t2").await, 4);
+
+        assert_eq!(sequence_of("c0").await, 0, "a clean run is not renumbered");
+        assert_eq!(sequence_of("c5").await, 5, "a clean run keeps its gaps");
+
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM events").await.unwrap(),
+            rows.len() as i64,
+            "the repair moves rows, it never deletes them"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name LIKE '_event_sequence%'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "the repair's scratch tables are dropped"
+        );
+
+        // The constraint is live: a duplicate slot is now rejected outright.
+        let duplicate = db
+            .execute(
+                "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+                 VALUES ('c0-dup','run-clean',0,1,'assistant','{}',1)",
+                (),
+            )
+            .await;
+        assert!(
+            duplicate.is_err(),
+            "events(run_id, sequence) must reject a duplicate slot"
+        );
     }
 
     #[tokio::test]
@@ -1725,7 +2280,7 @@ mod tests {
             .unwrap();
         let before_0104 = TURSO_MIGRATIONS
             .iter()
-            .filter(|migration| migration.version != "0104")
+            .take_while(|migration| migration.version != "0104")
             .copied()
             .collect::<Vec<_>>();
         MigrationRunner::new(before_0104).run(&db).await.unwrap();
@@ -1764,6 +2319,89 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("/managed/worktree")
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_coordinates_preserve_job_and_reconcile_state() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("virtual-coordinates.turso.db"))
+            .await
+            .unwrap();
+        let before_0118 = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0118")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before_0118).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             INSERT INTO jobs (
+                 id, project_id, status, worktree_path, owns_ephemeral_worktree,
+                 branch, base_branch, base_commit, created_at, updated_at
+             ) VALUES (
+                 'job', 'project', 'running', '/legacy/job', 1,
+                 'agent/job', 'main', 'base-sha', 1, 1
+             );
+             INSERT INTO jj_reconcile_intents (
+                 id, project_id, store_path, target_branch, destination_commit,
+                 created_at, updated_at
+             ) VALUES ('intent', 'project', '/store', 'main', 'destination-sha', 1, 1);
+             INSERT INTO jj_reconcile_items (
+                 intent_id, bookmark, workspace_path, observed_tip, workspace_lineage,
+                 status, updated_at
+             ) VALUES ('intent', 'agent/job', '/legacy/job', 'observed-sha', 'lineage', 'pending', 1);",
+        )
+        .await
+        .unwrap();
+
+        let migration = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == "0118")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MigrationRunner::new(migration).run(&db).await.unwrap(),
+            vec!["0118_virtual_reconcile_coordinates".to_string()]
+        );
+        assert_eq!(
+            db.query_text(
+                "SELECT branch || '|' || base_branch || '|' || base_commit FROM jobs WHERE id = 'job'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("agent/job|main|base-sha")
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name IN ('worktree_path', 'owns_ephemeral_worktree')",
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_text(
+                "SELECT bookmark || '|' || observed_tip || '|' || status FROM jj_reconcile_items WHERE intent_id = 'intent'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("agent/job|observed-sha|pending")
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('jj_reconcile_items') WHERE name IN ('workspace_path', 'workspace_lineage')",
+            )
+            .await
+            .unwrap(),
+            0
         );
     }
 
@@ -3098,6 +3736,21 @@ mod tests {
                 "0114_add_jj_reconcile_intents".to_string(),
                 "0115_add_agent_waits".to_string(),
                 "0116_add_jj_reconcile_quarantines".to_string(),
+                "0118_virtual_reconcile_coordinates".to_string(),
+                "0121_check_result_cache_recency_index".to_string(),
+                "0122_session_account".to_string(),
+                "0123_job_repls".to_string(),
+                "0124_repl_exchanges".to_string(),
+                "0125_rebind_terminals_to_residencies".to_string(),
+                "0126_agent_waits_concurrent_calls".to_string(),
+                "0127_image_refs".to_string(),
+                "0129_mcp_continuation_prompts".to_string(),
+                "0130_retire_snapshot_child_wakes".to_string(),
+                "0131_unique_event_sequence".to_string(),
+                "0132_check_result_cache_infra_suppression".to_string(),
+                "0134_check_result_observations".to_string(),
+                "0135_check_definition_provenance".to_string(),
+                "0136_conflict_resolution_sessions".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

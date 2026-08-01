@@ -8,28 +8,25 @@ pub(super) fn handle_checkpoint_node(
     execution_id: &str,
     effects: &mut Vec<WorkflowEffect>,
 ) -> Result<(), String> {
-    // Standalone checkpoint nodes are command gates: run the command. Exit 0
-    // passes (the effect loop confirms the artifact -> Complete); a non-zero exit
-    // blocks the job (resumable). There is no human-approval checkpoint variant.
     let checkpoint_config: Option<crate::models::CheckpointNodeConfig> = node
         .config
         .as_ref()
-        .and_then(|c| serde_json::from_str(c).ok());
-
+        .and_then(|config| serde_json::from_str(config).ok());
     let command = checkpoint_config
         .as_ref()
-        .and_then(|c| c.command.clone())
+        .and_then(|config| config.command.clone())
         .unwrap_or_else(|| "exit 0".to_string());
 
-    let worktree_path = find_checkpoint_worktree(db, db_job, node)?;
-    let cached_result = check_checkpoint_cache(orch, db, db_job, &command, &worktree_path);
-    let cached_pass = matches!(&cached_result, Some((0, _, true)));
+    let coordinate = resolve_checkpoint_coordinate(orch, db, db_job, node)?;
+    let cached_pass = matches!(
+        check_checkpoint_cache(db, db_job, &command, &coordinate),
+        Some((0, _, true))
+    );
 
     effects.push(WorkflowEffect::RunCheckpointCommand {
         job_id: db_job.id.clone(),
         node_name: node.name.clone(),
         command,
-        worktree_path: PathBuf::from(&worktree_path),
         cached_pass,
         ctx: EffectContext {
             job_id: Some(db_job.id.clone()),
@@ -38,74 +35,90 @@ pub(super) fn handle_checkpoint_node(
             source: EffectSource::DagAdvancement,
         },
     });
-
     Ok(())
 }
 
-fn find_checkpoint_worktree(
+/// Resolve the branch coordinate a checkpoint verifies. A checkpoint attached to
+/// a parent node follows that parent's newest live job; otherwise it verifies its
+/// own job branch. Neither case allocates or inspects a checkout.
+fn resolve_checkpoint_coordinate(
+    orch: &Orchestrator,
     db: &Arc<LocalDb>,
     job: &DbJob,
     node: &DbRecipeNode,
 ) -> Result<String, String> {
     let execution_id = job.execution_id.clone().ok_or("Job has no execution_id")?;
+    let checkpoint_job_id = job.id.clone();
     let parent_id = node.parent_id.clone();
     let db = db.clone();
-    run_advancement_db(async move {
+    let (branch, repo_path) = run_advancement_db(async move {
         db.read(|conn| {
             let execution_id = execution_id.clone();
+            let checkpoint_job_id = checkpoint_job_id.clone();
             let parent_id = parent_id.clone();
             Box::pin(async move {
                 if let Some(parent_id) = parent_id.as_deref() {
                     let mut rows = conn
                         .query(
-                            "SELECT worktree_path
-                             FROM jobs
-                             WHERE execution_id = ?1
-                               AND recipe_node_id = ?2
-                               AND worktree_path IS NOT NULL
-                               AND status <> 'cancelled'
-                             ORDER BY created_at DESC
+                            "SELECT j.branch, p.repo_path
+                             FROM jobs j
+                             JOIN projects p ON p.id = j.project_id
+                             WHERE j.execution_id = ?1
+                               AND j.recipe_node_id = ?2
+                               AND j.branch IS NOT NULL
+                               AND j.status <> 'cancelled'
+                             ORDER BY j.created_at DESC
                              LIMIT 1",
                             params![execution_id.as_str(), parent_id],
                         )
                         .await?;
                     if let Some(row) = rows.next().await? {
-                        return row.text(0);
+                        return Ok((row.text(0)?, row.text(1)?));
                     }
                 }
 
                 let mut rows = conn
                     .query(
-                        "SELECT worktree_path
-                         FROM jobs
-                         WHERE execution_id = ?1
-                           AND worktree_path IS NOT NULL
-                           AND status <> 'cancelled'
-                         ORDER BY created_at DESC
+                        "SELECT j.branch, p.repo_path
+                         FROM jobs j
+                         JOIN projects p ON p.id = j.project_id
+                         WHERE j.id = ?1 AND j.branch IS NOT NULL
                          LIMIT 1",
-                        (execution_id.as_str(),),
+                        (checkpoint_job_id.as_str(),),
                     )
                     .await?;
                 rows.next()
                     .await?
-                    .map(|row| row.text(0))
+                    .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?)))
                     .transpose()?
                     .ok_or_else(|| {
-                        DbError::internal("No worktree found for programmatic checkpoint")
+                        DbError::internal("Checkpoint has no resolvable branch coordinate")
                     })
             })
         })
         .await
-        .map_err(|e| format!("Failed to find checkpoint worktree: {e}"))
+        .map_err(|error| format!("Failed to resolve checkpoint coordinate: {error}"))
+    })?;
+
+    let repository = PathBuf::from(repo_path);
+    let store = crate::jj::project_store_dir(&orch.config_dir, &repository);
+    let coordinate_repository = if crate::jj::is_jj_dir(&store) {
+        store
+    } else {
+        repository
+    };
+    run_advancement_db(async move {
+        cairn_vcs::resolve_coordinate(&coordinate_repository, &branch)
+            .await
+            .map_err(|error| format!("Checkpoint branch '{branch}' is unresolvable: {error}"))
     })
 }
 
 fn check_checkpoint_cache(
-    orch: &Orchestrator,
     db: &Arc<LocalDb>,
     checkpoint_job: &DbJob,
     command: &str,
-    worktree_path: &str,
+    current_coordinate: &str,
 ) -> Option<(i32, String, bool)> {
     let parent_job_id = checkpoint_job.parent_job_id.clone()?;
     let normalized = normalize_command(command);
@@ -133,13 +146,10 @@ fn check_checkpoint_cache(
             })
         })
         .await
-        .map_err(|e| format!("Failed to load checkpoint cache: {e}"))
+        .map_err(|error| format!("Failed to load checkpoint cache: {error}"))
     })
     .ok()??;
 
-    let current_sha = get_current_head_sha(orch, worktree_path).ok()?;
-    let currently_dirty = is_worktree_dirty(orch, worktree_path).unwrap_or(true);
-    let is_valid = cached.1 == current_sha && cached.2 == 0 && !currently_dirty;
-
+    let is_valid = cached.1 == current_coordinate && cached.2 == 0;
     Some((cached.0, cached.1, is_valid))
 }

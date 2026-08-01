@@ -53,6 +53,7 @@ pub(crate) async fn handle_mcp_read(
         (None, _) => {
             list_servers(
                 gateway.as_ref(),
+                &orch.config_dir,
                 &session_key,
                 &servers,
                 project_path.as_deref(),
@@ -69,10 +70,13 @@ pub(crate) async fn handle_mcp_read(
                 mcp_credential_key(&server, project_path.as_deref(), &project_servers);
             describe_server(
                 gateway.as_ref(),
+                &orch.config_dir,
                 &session_key,
                 &server,
                 &credential_key,
                 &config.expanded(&credential_key),
+                project_path.as_deref(),
+                &project_servers,
             )
             .await
         }
@@ -110,6 +114,7 @@ fn mcp_credential_key(
 
 async fn list_servers(
     gateway: &dyn crate::mcp::gateway::McpGateway,
+    config_dir: &std::path::Path,
     session_key: &str,
     servers: &HashMap<String, McpServerConfig>,
     project_path: Option<&std::path::Path>,
@@ -133,17 +138,22 @@ async fn list_servers(
         let credential_key = mcp_credential_key(name, project_path, project_servers);
         let config = servers[name].expanded(&credential_key);
         out.push_str(&format!("\n## {name} ({})\n", config.transport));
-        match gateway
-            .list_tools(session_key, &credential_key, &config)
-            .await
+        match cached_or_refresh_tools(
+            gateway,
+            config_dir,
+            session_key,
+            name,
+            &credential_key,
+            &config,
+            project_path,
+            project_servers,
+        )
+        .await
         {
+            Ok(tools) if tools.is_empty() => out.push_str("  (no tools advertised)\n"),
             Ok(tools) => {
-                if tools.is_empty() {
-                    out.push_str("  (no tools advertised)\n");
-                } else {
-                    for tool in &tools {
-                        out.push_str(&format!("  - {}{}\n", tool.name, one_line_desc(tool)));
-                    }
+                for tool in sorted_tools(&tools) {
+                    out.push_str(&format!("  - {}{}\n", tool.name, one_line_desc(tool)));
                 }
             }
             Err(e) => out.push_str(&format!("  (failed to list tools: {e})\n")),
@@ -159,41 +169,82 @@ async fn list_servers(
 
 /// Affordance block advertising the `write cairn://mcp` registry CRUD. Mirrors
 /// the contract-table mutations so discovery teaches the write surface, not just
-/// reads. Workspace writes edit ~/.cairn/settings.yaml and are gated by the
-/// worktree fence; project writes edit the run's .cairn/config.yaml in place.
+/// reads. Workspace writes edit ~/.cairn/settings.yaml and are gated as explicit
+/// host capabilities; project writes use the run's logical repository view.
+#[allow(clippy::too_many_arguments)]
+async fn cached_or_refresh_tools(
+    gateway: &dyn crate::mcp::gateway::McpGateway,
+    config_dir: &std::path::Path,
+    session_key: &str,
+    server: &str,
+    credential_key: &str,
+    config: &McpServerConfig,
+    project_path: Option<&std::path::Path>,
+    project_servers: &HashMap<String, McpServerConfig>,
+) -> Result<Vec<McpToolDef>, String> {
+    use crate::config::mcp_tools::{self, ToolScope};
+    let scope = project_path
+        .filter(|_| project_servers.contains_key(server))
+        .map(ToolScope::Project)
+        .unwrap_or(ToolScope::Workspace);
+    if let Some(tools) = mcp_tools::fresh_tools(config_dir, scope, server) {
+        return Ok(tools);
+    }
+    let catalog = gateway
+        .list_tools(session_key, credential_key, config)
+        .await?;
+    mcp_tools::record_catalog(config_dir, scope, server, &catalog)?;
+    Ok(catalog.tools)
+}
+
+fn sorted_tools(tools: &[McpToolDef]) -> Vec<&McpToolDef> {
+    let mut tools: Vec<_> = tools.iter().collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
+}
+
 fn mutations_affordance() -> String {
     String::from(
         "\n## Manage the server registry (write)\n\
          - add: write {target:\"cairn://mcp\", mode:\"create\", payload:{name, command?, args?, env?, type?, url?, headers?, enabled?, oauth?, scope?}}\n\
          - edit: write {target:\"cairn://mcp/<server>\", mode:\"patch\", payload:{...same fields...}}\n\
          - remove: write {target:\"cairn://mcp/<server>\", mode:\"delete\"}\n\
-         scope defaults to workspace (~/.cairn/settings.yaml, gated by the worktree fence like any \
-         out-of-worktree write); scope:\"project\" edits the run's .cairn/config.yaml in place. \
+         scope defaults to workspace (~/.cairn/settings.yaml, gated by the logical namespace fence as an \
+         explicit host write); scope:\"project\" addresses the run's logical .cairn/config.yaml. \
          Set non-secret config only — reference secrets with ${VAR}, not plaintext.\n",
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn describe_server(
     gateway: &dyn crate::mcp::gateway::McpGateway,
+    config_dir: &std::path::Path,
     session_key: &str,
     server: &str,
     credential_key: &str,
     config: &McpServerConfig,
+    project_path: Option<&std::path::Path>,
+    project_servers: &HashMap<String, McpServerConfig>,
 ) -> String {
     let mut out = format!("# MCP server: {server} ({})\n", config.transport);
 
     out.push_str("\n## Tools\n");
-    match gateway
-        .list_tools(session_key, credential_key, config)
-        .await
+    match cached_or_refresh_tools(
+        gateway,
+        config_dir,
+        session_key,
+        server,
+        credential_key,
+        config,
+        project_path,
+        project_servers,
+    )
+    .await
     {
+        Ok(tools) if tools.is_empty() => out.push_str("(no tools advertised)\n"),
         Ok(tools) => {
-            if tools.is_empty() {
-                out.push_str("(no tools advertised)\n");
-            } else {
-                for tool in &tools {
-                    out.push_str(&render_tool_contract(server, tool));
-                }
+            for tool in sorted_tools(&tools) {
+                out.push_str(&render_tool_contract(server, tool));
             }
         }
         Err(e) => out.push_str(&format!("(failed to list tools: {e})\n")),
@@ -332,8 +383,9 @@ fn property_desc(spec: &serde_json::Value) -> String {
 /// Render the compact MCP affordance block for the agent orientation prompt:
 /// each configured (enabled) server with its tools listed by name and one-line
 /// description. Tool lists come from the persisted tool store
-/// (`config::mcp_tools`), captured when a server was saved in Settings; a server
-/// absent from the store renders a `read cairn://mcp/<server>` pointer instead,
+/// (`config::mcp_tools`), initially captured in Settings and lazily refreshed by
+/// MCP catalog reads after expiry; a server absent from the store renders a
+/// `read cairn://mcp/<server>` pointer instead,
 /// so awareness never blocks on spawning a server inline. Full argument schemas
 /// stay a `read cairn://mcp/<server>` away. Returns `None` when no servers are
 /// configured.
@@ -358,7 +410,7 @@ pub(crate) fn render_mcp_affordance_block(
         match tools_by_server.get(name) {
             Some(tools) if !tools.is_empty() => {
                 out.push_str(&format!("- **{name}** ({transport})\n"));
-                for tool in tools {
+                for tool in sorted_tools(tools) {
                     out.push_str(&format!("  - `{}`{}\n", tool.name, one_line_desc(tool)));
                 }
             }
@@ -531,6 +583,34 @@ mod tests {
         // Server with no stored tools: a read pointer, not a spawn.
         assert!(block
             .contains("- **playwright** (stdio) — read `cairn://mcp/playwright` for its tools"));
+    }
+
+    #[test]
+    fn affordance_tools_are_sorted_deterministically() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "server".to_string(),
+            McpServerConfig {
+                transport: "stdio".to_string(),
+                command: Some("server".to_string()),
+                args: vec![],
+                env: HashMap::new(),
+                url: None,
+                headers: HashMap::new(),
+                enabled: true,
+                oauth: None,
+            },
+        );
+        let mut catalogs = HashMap::new();
+        catalogs.insert(
+            "server".to_string(),
+            vec![
+                tool("zeta", serde_json::json!({})),
+                tool("alpha", serde_json::json!({})),
+            ],
+        );
+        let block = render_mcp_affordance_block(&servers, &catalogs).unwrap();
+        assert!(block.find("`alpha`").unwrap() < block.find("`zeta`").unwrap());
     }
 
     #[test]

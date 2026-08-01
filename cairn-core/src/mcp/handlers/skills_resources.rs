@@ -73,39 +73,6 @@ pub(crate) async fn project_path_by_key(
         .ok_or_else(|| format!("Project '{key}' has no repository path"))
 }
 
-/// Pick the directory whose `.cairn/skills/` should be read for project-scoped
-/// skills. Prefers an active worktree checkout so a skill authored or edited on
-/// the run's branch is visible from within that run; falls back to `base` (the
-/// project's base checkout) when there is no worktree or it is gone from disk.
-fn prefer_worktree_root(worktree_path: Option<&str>, base: Option<PathBuf>) -> Option<PathBuf> {
-    if let Some(path) = worktree_path {
-        let candidate = PathBuf::from(path);
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-    }
-    base
-}
-
-/// The active run's worktree checkout, but only when that run targets
-/// `project_id`. Used by the explicit `cairn://p/PROJECT/skills` forms so a run
-/// editing skills on its own project's branch sees them, while a read aimed at a
-/// different project keeps the base-checkout resolution. Returns `None` for
-/// project-level (non-worktree) runs, which carry no worktree path.
-async fn active_run_worktree_for_project(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    project_id: Option<&str>,
-) -> Option<String> {
-    let project_id = project_id?;
-    let ctx = super::run_context::lookup_run(&orch.db.local, request)
-        .await
-        .ok()?;
-    (ctx.project_id == project_id)
-        .then_some(ctx.worktree_path)
-        .flatten()
-}
-
 /// Resolve a skill for a given scope.
 ///
 /// Contextual scope (no explicit project) resolves project-first then workspace,
@@ -162,11 +129,7 @@ pub(crate) async fn resolve_skill_script_path(
 
     let project_path: Option<PathBuf> = if let Some(project) = &explicit_project {
         let base = project_path_by_key(orch, project).await?;
-        let id = super::run_context::project_id_by_key(&orch.db.local, project)
-            .await
-            .ok();
-        let worktree = active_run_worktree_for_project(orch, request, id.as_deref()).await;
-        prefer_worktree_root(worktree.as_deref(), Some(base))
+        Some(base)
     } else {
         match super::run_context::lookup_run(&orch.db.local, request).await {
             Ok(ctx) => {
@@ -175,7 +138,7 @@ pub(crate) async fn resolve_skill_script_path(
                     .ok()
                     .flatten()
                     .map(PathBuf::from);
-                prefer_worktree_root(ctx.worktree_path.as_deref(), base)
+                base
             }
             Err(_) => None,
         }
@@ -233,11 +196,7 @@ pub(crate) async fn read_skills_collection(
                 let id = super::run_context::project_id_by_key(&orch.db.local, project)
                     .await
                     .ok();
-                // Prefer the active run's worktree when it targets this project,
-                // so skills it just authored/edited on its branch are visible.
-                let worktree = active_run_worktree_for_project(orch, request, id.as_deref()).await;
-                let path = prefer_worktree_root(worktree.as_deref(), Some(base));
-                (id, Some(project.to_uppercase()), path)
+                (id, Some(project.to_uppercase()), Some(base))
             }
             Err(e) => return e,
         }
@@ -249,9 +208,7 @@ pub(crate) async fn read_skills_collection(
                     .ok()
                     .flatten()
                     .map(PathBuf::from);
-                // Contextual reads come from the current run; prefer its worktree.
-                let path = prefer_worktree_root(ctx.worktree_path.as_deref(), base);
-                (Some(ctx.project_id), Some(ctx.project_key), path)
+                (Some(ctx.project_id), Some(ctx.project_key), base)
             }
             Err(_) => (None, None, None),
         }
@@ -330,11 +287,7 @@ pub(crate) async fn read_skill(
                 let id = super::run_context::project_id_by_key(&orch.db.local, project)
                     .await
                     .ok();
-                // Prefer the active run's worktree when it targets this project,
-                // so skills it just authored/edited on its branch are visible.
-                let worktree = active_run_worktree_for_project(orch, request, id.as_deref()).await;
-                let path = prefer_worktree_root(worktree.as_deref(), Some(base));
-                (id, path)
+                (id, Some(base))
             }
             Err(e) => return e,
         }
@@ -346,9 +299,7 @@ pub(crate) async fn read_skill(
                     .ok()
                     .flatten()
                     .map(PathBuf::from);
-                // Contextual reads come from the current run; prefer its worktree.
-                let path = prefer_worktree_root(ctx.worktree_path.as_deref(), base);
-                (Some(ctx.project_id), path)
+                (Some(ctx.project_id), base)
             }
             Err(_) => (None, None),
         }
@@ -699,203 +650,4 @@ mod tests {
     // seeded run, proving that an active worktree run resolves project skills
     // from its branch checkout while a no-worktree run keeps the base-checkout
     // resolution.
-
-    async fn worktree_orch(config_dir: &Path) -> Orchestrator {
-        use crate::db::DbState;
-        use crate::orchestrator::OrchestratorBuilder;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
-        use std::sync::Arc;
-
-        let local = LocalDb::open(tempdir().unwrap().keep().join("t.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
-        let search = Arc::new(SearchIndex::open_or_create(tempdir().unwrap().keep()).unwrap());
-        let db = Arc::new(DbState::new(Arc::new(local), search));
-        OrchestratorBuilder::new(
-            db,
-            Arc::new(TestServicesBuilder::new().build()),
-            config_dir.to_path_buf(),
-        )
-        .build()
-    }
-
-    async fn exec_sql(orch: &Orchestrator, sql: String) {
-        orch.db
-            .local
-            .write(move |conn| {
-                let sql = sql.clone();
-                Box::pin(async move {
-                    conn.execute(&sql, ()).await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-    }
-
-    fn request_for_run(run_id: &str) -> McpCallbackRequest {
-        McpCallbackRequest {
-            thread_id: None,
-            cwd: "/unused".to_string(),
-            run_id: Some(run_id.to_string()),
-            tool: "read_resource".to_string(),
-            payload: serde_json::json!({}),
-            tool_use_id: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn worktree_run_sees_project_skill_authored_on_its_branch() {
-        let config = tempdir().unwrap();
-        let base = tempdir().unwrap();
-        let worktree = tempdir().unwrap();
-        // A project skill that exists only on the worktree branch, not in the base
-        // checkout — the exact bug scenario (just authored/edited on the branch).
-        write_project_skill(worktree.path(), "branch-skill", "Authored on branch");
-
-        let orch = worktree_orch(config.path()).await;
-        exec_sql(
-            &orch,
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws','WS',1,1)"
-                .into(),
-        )
-        .await;
-        exec_sql(
-            &orch,
-            format!(
-                "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) \
-                 VALUES ('proj','ws','NT','NT','{}',1,1)",
-                base.path().display()
-            ),
-        )
-        .await;
-        exec_sql(
-            &orch,
-            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) \
-             VALUES ('iss','proj',7,'I','active',1,1)"
-                .into(),
-        )
-        .await;
-        exec_sql(
-            &orch,
-            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) \
-             VALUES ('exe','r','iss','proj','running',1,1)"
-                .into(),
-        )
-        .await;
-        exec_sql(
-            &orch,
-            format!(
-                "INSERT INTO jobs (id, project_id, issue_id, execution_id, uri_segment, status, worktree_path, created_at, updated_at) \
-                 VALUES ('job','proj','iss','exe','builder','running','{}',1,1)",
-                worktree.path().display()
-            ),
-        )
-        .await;
-        exec_sql(
-            &orch,
-            "INSERT INTO runs (id, job_id, issue_id, created_at, updated_at) \
-             VALUES ('run','job','iss',1,1)"
-                .into(),
-        )
-        .await;
-
-        let request = request_for_run("run");
-
-        // Contextual cairn://skills resolves from the worktree.
-        let rendered = read_skill(&orch, &request, "branch-skill", &[], None).await;
-        assert!(
-            rendered.contains("Project body for branch-skill"),
-            "contextual read should resolve the branch skill: {rendered}"
-        );
-
-        // Explicit cairn://p/NT/skills/branch-skill resolves from the worktree too.
-        let rendered = read_skill(&orch, &request, "branch-skill", &[], Some("NT")).await;
-        assert!(
-            rendered.contains("Project body for branch-skill"),
-            "explicit-project read should resolve the branch skill: {rendered}"
-        );
-
-        // And it appears in the collection listing.
-        let collection = read_skills_collection(&orch, &request, None).await;
-        assert!(
-            collection.contains("branch-skill"),
-            "collection should list the branch skill: {collection}"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_without_worktree_resolves_project_skills_from_base() {
-        let config = tempdir().unwrap();
-        let base = tempdir().unwrap();
-        // A project skill committed in the base checkout.
-        write_project_skill(base.path(), "base-skill", "Lives in base");
-
-        let orch = worktree_orch(config.path()).await;
-        exec_sql(
-            &orch,
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws','WS',1,1)"
-                .into(),
-        )
-        .await;
-        exec_sql(
-            &orch,
-            format!(
-                "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) \
-                 VALUES ('proj','ws','NT','NT','{}',1,1)",
-                base.path().display()
-            ),
-        )
-        .await;
-        // No-worktree job: project skill resolution falls back to the base checkout.
-        exec_sql(
-            &orch,
-            "INSERT INTO jobs (id, project_id, status, created_at, updated_at) \
-             VALUES ('job','proj','running',1,1)"
-                .into(),
-        )
-        .await;
-        exec_sql(
-            &orch,
-            "INSERT INTO runs (id, job_id, created_at, updated_at) VALUES ('run','job',1,1)".into(),
-        )
-        .await;
-
-        let request = request_for_run("run");
-
-        // With no worktree, the base checkout still resolves the skill.
-        let rendered = read_skill(&orch, &request, "base-skill", &[], None).await;
-        assert!(
-            rendered.contains("Project body for base-skill"),
-            "non-worktree read should resolve from base: {rendered}"
-        );
-    }
-
-    #[test]
-    fn prefer_worktree_root_prefers_existing_worktree_else_base() {
-        let worktree = tempdir().unwrap();
-        let base = tempdir().unwrap();
-        let base_path = base.path().to_path_buf();
-
-        // An existing worktree dir wins over the base checkout.
-        assert_eq!(
-            prefer_worktree_root(worktree.path().to_str(), Some(base_path.clone())),
-            Some(worktree.path().to_path_buf())
-        );
-        // A non-existent worktree path falls back to base.
-        assert_eq!(
-            prefer_worktree_root(Some("/no/such/worktree/dir"), Some(base_path.clone())),
-            Some(base_path.clone())
-        );
-        // No worktree path at all falls back to base.
-        assert_eq!(
-            prefer_worktree_root(None, Some(base_path.clone())),
-            Some(base_path)
-        );
-    }
 }

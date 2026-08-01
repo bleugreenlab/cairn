@@ -1,6 +1,6 @@
 //! Tool-result formatting: char-capping, augmentation-reminder assembly, and
 //! change-report failure rendering, plus the shared `CallbackOutcome`.
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Default)]
@@ -180,7 +180,7 @@ fn callback_transport_error_result(
         callback_failure_class(&outcome.result),
         outcome.result
     );
-    CallToolResult::error(vec![Content::text(cap_text_result(&message, 0))])
+    CallToolResult::error(vec![ContentBlock::text(cap_text_result(&message, 0))])
 }
 
 fn change_report_failure_reason(raw: &str) -> Option<String> {
@@ -260,9 +260,9 @@ pub(crate) fn change_callback_result(
     match failure {
         Some(reason) => {
             let text = format!("{}\n\n{}", reason, body);
-            CallToolResult::error(vec![Content::text(cap_text_result(&text, 0))])
+            CallToolResult::error(vec![ContentBlock::text(cap_text_result(&text, 0))])
         }
-        None => CallToolResult::success(vec![Content::text(cap_text_result(&body, 0))]),
+        None => CallToolResult::success(vec![ContentBlock::text(cap_text_result(&body, 0))]),
     }
 }
 
@@ -609,20 +609,17 @@ mod tests {
         // (e.g. an Axon look screenshot) reaches the agent. Exercise that lift.
         let envelope = RunBatchEnvelope {
             text: "=== look ===\nAX tree".to_string(),
-            images: vec![cairn_common::read::ImageBlock {
-                mime_type: "image/png".to_string(),
-                data: "b64".to_string(),
-            }],
+            images: vec![cairn_common::read::ImageBlock::inline("image/png", "b64")],
         };
         let serialized = serde_json::to_string(&envelope).unwrap();
         let parsed: RunBatchEnvelope = serde_json::from_str(&serialized).unwrap();
 
-        let mut blocks: Vec<Content> = vec![Content::text(parsed.text)];
+        let mut blocks: Vec<ContentBlock> = vec![ContentBlock::text(parsed.text)];
         for image in parsed.images {
-            blocks.push(Content::image(image.data, image.mime_type));
+            blocks.push(ContentBlock::image(image.data, image.mime_type));
         }
         assert_eq!(blocks.len(), 2);
-        let image_block = blocks[1].raw.as_image().expect("second block is an image");
+        let image_block = blocks[1].as_image().expect("second block is an image");
         assert_eq!(image_block.mime_type, "image/png");
         assert_eq!(image_block.data, "b64");
     }

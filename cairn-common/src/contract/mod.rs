@@ -50,14 +50,19 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::DEV_DB_CONTRACT,
     globals::DEV_PID_CONTRACT,
     globals::LOGS_CONTRACT,
+    globals::EXECUTORS_CONTRACT,
+    globals::EXECUTOR_CONTRACT,
     globals::MCP_CONTRACT,
     globals::HELP_CONTRACT,
     globals::WEB_SEARCH_CONTRACT,
     projects::PROJECT_CONTRACT,
+    projects::PROJECT_IMAGE_CONTRACT,
+    projects::PROJECT_IMAGES_CONTRACT,
     projects::SETTINGS_CONTRACT,
     projects::PROJECTS_CONTRACT,
     projects::PROJECT_SETTINGS_CONTRACT,
     projects::PROJECT_ISSUES_CONTRACT,
+    projects::PROJECT_CHECK_RESULTS_CONTRACT,
     projects::PROJECT_MESSAGES_CONTRACT,
     projects::PROJECT_TERMINAL_CONTRACT,
     projects::PROJECT_BROWSER_CONTRACT,
@@ -78,6 +83,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     nodes::NODE_CHAT_EVENT_CONTRACT,
     nodes::NODE_ARTIFACT_CONTRACT,
     nodes::NODE_DIFF_CONTRACT,
+    nodes::NODE_REBASE_CONTRACT,
     nodes::NODE_TERMINAL_CONTRACT,
     nodes::NODE_REPL_CONTRACT,
     nodes::NODE_BROWSER_CONTRACT,
@@ -139,6 +145,31 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
 mod tests {
     use super::specs::SUBAGENT_TYPE;
     use super::*;
+
+    /// The fleet is inspected, never mutated through the resource graph. A
+    /// machine is renamed by an operator command that also moves the enrollment
+    /// claim and restarts supervision, which no resource write could do, so the
+    /// contract advertises no mutation and the affordance points at the command.
+    #[test]
+    fn the_executor_family_is_read_only_and_names_the_rename_command() {
+        for kind in [ResourceKind::Executors, ResourceKind::Executor] {
+            let contract = contract_for(kind).expect("the executor family is registered");
+            assert!(
+                contract.mutations.is_empty(),
+                "{kind:?} must advertise no resource mutation"
+            );
+            for mode in ChangeMode::ALL {
+                assert!(
+                    mutation_spec(kind, *mode).is_none(),
+                    "{kind:?} must reject {mode:?}"
+                );
+            }
+        }
+        assert!(contract_for(ResourceKind::Executor)
+            .expect("registered")
+            .description
+            .contains("cairn executor rename"));
+    }
 
     #[test]
     fn every_kind_has_exactly_one_contract() {

@@ -1,5 +1,5 @@
 //! jj subprocess driver (`JjEnv`), repo/file probes, per-project store
-//! provisioning, and populate/auto-track fileset translation.
+//! store initialization and bounded command execution.
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -12,9 +12,11 @@ use std::sync::{Mutex, OnceLock};
 use crate::mcp::git::GitAuthor;
 
 /// Fallback identity used when no per-call author is supplied. Per-commit author
-/// is injected via `--config user.{name,email}=…` on each seal.
-const JJ_DEFAULT_USER_NAME: &str = "Cairn Agent";
-const JJ_DEFAULT_USER_EMAIL: &str = "agent@cairn.local";
+/// is injected via `--config user.{name,email}=…` on each seal. Shared with the
+/// embedded publication path so the CLI-driven and in-process jj drivers can
+/// never fall back to different identities.
+const JJ_DEFAULT_USER_NAME: &str = cairn_vcs::MANAGED_IDENTITY_NAME;
+const JJ_DEFAULT_USER_EMAIL: &str = cairn_vcs::MANAGED_IDENTITY_EMAIL;
 pub(crate) const JJ_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const JJ_NETWORK_TIMEOUT: Duration = Duration::from_secs(600);
 const PIPE_READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -289,6 +291,38 @@ impl JjEnv {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// Run a jj command, returning trimmed stdout AND trimmed stderr on success.
+    ///
+    /// Every other runner drops stderr on a zero exit, which is correct for the
+    /// commands whose failures are exit codes. `jj git export` is not one of
+    /// them: when a `refs/heads/*` ref moved outside jj, the export refuses that
+    /// ref, reports it as `Warning: Failed to export some bookmarks: …` on
+    /// stderr, and **exits 0**. The bookmark advances, the git ref does not, and
+    /// nothing downstream can tell. Verified against jj 0.42. The export
+    /// verifier reads that stderr so a silent freeze becomes a named,
+    /// diagnosable event instead of a stale push.
+    pub(crate) fn run_capturing_stderr(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        ctx: &str,
+    ) -> Result<(String, String), String> {
+        #[cfg(test)]
+        let _guard = jj_subprocess_lock()
+            .lock()
+            .expect("jj subprocess test lock poisoned");
+
+        let out = bounded_command_output(self.cmd(cwd).args(args), JJ_DEFAULT_TIMEOUT, ctx)?;
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !out.status.success() {
+            return Err(format!("{ctx} failed: {stderr}"));
+        }
+        Ok((
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            stderr,
+        ))
+    }
+
     pub(crate) fn run_with_timeout(
         &self,
         cwd: &Path,
@@ -356,6 +390,27 @@ pub fn ensure_project_store(
     store_dir: &Path,
     project_repo: &Path,
 ) -> Result<(), String> {
+    ensure_store_initialized(jj, store_dir, project_repo)?;
+    // Always sync the backing git repo into the store. `jj git init` imports on
+    // creation, but an already-existing store is otherwise frozen at the refs it
+    // last saw: a base ref that advanced since then would not resolve when adding
+    // a new workspace (`Revision <sha> doesn't exist`), so every later job on a
+    // jj-managed project would fail to provision once the project git moved.
+    import_git(jj, store_dir)?;
+    Ok(())
+}
+
+/// Create the shared per-project jj store if absent, WITHOUT importing.
+///
+/// Split out of [`ensure_project_store`] so a caller that owns its own import —
+/// [`crate::jj::reconcile_tracked_bookmark`], which must import at a precise
+/// point between a fetch and a bookmark comparison — can guarantee the store
+/// exists without paying for a redundant import first.
+pub(crate) fn ensure_store_initialized(
+    jj: &JjEnv,
+    store_dir: &Path,
+    project_repo: &Path,
+) -> Result<(), String> {
     if !is_jj_dir(store_dir) {
         if let Some(parent) = store_dir.parent() {
             std::fs::create_dir_all(parent)
@@ -374,20 +429,26 @@ pub fn ensure_project_store(
             "jj git init --git-repo",
         )?;
     }
-    // Always sync the backing git repo into the store. `jj git init` imports on
-    // creation, but an already-existing store is otherwise frozen at the refs it
-    // last saw: a base ref that advanced since then would not resolve when adding
-    // a new workspace (`Revision <sha> doesn't exist`), so every later job on a
-    // jj-managed project would fail to provision once the project git moved.
-    import_git(jj, store_dir)?;
     Ok(())
 }
 
 /// Import the backing git repo's refs and commits into the shared store, so a
 /// base ref that advanced since the store was created resolves.
-fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
-    jj.run(store_dir, &["git", "import"], "jj git import")
-        .map(|_| ())
+///
+/// `--ignore-working-copy` for the same reason every other store operation
+/// passes it: nothing here reads the store default workspace's `@`, and a store
+/// whose default workspace went stale (the ordinary consequence of the
+/// `--ignore-working-copy` writes everywhere else) would otherwise fail this
+/// import outright — which is how a stale default workspace came to kill every
+/// new child spawn. This was the ONLY jj invocation against the store that
+/// omitted the flag.
+pub(crate) fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
+    jj.run(
+        store_dir,
+        &["git", "import", "--ignore-working-copy"],
+        "jj git import",
+    )
+    .map(|_| ())
 }
 
 /// Fetch a remote into the shared store, advancing its remote-tracking bookmarks
@@ -395,10 +456,39 @@ fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
 /// externally-advanced default branch into the store independent of the project
 /// checkout's branch, so a sibling can rebase onto `<default>@origin`. Mirrors
 /// `import_git`: a one-liner over the store's backing git.
+/// Fetch one branch into the backing Git remote-tracking ref without opening or
+/// mutating jj. Stale-publication recovery calls this outside the per-store lock,
+/// then imports the fetched ref under the lock before changing the graph.
+pub(crate) fn fetch_remote_branch_via_git(
+    store_dir: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let checkout = super::export::resolve_backing_checkout(store_dir).ok_or_else(|| {
+        format!(
+            "git fetch {remote} branch `{branch}`: no backing checkout resolved for {}",
+            store_dir.display()
+        )
+    })?;
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    let output = crate::env::git()
+        .args(["fetch", remote, &refspec])
+        .current_dir(checkout)
+        .output()
+        .map_err(|error| format!("git fetch {remote} branch `{branch}`: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git fetch {remote} branch `{branch}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn fetch_remote(jj: &JjEnv, store_dir: &Path, remote: &str) -> Result<(), String> {
     jj.run_with_timeout(
         store_dir,
-        &["git", "fetch", "--remote", remote],
+        &["git", "fetch", "--remote", remote, "--ignore-working-copy"],
         "jj git fetch",
         JJ_NETWORK_TIMEOUT,
     )
@@ -416,78 +506,6 @@ pub(crate) fn quote_fileset(path: &str) -> String {
     let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
-
-/// Translate one populate glob pattern into jj `snapshot.auto-track` exclude
-/// filesets. Populate matches with `literal_separator(false)` (so `*` crosses
-/// `/`) against repo-relative paths; the jj exclusion must be at least as broad,
-/// so each pattern is anchored with a leading `**/` to match at any depth
-/// (over-exclusion is safe — it only keeps more new files untracked). A trailing
-/// slash marks a directory: exclude both its subtree (`**/<dir>/**`) and the
-/// entry itself (`**/<dir>`, e.g. a symlinked dir, which appears as one path).
-fn populate_pattern_filesets(pattern: &str) -> Vec<String> {
-    let is_dir = pattern.ends_with('/');
-    let body = pattern.trim_end_matches('/');
-    if body.is_empty() {
-        return Vec::new();
-    }
-    if is_dir {
-        vec![
-            format!("glob:\"**/{body}/**\""),
-            format!("glob:\"**/{body}\""),
-        ]
-    } else {
-        vec![format!("glob:\"**/{body}\"")]
-    }
-}
-
-/// Build the `snapshot.auto-track` revset that tracks everything EXCEPT the
-/// populate-matched paths (plus any `extra_paths` exact paths fed back by the
-/// security backstop after a glob-translation miss). Returns `None` when there
-/// is nothing to exclude, so the caller leaves jj's `all()` default untouched.
-pub(crate) fn populate_auto_track_expr(
-    config: &crate::config::project_settings::PopulateConfig,
-    extra_paths: &[String],
-) -> Option<String> {
-    let mut filesets: Vec<String> = Vec::new();
-    for pattern in config.copy.iter().chain(config.symlink.iter()) {
-        filesets.extend(populate_pattern_filesets(pattern));
-    }
-    for path in extra_paths {
-        let trimmed = path.trim_matches('/');
-        if !trimmed.is_empty() {
-            filesets.push(quote_fileset(trimmed));
-        }
-    }
-    if filesets.is_empty() {
-        return None;
-    }
-    Some(format!("all() ~ ({})", filesets.join(" | ")))
-}
-
-/// Set the shared store's `snapshot.auto-track` so jj's working-copy snapshot
-/// never auto-tracks explicitly-populated gitignored content. Repo-scoped
-/// (`--repo`), so it applies to every workspace over the store and is idempotent
-/// under concurrent job provisioning. MUST run before populate copies files in:
-/// jj auto-tracks a new file on the first snapshot after it appears, and a later
-/// rule cannot un-track it. `extra_paths` lets the backstop extend the exclusion
-/// with exact leaked paths. No-op when there is nothing to exclude.
-pub(crate) fn set_populate_auto_track(
-    jj: &JjEnv,
-    store_dir: &Path,
-    config: &crate::config::project_settings::PopulateConfig,
-    extra_paths: &[String],
-) -> Result<(), String> {
-    let Some(expr) = populate_auto_track_expr(config, extra_paths) else {
-        return Ok(());
-    };
-    jj.run(
-        store_dir,
-        &["config", "set", "--repo", "snapshot.auto-track", &expr],
-        "jj config set snapshot.auto-track",
-    )
-    .map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,14 +531,29 @@ mod tests {
             config_path: home.path().join("config.toml"),
         };
 
+        // The timeout has to outlast the child's own startup, not merely be
+        // short. It was 500ms, which the shell wins comfortably on an idle
+        // machine and loses under a loaded one: the kill lands before `echo $$`
+        // runs, the pid file is never written, and the test fails reading it —
+        // reporting a timeout defect where there is only CPU contention. Three
+        // seconds is still far below the script's 30s sleep, so the assertion
+        // that the timeout fired remains exactly as sharp.
         let started = Instant::now();
         let error = jj
-            .run_bytes_with_timeout(home.path(), &[], "slow jj", Duration::from_millis(500))
+            .run_bytes_with_timeout(home.path(), &[], "slow jj", Duration::from_secs(3))
             .unwrap_err();
         assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(3));
-        let pid: i32 = std::fs::read_to_string(pid_file)
-            .unwrap()
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the timeout must cut the 30s sleep short"
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the timed-out child never recorded its pid at {}: {error}",
+                    pid_file.display()
+                )
+            })
             .trim()
             .parse()
             .unwrap();
@@ -546,12 +579,22 @@ mod tests {
             config_path: home.path().join("config.toml"),
         };
 
+        // Same load-sensitivity as `managed_command_times_out_and_kills_child`,
+        // and the same remedy. The bound must outlast the script's own startup,
+        // not merely be short: at 500ms a loaded machine loses the race, the
+        // deadline fires before `exit 0` runs, and the SIGKILL to the process
+        // group reaps the backgrounded sleep as well — so the pipes close, the
+        // reader joins cleanly, and the error is the TIMEOUT rather than the
+        // pipe-shutdown bound this test exists to cover. Observed failing 2 of 5
+        // runs. Three seconds is still far below the script's 30s sleep, so the
+        // assertion is exactly as sharp; the elapsed bound covers that timeout
+        // plus the 2s reader join with room for a loaded machine.
         let started = Instant::now();
         let error = jj
-            .run_bytes_with_timeout(home.path(), &[], "leaky jj", Duration::from_millis(500))
+            .run_bytes_with_timeout(home.path(), &[], "leaky jj", Duration::from_secs(3))
             .unwrap_err();
         assert!(error.contains("pipe remained open"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[cfg(unix)]

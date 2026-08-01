@@ -75,6 +75,10 @@ pub mod dispatch {
     pub use crate::dispatch::*;
 }
 
+pub mod dev_instances {
+    pub use crate::dev_instances::*;
+}
+
 pub mod effects {
     pub use crate::effects::*;
 }

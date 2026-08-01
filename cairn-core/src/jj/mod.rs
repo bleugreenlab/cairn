@@ -1,19 +1,10 @@
-//! Jujutsu (jj) driver: the all-jj VCS substrate for agent worktrees.
+//! Jujutsu (jj) driver for the runner-owned branch store.
 //!
-//! Cairn provisions **one shared jj store per jj-managed project** (a single
-//! commit graph and operation log), backed by the project's existing `.git` so
-//! commits stay in the project's object database (pushable, readable by git
-//! tooling against the project) and the user's working checkout is never
-//! touched. Each job's working directory is a `jj workspace` off that one store:
-//! physically isolated files over one shared graph, which is what gives
-//! cross-sibling auto-rebase, the entire reason to move off git.
-//!
-//! Workspaces created by `jj workspace add` are non-colocated: a workspace dir
-//! carries a `.jj` and **no `.git`**. Branch-keyed tooling cannot read the git
-//! branch inside such a dir, so Cairn records the real branch in a marker that is
-//! invisible to the working-copy commit (`<workspace>/.jj/cairn-branch` — jj
-//! never snapshots its own metadata dir) and `resolveBranch` reads it. See
-//! `docs/jj-migration.md`.
+//! Cairn maintains one runner-owned jj store per repository. The store is the
+//! branch graph and logical-head authority; agent processes live in scratch and
+//! never own a jj workspace. Executor materializations are disposable
+//! projections whose deltas publish back through the runner's compare-and-swap
+//! transaction.
 //!
 //! jj opens `$EDITOR` for `describe`/`commit`/`squash` and writes user config
 //! under `~/.config/jj` unless redirected; every command here forces
@@ -33,7 +24,7 @@ mod workspace;
 mod worktree;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use bookmark::*;
 pub use conflict::*;
@@ -57,8 +48,6 @@ pub(crate) use errors::{CONFLICTED_BRANCH_SEAL_MSG, LOST_SEAL_MSG};
 pub(crate) use worktree::sealed_tree_hash_via_git;
 
 // Referenced only by the jj test suite (unused in non-test builds).
-#[cfg(test)]
-pub(crate) use env::populate_auto_track_expr;
 #[cfg(test)]
 pub(crate) use reconcile::restore_bookmark;
 #[cfg(test)]

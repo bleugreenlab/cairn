@@ -561,13 +561,7 @@ pub(crate) async fn render_browser_screenshot(
     };
 
     match browser_capture_roundtrip(orch, &browser.id, BRIDGE_TIMEOUT).await {
-        Ok(data) => (
-            header,
-            Some(ImageBlock {
-                mime_type: "image/png".to_string(),
-                data,
-            }),
-        ),
+        Ok(data) => (header, Some(ImageBlock::inline("image/png", data))),
         Err(error) => (
             format!("{header}\n\n(Could not capture screenshot: {error})"),
             None,
@@ -1154,6 +1148,14 @@ fn format_interactive_body(elements: &[InteractiveElement]) -> String {
         }
         if let Some(hint) = el.meta.context_hint.as_deref() {
             line.push_str(&format!(" — {hint}"));
+        }
+        // A dropdown's choices are what `select` may be given; without them the
+        // agent has to read the whole page just to learn what it may pick.
+        if !el.meta.options.is_empty() {
+            line.push_str(&format!(" · options: {}", el.meta.options.join(" | ")));
+            if let Some(selected) = el.meta.selected.as_deref() {
+                line.push_str(&format!(" · selected: {selected}"));
+            }
         }
         line.push_str(&format!(" · selector: `{}`", el.selector));
         out.push_str(&line);

@@ -13,6 +13,7 @@ pub mod artifacts;
 pub mod browser_network;
 pub mod browsers;
 pub mod config_disables;
+pub mod images;
 pub mod issues;
 pub mod jobs;
 pub mod labels;
@@ -33,7 +34,6 @@ pub mod todos;
 pub mod turns;
 pub mod workflow_journal;
 pub mod workflow_progress;
-pub use cairn_symbols::worktree_search;
 
 // ── Stable public operations ───────────────────────────
 pub use backends::SessionStart;
@@ -71,6 +71,8 @@ mod agent_process;
 mod backends;
 mod clock;
 mod db;
+mod dev_instances;
+mod durable_content;
 pub(crate) mod fleet;
 pub use cairn_db::db_records;
 mod effects;
@@ -79,7 +81,6 @@ mod env;
 mod execution;
 mod git;
 mod jj;
-mod managed_worktrees;
 mod markdown_frontmatter;
 mod mcp;
 mod node_segments;
@@ -94,8 +95,6 @@ mod workspace;
 // Cross-engine parity tests comparing the fff worktree index (cairn-symbols)
 // against this crate's canonical ripgrep walk. Only cairn-core sees both
 // engines, so the comparison is anchored here rather than in cairn-symbols.
-#[cfg(test)]
-mod worktree_search_parity;
 
 /// Unstable app-facing API used by Cairn host crates.
 ///

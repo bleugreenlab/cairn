@@ -32,10 +32,7 @@ fn collapse_envelope_text_extracts_run_text_and_drops_images() {
     // (they cannot ride a chat-completions tool result).
     let envelope = cairn_common::read::RunBatchEnvelope {
         text: "=== look ===\nAX tree".to_string(),
-        images: vec![cairn_common::read::ImageBlock {
-            mime_type: "image/png".to_string(),
-            data: "b64".to_string(),
-        }],
+        images: vec![cairn_common::read::ImageBlock::inline("image/png", "b64")],
     };
     let json = serde_json::to_string(&envelope).unwrap();
     assert_eq!(collapse_envelope_text(json), "=== look ===\nAX tree");
@@ -389,7 +386,6 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
         "run-1",
         "session-1",
         None,
-        2,
         "openrouter",
     )
     .unwrap();
@@ -422,7 +418,6 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
         "run-1",
         "session-1",
         None,
-        3,
         "",
         std::slice::from_ref(&read_call),
         None,
@@ -440,7 +435,6 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
         "run-1",
         "session-1",
         None,
-        4,
         "call-read-1",
         &DispatchOutput {
             content: "file body".to_string(),
@@ -566,8 +560,10 @@ impl WireAdapter for SeamAdapter {
     fn default_model(&self) -> &'static str {
         "seam/default"
     }
-    fn api_key(&self, _orch: &Orchestrator) -> Option<String> {
-        Some("seam-key".to_string())
+    fn connection(&self, _orch: &Orchestrator) -> Result<super::Connection, String> {
+        Ok(super::Connection {
+            api_key: Some("seam-key".to_string()),
+        })
     }
     fn build_conversation(
         &self,
@@ -593,14 +589,13 @@ impl WireAdapter for SeamAdapter {
         &self,
         orch: &Orchestrator,
         _run_db: &Arc<LocalDb>,
-        _api_key: &str,
+        _connection: &super::Connection,
         _model: &str,
         _session_id: &str,
         _outgoing: &[SeamMessage],
         _config: &SessionConfig,
         run_id: &str,
         _turn_id: Option<&str>,
-        _sequence: i32,
         _cancel: &Arc<AtomicBool>,
     ) -> Result<Generation<SeamMessage>, String> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -638,7 +633,10 @@ fn seam_config(run_id: &str, session_id: &str) -> SessionConfig {
     SessionConfig {
         run_id: run_id.to_string(),
         working_dir: "/tmp".to_string(),
+        project_id: "project-seam".to_string(),
+        project_key: "SEAM".to_string(),
         prompt: "hi".to_string(),
+        message_content: crate::agent_process::stdin::MessageContent::text("hi"),
         system_prompt_content: None,
         system_prompt_dynamic_tail: None,
         model: None,
@@ -741,9 +739,10 @@ async fn run_seam(mode: SeamMode) -> (Orchestrator, usize, tempfile::TempDir) {
             &orch_thread,
             run_db,
             cfg,
-            "seam-key".to_string(),
+            super::Connection {
+                api_key: Some("seam-key".to_string()),
+            },
             sid,
-            0,
             None,
             Arc::new(AtomicBool::new(false)),
             String::new(),

@@ -5,7 +5,7 @@
 
 use super::process::ChildProcess;
 use super::pty_osc::Osc133Event;
-use cairn_common::executor_protocol::{LifetimeLeaseFence, LifetimeProcessEvent};
+use cairn_common::executor_protocol::{ResidencyFence, ResidentProcessEvent};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -53,7 +53,7 @@ impl TerminalChild for RemoteTerminalChild {
 
 #[derive(Clone)]
 pub struct LeaseTerminalBinding {
-    pub fence: LifetimeLeaseFence,
+    pub fence: ResidencyFence,
     pub process_key: String,
     pub process_generation: u64,
 }
@@ -146,7 +146,7 @@ pub struct PtySession {
     /// Process handle for cleanup and exit tracking.
     pub child: Box<dyn TerminalChild>,
     /// Executor-hosted terminal authority. When present, input, resize, and stop
-    /// route through the lifetime lease instead of local process handles.
+    /// route through the residency instead of local process handles.
     pub lease: Option<LeaseTerminalBinding>,
     /// Output buffer for late attachment (agent terminals only)
     pub output_buffer: Option<Arc<Mutex<VecDeque<u8>>>>,
@@ -168,16 +168,38 @@ pub struct PtySession {
     /// wake-subscribe path share this `Arc`, so a subscription created after the
     /// terminal starts is seen by the running loop without a restart.
     pub output_watchers: Option<Arc<Mutex<Vec<TerminalOutputWatcher>>>>,
+    /// The persisted log this session tees its output into, so a post-exit read
+    /// shows what a live read showed. Held here rather than only inside the
+    /// session's own event handler, so anything holding the session can say
+    /// something in this terminal's transcript and have it persist too.
+    pub output_log: Option<Arc<Mutex<Option<crate::scratch::TerminalLog>>>>,
 }
 
 /// Manages all active PTY sessions
-pub type LifetimeProcessHandler = Arc<dyn Fn(LifetimeProcessEvent) + Send + Sync>;
+pub type LifetimeProcessHandler = Arc<dyn Fn(ResidentProcessEvent) + Send + Sync>;
+
+/// How long a terminal Cairn started again has to keep running before that
+/// restart counts as having held. A terminal that dies inside this window died
+/// of whatever the restart ran into, so starting it again would only loop.
+pub const TERMINAL_RESTART_SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a restart made at `restarted_at` had settled by `now`. Split from the
+/// ledger that consults it so the bound on recovery is a fact a test can state
+/// rather than one it would have to wait out.
+fn restart_has_settled(restarted_at: std::time::Instant, now: std::time::Instant) -> bool {
+    now.duration_since(restarted_at) >= TERMINAL_RESTART_SETTLE
+}
 
 pub struct PtyState {
     pub sessions: Mutex<HashMap<String, Arc<Mutex<PtySession>>>>,
     pub inline_commands: Mutex<HashMap<String, HashMap<String, SharedInlineChild>>>,
     pub lifetime_handlers: Mutex<HashMap<(String, String), LifetimeProcessHandler>>,
     pub lifetime_subscription_installed: std::sync::atomic::AtomicBool,
+    /// When Cairn last started a terminal again, keyed by that terminal's own
+    /// URI. The key is the terminal, not the session, because a restart mints a
+    /// new session for the same terminal — keying on the session would forget
+    /// the restart at the exact moment it needs to be remembered.
+    terminal_restarts: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl Default for PtyState {
@@ -187,11 +209,42 @@ impl Default for PtyState {
             inline_commands: Mutex::new(HashMap::new()),
             lifetime_handlers: Mutex::new(HashMap::new()),
             lifetime_subscription_installed: std::sync::atomic::AtomicBool::new(false),
+            terminal_restarts: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl PtyState {
+    /// Start the settle clock for a terminal Cairn has just started again.
+    pub fn note_terminal_restart(&self, terminal_uri: &str) {
+        if let Ok(mut restarts) = self.terminal_restarts.lock() {
+            restarts.insert(terminal_uri.to_string(), std::time::Instant::now());
+        }
+    }
+
+    /// Whether the terminal that just died is one Cairn started again too
+    /// recently for that restart to have held. This is the bound on recovery:
+    /// answering `true` is what leaves a terminal stopped instead of starting a
+    /// process that has already shown it cannot stay up.
+    pub fn terminal_restart_unsettled(&self, terminal_uri: &str) -> bool {
+        self.terminal_restarts
+            .lock()
+            .ok()
+            .and_then(|restarts| restarts.get(terminal_uri).copied())
+            .is_some_and(|restarted_at| {
+                !restart_has_settled(restarted_at, std::time::Instant::now())
+            })
+    }
+
+    /// Drop a terminal's restart record once that terminal is over, so the
+    /// ledger holds one entry per terminal that might still come back rather
+    /// than one per terminal this host has ever run.
+    pub fn forget_terminal_restart(&self, terminal_uri: &str) {
+        if let Ok(mut restarts) = self.terminal_restarts.lock() {
+            restarts.remove(terminal_uri);
+        }
+    }
+
     pub fn register_inline_command(
         &self,
         run_id: String,
@@ -506,6 +559,42 @@ pub fn get_default_shell() -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Recovery is bounded by this window and nothing else: inside it, a
+    /// terminal that died is one whose restart did not hold, and starting it
+    /// again would loop. Outside it, the restart held and a later death is a
+    /// fresh incident that recovery answers normally.
+    #[test]
+    fn a_restart_settles_only_after_the_window_it_is_given() {
+        let restarted = std::time::Instant::now();
+        assert!(!restart_has_settled(restarted, restarted));
+        assert!(!restart_has_settled(
+            restarted,
+            restarted + TERMINAL_RESTART_SETTLE - std::time::Duration::from_secs(1)
+        ));
+        assert!(restart_has_settled(
+            restarted,
+            restarted + TERMINAL_RESTART_SETTLE
+        ));
+    }
+
+    /// The ledger is keyed by terminal, not session, because a restart mints a
+    /// new session for the same terminal — keying on the session would forget
+    /// the restart at the moment it has to be remembered.
+    #[test]
+    fn the_restart_ledger_answers_per_terminal_and_forgets_on_request() {
+        let state = PtyState::default();
+        let terminal = "cairn://p/CAIRN/1/1/builder/terminal/tests";
+        let sibling = "cairn://p/CAIRN/1/1/builder/terminal/dev";
+
+        assert!(!state.terminal_restart_unsettled(terminal));
+        state.note_terminal_restart(terminal);
+        assert!(state.terminal_restart_unsettled(terminal));
+        assert!(!state.terminal_restart_unsettled(sibling));
+
+        state.forget_terminal_restart(terminal);
+        assert!(!state.terminal_restart_unsettled(terminal));
+    }
 
     // =========================================================================
     // ensure_submitted_line tests

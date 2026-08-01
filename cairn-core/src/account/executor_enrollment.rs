@@ -3,7 +3,8 @@
 use crate::storage::{LocalDb, RowExt};
 use base64::Engine;
 use cairn_common::executor_protocol::{
-    EnrollmentRejectionReason, ExecutorEnrollmentIdentity, ExecutorIdentity,
+    normalize_executor_name, EnrollmentRejectionReason, ExecutorEnrollmentIdentity,
+    ExecutorIdentity,
 };
 use cairn_db::turso::params;
 use rand::RngCore;
@@ -77,8 +78,59 @@ pub async fn accept(
                 return Err(EnrollmentRejectionReason::RunnerIdentityMismatch);
             }
             validate_credential(db, credential, identity, runner_device_id).await?;
+            claim_executor_name(db, identity).await?;
             Ok(None)
         }
+    }
+}
+
+/// Bind this executor's public name to its enrollment, or confirm it still
+/// holds it.
+///
+/// A public name is an address: every placement request is written in one, so a
+/// second machine answering to a name already in use would route work to the
+/// wrong host with nothing to see. The read of the current holder and the write
+/// of the claim share one transaction, so two executors presenting the same name
+/// at once cannot both win.
+///
+/// A reconnecting executor that has changed its advertised label simply moves
+/// its own claim — the row is keyed by executor identity, and an operator
+/// renaming a machine is exactly that case.
+async fn claim_executor_name(
+    db: &LocalDb,
+    identity: &ExecutorIdentity,
+) -> Result<(), EnrollmentRejectionReason> {
+    let Some(name) = normalize_executor_name(&identity.display_name) else {
+        return Err(EnrollmentRejectionReason::MalformedAdvertisement);
+    };
+    let executor = identity.executor_id.clone();
+    let holder = db
+        .write(|conn| {
+            let name = name.clone();
+            let executor = executor.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT executor_id FROM executor_enrollments WHERE executor_name=?1 AND revoked_at IS NULL AND executor_id<>?2",
+                        params![name.clone(), executor.clone()],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    return Ok(Some(row.text(0)?));
+                }
+                conn.execute(
+                    "UPDATE executor_enrollments SET executor_name=?1, updated_at=?3 WHERE executor_id=?2 AND revoked_at IS NULL",
+                    params![name, executor, chrono::Utc::now().timestamp()],
+                )
+                .await?;
+                Ok(None)
+            })
+        })
+        .await
+        .map_err(|_| EnrollmentRejectionReason::Unenrolled)?;
+    match holder {
+        Some(holder) => Err(EnrollmentRejectionReason::NameConflict { name, holder }),
+        None => Ok(()),
     }
 }
 
@@ -109,20 +161,47 @@ async fn consume_grant(
     {
         return Err(EnrollmentRejectionReason::IdentityMismatch);
     }
+    // The public name is settled in the SAME transaction that spends the grant
+    // and writes the enrollment. Checking it afterwards would burn a one-time
+    // grant and leave a nameless active enrollment behind for a machine that was
+    // refused — an executor that can never attach and an operator who cannot
+    // retry without minting a new grant.
+    let Some(name) = normalize_executor_name(&identity.display_name) else {
+        return Err(EnrollmentRejectionReason::MalformedAdvertisement);
+    };
     let credential = token();
     let credential_hash = hash(&credential);
     let identity = identity.clone();
     let runner = runner_device_id.to_string();
     let credential_expires = now + CREDENTIAL_LIFETIME_SECONDS;
-    let consumed = db.write(|conn| { let digest=digest.clone(); let credential_hash=credential_hash.clone(); let identity=identity.clone(); let runner=runner.clone(); Box::pin(async move {
+    let outcome = db.write(|conn| { let digest=digest.clone(); let credential_hash=credential_hash.clone(); let identity=identity.clone(); let runner=runner.clone(); let name=name.clone(); Box::pin(async move {
+        // Read the holder before anything is written, so the refusal path
+        // commits an empty transaction rather than a half-finished enrollment.
+        let mut rows = conn.query("SELECT executor_id FROM executor_enrollments WHERE executor_name=?1 AND revoked_at IS NULL AND executor_id<>?2", params![name.clone(), identity.executor_id.clone()]).await?;
+        if let Some(row) = rows.next().await? {
+            return Ok(GrantOutcome::NameHeldBy(row.text(0)?));
+        }
+        drop(rows);
         let changed = conn.execute("UPDATE executor_enrollment_grants SET consumed_at=?2 WHERE token_hash=?1 AND consumed_at IS NULL", params![digest,now]).await?;
-        if changed != 1 { return Ok(false); }
-        conn.execute("INSERT INTO executor_enrollments (executor_id,device_id,runner_device_id,credential_hash,enrolled_at,expires_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?5) ON CONFLICT(executor_id) DO UPDATE SET device_id=excluded.device_id,runner_device_id=excluded.runner_device_id,credential_hash=excluded.credential_hash,enrolled_at=excluded.enrolled_at,expires_at=excluded.expires_at,revoked_at=NULL,updated_at=excluded.updated_at", params![identity.executor_id,identity.device_id,runner,credential_hash,now,credential_expires]).await?; Ok(true)
+        if changed != 1 { return Ok(GrantOutcome::GrantLost); }
+        conn.execute("INSERT INTO executor_enrollments (executor_id,device_id,runner_device_id,credential_hash,enrolled_at,expires_at,updated_at,executor_name) VALUES (?1,?2,?3,?4,?5,?6,?5,?7) ON CONFLICT(executor_id) DO UPDATE SET device_id=excluded.device_id,runner_device_id=excluded.runner_device_id,credential_hash=excluded.credential_hash,enrolled_at=excluded.enrolled_at,expires_at=excluded.expires_at,revoked_at=NULL,updated_at=excluded.updated_at,executor_name=excluded.executor_name", params![identity.executor_id,identity.device_id,runner,credential_hash,now,credential_expires,name]).await?; Ok(GrantOutcome::Enrolled)
     })}).await.map_err(|_| EnrollmentRejectionReason::Unenrolled)?;
-    if !consumed {
-        return Err(EnrollmentRejectionReason::Unenrolled);
+    match outcome {
+        GrantOutcome::Enrolled => Ok(credential),
+        GrantOutcome::GrantLost => Err(EnrollmentRejectionReason::Unenrolled),
+        GrantOutcome::NameHeldBy(holder) => {
+            Err(EnrollmentRejectionReason::NameConflict { name, holder })
+        }
     }
-    Ok(credential)
+}
+
+/// What the one transaction that spends a grant decided.
+enum GrantOutcome {
+    Enrolled,
+    /// The grant was consumed by someone else between the read and the write.
+    GrantLost,
+    /// Another live machine already answers to this public name.
+    NameHeldBy(String),
 }
 
 async fn validate_credential(
@@ -208,6 +287,48 @@ pub async fn confirm_rotated_credential(
             Ok(changed == 1)
         })
     }).await.map_err(|error| error.to_string())
+}
+
+/// Move an enrolled machine's public-name claim.
+///
+/// An operator rename has to land here as well as in configuration: the claim is
+/// what makes a name an exclusive address, so leaving it on the old value would
+/// have the machine's own reconnection refused as a second claimant of a name it
+/// no longer uses.
+pub async fn rename(db: &LocalDb, executor_id: &str, new_name: &str) -> Result<(), String> {
+    let name = normalize_executor_name(new_name)
+        .ok_or_else(|| format!("{new_name:?} is not a usable executor name"))?;
+    let executor = executor_id.to_string();
+    let holder = db
+        .write(|conn| {
+            let name = name.clone();
+            let executor = executor.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT executor_id FROM executor_enrollments WHERE executor_name=?1 AND revoked_at IS NULL AND executor_id<>?2",
+                        params![name.clone(), executor.clone()],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    return Ok(Some(row.text(0)?));
+                }
+                conn.execute(
+                    "UPDATE executor_enrollments SET executor_name=?1, updated_at=?3 WHERE executor_id=?2 AND revoked_at IS NULL",
+                    params![name, executor, chrono::Utc::now().timestamp()],
+                )
+                .await?;
+                Ok(None)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    match holder {
+        Some(holder) => Err(format!(
+            "the public name {name} already addresses enrolled executor {holder}"
+        )),
+        None => Ok(()),
+    }
 }
 
 pub async fn revoke(
@@ -408,6 +529,257 @@ mod tests {
             )
             .await,
             Err(EnrollmentRejectionReason::Revoked)
+        );
+    }
+
+    async fn enroll(
+        db: &LocalDb,
+        executor_id: &str,
+        display_name: &str,
+    ) -> Result<String, EnrollmentRejectionReason> {
+        let grant = create_grant(db, "runner", Some(executor_id), None, 60)
+            .await
+            .unwrap();
+        let identity = ExecutorIdentity {
+            device_id: format!("{executor_id}-device"),
+            executor_id: executor_id.into(),
+            display_name: display_name.into(),
+        };
+        accept(
+            db,
+            &grant,
+            &ExecutorEnrollmentIdentity::Grant {
+                token: grant.clone(),
+                expected_runner_device_id: "runner".into(),
+            },
+            &identity,
+            "runner",
+        )
+        .await
+        .map(|credential| credential.unwrap())
+    }
+
+    async fn enrollment_count(db: &LocalDb, executor_id: &str) -> i64 {
+        let executor = executor_id.to_string();
+        db.read(|conn| {
+            let executor = executor.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM executor_enrollments WHERE executor_id=?1",
+                        (executor.as_str(),),
+                    )
+                    .await?;
+                rows.next()
+                    .await?
+                    .expect("COUNT always returns a row")
+                    .i64(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn claimed_name(db: &LocalDb, executor_id: &str) -> Option<String> {
+        let executor = executor_id.to_string();
+        db.read(|conn| {
+            let executor = executor.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT executor_name FROM executor_enrollments WHERE executor_id=?1",
+                        (executor.as_str(),),
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                row.opt_text(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The claim records the normalized address, not the operator's label: the
+    /// label is what a person typed, and the address is what placement and
+    /// `cairn://executors` both speak.
+    #[tokio::test]
+    async fn enrollment_claims_the_normalized_public_name() {
+        let db = db().await;
+        enroll(&db, "remote-a", "BGLab UB").await.unwrap();
+        assert_eq!(
+            claimed_name(&db, "remote-a").await.as_deref(),
+            Some("bglab-ub")
+        );
+    }
+
+    /// A second machine cannot take over an address that already routes work.
+    /// The refusal names the address and the machine holding it, because an
+    /// operator has to know which of the two to rename.
+    ///
+    /// The refusal must also cost nothing. A grant is one-time and an enrollment
+    /// row is what lets a machine attach at all, so spending the first or
+    /// creating the second on the way to saying "no" would leave the operator
+    /// unable to retry and the fleet holding an enrollment for a machine it
+    /// refused.
+    #[tokio::test]
+    async fn a_second_machine_cannot_claim_a_name_already_in_use() {
+        let db = db().await;
+        enroll(&db, "remote-a", "bglab-ub").await.unwrap();
+
+        let grant = create_grant(&db, "runner", Some("remote-b"), None, 60)
+            .await
+            .unwrap();
+        let present = || ExecutorEnrollmentIdentity::Grant {
+            token: grant.clone(),
+            expected_runner_device_id: "runner".into(),
+        };
+        let identity = ExecutorIdentity {
+            device_id: "remote-b-device".into(),
+            executor_id: "remote-b".into(),
+            display_name: "BGLab-UB".into(),
+        };
+        let rejection = accept(&db, &grant, &present(), &identity, "runner")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            rejection,
+            EnrollmentRejectionReason::NameConflict {
+                name: "bglab-ub".into(),
+                holder: "remote-a".into(),
+            }
+        );
+        let diagnostic = rejection
+            .diagnostic()
+            .expect("a name conflict is actionable");
+        assert!(diagnostic.contains("bglab-ub"), "{diagnostic}");
+        assert!(diagnostic.contains("remote-a"), "{diagnostic}");
+        assert!(diagnostic.contains("cairn executor rename"), "{diagnostic}");
+
+        // Nothing was spent, and nothing was created.
+        assert!(
+            token_is_known(&db, &grant).await,
+            "a refused enrollment must leave its one-time grant unspent"
+        );
+        assert_eq!(
+            enrollment_count(&db, "remote-b").await,
+            0,
+            "a refused enrollment must leave no row behind"
+        );
+
+        // So the operator retries with the same grant once the name is free.
+        let renamed = ExecutorIdentity {
+            display_name: "bglab-mac".into(),
+            ..identity
+        };
+        accept(&db, &grant, &present(), &renamed, "runner")
+            .await
+            .expect("the unspent grant still enrolls under a free name");
+        assert_eq!(
+            claimed_name(&db, "remote-b").await.as_deref(),
+            Some("bglab-mac")
+        );
+    }
+
+    /// Reconnecting under a name you already hold is not a conflict with
+    /// yourself, and a machine whose label changed moves its own claim rather
+    /// than being locked out of the address it is about to use.
+    #[tokio::test]
+    async fn a_machine_keeps_and_may_move_its_own_claim() {
+        let db = db().await;
+        let credential = enroll(&db, "remote-a", "bglab-ub").await.unwrap();
+        let identity = ExecutorIdentity {
+            device_id: "remote-a-device".into(),
+            executor_id: "remote-a".into(),
+            display_name: "bglab-ub".into(),
+        };
+        accept(
+            &db,
+            &credential,
+            &ExecutorEnrollmentIdentity::Credential {
+                credential: credential.clone(),
+                expected_runner_device_id: "runner".into(),
+            },
+            &identity,
+            "runner",
+        )
+        .await
+        .expect("a machine reconnecting under its own name is not an impostor");
+
+        let moved = ExecutorIdentity {
+            display_name: "bglab-ubuntu".into(),
+            ..identity
+        };
+        accept(
+            &db,
+            &credential,
+            &ExecutorEnrollmentIdentity::Credential {
+                credential: credential.clone(),
+                expected_runner_device_id: "runner".into(),
+            },
+            &moved,
+            "runner",
+        )
+        .await
+        .expect("a renamed machine moves its own claim");
+        assert_eq!(
+            claimed_name(&db, "remote-a").await.as_deref(),
+            Some("bglab-ubuntu")
+        );
+    }
+
+    /// A revoked machine releases its address for whatever replaces it, which is
+    /// what makes `cairn executor remove` followed by a re-add work.
+    #[tokio::test]
+    async fn revoking_an_enrollment_releases_its_public_name() {
+        let db = db().await;
+        enroll(&db, "remote-a", "bglab-ub").await.unwrap();
+        assert!(revoke(&db, "remote-a", "remote-a-device", "runner")
+            .await
+            .unwrap());
+        enroll(&db, "remote-b", "bglab-ub")
+            .await
+            .expect("a released name is claimable");
+    }
+
+    /// An operator rename moves the durable claim. Left behind, the machine's
+    /// own reconnection under the new label would be refused as a second
+    /// claimant of a name nothing uses.
+    #[tokio::test]
+    async fn an_operator_rename_moves_the_claim_and_refuses_a_taken_name() {
+        let db = db().await;
+        enroll(&db, "remote-a", "bglab-ub").await.unwrap();
+        enroll(&db, "remote-b", "bglab-mac").await.unwrap();
+
+        rename(&db, "remote-a", "BGLab Ubuntu").await.unwrap();
+        assert_eq!(
+            claimed_name(&db, "remote-a").await.as_deref(),
+            Some("bglab-ubuntu")
+        );
+
+        let taken = rename(&db, "remote-a", "bglab-mac").await.unwrap_err();
+        assert!(taken.contains("bglab-mac"), "{taken}");
+        assert!(taken.contains("remote-b"), "{taken}");
+        assert_eq!(
+            claimed_name(&db, "remote-a").await.as_deref(),
+            Some("bglab-ubuntu"),
+            "a refused rename leaves the previous claim intact"
+        );
+
+        assert!(rename(&db, "remote-a", "---").await.is_err());
+    }
+
+    /// A label carrying nothing that can be part of an address is not an
+    /// enrollment the runner can route to, so it is refused at the door rather
+    /// than admitted as a machine no request can name.
+    #[tokio::test]
+    async fn an_unaddressable_label_is_refused_at_enrollment() {
+        let db = db().await;
+        assert_eq!(
+            enroll(&db, "remote-a", "   ").await.unwrap_err(),
+            EnrollmentRejectionReason::MalformedAdvertisement
         );
     }
 

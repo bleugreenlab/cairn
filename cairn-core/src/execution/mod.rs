@@ -14,8 +14,9 @@
 pub mod accumulator;
 pub mod actions;
 pub mod advancement;
+pub mod branch_target;
 pub mod cache;
-pub mod check_admission;
+pub mod check_identity;
 pub mod check_parsers;
 pub mod checkpoint_runs;
 pub mod checkpoints;
@@ -27,6 +28,7 @@ pub mod creation;
 pub mod dag;
 pub mod delegation;
 pub mod dispatch;
+pub mod inputs;
 pub mod jobs;
 pub mod ownership;
 pub mod queries;
@@ -38,7 +40,6 @@ pub mod snapshot_edit;
 pub mod step_behavior;
 pub mod teardown;
 pub mod triggers;
-pub mod worktree_gc;
 
 /// Resolver key for auto-started DAG jobs and cold resumes. Defined in
 /// `models::execution`; re-exported here so existing `crate::execution::Initiator`

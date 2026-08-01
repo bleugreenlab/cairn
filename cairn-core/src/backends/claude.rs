@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use uuid::Uuid;
 
-use super::{AgentBackend, DiscoveredModel, ResolvedTools, SessionConfig};
+use super::{AgentBackend, BackendFailure, DiscoveredModel, ResolvedTools, SessionConfig};
 
 const CLAUDE_BACKEND_NAME: &str = "Claude";
 const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 512;
@@ -520,6 +520,57 @@ fn claude_rate_limit_snapshot(info: &RateLimitInfo) -> ProviderUsageSnapshot {
     }
 }
 
+/// The Claude CLI's wording when `--resume <id>` finds no conversation for the
+/// process's working directory (the CLI keys its conversation store by cwd).
+/// Matched here, at the boundary that emits it; no other layer sees the string.
+fn classify_stderr_failure(line: &str) -> Option<BackendFailure> {
+    line.contains("No conversation found with session ID")
+        .then_some(BackendFailure::SessionUnresolvable)
+}
+
+/// The stderr drain for a spawned agent process plus any failure it classified.
+///
+/// [`StderrWatch::settle`] joins the drain before reading, so a diagnosis the
+/// process printed on its way out is never lost to a race with stdout EOF.
+/// Joining is bounded rather than polled: the read loop that just ended proves
+/// the child closed stdout, and stderr is closed by the same process exit, so
+/// the drain is already finishing. A timeout here would either race the
+/// classification or tax every crash path with a fixed wait.
+struct StderrWatch {
+    join: thread::JoinHandle<()>,
+    failure: Arc<Mutex<Option<BackendFailure>>>,
+}
+
+impl StderrWatch {
+    /// Drain `stderr` on a background thread, logging every line as today and
+    /// recording the first line that classifies as a typed backend failure.
+    fn spawn(stderr: Box<dyn BufRead + Send>) -> Self {
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = failure.clone();
+        let join = thread::spawn(move || {
+            log::debug!("stderr_thread: started");
+            for line in stderr.lines().map_while(Result::ok) {
+                log::error!("claude stderr: {}", line);
+                if let Some(classified) = classify_stderr_failure(&line) {
+                    if let Ok(mut slot) = thread_failure.lock() {
+                        slot.get_or_insert(classified);
+                    }
+                }
+            }
+            log::debug!("stderr_thread: ended");
+        });
+        Self { join, failure }
+    }
+
+    /// Join the drain, then report whatever it classified.
+    fn settle(self) -> Option<BackendFailure> {
+        if self.join.join().is_err() {
+            log::warn!("stderr_thread panicked; treating its diagnosis as absent");
+        }
+        self.failure.lock().ok().and_then(|slot| *slot)
+    }
+}
+
 /// How a Claude process's stdout-EOF should finalize its run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EofVerdict {
@@ -572,6 +623,45 @@ fn classify_eof(
     EofVerdict::AlreadyTerminal
 }
 
+#[derive(Debug)]
+struct RateLimitRetryTarget {
+    job_id: String,
+    session_id: String,
+    turn_id: String,
+    project_id: Option<String>,
+    account_id: String,
+}
+
+fn rate_limit_retry_target(
+    db: &Arc<LocalDb>,
+    run_id: &str,
+) -> Result<Option<RateLimitRetryTarget>, String> {
+    let db = db.clone();
+    let run_id = run_id.to_string();
+    run_backend_db(CLAUDE_BACKEND_NAME, async move {
+        db.read(|conn| Box::pin(async move {
+            let mut rows = conn.query(
+                "SELECT j.id, j.current_session_id, j.current_turn_id, COALESCE(r.project_id, i.project_id), s.account_id
+                   FROM runs r
+                   JOIN jobs j ON j.id = r.job_id
+                   LEFT JOIN issues i ON i.id = r.issue_id
+                   JOIN sessions s ON s.id = j.current_session_id
+                  WHERE r.id = ?1
+                  LIMIT 1",
+                (run_id.as_str(),),
+            ).await?;
+            let Some(row) = rows.next().await? else { return Ok(None); };
+            let Some(session_id) = row.opt_text(1)? else { return Ok(None); };
+            let Some(turn_id) = row.opt_text(2)? else { return Ok(None); };
+            let Some(account_id) = row.opt_text(4)? else { return Ok(None); };
+            Ok(Some(RateLimitRetryTarget {
+                job_id: row.text(0)?, session_id, turn_id,
+                project_id: row.opt_text(3)?, account_id,
+            }))
+        })).await.map_err(|error| error.to_string())
+    })
+}
+
 /// Look up `(job_id, execution_id)` for a run, for the crash diagnostic.
 fn run_job_execution(db: &Arc<LocalDb>, run_id: &str) -> (Option<String>, Option<String>) {
     let db = db.clone();
@@ -613,9 +703,9 @@ fn finalize_streaming_message(
     streaming_state: &mut Option<StreamingState>,
     mut final_event: Option<TranscriptEvent>,
     counts: TokenCounts,
-) -> bool {
+) {
     let Some(mut state) = streaming_state.take() else {
-        return false;
+        return;
     };
     // Flush buffered chunks before finalize: finalize_stream reconstructs the
     // final content from the chunk rows, so unflushed tokens would be lost.
@@ -673,19 +763,13 @@ fn finalize_streaming_message(
         final_event,
         counts,
     ) {
-        Ok(finalized) => {
-            process_post_commit_outbox(orch, &finalized.outbox_entries);
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Failed to finalize stream {} for run {}: {}",
-                state.stream_id,
-                run_id,
-                error
-            );
-            false
-        }
+        Ok(finalized) => process_post_commit_outbox(orch, &finalized.outbox_entries),
+        Err(error) => log::error!(
+            "Failed to finalize stream {} for run {}: {}",
+            state.stream_id,
+            run_id,
+            error
+        ),
     }
 }
 
@@ -740,28 +824,25 @@ fn merge_pending_assistant(parked: &mut TranscriptEvent, incoming: &TranscriptEv
 /// guard must commit that parked message rather than null it: it is a real
 /// transcript event the model produced, never transport noise.
 ///
-/// Returns `true` when an event was committed (the caller bumps `sequence`).
 /// Normally the pending message is paired with its still-open streaming row and
 /// is finalized in place. If that pairing was already broken (the stream row is
 /// gone but a pending event remains), the message is inserted directly so it is
 /// never silently dropped.
-#[allow(clippy::too_many_arguments)]
 fn flush_pending_assistant_before_suppress(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
     run_id: &str,
     session_id: Option<&str>,
-    sequence: i32,
     streaming_state: &mut Option<StreamingState>,
     pending_final_assistant_event: &mut Option<TranscriptEvent>,
     pending_delta_usage: Option<&Usage>,
-) -> bool {
+) {
     let Some(pending) = pending_final_assistant_event.take() else {
-        return false;
+        return;
     };
     let counts = TokenCounts::from_optional_usage(pending_delta_usage);
     if streaming_state.is_some() {
-        return finalize_streaming_message(
+        finalize_streaming_message(
             orch,
             db,
             run_id,
@@ -770,6 +851,7 @@ fn flush_pending_assistant_before_suppress(
             Some(pending),
             counts,
         );
+        return;
     }
     // Defensive: the streaming row is already gone, so finalize_streaming_message
     // would early-return and silently drop this message. Insert it directly so a
@@ -784,7 +866,6 @@ fn flush_pending_assistant_before_suppress(
             id: Uuid::new_v4().to_string(),
             run_id: run_id.to_string(),
             session_id: session_id.map(str::to_string),
-            sequence,
             timestamp: now,
             event_type: pending.event_type.clone(),
             data,
@@ -799,15 +880,16 @@ fn flush_pending_assistant_before_suppress(
             cost_usd: None,
         },
     ) {
-        Ok(inserted) => inserted,
-        Err(error) => {
-            log::warn!(
-                "Failed to insert pending assistant for run {} before suppression: {}",
-                &run_id[..run_id.len().min(8)],
-                error
-            );
-            false
-        }
+        Ok(true) => {}
+        Ok(false) => log::error!(
+            "Pending assistant event for run {} was not stored before suppression (duplicate id)",
+            &run_id[..run_id.len().min(8)]
+        ),
+        Err(error) => log::error!(
+            "Failed to insert pending assistant for run {} before suppression: {}",
+            &run_id[..run_id.len().min(8)],
+            error
+        ),
     }
 }
 
@@ -931,7 +1013,7 @@ impl AgentBackend for ClaudeBackend {
         let system_prompt_path =
             write_system_prompt_file(&config.run_id, &flatten_prompt_segments(&prompt_segments))?;
 
-        let initial_sequence = persist_system_prompt_event(
+        persist_system_prompt_event(
             orch,
             &config.run_id,
             session_id.as_deref(),
@@ -1021,12 +1103,21 @@ impl AgentBackend for ClaudeBackend {
 
         // Inject user identity into Claude process environment
         // Prefer pre-resolved identity from SessionConfig (includes project overrides)
-        if let Some(user) = config
+        let identity = config
             .identity
             .as_ref()
             .cloned()
-            .or_else(|| orch.get_identity())
-        {
+            .or_else(|| orch.get_identity());
+
+        // The Cairn-managed Claude profile, when the identity carries one. It is
+        // also where the CLI keeps the conversation a resume replays, so the
+        // transcript repair below needs the same path.
+        let claude_config_dir = identity.as_ref().and_then(|user| match &user.claude_auth {
+            Some(crate::identity::ClaudeAuth::ConfigDir(path)) => Some(path.clone()),
+            _ => None,
+        });
+
+        if let Some(user) = identity {
             spawn_config = spawn_config
                 .env("GIT_AUTHOR_NAME", &user.name)
                 .env("GIT_AUTHOR_EMAIL", &user.email)
@@ -1043,13 +1134,31 @@ impl AgentBackend for ClaudeBackend {
                     log::info!("Setting ANTHROPIC_API_KEY (len={})", key.len());
                     spawn_config = spawn_config.env("ANTHROPIC_API_KEY", key);
                 }
-                None => {} // Use ambient auth (local claude login)
+                Some(crate::identity::ClaudeAuth::ConfigDir(path)) => {
+                    crate::identity::claude_profile::provision_profile(path)?;
+                    spawn_config =
+                        spawn_config.env("CLAUDE_CONFIG_DIR", path.to_string_lossy().as_ref());
+                }
+                None => {} // No configured Claude authentication
             }
 
             log::info!(
                 "Injected user identity into session: {} <{}>",
                 user.name,
                 user.email
+            );
+        }
+
+        // A resume hands the CLI its own persisted conversation to replay, and a
+        // single content block the API rejects there kills the session for good:
+        // every later resume, including a well-formed operator message, fails
+        // with the same 400 (CAIRN-3263). Repair it now, while no CLI process
+        // holds the file open.
+        if let Some(backend_id) = config.session_start.replayed_backend_id() {
+            super::claude_transcript::repair_before_resume(
+                claude_config_dir.as_deref(),
+                std::path::Path::new(&config.working_dir),
+                backend_id,
             );
         }
 
@@ -1086,17 +1195,10 @@ impl AgentBackend for ClaudeBackend {
         let confirm_backend_id_after_init =
             should_confirm_backend_id_after_init(&config.session_start);
 
-        // Spawn thread to log stderr
-        if let Some(stderr) = stderr {
-            thread::spawn(move || {
-                log::debug!("stderr_thread: started");
-                for line in stderr.lines().map_while(Result::ok) {
-                    log::debug!("claude stderr: {}", line);
-                    log::error!("claude stderr: {}", line);
-                }
-                log::debug!("stderr_thread: ended");
-            });
-        }
+        // Drain stderr on its own thread, keeping a joinable handle so the
+        // reader thread can read any typed failure it classified before
+        // deciding what stdout EOF meant.
+        let stderr_watch = stderr.map(StderrWatch::spawn);
 
         // Store the process handle with stdin for bidirectional communication
         let child_arc = Arc::new(Mutex::new(Some(child)));
@@ -1107,11 +1209,6 @@ impl AgentBackend for ClaudeBackend {
             run_job_id(CLAUDE_BACKEND_NAME, &run_db, &config.run_id);
 
         {
-            let mut processes = orch
-                .process_state
-                .processes
-                .lock()
-                .map_err(|e| e.to_string())?;
             let mut active_process = crate::agent_process::process::ActiveProcess::new(
                 child_arc.clone(),
                 stdin_arc.clone(),
@@ -1119,18 +1216,16 @@ impl AgentBackend for ClaudeBackend {
                 process_job_id,
             );
             active_process.model = effective_model.clone();
-            processes.register(config.run_id.clone(), active_process);
+            orch.process_state
+                .register_process(config.run_id.clone(), active_process)?;
         }
 
         // In bidirectional mode, send the initial prompt via stdin
         if args_config.bidirectional {
             let mut stdin_guard = stdin_arc.lock().map_err(|e| e.to_string())?;
             if let Some(ref mut stdin_writer) = *stdin_guard {
-                let content = crate::agent_process::stdin::build_message_content(
-                    &config.prompt,
-                    Some(&config.working_dir),
-                    None,
-                );
+                let content =
+                    crate::agent_process::stdin::build_message_content(&config.message_content)?;
 
                 let initial_message = serde_json::json!({
                     "type": "user",
@@ -1166,8 +1261,8 @@ impl AgentBackend for ClaudeBackend {
                 &run_id,
                 thread_session_id,
                 confirm_backend_id_after_init,
-                initial_sequence,
                 stdout,
+                stderr_watch,
                 run_db,
             );
         });
@@ -1201,18 +1296,16 @@ impl AgentBackend for ClaudeBackend {
     fn send_user_message(
         &self,
         stdin: &mut dyn crate::agent_process::process::BackendStdin,
-        content: &str,
+        content: &crate::agent_process::stdin::MessageContent,
         session_id: &str,
         parent_tool_use_id: Option<&str>,
-        working_dir: Option<&str>,
+        _working_dir: Option<&str>,
     ) -> Result<(), String> {
-        crate::agent_process::stdin::send_user_message_with_images(
+        crate::agent_process::stdin::send_user_message(
             stdin,
             session_id,
             content,
             parent_tool_use_id,
-            working_dir,
-            None,
         )
     }
 
@@ -1355,14 +1448,14 @@ impl ClaudeBackend {
         run_id: &str,
         session_id: Option<String>,
         confirm_backend_id_after_init: bool,
-        initial_sequence: i32,
         stdout: Box<dyn std::io::BufRead + Send>,
+        stderr_watch: Option<StderrWatch>,
         run_db: Arc<LocalDb>,
     ) {
         log::debug!("reader_thread: started");
         let thread_start = std::time::Instant::now();
         log::debug!("[PROFILE] Reader thread started");
-        let mut sequence = initial_sequence;
+        let mut lines_read: u64 = 0;
         let mut first_event_logged = false;
         let mut boundary_checker = TurnBoundaryChecker::new();
         let mut terminal_tool_suspended = false;
@@ -1402,10 +1495,11 @@ impl ClaudeBackend {
         for line_result in stdout.lines() {
             let line = match line_result {
                 Ok(l) => {
+                    lines_read += 1;
                     if !l.contains("\"type\":\"stream_event\"") {
                         log::trace!(
                             "reader_thread: line {}: {}",
-                            sequence,
+                            lines_read,
                             &l[..l.len().min(100)]
                         );
                     }
@@ -1534,9 +1628,22 @@ impl ClaudeBackend {
                             rate_limit_info.resets_at,
                             rate_limit_info.overage_resets_at,
                         );
-                        orch.store_provider_usage_snapshot(claude_rate_limit_snapshot(
-                            rate_limit_info,
-                        ));
+                        let snapshot = claude_rate_limit_snapshot(rate_limit_info);
+                        orch.store_provider_usage_snapshot(snapshot.clone());
+                        if rate_limit_info.is_blocking() {
+                            if let Ok(Some(target)) = rate_limit_retry_target(&run_db, run_id) {
+                                let blocked_until = rate_limit_info
+                                    .resets_at
+                                    .or(rate_limit_info.overage_resets_at);
+                                if let Err(error) = orch.mark_account_blocked(
+                                    &target.account_id,
+                                    snapshot.windows,
+                                    blocked_until,
+                                ) {
+                                    log::warn!("Failed to record Claude account block: {error}");
+                                }
+                            }
+                        }
                         continue;
                     }
                     if let ClaudeEvent::System { subtype, data, .. } = &event {
@@ -1589,25 +1696,22 @@ impl ClaudeBackend {
                             // stream (CAIRN-1611). The `message_delta` that would
                             // normally finalize it is one of the events this guard
                             // skips, so flush here or the tool-call event is lost.
-                            if flush_pending_assistant_before_suppress(
+                            flush_pending_assistant_before_suppress(
                                 orch,
                                 &run_db,
                                 run_id,
                                 session_id.as_deref(),
-                                sequence,
                                 &mut streaming_state,
                                 &mut pending_final_assistant_event,
                                 pending_delta_usage.as_ref(),
-                            ) {
-                                sequence += 1;
-                            }
+                            );
                             continue;
                         }
                         match inner {
                             StreamEventInner::MessageStart { .. } => {
                                 if streaming_state.is_some() {
                                     log::warn!("New MessageStart while a stream is still active");
-                                    if finalize_streaming_message(
+                                    finalize_streaming_message(
                                         orch,
                                         &run_db,
                                         run_id,
@@ -1617,9 +1721,7 @@ impl ClaudeBackend {
                                         TokenCounts::from_optional_usage(
                                             pending_delta_usage.as_ref(),
                                         ),
-                                    ) {
-                                        sequence += 1;
-                                    }
+                                    );
                                 }
                                 pending_delta_usage = None;
                                 last_thinking_tokens = pending_thinking_tokens.take();
@@ -1630,7 +1732,6 @@ impl ClaudeBackend {
                                     session_id.as_deref(),
                                     current_turn.as_deref(),
                                     "claude",
-                                    Some(sequence),
                                 ) {
                                     Ok(stream) => {
                                         let mut new_state = StreamingState::new(&stream);
@@ -1772,7 +1873,8 @@ impl ClaudeBackend {
                                     TokenCounts::from_optional_usage(pending_delta_usage.as_ref());
                                 if pending_final_assistant_event.is_some()
                                     && streaming_state.is_some()
-                                    && finalize_streaming_message(
+                                {
+                                    finalize_streaming_message(
                                         orch,
                                         &run_db,
                                         run_id,
@@ -1780,9 +1882,7 @@ impl ClaudeBackend {
                                         &mut streaming_state,
                                         pending_final_assistant_event.take(),
                                         counts,
-                                    )
-                                {
-                                    sequence += 1;
+                                    );
                                 }
                             }
                             _ => {}
@@ -1805,18 +1905,15 @@ impl ClaudeBackend {
                         // stream (CAIRN-1611). The flush takes the paired stream
                         // when it commits, so the abort below only fires for an
                         // orphaned post-boundary placeholder with no real message.
-                        if flush_pending_assistant_before_suppress(
+                        flush_pending_assistant_before_suppress(
                             orch,
                             &run_db,
                             run_id,
                             session_id.as_deref(),
-                            sequence,
                             &mut streaming_state,
                             &mut pending_final_assistant_event,
                             pending_delta_usage.as_ref(),
-                        ) {
-                            sequence += 1;
-                        }
+                        );
                         // Delete any streaming placeholder that started after the flag.
                         if let Some(state) = streaming_state.take() {
                             let _ = abort_stream(
@@ -1835,7 +1932,6 @@ impl ClaudeBackend {
                                 ),
                             );
                         }
-                        sequence += 1;
                         continue;
                     }
 
@@ -1878,13 +1974,12 @@ impl ClaudeBackend {
                                 );
                             }
                         }
-                        sequence += 1;
                         continue;
                     }
 
                     // Finalize streaming placeholder before Result event
-                    if matches!(&event, ClaudeEvent::Result { .. })
-                        && finalize_streaming_message(
+                    if matches!(&event, ClaudeEvent::Result { .. }) {
+                        finalize_streaming_message(
                             orch,
                             &run_db,
                             run_id,
@@ -1892,9 +1987,7 @@ impl ClaudeBackend {
                             &mut streaming_state,
                             pending_final_assistant_event.take(),
                             TokenCounts::from_optional_usage(pending_delta_usage.as_ref()),
-                        )
-                    {
-                        sequence += 1;
+                        );
                     }
 
                     let transcript_event = TranscriptEvent::from_claude_event(&event, raw.clone());
@@ -1935,7 +2028,7 @@ impl ClaudeBackend {
                         }
                         let counts = TokenCounts::from_optional_usage(pending_delta_usage.as_ref());
                         if pending_delta_usage.is_some() {
-                            if finalize_streaming_message(
+                            finalize_streaming_message(
                                 orch,
                                 &run_db,
                                 run_id,
@@ -1943,9 +2036,7 @@ impl ClaudeBackend {
                                 &mut streaming_state,
                                 Some(transcript_event.clone()),
                                 counts,
-                            ) {
-                                sequence += 1;
-                            }
+                            );
                         } else {
                             // claude-code can emit a second consolidated assistant
                             // event before the trailing message_delta (a batched
@@ -1989,18 +2080,15 @@ impl ClaudeBackend {
                         // deferred finalization (its `message_delta` never arrived
                         // before the abort). Commit it before discarding the
                         // interrupt-notice stream (CAIRN-1611).
-                        if flush_pending_assistant_before_suppress(
+                        flush_pending_assistant_before_suppress(
                             orch,
                             &run_db,
                             run_id,
                             session_id.as_deref(),
-                            sequence,
                             &mut streaming_state,
                             &mut pending_final_assistant_event,
                             pending_delta_usage.as_ref(),
-                        ) {
-                            sequence += 1;
-                        }
+                        );
                         if let Some(state) = streaming_state.take() {
                             let _ = abort_stream(
                                 run_db.clone(),
@@ -2018,7 +2106,6 @@ impl ClaudeBackend {
                                 ),
                             );
                         }
-                        sequence += 1;
                         continue;
                     }
 
@@ -2052,7 +2139,6 @@ impl ClaudeBackend {
                                 id: event_id.clone(),
                                 run_id: run_id.to_string(),
                                 session_id: session_id.clone(),
-                                sequence,
                                 timestamp: now,
                                 event_type: event_type.clone(),
                                 data: data.clone(),
@@ -2066,8 +2152,23 @@ impl ClaudeBackend {
                                 turn_id: current_turn.clone(),
                                 cost_usd: None,
                             },
-                        )
-                        .unwrap_or(false);
+                        );
+                        let inserted = match inserted {
+                            Ok(inserted) => inserted,
+                            Err(error) => {
+                                // A dropped transcript write is silent data loss:
+                                // the event never reaches the chat, the digest, or
+                                // replay. Surface it rather than folding it into a
+                                // "nothing inserted" bool (CAIRN-3290).
+                                log::error!(
+                                    "Failed to store {} event for run {}: {}",
+                                    event_type,
+                                    &run_id[..run_id.len().min(8)],
+                                    error
+                                );
+                                false
+                            }
+                        };
 
                         if inserted {
                             // Embed events for vibe coloring (agent content) and
@@ -2252,8 +2353,6 @@ impl ClaudeBackend {
                             }),
                         );
                     }
-
-                    sequence += 1;
                 }
                 Err(e) => {
                     log::warn!("Failed to parse event: {} - line: {}", e, line);
@@ -2262,7 +2361,7 @@ impl ClaudeBackend {
         }
 
         // Finalize any remaining durable stream on EOF
-        let _ = finalize_streaming_message(
+        finalize_streaming_message(
             orch,
             &run_db,
             run_id,
@@ -2272,7 +2371,7 @@ impl ClaudeBackend {
             TokenCounts::from_optional_usage(pending_delta_usage.as_ref()),
         );
 
-        log::debug!("reader_thread: loop ended after {} lines", sequence);
+        log::debug!("reader_thread: loop ended after {} lines", lines_read);
 
         // Stdout closed - process has terminated.
         //
@@ -2289,6 +2388,10 @@ impl ClaudeBackend {
         let run_status_val = run_status(CLAUDE_BACKEND_NAME, &run_db, run_id);
         let terminal_tool_called = terminal_tool_flag.load(std::sync::atomic::Ordering::Acquire);
         let task_spawned = is_task_spawned_run(CLAUDE_BACKEND_NAME, &run_db, run_id);
+        // Settle the stderr drain BEFORE classifying, so a diagnosis the process
+        // printed on its way out (e.g. an unresolvable resume handle) is
+        // available to every arm rather than racing this thread's exit.
+        let backend_failure = stderr_watch.and_then(StderrWatch::settle);
 
         match classify_eof(
             was_warm,
@@ -2323,12 +2426,111 @@ impl ClaudeBackend {
                      saw_blocking_rate_limit={saw_blocking_rate_limit} run_status={run_status_val:?}"
                 );
 
+                if saw_blocking_rate_limit {
+                    if let Ok(Some(target)) = rate_limit_retry_target(&run_db, run_id) {
+                        if let Some((replacement_id, _)) = orch.select_claude_identity(
+                            target.project_id.as_deref(),
+                            None,
+                            Some(&target.account_id),
+                        ) {
+                            let old_label = orch
+                                .list_accounts(target.project_id.as_deref())
+                                .into_iter()
+                                .find(|account| account.id == target.account_id)
+                                .map(|account| account.label)
+                                .unwrap_or_else(|| target.account_id.clone());
+                            let new_label = orch
+                                .list_accounts(target.project_id.as_deref())
+                                .into_iter()
+                                .find(|account| account.id == replacement_id)
+                                .map(|account| account.label)
+                                .unwrap_or_else(|| replacement_id.clone());
+                            let repinned = crate::storage::run_db_blocking({
+                                let db = run_db.clone();
+                                let session_id = target.session_id.clone();
+                                let replacement_id = replacement_id.clone();
+                                move || async move {
+                                    crate::sessions::queries::set_account_id(
+                                        &db,
+                                        &session_id,
+                                        &replacement_id,
+                                    )
+                                    .await
+                                }
+                            });
+                            if repinned.is_ok() {
+                                // Remove the exhausted process before launching its immediate successor.
+                                if let Ok(mut processes) = orch.process_state.processes.lock() {
+                                    processes.remove(run_id);
+                                }
+                                crate::orchestrator::lifecycle::fail_run(
+                                    orch,
+                                    run_id,
+                                    "rate_limit_switch",
+                                );
+                                if let Ok(Some(retry_turn_id)) =
+                                    crate::execution::jobs::claim_retry_successor_if_head_matches(
+                                        orch,
+                                        run_db.clone(),
+                                        &target.job_id,
+                                        &target.session_id,
+                                        &target.turn_id,
+                                    )
+                                {
+                                    let message = format!("Rate limit reached on {old_label}. Continuing on {new_label}.");
+                                    let _ = crate::messages::transcript::insert_system_message_sync(
+                                        orch,
+                                        run_id,
+                                        session_id.as_deref(),
+                                        Some(&target.turn_id),
+                                        &message,
+                                        serde_json::json!({"provider":"claude","kind":"rate_limit_account_switch","fromAccountId":target.account_id,"toAccountId":replacement_id}),
+                                    );
+                                    if let Err(error) =
+                                        crate::execution::jobs::continue_automatic_retry(
+                                            orch,
+                                            &target.job_id,
+                                            &retry_turn_id,
+                                        )
+                                    {
+                                        log::warn!(
+                                            "Claude account failover retry did not launch: {error}"
+                                        );
+                                        let _ = crate::execution::jobs::abandon_pending_retry_if_head_matches(run_db.clone(), &target.job_id, &retry_turn_id);
+                                    }
+                                    return;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 let error_message = if saw_blocking_rate_limit {
                     "Process exited after the account rate limit was reached, before completing the turn. The turn is interrupted and resumable once the limit resets."
+                } else if backend_failure == Some(BackendFailure::SessionUnresolvable) {
+                    // Deliberately descriptive rather than promissory: the
+                    // digest-reseed fallback in `finalize_run` may decline (an
+                    // already-attempted session, an active head turn), so this
+                    // text must not guarantee a recovery.
+                    "The provider could not resolve this session's conversation handle, so the resume produced no output. Cairn's own transcript is intact."
                 } else {
                     "Process terminated unexpectedly without completing"
                 };
                 insert_error_event(orch, run_id, session_id.as_deref(), error_message);
+
+                // Record the typed diagnosis on the run before finalizing, so
+                // the lifecycle reaction reads a durable fact off `runs` rather
+                // than re-parsing provider text. Mirrors `fail_run`'s ordering.
+                if let Some(failure) = backend_failure {
+                    if let Err(e) = crate::orchestrator::lifecycle::set_exit_reason(
+                        orch,
+                        run_id,
+                        failure.exit_reason(),
+                    ) {
+                        log::warn!("Failed to record exit reason for run {}: {}", run_id, e);
+                    }
+                }
 
                 crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Crashed);
             }
@@ -2343,6 +2545,83 @@ impl ClaudeBackend {
                 &run_id[..run_id.len().min(8)]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stderr_failure_tests {
+    use super::{classify_stderr_failure, BackendFailure, StderrWatch};
+
+    fn watch_over(lines: &str) -> Option<BackendFailure> {
+        StderrWatch::spawn(Box::new(std::io::Cursor::new(lines.to_string()))).settle()
+    }
+
+    #[test]
+    fn settle_reports_a_diagnosis_the_process_printed_before_exiting() {
+        // The join in `settle` is what makes this deterministic: without it the
+        // reader thread could classify EOF before the drain recorded the line.
+        assert_eq!(
+            watch_over(
+                "(node:1) ExperimentalWarning: stream/web\n\
+                 No conversation found with session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"
+            ),
+            Some(BackendFailure::SessionUnresolvable)
+        );
+    }
+
+    #[test]
+    fn settle_reports_nothing_for_a_silent_or_ordinary_exit() {
+        assert_eq!(watch_over(""), None);
+        assert_eq!(watch_over("some unrelated warning\nand another"), None);
+    }
+
+    /// CAIRN-3104: the stderr drain must be settled BEFORE the EOF verdict is
+    /// classified, so every arm sees a diagnosis the process printed on its way
+    /// out. Guarded structurally because the ordering is load-bearing and
+    /// hoisting the settle below the match would silently reintroduce the race
+    /// between the drain and this thread's exit.
+    #[test]
+    fn the_stderr_drain_is_settled_before_the_eof_verdict() {
+        const SOURCE: &str = include_str!("claude.rs");
+        let start = SOURCE
+            .find("fn reader_thread")
+            .expect("reader_thread present in source");
+        let body = &SOURCE[start..];
+        let settle = body
+            .find("StderrWatch::settle")
+            .expect("stderr settle call present");
+        let classify = body
+            .find("match classify_eof(")
+            .expect("classify_eof dispatch present");
+        assert!(
+            settle < classify,
+            "reader_thread: the stderr drain must settle before classify_eof (CAIRN-3104)"
+        );
+    }
+
+    #[test]
+    fn the_cli_resume_miss_classifies_as_session_unresolvable() {
+        // Verbatim from the runner log that opened CAIRN-3104.
+        assert_eq!(
+            classify_stderr_failure(
+                "No conversation found with session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"
+            ),
+            Some(BackendFailure::SessionUnresolvable)
+        );
+    }
+
+    #[test]
+    fn ordinary_stderr_classifies_as_nothing() {
+        assert_eq!(classify_stderr_failure(""), None);
+        assert_eq!(
+            classify_stderr_failure("(node:12345) ExperimentalWarning: stream/web is experimental"),
+            None
+        );
+        // Merely naming a session is not this failure.
+        assert_eq!(
+            classify_stderr_failure("Resuming session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"),
+            None
+        );
     }
 }
 
@@ -2428,8 +2707,11 @@ mod terminal_tool_tests {
 /// host-interrupt guard suppresses the in-flight stream.
 #[cfg(test)]
 mod flush_pending_tests {
-    use super::{flush_pending_assistant_before_suppress, merge_pending_assistant, StreamingState};
-    use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
+    use super::{
+        claude_event_kind, flush_pending_assistant_before_suppress, merge_pending_assistant,
+        ClaudeBackend, StreamingState,
+    };
+    use crate::agent_process::stream::{parse_event, ToolUseInfo, TranscriptEvent};
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
@@ -2528,6 +2810,15 @@ mod flush_pending_tests {
         }
     }
 
+    async fn count_events(orch: &Orchestrator, run_id: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM events WHERE run_id = '{run_id}'");
+        orch.db
+            .local
+            .query_one(sql.as_str(), (), |row| row.i64(0))
+            .await
+            .unwrap()
+    }
+
     async fn count_assistant_with_tooluse(
         orch: &Orchestrator,
         run_id: &str,
@@ -2545,6 +2836,120 @@ mod flush_pending_tests {
             .unwrap()
     }
 
+    /// Every persisted sequence for a run, in ascending order.
+    async fn sequences(orch: &Orchestrator, run_id: &str) -> Vec<i64> {
+        let sql =
+            format!("SELECT sequence FROM events WHERE run_id = '{run_id}' ORDER BY sequence ASC");
+        orch.db
+            .local
+            .query_all(sql, (), |row| row.i64(0))
+            .await
+            .unwrap()
+    }
+
+    /// One streamed, tool-using turn in the wire order that produced CAIRN-3290.
+    ///
+    /// The consolidated `assistant` event arrives BEFORE its trailing
+    /// `message_delta` (the order Opus-class models emit), so it parks; the
+    /// `tool_result` for its tool call then lands while the stream row is still
+    /// open holding a reserved slot. That interleaving is what made the old
+    /// counter hand the same number to two events and skip the next.
+    fn streamed_tool_turn_fixture() -> String {
+        [
+            r#"{"type":"system","subtype":"init","session_id":"session-1","cwd":"/tmp","model":"claude-opus-4","tools":[]}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"msg_01","role":"assistant","model":"claude-opus-4"}}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Reading the file."}}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"mcp__cairn__read","input":{}}}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"paths\":[\"file:src/lib.rs\"]}"}}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_stop","index":1}}"#,
+            r#"{"type":"assistant","uuid":"evt-assistant","session_id":"session-1","message":{"role":"assistant","content":[{"type":"text","text":"Reading the file."},{"type":"tool_use","id":"toolu_01","name":"mcp__cairn__read","input":{"paths":["file:src/lib.rs"]}}]}}"#,
+            r#"{"type":"user","uuid":"evt-tool-result","session_id":"session-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"pub fn main() {}"}]}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"stream_event","session_id":"session-1","event":{"type":"message_stop"}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"session-1","is_error":false,"duration_ms":1200,"num_turns":1,"total_cost_usd":0.01,"usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#,
+        ]
+        .join("\n")
+    }
+
+    /// The fixture must keep exercising the branches it claims to. If the wire
+    /// shapes drift, this fails loudly rather than letting the regression test
+    /// silently run over a stream of `Unknown`.
+    #[test]
+    fn fixture_parses_into_the_branches_under_test() {
+        let kinds: Vec<&'static str> = streamed_tool_turn_fixture()
+            .lines()
+            .map(|line| claude_event_kind(&parse_event(line).expect("fixture line parses").0))
+            .collect();
+        assert!(!kinds.contains(&"unknown"));
+        assert_eq!(kinds.first().copied(), Some("system"));
+        assert_eq!(kinds.last().copied(), Some("result"));
+        assert!(kinds.contains(&"assistant"));
+        assert!(kinds.contains(&"user"));
+        assert!(kinds.contains(&"stream_event"));
+    }
+
+    /// CAIRN-3290: the persisted transcript for one streamed tool turn carries
+    /// each sequence exactly once, with no gap.
+    #[tokio::test]
+    async fn reader_thread_persists_each_sequence_exactly_once() {
+        let orch = build_orch(test_db().await);
+        insert_run(&orch, "run-reader").await;
+
+        let orch_thread = orch.clone();
+        let run_db = orch.db.local.clone();
+        let emitter = orch.services.emitter.clone();
+        let stdout = Box::new(std::io::Cursor::new(
+            streamed_tool_turn_fixture().into_bytes(),
+        ));
+        std::thread::spawn(move || {
+            ClaudeBackend::reader_thread(
+                &orch_thread,
+                &emitter,
+                "run-reader",
+                Some("session-1".to_string()),
+                false,
+                stdout,
+                None,
+                run_db,
+            );
+        })
+        .join()
+        .unwrap();
+
+        let sequences = sequences(&orch, "run-reader").await;
+        assert_eq!(
+            sequences,
+            (0..sequences.len() as i64).collect::<Vec<_>>(),
+            "sequences must be exactly 0..n — no duplicate, no gap"
+        );
+
+        // The turn's four durable events: the init notice, the assistant message
+        // that issued the tool call, its result, and the terminal result.
+        let types = orch
+            .db
+            .local
+            .query_all(
+                "SELECT event_type FROM events WHERE run_id = 'run-reader' ORDER BY sequence ASC",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            types,
+            vec![
+                "system:init".to_string(),
+                "assistant".to_string(),
+                "tool_result".to_string(),
+                "result:success".to_string(),
+            ],
+            "the assistant message sorts where it STARTED streaming, ahead of the \
+             tool_result that arrived before its trailing message_delta"
+        );
+    }
+
     #[tokio::test]
     async fn flush_commits_pending_assistant_paired_with_stream() {
         let orch = build_orch(test_db().await);
@@ -2555,24 +2960,21 @@ mod flush_pending_tests {
             Some("session-1"),
             None,
             "claude",
-            Some(0),
         )
         .unwrap();
         let mut streaming_state = Some(StreamingState::new(&opened));
         let mut pending = Some(write_tool_assistant("toolu_paired"));
 
-        let committed = flush_pending_assistant_before_suppress(
+        flush_pending_assistant_before_suppress(
             &orch,
             &orch.db.local,
             "run-paired",
             Some("session-1"),
-            0,
             &mut streaming_state,
             &mut pending,
             None,
         );
 
-        assert!(committed, "a paired pending assistant should commit");
         assert!(pending.is_none(), "pending must be cleared after commit");
         assert!(
             streaming_state.is_none(),
@@ -2592,21 +2994,16 @@ mod flush_pending_tests {
         let mut streaming_state: Option<StreamingState> = None;
         let mut pending = Some(write_tool_assistant("toolu_orphan"));
 
-        let committed = flush_pending_assistant_before_suppress(
+        flush_pending_assistant_before_suppress(
             &orch,
             &orch.db.local,
             "run-orphan",
             Some("session-1"),
-            7,
             &mut streaming_state,
             &mut pending,
             None,
         );
 
-        assert!(
-            committed,
-            "defensive insert must commit the orphaned message"
-        );
         assert!(pending.is_none(), "pending must be cleared after insert");
         assert_eq!(
             count_assistant_with_tooluse(&orch, "run-orphan", "toolu_orphan").await,
@@ -2622,18 +3019,21 @@ mod flush_pending_tests {
         let mut streaming_state: Option<StreamingState> = None;
         let mut pending: Option<TranscriptEvent> = None;
 
-        let committed = flush_pending_assistant_before_suppress(
+        flush_pending_assistant_before_suppress(
             &orch,
             &orch.db.local,
             "run-empty",
             Some("session-1"),
-            0,
             &mut streaming_state,
             &mut pending,
             None,
         );
 
-        assert!(!committed, "no pending message means nothing to commit");
+        assert_eq!(
+            count_events(&orch, "run-empty").await,
+            0,
+            "no pending message means nothing is written"
+        );
     }
 
     // CAIRN-2249: a batched multi-tool turn arrives as two consolidated
@@ -2715,7 +3115,6 @@ mod flush_pending_tests {
             Some("session-1"),
             None,
             "claude",
-            Some(0),
         )
         .unwrap();
         let mut streaming_state = Some(StreamingState::new(&opened));
@@ -2728,18 +3127,16 @@ mod flush_pending_tests {
             None => pending = Some(write_event.clone()),
         }
 
-        let committed = flush_pending_assistant_before_suppress(
+        flush_pending_assistant_before_suppress(
             &orch,
             &orch.db.local,
             "run-merge",
             Some("session-1"),
-            0,
             &mut streaming_state,
             &mut pending,
             None,
         );
 
-        assert!(committed, "the merged pending assistant should commit");
         assert_eq!(
             count_assistant_with_tooluse(&orch, "run-merge", "toolu_read").await,
             1,

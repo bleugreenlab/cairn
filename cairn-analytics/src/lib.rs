@@ -29,16 +29,19 @@ pub use cost::{
 pub use economics::{
     issue_lead_times, merged_pr_cost_trend, merged_pr_economics, model_role_economics,
 };
-pub use tokens::{avg_tokens_per_session, token_composition_timeseries, tokens_per_loc};
+pub use tokens::{
+    avg_tokens_per_session, token_composition_timeseries, tokens_by_model_timeseries,
+    tokens_per_loc,
+};
 pub use tools::{
     avg_tool_calls_per_session, command_durations, session_durations, target_breakdown,
     time_composition, tool_error_rate, tool_mix, tool_time_mix, usage_heatmap,
 };
 pub use types::{
     BackendCostPoint, Bucket, CommandDurationRow, CostPoint, EconomicsRow, EffectiveCostPoint,
-    HeatmapCell, IssueLeadTimePoint, MergedPrEconomics, ModelRoleEconomics, PrCostTrendPoint,
-    PrEconomicsRow, ProjectCost, Scope, SessionDurationPoint, TargetBreakdown, TargetShapeRow,
-    TimeCompositionPoint, TimeRange, TokenCompositionPoint, TokensPerLocPoint,
+    HeatmapCell, IssueLeadTimePoint, MergedPrEconomics, ModelRoleEconomics, ModelTokenPoint,
+    PrCostTrendPoint, PrEconomicsRow, ProjectCost, Scope, SessionDurationPoint, TargetBreakdown,
+    TargetShapeRow, TimeCompositionPoint, TimeRange, TokenCompositionPoint, TokensPerLocPoint,
     TokensPerSessionPoint, ToolBackfillSummary, ToolCallsPerSessionPoint, ToolErrorRatePoint,
     ToolMixPoint, ToolTimeMixPoint, TopTargetRow,
 };

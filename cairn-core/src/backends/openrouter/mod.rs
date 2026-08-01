@@ -4,16 +4,13 @@
 //! turn/tool loop for this backend so models receive Cairn's direct read/write/run
 //! tools instead of Codex/Claude host tools. The generic turn/tool driver lives
 //! in `backends/http_loop`; this module is its OpenRouter adapter (`adapter.rs`)
-//! plus the OpenRouter wire submodules the adapter owns (`wire`, `http`,
-//! `conversation`, `context`).
+//! plus its provider-specific request construction. The shared protocol lives in
+//! `backends/openai_compat`.
 
 mod adapter;
-mod context;
-mod conversation;
 mod http;
 mod models;
 mod usage;
-mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -124,7 +121,7 @@ impl AgentBackend for OpenRouterBackend {
     fn send_user_message(
         &self,
         _stdin: &mut dyn BackendStdin,
-        _content: &str,
+        _content: &crate::agent_process::stdin::MessageContent,
         _session_id: &str,
         _parent_tool_use_id: Option<&str>,
         _working_dir: Option<&str>,

@@ -6,6 +6,28 @@
 use super::specs::*;
 use super::types::*;
 
+pub(crate) const PROJECT_IMAGE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectImage,
+    uri_template: "cairn://p/{project}/{issue}/images/{n}",
+    name: "Project image",
+    description: "Immutable stored image returned as one native image block; also addressable project-wide (cairn://p/{project}/images/{n}) and, for images stored before scoped addresses existed, by content hash",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const PROJECT_IMAGES_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectImages,
+    uri_template: "cairn://p/{project}/{issue}/images",
+    name: "Issue images",
+    description: "Every image minted in this scope, in ordinal order. An image address ends in its ordinal here, so you may construct a sibling's URI directly (images/4) instead of looking it up; ordinals are stable and never reused. Also addressable project-wide (cairn://p/{project}/images)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const PROJECT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Project,
     uri_template: "cairn://p/{project}",
@@ -115,7 +137,7 @@ pub(crate) const PROJECT_SETTINGS_CONTRACT: ResourceContract =
             optional: &[
                 PS_SETUP_COMMANDS,
                 PS_TERMINAL_COMMANDS,
-                PS_WORKTREE_POPULATE,
+                PS_MATERIALIZATION_POPULATE,
                 PROJECT_DEFAULT_BRANCH,
                 PS_ACCOUNT_OVERRIDES,
                 PS_REFERENCES,
@@ -125,6 +147,42 @@ pub(crate) const PROJECT_SETTINGS_CONTRACT: ResourceContract =
             example: "write({changes:[{target:\"cairn://p/PROJECT/settings\",mode:\"patch\",payload:{setupCommands:[\"bun install\"]}}]})",
         }],
     };
+
+pub(crate) const PROJECT_CHECK_RESULTS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectCheckResults,
+    uri_template: "cairn://p/{project}/check-results/{commit}",
+    name: "Project check results",
+    description: "Immutable check observations for an exact commit, suite, and environment fingerprint (read-only)",
+    read_projections: &[
+        ProjectionSpec {
+            key: "suite",
+            values: "required check suite name",
+        },
+        ProjectionSpec {
+            key: "environment",
+            values: "required exact fingerprint, or current for the local runner",
+        },
+        ProjectionSpec {
+            key: "status",
+            values: "passed|failed|skipped — optional exact test-status filter",
+        },
+        ProjectionSpec {
+            key: "name",
+            values: "optional case-sensitive substring of the test name",
+        },
+        ProjectionSpec {
+            key: "offset",
+            values: "non-negative test-row offset (default 0)",
+        },
+        ProjectionSpec {
+            key: "limit",
+            values: "test rows per page (default 100, maximum 1000)",
+        },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
 
 pub(crate) const PROJECT_ISSUES_CONTRACT: ResourceContract =
     ResourceContract {
@@ -247,7 +305,7 @@ pub(crate) const PROJECT_BROWSER_CONTRACT: ResourceContract =
         kind: ResourceKind::ProjectBrowser,
         uri_template: "cairn://p/{project}/browser/{slug}",
         name: "Project browser",
-        description: "Project-scoped shared browser pane (native webview). replace = go to a URL (sets the page; url required). create = open/ensure the pane (url optional). patch = drive it: navigate (url/navigate) or history/interaction (action: back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad; click/type/scroll take a selector, visible text, or a ?interactive handle). delete = close it. create/replace/patch are an idempotent ensure — they reuse the open pane (reopening it if closed) and never error on an existing slug. Read returns the live url/title/status plus current page content (paged via ?offset/?limit); ?screenshot for a native PNG, ?console/?network for captured runtime buffers, ?interactive for actionable elements as durable handles (e1..eN). Add ?return_content=true to a write to get the post-action page inline. The pane self-heals across an app restart.",
+        description: "Project-scoped shared browser pane (native webview). replace = go to a URL (sets the page; url required). create = open/ensure the pane (url optional). patch = drive it: navigate (url/navigate) or history/interaction (action: back|forward|reload|click|type|select|drag|scroll|waitFor|waitForNavigation|waitForLoad|clearData; click/type/select/scroll take a selector, visible text, or a ?interactive handle, and drag adds a toSelector/toText/toHandle destination). delete = close it. create/replace/patch are an idempotent ensure — they reuse the open pane (reopening it if closed) and never error on an existing slug. Read returns the live url/title/status plus current page content (paged via ?offset/?limit); ?screenshot for a native PNG, ?console/?network for captured runtime buffers, ?interactive for actionable elements as durable handles (e1..eN). Add ?return_content=true to a write to get the post-action page inline. The pane self-heals across an app restart.",
         read_projections: BROWSER_READ_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -277,6 +335,12 @@ pub(crate) const PROJECT_BROWSER_CONTRACT: ResourceContract =
                     BROWSER_HANDLE,
                     BROWSER_VALUE,
                     BROWSER_SUBMIT,
+                    BROWSER_TO_SELECTOR,
+                    BROWSER_TO_TEXT,
+                    BROWSER_TO_HANDLE,
+                    BROWSER_MODE,
+                    BROWSER_STEPS,
+                    BROWSER_DELAY_MS,
                     BROWSER_TO,
                     BROWSER_BY,
                     BROWSER_TIMEOUT_MS,

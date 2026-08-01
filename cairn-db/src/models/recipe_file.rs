@@ -8,10 +8,11 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::{
-    ActionNodeConfig, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, CheckpointNodeConfig,
-    ConditionErrorBehavior, ConditionNodeConfig, ConditionType, ConfirmPolicy, ContextNodeConfig,
-    EventFilter, NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType,
-    RecipeTrigger, ScheduleConfig, SchemaConfig, TriggerConfig, TriggerScope, WorktreeMode,
+    default_branch_targets, ActionNodeConfig, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig,
+    BranchMode, BranchTarget, CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig,
+    ConditionType, ConfirmPolicy, ContextNodeConfig, EventFilter, NodePosition, Recipe, RecipeEdge,
+    RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger, ScheduleConfig, SchemaConfig,
+    TriggerConfig, TriggerScope,
 };
 
 /// Generate a slug from a name (lowercase, hyphens, no special chars)
@@ -50,6 +51,12 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// serde skip helper: omit `branchTargets` when it is the implicit default, so a
+/// recipe file that never mentions it round-trips byte-identically.
+fn is_default_branch_targets(targets: &[BranchTarget]) -> bool {
+    targets == default_branch_targets()
+}
+
 /// Recipe file format for export/import
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +76,14 @@ pub struct RecipeFile {
     /// still listed in Settings. Only written to YAML when true.
     #[serde(default, skip_serializing_if = "is_false")]
     system: bool,
+    /// Branch targets this recipe's graph supports (`[new]` when absent). A
+    /// recipe declares `base` only when pruning its terminal `pr` node still
+    /// leaves a coherent workflow.
+    #[serde(
+        default = "default_branch_targets",
+        skip_serializing_if = "is_default_branch_targets"
+    )]
+    pub branch_targets: Vec<BranchTarget>,
     /// Legacy context field — read during deserialization for migration, never written.
     /// Value is migrated into the trigger node's scope during into_recipe().
     #[serde(default, skip_serializing)]
@@ -119,7 +134,7 @@ pub struct NodeFileConfig {
     pub agent: Option<String>,
     /// Worktree mode: "own" (default), "inherit", or "none"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worktree_mode: Option<WorktreeMode>,
+    pub branch_mode: Option<BranchMode>,
 
     // Action config
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,6 +284,7 @@ impl From<Recipe> for RecipeFile {
             bundles: Vec::new(),
             trigger: recipe.trigger,
             system: recipe.is_system,
+            branch_targets: recipe.branch_targets,
             context: None,
             nodes,
             edges,
@@ -313,10 +329,10 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
     if let Some(ac) = &node.agent_config {
         config.agent = ac.agent_config_id.clone();
         config.output_schema = ac.output_schema.clone();
-        // Export worktree_mode if non-default
+        // Export branch_mode if non-default
         if let Some(ref gc) = ac.git_config {
-            if gc.worktree_mode != WorktreeMode::Own {
-                config.worktree_mode = Some(gc.worktree_mode.clone());
+            if gc.branch_mode != BranchMode::Isolate {
+                config.branch_mode = Some(gc.branch_mode.clone());
             }
         }
         has_config = true;
@@ -445,6 +461,7 @@ impl RecipeFile {
             child_recipe_id: None,
             nodes,
             edges,
+            branch_targets: self.branch_targets,
             created_at: now,
             updated_at: now,
         }
@@ -530,7 +547,7 @@ impl RecipeFile {
                     ));
                 }
                 // Check inherit mode has a valid upstream agent
-                if let Some(WorktreeMode::Inherit) = &config.worktree_mode {
+                if let Some(BranchMode::Inherit) = &config.branch_mode {
                     // Find incoming control edges to this node
                     let has_agent_parent = self.edges.iter().any(|edge| {
                         let (target_node, _) = parse_node_handle(&edge.to);
@@ -548,7 +565,7 @@ impl RecipeFile {
                     });
                     if !has_agent_parent {
                         warnings.push(format!(
-                            "Node '{}' uses worktree_mode 'inherit' but has no upstream agent node - ensure it follows an agent with worktree_mode 'own'",
+                            "Node '{}' uses branch_mode 'inherit' but has no upstream agent node - ensure it follows an agent with branch_mode 'own'",
                             node.name
                         ));
                     }
@@ -665,6 +682,29 @@ impl RecipeFile {
             }
         }
 
+        // Declaring the `base` branch target means an execution may be launched
+        // with every `pr` node pruned from the snapshot. Pruning a node that
+        // still has downstream control would sever the DAG, so a recipe may only
+        // offer `base` when each of its PR nodes is control-terminal. Catch it
+        // here rather than producing a broken graph at launch.
+        if self.branch_targets.contains(&BranchTarget::Base) {
+            for node in &self.nodes {
+                if node.node_type != RecipeNodeType::Pr {
+                    continue;
+                }
+                let has_outgoing_control = self.edges.iter().any(|edge| {
+                    let (source_node, _) = parse_node_handle(&edge.from);
+                    source_node == node.id && edge.edge_type == RecipeEdgeType::Control
+                });
+                if has_outgoing_control {
+                    errors.push(format!(
+                        "Recipe declares branch target 'base' but PR node '{}' has an outgoing control edge; pruning it would sever the graph, so only a control-terminal PR node may be pruned",
+                        node.id
+                    ));
+                }
+            }
+        }
+
         RecipeFileValidation {
             valid: errors.is_empty(),
             warnings,
@@ -690,14 +730,18 @@ impl RecipeFileNode {
 
         let agent_config = if config.agent.is_some()
             || config.output_schema.is_some()
-            || config.worktree_mode.is_some()
+            || config.branch_mode.is_some()
         {
             // Only create agent config for agent nodes
             if self.node_type == RecipeNodeType::Agent {
-                // Build git_config when worktree_mode is specified
-                let git_config = if config.worktree_mode.is_some() {
+                // Build git_config when branch_mode is specified
+                let git_config = if config.branch_mode.is_some() {
                     Some(AgentGitConfig {
-                        worktree_mode: config.worktree_mode.clone().unwrap_or_default(),
+                        branch_mode: config.branch_mode.clone().unwrap_or_default(),
+                        // Authored recipes keep the degrading inherit ladder; the
+                        // strict grade is set by the delegation edge, which has
+                        // no recipe file.
+                        require_parent_head: false,
                     })
                 } else {
                     None
@@ -909,6 +953,7 @@ mod tests {
 
     fn make_test_recipe() -> Recipe {
         Recipe {
+            branch_targets: crate::models::default_branch_targets(),
             id: "test-recipe-id".to_string(),
             name: "Test Recipe".to_string(),
             description: Some("A test recipe".to_string()),
@@ -1065,6 +1110,7 @@ mod tests {
     #[test]
     fn test_validation_missing_trigger() {
         let file = RecipeFile {
+            branch_targets: crate::models::default_branch_targets(),
             cairn_version: 1,
             name: "No Trigger".to_string(),
             description: None,
@@ -1091,6 +1137,7 @@ mod tests {
     #[test]
     fn test_validation_invalid_edge_reference() {
         let file = RecipeFile {
+            branch_targets: crate::models::default_branch_targets(),
             cairn_version: 1,
             name: "Bad Edge".to_string(),
             description: None,
@@ -1256,6 +1303,7 @@ edges: []
     fn test_context_field_not_serialized() {
         // The context field should never appear in serialized YAML output
         let recipe = Recipe {
+            branch_targets: crate::models::default_branch_targets(),
             id: "r1".into(),
             name: "Test".into(),
             description: None,
@@ -1283,6 +1331,7 @@ edges: []
     #[test]
     fn test_context_node_roundtrip() {
         let recipe = Recipe {
+            branch_targets: crate::models::default_branch_targets(),
             id: "test-recipe".to_string(),
             name: "Context Test".to_string(),
             description: None,
@@ -1368,6 +1417,7 @@ edges: []
         // and must survive the RecipeFile YAML round-trip with both its content
         // and its `Instruction` node_type intact (distinct from a Context node).
         let recipe = Recipe {
+            branch_targets: crate::models::default_branch_targets(),
             id: "test-recipe".to_string(),
             name: "Instruction Test".to_string(),
             description: None,
@@ -1448,6 +1498,7 @@ edges: []
 
     fn make_trigger_recipe_with_filter(filter: Option<EventFilter>) -> RecipeFile {
         RecipeFile {
+            branch_targets: crate::models::default_branch_targets(),
             cairn_version: 1,
             name: "Test".to_string(),
             description: None,
@@ -1585,10 +1636,6 @@ edges: []
                 include_str!("../../../../recipes/coordinator.yaml"),
             ),
             (
-                "main-coordinator",
-                include_str!("../../../../recipes/main-coordinator.yaml"),
-            ),
-            (
                 "task-list",
                 include_str!("../../../../recipes/task-list.yaml"),
             ),
@@ -1613,9 +1660,9 @@ edges: []
     #[test]
     fn instruction_edge_to_non_agent_fails_validation() {
         // An Instruction node wired to a non-agent target (here a PR node) drops
-        // its text at runtime, so validation must reject it. The bundled
-        // Feature/Manager recipes, whose Instruction edges target the coordinator
-        // agent's context-in, still pass (bundled_recipes_parse_and_validate).
+        // its text at runtime, so validation must reject it. A bundled recipe
+        // whose Instruction edges target an agent's context-in still passes
+        // (bundled_recipes_parse_and_validate).
         let yaml = r#"
 cairnVersion: 1
 name: Bad Instruction
@@ -1704,54 +1751,38 @@ edges:
     }
 
     #[test]
-    fn coordinator_recipes_carry_mode_specific_instruction_framing() {
-        // The retired coordinator.md mode-blocks now live on each recipe's
-        // Instruction node, injected into the coordinator's system prompt. Feature
-        // framing speaks of the integration branch and never of the standing/idle
-        // endpoint; Manager framing is the inverse. This is the recipe-data-layer
-        // replacement for the deleted `coordinator_md_modes_do_not_blend`
-        // prompt-assembly test: separation is now guaranteed by the two recipes
-        // carrying different Instruction content, not by marker resolution.
-        fn instruction_content(yaml: &str) -> String {
-            let recipe = RecipeFile::from_yaml(yaml)
-                .unwrap()
-                .into_recipe(Some("default".to_string()), None);
-            recipe
+    fn coordinator_pr_node_carries_the_integration_branch_framing() {
+        // The single Coordinator recipe authors no Instruction node: the
+        // branch-specific framing rides on the PR node's input-schema
+        // description, which the prompt renders only when that node survives
+        // (the `new` branch target). Under `base` the node is pruned and the
+        // framing disappears with it, so the text must live here and nowhere
+        // else.
+        let parsed = RecipeFile::from_yaml(include_str!("../../../../recipes/coordinator.yaml"))
+            .expect("coordinator parses");
+        assert!(
+            !parsed
                 .nodes
                 .iter()
-                .find(|n| n.node_type == RecipeNodeType::Instruction)
-                .and_then(|n| n.context_config.as_ref())
-                .map(|c| c.content.clone())
-                .expect("recipe carries an Instruction node with content")
-        }
-
-        let feature = instruction_content(include_str!("../../../../recipes/coordinator.yaml"));
-        assert!(
-            feature.contains("integration branch"),
-            "Feature framing keeps the integration-branch endpoint"
-        );
-        assert!(
-            !feature.contains("closes your issue"),
-            "Feature framing drops the standing close condition"
-        );
-        assert!(
-            !feature.contains("settle idle"),
-            "Feature framing drops the idle framing"
+                .any(|n| n.node_type == RecipeNodeType::Instruction),
+            "framing is derived from topology, not authored on an Instruction node"
         );
 
-        let manager =
-            instruction_content(include_str!("../../../../recipes/main-coordinator.yaml"));
+        let description = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "pr-1")
+            .and_then(|n| n.config.as_ref())
+            .and_then(|c| c.input_schema.as_ref())
+            .and_then(|s| s.description.clone())
+            .expect("the PR node carries an input-schema description");
         assert!(
-            manager.contains("closes your issue"),
-            "Manager framing keeps the user-closes-issue endpoint"
+            description.contains("integration branch"),
+            "PR framing names the coordinator's branch as the integration branch"
         );
         assert!(
-            manager.contains("settle idle"),
-            "Manager framing keeps the idle framing"
-        );
-        assert!(
-            !manager.contains("integration branch"),
-            "Manager framing drops the feature-only integration-branch endpoint"
+            description.contains("gh pr create"),
+            "PR framing tells the coordinator the workflow opens the PR"
         );
     }
 
@@ -1985,64 +2016,54 @@ edges:
     }
 
     #[test]
-    fn main_coordinator_is_long_running_by_topology() {
-        // The standing main-coordinator has the exact topology the long-running
-        // derivation keys on (no node flag): no terminal action node, and a
-        // contract-less, control-terminal coordinator node. Children land their
-        // own PRs into the default branch, so the coordinator ships no PR of its
-        // own and never completes — it settles idle until the user closes the
-        // issue. cairn-db can't reach the cairn-core `is_long_running_node`
-        // helper, so this asserts the topological facts (a)/(b)/(c) it derives
-        // from; the end-to-end derivation is exercised in cairn-core's
-        // `long_running_derives_from_recipe_topology`.
-        let parsed =
-            RecipeFile::from_yaml(include_str!("../../../../recipes/main-coordinator.yaml"))
-                .expect("main-coordinator parses");
-        assert!(parsed.validate().valid, "main-coordinator validates");
+    fn coordinator_offers_both_branch_targets_with_a_prunable_pr_node() {
+        // The single Coordinator recipe is the one bundled recipe whose graph is
+        // meaningful under both branch targets, so it declares both. `base`
+        // prunes every PR node, which is only sound when each is
+        // control-terminal — the precondition `validate()` enforces and the
+        // launch-time transform relies on. The transformed topology itself
+        // (agent nodes on `none`, no PR node, long-running derivation) is
+        // asserted in cairn-core's `execution::branch_target` tests, which can
+        // reach `is_long_running_node`.
+        let parsed = RecipeFile::from_yaml(include_str!("../../../../recipes/coordinator.yaml"))
+            .expect("coordinator parses");
+        assert_eq!(
+            parsed.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+        assert!(parsed.validate().valid, "coordinator validates");
 
+        let pr_nodes: Vec<&RecipeFileNode> = parsed
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == RecipeNodeType::Pr)
+            .collect();
+        assert_eq!(pr_nodes.len(), 1, "one PR node to prune");
+        assert!(
+            !parsed.edges.iter().any(|e| {
+                let (source, _) = parse_node_handle(&e.from);
+                source == pr_nodes[0].id && e.edge_type == RecipeEdgeType::Control
+            }),
+            "the PR node is control-terminal, so pruning it cannot sever the graph"
+        );
+
+        // Under `new` the coordinator mints its own branch: no authored
+        // branchMode, so it takes the `isolate` default.
         let coordinator = parsed
             .nodes
             .iter()
             .find(|n| n.id == "coordinator-1")
             .expect("coordinator-1 node");
-        // Runs on the project's live checkout with no worktree (Branch: main) —
-        // the other half of the Main coordinator-mode key. Children route to the
-        // default branch naturally: a no-worktree parent job has no live branch
-        // for `resolve_parent_branch` to hand down.
         assert_eq!(
             coordinator
                 .config
                 .as_ref()
-                .and_then(|c| c.worktree_mode.clone()),
-            Some(WorktreeMode::None)
+                .and_then(|c| c.branch_mode.clone()),
+            None
         );
 
-        // (c) No terminal action node anywhere: no `pr` and no `action` node.
-        assert!(
-            !parsed
-                .nodes
-                .iter()
-                .any(|n| matches!(n.node_type, RecipeNodeType::Pr | RecipeNodeType::Action)),
-            "main-coordinator ships no terminal action node"
-        );
-
-        // (a) No terminal context-out output contract from the coordinator, and
-        // (b) it is a control-terminal — no outgoing control edge.
-        assert!(
-            !parsed
-                .edges
-                .iter()
-                .any(|e| e.from == "coordinator-1@context-out"),
-            "coordinator ships no terminal context-out output"
-        );
-        assert!(
-            !parsed.edges.iter().any(|e| {
-                e.from.starts_with("coordinator-1@") && e.edge_type == RecipeEdgeType::Control
-            }),
-            "coordinator is a control-terminal — no outgoing control edge"
-        );
-
-        // The living board is still wired through the context-self port.
+        // The living board is wired through the context-self port under both
+        // targets — the transform never touches context-self edges.
         let ctx_self: Vec<&RecipeFileEdge> = parsed
             .edges
             .iter()
@@ -2050,6 +2071,105 @@ edges:
             .collect();
         assert_eq!(ctx_self.len(), 1, "coordinator owns one context-self board");
         assert_eq!(ctx_self[0].to, "board-1@context-in");
+    }
+
+    #[test]
+    fn branch_targets_default_to_new_and_round_trip() {
+        // Absent means `[new]`, and the default is omitted on write so every
+        // existing recipe file round-trips byte-identically.
+        let base_yaml = r#"
+cairnVersion: 1
+name: Plain
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+edges: []
+"#;
+        let plain = RecipeFile::from_yaml(base_yaml).expect("parses");
+        assert_eq!(plain.branch_targets, vec![BranchTarget::New]);
+        assert!(
+            !plain.to_yaml().unwrap().contains("branchTargets"),
+            "the default target list is not written back out"
+        );
+
+        let declared_yaml = base_yaml.replace(
+            "trigger: manual\nnodes:",
+            "trigger: manual\nbranchTargets: [new, base]\nnodes:",
+        );
+        let declared = RecipeFile::from_yaml(&declared_yaml).expect("parses");
+        assert_eq!(
+            declared.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+        let reparsed = RecipeFile::from_yaml(&declared.to_yaml().unwrap()).expect("reparses");
+        assert_eq!(
+            reparsed.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+
+        // The declaration survives the Recipe round-trip too.
+        let recipe = declared.into_recipe(None, None);
+        assert_eq!(
+            recipe.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+        assert_eq!(
+            RecipeFile::from(recipe).branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+    }
+
+    #[test]
+    fn base_branch_target_rejects_a_mid_graph_pr_node() {
+        // Pruning a PR node that still has downstream control would sever the
+        // DAG, so a recipe with one may not offer `base`.
+        let yaml = r#"
+cairnVersion: 1
+name: Mid-graph PR
+trigger: manual
+branchTargets: [new, base]
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+- id: pr-1
+  type: pr
+  name: PR
+  position: 0@100
+  config:
+    actionParams: {}
+- id: builder-1
+  type: agent
+  name: Builder
+  position: 0@200
+  config:
+    agent: builder
+edges:
+- from: trigger-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: pr-1@control-out
+  to: builder-1@control-in
+  type: control
+"#;
+        let validation = RecipeFile::from_yaml(yaml).unwrap().validate();
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|e| e.contains("branch target 'base'") && e.contains("pr-1")),
+            "errors: {:?}",
+            validation.errors
+        );
     }
 
     #[test]

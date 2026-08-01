@@ -410,11 +410,9 @@ fn scan_top_level(command: &str, mut visit: impl FnMut(&[u8], usize, u8) -> Scan
             b'`' => in_backtick = true,
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => {
-                if visit(bytes, i, c) == ScanAction::SkipNext {
-                    i += 2;
-                    continue;
-                }
+            _ if depth == 0 && visit(bytes, i, c) == ScanAction::SkipNext => {
+                i += 2;
+                continue;
             }
             _ => {}
         }
@@ -604,7 +602,6 @@ mod tests {
             succeeded,
             suspended: false,
             images: Vec::new(),
-            promoted_terminal: None,
             tracked_modifications: None,
         }
     }
@@ -614,10 +611,7 @@ mod tests {
         // The run result is serialized as a RunBatchEnvelope so the transport
         // edge can lift each image into its own content block. Round-trip an
         // image-bearing result to prove the carrier preserves both.
-        let image = ImageBlock {
-            mime_type: "image/png".to_string(),
-            data: "b64".to_string(),
-        };
+        let image = ImageBlock::inline("image/png", "b64");
         let json = run_envelope("=== look ===\nAX tree".to_string(), vec![image.clone()]);
         let parsed: RunBatchEnvelope = serde_json::from_str(&json).expect("valid envelope JSON");
         assert_eq!(parsed.text, "=== look ===\nAX tree");
@@ -626,14 +620,8 @@ mod tests {
 
     #[test]
     fn collect_run_images_gathers_in_item_order() {
-        let img_a = ImageBlock {
-            mime_type: "image/png".to_string(),
-            data: "a".to_string(),
-        };
-        let img_b = ImageBlock {
-            mime_type: "image/png".to_string(),
-            data: "b".to_string(),
-        };
+        let img_a = ImageBlock::inline("image/png", "a");
+        let img_b = ImageBlock::inline("image/png", "b");
         let outcomes = vec![
             ItemOutcome {
                 header: "look".to_string(),
@@ -641,7 +629,6 @@ mod tests {
                 succeeded: true,
                 suspended: false,
                 images: vec![img_a.clone()],
-                promoted_terminal: None,
                 tracked_modifications: None,
             },
             // A text-only item contributes no images and is skipped.
@@ -652,7 +639,6 @@ mod tests {
                 succeeded: true,
                 suspended: false,
                 images: vec![img_b.clone()],
-                promoted_terminal: None,
                 tracked_modifications: None,
             },
         ];

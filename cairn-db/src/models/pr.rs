@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 pub struct PrCache {
     pub id: String,
     pub job_id: Option<String>,
-    pub pr_number: i32,
+    /// The pull request this change is bound to, or `None` when no pull request
+    /// exists for it. There is deliberately no zero sentinel: a rendered `#0`
+    /// was, in the incident that motivated this type, a pull request that had
+    /// never been opened at all.
+    pub pr_number: Option<i32>,
     pub pr_url: String,
     pub title: Option<String>,
     pub body: Option<String>,
@@ -30,7 +34,15 @@ pub struct PrCache {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PrState {
+    /// No pull request exists for this change: either its branch has not reached
+    /// the remote, or the remote has it but nothing was ever opened against it.
+    ///
+    /// This is the default because it is the only state that claims nothing. The
+    /// other three each assert a pull request exists, and asserting that from a
+    /// database row rather than from GitHub is what produced an artifact
+    /// describing a pull request nobody had opened.
     #[default]
+    Unpublished,
     Open,
     Closed,
     Merged,
@@ -39,6 +51,7 @@ pub enum PrState {
 impl std::fmt::Display for PrState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PrState::Unpublished => write!(f, "UNPUBLISHED"),
             PrState::Open => write!(f, "OPEN"),
             PrState::Closed => write!(f, "CLOSED"),
             PrState::Merged => write!(f, "MERGED"),
@@ -51,6 +64,7 @@ impl std::str::FromStr for PrState {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_uppercase().as_str() {
+            "UNPUBLISHED" => Ok(PrState::Unpublished),
             "OPEN" => Ok(PrState::Open),
             "CLOSED" => Ok(PrState::Closed),
             "MERGED" => Ok(PrState::Merged),
@@ -218,7 +232,8 @@ pub struct CheckFailureDetails {
 pub struct PrDataSummary {
     pub id: String,
     pub action_run_id: Option<String>,
-    pub pr_number: i32,
+    /// `None` when no pull request is bound — see [`PrCache::pr_number`].
+    pub pr_number: Option<i32>,
     pub pr_url: String,
     pub pr_status: String,
 }

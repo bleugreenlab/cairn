@@ -698,6 +698,13 @@ pub struct AnnotationMeta {
     pub(crate) input_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     has_value: Option<bool>,
+    /// A `<select>`'s option labels (capped page-side). Present so an agent can
+    /// see what `select` may be given without reading the whole page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) options: Vec<String>,
+    /// The `<select>`'s currently selected option label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selected: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) context_hint: Option<String>,
 }
@@ -748,6 +755,40 @@ pub enum BridgeRequest {
         value: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         submit: Option<bool>,
+    },
+    /// Choose an option in a native `<select>`, matching `value` against option
+    /// values then labels. Custom (non-`<select>`) dropdowns are click-driven.
+    Select {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        value: String,
+    },
+    /// Drag one element onto another. The destination reuses the same three
+    /// locator shapes under a `to` prefix. `mode` picks the event family
+    /// (`auto` infers from `draggable`), `steps`/`delay_ms` pace the movement.
+    Drag {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        #[serde(rename = "toSelector", skip_serializing_if = "Option::is_none")]
+        to_selector: Option<String>,
+        #[serde(rename = "toText", skip_serializing_if = "Option::is_none")]
+        to_text: Option<String>,
+        #[serde(rename = "toHandle", skip_serializing_if = "Option::is_none")]
+        to_handle: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        steps: Option<u32>,
+        #[serde(rename = "delayMs", skip_serializing_if = "Option::is_none")]
+        delay_ms: Option<u64>,
     },
     /// Scroll: `scrollIntoView` for a selector/text/handle, or window scroll via
     /// `to` (top|bottom) or a `by` pixel delta.
@@ -855,6 +896,17 @@ pub struct BridgeResponse {
     /// Actionable elements for a `ListInteractive` request.
     #[serde(default)]
     pub elements: Option<Vec<InteractiveElement>>,
+    /// The event family a `Drag` actually used (`html5` or `pointer`).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Whether an HTML5 drop target accepted the payload (a `dragover` handler
+    /// called `preventDefault`). `None` on the pointer path, which has no
+    /// equivalent signal.
+    #[serde(default)]
+    pub accepted: Option<bool>,
+    /// The option label a `Select` landed on.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// RAII bracket around a content-script bridge round-trip. Sends

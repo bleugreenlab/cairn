@@ -28,6 +28,24 @@ pub(super) async fn dispatch(
                 })?),
                 None => None,
             };
+            let branch_target = match item.payload.as_ref().and_then(|p| p.get("branch")) {
+                Some(value) => {
+                    let raw = value.as_str().ok_or_else(|| {
+                        build_failure(index, item, "payload.branch must be a string")
+                    })?;
+                    Some(
+                        raw.parse::<crate::models::BranchTarget>()
+                            .map_err(|error| {
+                                build_failure(
+                                    index,
+                                    item,
+                                    format!("payload.branch: {error} (new|base)"),
+                                )
+                            })?,
+                    )
+                }
+                None => None,
+            };
             if dry_run {
                 format!(
                     "Would start an execution for {project}-{number}{}",
@@ -36,9 +54,16 @@ pub(super) async fn dispatch(
                         .unwrap_or_default()
                 )
             } else {
-                executions::start_execution_from_collection(orch, project, *number, recipe, backend)
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?
+                executions::start_execution_from_collection(
+                    orch,
+                    project,
+                    *number,
+                    recipe,
+                    backend,
+                    branch_target,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?
             }
         }
         (

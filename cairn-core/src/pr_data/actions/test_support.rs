@@ -162,3 +162,37 @@ pub(super) async fn seed_pr_node_merge_request_for_artifact_job(db: &LocalDb) {
         .await
         .unwrap();
 }
+
+/// A merge request bound to a live GitHub pull request, so the create-pr
+/// artifact sync has an external head to advance.
+pub(super) async fn seed_remote_open_merge_request(db: &LocalDb, owner_id: &str, repo_path: &str) {
+    let owner_id = owner_id.to_string();
+    let repo_path = repo_path.to_string();
+    db.write(|conn| {
+            let owner_id = owner_id.clone();
+            let repo_path = repo_path.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-remote', 'default', 'Project', 'PROJ', ?1, 'main', 1, 1)",
+                    params![repo_path.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                     VALUES ('issue-remote', 'proj-remote', 4, 'Issue', 'active', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, body, source_branch, target_branch, status, is_local, opened_at, updated_at, github_pr_number, github_pr_url)
+                     VALUES ('mr-remote', ?1, 'proj-remote', 'issue-remote', 'Old title', 'Old body', 'agent/PROJ-4-builder-0', 'main', 'open', 0, 1, 1, 2833, 'https://example.com/pr/2833')",
+                    params![owner_id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}

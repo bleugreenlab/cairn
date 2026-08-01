@@ -6,7 +6,7 @@ pub(super) enum TargetFamily {
 
 pub(super) fn invalid_target_error(target: &str) -> String {
     format!(
-        "Invalid target: expected cairn://... or file:...; use file:relative/path (worktree-relative), file:/absolute/path, or bare file: for the worktree root instead of '{target}'"
+        "Invalid target: expected cairn://... or file:...; use file:relative/path (logical project-relative), file:/absolute/path, or bare file: for the logical project root instead of '{target}'"
     )
 }
 

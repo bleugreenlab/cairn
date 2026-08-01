@@ -101,6 +101,11 @@ pub struct ChangePayload {
     pub(crate) preview: Option<bool>,
     #[serde(default)]
     pub(crate) atomic: Option<bool>,
+    /// A written reason for committing content that contains literal Git
+    /// conflict markers. Absent (the default) means the marker guard refuses
+    /// such a commit; see [`cairn_common::conflict_scaffolding`].
+    #[serde(default)]
+    pub(crate) conflict_markers_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -141,14 +146,14 @@ pub struct TaskPayload {
     pub(crate) output_schema: Option<crate::models::OutputSchema>,
 }
 
-/// Worktree binding for an ephemeral call (CAIRN-2481).
+/// Branch-coordinate policy for an ephemeral call.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum CallWorktreeMode {
-    /// Run in the caller's inherited worktree; mutating calls are first-class.
+pub enum CallBranchMode {
+    /// Inherit the caller's durable branch and logical head.
     #[default]
     Inherit,
-    /// Run in a fresh scratch dir with no project-tree binding.
+    /// Run without a repository coordinate.
     None,
 }
 
@@ -174,7 +179,7 @@ pub struct CallPayload {
     #[serde(default)]
     pub(crate) output_schema: Option<crate::models::OutputSchema>,
     #[serde(default)]
-    pub(crate) worktree: Option<CallWorktreeMode>,
+    pub(crate) branch: Option<CallBranchMode>,
     /// Durable workflow tags (no UI yet).
     #[serde(default)]
     pub(crate) label: Option<String>,

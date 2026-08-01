@@ -15,6 +15,37 @@ fn gate(item: &ChangeItem) -> ResourceMutationResult<&'static MutationSpec> {
     gate_resource_change(0, item, &resource)
 }
 
+/// The replay action is the only sanctioned way a branch's ancestry moves, so it
+/// has to actually reach dispatch. A contract entry nothing routes to is a
+/// documented action that silently does nothing.
+#[test]
+fn gate_accepts_the_rebase_replay_action() {
+    let it = item(
+        "cairn://p/CAIRN/1/1/builder/rebase",
+        ChangeMode::Patch,
+        Some(serde_json::json!({"action": "replay"})),
+    );
+    let spec = gate(&it).expect("the replay mutation is gated in");
+    assert_eq!(
+        spec.label,
+        "ask the store to replay this branch onto its base"
+    );
+}
+
+/// A rebase session is read and replayed, never created or deleted by hand.
+#[test]
+fn gate_rejects_creating_or_deleting_a_rebase_session() {
+    for mode in [ChangeMode::Create, ChangeMode::Delete, ChangeMode::Append] {
+        let it = item("cairn://p/CAIRN/1/1/builder/rebase", mode, None);
+        let failure = gate(&it).unwrap_err();
+        assert!(
+            failure.error.contains("Unsupported resource mutation"),
+            "{mode:?}: {}",
+            failure.error
+        );
+    }
+}
+
 #[test]
 fn gate_rejects_apply_mode_with_enumeration() {
     let it = item(

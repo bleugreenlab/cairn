@@ -3,17 +3,117 @@ use crate::mcp::git::GitAuthor;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-fn jj_bin() -> Option<String> {
+/// The jj binary a fixture test may drive, or `None` when jj is not resolvable
+/// on this machine. The single definition for every crate-internal suite that
+/// builds a real store.
+///
+/// A bare `jj` on PATH is very often Cairn's OWN shim: `<cairn_home>/bin` leads
+/// PATH in every agent shell and, once installed, in the operator's. That shim
+/// intercepts `jj workspace update-stale`, so a suite resolving it would drive
+/// an unconditional no-op while believing it was driving jj — which is exactly
+/// the confusion this harness must never reproduce, since an evening went to
+/// diagnosing a stale store against that no-op. A resolved shim is unwrapped to
+/// the binary it forwards to, read out of the `exec` line Cairn generated.
+pub(crate) fn jj_bin() -> Option<String> {
     let bin = std::env::var("CAIRN_JJ_BIN")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "jj".to_string());
+    let bin = crate::env::real_jj_behind_shim(&bin).unwrap_or(bin);
     crate::env::command(&bin)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
         .then_some(bin)
+}
+
+/// Tree identity sees through a stale base coordinate; the changed-file diff
+/// does not. This is the VCS-level fact the turn-end zero-delta gate rests on
+/// (CAIRN-3108), reproduced against real jj rather than asserted in prose.
+///
+/// The topology is job 7d9755b2's: the node's branch has been brought level with
+/// a main that advanced after the node started, so its TREE is main's, but its
+/// recorded `base_commit` still points at the older main. Diffing against that
+/// row reports every intervening change and fires the full review suite on a
+/// node that changed nothing.
+///
+/// Note the node's head is deliberately a DIFFERENT COMMIT from main's tip with
+/// the same tree, so a gate that compared coordinates instead of trees would
+/// fail this even with a perfectly fresh base row.
+#[test]
+#[serial_test::serial(jj)]
+fn tree_identity_sees_through_a_stale_base_commit_that_the_diff_does_not() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping tree_identity_sees_through_a_stale_base_commit: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    // The base coordinate the node recorded when it started.
+    let stale_base = bookmark_commit(&jj, &store, "main").unwrap();
+
+    // main advances underneath it, the way a merged PR advances it in practice.
+    let advancing = wts.path().join("advancing");
+    add_workspace(&jj, &store, &advancing, "agent/advance", "main", None).unwrap();
+    std::fs::write(advancing.join("shared.rs"), "advanced\n").unwrap();
+    seal(&jj, &advancing, "advance main", None).unwrap();
+    let new_main = head_commit(&jj, &advancing).unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            &new_main,
+            "--allow-backwards",
+        ],
+        "advance main for the stale-base fixture",
+    )
+    .unwrap();
+
+    // The node reaches main's content on its own branch: same tree, own commit.
+    let node = wts.path().join("node");
+    add_workspace(&jj, &store, &node, "agent/zero-delta", &stale_base, None).unwrap();
+    std::fs::write(node.join("shared.rs"), "advanced\n").unwrap();
+    seal(&jj, &node, "reach main's content", None).unwrap();
+    let node_head = head_commit(&jj, &node).unwrap();
+
+    assert_ne!(
+        node_head, new_main,
+        "the node must sit at its OWN commit, so this tests trees and not coordinates"
+    );
+
+    // The trap: diffed against the stale row, this zero-delta node looks like a
+    // real change, and the changed-file gate selects checks for it.
+    let changed = logical_changed_files(&jj, &store, &stale_base, &node_head)
+        .expect("the stale-base range is resolvable");
+    assert!(
+        !changed.is_empty(),
+        "a stale base coordinate makes a zero-delta node look changed — this is the bug the \
+         tree gate exists to survive, so if this ever goes empty the fixture stopped reproducing it"
+    );
+
+    // The fact the gate uses: content is identical, whatever the row says.
+    let node_tree = logical_tree_hash(&jj, &store, &node_head).unwrap();
+    let main_tree = logical_tree_hash(&jj, &store, &new_main).unwrap();
+    let stale_tree = logical_tree_hash(&jj, &store, &stale_base).unwrap();
+    assert_eq!(
+        node_tree, main_tree,
+        "the node's tree is byte-identical to the live base branch's"
+    );
+    assert_ne!(
+        node_tree, stale_tree,
+        "and differs from the stale coordinate's, which is exactly why resolving the base tree \
+         from the BRANCH rather than the recorded commit is what makes the gate correct"
+    );
 }
 
 #[test]
@@ -161,21 +261,6 @@ fn base_marker_round_trips() {
     );
 }
 
-#[test]
-fn project_root_marker_round_trips() {
-    let dir = TempDir::new().unwrap();
-    std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
-
-    assert_eq!(read_project_root_marker(dir.path()), None);
-
-    write_project_root_marker(dir.path(), Path::new("/Users/dev/projects/cairn")).unwrap();
-    assert_eq!(
-        read_project_root_marker(dir.path()),
-        Some(PathBuf::from("/Users/dev/projects/cairn"))
-    );
-    assert!(dir.path().join(".jj").join("cairn-project-root").exists());
-}
-
 /// Provision a real non-colocated workspace, record the base marker as
 /// production does (after `add_workspace`), and assert it persists across a
 /// seal — the `.jj` dir is never snapshotted, so the marker is invisible to
@@ -212,15 +297,21 @@ fn base_marker_provisions_and_survives_a_seal() {
     );
 }
 
-/// CAIRN-2260 (b)+(c): a `when:write` check that rewrites a TRACKED file folds
-/// that edit into the just-sealed commit and leaves `@` clean; a GITIGNORED
-/// write the same check makes is neither folded into the commit nor counted as
-/// working-copy dirt.
+/// A Cairn-owned seal that cannot PUBLISH is not a seal. The marker says Cairn
+/// provisioned this workspace and owns `branch` in it, so landing the sealed
+/// commit ON that branch is the operation's contract, not incidental cleanup: a
+/// refused export exits 0 (jj reports the refusal on stderr only) and does NOT
+/// self-heal on the next seal, so swallowing it leaves the branch silently not
+/// carrying work every later reader is told it carries — the CAIRN-3270 shape.
+///
+/// The refusal here is git's own directory/file rule — `refs/heads/<branch>`
+/// cannot exist while `refs/heads/<branch>/inner` does — which is the one freeze
+/// the verifier's import-and-re-export repair cannot close.
 #[test]
 #[serial_test::serial(jj)]
-fn fold_worktree_into_seal_amends_tracked_and_skips_gitignored() {
+fn a_seal_whose_export_is_refused_rolls_back_and_reports_the_unpublished_commit() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping fold_worktree_into_seal_amends_tracked_and_skips_gitignored: jj not resolvable");
+        eprintln!("skipping seal_whose_export_is_refused_rolls_back: jj not resolvable");
         return;
     };
     let home = TempDir::new().unwrap();
@@ -231,67 +322,79 @@ fn fold_worktree_into_seal_amends_tracked_and_skips_gitignored() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-1-builder-0";
+    let branch = "agent/CAIRN-3280-builder-0";
     let ws = wts.path().join("job");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
 
-    // write1: a normal path-scoped seal of source + a .gitignore that ignores caches.
-    std::fs::create_dir_all(ws.join("src")).unwrap();
-    std::fs::write(ws.join("src/foo.ts"), "const x=1\n").unwrap();
-    std::fs::write(ws.join(".gitignore"), "*.cache\n").unwrap();
-    seal_paths(&jj, &ws, "edit1", None, &["src/foo.ts", ".gitignore"]).unwrap();
-    let sealed_before = head_commit(&jj, &ws).unwrap();
-
-    // The check reformats the tracked source AND writes a gitignored cache.
-    std::fs::write(ws.join("src/foo.ts"), "const x = 1;\n").unwrap();
-    std::fs::write(ws.join("vitest.cache"), "junk\n").unwrap();
-
-    let outcome = fold_worktree_into_seal(&jj, &ws)
-        .unwrap()
-        .expect("a tracked reformat folds into the seal");
-    assert_eq!(outcome.folded_files, vec!["src/foo.ts".to_string()]);
-
-    // `@` is clean == the amended tip; the seal's commit id changed (amended).
-    assert!(
-        !is_working_copy_dirty(&jj, &ws).unwrap(),
-        "@ is clean after the fold"
+    // Occupy the branch's ref path with a directory, so git can never write the
+    // ref itself and the export stays refused however often it is retried.
+    let main_commit = git_stdout(proj.path(), &["rev-parse", "refs/heads/main"]);
+    git(
+        proj.path(),
+        &["update-ref", "-d", &format!("refs/heads/{branch}")],
     );
-    assert_ne!(
-        sealed_before,
+    git(
+        proj.path(),
+        &[
+            "update-ref",
+            &format!("refs/heads/{branch}/inner"),
+            &main_commit,
+        ],
+    );
+
+    let pre_seal_head = head_commit(&jj, &ws).unwrap();
+    std::fs::write(ws.join("work.rs"), "agent work\n").unwrap();
+
+    let error = seal(&jj, &ws, "agent work", None).expect_err(
+        "a seal that cannot publish must not \
+            report success",
+    );
+
+    assert!(
+        error.contains(branch),
+        "the error names the branch: {error}"
+    );
+    assert!(
+        error.contains("unpublished"),
+        "the error says the commit never reached its branch: {error}"
+    );
+
+    // The rollback is the load-bearing half. A reported failure that still left
+    // the commit in the workspace would strand an orphan off the branch, which
+    // the generic discard (`jj restore` only resets `@` to its parent) cannot
+    // recover — the same invariant the integrity probe's restore keeps.
+    assert_eq!(
         head_commit(&jj, &ws).unwrap(),
-        "the seal was amended in place"
+        pre_seal_head,
+        "the failed seal is rolled back, leaving no orphan commit behind"
     );
-
-    // The reformat is in the commit; the gitignored cache is not.
-    let foo_in_commit = jj
-        .run(&ws, &["file", "show", "-r", "@-", "src/foo.ts"], "show foo")
-        .unwrap();
-    assert!(
-        foo_in_commit.contains("const x = 1;"),
-        "the reformatted source is folded into the commit: {foo_in_commit}"
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(pre_seal_head.as_str()),
+        "the bookmark is back where it started"
     );
-    let committed = jj
-        .run(&ws, &["diff", "-r", "@-", "--name-only"], "committed files")
-        .unwrap();
-    assert!(
-        committed.contains("src/foo.ts"),
-        "the source file is in the amended commit: {committed}"
-    );
-    assert!(
-        !committed.contains("vitest.cache"),
-        "the gitignored cache must NOT be committed: {committed}"
+    // And the agent's work is still on disk to retry with, not destroyed.
+    assert_eq!(
+        std::fs::read_to_string(ws.join("work.rs")).unwrap(),
+        "agent work\n"
     );
 }
 
-/// CAIRN-2260 (a): with the check's changes folded into the seal, a concurrent
-/// base advance (a sibling merge that rebases this workspace) in the lock-free
-/// check window leaves the NEXT write's seal clean — no stale / divergent /
-/// behind-tip wedge, and no divergent `@` twin (the bug's signature).
+/// The marker is an OWNERSHIP predicate, not a provisioning receipt. Absent, the
+/// checkout is somebody else's — a user-colocated jj repo is the standing case —
+/// so the seal commits locally and publishes NOTHING: no bookmark moves and no
+/// git ref is written.
+///
+/// Withholding is the intended answer rather than a degraded one. Absence is in
+/// fact the only answer production gives (nothing outside tests provisions a
+/// workspace), so a seal that REFUSED on a missing marker would break every
+/// ambient seal instead of surfacing a fault. This test pins that, so the
+/// behavior is not re-filed as a bug.
 #[test]
 #[serial_test::serial(jj)]
-fn folded_check_keeps_next_seal_clean_under_a_concurrent_advance() {
+fn a_seal_in_a_checkout_cairn_does_not_own_commits_and_publishes_nothing() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping folded_check_keeps_next_seal_clean_under_a_concurrent_advance: jj not resolvable");
+        eprintln!("skipping seal_in_a_checkout_cairn_does_not_own: jj not resolvable");
         return;
     };
     let home = TempDir::new().unwrap();
@@ -302,76 +405,38 @@ fn folded_check_keeps_next_seal_clean_under_a_concurrent_advance() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    // Coordinator integration bookmark + one sibling builder branched off it.
-    let int = "agent/CAIRN-1-coordinator-0";
-    add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
-    let branch = "agent/CAIRN-2-builder-0";
-    let ws = wts.path().join("builder");
-    add_workspace(&jj, &store, &ws, branch, int, None).unwrap();
+    let branch = "agent/CAIRN-3280-builder-1";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    let bookmark_before = bookmark_commit(&jj, &store, branch).unwrap();
 
-    // write1: a path-scoped seal on the builder.
-    std::fs::write(ws.join("a.rs"), "fn a() {}\n").unwrap();
-    seal_paths(&jj, &ws, "edit1", None, &["a.rs"]).unwrap();
+    // Strip the marker: what remains is the shape of a jj checkout Cairn merely
+    // found rather than provisioned.
+    std::fs::remove_file(ws.join(".jj").join(BRANCH_MARKER)).unwrap();
+    assert!(read_branch_marker(&ws).is_none());
 
-    // The check reformats a.rs (tracked dirt in @); the fix folds it into the seal.
-    std::fs::write(ws.join("a.rs"), "fn a() {} // fmt\n").unwrap();
-    fold_worktree_into_seal(&jj, &ws)
-        .unwrap()
-        .expect("the tracked reformat folds into the seal");
-    assert!(
-        !is_working_copy_dirty(&jj, &ws).unwrap(),
-        "@ is clean after the fold"
-    );
+    std::fs::write(ws.join("work.rs"), "somebody else's work\n").unwrap();
+    let sealed =
+        seal(&jj, &ws, "local commit", None).expect("an unowned checkout still commits locally");
 
-    // A child merges into the integration branch: advance its tip with a
-    // different file, then reconcile rebases the sibling onto the new tip
-    // (the concurrent advance that, on a check-dirtied @, used to wedge).
-    jj.run(&store, &["new", int], "new on int").unwrap();
-    std::fs::write(store.join("z.rs"), "fn z() {}\n").unwrap();
-    jj.run(&store, &["describe", "-m", "child merged"], "describe")
-        .unwrap();
-    jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
-        .unwrap();
-    let report = reconcile_siblings(&jj, &store, int, &[(branch.to_string(), ws.clone())]).unwrap();
-    assert_eq!(report.rebased_clean, vec![branch.to_string()]);
-    assert!(
-        report.failed.is_empty(),
-        "a missing origin does not turn a completed local reconcile into a failure"
-    );
-
-    // write2: the next seal must SUCCEED and leave `@` clean == tip.
-    std::fs::write(ws.join("b.rs"), "fn b() {}\n").unwrap();
-    seal_paths(&jj, &ws, "edit2", None, &["b.rs"])
-        .expect("the second seal succeeds after a concurrent advance");
-    assert!(
-        !is_working_copy_dirty(&jj, &ws).unwrap(),
-        "@ is clean after the second seal"
-    );
-
-    // No divergent twin of `@` (the bug's signature): change_id(@) resolves to one.
-    let cid = snapshot_change_id(&jj, &ws).unwrap();
-    let twins = jj
-        .run(
-            &ws,
-            &[
-                "log",
-                "-r",
-                &format!("change_id({})", cid.trim()),
-                "--no-graph",
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-            "divergence check",
-        )
-        .unwrap();
+    assert!(!sealed.sha.is_empty(), "the commit is real and addressable");
     assert_eq!(
-        twins.lines().filter(|l| !l.trim().is_empty()).count(),
-        1,
-        "no divergent @ twin after the fold + advance + reseal"
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(bookmark_before.as_str()),
+        "no bookmark may move in a checkout Cairn does not own"
+    );
+    let exported = crate::env::git()
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(proj.path())
+        .output()
+        .unwrap();
+    assert!(
+        !exported.status.success(),
+        "no git ref may be written for a branch Cairn does not own"
     );
 }
 
-fn git(repo: &Path, args: &[&str]) {
+pub(crate) fn git(repo: &Path, args: &[&str]) {
     assert!(
         crate::env::git()
             .args(args)
@@ -383,7 +448,7 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-fn init_project(repo: &Path) {
+pub(crate) fn init_project(repo: &Path) {
     git(repo, &["init", "-q", "-b", "main"]);
     git(repo, &["config", "user.email", "p@e.com"]);
     git(repo, &["config", "user.name", "P"]);
@@ -393,7 +458,7 @@ fn init_project(repo: &Path) {
 }
 
 /// Capture trimmed stdout of a git command (test helper).
-fn git_stdout(repo: &Path, args: &[&str]) -> String {
+pub(crate) fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let out = crate::env::git()
         .args(args)
         .current_dir(repo)
@@ -401,6 +466,24 @@ fn git_stdout(repo: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(out.status.success(), "git {args:?} failed");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Rebase a branch WITHOUT the conflict guard, leaving the recorded conflict in
+/// place.
+///
+/// [`rebase_branch_onto`] deliberately refuses to do this — it rolls a
+/// conflicting rebase back so nothing conflict-flagged can reach git — so it can
+/// no longer be used to BUILD a conflicted store. Fixtures that need that shape
+/// construct it here: a branch carrying conflict-flagged commits still arrives
+/// from stores that predate the guard and from `jj` run outside Cairn, and
+/// flatten recovery exists precisely to clear it.
+pub(crate) fn rebase_recording_conflict(jj: &JjEnv, store: &Path, branch: &str, dest: &str) {
+    jj.run(
+        store,
+        &["rebase", "-b", branch, "-o", dest, "--ignore-working-copy"],
+        "test fixture: unguarded rebase",
+    )
+    .unwrap();
 }
 
 fn advance_project(repo: &Path) -> String {
@@ -539,7 +622,6 @@ fn marker_failure_rolls_back_new_workspace_registration_bookmark_and_path() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
     let branch = "agent/CAIRN-2924-marker-failure";
-    let name = workspace_name_for_branch(branch);
     let ws = wts.path().join("job");
 
     let error = add_workspace_with_marker_writer(
@@ -554,7 +636,6 @@ fn marker_failure_rolls_back_new_workspace_registration_bookmark_and_path() {
     .unwrap_err();
     assert!(error.contains("injected branch marker failure"));
     assert!(!ws.exists(), "partial workspace directory is removed");
-    assert!(!workspace_registered(&jj, &store, &name));
     assert!(bookmark_commit(&jj, &store, branch).is_none());
 }
 
@@ -589,63 +670,6 @@ fn marker_failure_preserves_preexisting_branch_bookmark() {
         bookmark_commit(&jj, &store, branch).as_deref(),
         Some(tip.as_str()),
         "rollback preserves the bookmark that predated this add"
-    );
-}
-
-/// A failed `jj workspace add` registers the workspace name (and writes a
-/// half-created `.jj` dir) before it resolves `-r`, so a retried job would hit
-/// `Workspace named X already exists` / `Destination path exists`.
-/// Destructive retry cleanup is explicit: the orchestration layer proves the
-/// half-created registration/path belongs to the same assignment, then calls the
-/// cleanup helper before retrying `add_workspace`.
-#[test]
-#[serial_test::serial(jj)]
-fn proven_half_created_workspace_retry_recovers() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping proven_half_created_workspace_retry_recovers: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let branch = "agent/CAIRN-1-builder-0";
-    let ws = wts.path().join("job");
-    let name = workspace_name_for_branch(branch);
-
-    // Simulate the live failure: an add against an unresolvable revision still
-    // registers the workspace name and writes a `.jj` dir, then errors.
-    let _ = jj.run(
-        &store,
-        &[
-            "workspace",
-            "add",
-            "--name",
-            &name,
-            "-r",
-            "does-not-exist",
-            &ws.to_string_lossy(),
-        ],
-        "seed half-created workspace",
-    );
-    assert!(
-        ws.join(".jj").exists(),
-        "the failed add still wrote a stale .jj dir"
-    );
-
-    // The owner proof happens above this layer; only the explicit cleanup is
-    // allowed to forget/remove the half-created state.
-    assert!(workspace_retry_is_clean(&jj, &ws));
-    cleanup_workspace_retry(&jj, &store, &ws, &name).unwrap();
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-    assert!(is_jj_dir(&ws), "the retried add provisions the workspace");
-    assert!(
-        bookmark_commit(&jj, &store, branch).is_some(),
-        "the retried add creates the branch bookmark"
     );
 }
 
@@ -857,186 +881,6 @@ index 1111111111..2222222222 100644
 fn parse_git_diff_empty_is_empty() {
     assert!(parse_git_diff("").is_empty());
 }
-
-/// A non-jj directory yields `None` so the projection falls back to the
-/// recorded cache. No jj binary is invoked (the `.jj` probe short-circuits).
-#[test]
-fn node_changed_files_returns_none_for_non_jj_dir() {
-    let jj = JjEnv::resolve("jj", Path::new("/tmp"));
-    let dir = TempDir::new().unwrap();
-    assert!(node_changed_files(&jj, dir.path(), Some("main"), None).is_none());
-}
-
-fn setup_base_advance_with_node_change(
-    bin: &str,
-    rebase_workspace: bool,
-) -> (
-    TempDir,
-    TempDir,
-    TempDir,
-    TempDir,
-    JjEnv,
-    std::path::PathBuf,
-    String,
-) {
-    let home = TempDir::new().unwrap();
-    let origin = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-
-    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-    init_project(proj.path());
-    std::fs::write(proj.path().join("base-only.rs"), "base-only\n").unwrap();
-    git(proj.path(), &["add", "-A"]);
-    git(proj.path(), &["commit", "-q", "-m", "add base-only"]);
-    let base = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
-    git(
-        proj.path(),
-        &["remote", "add", "origin", &origin.path().to_string_lossy()],
-    );
-    git(proj.path(), &["push", "-q", "origin", "main"]);
-
-    let jj = JjEnv::resolve(bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let ws = wts.path().join("job");
-    let branch = "agent/CAIRN-1-builder-0";
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-
-    std::fs::write(ws.join("node.rs"), "node\n").unwrap();
-    seal(&jj, &ws, "node work", None).unwrap();
-
-    std::fs::remove_file(proj.path().join("base-only.rs")).unwrap();
-    git(proj.path(), &["add", "-A"]);
-    git(
-        proj.path(),
-        &["commit", "-q", "-m", "external base deletion"],
-    );
-    git(proj.path(), &["push", "-q", "origin", "main"]);
-    fetch_remote(&jj, &store, "origin").unwrap();
-
-    if rebase_workspace {
-        reconcile_siblings(
-            &jj,
-            &store,
-            "main@origin",
-            &[(branch.to_string(), ws.clone())],
-        )
-        .unwrap();
-    }
-
-    (home, origin, proj, wts, jj, ws, base)
-}
-
-/// The graph-derived change set lists a SEALED file (the omission this fixes)
-/// AND a loose, un-sealed `@` edit, while leaving the unchanged base file
-/// out. Drives the real shared-store seal path, mirroring the seal/discard
-/// fixture.
-#[test]
-#[serial_test::serial(jj)]
-fn node_changed_files_derives_sealed_and_loose_against_base() {
-    let Some(bin) = jj_bin() else {
-        eprintln!(
-                "skipping node_changed_files_derives_sealed_and_loose_against_base: jj not resolvable via CAIRN_JJ_BIN/PATH"
-            );
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    let author = GitAuthor::new("Alice", "alice@example.com");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let a = wts.path().join("jobA");
-    add_workspace(
-        &jj,
-        &store,
-        &a,
-        "agent/CAIRN-1-builder-0",
-        "main",
-        Some(&author),
-    )
-    .unwrap();
-
-    // Seal a new file: it must appear in the graph-derived change set.
-    std::fs::write(a.join("mod.rs"), "code\n").unwrap();
-    let res = seal(&jj, &a, "agent work", Some(&author)).unwrap();
-    assert!(!res.sha.is_empty());
-
-    // A loose, un-sealed edit, snapshotted into `@` by a jj op (as the
-    // agent's own operations do before a reviewer reads `/changed`).
-    std::fs::write(a.join("loose.rs"), "wip\n").unwrap();
-    assert!(is_working_copy_dirty(&jj, &a).unwrap());
-
-    let changes = node_changed_files(&jj, &a, Some("main"), None)
-        .expect("jj workspace resolves the base bookmark");
-    let by_path: std::collections::HashMap<&str, &GraphFileChange> =
-        changes.iter().map(|c| (c.path.as_str(), c)).collect();
-
-    let sealed = by_path.get("mod.rs").expect("sealed file present in graph");
-    assert_eq!(sealed.status, "added");
-    assert_eq!(sealed.additions, 1);
-
-    let loose = by_path
-        .get("loose.rs")
-        .expect("loose @ edit present in graph");
-    assert_eq!(loose.status, "added");
-
-    assert!(
-        !by_path.contains_key("shared.rs"),
-        "the unchanged base file must not appear: {changes:?}"
-    );
-}
-
-/// When origin/main advances externally and deletes a base file, but the node
-/// has not yet been rebased, the effective fork point remains the original
-/// base. `/changed` must report only the node's own file, not the unrelated
-/// base deletion.
-#[test]
-#[serial_test::serial(jj)]
-fn node_changed_files_excludes_unrebased_external_base_deletion() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping node_changed_files_excludes_unrebased_external_base_deletion: jj not resolvable");
-        return;
-    };
-    let (_home, _origin, _proj, _wts, jj, ws, base) =
-        setup_base_advance_with_node_change(&bin, false);
-
-    let changes = node_changed_files(&jj, &ws, Some("main"), Some(&base))
-        .expect("jj workspace resolves an effective fork point");
-    let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
-    assert_eq!(
-        paths,
-        vec!["node.rs"],
-        "base deletion must be absent: {changes:?}"
-    );
-}
-
-/// After the same external advance, reconcile rebases the node onto
-/// `main@origin`. The effective fork point must move to that remote-tracking
-/// tip, so the base branch's deletion still does not appear as node work.
-#[test]
-#[serial_test::serial(jj)]
-fn node_changed_files_excludes_rebased_external_base_deletion() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping node_changed_files_excludes_rebased_external_base_deletion: jj not resolvable");
-        return;
-    };
-    let (_home, _origin, _proj, _wts, jj, ws, base) =
-        setup_base_advance_with_node_change(&bin, true);
-
-    let changes = node_changed_files(&jj, &ws, Some("main"), Some(&base))
-        .expect("jj workspace resolves an effective fork point");
-    let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
-    assert_eq!(
-        paths,
-        vec!["node.rs"],
-        "base deletion must be absent: {changes:?}"
-    );
-}
-
 /// `list_files` enumerates a non-colocated workspace's tracked files — the
 /// exact `.jj`-only shape (no `.git`) where the File tab's old `git ls-files`
 /// returned nothing and rendered "Path not found" for everything. Asserts the
@@ -1228,6 +1072,82 @@ fn parse_ls_tree_extracts_sorted_path_blob_pairs() {
     );
 }
 
+/// `parse_cat_file_batch` reads the length-delimited `--batch` wire format:
+/// content is taken by the declared byte count (never scanned for line
+/// structure, so a manifest containing a blank line or a `\n<sha> blob` lookalike
+/// cannot desynchronize the scan), non-blob and `missing` records carry no body,
+/// and a truncated stream ends the scan instead of yielding garbage. Pure — no
+/// git binary needed.
+#[test]
+fn parse_cat_file_batch_reads_length_delimited_records() {
+    let body = "[package]\n\nname = \"x\"\n";
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("aaa blob {}\n", body.len()).as_bytes());
+    out.extend_from_slice(body.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(b"deadbeef missing\n");
+    out.extend_from_slice(b"ccc tree 4\n");
+    out.extend_from_slice(b"xxxx\n");
+    out.extend_from_slice(b"bbb blob 2\n");
+    out.extend_from_slice(b"hi\n");
+
+    let blobs = super::parse_cat_file_batch(&out);
+    assert_eq!(blobs.len(), 2, "only blob records carry content");
+    assert_eq!(blobs["aaa"], body.as_bytes());
+    assert_eq!(blobs["bbb"], b"hi");
+
+    // A stream cut mid-body yields the records that completed, not a partial one.
+    let truncated = &out[..out.len() - 2];
+    let blobs = super::parse_cat_file_batch(truncated);
+    assert!(blobs.contains_key("aaa"));
+    assert!(!blobs.contains_key("bbb"));
+
+    assert!(super::parse_cat_file_batch(b"").is_empty());
+}
+
+/// `read_blobs` resolves real object ids through the store's git backend, so
+/// check-input derivation reads a sealed tree's manifests with no checkout.
+#[test]
+#[serial_test::serial(jj)]
+fn read_blobs_returns_sealed_tree_content_without_a_checkout() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping read_blobs_returns_sealed_tree_content: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let ws = wts.path().join("a");
+    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+
+    let manifest = "[package]\nname = \"probe\"\n";
+    std::fs::write(ws.join("Cargo.toml"), manifest).unwrap();
+    seal(&jj, &ws, "add a manifest", None).unwrap();
+    let commit = head_commit(&jj, &ws).unwrap();
+
+    let entries = super::tree_entries(&jj, &ws, &commit).unwrap();
+    let blob = entries
+        .iter()
+        .find(|(path, _)| path == "Cargo.toml")
+        .map(|(_, blob)| blob.clone())
+        .expect("the sealed tree lists the manifest");
+
+    let blobs = super::read_blobs(&jj, &ws, &[blob.as_str()]).unwrap();
+    assert_eq!(
+        blobs.get(&blob).map(|bytes| String::from_utf8_lossy(bytes)),
+        Some(std::borrow::Cow::Borrowed(manifest)),
+        "the manifest's bytes come back by object id alone"
+    );
+    assert!(
+        super::read_blobs(&jj, &ws, &[]).unwrap().is_empty(),
+        "an empty id list spawns nothing"
+    );
+}
+
 /// A seal followed by `push_to_origin` lands the workspace's bookmark on a
 /// bare `origin` — the in-tree form of the bare-origin spike.
 #[test]
@@ -1371,236 +1291,6 @@ fn ensure_bookmark_on_origin_publishes_store_bookmark() {
     ensure_bookmark_on_origin(&jj, &store, base).unwrap();
 }
 
-/// The headline: the coordinator topology reconciled in-tree. Two sibling
-/// workspaces off a shared integration bookmark; the integration tip advances
-/// (a child PR merged into it); `reconcile_siblings` non-blockingly rebases
-/// both. The overlapping sibling records a conflict with its change-id
-/// preserved (only the commit-id churns), its workspace goes stale and
-/// `update-stale` materializes conflict markers, and jj refuses to push that
-/// conflicted bookmark while the cleanly-rebased sibling pushes fine.
-#[test]
-#[serial_test::serial(jj)]
-fn reconcile_siblings_auto_rebases_with_recorded_conflict() {
-    let Some(bin) = jj_bin() else {
-        eprintln!(
-            "skipping reconcile_siblings_auto_rebases_with_recorded_conflict: jj not resolvable"
-        );
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let origin = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-
-    // Project wired to a bare origin; shared store over its .git.
-    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-    init_project(proj.path());
-    git(
-        proj.path(),
-        &["remote", "add", "origin", &origin.path().to_string_lossy()],
-    );
-    git(proj.path(), &["push", "-q", "origin", "main"]);
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    // The Coordinator's integration bookmark, created by the coordinator's
-    // own `add_workspace` (the real flow — a coordinator never seals, so its
-    // bookmark must exist from creation) and published to origin.
-    let int = "agent/CAIRN-1940-coordinator-0";
-    add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
-    ensure_bookmark_on_origin(&jj, &store, int).unwrap();
-
-    // Two sibling jobs off the integration tip: one edits the shared file
-    // (conflict-bound), one edits a different file (clean).
-    let overlap = "agent/CAIRN-1-builder-0";
-    let clean = "agent/CAIRN-2-builder-0";
-    let ws_overlap = wts.path().join("overlap");
-    let ws_clean = wts.path().join("clean");
-    add_workspace(&jj, &store, &ws_overlap, overlap, int, None).unwrap();
-    add_workspace(&jj, &store, &ws_clean, clean, int, None).unwrap();
-    std::fs::write(ws_overlap.join("shared.rs"), "sibling-A-change\n").unwrap();
-    seal(&jj, &ws_overlap, "overlap edits shared", None).unwrap();
-    std::fs::write(ws_clean.join("other.rs"), "b-only\n").unwrap();
-    seal(&jj, &ws_clean, "clean edits other", None).unwrap();
-    // Establish each sibling's PR head on origin (both clean so far).
-    push_to_origin(&jj, &ws_overlap, overlap).unwrap();
-    push_to_origin(&jj, &ws_clean, clean).unwrap();
-
-    let change_overlap_before = jj
-        .run(
-            &store,
-            &[
-                "log",
-                "-r",
-                &format!("bookmarks(exact:{overlap:?})"),
-                "--no-graph",
-                "-T",
-                "change_id.short()",
-            ],
-            "change before",
-        )
-        .unwrap();
-    let commit_overlap_before = jj
-        .run(
-            &store,
-            &[
-                "log",
-                "-r",
-                &format!("bookmarks(exact:{overlap:?})"),
-                "--no-graph",
-                "-T",
-                "commit_id.short()",
-            ],
-            "commit before",
-        )
-        .unwrap();
-
-    // A child PR merges into the integration branch: advance its tip with a
-    // conflicting change to the shared file, and publish it to origin.
-    jj.run(&store, &["new", int], "new on int").unwrap();
-    std::fs::write(store.join("shared.rs"), "integration-advanced\n").unwrap();
-    jj.run(
-        &store,
-        &["describe", "-m", "child merged: shared advanced"],
-        "describe",
-    )
-    .unwrap();
-    jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
-        .unwrap();
-    jj.run(
-        &store,
-        &["git", "push", "--remote", "origin", "--bookmark", int],
-        "push advanced int",
-    )
-    .unwrap();
-
-    // The cleanly-rebased sibling's PR head on origin before reconcile.
-    let clean_origin_before = git_stdout(origin.path(), &["rev-parse", clean]);
-
-    // The reconcile: both siblings rebase onto the advanced tip.
-    let report = reconcile_siblings(
-        &jj,
-        &store,
-        int,
-        &[
-            (overlap.to_string(), ws_overlap.clone()),
-            (clean.to_string(), ws_clean.clone()),
-        ],
-    )
-    .unwrap();
-    assert_eq!(report.conflicted, vec![overlap.to_string()]);
-    assert_eq!(report.rebased_clean, vec![clean.to_string()]);
-
-    // reconcile pushed the cleanly-rebased sibling, advancing its PR head on
-    // origin (no force-push needed); the conflicted one was not pushed.
-    let clean_origin_after = git_stdout(origin.path(), &["rev-parse", clean]);
-    assert_ne!(
-        clean_origin_before, clean_origin_after,
-        "reconcile pushes the cleanly-rebased sibling's advanced tip to origin"
-    );
-
-    // The overlapping sibling kept its change-id; only the commit churned.
-    let change_overlap_after = jj
-        .run(
-            &store,
-            &[
-                "log",
-                "-r",
-                &format!("bookmarks(exact:{overlap:?})"),
-                "--no-graph",
-                "-T",
-                "change_id.short()",
-            ],
-            "change after",
-        )
-        .unwrap();
-    let commit_overlap_after = jj
-        .run(
-            &store,
-            &[
-                "log",
-                "-r",
-                &format!("bookmarks(exact:{overlap:?})"),
-                "--no-graph",
-                "-T",
-                "commit_id.short()",
-            ],
-            "commit after",
-        )
-        .unwrap();
-    assert_eq!(
-        change_overlap_before, change_overlap_after,
-        "auto-rebase preserves the sibling's change-id"
-    );
-    assert_ne!(
-        commit_overlap_before, commit_overlap_after,
-        "the rebased commit-id churns"
-    );
-
-    // jj records the conflict on the overlapping sibling, not the clean one.
-    assert!(branch_has_conflict(&jj, &store, overlap).unwrap());
-    assert!(!branch_has_conflict(&jj, &store, clean).unwrap());
-
-    // update-stale materialized the conflict markers in the workspace file.
-    let conflicted_file = std::fs::read_to_string(ws_overlap.join("shared.rs")).unwrap();
-    assert!(
-        conflicted_file.contains("<<<<<<<") && conflicted_file.contains(">>>>>>>"),
-        "the agent sees materialized conflict markers: {conflicted_file}"
-    );
-
-    // jj refuses to push the conflicted bookmark (so a conflicted sibling
-    // cannot advance its PR head on origin); the clean one pushes fine.
-    assert!(
-        jj.run(
-            &store,
-            &["git", "push", "--remote", "origin", "--bookmark", overlap],
-            "push conflicted",
-        )
-        .is_err(),
-        "jj must refuse to push a conflicted bookmark"
-    );
-    assert!(
-        jj.run(
-            &store,
-            &["git", "push", "--remote", "origin", "--bookmark", clean],
-            "push clean",
-        )
-        .is_ok(),
-        "the cleanly-rebased sibling pushes its advanced tip"
-    );
-
-    // Advance the integration tip once more, then make origin unavailable. The
-    // local rebase still succeeds, but a failed PR-head push must classify the
-    // sibling as failed rather than sending a misleading clean-rebase note.
-    jj.run(&store, &["new", int], "second new on int").unwrap();
-    std::fs::write(store.join("second.rs"), "second advance\n").unwrap();
-    jj.run(
-        &store,
-        &["describe", "-m", "second integration advance"],
-        "describe second",
-    )
-    .unwrap();
-    jj.run(
-        &store,
-        &["bookmark", "set", int, "-r", "@"],
-        "advance int second",
-    )
-    .unwrap();
-    std::fs::remove_dir_all(origin.path()).unwrap();
-
-    let failed_push =
-        reconcile_siblings(&jj, &store, int, &[(clean.to_string(), ws_clean.clone())]).unwrap();
-    assert_eq!(failed_push.failed.len(), 1);
-    assert_eq!(failed_push.failed[0].branch, clean);
-    assert_eq!(failed_push.failed[0].workspace_path, ws_clean);
-    assert!(
-        failed_push.failed[0].error.contains("jj git push"),
-        "configured-origin publication failure preserves the exact operation error: {failed_push:?}"
-    );
-    assert!(failed_push.rebased_clean.is_empty());
-}
-
 /// External default-branch advance: origin/main moves OUT OF BAND (a non-Cairn
 /// merge or direct push, not folded through the store). `fetch_remote` brings
 /// the new tip into the store as `main@origin`, which resolves as the rebase
@@ -1682,18 +1372,12 @@ fn reconcile_external_advance_via_origin_fetch_is_idempotent() {
     );
 
     let clean_origin_before = git_stdout(origin.path(), &["rev-parse", clean]);
+    let overlap_before = bookmark_commit(&jj, &store, overlap).unwrap();
 
-    // First reconcile: both siblings rebase onto the externally-advanced tip.
-    let report = reconcile_siblings(
-        &jj,
-        &store,
-        dest,
-        &[
-            (overlap.to_string(), ws_overlap.clone()),
-            (clean.to_string(), ws_clean.clone()),
-        ],
-    )
-    .unwrap();
+    // First reconcile: the clean sibling rebases onto the externally-advanced
+    // tip; the overlapping one conflicts and is rolled back.
+    let report =
+        reconcile_siblings(&jj, &store, dest, &[overlap.to_string(), clean.to_string()]).unwrap();
     assert_eq!(report.conflicted, vec![overlap.to_string()]);
     assert_eq!(report.rebased_clean, vec![clean.to_string()]);
 
@@ -1703,7 +1387,15 @@ fn reconcile_external_advance_via_origin_fetch_is_idempotent() {
         clean_origin_before, clean_origin_after,
         "reconcile pushes the cleanly-rebased sibling's advanced tip to origin"
     );
-    assert!(branch_has_conflict(&jj, &store, overlap).unwrap());
+    assert!(
+        !branch_has_conflict(&jj, &store, overlap).unwrap(),
+        "the conflicting rebase was rolled back, so nothing conflict-flagged is left"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, overlap).unwrap(),
+        overlap_before,
+        "the conflicting sibling is exactly where it was"
+    );
     assert!(!branch_has_conflict(&jj, &store, clean).unwrap());
 
     // The conflicted sibling's commit id after the first reconcile.
@@ -1714,16 +1406,8 @@ fn reconcile_external_advance_via_origin_fetch_is_idempotent() {
     // reads exactly this equality to suppress a redundant wake.
     git(proj.path(), &["fetch", "-q", "origin"]);
     ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let report2 = reconcile_siblings(
-        &jj,
-        &store,
-        dest,
-        &[
-            (overlap.to_string(), ws_overlap.clone()),
-            (clean.to_string(), ws_clean.clone()),
-        ],
-    )
-    .unwrap();
+    let report2 =
+        reconcile_siblings(&jj, &store, dest, &[overlap.to_string(), clean.to_string()]).unwrap();
     assert_eq!(
         report2.conflicted,
         vec![overlap.to_string()],
@@ -1738,8 +1422,8 @@ fn reconcile_external_advance_via_origin_fetch_is_idempotent() {
 
 /// A sibling that has not sealed work yet has its bookmark sitting exactly on
 /// the old base. When the base advances, reconcile must fast-forward that idle
-/// bookmark and re-parent the workspace `@` onto the new base instead of
-/// handing it to `jj rebase -b`, whose revset is empty for an ancestor bookmark.
+/// bookmark instead of handing it to `jj rebase -b`, whose revset is empty for
+/// an ancestor bookmark.
 #[test]
 #[serial_test::serial(jj)]
 fn reconcile_siblings_fast_forwards_no_work_sibling() {
@@ -1758,8 +1442,7 @@ fn reconcile_siblings_fast_forwards_no_work_sibling() {
     let int = "agent/CAIRN-2345-coordinator-0";
     add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
     let idle = "agent/CAIRN-2345-builder-0";
-    let ws_idle = wts.path().join("idle");
-    add_workspace(&jj, &store, &ws_idle, idle, int, None).unwrap();
+    add_workspace(&jj, &store, &wts.path().join("idle"), idle, int, None).unwrap();
     let old_idle_commit = bookmark_commit(&jj, &store, idle).unwrap();
 
     jj.run(&store, &["new", int], "new on int").unwrap();
@@ -1778,16 +1461,11 @@ fn reconcile_siblings_fast_forwards_no_work_sibling() {
         "the integration bookmark must advance past the idle sibling's old base"
     );
 
-    let specs = vec![(idle.to_string(), ws_idle.clone())];
+    let specs = vec![idle.to_string()];
     let report = reconcile_siblings(&jj, &store, int, &specs).unwrap();
     assert_eq!(report.rebased_clean, vec![idle.to_string()]);
     assert!(report.conflicted.is_empty());
     assert_eq!(bookmark_commit(&jj, &store, idle).unwrap(), dest_commit);
-    assert_eq!(
-        std::fs::read_to_string(ws_idle.join("base-advance.rs")).unwrap(),
-        "advanced base\n",
-        "the fast-forwarded workspace materializes the new base file"
-    );
 
     let commit_after_first = bookmark_commit(&jj, &store, idle).unwrap();
     let report2 = reconcile_siblings(&jj, &store, int, &specs).unwrap();
@@ -1797,63 +1475,6 @@ fn reconcile_siblings_fast_forwards_no_work_sibling() {
         bookmark_commit(&jj, &store, idle).unwrap(),
         commit_after_first,
         "a second reconcile is caught by the already-on-dest skip and does not rewrite"
-    );
-}
-
-/// The fast-forward path advances the idle bookmark while preserving unsealed
-/// workspace work instead of destructively re-parenting it onto the new base.
-#[test]
-#[serial_test::serial(jj)]
-fn reconcile_siblings_no_work_sibling_preserves_conflicting_wip() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping reconcile_siblings_no_work_sibling_preserves_conflicting_wip: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let int = "agent/CAIRN-2345-coordinator-0";
-    add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
-    let idle = "agent/CAIRN-2345-builder-0";
-    let ws_idle = wts.path().join("idle-conflict");
-    add_workspace(&jj, &store, &ws_idle, idle, int, None).unwrap();
-
-    std::fs::write(ws_idle.join("shared.rs"), "idle unsealed change\n").unwrap();
-    jj.run(&ws_idle, &["log", "-r", "@"], "snapshot idle wip")
-        .unwrap();
-
-    jj.run(&store, &["new", int], "new on int").unwrap();
-    std::fs::write(store.join("shared.rs"), "integration advanced shared\n").unwrap();
-    jj.run(
-        &store,
-        &["describe", "-m", "integration advances shared"],
-        "describe",
-    )
-    .unwrap();
-    jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
-        .unwrap();
-    let dest_commit = bookmark_commit(&jj, &store, int).unwrap();
-
-    let specs = vec![(idle.to_string(), ws_idle.clone())];
-    let report = reconcile_siblings(&jj, &store, int, &specs).unwrap();
-    assert!(report.conflicted.is_empty());
-    assert_eq!(report.rebased_clean, vec![idle.to_string()]);
-    assert_eq!(report.silent, vec![idle.to_string()]);
-    assert_eq!(
-        bookmark_commit(&jj, &store, idle).unwrap(),
-        dest_commit,
-        "the idle bookmark still fast-forwards to the new base"
-    );
-
-    let preserved_file = std::fs::read_to_string(ws_idle.join("shared.rs")).unwrap();
-    assert_eq!(
-        preserved_file, "idle unsealed change\n",
-        "loose local work is preserved rather than destructively re-parented"
     );
 }
 
@@ -1915,9 +1536,9 @@ fn reconcile_siblings_idempotent_no_divergence_across_import_round_trips() {
         .unwrap();
 
     let specs = vec![
-        (overlap.to_string(), ws_overlap.clone()),
-        (clean_a.to_string(), ws_a.clone()),
-        (clean_b.to_string(), ws_b.clone()),
+        overlap.to_string(),
+        clean_a.to_string(),
+        clean_b.to_string(),
     ];
 
     // First reconcile: overlap conflicts, the other two land clean.
@@ -1927,7 +1548,10 @@ fn reconcile_siblings_idempotent_no_divergence_across_import_round_trips() {
         report1.rebased_clean,
         vec![clean_a.to_string(), clean_b.to_string()]
     );
-    assert!(branch_has_conflict(&jj, &store, overlap).unwrap());
+    assert!(
+        !branch_has_conflict(&jj, &store, overlap).unwrap(),
+        "the conflicting rebase was rolled back; the branch stays on its own content"
+    );
 
     // Snapshot every child's post-reconcile commit id; later passes must not
     // move any of them.
@@ -2016,15 +1640,18 @@ fn reconcile_siblings_preserves_resolved_bookmark() {
     jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
         .unwrap();
 
-    let specs = vec![(overlap.to_string(), ws_overlap.clone())];
+    let specs = vec![overlap.to_string()];
 
-    // First reconcile records the conflict and materializes markers on disk.
-    let report1 = reconcile_siblings(&jj, &store, int, &specs).unwrap();
-    assert_eq!(report1.conflicted, vec![overlap.to_string()]);
+    // The clean-tip-over-conflicted-intermediate shape this heals, built the way
+    // it actually arrives now. A Cairn reconcile no longer produces it —
+    // `rebase_branch_onto` rolls a conflicting rebase back — so a branch carrying
+    // a conflicted commit comes from a store predating that guard, or from `jj`
+    // run outside Cairn. Flatten recovery still has to clear it.
+    rebase_recording_conflict(&jj, &store, overlap, int);
     assert!(branch_has_conflict(&jj, &store, overlap).unwrap());
 
-    // The agent resolves the markers in its workspace and re-seals: the
-    // bookmark advances to a CLEAN commit on top of the conflicted rebase.
+    // The agent resolves the conflict and re-seals: the bookmark advances to a
+    // CLEAN commit on top of the conflicted rebase.
     update_stale(&jj, &ws_overlap).unwrap();
     std::fs::write(ws_overlap.join("shared.rs"), "resolved-by-agent\n").unwrap();
     seal(&jj, &ws_overlap, "resolve base conflict", None).unwrap();
@@ -2178,7 +1805,7 @@ fn reconcile_siblings_holds_children_off_conflicted_base() {
         "the integration tip is conflicted"
     );
 
-    let specs = vec![(child.to_string(), ws_child.clone())];
+    let specs = vec![child.to_string()];
 
     // First reconcile: the dest (int) is conflicted, so the child is HELD on
     // its prior clean commit — never rebased onto the conflicted base.
@@ -2240,13 +1867,20 @@ fn reconcile_siblings_holds_children_off_conflicted_base() {
 }
 
 /// `conflicted_files` enumerates the conflicting file paths in a workspace
-/// whose markers are materialized — the detail threaded into the stop-the-line
-/// note so the agent knows exactly where to look.
+/// captured inside the rebase and carried out on the report — the detail threaded
+/// into the stop-the-line note so the agent knows exactly where to look.
+///
+/// This is the assertion that pins the capture ORDER. The rebase is rolled back,
+/// so after `reconcile_siblings` returns there is no conflict left in the store
+/// to enumerate; if the paths were read at notification time they would always be
+/// empty and the note would name no files at all.
 #[test]
 #[serial_test::serial(jj)]
-fn conflicted_files_lists_conflicting_paths() {
+fn conflicting_paths_survive_the_rollback_on_the_report() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping conflicted_files_lists_conflicting_paths: jj not resolvable");
+        eprintln!(
+            "skipping conflicting_paths_survive_the_rollback_on_the_report: jj not resolvable"
+        );
         return;
     };
     let home = TempDir::new().unwrap();
@@ -2277,18 +1911,28 @@ fn conflicted_files_lists_conflicting_paths() {
     jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
         .unwrap();
 
-    // The reconcile rebases the child onto the advanced tip, recording a
-    // conflict and materializing the markers in the child workspace.
-    let report =
-        reconcile_siblings(&jj, &store, int, &[(child.to_string(), ws_child.clone())]).unwrap();
-    assert_eq!(report.conflicted, vec![child.to_string()]);
+    let child_before = bookmark_commit(&jj, &store, child).unwrap();
 
-    update_stale(&jj, &ws_child).unwrap();
-    let files = conflicted_files(&jj, &ws_child);
+    // The reconcile attempts the rebase, sees the conflict, and rolls it back.
+    let report = reconcile_siblings(&jj, &store, int, &[child.to_string()]).unwrap();
+    assert_eq!(report.conflicted, vec![child.to_string()]);
     assert_eq!(
-        files,
-        vec!["shared.rs".to_string()],
-        "the conflicting path is listed"
+        report
+            .conflict_diagnostics
+            .get(child)
+            .map(|diagnostic| diagnostic.conflicting_paths()),
+        Some(vec!["shared.rs".to_string()]),
+        "the conflicting path rides out on the report"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, child).unwrap(),
+        child_before,
+        "the conflicting rebase was rolled back; the branch never moved"
+    );
+    assert!(
+        !branch_has_conflict(&jj, &store, child).unwrap(),
+        "nothing conflict-flagged survives in the store — which is exactly why the \
+         paths had to be captured inside the rebase"
     );
 }
 
@@ -2336,9 +1980,11 @@ fn conflicted_commits_enumerates_conflicting_commits_and_files() {
     .unwrap();
     jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
         .unwrap();
-    let report =
-        reconcile_siblings(&jj, &store, int, &[(child.to_string(), ws_child.clone())]).unwrap();
-    assert_eq!(report.conflicted, vec![child.to_string()]);
+    // Unguarded on purpose: a reconcile now rolls a conflicting rebase back, so a
+    // conflicted commit has to be constructed directly for the enumerator to have
+    // anything to enumerate. (What the reconcile carries out instead is asserted
+    // by `conflicting_paths_survive_the_rollback_on_the_report`.)
+    rebase_recording_conflict(&jj, &store, child, int);
 
     // The conflicted child commit is enumerated with its conflicted path.
     let conflicts = conflicted_commits(&jj, &store, &format!("bookmarks(exact:{child:?})"));
@@ -2550,7 +2196,7 @@ fn forked_op_rebase_diverges_but_reconcile_converges() {
     // no-op (the child already descends from `int`), so it never re-mints a
     // divergent twin. This is the single-writer + skip behavior the mutex
     // guarantees in production.
-    let specs = vec![(overlap.to_string(), ws_overlap.clone())];
+    let specs = vec![overlap.to_string()];
     let before = bookmark_commit(&jj, &store, overlap).unwrap();
     reconcile_siblings(&jj, &store, int, &specs).unwrap();
     reconcile_siblings(&jj, &store, int, &specs).unwrap();
@@ -2776,74 +2422,6 @@ fn collapse_self_heals_one_conflicted_one_clean_twin() {
         "the bookmark points at the surviving clean twin"
     );
 }
-
-/// (2) THE #162 closure: after collapsing the divergence, an agent re-seal on
-/// the sibling workspace returns `Ok` — `sealed_commit_is_lost` no longer fires
-/// (a single visible commit) and the re-sealed commit carries no resurfaced
-/// conflict. This is the invariant the thrash violated.
-#[test]
-#[serial_test::serial(jj)]
-fn reseal_after_collapse_returns_ok_without_resurfaced_conflict() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping reseal_after_collapse_returns_ok_without_resurfaced_conflict: jj not resolvable");
-        return;
-    };
-    let fx = setup_divergence_fixture(&bin);
-    // Park the workspace `@` off the sibling's sealed change before forking, so
-    // ONLY the sealed change diverges. In production `@` is a fresh working
-    // copy on the sibling tip, never itself divergent; without this, the
-    // `--at-op` fork rewrites the whole subtree (including `@`) and corrupts
-    // the working-copy commit — a test artifact, not the real failure mode.
-    fx.jj
-        .run(
-            &fx.ws_sibling,
-            &["new", "main"],
-            "park workspace @ off the sibling",
-        )
-        .unwrap();
-    let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
-    let (cid, _conflicted, clean) = fork_conflicted_and_clean(&fx.jj, &fx.store, &dest);
-    fx.jj
-        .run(
-            &fx.store,
-            &[
-                "bookmark",
-                "set",
-                DIV_SIBLING,
-                "-r",
-                &clean,
-                "--ignore-working-copy",
-            ],
-            "pin bookmark to clean twin",
-        )
-        .unwrap();
-
-    let outcome = collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
-    assert!(matches!(outcome, CollapseOutcome::Collapsed { .. }));
-    assert_eq!(visible_commits_for_change(&fx.jj, &fx.store, &cid), 1);
-
-    // Bring the workspace current onto the collapsed tip (the production
-    // re-parent a reconcile performs), then drive an agent re-seal. Before the
-    // collapse this seal tripped the lost-seal backstop (still-divergent
-    // change) and returned `LOST_SEAL_MSG`; now it lands cleanly.
-    let conflicted =
-        advance_workspace_onto(&fx.jj, &fx.store, &fx.ws_sibling, DIV_SIBLING, &clean).unwrap();
-    assert!(
-        !conflicted,
-        "advancing onto the clean collapsed tip is conflict-free"
-    );
-    std::fs::write(fx.ws_sibling.join("resolved.rs"), "resolved\n").unwrap();
-    let result = seal(&fx.jj, &fx.ws_sibling, "re-seal after collapse", None);
-    assert!(
-        result.is_ok(),
-        "the re-seal returns Ok (no lost-seal thrash): {result:?}"
-    );
-    assert!(
-        !branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
-        "the re-sealed sibling carries no resurfaced conflict"
-    );
-}
-
 /// (3) Ambiguous — both twins conflicted: every twin still conflicts, so there
 /// is no single clean keep. The helper holds and surfaces, mutating nothing.
 #[test]
@@ -3221,7 +2799,7 @@ fn bookmark_landed_in_tracks_the_fold() {
 /// Returns the advanced integration tip commit id (the flatten dest).
 fn make_intermediate_only(fx: &DivergenceFixture) -> String {
     let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
-    rebase_branch_onto(&fx.jj, &fx.store, DIV_SIBLING, DIV_INT).unwrap();
+    rebase_recording_conflict(&fx.jj, &fx.store, DIV_SIBLING, DIV_INT);
     assert!(
         branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
         "the rebase records a conflict on the sibling's sealed commit"
@@ -3253,11 +2831,8 @@ struct WedgedHub {
     _proj: TempDir,
     _wts: TempDir,
     _origin: TempDir,
-    origin_path: PathBuf,
     jj: JjEnv,
     store: PathBuf,
-    ws_coord: PathBuf,
-    main_tip: String,
     int: &'static str,
     child: &'static str,
 }
@@ -3331,7 +2906,7 @@ fn setup_wedged_hub(bin: &str) -> WedgedHub {
     // shared `hub-edit` commit; the child (which descends from it) is dragged
     // onto the same conflicted commit. Resolve each branch at ITS OWN tip and
     // re-seal, leaving both with a CLEAN tip over the conflicted INTERMEDIATE.
-    rebase_branch_onto(&jj, &store, int, "main").unwrap();
+    rebase_recording_conflict(&jj, &store, int, "main");
     assert!(branch_has_conflict(&jj, &store, int).unwrap());
     update_stale(&jj, &ws_coord).unwrap();
     std::fs::write(ws_coord.join("shared.rs"), "hub-resolved\n").unwrap();
@@ -3352,17 +2927,13 @@ fn setup_wedged_hub(bin: &str) -> WedgedHub {
         "hub: clean tip over a conflicted intermediate"
     );
 
-    let origin_path = origin.path().to_path_buf();
     WedgedHub {
         _home: home,
         _proj: proj,
         _wts: wts,
         _origin: origin,
-        origin_path,
         jj,
         store,
-        ws_coord,
-        main_tip,
         int,
         child,
     }
@@ -3593,7 +3164,7 @@ fn reconcile_siblings_flattens_intermediate_only_sibling() {
 
     // Drive the sibling into the clean-tip / conflicted-intermediate shape:
     // rebase onto the conflicting tip, then resolve on top.
-    rebase_branch_onto(&jj, &store, sibling, int).unwrap();
+    rebase_recording_conflict(&jj, &store, sibling, int);
     assert!(branch_has_conflict(&jj, &store, sibling).unwrap());
     update_stale(&jj, &ws).unwrap();
     std::fs::write(ws.join("shared.rs"), "resolved\n").unwrap();
@@ -3607,8 +3178,7 @@ fn reconcile_siblings_flattens_intermediate_only_sibling() {
 
     // The reconcile flattens the sibling (already-on-dest path), classifies it
     // clean, and pushes the flattened tip to origin.
-    let report =
-        reconcile_siblings(&jj, &store, int, &[(sibling.to_string(), ws.clone())]).unwrap();
+    let report = reconcile_siblings(&jj, &store, int, &[sibling.to_string()]).unwrap();
     assert_eq!(report.rebased_clean, vec![sibling.to_string()]);
     assert!(report.conflicted.is_empty());
 
@@ -3654,7 +3224,7 @@ fn flatten_repoints_rider_bookmark_on_conflicted_intermediate() {
     // Advance the integration tip conflictingly and rebase the sibling onto it,
     // recording a conflict on the sibling's (now INTERMEDIATE) sealed commit.
     let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
-    rebase_branch_onto(&fx.jj, &fx.store, DIV_SIBLING, DIV_INT).unwrap();
+    rebase_recording_conflict(&fx.jj, &fx.store, DIV_SIBLING, DIV_INT);
     assert!(branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap());
 
     // A sibling planner bookmark rides the conflicted intermediate.
@@ -3780,72 +3350,6 @@ fn operation_id_and_restore_operation_roll_back_a_fold() {
         "no divergent twin accumulated for the child change across the rollback+retry"
     );
 }
-
-/// Component A (the load-bearing fix), positive case: a hub with a CLEAN tip
-/// over a conflicted INTERMEDIATE (a `main` advance baked the conflict into the
-/// hub's own history; the coordinator resolved at the tip and re-sealed) is
-/// flattened at merge time, the child rebases + folds onto it, and the
-/// integration branch pushes to a bare origin — the wedge is cleared.
-#[test]
-#[serial_test::serial(jj)]
-fn target_flatten_unwedges_child_merge_into_conflicted_hub() {
-    let Some(bin) = jj_bin() else {
-        eprintln!(
-            "skipping target_flatten_unwedges_child_merge_into_conflicted_hub: jj not resolvable"
-        );
-        return;
-    };
-    let hub = setup_wedged_hub(&bin);
-    // The fixture's child: clean tip over its own conflicted intermediate,
-    // carrying its own resolution (as the live child B did).
-    let child = hub.child;
-
-    // === Replicate store_merge_child's integration path ===
-    // 1. Target preflight: flatten the hub onto its base (main_tip).
-    let report =
-        flatten_branch_recovery(&hub.jj, &hub.store, hub.int, &hub.main_tip, "hub flattened")
-            .unwrap();
-    assert!(
-        report.collapsed_conflicted_commits >= 1,
-        "the hub flatten collapsed its conflicted intermediate"
-    );
-    assert!(!branch_has_conflict(&hub.jj, &hub.store, hub.int).unwrap());
-    let flattened_int = bookmark_commit(&hub.jj, &hub.store, hub.int).unwrap();
-    advance_workspace_onto(&hub.jj, &hub.store, &hub.ws_coord, hub.int, &flattened_int).unwrap();
-
-    // 2. Rebase the source onto the flattened integration tip. The rebase
-    //    re-applies the child's inherited (old) hub lineage, so it now carries a
-    //    conflicted intermediate of its own — the SOURCE flatten clears it.
-    rebase_branch_onto(&hub.jj, &hub.store, child, hub.int).unwrap();
-    if let FlattenState::IntermediateOnly =
-        flatten_state(&hub.jj, &hub.store, hub.int, child).unwrap()
-    {
-        let d = bookmark_commit(&hub.jj, &hub.store, hub.int).unwrap();
-        flatten_branch_recovery(&hub.jj, &hub.store, child, &d, "child flattened").unwrap();
-    }
-    let range = format!("bookmarks(exact:{:?})..bookmarks(exact:{child:?})", hub.int);
-    assert!(
-        conflicted_commits(&hub.jj, &hub.store, &range).is_empty(),
-        "no conflicted commit survives on the child after the flattens"
-    );
-
-    // 3. Fold + push: the integration branch advances on origin (was wedged).
-    merge_into_bookmark(&hub.jj, &hub.store, hub.int, child).unwrap();
-    let origin_before = git_stdout(&hub.origin_path, &["rev-parse", hub.int]);
-    track_bookmark(&hub.jj, &hub.store, child).ok();
-    push_store_bookmark(&hub.jj, &hub.store, child).unwrap();
-    push_store_bookmark(&hub.jj, &hub.store, hub.int).unwrap();
-    let origin_after = git_stdout(&hub.origin_path, &["rev-parse", hub.int]);
-    assert_ne!(
-        origin_before, origin_after,
-        "the integration branch advanced on origin after the merge"
-    );
-    assert!(
-        bookmark_landed_in(&hub.jj, &hub.store, child, hub.int),
-        "the child's tip is an ancestor of the advanced integration branch"
-    );
-}
-
 /// Component A, the pinned failure mode: WITHOUT the target flatten, folding a
 /// child into the conflicted hub leaves the integration branch's ancestry
 /// carrying a conflicted commit, so the push is REFUSED — exactly the live
@@ -3861,7 +3365,9 @@ fn child_merge_push_refused_without_target_flatten() {
     let child = hub.child;
 
     // Skip the target flatten; fold the child straight into the conflicted hub.
-    rebase_branch_onto(&hub.jj, &hub.store, child, hub.int).unwrap();
+    // Unguarded on purpose: this is the pre-flatten wedge itself, which
+    // `rebase_branch_onto` now rolls back rather than lands.
+    rebase_recording_conflict(&hub.jj, &hub.store, child, hub.int);
     merge_into_bookmark(&hub.jj, &hub.store, hub.int, child).unwrap();
 
     // The integration branch's ancestry now includes the hub's conflicted
@@ -4159,14 +3665,20 @@ fn rebase_then_fold_conflict_returns_safe_error_and_leaves_default_unmoved() {
 
     let main_before = bookmark_commit(&jj, &store, "main").unwrap();
 
+    let source_before = bookmark_commit(&jj, &store, source).unwrap();
+
     let err = rebase_then_fold_into(&jj, &store, "main", source, "main").unwrap_err();
     assert!(
         !err.to_lowercase().contains("allow-backwards"),
         "the conflict error must never surface the dangerous --allow-backwards hint: {err}"
     );
     assert!(
-        err.to_lowercase().contains("conflict"),
-        "the error explains a conflict was recorded: {err}"
+        err.contains("shared.rs"),
+        "the refusal names the file that did not merge: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("marker"),
+        "agents hold detached git worktrees, so there are no markers to point them at: {err}"
     );
     assert_eq!(
         bookmark_commit(&jj, &store, "main").unwrap(),
@@ -4174,21 +3686,30 @@ fn rebase_then_fold_conflict_returns_safe_error_and_leaves_default_unmoved() {
         "the default bookmark is left unchanged — never moved backward on a conflict"
     );
 
-    // The conflict was recorded on the source bookmark, but its live
-    // workspace `@` was rebased out from under it and is stale. Refreshing it
-    // (what `store_merge_child` does via `materialize_source_conflict_in_workspaces`
-    // on this conflict) materializes the markers the resolve-and-retry error
-    // points the agent at — without this, the guidance would be empty.
-    assert!(
-        branch_has_conflict(&jj, &store, source).unwrap(),
-        "the conflict is recorded on the source bookmark"
+    // The refusal's central claim, asserted rather than promised: the source is
+    // bit-identical to its pre-merge self, carries no recorded conflict, and its
+    // backing git ref still holds the agent's own content.
+    assert_eq!(
+        bookmark_commit(&jj, &store, source).unwrap(),
+        source_before,
+        "the refused merge left the source exactly where it was"
     );
-    update_stale(&jj, &ws_src).unwrap();
-    let on_disk = std::fs::read_to_string(ws_src.join("shared.rs")).unwrap();
     assert!(
-        on_disk.contains("<<<<<<<") && on_disk.contains(">>>>>>>"),
-        "refreshing the source workspace materializes the conflict markers on disk: {on_disk}"
+        !branch_has_conflict(&jj, &store, source).unwrap(),
+        "no conflict was left on the source for anything to export"
     );
+    let source_ref = format!("refs/heads/{source}");
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &source_ref]),
+        source_before,
+        "the backing git ref stayed on the pre-merge tip"
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["show", &format!("{source_ref}:shared.rs")]),
+        "source-change",
+        "the source's own content survived; the destination side never landed on it"
+    );
+    let _ = &ws_src;
 }
 
 /// A store-side rebase must export the moved bookmark back to the backing git
@@ -4649,7 +4170,7 @@ fn seal_refuses_conflicted_branch_with_distinct_error() {
 
     // Reconcile: rebase the feature branch onto main — the bookmark tip now
     // carries a recorded conflict.
-    rebase_branch_onto(&jj, &store, branch, "main").unwrap();
+    rebase_recording_conflict(&jj, &store, branch, "main");
     assert!(
         branch_has_conflict(&jj, &store, branch).unwrap(),
         "precondition: the rebased bookmark tip carries a recorded conflict"
@@ -4868,7 +4389,15 @@ fn seal_paths_detects_and_backs_out_a_lost_seal() {
 
     // A clean seal succeeds normally (the no-false-positive baseline).
     std::fs::write(ws.join("a.txt"), "v1\n").unwrap();
-    let ok = seal_paths(&jj, &ws, "seal1", None, &[]).expect("a clean seal succeeds");
+    let ok = seal_paths(
+        &jj,
+        &ws,
+        "seal1",
+        None,
+        &[],
+        Some("agent/CAIRN-1-builder-0"),
+    )
+    .expect("a clean seal succeeds");
     assert!(!ok.sha.is_empty());
     let parent_cid = jj
         .run(
@@ -4902,8 +4431,15 @@ fn seal_paths_detects_and_backs_out_a_lost_seal() {
     .unwrap();
 
     std::fs::write(ws.join("b.txt"), "v2\n").unwrap();
-    let err = seal_paths(&jj, &ws, "seal2", None, &[])
-        .expect_err("a lost seal must surface as Err, not Ok with a phantom sha");
+    let err = seal_paths(
+        &jj,
+        &ws,
+        "seal2",
+        None,
+        &[],
+        Some("agent/CAIRN-1-builder-0"),
+    )
+    .expect_err("a lost seal must surface as Err, not Ok with a phantom sha");
     assert!(
         is_lost_seal_error(&err),
         "the seal error is classified lost-seal: {err}"
@@ -5025,213 +4561,6 @@ fn discard_self_heals_stale_working_copy_with_loose_edits() {
         "the worktree is clean and equals the advanced @ after self-heal"
     );
 }
-
-/// The #158 recovery contract at the jj layer: a child folds into the
-/// coordinator's integration base, leaving the coordinator workspace STALE.
-/// The primitives `recover_stale_file_commit` chains — reconcile the stale
-/// workspace onto the advanced base (the `update_stale` it calls, here via the
-/// production `advance_workspace_onto`), re-apply the agent's edit, then
-/// re-seal — must land the batch ON the advanced base, preserving BOTH the
-/// merged sibling work and the agent's edit, never losing either. (The
-/// loose-edits-during-rebase shape that mints a divergent twin — correctly
-/// caught by the lost-seal guard — is a distinct failure tracked as a separate
-/// follow-up; this pins the common clean case.)
-#[test]
-#[serial_test::serial(jj)]
-fn stale_seal_recovers_batch_onto_advanced_base() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping stale_seal_recovers_batch_onto_advanced_base: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    // A child folds into the coordinator's integration bookmark, advancing the
-    // base and leaving the coordinator workspace STALE behind it — the
-    // post-advance race that routes a write into recovery.
-    let (int_tip, ws_coord, int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
-
-    // Recovery (a): reconcile the stale coordinator onto the advanced base.
-    // `advance_workspace_onto` performs the store-side rebase plus the same
-    // `update_stale` `recover_stale_file_commit` calls, materializing the
-    // merged sibling work. Re-parenting the empty `@` leaves no divergent twin.
-    advance_workspace_onto(&jj, &store, &ws_coord, &int, &int_tip).unwrap();
-    assert!(
-        ws_coord.join("child.rs").exists(),
-        "the merged sibling's work is materialized on the advanced base"
-    );
-
-    // Recovery (b): re-apply the agent's batch edit against the advanced base.
-    std::fs::write(ws_coord.join("feature.rs"), "agent feature\n").unwrap();
-
-    // Recovery (c): re-seal — lands a real commit on the advanced base.
-    let result = seal(&jj, &ws_coord, "agent feature", None).unwrap();
-    assert!(
-        !result.sha.is_empty(),
-        "the recovered batch seals a real commit"
-    );
-    assert_eq!(
-        is_working_copy_dirty(&jj, &ws_coord),
-        Ok(false),
-        "the worktree equals HEAD after the recovered seal"
-    );
-
-    // The sealed commit (`@-`) carries the agent's edit...
-    let sealed_names = jj
-        .run(
-            &ws_coord,
-            &["diff", "-r", "@-", "--name-only"],
-            "recovered seal contents",
-        )
-        .unwrap();
-    assert!(
-        sealed_names.contains("feature.rs"),
-        "the recovered seal commits the agent's edit: {sealed_names}"
-    );
-
-    // ...and the integration bookmark advanced FORWARD over the merged sibling
-    // tip, so neither the sibling's merged work nor the agent's edit was lost.
-    let int_after = bookmark_commit(&jj, &store, &int).unwrap();
-    let fwd = jj
-        .run(
-            &store,
-            &[
-                "log",
-                "-r",
-                &format!("{int_tip} & ::{int_after}"),
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ],
-            "forward-only check",
-        )
-        .unwrap();
-    assert_eq!(
-        fwd, int_tip,
-        "the recovered seal advances the base forward over the merged sibling work, never backward"
-    );
-    assert!(
-        ws_coord.join("feature.rs").exists() && ws_coord.join("child.rs").exists(),
-        "both the agent's edit and the merged sibling work coexist after recovery"
-    );
-}
-
-/// `advance_workspace_onto` re-parents the stale coordinator `@` onto the
-/// folded integration tip and materializes the merged child's file on disk —
-/// the jj-native restoration of §6's post-merge fast-forward. Idempotent: a
-/// second advance at the same tip is a no-op.
-#[test]
-#[serial_test::serial(jj)]
-fn advance_coordinator_workspace_after_fold() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping advance_coordinator_workspace_after_fold: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let (int_tip, ws_coord, int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
-
-    let conflicted = advance_workspace_onto(&jj, &store, &ws_coord, &int, &int_tip).unwrap();
-    assert!(
-        !conflicted,
-        "re-parenting the empty coordinator @ never conflicts"
-    );
-
-    let coord_parent_after = jj
-        .run(
-            &ws_coord,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "coord @- after",
-        )
-        .unwrap();
-    assert_eq!(
-        coord_parent_after, int_tip,
-        "the coordinator @ is re-parented onto the folded tip"
-    );
-    assert!(
-        ws_coord.join("child.rs").exists(),
-        "update-stale materialized the merged child's file in the coordinator workspace"
-    );
-
-    // Idempotency under the merge/webhook double-fire: a second advance when
-    // `@` already sits on the tip is a no-op.
-    let again = advance_workspace_onto(&jj, &store, &ws_coord, &int, &int_tip).unwrap();
-    assert!(!again);
-    let coord_parent_twice = jj
-        .run(
-            &ws_coord,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "coord @- twice",
-        )
-        .unwrap();
-    assert_eq!(
-        coord_parent_twice, int_tip,
-        "re-running the advance when already on the tip leaves @ in place"
-    );
-}
-
-/// After the coordinator is advanced onto the folded tip, an edit + `seal`
-/// moves the integration bookmark FORWARD to the new sealed commit (a
-/// descendant of the folded tip) — never backward, so no merged child is
-/// dropped.
-#[test]
-#[serial_test::serial(jj)]
-fn seal_after_fold_advances_bookmark_forward() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping seal_after_fold_advances_bookmark_forward: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let (int_tip, ws_coord, int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
-    advance_workspace_onto(&jj, &store, &ws_coord, &int, &int_tip).unwrap();
-
-    std::fs::write(ws_coord.join("coord.rs"), "coord work\n").unwrap();
-    seal(&jj, &ws_coord, "coord work", None).unwrap();
-
-    let int_after = bookmark_commit(&jj, &store, &int).unwrap();
-    assert_ne!(
-        int_after, int_tip,
-        "the seal advanced the integration bookmark"
-    );
-    // Forward-only: the folded tip is an ancestor of the new bookmark commit.
-    let fwd = jj
-        .run(
-            &store,
-            &[
-                "log",
-                "-r",
-                &format!("{int_tip} & ::{int_after}"),
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ],
-            "forward-only check",
-        )
-        .unwrap();
-    assert_eq!(
-        fwd, int_tip,
-        "the folded tip is an ancestor of the new bookmark (forward-only, never backward)"
-    );
-}
-
 /// Fix (b) backstop: with the coordinator `@` left deliberately STALE (no
 /// advance), a `seal` must fail loudly and — critically — BEFORE creating any
 /// commit, so it never produces an orphaned off-branch commit that the generic
@@ -5298,250 +4627,6 @@ fn seal_refuses_non_fast_forward_bookmark_move() {
         "the refused seal never moves the integration bookmark backward/sideways"
     );
 }
-
-/// The archival load-bearing case: jj's auto-rebase churns a descendant's
-/// commit-id while its change-id stays stable, and `forward_resolve_commit`
-/// maps the now-hidden original commit-id forward to the current one. A
-/// non-jj directory yields `None` (identity at the call site).
-#[test]
-#[serial_test::serial(jj)]
-fn forward_resolve_commit_maps_churned_commit_to_current() {
-    let Some(bin) = jj_bin() else {
-        eprintln!(
-            "skipping forward_resolve_commit_maps_churned_commit_to_current: jj not resolvable"
-        );
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
-
-    // Seal a parent then a child commit on top of it.
-    std::fs::write(ws.join("parent.rs"), "p\n").unwrap();
-    seal(&jj, &ws, "parent", None).unwrap();
-    std::fs::write(ws.join("child.rs"), "c\n").unwrap();
-    seal(&jj, &ws, "child", None).unwrap();
-
-    let child_commit_before = jj
-        .run(
-            &ws,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "child commit",
-        )
-        .unwrap();
-    let child_change = jj
-        .run(
-            &ws,
-            &["log", "-r", "@-", "--no-graph", "-T", "change_id"],
-            "child change",
-        )
-        .unwrap();
-    // The SHORT form a write tool_result actually records.
-    let child_short_before = jj
-        .run(
-            &ws,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id.short()"],
-            "child short",
-        )
-        .unwrap();
-    // This is a non-colocated workspace: it has no .git, so a git-in-worktree
-    // resolution of the recorded id is impossible — only jj can resolve it.
-    assert!(
-        !ws.join(".git").exists(),
-        "a jj workspace is non-colocated (no .git)"
-    );
-
-    // Reword the PARENT (@--), which auto-rebases the child and churns its
-    // commit-id while preserving its change-id.
-    jj.run(
-        &ws,
-        &["describe", "-r", "@--", "-m", "parent reworded"],
-        "reword parent",
-    )
-    .unwrap();
-    let child_commit_after = jj
-        .run(
-            &ws,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "child commit after",
-        )
-        .unwrap();
-    assert_ne!(
-        child_commit_before, child_commit_after,
-        "auto-rebase churns the child commit-id"
-    );
-
-    let (change_id, current) = forward_resolve_commit(&jj, &ws, &child_commit_before)
-        .expect("forward-map resolves a churned commit");
-    assert_eq!(change_id, child_change, "the stable change-id is recovered");
-    assert_eq!(
-        current, child_commit_after,
-        "forward-maps the hidden original commit-id to the current one"
-    );
-
-    // The same holds for the SHORT, now-hidden id — the form archival actually
-    // hands in — with no git in the worktree.
-    let (_, from_short) = forward_resolve_commit(&jj, &ws, &child_short_before)
-        .expect("forward-map resolves a churned SHORT commit-id");
-    assert_eq!(from_short, child_commit_after);
-
-    // A non-jj directory is a clean identity no-op (returns None).
-    let plain = wts.path().join("plain-git");
-    std::fs::create_dir_all(&plain).unwrap();
-    assert!(forward_resolve_commit(&jj, &plain, &child_commit_before).is_none());
-}
-
-/// A divergent change resolves to several visible commits; `forward_resolve_commit`
-/// must pick the one reachable from the worktree tip (`@`) — the side that
-/// lands in the archival pack — rather than erroring on the bare change-id.
-#[test]
-#[serial_test::serial(jj)]
-fn forward_resolve_commit_prefers_tip_reachable_on_divergence() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping forward_resolve_commit_prefers_tip_reachable_on_divergence: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let dir = TempDir::new().unwrap();
-    let d = dir.path();
-    // A colocated jj repo over a git repo, so `--at-op` divergence is easy to
-    // construct and the change-id resolves the same way archival sees it.
-    git(d, &["init", "-q", "-b", "main"]);
-    git(d, &["config", "user.email", "t@e.com"]);
-    git(d, &["config", "user.name", "t"]);
-    std::fs::write(d.join("a.txt"), "base\n").unwrap();
-    git(d, &["add", "-A"]);
-    git(d, &["commit", "-q", "-m", "base"]);
-    let jj = JjEnv::resolve(&bin, home.path());
-    jj.run(d, &["git", "init", "--colocate"], "colocate")
-        .unwrap();
-    jj.run(d, &["new"], "new").unwrap();
-    std::fs::write(d.join("c.rs"), "c\n").unwrap();
-    jj.run(d, &["commit", "-m", "C"], "commit C").unwrap();
-
-    let c0 = jj
-        .run(
-            d,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "c0",
-        )
-        .unwrap();
-    let change = jj
-        .run(
-            d,
-            &["log", "-r", "@-", "--no-graph", "-T", "change_id"],
-            "change",
-        )
-        .unwrap();
-    let op0 = jj
-        .run(
-            d,
-            &["op", "log", "--no-graph", "--limit", "1", "-T", "id"],
-            "op0",
-        )
-        .unwrap();
-
-    // Rewrite C one way, then concurrently rewrite the ORIGINAL C a different
-    // way at the earlier operation, creating a divergent change.
-    jj.run(d, &["describe", "-r", &c0, "-m", "A"], "describe A")
-        .unwrap();
-    jj.run(
-        d,
-        &["--at-op", &op0, "describe", "-r", &c0, "-m", "B"],
-        "describe B",
-    )
-    .unwrap();
-    // A normal command resolves the concurrent operations.
-    let _ = jj.run(
-        d,
-        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
-        "resolve ops",
-    );
-
-    let visible = jj
-        .run(
-            d,
-            &[
-                "log",
-                "-r",
-                &format!("change_id({change})"),
-                "--no-graph",
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-            "visible",
-        )
-        .unwrap();
-    let count = visible.lines().filter(|l| !l.is_empty()).count();
-    assert!(
-        count >= 2,
-        "the change must be divergent (>=2 visible commits): {visible}"
-    );
-
-    let (_, current) =
-        forward_resolve_commit(&jj, d, &c0).expect("forward-map resolves a divergent change");
-    assert!(
-        visible.lines().any(|l| l == current),
-        "the chosen commit is one of the divergent commits: {current} in {visible}"
-    );
-    let reachable = jj
-        .run(
-            d,
-            &[
-                "log",
-                "-r",
-                &format!("({current}) & ::@"),
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ],
-            "reachable check",
-        )
-        .unwrap();
-    assert!(
-        !reachable.is_empty(),
-        "forward-map picks the tip-reachable side of the divergence: {current}"
-    );
-}
-
-/// The populate glob -> jj `snapshot.auto-track` fileset translation: file
-/// globs become depth-agnostic `glob:"**/<p>"`, a `dir/` becomes both its
-/// subtree and its own path, an empty config keeps jj's `all()` default, and
-/// backstop `extra_paths` are added as exact literal filesets.
-#[test]
-fn populate_auto_track_expr_translates_patterns() {
-    use crate::config::project_settings::PopulateConfig;
-    let config = PopulateConfig {
-        copy: vec![".env".into(), ".env*".into(), "target/".into()],
-        symlink: vec!["node_modules/".into()],
-    };
-    let expr = populate_auto_track_expr(&config, &[]).unwrap();
-    assert!(expr.starts_with("all() ~ ("), "got: {expr}");
-    assert!(expr.contains("glob:\"**/.env\""), "got: {expr}");
-    assert!(expr.contains("glob:\"**/.env*\""), "got: {expr}");
-    assert!(expr.contains("glob:\"**/target/**\""), "got: {expr}");
-    assert!(expr.contains("glob:\"**/target\""), "got: {expr}");
-    assert!(expr.contains("glob:\"**/node_modules/**\""), "got: {expr}");
-    assert!(expr.contains("glob:\"**/node_modules\""), "got: {expr}");
-
-    assert!(
-        populate_auto_track_expr(&PopulateConfig::default(), &[]).is_none(),
-        "empty config leaves jj's all() default untouched"
-    );
-
-    let healed =
-        populate_auto_track_expr(&PopulateConfig::default(), &["secret/leaked.txt".into()])
-            .unwrap();
-    assert!(healed.contains("\"secret/leaked.txt\""), "got: {healed}");
-}
-
 /// `quote_fileset` wraps a repo-relative path as a jj string literal so paths
 /// with fileset metacharacters (a Next.js `(app)` route group) match
 /// literally instead of parsing as a fileset expression. `"` and `\` are
@@ -5597,7 +4682,15 @@ fn seal_paths_commits_path_with_fileset_metacharacters() {
     std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
     std::fs::write(&abs, "export default function Page() {}\n").unwrap();
 
-    let res = seal_paths(&jj, &ws, "add drawings page", None, &[rel]).unwrap();
+    let res = seal_paths(
+        &jj,
+        &ws,
+        "add drawings page",
+        None,
+        &[rel],
+        Some("agent/CAIRN-2019-builder-0"),
+    )
+    .unwrap();
     assert!(
         !res.sha.is_empty(),
         "path-scoped seal of a parens path returns a commit id"
@@ -5616,148 +4709,6 @@ fn seal_paths_commits_path_with_fileset_metacharacters() {
         "@ is clean after the path-scoped seal"
     );
 }
-
-/// SECURITY: explicitly-populated gitignored content must stay UNCOMMITTED in
-/// a jj workspace. With `snapshot.auto-track` set BEFORE the files appear, a
-/// populated path that has NO ignore rule in the workspace (the residual
-/// leak: ignored only by an untracked source `.gitignore`) never enters `@`
-/// and cannot be sealed, while a normal new source file IS tracked and
-/// sealable. Runs in the production NON-colocated shape (store + workspace,
-/// asserted no `.git` — a colocated repo would mask the bug).
-#[test]
-#[serial_test::serial(jj)]
-fn populate_auto_track_keeps_ignored_content_out_of_snapshot_and_seals() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping populate_auto_track_keeps_ignored_content_out_of_snapshot_and_seals: jj not resolvable");
-        return;
-    };
-    use crate::config::project_settings::PopulateConfig;
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let branch = "agent/CAIRN-7-builder-0";
-    let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-
-    // Production shape: a `.jj`-only workspace with NO `.git`.
-    assert!(ws.join(".jj").is_dir());
-    assert!(
-        !ws.join(".git").exists(),
-        "workspace must be .jj-only (non-colocated) or both bugs are masked"
-    );
-
-    let config = PopulateConfig {
-        copy: vec![".env".into()],
-        symlink: vec!["node_modules/".into()],
-    };
-    // Establish the exclude BEFORE the populated files appear.
-    set_populate_auto_track(&jj, &store, &config, &[]).unwrap();
-
-    // Simulate populate: a secret with NO ignore rule in the workspace, a
-    // populated dir, plus a normal source file an agent would later write.
-    std::fs::write(ws.join(".env"), "SECRET=token\n").unwrap();
-    std::fs::create_dir_all(ws.join("node_modules")).unwrap();
-    std::fs::write(ws.join("node_modules").join("pkg.js"), "x\n").unwrap();
-    std::fs::write(ws.join("real.rs"), "fn main() {}\n").unwrap();
-
-    let dirty = working_copy_dirty_paths(&jj, &ws).unwrap();
-    assert!(
-        dirty.iter().any(|p| p == "real.rs"),
-        "a normal source file must be tracked: {dirty:?}"
-    );
-    assert!(
-        !dirty.iter().any(|p| p.contains(".env")),
-        "populated secret must NOT be snapshot-visible: {dirty:?}"
-    );
-    assert!(
-        !dirty.iter().any(|p| p.contains("node_modules")),
-        "populated dir must NOT be snapshot-visible: {dirty:?}"
-    );
-
-    // A seal must not fold the populated content into the commit.
-    seal(&jj, &ws, "agent work", None).unwrap();
-    let cfg = home.path().join("jj").join("config.toml");
-    let out = crate::env::command(&bin)
-        .args(["diff", "-r", "@-", "--name-only"])
-        .current_dir(&ws)
-        .env("JJ_CONFIG", &cfg)
-        .output()
-        .unwrap();
-    let names = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        names.contains("real.rs"),
-        "the agent's file must be sealed: {names}"
-    );
-    assert!(
-        !names.contains(".env"),
-        "the secret must NEVER be sealed: {names}"
-    );
-    assert!(
-        !names.contains("node_modules"),
-        "populated dir must NEVER be sealed: {names}"
-    );
-}
-
-/// Backstop self-heal: a populated path the initial glob translation missed
-/// gets tracked; feeding it back through `set_populate_auto_track(extra)` +
-/// `untrack_paths` removes it from the snapshot WITHOUT deleting it from disk
-/// — the recovery that runs before fail-loud in `prepare_worktree_for_job`.
-#[test]
-#[serial_test::serial(jj)]
-fn untrack_self_heals_a_leaked_populated_path() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping untrack_self_heals_a_leaked_populated_path: jj not resolvable");
-        return;
-    };
-    use crate::config::project_settings::PopulateConfig;
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-7-builder-0", "main", None).unwrap();
-
-    // A populate config whose globs do NOT cover this path — it leaks.
-    let config = PopulateConfig {
-        copy: vec![".env".into()],
-        symlink: vec![],
-    };
-    set_populate_auto_track(&jj, &store, &config, &[]).unwrap();
-    std::fs::write(ws.join("leaked.secret"), "token\n").unwrap();
-    assert!(
-        working_copy_dirty_paths(&jj, &ws)
-            .unwrap()
-            .iter()
-            .any(|p| p == "leaked.secret"),
-        "the unmatched path is tracked until self-heal"
-    );
-
-    // Self-heal: add the exact leaked path to auto-track and untrack it.
-    set_populate_auto_track(&jj, &store, &config, &["leaked.secret".into()]).unwrap();
-    untrack_paths(&jj, &ws, &["leaked.secret".into()]).unwrap();
-
-    assert!(
-        !working_copy_dirty_paths(&jj, &ws)
-            .unwrap()
-            .iter()
-            .any(|p| p == "leaked.secret"),
-        "self-heal removes the leaked path from the snapshot"
-    );
-    assert!(
-        ws.join("leaked.secret").exists(),
-        "untrack must NOT delete the file from disk"
-    );
-}
-
 /// A `git rev-parse` test closure over `repo` mirroring the production
 /// `GitService::rev_parse` contract: `Some(trimmed_sha)` for a ref git
 /// resolves, `None` otherwise (non-zero exit — unborn or unmatched ref).
@@ -6011,213 +4962,6 @@ fn induced_stale_clean_workspace_heals_via_update_stale() {
         "the merged sibling file is materialized after the heal"
     );
 }
-
-/// The core WS1 fix at the backend level: a workspace sitting BEHIND its
-/// advanced branch tip (the coordinator-fold shape) is reconciled by
-/// `reconcile_workspace` — `@` re-parented onto the tip, merged sibling work
-/// materialized, working copy clean — and a subsequent seal succeeds with no
-/// agent-visible error.
-#[test]
-#[serial_test::serial(jj)]
-fn reconcile_workspace_heals_behind_tip_and_reseals() {
-    use crate::mcp::vcs::WorktreeVcs;
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping reconcile_workspace_heals_behind_tip_and_reseals: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let (int_tip, ws_coord, int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
-
-    // Precondition: a seal is refused — `@` is behind the advanced branch tip.
-    let premature = seal(&jj, &ws_coord, "premature", None);
-    assert!(
-        premature
-            .as_ref()
-            .err()
-            .map(|e| is_stale_error(e))
-            .unwrap_or(false),
-        "precondition: sealing a behind-tip workspace is refused: {premature:?}"
-    );
-
-    // Reconcile via the production backend.
-    let backend = crate::mcp::vcs::JjBackend::new(JjEnv::resolve(&bin, home.path()));
-    backend.reconcile_workspace(&ws_coord).unwrap();
-
-    // `@` now sits on the branch tip; the merged sibling file is materialized.
-    let coord_parent = jj
-        .run(
-            &ws_coord,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "coord @- after reconcile",
-        )
-        .unwrap();
-    assert_eq!(
-        coord_parent, int_tip,
-        "reconcile re-parents @ onto the branch tip"
-    );
-    assert!(
-        ws_coord.join("child.rs").exists(),
-        "the merged sibling work is materialized"
-    );
-    assert_eq!(
-        is_working_copy_dirty(&jj, &ws_coord),
-        Ok(false),
-        "the worktree is clean after reconcile"
-    );
-
-    // A subsequent seal succeeds and advances the branch forward.
-    std::fs::write(ws_coord.join("feature.rs"), "coord feature\n").unwrap();
-    let sealed = seal(&jj, &ws_coord, "coord feature", None).unwrap();
-    assert!(
-        !sealed.sha.is_empty(),
-        "the post-reconcile seal lands a commit"
-    );
-    let int_after = bookmark_commit(&jj, &store, &int).unwrap();
-    assert_ne!(
-        int_after, int_tip,
-        "the branch advanced forward past the folded tip"
-    );
-}
-
-/// `reconcile_workspace` leaves a DIRTY working copy untouched — it does not
-/// advance `@` and does not disturb the agent's loose edits — so the seal-time
-/// stale-recovery path retains ownership of the dirty case (running an
-/// unconditional advance on a dirty tree would mint a divergent recovery
-/// commit, jj's own tangle).
-#[test]
-#[serial_test::serial(jj)]
-fn reconcile_workspace_leaves_dirty_workspace_untouched() {
-    use crate::mcp::vcs::WorktreeVcs;
-    let Some(bin) = jj_bin() else {
-        eprintln!(
-            "skipping reconcile_workspace_leaves_dirty_workspace_untouched: jj not resolvable"
-        );
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let (_int_tip, ws_coord, _int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
-
-    // The agent left uncommitted work in `@` (behind-tip AND dirty).
-    std::fs::write(ws_coord.join("wip.rs"), "work in progress\n").unwrap();
-
-    let backend = crate::mcp::vcs::JjBackend::new(JjEnv::resolve(&bin, home.path()));
-    backend.reconcile_workspace(&ws_coord).unwrap();
-
-    // The dirty edit is preserved and `@` was NOT advanced onto the tip.
-    assert_eq!(
-        std::fs::read_to_string(ws_coord.join("wip.rs")).unwrap(),
-        "work in progress\n",
-        "the dirty edit is preserved for seal-time handling"
-    );
-    assert!(
-        !ws_coord.join("child.rs").exists(),
-        "a dirty tree is left to seal-time, not advanced onto the tip"
-    );
-}
-
-/// Run/write preflight preserves the conflicted-tip boundary: a clean workspace
-/// behind its conflicted bookmark is not re-parented and no conflict markers are
-/// materialized by ordinary command preparation.
-#[test]
-#[serial_test::serial(jj)]
-fn reconcile_workspace_leaves_conflicted_bookmark_tip_untouched() {
-    use crate::mcp::vcs::WorktreeVcs;
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping reconcile_workspace_leaves_conflicted_bookmark_tip_untouched: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let branch = "agent/CAIRN-2817-builder-0";
-    let ws = wts.path().join("conflicted-tip");
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-    let parent_before = jj
-        .run(
-            &ws,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "parent before",
-        )
-        .unwrap();
-
-    jj.run(&store, &["new", branch], "branch edit").unwrap();
-    std::fs::write(store.join("shared.rs"), "branch\n").unwrap();
-    jj.run(
-        &store,
-        &["describe", "-m", "branch edit"],
-        "describe branch",
-    )
-    .unwrap();
-    jj.run(
-        &store,
-        &[
-            "bookmark",
-            "set",
-            branch,
-            "-r",
-            "@",
-            "--ignore-working-copy",
-        ],
-        "set branch",
-    )
-    .unwrap();
-
-    jj.run(&store, &["new", "main"], "main edit").unwrap();
-    std::fs::write(store.join("shared.rs"), "main\n").unwrap();
-    jj.run(&store, &["describe", "-m", "main edit"], "describe main")
-        .unwrap();
-    jj.run(
-        &store,
-        &[
-            "bookmark",
-            "set",
-            "main",
-            "-r",
-            "@",
-            "--ignore-working-copy",
-        ],
-        "set main",
-    )
-    .unwrap();
-    rebase_branch_onto(&jj, &store, branch, "main").unwrap();
-    assert!(branch_has_conflict(&jj, &store, branch).unwrap());
-
-    let backend = crate::mcp::vcs::JjBackend::new(JjEnv::resolve(&bin, home.path()));
-    backend.reconcile_workspace(&ws).unwrap();
-
-    let parent_after = jj
-        .run(
-            &ws,
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
-            "parent after",
-        )
-        .unwrap();
-    assert_eq!(parent_after, parent_before);
-    assert_eq!(
-        std::fs::read_to_string(ws.join("shared.rs")).unwrap(),
-        "base\n"
-    );
-}
-
 /// WS3: a `^` amend whose target commit `@-` is SHARED with a sibling bookmark
 /// is converted into a regular child commit — the shared commit is never
 /// rewritten, only the workspace's own bookmark advances, and the foreign
@@ -6425,8 +5169,8 @@ fn jj_shim_intercepts_update_stale_and_passes_through() {
     let shim = bin_dir.join("jj");
     assert!(shim.exists(), "the shim script is generated");
 
-    // `workspace update-stale` is intercepted: exit 0, explanatory stderr, and
-    // the real jj (pointed at a bogus path) is NEVER invoked.
+    // `workspace update-stale` is intercepted: exit 0, no output at all, and the
+    // real jj (pointed at a bogus path) is NEVER invoked.
     let intercepted = std::process::Command::new(&shim)
         .args(["workspace", "update-stale"])
         .env("CAIRN_JJ_BIN", "/definitely/not/a/real/jj")
@@ -6436,10 +5180,25 @@ fn jj_shim_intercepts_update_stale_and_passes_through() {
         intercepted.status.success(),
         "the intercepted update-stale exits 0"
     );
-    let stderr = String::from_utf8_lossy(&intercepted.stderr);
+    // Narrated, never silent. `CAIRN_JJ_BIN` points at a path that cannot be
+    // executed, so a clean exit is itself proof the real jj was never reached;
+    // what this asserts is that the caller is TOLD. A silent clean exit is
+    // indistinguishable from a successful repair, and that is what made a stale
+    // store cost an evening to diagnose — the operator's shell resolves this
+    // shim too, so `jj workspace update-stale` reported success and did nothing.
+    let narration = String::from_utf8_lossy(&intercepted.stderr);
     assert!(
-        stderr.contains("Cairn reconciles jj workspace staleness"),
-        "the interception explains itself: {stderr}"
+        narration.contains("changed nothing"),
+        "the interception must say it changed nothing: {narration:?}"
+    );
+    assert!(
+        narration.contains("/definitely/not/a/real/jj"),
+        "and must name the real binary as the escape hatch: {narration:?}"
+    );
+    assert!(
+        intercepted.stdout.is_empty(),
+        "the narration goes to stderr, so stdout stays clean for callers that parse it: {:?}",
+        String::from_utf8_lossy(&intercepted.stdout)
     );
 
     // Every other command execs the real jj: `--version` matches byte-for-byte.
@@ -6455,65 +5214,6 @@ fn jj_shim_intercepts_update_stale_and_passes_through() {
         "the shim execs the real jj untouched for non-intercepted commands"
     );
 }
-
-/// WS4 discriminator: the create-pr gate refuses a branch whose delta versus
-/// base is empty. `node_changed_files` reports an empty set over a zero-delta
-/// branch (the +0/-0 PR the gate catches) and a non-empty set once work is
-/// sealed — the exact boolean the sweep-and-gate turns into a refusal.
-#[test]
-#[serial_test::serial(jj)]
-fn node_changed_files_empty_over_zero_delta_branch() {
-    let Some(bin) = jj_bin() else {
-        eprintln!("skipping node_changed_files_empty_over_zero_delta_branch: jj not resolvable");
-        return;
-    };
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
-
-    // No seals yet: the branch delta vs main is empty (the empty-PR shape).
-    let empty = node_changed_files(&jj, &ws, Some("main"), None)
-        .expect("base resolves so the delta is measurable");
-    assert!(
-        empty.is_empty(),
-        "a branch with no commits over base has an empty delta: {empty:?}"
-    );
-
-    // After a seal, the delta is non-empty and the gate would pass.
-    std::fs::write(ws.join("feature.rs"), "real work\n").unwrap();
-    seal(&jj, &ws, "real work", None).unwrap();
-    let nonempty = node_changed_files(&jj, &ws, Some("main"), None).unwrap();
-    assert!(
-        nonempty.iter().any(|c| c.path == "feature.rs"),
-        "a sealed branch carries a real delta: {nonempty:?}"
-    );
-}
-
-#[test]
-fn workspace_identity_round_trips_atomically() {
-    let root = TempDir::new().unwrap();
-    std::fs::create_dir_all(root.path().join(".jj")).unwrap();
-    let identity = WorkspaceIdentity::new(
-        "owner-job",
-        "owner-job",
-        "project-id",
-        PathBuf::from("/project"),
-        root.path().to_path_buf(),
-        "agent/branch",
-        "agent-branch",
-        "deadbeef",
-    );
-    write_workspace_identity(root.path(), &identity).unwrap();
-    assert_eq!(read_workspace_identity(root.path()), Some(identity));
-}
-
 #[test]
 #[serial_test::serial(jj)]
 fn add_workspace_never_cleans_an_existing_registration_or_directory() {
@@ -6544,19 +5244,1017 @@ fn add_workspace_never_cleans_an_existing_registration_or_directory() {
         bookmark_commit(&jj, &store, branch).as_deref(),
         Some(tip.as_str())
     );
-    assert!(workspace_registered(
-        &jj,
-        &store,
-        &workspace_name_for_branch(branch)
-    ));
 }
 
+// ---------------------------------------------------------------------------
+// VCS reconciliation spine: a self-healing default bookmark, and an export that
+// is proven to have reached git.
+//
+// Every fixture here drives real jj against a real bare origin, because the
+// behaviors under test are jj's own and none of them is inferable from prose:
+// that both sides moving conflicts a tracked bookmark NAME, that a conflicted
+// name resolves to several commits, that `jj git export` reports a refused ref
+// only on stderr while exiting 0, and that re-running the export does not clear
+// it.
+// ---------------------------------------------------------------------------
+
+/// A project checkout wired to a bare `origin`, with a shared store whose `main`
+/// bookmark TRACKS `main@origin`. This is the production topology for a default
+/// branch, and the only one in which the two sides can move independently.
+struct TrackedOrigin {
+    _home: TempDir,
+    _origin: TempDir,
+    proj: TempDir,
+    wts: TempDir,
+    jj: JjEnv,
+    store: PathBuf,
+    base: String,
+}
+
+fn setup_tracked_origin(bin: &str) -> TrackedOrigin {
+    let home = TempDir::new().unwrap();
+    let origin = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    init_project(proj.path());
+    git(
+        proj.path(),
+        &["remote", "add", "origin", &origin.path().to_string_lossy()],
+    );
+    git(proj.path(), &["push", "-q", "origin", "main"]);
+    let base = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+
+    let jj = JjEnv::resolve(bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    jj.run(
+        &store,
+        &["bookmark", "track", "main", "--remote=origin"],
+        "track main",
+    )
+    .unwrap();
+
+    TrackedOrigin {
+        _home: home,
+        _origin: origin,
+        proj,
+        wts: TempDir::new().unwrap(),
+        jj,
+        store,
+        base,
+    }
+}
+
+/// Advance `origin/main` onto a NEW commit parented on `parent` — the shape of a
+/// GitHub squash-merge, which mints a commit id the store has never seen.
+fn advance_origin_from(fx: &TrackedOrigin, parent: &str, file: &str, contents: &str) -> String {
+    git(fx.proj.path(), &["checkout", "-q", "--detach", parent]);
+    std::fs::write(fx.proj.path().join(file), contents).unwrap();
+    git(fx.proj.path(), &["add", "-A"]);
+    git(fx.proj.path(), &["commit", "-q", "-m", "squash merge (#1)"]);
+    let sha = git_stdout(fx.proj.path(), &["rev-parse", "HEAD"]);
+    git(fx.proj.path(), &["push", "-q", "-f", "origin", "HEAD:main"]);
+    git(fx.proj.path(), &["fetch", "-q", "origin"]);
+    sha
+}
+
+/// Advance the store's LOCAL `main` onto a fresh commit and export it, the way a
+/// Cairn-driven fold does.
+fn fold_local_main(fx: &TrackedOrigin, message: &str) -> String {
+    fx.jj
+        .run(
+            &fx.store,
+            &["new", "main", "-m", message, "--ignore-working-copy"],
+            "test fold",
+        )
+        .unwrap();
+    let tip = fx
+        .jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                "heads(main::)",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "test fold tip",
+        )
+        .unwrap();
+    set_bookmark_at(&fx.jj, &fx.store, "main", &tip).unwrap();
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "test fold export").unwrap();
+    tip
+}
+
+/// A fresh commit in the store parented on `parent`, without touching any
+/// workspace. The commit id is read back from `@`, which `jj new` just moved.
+fn store_child_of(fx: &TrackedOrigin, parent: &str, message: &str) -> String {
+    fx.jj
+        .run(
+            &fx.store,
+            &["new", parent, "-m", message, "--ignore-working-copy"],
+            "test child commit",
+        )
+        .unwrap();
+    fx.jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "test child commit id",
+        )
+        .unwrap()
+}
+
+fn proj_ref(fx: &TrackedOrigin, branch: &str) -> String {
+    git_stdout(
+        fx.proj.path(),
+        &["rev-parse", &format!("refs/heads/{branch}")],
+    )
+}
+
+/// THE defect: an operator squash-merges a PR on GitHub, so origin advances onto
+/// a commit id the store has never seen while the store's local `main` sits
+/// elsewhere. The import that observes it CONFLICTS the bookmark name, and every
+/// `main`-resolving verb — job spawn included — dies until someone repairs it by
+/// hand.
+///
+/// Note what this also proves: the import ALONE does not resolve the conflict.
+/// The reflex recorded in the incident dossier repaired a narrower case; the
+/// repair that closes this one is the bookmark move plus the export that follows
+/// it.
 #[test]
 #[serial_test::serial(jj)]
-fn managed_backend_refuses_marker_mismatch_without_touching_dirty_bytes() {
-    use crate::mcp::vcs::WorktreeVcs;
+fn reconcile_clears_a_conflicted_default_bookmark_after_a_github_squash() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping managed_backend_refuses_marker_mismatch_without_touching_dirty_bytes");
+        eprintln!("skipping reconcile_clears_a_conflicted_default_bookmark: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+
+    // Both sides move off the same base: the store folds locally, GitHub squashes.
+    let folded = fold_local_main(&fx, "cairn fold: land child");
+    let squashed = advance_origin_from(&fx, &fx.base, "gh.txt", "squash\n");
+    assert_ne!(folded, squashed);
+
+    // Observing origin is what conflicts the name, and re-importing does not undo it.
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(
+        bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap(),
+        "a local fold plus an independent origin advance must conflict the bookmark name"
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(
+        bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap(),
+        "a second import does not by itself resolve the conflicted name"
+    );
+
+    let outcome = reconcile_tracked_bookmark(&fx.jj, &fx.store, "main").unwrap();
+    assert!(
+        matches!(&outcome, BookmarkReconciliation::Repaired { to, .. } if to == &squashed),
+        "expected a repair onto origin's tip, got {outcome:?}"
+    );
+
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap());
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(squashed.as_str())
+    );
+    // The backing git ref followed, or the next import re-conflicts the name and
+    // the whole cycle starts again.
+    assert_eq!(proj_ref(&fx, "main"), squashed);
+
+    // The verb the conflicted name was killing: provisioning a job off `main`.
+    let ws = fx.wts.path().join("spawned-job");
+    add_workspace(
+        &fx.jj,
+        &fx.store,
+        &ws,
+        "agent/CAIRN-1-builder-0",
+        "main",
+        None,
+    )
+    .expect("a job must spawn off `main` once the bookmark is reconciled");
+}
+
+/// The plain case, and the one the old code reached least often: origin advanced,
+/// nothing else did, and NO sibling is in flight. Reconciliation is owed here
+/// regardless, because the store must be able to answer for `main` whether or
+/// not anything downstream needs rebasing.
+#[test]
+#[serial_test::serial(jj)]
+fn reconcile_converges_when_only_origin_advanced() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping reconcile_converges_when_only_origin_advanced: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let advanced = advance_origin_from(&fx, &fx.base, "gh.txt", "advance\n");
+
+    reconcile_tracked_bookmark(&fx.jj, &fx.store, "main").unwrap();
+
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(advanced.as_str()),
+        "the store's `main` must equal origin after a reconcile"
+    );
+    assert_eq!(proj_ref(&fx, "main"), advanced);
+
+    // Idempotent: a second pass reports no change and moves nothing.
+    let again = reconcile_tracked_bookmark(&fx.jj, &fx.store, "main").unwrap();
+    assert_eq!(
+        again,
+        BookmarkReconciliation::Unchanged {
+            commit: advanced.clone()
+        }
+    );
+}
+
+/// A local bookmark that strictly DESCENDS from origin holds work origin has not
+/// seen. Reconciliation reports it and moves nothing: the backward repair is only
+/// ever correct where origin is the sole authority, and "ahead" is a signal, not
+/// a state to overwrite.
+#[test]
+#[serial_test::serial(jj)]
+fn reconcile_never_moves_a_bookmark_that_is_ahead_of_origin() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping reconcile_never_moves_a_bookmark_ahead_of_origin: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let folded = fold_local_main(&fx, "unpushed local work");
+
+    let outcome = reconcile_tracked_bookmark(&fx.jj, &fx.store, "main").unwrap();
+
+    assert_eq!(
+        outcome,
+        BookmarkReconciliation::AheadOfOrigin {
+            local: folded.clone(),
+            remote: fx.base.clone(),
+        }
+    );
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(folded.as_str()),
+        "an ahead bookmark must not be reset onto origin"
+    );
+}
+
+/// A project with no `origin` has no authority to reconcile against, so this is a
+/// clean no-op rather than an error. Local-only projects must not be made to fail.
+#[test]
+#[serial_test::serial(jj)]
+fn reconcile_is_a_clean_noop_without_a_remote() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping reconcile_is_a_clean_noop_without_a_remote: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    assert_eq!(
+        reconcile_tracked_bookmark(&jj, &store, "main").unwrap(),
+        BookmarkReconciliation::NoRemote
+    );
+}
+
+/// A conflicted bookmark name resolves to SEVERAL commits. The single-commit
+/// resolver templated `commit_id` with no separator, so it used to return their
+/// 80-character concatenation — a string that is not a commit id, handed to
+/// callers as a revision. It must resolve to nothing instead, leaving the
+/// conflicted state to the probe and repair that can actually name it.
+#[test]
+#[serial_test::serial(jj)]
+fn a_conflicted_bookmark_resolves_to_no_commit_rather_than_a_concatenation() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping conflicted_bookmark_resolves_to_no_commit: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    fold_local_main(&fx, "cairn fold: land child");
+    advance_origin_from(&fx, &fx.base, "gh.txt", "squash\n");
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap());
+
+    let resolved = bookmark_commit(&fx.jj, &fx.store, "main");
+
+    assert_eq!(
+        resolved, None,
+        "a conflicted bookmark must not resolve to a concatenation of its targets"
+    );
+}
+
+/// Drive an AGENT branch into jj's conflicted-name state the way the incidents
+/// did: the store advances the bookmark while the export is frozen, and the
+/// backing git ref moves outside jj. Both sides leave the last exported point,
+/// so the next import records them as competing targets.
+///
+/// Returns the store-side tip and the git-side target. The store side is a
+/// DESCENDANT of the git side here, which is the shape every observed occurrence
+/// had: no commit on either side is outside the other's history.
+fn conflict_agent_branch(fx: &TrackedOrigin, branch: &str) -> (String, String) {
+    let exported = store_child_of(fx, "main", "agent work: first");
+    create_bookmark_at(&fx.jj, &fx.store, branch, &exported).unwrap();
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "test agent branch export").unwrap();
+    assert_eq!(proj_ref(fx, branch), exported);
+
+    // The store keeps advancing; the export does not follow (the freeze).
+    let tip = store_child_of(fx, &exported, "agent work: second");
+    set_bookmark_at(&fx.jj, &fx.store, branch, &tip).unwrap();
+
+    // The git ref moves under jj, which is a thing Cairn itself does.
+    let git_side = fx.base.clone();
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), &git_side],
+    );
+
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(
+        bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap(),
+        "the fixture must actually conflict `{branch}`"
+    );
+    (tip, git_side)
+}
+
+/// THE stranding specimen, from the branch side. An agent branch whose name went
+/// conflicted made its node completely inert: no run could hydrate a checkout,
+/// so the agent could not even attempt a repair from inside. The repair settles
+/// the name on the target that contains every other, which here is the store's
+/// own tip — the agent's sealed work, kept.
+#[test]
+#[serial_test::serial(jj)]
+fn a_conflicted_agent_branch_settles_on_the_target_that_contains_the_rest() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping conflicted_agent_branch_settles: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/CAIRN-1-builder-1";
+    let (tip, git_side) = conflict_agent_branch(&fx, branch);
+    assert_ne!(tip, git_side);
+
+    let settled = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch).unwrap();
+
+    assert_eq!(settled.as_deref(), Some(tip.as_str()));
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
+        Some(tip.as_str())
+    );
+    // The git ref has to follow, or the next import re-conflicts the name and
+    // the whole cycle starts again.
+    assert_eq!(proj_ref(&fx, branch), tip);
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(
+        !bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap(),
+        "a repair the next import undoes is not a repair"
+    );
+}
+
+/// The repair is never a guess. Where the two sides hold genuinely different
+/// histories, settling on either one silently discards the other's commits — the
+/// exact failure this whole arc exists to prevent — so it reports and refuses.
+#[test]
+#[serial_test::serial(jj)]
+fn a_genuinely_divergent_branch_is_reported_rather_than_settled() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping divergent_branch_is_reported: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/CAIRN-2-builder-1";
+
+    let exported = store_child_of(&fx, "main", "agent work");
+    create_bookmark_at(&fx.jj, &fx.store, branch, &exported).unwrap();
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "test agent branch export").unwrap();
+    let store_side = store_child_of(&fx, &exported, "store-only work");
+    set_bookmark_at(&fx.jj, &fx.store, branch, &store_side).unwrap();
+    // A sibling of the store's tip rather than an ancestor or descendant of it.
+    let git_side = advance_origin_from(&fx, &exported, "stranger.txt", "unrelated\n");
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), &git_side],
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+
+    let error = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .expect_err("divergent targets must not be settled by picking one");
+
+    assert!(error.contains(&store_side), "{error}");
+    assert!(error.contains(&git_side), "{error}");
+    assert!(
+        bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap(),
+        "a refused repair must leave both sides intact"
+    );
+}
+
+/// Nothing to repair is not an error, and it costs no store write.
+#[test]
+#[serial_test::serial(jj)]
+fn repairing_an_unconflicted_branch_is_a_clean_noop() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping repairing_an_unconflicted_branch: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    assert_eq!(
+        repair_conflicted_bookmark_name(&fx.jj, &fx.store, "main").unwrap(),
+        None
+    );
+    assert_eq!(
+        repair_conflicted_bookmark_name(&fx.jj, &fx.store, "never-existed").unwrap(),
+        None
+    );
+}
+
+/// The default branch takes the origin-authoritative route through the same
+/// entry point, so one call site serves both kinds of branch.
+#[test]
+#[serial_test::serial(jj)]
+fn the_default_branch_repairs_against_origin_through_the_shared_entry_point() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping default_branch_repairs_against_origin: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    fold_local_main(&fx, "cairn fold: land child");
+    let squashed = advance_origin_from(&fx, &fx.base, "gh.txt", "squash\n");
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap());
+
+    let settled =
+        repair_conflicted_branch_name(&fx.jj, &fx.store, "main", BranchAuthority::Origin).unwrap();
+
+    assert_eq!(settled.as_deref(), Some(squashed.as_str()));
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap());
+}
+
+/// A conflicted bookmark is a reconciliation TODO, not a terminal state. Recording
+/// it as permanent meant it was never retried and never repaired.
+#[test]
+fn a_conflicted_bookmark_is_a_retryable_reconcile_failure() {
+    assert_eq!(
+        reconcile_failure_kind("Error: Name `main` is conflicted"),
+        "conflicted_bookmark"
+    );
+    assert!(
+        !reconcile_failure_is_permanent("conflicted_bookmark"),
+        "a conflicted bookmark must be retried so the next reconcile can repair it"
+    );
+    // The genuinely unrepairable families are unchanged.
+    assert!(reconcile_failure_is_permanent("immutable_commit"));
+    assert!(reconcile_failure_is_permanent("ambiguous_divergence"));
+    assert!(reconcile_failure_is_permanent("missing_bookmark"));
+}
+
+/// THE EXPORT FREEZE. A `refs/heads/*` ref moved outside jj — which Cairn itself
+/// does, via HEAD re-attachment, executor resets, and worktree operations — makes
+/// every later `jj git export` refuse that one ref, report it on stderr, and EXIT
+/// 0. The bookmark advances; the git ref does not; the next push carries a tree
+/// nobody produced.
+///
+/// The unverified export cannot tell, which is the point: the same call with an
+/// expectation detects the freeze, repairs it, and leaves the ref correct.
+#[test]
+#[serial_test::serial(jj)]
+fn a_verified_export_detects_and_repairs_a_frozen_git_ref() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping verified_export_detects_and_repairs_a_frozen_ref: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    // Detach so the export's HEAD repair never enters the picture.
+    git(proj.path(), &["checkout", "-q", "--detach"]);
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-2765-builder-0";
+    jj.run(
+        &store,
+        &["new", "main", "-m", "agent work", "--ignore-working-copy"],
+        "seal",
+    )
+    .unwrap();
+    let first = jj
+        .run(
+            &store,
+            &[
+                "log",
+                "-r",
+                "heads(main::)",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "tip",
+        )
+        .unwrap();
+    create_bookmark_at(&jj, &store, branch, &first).unwrap();
+    export_git_preserving_checkout(&jj, &store, true, "initial export").unwrap();
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+        first
+    );
+
+    // Something outside jj moves the ref, and the bookmark then advances.
+    let main_commit = git_stdout(proj.path(), &["rev-parse", "refs/heads/main"]);
+    git(
+        proj.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), &main_commit],
+    );
+    jj.run(
+        &store,
+        &[
+            "new",
+            branch,
+            "-m",
+            "more agent work",
+            "--ignore-working-copy",
+        ],
+        "seal again",
+    )
+    .unwrap();
+    let second = jj
+        .run(
+            &store,
+            &[
+                "log",
+                "-r",
+                &format!("heads({branch}::)"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "tip",
+        )
+        .unwrap();
+    set_bookmark_at(&jj, &store, branch, &second).unwrap();
+
+    // The unverified export reports success and changes nothing. This is the
+    // freeze, and it is exactly what shipped a PR whose tests ran on an unpushed
+    // tree.
+    export_git_preserving_checkout(&jj, &store, true, "frozen export")
+        .expect("jj reports success even though it refused the ref");
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+        main_commit,
+        "the unverified export leaves the git ref frozen behind the bookmark"
+    );
+
+    // The same export, told what it is publishing, detects and repairs it.
+    export_git_verified(
+        &jj,
+        &store,
+        true,
+        "verified export",
+        &[(branch, second.as_str())],
+    )
+    .expect("the verifier must repair a frozen ref rather than report it");
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+        second,
+        "after repair the git ref equals the bookmark it must publish"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(second.as_str())
+    );
+}
+
+/// A freeze the repair cannot close returns the typed error. It is never `Ok`: a
+/// push carrying a ref that disagrees with its bookmark publishes a tree nobody
+/// tested, which is the failure this whole slice exists to make impossible.
+///
+/// The unwritable ref here is git's own directory/file rule — `refs/heads/feat`
+/// cannot exist while `refs/heads/feat/inner` does — which is the very case jj's
+/// export-failure hint calls out.
+#[test]
+#[serial_test::serial(jj)]
+fn an_unrepairable_export_freeze_is_an_error_not_a_success() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping unrepairable_export_freeze_is_an_error: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    git(proj.path(), &["checkout", "-q", "--detach"]);
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    // Block `refs/heads/feat` by occupying it as a directory.
+    let main_commit = git_stdout(proj.path(), &["rev-parse", "refs/heads/main"]);
+    git(
+        proj.path(),
+        &["update-ref", "refs/heads/feat/inner", &main_commit],
+    );
+
+    jj.run(
+        &store,
+        &["new", "main", "-m", "agent work", "--ignore-working-copy"],
+        "seal",
+    )
+    .unwrap();
+    let tip = jj
+        .run(
+            &store,
+            &[
+                "log",
+                "-r",
+                "heads(main::)",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "tip",
+        )
+        .unwrap();
+    create_bookmark_at(&jj, &store, "feat", &tip).unwrap();
+
+    let error = export_git_verified(
+        &jj,
+        &store,
+        true,
+        "blocked export",
+        &[("feat", tip.as_str())],
+    )
+    .expect_err("an unrepairable freeze must not be reported as a successful export");
+
+    assert!(
+        is_export_freeze_error(&error),
+        "expected the typed export-freeze family, got: {error}"
+    );
+    assert!(
+        error.contains("feat"),
+        "the error must name the branch: {error}"
+    );
+    assert!(
+        error.contains(&tip),
+        "the error must name the bookmark commit that did not reach git: {error}"
+    );
+}
+
+/// "Which commit is this push publishing?" has no single answer while the
+/// bookmark name is conflicted, so the push is refused rather than allowed to
+/// publish an arbitrary side.
+#[test]
+#[serial_test::serial(jj)]
+fn publication_refuses_a_conflicted_bookmark() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping publication_refuses_a_conflicted_bookmark: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    fold_local_main(&fx, "cairn fold: land child");
+    advance_origin_from(&fx, &fx.base, "gh.txt", "squash\n");
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, "main").unwrap());
+
+    let error = verified_publish_target(&fx.jj, &fx.store, "main")
+        .expect_err("a conflicted bookmark has no single commit to publish");
+
+    assert!(error.contains("conflicted"), "{error}");
+}
+
+/// The push-side half: a push that reports success while origin gained nothing —
+/// or gained something else — is the phantom-PR specimen, and it is caught by
+/// asking origin rather than trusting the exit code.
+#[test]
+#[serial_test::serial(jj)]
+fn origin_confirmation_catches_a_push_origin_did_not_record() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping origin_confirmation_catches_a_push_origin_did_not_record: jj not resolvable"
+        );
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/CAIRN-3189-builder-0";
+
+    // Nothing has been pushed yet: origin has no such branch.
+    let error = confirm_origin_tip(&fx.store, branch, &fx.base)
+        .expect_err("origin has no such branch, which must not read as a successful publish");
+    assert!(error.contains("no `"), "{error}");
+
+    // Publish it, then confirm both the agreeing and the disagreeing verdicts.
+    create_bookmark_at(&fx.jj, &fx.store, branch, &fx.base).unwrap();
+    push_store_bookmark(&fx.jj, &fx.store, branch).unwrap();
+    confirm_origin_tip(&fx.store, branch, &fx.base)
+        .expect("origin's tip matches what was published");
+
+    let squashed = advance_origin_from(&fx, &fx.base, "gh.txt", "other\n");
+    let error = confirm_origin_tip(&fx.store, branch, &squashed)
+        .expect_err("origin's tip disagrees with the claimed publication");
+    assert!(error.contains(&squashed), "{error}");
+}
+
+/// The push-side verifier must not report "could not confirm" as "confirmed".
+///
+/// An unreachable origin means the publication is UNVERIFIED, and on a
+/// publication path that has to be an error — treating it as success is exactly
+/// the trust-the-exit-code reasoning that produced a create-pr artifact for a
+/// pull request that never existed.
+#[test]
+#[serial_test::serial(jj)]
+fn origin_confirmation_fails_closed_when_origin_is_unreachable() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping origin_confirmation_fails_closed_when_unreachable: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let unreachable = home.path().join("no-such-origin");
+    git(
+        proj.path(),
+        &["remote", "add", "origin", &unreachable.to_string_lossy()],
+    );
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let head = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+
+    let error = confirm_origin_tip(&store, "main", &head).expect_err(
+        "an unreachable origin leaves the publication unverified, which is not success",
+    );
+
+    assert!(
+        error.contains("cannot confirm"),
+        "the error must say the publication could not be confirmed: {error}"
+    );
+    assert!(error.contains("main"), "{error}");
+}
+
+/// The fold's own contract says its export "fails the fold rather than silently
+/// leaving a stale ref". A refused export exits 0, so before verification the
+/// fold could satisfy that contract while leaving precisely the stale ref it
+/// promises never to leave — and a later child provisioned off the integration
+/// branch resolves its base through that ref and starts from the pre-merge tip.
+///
+/// With the expectation passed, the fold repairs the frozen ref instead.
+#[test]
+#[serial_test::serial(jj)]
+fn a_fold_repairs_a_frozen_integration_ref_instead_of_reporting_success() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping fold_repairs_a_frozen_integration_ref: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    git(proj.path(), &["checkout", "-q", "--detach"]);
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let integration = "agent/CAIRN-1-coordinator-0";
+    let child = "agent/CAIRN-2-builder-0";
+    let base = git_stdout(proj.path(), &["rev-parse", "refs/heads/main"]);
+    create_bookmark_at(&jj, &store, integration, &base).unwrap();
+    jj.run(
+        &store,
+        &[
+            "new",
+            integration,
+            "-m",
+            "child work",
+            "--ignore-working-copy",
+        ],
+        "child seal",
+    )
+    .unwrap();
+    let child_tip = jj
+        .run(
+            &store,
+            &[
+                "log",
+                "-r",
+                &format!("heads({integration}::)"),
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "child tip",
+        )
+        .unwrap();
+    create_bookmark_at(&jj, &store, child, &child_tip).unwrap();
+    export_git_preserving_checkout(&jj, &store, true, "seed export").unwrap();
+
+    // Something outside jj moves the integration ref to a commit jj did not put
+    // there. The move must differ from BOTH what jj last exported (`base`) and the
+    // commit the fold will land (`child_tip`), or there is nothing for jj to
+    // refuse and nothing for the verifier to catch — an earlier version of this
+    // fixture moved the ref to the value it already held and passed against the
+    // unfixed code, proving nothing.
+    git(proj.path(), &["checkout", "-q", "--detach", &base]);
+    std::fs::write(proj.path().join("outside.rs"), "moved outside jj\n").unwrap();
+    git(proj.path(), &["add", "-A"]);
+    git(proj.path(), &["commit", "-q", "-m", "moved outside jj"]);
+    let outside = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(outside, base);
+    assert_ne!(outside, child_tip);
+    git(
+        proj.path(),
+        &["update-ref", &format!("refs/heads/{integration}"), &outside],
+    );
+
+    merge_into_bookmark(&jj, &store, integration, child).unwrap();
+
+    assert_eq!(
+        bookmark_commit(&jj, &store, integration).as_deref(),
+        Some(child_tip.as_str())
+    );
+    assert_eq!(
+        git_stdout(
+            proj.path(),
+            &["rev-parse", &format!("refs/heads/{integration}")]
+        ),
+        child_tip,
+        "the fold must leave the integration ref at the folded tip, not the pre-merge one"
+    );
+}
+
+/// The resolver keeps its three answers apart, which is what lets a caller that
+/// just moved a bookmark tell "there is nothing to publish" from "I cannot tell
+/// what to publish".
+#[test]
+#[serial_test::serial(jj)]
+fn the_checked_resolver_separates_absent_from_unresolvable() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping checked_resolver_separates_absent_from_unresolvable: jj not resolvable"
+        );
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+
+    // Present: exactly one commit.
+    assert_eq!(
+        bookmark_commit_checked(&fx.jj, &fx.store, "main").unwrap(),
+        Some(fx.base.clone())
+    );
+    // Absent: jj exits 0 with empty output, so this is a real answer, not a failure.
+    assert_eq!(
+        bookmark_commit_checked(&fx.jj, &fx.store, "agent/never-existed").unwrap(),
+        None
+    );
+    // Unresolvable: a nonexistent remote-tracking name is a jj ERROR, and must not
+    // be laundered into "absent".
+    assert!(revset_commit_checked(&fx.jj, &fx.store, "nope@origin").is_err());
+
+    // Conflicted: several targets for one name is an error, never a commit id and
+    // never a concatenation of them.
+    fold_local_main(&fx, "cairn fold: land child");
+    advance_origin_from(&fx, &fx.base, "gh.txt", "squash\n");
+    import_git(&fx.jj, &fx.store).unwrap();
+    let error = bookmark_commit_checked(&fx.jj, &fx.store, "main")
+        .expect_err("a conflicted name does not resolve to a single commit");
+    assert!(error.contains("more than one commit"), "{error}");
+}
+
+/// An export that cannot prove what it advanced must FAIL, not fall back to an
+/// unverified export. Every caller of this helper reaches it having just moved
+/// that bookmark, so "it does not resolve" means the operation's own
+/// postcondition is unprovable — and a load-bearing fold reporting success there
+/// is the same fail-open the verifier exists to close.
+#[test]
+#[serial_test::serial(jj)]
+fn a_bookmark_advance_export_fails_when_the_bookmark_does_not_resolve() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping bookmark_advance_export_fails_when_unresolvable: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+
+    // Absent bookmark: nothing was advanced, so nothing can be proven.
+    let error = export_bookmark_advance(
+        &fx.jj,
+        &fx.store,
+        true,
+        "agent/never-existed",
+        "test export",
+    )
+    .expect_err("an absent bookmark cannot be verified, so the export must not report success");
+    assert!(is_export_freeze_error(&error), "{error}");
+    assert!(error.contains("does not exist"), "{error}");
+
+    // Conflicted name: the commit to publish is ambiguous.
+    fold_local_main(&fx, "cairn fold: land child");
+    advance_origin_from(&fx, &fx.base, "gh.txt", "squash\n");
+    import_git(&fx.jj, &fx.store).unwrap();
+    let error = export_bookmark_advance(&fx.jj, &fx.store, true, "main", "test export")
+        .expect_err("a conflicted bookmark cannot be verified");
+    assert!(is_export_freeze_error(&error), "{error}");
+    assert!(error.contains("more than one commit"), "{error}");
+}
+
+// ── Conflict scaffolding never reaches trees or history (CAIRN-3197) ─────────
+
+/// A store whose agent branch carries BOTH an edit that will conflict with an
+/// advanced base (`shared.rs`) and genuine unrelated work (`own.rs`), with the
+/// base already advanced conflictingly.
+///
+/// The unrelated work is load-bearing to the fixture, not decoration: the
+/// specimen this whole slice exists for had one file silently resolved to the
+/// destination side while every other file on the branch stayed intact, so an
+/// assertion that only checks "the branch still has work on it" would pass on
+/// the broken behavior.
+struct ConflictingAdvance {
+    _home: TempDir,
+    proj: TempDir,
+    _wts: TempDir,
+    jj: JjEnv,
+    store: PathBuf,
+    branch: &'static str,
+    pre_tip: String,
+}
+
+fn setup_conflicting_advance(bin: &str) -> ConflictingAdvance {
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-3197-builder-0";
+    let ws = wts.path().join("agent");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("shared.rs"), "AGENT-SIDE\n").unwrap();
+    std::fs::write(ws.join("own.rs"), "AGENT GENUINE WORK\n").unwrap();
+    seal(&jj, &ws, "agent edits shared and adds its own work", None).unwrap();
+    let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
+
+    // The base advances out of band with a conflicting edit to the same file.
+    let oob = "agent/CAIRN-9-oob-0";
+    let ws_oob = wts.path().join("oob");
+    add_workspace(&jj, &store, &ws_oob, oob, "main", None).unwrap();
+    std::fs::write(ws_oob.join("shared.rs"), "MAIN-SIDE\n").unwrap();
+    seal(&jj, &ws_oob, "main advances shared", None).unwrap();
+    let oob_tip = bookmark_commit(&jj, &store, oob).unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            &oob_tip,
+            "--ignore-working-copy",
+        ],
+        "advance main out of band",
+    )
+    .unwrap();
+
+    ConflictingAdvance {
+        _home: home,
+        proj,
+        _wts: wts,
+        jj,
+        store,
+        branch,
+        pre_tip,
+    }
+}
+
+/// The probe that separates BASE DRIFT from a content conflict, exercised over a
+/// real store.
+///
+/// Everything downstream of the classification turns on this one question: do
+/// the two sides actually disagree about the bytes of the conflicting paths? A
+/// probe that answered "no" when they differ would tell an agent with real
+/// merging to do that its work was already finished, so it is tested directly
+/// rather than only through whatever fixture happens to reach it.
+#[test]
+fn the_base_drift_probe_answers_only_for_the_paths_it_is_given() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping the_base_drift_probe_answers_only_for_the_paths_it_is_given: jj not resolvable");
         return;
     };
     let home = TempDir::new().unwrap();
@@ -6566,41 +6264,1425 @@ fn managed_backend_refuses_marker_mismatch_without_touching_dirty_bytes() {
     let jj = JjEnv::resolve(&bin, home.path());
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let branch = "agent/current";
-    let ws = wts.path().join("current");
-    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-    write_project_root_marker(&ws, proj.path()).unwrap();
-    let base = head_commit(&jj, &ws).unwrap();
-    let identity = WorkspaceIdentity::new(
-        "job-current",
-        "job-current",
-        "project-current",
-        proj.path().to_path_buf(),
-        ws.clone(),
-        branch,
-        workspace_name_for_branch(branch),
-        base,
-    );
-    write_workspace_identity(&ws, &identity).unwrap();
-    std::fs::write(ws.join("tracked.txt"), "dirty bytes\n").unwrap();
-    write_branch_marker(&ws, "agent/unrelated").unwrap();
 
-    let backend = crate::mcp::vcs::JjBackend::managed(JjEnv::resolve(&bin, home.path()), identity);
-    let before_at = working_copy_commit(&jj, &ws).unwrap();
-    let before_head = head_commit(&jj, &ws).unwrap();
-    let before_tip = bookmark_commit(&jj, &store, branch).unwrap();
-    let error = backend
-        .seal_files(&ws, &["tracked.txt"], "must refuse", None)
-        .unwrap_err();
-    assert!(crate::mcp::vcs::is_workspace_lineage_mismatch(&error));
-    assert_eq!(
-        std::fs::read_to_string(ws.join("tracked.txt")).unwrap(),
-        "dirty bytes\n"
+    // Two branches that AGREE on `shared.rs` and differ on `own.rs`.
+    let left = "agent/CAIRN-3337-left-0";
+    let ws_left = wts.path().join("left");
+    add_workspace(&jj, &store, &ws_left, left, "main", None).unwrap();
+    std::fs::write(ws_left.join("shared.rs"), "AGREED\n").unwrap();
+    std::fs::write(ws_left.join("own.rs"), "LEFT\n").unwrap();
+    seal(&jj, &ws_left, "left", None).unwrap();
+    let left_tip = bookmark_commit(&jj, &store, left).unwrap();
+
+    let right = "agent/CAIRN-3337-right-0";
+    let ws_right = wts.path().join("right");
+    add_workspace(&jj, &store, &ws_right, right, "main", None).unwrap();
+    std::fs::write(ws_right.join("shared.rs"), "AGREED\n").unwrap();
+    std::fs::write(ws_right.join("own.rs"), "RIGHT\n").unwrap();
+    seal(&jj, &ws_right, "right", None).unwrap();
+    let right_tip = bookmark_commit(&jj, &store, right).unwrap();
+
+    assert!(
+        !paths_differ_between(
+            &jj,
+            &store,
+            &left_tip,
+            &right_tip,
+            &["shared.rs".to_string()]
+        ),
+        "the two sides agree on shared.rs, which is what base drift looks like"
     );
-    assert_eq!(working_copy_commit(&jj, &ws).unwrap(), before_at);
-    assert_eq!(head_commit(&jj, &ws).unwrap(), before_head);
+    assert!(
+        paths_differ_between(&jj, &store, &left_tip, &right_tip, &["own.rs".to_string()]),
+        "a genuine content difference must never be classified as drift"
+    );
+    assert!(
+        paths_differ_between(
+            &jj,
+            &store,
+            &left_tip,
+            &right_tip,
+            &["shared.rs".to_string(), "own.rs".to_string()]
+        ),
+        "one genuinely differing path makes the whole conflict a content conflict"
+    );
+    // An empty path set is not evidence of agreement. Answering "they agree"
+    // there would classify a conflict whose paths jj could not enumerate as
+    // "your work is already done" — the most misleading thing this could say.
+    assert!(
+        paths_differ_between(&jj, &store, &left_tip, &right_tip, &[]),
+        "no enumerated paths must fall back to a content conflict, never to drift"
+    );
+}
+
+/// THE core invariant: a conflict-flagged commit never becomes a git ref.
+///
+/// jj exports such a commit as the DESTINATION side of every conflicted file at
+/// the top level with no markers, plus `.jjconflict-*` sidecars — and every agent
+/// cell is a `git worktree add --detach` of exactly that ref. So the rebase is
+/// rolled back and the branch stays on its own content.
+///
+/// The last two assertions are the ones that actually encode the incident: a tree
+/// can be perfectly free of scaffolding and still silently hold the wrong side,
+/// which is how a residue cleanup came to delete the only surviving copy of a
+/// branch's work in good faith.
+#[test]
+#[serial_test::serial(jj)]
+fn a_conflicting_rebase_is_rolled_back_and_never_reaches_git() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping a_conflicting_rebase_is_rolled_back_and_never_reaches_git: jj not resolvable"
+        );
+        return;
+    };
+    let fx = setup_conflicting_advance(&bin);
+
+    let outcome = rebase_branch_onto(&fx.jj, &fx.store, fx.branch, "main").unwrap();
+    let RebaseOutcome::Conflicted { diagnostic } = outcome else {
+        panic!("expected a rolled-back conflict, got {outcome:?}");
+    };
     assert_eq!(
-        bookmark_commit(&jj, &store, branch).as_deref(),
-        Some(before_tip.as_str())
+        diagnostic.conflicting_paths(),
+        vec!["shared.rs".to_string()],
+        "the caller is told it conflicted, and on which file"
+    );
+    // Both sides really did edit the file, so this is a content conflict and the
+    // agent has merging to do.
+    assert_eq!(diagnostic.condition, ConflictCondition::ContentConflict);
+    // The immutable coordinates survive the rollback that erased everything else.
+    assert_eq!(
+        diagnostic.ours.as_deref(),
+        Some(fx.pre_tip.as_str()),
+        "`ours` is the pre-rebase tip"
+    );
+    assert!(
+        diagnostic.base.is_some() && diagnostic.theirs.is_some(),
+        "the base and destination resolve to commits: {diagnostic:?}"
+    );
+    assert_ne!(
+        diagnostic.base, diagnostic.theirs,
+        "the destination advanced past the fork point"
+    );
+
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap(),
+        fx.pre_tip,
+        "the bookmark is bit-identical to its pre-rebase value"
+    );
+    assert!(
+        !branch_has_conflict(&fx.jj, &fx.store, fx.branch).unwrap(),
+        "nothing conflict-flagged remains in the store"
+    );
+
+    let branch_ref = format!("refs/heads/{}", fx.branch);
+    assert_eq!(
+        git_stdout(fx.proj.path(), &["rev-parse", &branch_ref]),
+        fx.pre_tip,
+        "the backing git ref never moved off the clean commit"
+    );
+    let tree = git_stdout(
+        fx.proj.path(),
+        &["ls-tree", "-r", "--name-only", &branch_ref],
+    );
+    assert!(
+        !tree.contains(".jjconflict-") && !tree.contains("JJ-CONFLICT-README"),
+        "no conflict scaffolding reached the exported tree: {tree}"
+    );
+    assert_eq!(
+        git_stdout(
+            fx.proj.path(),
+            &["show", &format!("{branch_ref}:shared.rs")]
+        ),
+        "AGENT-SIDE",
+        "the branch's own side of the conflicted file survived — a scaffolding-free \
+         tree silently holding the DESTINATION side is the actual incident"
+    );
+    assert_eq!(
+        git_stdout(fx.proj.path(), &["show", &format!("{branch_ref}:own.rs")]),
+        "AGENT GENUINE WORK",
+        "the branch's unrelated work is untouched"
+    );
+}
+
+/// The rollback is scoped to the one rebase that conflicted.
+///
+/// `jj op restore` rewinds WHOLE-STORE state, so a snapshot taken once per
+/// reconcile rather than once per rebase would undo the earlier siblings that
+/// rebased perfectly well. Two siblings in one reconcile: the first rebases
+/// cleanly and must STAY rebased; the second conflicts and must return to clean.
+#[test]
+#[serial_test::serial(jj)]
+fn the_rollback_undoes_only_the_conflicting_siblings_rebase() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping the_rollback_undoes_only_the_conflicting_siblings_rebase: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let int = "agent/CAIRN-3197-coordinator-0";
+    add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+
+    // Sibling A touches only its own file, so it rebases cleanly.
+    let clean = "agent/CAIRN-1-builder-0";
+    let ws_clean = wts.path().join("clean");
+    add_workspace(&jj, &store, &ws_clean, clean, int, None).unwrap();
+    std::fs::write(ws_clean.join("clean.rs"), "clean work\n").unwrap();
+    seal(&jj, &ws_clean, "clean sibling work", None).unwrap();
+
+    // Sibling B edits the file the base is about to change.
+    let conflicting = "agent/CAIRN-2-builder-0";
+    let ws_conflicting = wts.path().join("conflicting");
+    add_workspace(&jj, &store, &ws_conflicting, conflicting, int, None).unwrap();
+    std::fs::write(ws_conflicting.join("shared.rs"), "BRANCH-SIDE\n").unwrap();
+    seal(&jj, &ws_conflicting, "conflicting sibling work", None).unwrap();
+    let conflicting_before = bookmark_commit(&jj, &store, conflicting).unwrap();
+
+    // The integration tip advances conflictingly.
+    jj.run(&store, &["new", int], "new on int").unwrap();
+    std::fs::write(store.join("shared.rs"), "INT-SIDE\n").unwrap();
+    jj.run(
+        &store,
+        &["describe", "-m", "int advances shared"],
+        "describe",
+    )
+    .unwrap();
+    jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
+        .unwrap();
+    let int_tip = bookmark_commit(&jj, &store, int).unwrap();
+
+    let report = reconcile_siblings(
+        &jj,
+        &store,
+        int,
+        &[clean.to_string(), conflicting.to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(report.rebased_clean, vec![clean.to_string()]);
+    assert_eq!(report.conflicted, vec![conflicting.to_string()]);
+    assert!(
+        branch_descends_from(&jj, &store, clean, &int_tip),
+        "the cleanly-rebased sibling stayed on the advanced tip — the rollback of a \
+         LATER sibling must not rewind it"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, conflicting).unwrap(),
+        conflicting_before,
+        "the conflicting sibling returned to its own clean commit"
+    );
+    assert!(!branch_has_conflict(&jj, &store, conflicting).unwrap());
+}
+
+/// The unflagged half of the loss, made visible.
+///
+/// When both sides edit the same file in different regions, jj merges them and
+/// records NO conflict — so the rollback above never fires and the branch's
+/// version of an overlapping region can simply be replaced with no marker, no
+/// error, and no record. Prevention is not proven; detection is. The instrument
+/// must name that file, and must not cry wolf over files only one side touched.
+#[test]
+#[serial_test::serial(jj)]
+fn a_clean_rebase_names_the_files_both_sides_changed() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping a_clean_rebase_names_the_files_both_sides_changed: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+
+    // A file long enough that two edits at opposite ends merge without conflict.
+    git(proj.path(), &["init", "-q", "-b", "main"]);
+    git(proj.path(), &["config", "user.email", "p@e.com"]);
+    git(proj.path(), &["config", "user.name", "P"]);
+    let body: String = (0..40).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(proj.path().join("shared.rs"), &body).unwrap();
+    git(proj.path(), &["add", "-A"]);
+    git(proj.path(), &["commit", "-q", "-m", "base"]);
+
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-3197-builder-0";
+    let ws = wts.path().join("agent");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(
+        ws.join("shared.rs"),
+        body.replacen("line 0\n", "line 0 BRANCH\n", 1),
+    )
+    .unwrap();
+    std::fs::write(ws.join("branch-only.rs"), "only the branch\n").unwrap();
+    seal(&jj, &ws, "branch edits the top of shared", None).unwrap();
+    let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
+
+    // The base edits the far end of the SAME file, plus a file of its own.
+    let oob = "agent/CAIRN-9-oob-0";
+    let ws_oob = wts.path().join("oob");
+    add_workspace(&jj, &store, &ws_oob, oob, "main", None).unwrap();
+    std::fs::write(
+        ws_oob.join("shared.rs"),
+        body.replacen("line 39\n", "line 39 MAIN\n", 1),
+    )
+    .unwrap();
+    std::fs::write(ws_oob.join("base-only.rs"), "only the base\n").unwrap();
+    seal(&jj, &ws_oob, "base edits the bottom of shared", None).unwrap();
+    let oob_tip = bookmark_commit(&jj, &store, oob).unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            &oob_tip,
+            "--ignore-working-copy",
+        ],
+        "advance main",
+    )
+    .unwrap();
+
+    assert_eq!(
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
+        RebaseOutcome::Rebased,
+        "edits at opposite ends of one file merge with no conflict recorded"
+    );
+    let post_tip = bookmark_commit(&jj, &store, branch).unwrap();
+    assert_ne!(post_tip, pre_tip, "the rebase moved the branch");
+
+    let selection = rebase_side_selection(&jj, &store, "main", &pre_tip, &post_tip);
+    assert!(
+        selection.overlapping.contains(&"shared.rs".to_string()),
+        "the file BOTH sides changed is named: {selection:?}"
+    );
+    assert!(
+        !selection.overlapping.contains(&"base-only.rs".to_string()),
+        "a file only the base changed is not a side-selection risk: {selection:?}"
+    );
+    assert!(
+        !selection
+            .overlapping
+            .contains(&"branch-only.rs".to_string()),
+        "a file only the branch changed is not a side-selection risk: {selection:?}"
+    );
+    assert!(
+        selection
+            .changed
+            .iter()
+            .any(|(status, path)| !status.is_empty() && path == "shared.rs"),
+        "the name-status record covers what the rebase actually changed: {selection:?}"
+    );
+}
+
+/// The publish boundary refuses a delta whose tree root carries jj conflict
+/// scaffolding, so a poisoned tree that somehow got materialized can never be
+/// folded into history. Plain git — no jj needed to build the shape.
+#[test]
+fn pin_validated_delta_refuses_a_tree_carrying_conflict_scaffolding() {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "p@e.com"]);
+    git(repo.path(), &["config", "user.name", "P"]);
+    std::fs::write(repo.path().join("shared.rs"), "clean\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "base"]);
+    let base = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+
+    // Exactly what `jj git export` writes for a conflict-flagged commit.
+    for sidecar in [
+        ".jjconflict-base-0",
+        ".jjconflict-side-0",
+        ".jjconflict-side-1",
+    ] {
+        std::fs::create_dir_all(repo.path().join(sidecar)).unwrap();
+        std::fs::write(repo.path().join(sidecar).join("shared.rs"), "side\n").unwrap();
+    }
+    std::fs::write(repo.path().join("JJ-CONFLICT-README"), "conflict\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "scaffolding"]);
+    let poisoned = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+
+    let error = pin_validated_delta(repo.path(), &base, &poisoned, None)
+        .expect_err("a delta carrying conflict scaffolding must never be pinned");
+    assert!(error.contains(".jjconflict-side-0"), "{error}");
+    assert!(error.contains(&poisoned), "{error}");
+
+    // A clean delta still pins, so the guard is not simply refusing everything.
+    std::fs::remove_file(repo.path().join("JJ-CONFLICT-README")).unwrap();
+    for sidecar in [
+        ".jjconflict-base-0",
+        ".jjconflict-side-0",
+        ".jjconflict-side-1",
+    ] {
+        std::fs::remove_dir_all(repo.path().join(sidecar)).unwrap();
+    }
+    std::fs::write(repo.path().join("shared.rs"), "real work\n").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-q", "-m", "real work"]);
+    let clean = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    pin_validated_delta(repo.path(), &base, &clean, None).expect("a clean delta pins");
+}
+
+/// The straddle's shape in plain git: a base commit, an advance on top of it,
+/// and a delta parented at the base with the checkout detached there. That is
+/// exactly what the runner holds at publication time when the bookmark moved
+/// while a batch was running.
+fn straddle_fixture(
+    repo: &Path,
+    base_files: &[(&str, &str)],
+    advance_files: &[(&str, &str)],
+    delta_files: &[(&str, &str)],
+) -> (String, String, String) {
+    let write_all = |files: &[(&str, &str)]| {
+        for (name, content) in files {
+            std::fs::write(repo.join(name), content).unwrap();
+        }
+    };
+    git(repo, &["init", "-q", "-b", "main"]);
+    git(repo, &["config", "user.email", "p@e.com"]);
+    git(repo, &["config", "user.name", "P"]);
+    write_all(base_files);
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "base"]);
+    let base = git_stdout(repo, &["rev-parse", "HEAD"]);
+
+    write_all(advance_files);
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "a base advance"]);
+    let head = git_stdout(repo, &["rev-parse", "HEAD"]);
+
+    git(repo, &["checkout", "-q", "--detach", &base]);
+    write_all(delta_files);
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "the straddling batch"]);
+    let delta = git_stdout(repo, &["rev-parse", "HEAD"]);
+    (base, head, delta)
+}
+
+/// Every object in the repository, reachable or not — the only count that can
+/// see a commit written without a ref.
+fn object_count(repo: &Path) -> usize {
+    git_stdout(
+        repo,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objecttype)",
+        ],
+    )
+    .lines()
+    .count()
+}
+
+fn commit_count(repo: &Path) -> usize {
+    git_stdout(
+        repo,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objecttype)",
+        ],
+    )
+    .lines()
+    .filter(|kind| kind.trim() == "commit")
+    .count()
+}
+
+fn blob_at(repo: &Path, commit: &str, path: &str) -> String {
+    git_stdout(repo, &["show", &format!("{commit}:{path}")])
+}
+
+/// The ordinary straddle: the advance and the batch touched different files.
+/// Integration parents the batch's work at the head the branch actually holds
+/// and keeps both sides, which is what makes the publication that follows land
+/// the advance AND the batch rather than choosing between them.
+#[test]
+fn an_integrated_delta_carries_both_the_advance_and_the_batch() {
+    let repo = TempDir::new().unwrap();
+    let (base, head, delta) = straddle_fixture(
+        repo.path(),
+        &[("advanced.rs", "before\n"), ("mine.rs", "base\n")],
+        &[("advanced.rs", "after the advance\n")],
+        &[("mine.rs", "the batch's work\n")],
+    );
+
+    let Integration::Commit(integrated) =
+        integrate_delta_onto_head(repo.path(), &base, &delta, &head).unwrap()
+    else {
+        panic!("disjoint paths integrate without conflict");
+    };
+
+    assert_eq!(
+        git_stdout(repo.path(), &["rev-parse", &format!("{integrated}^")]),
+        head,
+        "the integrated commit is parented at the head the branch holds, which is the \
+         parent the logical-head transaction requires"
+    );
+    assert_eq!(
+        blob_at(repo.path(), &integrated, "advanced.rs"),
+        "after the advance",
+        "the advance survives: a replay of the batch's own diff would have dropped it"
+    );
+    assert_eq!(
+        blob_at(repo.path(), &integrated, "mine.rs"),
+        "the batch's work"
+    );
+
+    // The patch the runner reports is taken against the head published onto.
+    // Against the routed base it would attribute the advance's line to the
+    // batch, which is the counter this correction exists to keep honest.
+    let against_head = git_stdout(repo.path(), &["diff", "--no-ext-diff", &head, &integrated]);
+    let against_base = git_stdout(repo.path(), &["diff", "--no-ext-diff", &base, &integrated]);
+    let counted = |patch: &str| {
+        parse_git_patch(patch)
+            .iter()
+            .fold((0, 0), |(add, del), change| {
+                (add + change.additions, del + change.deletions)
+            })
+    };
+    assert_eq!(counted(&against_head), (1, 1), "only the batch's own line");
+    assert_eq!(
+        counted(&against_base),
+        (2, 2),
+        "against the routed base the advance's line is counted as the batch's too"
+    );
+}
+
+/// The case CAIRN-3214 pins from the seal side, seen from the publication side.
+/// A mid-batch refresh moved the checkout onto the advance, the batch then
+/// edited a file the advance had just rewritten, and the delta's content is the
+/// advance plus the batch's addition. Both sides agree on the advance's hunk, so
+/// the merge is clean and the batch's extra content survives — a false conflict
+/// here would strand exactly the work 3214 went to the trouble of preserving.
+#[test]
+fn an_edit_made_after_the_advance_integrates_without_a_false_conflict() {
+    let repo = TempDir::new().unwrap();
+    let (base, head, delta) = straddle_fixture(
+        repo.path(),
+        &[("shared.rs", "one\ntwo\nthree\n")],
+        &[("shared.rs", "one\nADVANCED\nthree\n")],
+        &[("shared.rs", "one\nADVANCED\nthree\nthe batch's line\n")],
+    );
+
+    let Integration::Commit(integrated) =
+        integrate_delta_onto_head(repo.path(), &base, &delta, &head).unwrap()
+    else {
+        panic!("an edit written on top of the advance is not a conflict");
+    };
+    assert_eq!(
+        blob_at(repo.path(), &integrated, "shared.rs"),
+        "one\nADVANCED\nthree\nthe batch's line"
+    );
+}
+
+/// Genuinely divergent edits to one region are the one case that must not be
+/// resolved silently. Taking either side would be a lost update, so integration
+/// names the paths and writes no commit — leaving the batch's work where the
+/// agent can still act on it.
+#[test]
+fn divergent_edits_to_one_region_conflict_and_write_no_commit() {
+    let repo = TempDir::new().unwrap();
+    let (base, head, delta) = straddle_fixture(
+        repo.path(),
+        &[("shared.rs", "one\ntwo\nthree\n")],
+        &[("shared.rs", "one\nADVANCED\nthree\n")],
+        &[("shared.rs", "one\nTHE BATCH\nthree\n")],
+    );
+    let refs_before = git_stdout(repo.path(), &["show-ref"]);
+    let commits_before = commit_count(repo.path());
+
+    let integration = integrate_delta_onto_head(repo.path(), &base, &delta, &head).unwrap();
+
+    assert_eq!(
+        integration,
+        Integration::Conflicted {
+            paths: vec!["shared.rs".to_string()]
+        },
+        "the conflicting path is named, once, so the agent knows where to look"
+    );
+    assert_eq!(git_stdout(repo.path(), &["show-ref"]), refs_before);
+    assert_eq!(commit_count(repo.path()), commits_before);
+}
+
+/// The ordinary path costs nothing. When the bookmark still holds the commit the
+/// batch was routed against there is no merge to perform and no commit to
+/// construct, and the sealed delta publishes byte-for-byte as it was.
+#[test]
+fn an_unmoved_head_constructs_nothing() {
+    let repo = TempDir::new().unwrap();
+    let (base, _head, delta) = straddle_fixture(
+        repo.path(),
+        &[("shared.rs", "base\n")],
+        &[("advanced.rs", "advance\n")],
+        &[("shared.rs", "the batch's work\n")],
+    );
+    let objects_before = object_count(repo.path());
+
+    assert_eq!(
+        integrate_delta_onto_head(repo.path(), &base, &delta, &base).unwrap(),
+        Integration::Unmoved
+    );
+    assert_eq!(object_count(repo.path()), objects_before);
+}
+
+/// A delta whose content the advance already delivered would publish as an empty
+/// commit. Saying so is better than putting one on the branch.
+#[test]
+fn a_delta_the_advance_already_delivered_is_already_landed() {
+    let repo = TempDir::new().unwrap();
+    let (base, head, delta) = straddle_fixture(
+        repo.path(),
+        &[("shared.rs", "base\n")],
+        &[("shared.rs", "the same content\n")],
+        &[("shared.rs", "the same content\n")],
+    );
+
+    assert_eq!(
+        integrate_delta_onto_head(repo.path(), &base, &delta, &head).unwrap(),
+        Integration::AlreadyLanded
+    );
+}
+
+/// The whole sequence, against real jj: a batch is routed at the bookmark's
+/// tip, a sibling lands while it runs, and the batch's sealed delta now declares
+/// a parent the bookmark no longer holds. The publication is refused, as it must
+/// be — and integration turns that refusal into a landing, with the branch
+/// carrying both the sibling's commit and the batch's work.
+#[test]
+#[serial_test::serial(jj)]
+fn a_straddled_delta_integrates_onto_the_moved_bookmark_and_lands() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping a_straddled_delta_integrates_onto_the_moved_bookmark: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let jj = JjEnv::resolve(&bin, home.path());
+    let path = repo.path();
+
+    git(path, &["init", "-q", "-b", "main"]);
+    git(path, &["config", "user.email", "p@e.com"]);
+    git(path, &["config", "user.name", "P"]);
+    std::fs::write(path.join("advanced.rs"), "before\n").unwrap();
+    std::fs::write(path.join("mine.rs"), "base\n").unwrap();
+    git(path, &["add", "-A"]);
+    git(path, &["commit", "-q", "-m", "base"]);
+    let base = git_stdout(path, &["rev-parse", "HEAD"]);
+
+    // Both the sibling's commit and the batch's delta are built off to the side,
+    // parented at the base and referenced by nothing — which is exactly the
+    // shape a sealed delta arrives in.
+    let side_commit = |files: &[(&str, &str)], message: &str| {
+        git(path, &["checkout", "-q", "--detach", &base]);
+        for (name, content) in files {
+            std::fs::write(path.join(name), content).unwrap();
+        }
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-q", "-m", message]);
+        git_stdout(path, &["rev-parse", "HEAD"])
+    };
+    let sibling = side_commit(&[("advanced.rs", "after the advance\n")], "a sibling lands");
+    let delta = side_commit(&[("mine.rs", "the batch's work\n")], "the straddling batch");
+    git(path, &["checkout", "-q", "main"]);
+
+    jj.run(
+        path,
+        &["git", "init", "--colocate", "."],
+        "colocate the fixture",
+    )
+    .unwrap();
+    jj.run(
+        path,
+        &["bookmark", "create", "feature", "-r", &base],
+        "create the job bookmark",
+    )
+    .unwrap();
+
+    // The sibling lands while the batch is still running.
+    let advanced = cairn_vcs::publish_logical_head(
+        path,
+        "feature",
+        &base,
+        &sibling,
+        None,
+        cairn_vcs::PublicationMode::Child {
+            description: "a sibling lands".into(),
+        },
+    )
+    .unwrap();
+    assert_ne!(advanced.head, base);
+
+    // The batch's own delta cannot publish: it declares a parent the bookmark
+    // has moved past. This is the failure the whole issue is about.
+    let refused = cairn_vcs::publish_logical_head(
+        path,
+        "feature",
+        &base,
+        &delta,
+        None,
+        cairn_vcs::PublicationMode::Child {
+            description: "the straddling batch".into(),
+        },
+    )
+    .unwrap_err();
+    assert!(refused.contains("changed from"), "{refused}");
+
+    // The runner's answer: merge the batch's changes onto the head the bookmark
+    // actually holds, then publish onto that head.
+    let Integration::Commit(integrated) =
+        integrate_delta_onto_head(path, &base, &delta, &advanced.head).unwrap()
+    else {
+        panic!("a straddle over disjoint paths integrates");
+    };
+    let _pin = pin_validated_delta(path, &advanced.head, &integrated, None).unwrap();
+    let landed = cairn_vcs::publish_logical_head(
+        path,
+        "feature",
+        &advanced.head,
+        &integrated,
+        None,
+        cairn_vcs::PublicationMode::Child {
+            description: "the straddling batch".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        jj.run(
+            path,
+            &[
+                "log",
+                "-r",
+                "feature",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy"
+            ],
+            "read the landed bookmark",
+        )
+        .unwrap(),
+        landed.head,
+        "the bookmark advanced to the integrated commit"
+    );
+    assert_eq!(
+        git_stdout(path, &["rev-parse", &format!("{}^", landed.head)]),
+        advanced.head
+    );
+    assert_eq!(
+        blob_at(path, &landed.head, "advanced.rs"),
+        "after the advance",
+        "the sibling's work is still on the branch"
+    );
+    assert_eq!(
+        blob_at(path, &landed.head, "mine.rs"),
+        "the batch's work",
+        "and so is the batch's, which before this had no route back into the branch"
+    );
+}
+
+/// A clean TIP is not a clean branch, and a commit-preserving fold must refuse
+/// the difference.
+///
+/// `branch_has_conflict` answers for the bookmark tip only. jj propagates a
+/// conflict to every descendant until something resolves it, so a *fresh*
+/// conflict always lands on the tip and is rolled back — but a branch that
+/// already carries a conflict-flagged commit keeps it through every later rebase,
+/// with a clean resolving commit on top hiding it from that probe. Folding such a
+/// branch carries the conflicted commit onto the target as ordinary history,
+/// after which jj refuses to push the target at all.
+///
+/// Built the way it actually arises: an unguarded rebase records the conflict
+/// (a store predating the guard, or `jj` run outside Cairn), the agent resolves
+/// on top and re-seals, and the base then advances again.
+#[test]
+#[serial_test::serial(jj)]
+fn a_clean_tip_over_conflicted_history_is_never_folded() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping a_clean_tip_over_conflicted_history_is_never_folded: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-3197-builder-0";
+    let ws = wts.path().join("agent");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("shared.rs"), "BRANCH-SIDE\n").unwrap();
+    seal(&jj, &ws, "branch edits shared", None).unwrap();
+
+    // `main` advances conflictingly, and the branch is rebased UNGUARDED — the
+    // pre-guard shape this has to keep coping with.
+    let oob = "agent/CAIRN-9-oob-0";
+    let ws_oob = wts.path().join("oob");
+    add_workspace(&jj, &store, &ws_oob, oob, "main", None).unwrap();
+    std::fs::write(ws_oob.join("shared.rs"), "MAIN-SIDE\n").unwrap();
+    seal(&jj, &ws_oob, "main advances shared", None).unwrap();
+    let oob_tip = bookmark_commit(&jj, &store, oob).unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            &oob_tip,
+            "--ignore-working-copy",
+        ],
+        "advance main",
+    )
+    .unwrap();
+    rebase_recording_conflict(&jj, &store, branch, "main");
+
+    // The agent resolves on top and re-seals: clean tip, conflicted ancestor.
+    update_stale(&jj, &ws).unwrap();
+    std::fs::write(ws.join("shared.rs"), "RESOLVED\n").unwrap();
+    seal(&jj, &ws, "resolve the base conflict", None).unwrap();
+    assert!(
+        !branch_has_conflict(&jj, &store, branch).unwrap(),
+        "precondition: the TIP is clean — which is exactly what makes this dangerous"
+    );
+    assert!(
+        !conflicted_commits(&jj, &store, &format!("main..bookmarks(exact:{branch:?})")).is_empty(),
+        "precondition: the branch's own history still carries a conflicted commit"
+    );
+
+    // The base advances once more, and the branch is rebased through the guarded
+    // path. The conflicted ancestor survives the rebase, and the outcome says so
+    // rather than reporting a clean rebase.
+    std::fs::write(ws_oob.join("unrelated.rs"), "base moves on\n").unwrap();
+    seal(&jj, &ws_oob, "main advances again", None).unwrap();
+    let oob_tip = bookmark_commit(&jj, &store, oob).unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            &oob_tip,
+            "--ignore-working-copy",
+        ],
+        "advance main again",
+    )
+    .unwrap();
+
+    let outcome = rebase_branch_onto(&jj, &store, branch, "main").unwrap();
+    match &outcome {
+        RebaseOutcome::RebasedOverConflictedAncestry { paths } => {
+            assert!(
+                paths.contains(&"shared.rs".to_string()),
+                "the conflicted ancestry names its file: {paths:?}"
+            );
+        }
+        other => panic!("a clean tip over conflicted history must not read as clean: {other:?}"),
+    }
+
+    // The commit-preserving fold refuses it, and the default branch never moves.
+    let main_before = bookmark_commit(&jj, &store, "main").unwrap();
+    let err = rebase_then_fold_into(&jj, &store, "main", branch, "main").unwrap_err();
+    assert!(
+        err.contains("history") && err.contains("conflicted"),
+        "the refusal names the conflicted history rather than a tip conflict: {err}"
+    );
+    assert!(err.contains("shared.rs"), "{err}");
+    assert_eq!(
+        bookmark_commit(&jj, &store, "main").unwrap(),
+        main_before,
+        "the default branch never gained the conflicted ancestry"
+    );
+    assert!(
+        conflicted_commits(&jj, &store, "bookmarks(exact:\"main\")").is_empty(),
+        "the default branch tip is still clean"
+    );
+
+    // And the healing path still works: the guarded flatten collapses the branch
+    // to one clean commit on the base, after which the same fold succeeds. This
+    // is why such a branch is exported rather than rolled back — the flatten can
+    // only run on a branch that has been rebased onto its dest.
+    let dest = bookmark_commit(&jj, &store, "main").unwrap();
+    flatten_branch_recovery(&jj, &store, branch, &dest, "flattened branch").unwrap();
+    assert_eq!(
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
+        RebaseOutcome::Rebased,
+        "the flattened branch is genuinely clean"
+    );
+    rebase_then_fold_into(&jj, &store, "main", branch, "main").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The store's default workspace: staleness there must reach nothing (CAIRN-3223)
+// ---------------------------------------------------------------------------
+
+/// Whether a flagless read of the store is refused for staleness — the ground
+/// truth these tests assert preconditions against, deliberately NOT routed
+/// through any Cairn helper, since the helpers are the thing under test.
+fn store_default_workspace_is_stale(jj: &JjEnv, store: &Path) -> bool {
+    jj.run(
+        store,
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+        "flagless store probe",
+    )
+    .err()
+    .is_some_and(|error| is_stale_error(&error))
+}
+
+/// Drive the store's DEFAULT workspace into jj's stale state exactly the way
+/// Cairn's own traffic does: every store write passes `--ignore-working-copy`,
+/// so one that rewrites the default `@` advances the repo view and leaves the
+/// disk behind. Returns the advanced `main` commit.
+fn make_store_default_workspace_stale(jj: &JjEnv, store: &Path, project: &Path) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Each call must move the backing git by a DISTINCT commit: a repeat of the
+    // same content is an empty commit git refuses, and jj detects staleness by
+    // comparing trees, so an advance that does not change main's tree would not
+    // make the rebased `@` stale either.
+    static ADVANCE: AtomicUsize = AtomicUsize::new(0);
+    let n = ADVANCE.fetch_add(1, Ordering::Relaxed);
+    std::fs::write(
+        project.join(format!("store-advance-{n}.rs")),
+        format!("advance {n}\n"),
+    )
+    .unwrap();
+    git(project, &["add", "-A"]);
+    git(project, &["commit", "-q", "-m", "advance the backing git"]);
+    ensure_project_store(jj, store, project).unwrap();
+    jj.run(
+        store,
+        &["rebase", "-r", "@", "-d", "main", "--ignore-working-copy"],
+        "rebase the store default @ onto the advanced main",
+    )
+    .unwrap();
+    assert!(
+        store_default_workspace_is_stale(jj, store),
+        "fixture must actually produce a stale store default workspace, or every \
+         assertion downstream passes against a healthy store"
+    );
+    bookmark_commit(jj, store, "main").unwrap()
+}
+
+/// The completion of "prepare is workspace-free": staleness in the store's
+/// default workspace must not fail, or silently distort, ANY store operation.
+///
+/// `--ignore-working-copy` on `jj git import` closed one of eleven store-facing
+/// sites. Measured on jj 0.42, the other ten all failed against a stale store,
+/// and four of them failed into a wrong answer rather than an error:
+/// `revset_resolves` returning `false` sends [`resolve_base_rev`] down to `HEAD`
+/// or `root()`, so a stale store would silently provision a job off the wrong
+/// base, and the conflict probes fall to the permissive side of a merge gate.
+#[test]
+#[serial_test::serial(jj)]
+fn a_stale_store_default_workspace_fails_no_store_operation() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping a_stale_store_default_workspace_fails_no_store_operation: no jj");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    init_project(project.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("project");
+    ensure_project_store(&jj, &store, project.path()).unwrap();
+    let original_main = bookmark_commit(&jj, &store, "main").unwrap();
+
+    // A sibling branch to interrogate, cut before the store goes stale.
+    let sibling = workspaces.path().join("sibling");
+    add_workspace(&jj, &store, &sibling, "agent/sibling", "main", None).unwrap();
+    std::fs::write(sibling.join("sibling.rs"), "sibling\n").unwrap();
+    seal(&jj, &sibling, "sibling work", None).unwrap();
+    let sibling_tip = bookmark_commit(&jj, &store, "agent/sibling").unwrap();
+
+    let advanced_main = make_store_default_workspace_stale(&jj, &store, project.path());
+    assert_ne!(advanced_main, original_main);
+
+    // Reads stay truthful.
+    assert_eq!(
+        bookmark_commit(&jj, &store, "main").as_deref(),
+        Some(advanced_main.as_str()),
+        "a bookmark read resolves over a stale store"
+    );
+    assert_eq!(
+        bookmark_commit_checked(&jj, &store, "agent/sibling"),
+        Ok(Some(sibling_tip.clone())),
+        "the proving resolver too — it must not report a stale store as an absent bookmark"
+    );
+    assert!(revset_resolves(&jj, &store, "agent/sibling"));
+    assert_eq!(
+        resolve_base_rev(&jj, &store, "agent/sibling", |_: &str| None),
+        "agent/sibling",
+        "a store-only bookmark is still recognised as a store revset; falling through here is \
+         how a stale store provisions the next job off the wrong base without erroring"
+    );
+    assert_eq!(branch_has_conflict(&jj, &store, "agent/sibling"), Ok(false));
+    assert!(
+        branch_descends_from(&jj, &store, "agent/sibling", &original_main),
+        "the descendant probe must not fall to `false` merely because the store is stale"
+    );
+    assert!(branch_is_ancestor_of(
+        &jj,
+        &store,
+        "agent/sibling",
+        &sibling_tip
+    ));
+    assert!(conflicted_commits(&jj, &store, "bookmarks(exact:\"agent/sibling\")").is_empty());
+
+    // None of those reads may have repaired the store on the way past, or every
+    // assertion after this point would pass vacuously against a healthy store.
+    assert!(
+        store_default_workspace_is_stale(&jj, &store),
+        "the read block must leave the store exactly as stale as it found it"
+    );
+
+    // And every write the spawn path performs still lands — `jj workspace add`
+    // included, which jj will not let Cairn run without a current default
+    // workspace and which therefore carries the repair.
+    let child = workspaces.path().join("child");
+    add_workspace(&jj, &store, &child, "agent/child", &advanced_main, None).unwrap();
+    assert_eq!(
+        bookmark_commit(&jj, &store, "agent/child").as_deref(),
+        Some(advanced_main.as_str()),
+        "the new workspace's bookmark was created at its base"
+    );
+    assert!(
+        child.join(".jj").is_dir(),
+        "the workspace is real, not merely registered"
+    );
+    forget_workspace(&jj, &store, "agent/child").unwrap();
+
+    // The import that slice 1 fixed still passes on a store the repair has now
+    // refreshed, and on one made stale again afterwards.
+    ensure_project_store(&jj, &store, project.path()).unwrap();
+    make_store_default_workspace_stale(&jj, &store, project.path());
+    ensure_project_store(&jj, &store, project.path()).unwrap();
+}
+
+/// The reason [`run_needing_store_workspace`] has to exist, pinned against jj
+/// rather than asserted in prose: `jj workspace add` REJECTS
+/// `--ignore-working-copy`, so it is the one store operation Cairn cannot make
+/// workspace-free by convention. If a future jj accepts the flag here, this test
+/// fails and the repair can be deleted in favour of the flag.
+#[test]
+#[serial_test::serial(jj)]
+fn jj_rejects_ignore_working_copy_on_workspace_add() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping jj_rejects_ignore_working_copy_on_workspace_add: no jj");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    init_project(project.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("project");
+    ensure_project_store(&jj, &store, project.path()).unwrap();
+
+    let path = workspaces.path().join("probe");
+    let error = jj
+        .run(
+            &store,
+            &[
+                "workspace",
+                "add",
+                "--ignore-working-copy",
+                "--name",
+                "probe",
+                &path.to_string_lossy(),
+            ],
+            "probe whether workspace add accepts the flag",
+        )
+        .expect_err("jj refuses the flag on a command that must write a working copy");
+    assert!(
+        error.contains("must be able to update the working copy"),
+        "the refusal must be jj's flag rejection, not some other failure: {error}"
+    );
+}
+
+/// `jj workspace update-stale` reconciles every staleness state the store can
+/// reach, and says so plainly when there is nothing to reconcile.
+///
+/// This encodes the empirical finding CAIRN-3223 was opened to settle. An
+/// incident had recorded `update-stale` as "exits 0, changes nothing" in the
+/// very state its own error message prescribes it for, which would have meant
+/// the repair had to run the other way (`jj edit` back to the commit the disk
+/// remembers). It does not: the no-op was Cairn's own `jj` shim intercepting the
+/// command before it reached jj. Real jj repairs all three states below. If a
+/// future jj regresses any of them, this fails rather than the runner quietly
+/// stranding a spawn.
+#[test]
+#[serial_test::serial(jj)]
+fn update_stale_reconciles_every_staleness_state_the_store_can_reach() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping update_stale_reconciles_every_staleness_state: no jj");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    init_project(project.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("project");
+    ensure_project_store(&jj, &store, project.path()).unwrap();
+
+    // State 1: `@` rewritten out from under the disk by an `--ignore-working-copy`
+    // rebase. This is the shape Cairn's own store traffic produces.
+    make_store_default_workspace_stale(&jj, &store, project.path());
+    update_stale(&jj, &store).unwrap();
+    assert!(
+        !store_default_workspace_is_stale(&jj, &store),
+        "a rebased-out `@` is reconciled"
+    );
+
+    // State 2: `@` ABANDONED, the view minting a replacement — the "disk
+    // remembers a commit the repo view abandoned" state, the one the plan
+    // suspected `update-stale` could not handle. Snapshotting a scratch file
+    // first is what makes the abandoned commit's tree differ from its
+    // replacement's; jj detects staleness by tree, so an empty `@` abandoned and
+    // replaced by an empty `@` is not stale at all.
+    std::fs::write(store.join("scratch.txt"), "scratch\n").unwrap();
+    let abandoned = jj
+        .run(
+            &store,
+            &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+            "snapshot the scratch file into the store's @",
+        )
+        .unwrap();
+    jj.run(
+        &store,
+        &["abandon", "-r", &abandoned, "--ignore-working-copy"],
+        "abandon the store's working-copy commit",
+    )
+    .unwrap();
+    assert!(
+        store_default_workspace_is_stale(&jj, &store),
+        "precondition: abandoning a non-empty `@` leaves the disk stale"
+    );
+    update_stale(&jj, &store).unwrap();
+    assert!(
+        !store_default_workspace_is_stale(&jj, &store),
+        "an abandoned `@` is reconciled — there is no inverse repair to add"
+    );
+    assert!(
+        !store.join("scratch.txt").exists(),
+        "the reconcile moved the disk to the view, discarding what only the disk held"
+    );
+
+    // State 3: the view rewound BELOW the disk by `jj op restore` — reachable
+    // from the store, which restores operations to roll back a conflicting
+    // rebase.
+    let op_before = jj
+        .run(
+            &store,
+            &[
+                "op",
+                "log",
+                "--no-graph",
+                "--limit",
+                "1",
+                "-T",
+                "id.short()",
+                "--ignore-working-copy",
+            ],
+            "capture the store op to rewind to",
+        )
+        .unwrap();
+    std::fs::write(store.join("rewind.txt"), "rewind\n").unwrap();
+    jj.run(
+        &store,
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+        "snapshot the rewind file into the store's @",
+    )
+    .unwrap();
+    jj.run(
+        &store,
+        &["op", "restore", &op_before, "--ignore-working-copy"],
+        "rewind the store view below the disk",
+    )
+    .unwrap();
+    assert!(
+        store_default_workspace_is_stale(&jj, &store),
+        "precondition: a rewound view leaves the disk ahead and therefore stale"
+    );
+    update_stale(&jj, &store).unwrap();
+    assert!(
+        !store_default_workspace_is_stale(&jj, &store),
+        "a rewound view is reconciled"
+    );
+
+    // State 4: nothing to do. `update-stale` is a no-op here, and that is the
+    // ONLY no-op it has — it reports it rather than exiting silently.
+    update_stale(&jj, &store).unwrap();
+    assert!(!store_default_workspace_is_stale(&jj, &store));
+}
+
+/// **The regression test for CAIRN-3270.** A publication that moves the jj
+/// bookmark and stops there looks entirely successful — it reports a real
+/// commit on a real branch — while `refs/heads/<branch>` in the backing
+/// checkout stays frozen at whatever it last held. That is how a coordinator
+/// made two integration commits, saw `✓ Committed` for both, and left its
+/// branch ref pinned at a tip containing neither.
+///
+/// Asserted across THREE successive publications on purpose: the single-
+/// publication case can pass by accident, because any unrelated jj CLI
+/// operation running against the store in between exports every bookmark as a
+/// side effect. Only a run where each publication carries its own export can
+/// keep the ref level with the bookmark every time.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn three_successive_publications_each_reach_the_backing_branch_ref() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping three_successive_publications_reach_the_branch_ref: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-3270-coordinator-0";
+    let base = bookmark_commit(&jj, &store, "main").unwrap();
+    create_bookmark_at(&jj, &store, branch, &base).unwrap();
+
+    let mut expected = base;
+    for round in 1..=3 {
+        let published = publish_logical_head_exported(
+            &jj,
+            &store,
+            branch,
+            &expected,
+            ProposedPublication::Mutations(vec![cairn_vcs::LogicalTreeMutation {
+                path: format!("integration-{round}.rs"),
+                content: Some(format!("integration {round}\n").into_bytes()),
+            }]),
+            None,
+            cairn_vcs::PublicationMode::Child {
+                description: format!("integrate child {round}"),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("round {round} publication: {error}"));
+        published
+            .export
+            .unwrap_or_else(|error| panic!("round {round} export: {error}"));
+
+        assert_eq!(
+            bookmark_commit(&jj, &store, branch).as_deref(),
+            Some(published.landed.head.as_str()),
+            "round {round}: the bookmark carries the published commit"
+        );
+        assert_eq!(
+            git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+            published.landed.head,
+            "round {round}: the BRANCH REF must carry the commit the publication reported. A ref \
+             left behind here is invisible to every consumer outside jj — a push, a child branch \
+             cut from it, GitHub's view of the PR head."
+        );
+        expected = published.landed.head;
+    }
+
+    // Every round's content is present at the ref, so no publication was lost.
+    let tree = git_stdout(
+        proj.path(),
+        &["ls-tree", "--name-only", &format!("refs/heads/{branch}")],
+    );
+    for round in 1..=3 {
+        assert!(
+            tree.contains(&format!("integration-{round}.rs")),
+            "round {round}'s content is missing from the published tree: {tree}"
+        );
+    }
+}
+
+/// An export that cannot be repaired is reported, never swallowed. The
+/// transaction has already committed by then, so the commit is real — but a
+/// caller that reads this as success republishes nothing and tells its agent the
+/// work landed where it did not.
+///
+/// The unwritable ref is git's own directory/file rule: `refs/heads/feat` cannot
+/// exist while `refs/heads/feat/inner` does.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_publication_reports_an_unrepairable_export_instead_of_success() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping publication_reports_an_unrepairable_export: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    git(proj.path(), &["checkout", "-q", "--detach"]);
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let base = bookmark_commit(&jj, &store, "main").unwrap();
+    git(proj.path(), &["update-ref", "refs/heads/feat/inner", &base]);
+    create_bookmark_at(&jj, &store, "feat", &base).unwrap();
+
+    let published = publish_logical_head_exported(
+        &jj,
+        &store,
+        "feat",
+        &base,
+        ProposedPublication::Mutations(vec![cairn_vcs::LogicalTreeMutation {
+            path: "blocked.rs".to_string(),
+            content: Some(b"blocked\n".to_vec()),
+        }]),
+        None,
+        cairn_vcs::PublicationMode::Child {
+            description: "a commit whose ref cannot be written".into(),
+        },
+    )
+    .await
+    .expect("the transaction itself succeeds; only its export leg is blocked");
+
+    assert!(
+        !published.landed.head.is_empty(),
+        "the commit is real \u{2014} the transaction committed before the export ran"
+    );
+    let error = published
+        .export
+        .expect_err("a blocked export must not be reported as a published commit");
+    assert!(
+        is_export_freeze_error(&error),
+        "expected the typed export-freeze family, got: {error}"
+    );
+    assert!(
+        error.contains("feat"),
+        "the error must name the branch: {error}"
+    );
+}
+
+type StalePublicationFixture = (
+    TempDir,
+    TempDir,
+    TempDir,
+    TempDir,
+    JjEnv,
+    PathBuf,
+    String,
+    PathBuf,
+);
+
+fn stale_publication_fixture() -> Option<StalePublicationFixture> {
+    let bin = jj_bin()?;
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let origin = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    init_project(project.path());
+    git(
+        project.path(),
+        &["remote", "add", "origin", &origin.path().to_string_lossy()],
+    );
+    git(project.path(), &["push", "-q", "origin", "main"]);
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("publication");
+    ensure_project_store(&jj, &store, project.path()).unwrap();
+    let branch = "agent/CAIRN-3307-builder-0".to_string();
+    let workspace = workspaces.path().join("builder");
+    add_workspace(&jj, &store, &workspace, &branch, "main", None).unwrap();
+    std::fs::write(workspace.join("published.rs"), "published\n").unwrap();
+    seal(&jj, &workspace, "published frontier", None).unwrap();
+    export_bookmark_advance(&jj, &store, true, &branch, "stale publication fixture").unwrap();
+    push_store_bookmark_classified(&jj, &store, &branch).unwrap();
+    Some((
+        home, project, origin, workspaces, jj, store, branch, workspace,
+    ))
+}
+
+/// A force-moved tracked branch is the sole push failure eligible for recovery.
+#[test]
+#[serial_test::serial(jj)]
+fn store_bookmark_push_classifies_a_remote_that_moved_after_tracking() {
+    let Some((_home, _project, origin, _workspaces, jj, store, branch, workspace)) =
+        stale_publication_fixture()
+    else {
+        return;
+    };
+    let base = bookmark_commit(&jj, &store, "main").unwrap();
+    git(
+        origin.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), &base],
+    );
+    std::fs::write(workspace.join("local.rs"), "local\n").unwrap();
+    seal(&jj, &workspace, "unpublished local work", None).unwrap();
+    let error = push_store_bookmark_classified(&jj, &store, &branch).unwrap_err();
+    assert!(
+        matches!(error, StoreBookmarkPushError::StaleRemote(_)),
+        "{error}"
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn managed_branch_convergence_refuses_an_unrelated_remote_without_mutation() {
+    let Some((_home, project, origin, _workspaces, jj, store, branch, workspace)) =
+        stale_publication_fixture()
+    else {
+        return;
+    };
+    std::fs::write(workspace.join("local.rs"), "local\n").unwrap();
+    seal(&jj, &workspace, "unpublished local work", None).unwrap();
+    let local_before = bookmark_commit(&jj, &store, &branch).unwrap();
+    let exported_before = git_stdout(
+        project.path(),
+        &["rev-parse", &format!("refs/heads/{branch}")],
+    );
+    let tree = git_stdout(project.path(), &["rev-parse", "main^{tree}"]);
+    let unrelated = git_stdout(
+        project.path(),
+        &["commit-tree", &tree, "-m", "unrelated remote rewrite"],
+    );
+    git(
+        project.path(),
+        &[
+            "push",
+            "-q",
+            "--force",
+            "origin",
+            &format!("{unrelated}:refs/heads/{branch}"),
+        ],
+    );
+    fetch_remote_branch_via_git(&store, "origin", &branch).unwrap();
+
+    let error = converge_managed_branch_after_remote_rewrite(&jj, &store, &branch).unwrap_err();
+    assert!(error.contains("no change-id twin"), "{error}");
+    assert_eq!(
+        bookmark_commit(&jj, &store, &branch).as_deref(),
+        Some(local_before.as_str())
+    );
+    assert_eq!(
+        git_stdout(
+            project.path(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        exported_before
+    );
+    assert_eq!(
+        git_stdout(
+            origin.path(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        unrelated
     );
 }

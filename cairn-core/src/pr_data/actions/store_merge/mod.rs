@@ -181,13 +181,6 @@ pub(super) async fn land_verified_store_merge_child(
             .await);
         }
     }
-    refresh_worktrees_on_branch(
-        orch,
-        &merge_context.project_id,
-        &jj,
-        &merge_context.target_branch,
-    )
-    .await;
     Ok(VerifiedLanding::Landed(commit))
 }
 
@@ -208,7 +201,7 @@ async fn store_merge_child_inner(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
-    materialize_conflicts: bool,
+    _materialize_conflicts: bool,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.as_str();
     let target_branch = merge_context.target_branch.as_str();
@@ -219,11 +212,6 @@ async fn store_merge_child_inner(
     let squash_title = merge_context.title.as_str();
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-
-    // Capture the source's clean pre-merge tip up front so a conflicted-rebase
-    // refusal can name the seal the merge-time re-rebase overwrites (recoverable
-    // via `jj restore --from <tip>` without `jj evolog`).
-    let pre_source_tip = crate::jj::bookmark_commit(&jj, &store, source_branch);
 
     if target_branch == default_branch {
         // The default branch advances out of band. Bring its live tip into the
@@ -257,27 +245,25 @@ async fn store_merge_child_inner(
             // collapse the rebased chain to a single commit on that tip before
             // the FF — so the default branch gains exactly one commit per PR
             // instead of every per-change commit the agent sealed.
-            crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)?;
-            if crate::jj::branch_has_conflict(&jj, &store, source_branch)? {
-                // The rebase recorded a conflict and the default bookmark was NOT
-                // moved. The source's live workspace `@` was rebased out from
-                // under it and is now stale: materialize the markers (as
-                // `reconcile_siblings` does) so resolve-and-retry is actionable,
-                // and let the merge gate keep blocking until they are resolved.
-                if materialize_conflicts {
-                    refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
-                }
-                return Err(format!(
-                    "Refusing to merge: rebasing `{source_branch}` onto the advanced default branch `{target_branch}` recorded a conflict.{detail}{hint}",
-                    detail = conflicted_history_detail(
-                        &jj,
-                        &store,
-                        &format!("bookmarks(exact:{source_branch:?})"),
+            // A conflicting rebase is rolled back inside `rebase_branch_onto`, so
+            // by the time this returns the source is bit-identical to its
+            // pre-merge tip and the default bookmark never moved. Branch on the
+            // outcome rather than re-probing for a conflict: the probe would now
+            // report a clean branch and read a refusal as a success.
+            match crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)? {
+                crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
+                    return Err(crate::jj::base_conflict_refusal(
+                        target_branch,
                         source_branch,
-                        Some(target_branch),
-                    ),
-                    hint = pre_merge_tip_hint(source_branch, &pre_source_tip),
-                ));
+                        &diagnostic.conflicting_paths(),
+                    ))
+                }
+                // A clean tip over conflicted history is safe HERE and only here:
+                // this path lands exactly one commit whose tree equals the source
+                // tip, so `flatten_branch_recovery` below discards the conflicted
+                // ancestry rather than folding it onto the default branch.
+                crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { .. }
+                | crate::jj::RebaseOutcome::Rebased => {}
             }
             // Idempotence guard (mirrors the old real-fold path's no-op on a
             // retry): if the source already resolves to the LOCAL default
@@ -351,7 +337,28 @@ async fn store_merge_child_inner(
             // the relaxed merge gate cannot let a conflicted-ancestor branch poison
             // the default branch via a preserved fold. Rebase onto the live default
             // tip, gate, then FF the default to it.
-            crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)?;
+            // This method preserves every commit, so conflict-flagged ancestry
+            // cannot be flattened away and must be refused outright.
+            match crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)? {
+                crate::jj::RebaseOutcome::Rebased => {}
+                crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
+                    return Err(crate::jj::base_conflict_refusal(
+                        target_branch,
+                        source_branch,
+                        &diagnostic.conflicting_paths(),
+                    ))
+                }
+                crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { paths } => {
+                    return Err(crate::jj::conflicted_ancestry_refusal(
+                        target_branch,
+                        source_branch,
+                        &paths,
+                    ))
+                }
+            }
+            // Belt and braces on the same question, from the other side: this
+            // also catches a conflicted intermediate that predates the rebase
+            // dest and so falls outside the rebased range.
             let clean = match crate::jj::flatten_state(&jj, &store, &dest, source_branch) {
                 Ok(crate::jj::FlattenState::Clean) => true,
                 Ok(_) => false,
@@ -364,15 +371,11 @@ async fn store_merge_child_inner(
                 }
             };
             if !clean {
-                // A conflict (tip or intermediate) survives the rebase and the
-                // default bookmark was NOT moved. The source's live workspace `@`
-                // is now stale: materialize the markers so resolve-and-retry is
-                // actionable, and keep the merge blocked until they are resolved.
-                if materialize_conflicts {
-                    refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
-                }
+                // Pre-existing conflict-flagged commits in the source's history.
+                // This PR method exists to preserve every commit, so they cannot
+                // be flattened away; the default bookmark was NOT moved.
                 return Err(format!(
-                    "Refusing to merge: rebasing `{source_branch}` onto the advanced default branch `{target_branch}` recorded a conflict, and this PR preserves every commit (its history cannot be flattened).{detail}{hint}",
+                    "Refusing to merge: `{source_branch}`'s own history contains conflict-flagged commit(s), and this PR preserves every commit, so they cannot be flattened away. `{target_branch}` was not advanced. Rebuild `{source_branch}` on clean content before merging again.{detail}",
                     detail = conflicted_history_detail(
                         &jj,
                         &store,
@@ -382,7 +385,6 @@ async fn store_merge_child_inner(
                         source_branch,
                         Some(target_branch),
                     ),
-                    hint = pre_merge_tip_hint(source_branch, &pre_source_tip),
                 ));
             }
             // Clean: the source now descends from the advanced default tip, so this
@@ -555,31 +557,6 @@ async fn store_merge_child_inner(
                         )
                         .await);
                     }
-                    // Re-parent every workspace on the integration branch onto the
-                    // flattened tip so the coordinator's `@` follows the collapse.
-                    if materialize_conflicts { if let (Ok(worktrees), Some(flattened)) = (
-                        load_worktrees_on_branch(&orch.db.local, project_id, target_branch).await,
-                        crate::jj::bookmark_commit(&jj, &store, target_branch),
-                    ) {
-                        let mut seen = std::collections::HashSet::new();
-                        for wt in worktrees {
-                            if !seen.insert(wt.clone()) {
-                                continue;
-                            }
-                            if let Err(e) = crate::jj::advance_workspace_onto(
-                                &jj,
-                                &store,
-                                Path::new(&wt),
-                                target_branch,
-                                &flattened,
-                            ) {
-                                log::warn!(
-                                    "jj store merge: re-parent integration workspace {wt} onto flattened tip failed: {e}"
-                                );
-                            }
-                        }
-                    }
-                    }
                     // Publish the repair to origin FAIL-CLOSED. If it cannot land,
                     // roll the flatten (and worktree re-parent) back to the
                     // pre-repair state so local and origin stay identical (both
@@ -615,31 +592,24 @@ async fn store_merge_child_inner(
         // un-does the published repair.
         let op_id = crate::jj::operation_id(&jj, &store)?;
 
-        crate::jj::rebase_branch_onto(&jj, &store, source_branch, target_branch)?;
-        if crate::jj::branch_has_conflict(&jj, &store, source_branch)? {
-            // The rebase recorded a conflict and the integration bookmark was NOT
-            // moved. The source's live workspace `@` was rebased out from under it
-            // and is now stale: materialize the markers (as `reconcile_siblings`
-            // does) so resolve-and-retry is actionable, and let the merge gate keep
-            // blocking until they are resolved. The target repair is already durable
-            // on origin (published in the preflight above), so this is a pure KEEP
-            // refusal: no rollback (the conflicted rebased source IS the
-            // resolve-and-reseal artifact) and no target push — origin is not left
-            // behind.
-            if materialize_conflicts {
-                refresh_worktrees_on_branch(orch, project_id, &jj, source_branch).await;
-            }
-            return Err(format!(
-                "Refusing to merge: rebasing `{source_branch}` onto the advanced integration branch `{target_branch}` recorded a conflict.{detail}{hint}",
-                detail = conflicted_history_detail(
-                    &jj,
-                    &store,
-                    &format!("bookmarks(exact:{source_branch:?})"),
+        // A conflicting rebase is rolled back inside `rebase_branch_onto`, so the
+        // source is bit-identical to its pre-merge tip and the integration
+        // bookmark never moved. The target repair above is already durable on
+        // origin, so this is a pure refusal: nothing to roll back, and origin is
+        // not left behind.
+        match crate::jj::rebase_branch_onto(&jj, &store, source_branch, target_branch)? {
+            crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
+                return Err(crate::jj::base_conflict_refusal(
+                    target_branch,
                     source_branch,
-                    Some(target_branch),
-                ),
-                hint = pre_merge_tip_hint(source_branch, &pre_source_tip),
-            ));
+                    &diagnostic.conflicting_paths(),
+                ))
+            }
+            // Handled below: the child is flattened to one clean commit on the
+            // integration tip before the fold, so conflicted ancestry is
+            // discarded rather than folded into the integration branch.
+            crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { .. }
+            | crate::jj::RebaseOutcome::Rebased => {}
         }
 
         // Clean tip: if a base advance baked conflicts into INTERMEDIATE commits
@@ -841,84 +811,6 @@ fn validate_source_publishability(
     ))
 }
 
-/// `update-stale` every live workspace on `branch` so its on-disk files match the
-/// store after a store-driven rewrite left `@` stale. Two callers: a
-/// conflicted-rebase refusal (the source `@` was rebased out from under it, so
-/// this materializes the conflict markers the agent must resolve) and
-/// [`rollback_merge`] (an op-restore rewound bookmarks a preflight had advanced,
-/// so the source AND target workspaces must be refreshed back to the restored
-/// state). Best-effort — a refresh failure only means the agent must run
-/// `jj workspace update-stale` itself; it never blocks the (already-failed) merge.
-async fn refresh_worktrees_on_branch(
-    orch: &Orchestrator,
-    project_id: &str,
-    jj: &crate::jj::JjEnv,
-    branch: &str,
-) {
-    let worktrees = match load_worktrees_on_branch(&orch.db.local, project_id, branch).await {
-        Ok(worktrees) => worktrees,
-        Err(e) => {
-            log::warn!(
-                "jj store merge: could not load workspaces on {branch} to refresh them: {e}"
-            );
-            return;
-        }
-    };
-    let mut seen = std::collections::HashSet::new();
-    for worktree in worktrees {
-        // Several jobs can share one physical worktree; refresh each once.
-        if !seen.insert(worktree.clone()) {
-            continue;
-        }
-        if let Err(e) = crate::jj::update_stale(jj, Path::new(&worktree)) {
-            log::warn!("jj store merge: update-stale {worktree} failed: {e}");
-        }
-    }
-}
-
-/// Worktree paths of in-flight jobs whose branch IS `branch` (the source branch
-/// of a merge). Mirrors `base_advance::load_on_branch_workspaces`' status guard
-/// so a just-finished Coordinator (status `complete`) whose PR is not yet marked
-/// merged is still found.
-async fn load_worktrees_on_branch(
-    db: &LocalDb,
-    project_id: &str,
-    branch: &str,
-) -> Result<Vec<String>, String> {
-    let project_id = project_id.to_string();
-    let branch = branch.to_string();
-    db.read(|conn| {
-        let project_id = project_id.clone();
-        let branch = branch.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT j.worktree_path
-                     FROM jobs j
-                     WHERE j.project_id = ?1
-                       AND j.branch = ?2
-                       AND j.worktree_path IS NOT NULL
-                       AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
-                             OR EXISTS (
-                               SELECT 1 FROM merge_requests mr
-                               WHERE mr.source_branch = j.branch
-                                 AND mr.project_id = j.project_id
-                                 AND mr.status NOT IN ('merged', 'closed')
-                             ) )",
-                    params![project_id.as_str(), branch.as_str()],
-                )
-                .await?;
-            let mut worktrees = Vec::new();
-            while let Some(row) = rows.next().await? {
-                worktrees.push(row.text(0)?);
-            }
-            Ok(worktrees)
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
-}
-
 /// The base branch the integration `target_branch` was itself cut from: the
 /// `base_branch` of the newest job whose `branch` IS `target_branch` in this
 /// project. A Coordinator integration branch's base is the project default, but a
@@ -1008,48 +900,21 @@ async fn resolve_target_base_commit(
 // would not clarify the call sites.
 #[allow(clippy::too_many_arguments)]
 async fn rollback_merge(
-    orch: &Orchestrator,
-    project_id: &str,
+    _orch: &Orchestrator,
+    _project_id: &str,
     jj: &crate::jj::JjEnv,
     store: &Path,
     op_id: &str,
-    source_branch: &str,
-    target_branch: Option<&str>,
+    _source_branch: &str,
+    _target_branch: Option<&str>,
     base_err: String,
 ) -> String {
     if let Err(e) = crate::jj::restore_operation(jj, store, op_id) {
         log::warn!("jj store merge: op restore during rollback failed: {e}");
     }
-    // Refresh BOTH the source-branch worktrees and (integration path) the
-    // target-branch worktrees onto the restored (pre-merge) `@`. The target
-    // preflight may have flattened the integration branch and re-parented its
-    // coordinator workspace via `advance_workspace_onto`; the op-restore rewinds
-    // that in the store, so without this the target workspace stays on the
-    // flattened/re-parented files on disk (stale) even though the bookmark is
-    // rolled back — leaving the "all local state restored" guarantee incomplete.
-    refresh_worktrees_on_branch(orch, project_id, jj, source_branch).await;
-    if let Some(target_branch) = target_branch {
-        if target_branch != source_branch {
-            refresh_worktrees_on_branch(orch, project_id, jj, target_branch).await;
-        }
-    }
     format!(
         "{base_err} All local bookmarks were restored to their pre-merge state; the merge is safe to retry."
     )
-}
-
-/// Recovery hint appended to a conflicted-rebase refusal. The merge rebases the
-/// source onto the current target tip before folding, which re-records the
-/// conflict inside the source's tip — overwriting a clean seal the agent produced
-/// at the current base (occurrence 3). Naming the pre-merge tip makes that seal's
-/// tree recoverable with a plain `jj restore --from <tip>` instead of `jj evolog`.
-fn pre_merge_tip_hint(source_branch: &str, pre_source_tip: &Option<String>) -> String {
-    match pre_source_tip {
-        Some(tip) => format!(
-            "\nThe pre-merge tip of `{source_branch}` was `{tip}`; if the merge-time re-rebase overwrote a clean seal, recover its tree with `jj restore --from {tip}`."
-        ),
-        None => String::new(),
-    }
 }
 
 /// Reflect a folded child merge as Merged on GitHub by pushing the advanced

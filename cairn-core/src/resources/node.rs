@@ -300,6 +300,14 @@ pub(super) async fn read_node_wakes(
             Ok(pending) => pending,
             Err(error) => return error,
         };
+    // The child issues this node coordinates carry no subscription row: their
+    // attention is routed by deriving the parent issue's current driver at wake
+    // time (CAIRN-3293), so this section is the only place the watch is visible.
+    let coordinated =
+        match crate::orchestrator::wakes::coordinated_child_issue_uris_for_job(db, &job_id).await {
+            Ok(coordinated) => coordinated,
+            Err(error) => return error,
+        };
     let uri = build_node_wakes_uri(project_key, number, exec_seq, node_name);
     let mut out = format!("# Wakes — {node_name}\n\n`{uri}`\n\n");
     if subscriptions.is_empty() {
@@ -321,6 +329,14 @@ pub(super) async fn read_node_wakes(
                 facts,
                 sub.created_by
             ));
+        }
+    }
+    if !coordinated.is_empty() {
+        out.push_str(
+            "\n## Coordinated child issues\n\nYou drive these children's parent issue, so their question, permission, review, resolved, and message facts wake you. Derived from the parent edge — no subscription needed, and it moves to the next coordinator execution on its own.\n\n",
+        );
+        for child_uri in &coordinated {
+            out.push_str(&format!("- `{child_uri}`\n"));
         }
     }
     out.push_str("\n## Pending digest\n\n");
@@ -1147,7 +1163,18 @@ pub(super) async fn read_node(
         repo_path,
     )) = pr
     {
-        if let (Some(pr_num), Some(url)) = (pr_number, pr_url) {
+        // A non-positive number is not a pull-request binding; see
+        // `bound_pr_number` in `pr_data::actions::context`.
+        let bound = pr_number.filter(|number| *number > 0).zip(pr_url);
+        if bound.is_none() && pr_status == "open" {
+            // The row exists but nothing is bound to it. Saying nothing here
+            // reads as "this node has no change", which is how a failed open
+            // stayed invisible; say what is actually true instead.
+            output.push_str(&format!(
+                "\n## Pull Request\n\nNot published: no pull request has been opened for `{source_branch}` yet. Refresh the node's PR artifact to re-check GitHub.\n"
+            ));
+        }
+        if let Some((pr_num, url)) = bound {
             output.push_str("\n## Pull Request\n\n");
             output.push_str(&format!("PR #{}: {}\n", pr_num, url));
             output.push_str(&format!("Status: {}\n", pr_status));
@@ -1430,7 +1457,7 @@ async fn render_job_chat_digest(
     let event_rows = load_job_events_ordered(
         conn,
         job_id,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await;
@@ -1506,7 +1533,7 @@ pub(super) async fn read_node_chat_raw(
     let event_rows = load_job_events_ordered(
         &conn,
         &job.id,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await;
@@ -1608,7 +1635,7 @@ pub(super) async fn read_node_chat_turn(
     let event_rows = load_turn_events(
         &conn,
         &turn_id,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await;
@@ -1998,7 +2025,7 @@ pub(super) async fn read_task_chat(
     let event_rows = load_job_events_ordered(
         &conn,
         &task_job.id,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await;
@@ -2060,7 +2087,7 @@ pub(super) async fn read_task_chat_raw(
     let event_rows = load_job_events_ordered(
         &conn,
         &task_job.id,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await;
@@ -2165,7 +2192,7 @@ pub(super) async fn read_task_chat_turn(
     let event_rows = load_turn_events(
         &conn,
         &turn_id,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await;
@@ -2352,7 +2379,7 @@ pub(super) async fn read_node_chat_event(
         &conn,
         &run_id,
         event_seq,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await
@@ -2415,6 +2442,83 @@ mod task_permission_tests {
         assert!(
             broken.contains("not found"),
             "flat sub-task node URI must not resolve: {broken}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod coordinated_child_wakes_tests {
+    use super::read_node_wakes;
+    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("coordinated-child-wakes.db");
+        std::mem::forget(temp);
+        let db = LocalDb::open(path).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// A coordinator node on issue 1 with a live session, and a child issue 2
+    /// parented to it.
+    async fn seed(db: &LocalDb) {
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('parent','p',1,'Parent','active',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at) VALUES ('child','p',2,'Child','active','parent',2,2)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','parent','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, current_session_id, uri_segment, node_name, created_at, updated_at) VALUES ('coord','e','parent','p','running','sess','coordinator','Coordinator',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+    }
+
+    /// The derived child watch has no subscription row, so `/wakes` is the only
+    /// surface that can tell a coordinator which children wake it.
+    #[tokio::test]
+    async fn wakes_lists_the_children_a_coordinator_drives() {
+        let db = test_db().await;
+        seed(&db).await;
+
+        let rendered = read_node_wakes(&db, "PRJ", 1, 1, "coordinator").await;
+
+        assert!(
+            rendered.contains("## Coordinated child issues"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("`cairn://p/PRJ/2`"),
+            "the coordinated child must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains("No wake subscriptions."),
+            "and it must be visible without any subscription row: {rendered}"
+        );
+    }
+
+    /// A node that drives no children omits the section entirely rather than
+    /// rendering an empty heading.
+    #[tokio::test]
+    async fn wakes_omits_the_section_when_a_node_drives_no_children() {
+        let db = test_db().await;
+        seed(&db).await;
+        db.execute(
+            "UPDATE issues SET parent_issue_id = NULL WHERE id = 'child'",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let rendered = read_node_wakes(&db, "PRJ", 1, 1, "coordinator").await;
+
+        assert!(
+            !rendered.contains("Coordinated child issues"),
+            "got: {rendered}"
         );
     }
 }
@@ -2823,7 +2927,7 @@ pub(super) async fn read_task_chat_event(
         &conn,
         &run_id,
         event_seq,
-        db.content_store().map(|s| s.as_ref()),
+        db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await

@@ -25,9 +25,46 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::mcp::gateway::McpToolDef;
+use crate::mcp::gateway::{McpToolCatalog, McpToolDef};
 
 const STORE_FILENAME: &str = "mcp_tools.json";
+/// Cache lifetime when a server omits the optional MCP cache hint.
+pub(crate) const DEFAULT_TTL_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogRecord {
+    tools: Vec<McpToolDef>,
+    ttl_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_scope: Option<String>,
+    fetched_at_ms: u64,
+}
+
+/// Old sidecars stored a bare tool array. Untagged decoding keeps those records
+/// readable; they are treated as stale so the first catalog read upgrades them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredCatalog {
+    Current(CatalogRecord),
+    Legacy(Vec<McpToolDef>),
+}
+
+impl StoredCatalog {
+    fn tools(&self) -> &[McpToolDef] {
+        match self {
+            Self::Current(record) => &record.tools,
+            Self::Legacy(tools) => tools,
+        }
+    }
+
+    fn is_stale_at(&self, now_ms: u64) -> bool {
+        match self {
+            Self::Legacy(_) => true,
+            Self::Current(record) => now_ms.saturating_sub(record.fetched_at_ms) >= record.ttl_ms,
+        }
+    }
+}
 
 /// The scope a captured tool list belongs to, mirroring server resolution.
 #[derive(Debug, Clone, Copy)]
@@ -45,10 +82,10 @@ pub enum ToolScope<'a> {
 struct McpToolStore {
     /// Workspace-scoped servers, keyed by server name.
     #[serde(default)]
-    workspace: HashMap<String, Vec<McpToolDef>>,
+    workspace: HashMap<String, StoredCatalog>,
     /// Project-scoped servers, keyed by canonical project path then server name.
     #[serde(default)]
-    projects: HashMap<String, HashMap<String, Vec<McpToolDef>>>,
+    projects: HashMap<String, HashMap<String, StoredCatalog>>,
 }
 
 fn store_path(config_dir: &Path) -> PathBuf {
@@ -81,30 +118,98 @@ fn save(config_dir: &Path, store: &McpToolStore) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("Failed to write MCP tool store: {e}"))
 }
 
-/// Record (replace) the tool list captured for `server` in the given scope.
-/// Called after a successful `list_tools` on save/edit. An empty list is stored
-/// faithfully ("server answered, no tools") — distinct from a *missing* entry,
-/// which renders the `read cairn://mcp/<server>` pointer.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Compatibility helper for callers without list-result metadata.
 pub fn record_tools(
     config_dir: &Path,
     scope: ToolScope<'_>,
     server: &str,
     tools: &[McpToolDef],
 ) -> Result<(), String> {
+    record_catalog(
+        config_dir,
+        scope,
+        server,
+        &McpToolCatalog {
+            tools: tools.to_vec(),
+            ttl_ms: None,
+            cache_scope: None,
+        },
+    )
+}
+
+/// Record a successful list result, including its MCP cache hints.
+pub fn record_catalog(
+    config_dir: &Path,
+    scope: ToolScope<'_>,
+    server: &str,
+    catalog: &McpToolCatalog,
+) -> Result<(), String> {
+    record_catalog_at(config_dir, scope, server, catalog, now_ms())
+}
+
+fn record_catalog_at(
+    config_dir: &Path,
+    scope: ToolScope<'_>,
+    server: &str,
+    catalog: &McpToolCatalog,
+    fetched_at_ms: u64,
+) -> Result<(), String> {
     let mut store = load(config_dir);
+    let record = StoredCatalog::Current(CatalogRecord {
+        tools: catalog.tools.clone(),
+        ttl_ms: catalog.ttl_ms.unwrap_or(DEFAULT_TTL_MS),
+        cache_scope: catalog.cache_scope.clone(),
+        fetched_at_ms,
+    });
     match scope {
         ToolScope::Workspace => {
-            store.workspace.insert(server.to_string(), tools.to_vec());
+            store.workspace.insert(server.to_string(), record);
         }
         ToolScope::Project(path) => {
             store
                 .projects
                 .entry(project_key(path))
                 .or_default()
-                .insert(server.to_string(), tools.to_vec());
+                .insert(server.to_string(), record);
         }
     }
     save(config_dir, &store)
+}
+
+/// Return a cached catalog only while it is fresh. Legacy array records are
+/// deliberately stale but remain available to synchronous prompt rendering.
+pub(crate) fn fresh_tools(
+    config_dir: &Path,
+    scope: ToolScope<'_>,
+    server: &str,
+) -> Option<Vec<McpToolDef>> {
+    fresh_tools_at(config_dir, scope, server, now_ms())
+}
+
+fn fresh_tools_at(
+    config_dir: &Path,
+    scope: ToolScope<'_>,
+    server: &str,
+    now_ms: u64,
+) -> Option<Vec<McpToolDef>> {
+    let store = load(config_dir);
+    let entry = match scope {
+        ToolScope::Workspace => store.workspace.get(server),
+        ToolScope::Project(path) => store
+            .projects
+            .get(&project_key(path))
+            .and_then(|s| s.get(server)),
+    }?;
+    (!entry.is_stale_at(now_ms)).then(|| entry.tools().to_vec())
 }
 
 /// Drop any captured tools for `server` in the given scope (e.g. on delete).
@@ -138,12 +243,15 @@ pub(crate) fn resolve_tools(
     let mut tools = store.workspace;
     if let Some(path) = project_path {
         if let Some(project_tools) = store.projects.get(&project_key(path)) {
-            for (name, defs) in project_tools {
-                tools.insert(name.clone(), defs.clone());
+            for (name, catalog) in project_tools {
+                tools.insert(name.clone(), catalog.clone());
             }
         }
     }
     tools
+        .into_iter()
+        .map(|(name, catalog)| (name, catalog.tools().to_vec()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -217,6 +325,37 @@ mod tests {
         assert!(resolve_tools(dir.path(), None).is_empty());
         // Removing a missing server is a no-op, not an error.
         remove_server(dir.path(), ToolScope::Workspace, "nope").unwrap();
+    }
+
+    #[test]
+    fn persists_cache_hints_and_observes_expiry() {
+        let dir = TempDir::new().unwrap();
+        let catalog = McpToolCatalog {
+            tools: vec![tool("look")],
+            ttl_ms: Some(1_000),
+            cache_scope: Some("private".to_string()),
+        };
+        record_catalog_at(dir.path(), ToolScope::Workspace, "axon", &catalog, 10_000).unwrap();
+
+        assert!(fresh_tools_at(dir.path(), ToolScope::Workspace, "axon", 10_999).is_some());
+        assert!(fresh_tools_at(dir.path(), ToolScope::Workspace, "axon", 11_000).is_none());
+        let json = std::fs::read_to_string(store_path(dir.path())).unwrap();
+        assert!(json.contains("\"ttlMs\": 1000"));
+        assert!(json.contains("\"cacheScope\": \"private\""));
+        assert!(json.contains("\"fetchedAtMs\": 10000"));
+    }
+
+    #[test]
+    fn legacy_array_records_remain_readable_but_are_stale() {
+        let dir = TempDir::new().unwrap();
+        let legacy = serde_json::json!({
+            "workspace": { "axon": [tool("look")] },
+            "projects": {}
+        });
+        std::fs::write(store_path(dir.path()), serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert_eq!(resolve_tools(dir.path(), None)["axon"][0].name, "look");
+        assert!(fresh_tools_at(dir.path(), ToolScope::Workspace, "axon", 1).is_none());
     }
 
     #[test]

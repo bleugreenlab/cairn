@@ -1,3 +1,4 @@
+use super::review_push::spawn_turn_end_checks;
 use super::{create_review_push_for_pr_open, evaluate_review_readiness};
 use crate::db::DbState;
 use crate::orchestrator::attention_push::{
@@ -9,6 +10,7 @@ use crate::storage::{LocalDb, SearchIndex};
 use std::sync::Arc;
 
 const ISSUE_URI: &str = "cairn://p/PRJ/7";
+const PLANBUILD_YAML: &str = include_str!("../../../../../recipes/planbuild.yaml");
 const REVIEW_KEY: &str = "review:cairn://p/PRJ/7";
 
 async fn test_db() -> LocalDb {
@@ -41,8 +43,8 @@ async fn seed(db: &LocalDb, start_reason: &str) {
               VALUES('i-rev','p-rev',7,'Rev','active','active','none',1,1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
               VALUES('e-rev','r','i-rev','p-rev','running',1,1);
-            INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, worktree_path, created_at, updated_at)
-              VALUES('j-prod','e-rev','p-rev','i-rev','complete','builder','builder','b','/tmp/wt',1,1);
+            INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, created_at, updated_at)
+              VALUES('j-prod','e-rev','p-rev','i-rev','complete','builder','builder','b',1,1);
             INSERT INTO jobs(id, project_id, issue_id, status, node_name, created_at, updated_at)
               VALUES('j-watch','p-rev','i-rev','running','watcher',1,1);
             INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
@@ -57,6 +59,84 @@ async fn seed(db: &LocalDb, start_reason: &str) {
         ))
         .await
         .unwrap();
+}
+
+enum NodeRole {
+    Builder,
+    Planner,
+    Review,
+}
+
+/// Give execution `e-rev` the bundled PlanBuild snapshot and bind `job_id` to
+/// one of its nodes. Only the turn-end-cadence tests need it: a live DAG makes
+/// the issue non-quiescent (its other nodes have no jobs in this fixture), which
+/// is the correct answer for a real execution but not what the review-push
+/// tests around it are modelling.
+async fn attach_planbuild_topology(db: &LocalDb, job_id: &str, role: NodeRole) {
+    let recipe = crate::models::RecipeFile::from_yaml(PLANBUILD_YAML)
+        .expect("bundled planbuild recipe parses")
+        .into_recipe(Some("default".to_string()), None);
+    // `into_recipe` reassigns node ids, so nodes are keyed by agent config.
+    let node_id = |agent: &str| {
+        recipe
+            .nodes
+            .iter()
+            .find(|node| {
+                node.agent_config
+                    .as_ref()
+                    .and_then(|c| c.agent_config_id.as_deref())
+                    == Some(agent)
+            })
+            .unwrap_or_else(|| panic!("planbuild has an agent node for '{agent}'"))
+            .id
+            .clone()
+    };
+    let node_id = match role {
+        NodeRole::Builder => node_id("build"),
+        NodeRole::Planner => node_id("planner"),
+        NodeRole::Review => node_id("pr-review"),
+    };
+    let snapshot = crate::models::ExecutionSnapshot::new(
+        crate::models::RecipeSnapshot {
+            id: recipe.id.clone(),
+            name: recipe.name.clone(),
+            description: recipe.description.clone(),
+            trigger: recipe.trigger.clone(),
+            nodes: recipe.nodes.clone(),
+            edges: recipe.edges.clone(),
+        },
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        crate::models::TriggerContext {
+            issue_id: Some("i-rev".to_string()),
+            project_id: "p-rev".to_string(),
+            trigger_type: crate::models::TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    );
+    let snapshot_json = snapshot.to_json().expect("snapshot serializes");
+    let job_id = job_id.to_string();
+    db.write(move |conn| {
+        let snapshot_json = snapshot_json.clone();
+        let node_id = node_id.clone();
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE executions SET snapshot = ?1 WHERE id = 'e-rev'",
+                (snapshot_json.as_str(),),
+            )
+            .await?;
+            conn.execute(
+                "UPDATE jobs SET recipe_node_id = ?1 WHERE id = ?2",
+                (node_id.as_str(), job_id.as_str()),
+            )
+            .await?;
+            Ok::<_, crate::storage::DbError>(())
+        })
+    })
+    .await
+    .unwrap();
 }
 
 async fn insert_open_pr(db: &LocalDb) {
@@ -778,7 +858,7 @@ async fn branch_advance_cancels_the_in_flight_review_suite() {
         .expect("claim the job's single-flight slot");
     assert!(!cancel.is_cancelled());
 
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod");
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod").await;
     assert!(
         cancel.is_cancelled(),
         "a sealed commit cancels the in-flight review suite for the job"
@@ -787,8 +867,386 @@ async fn branch_advance_cancels_the_in_flight_review_suite() {
     orch.end_turn_end_checks("j-prod");
     // No suite in flight ⇒ the branch-advance cancel is a harmless no-op, and the
     // single-flight slot remains claimable.
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod");
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod").await;
     assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
+}
+
+/// Two jobs on one branch and one job on another, so a branch-advance can be
+/// asked to distinguish them — plus a second project carrying a job on a branch
+/// of the SAME name, which only project scoping can tell apart.
+async fn seed_branch_sharers(db: &LocalDb) {
+    db.execute_script(
+        "
+        INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+        INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES('p-rev','w','Project','PRJ','/tmp/repo',1,1);
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+          VALUES('i-rev','p-rev',7,'Rev','active','active','none',1,1);
+        INSERT INTO jobs(id, project_id, issue_id, status, node_name, branch, created_at, updated_at)
+          VALUES('j-node','p-rev','i-rev','running','builder','agent/shared',1,1);
+        INSERT INTO jobs(id, project_id, issue_id, status, node_name, branch, created_at, updated_at)
+          VALUES('j-task','p-rev','i-rev','running','task','agent/shared',1,1);
+        INSERT INTO jobs(id, project_id, issue_id, status, node_name, branch, created_at, updated_at)
+          VALUES('j-other','p-rev','i-rev','running','sibling','agent/other',1,1);
+
+        INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES('p-far','w','Far','FAR','/tmp/far',1,1);
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+          VALUES('i-far','p-far',7,'Far','active','active','none',1,1);
+        INSERT INTO jobs(id, project_id, issue_id, status, node_name, branch, created_at, updated_at)
+          VALUES('j-far','p-far','i-far','running','builder','agent/shared',1,1);
+        ",
+    )
+    .await
+    .unwrap();
+}
+
+/// A task commits into the branch it inherited from the node that owns it. The
+/// node's in-flight review wave is now keyed to a tree that no longer exists, so
+/// it must be cancelled even though the commit arrived under a different job id
+/// — the gap that let a full exclusive lane keep burning against a superseded
+/// tree and then throw its verdicts away.
+#[tokio::test]
+async fn a_commit_supersedes_every_review_suite_on_the_same_branch() {
+    let db = test_db().await;
+    seed_branch_sharers(&db).await;
+    let orch = test_orchestrator(db);
+
+    let node = orch.try_begin_turn_end_checks("j-node").unwrap();
+    let other = orch.try_begin_turn_end_checks("j-other").unwrap();
+
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-task").await;
+
+    assert!(
+        node.is_cancelled(),
+        "a task's commit supersedes the wave of the node whose branch it shares"
+    );
+    assert!(
+        !other.is_cancelled(),
+        "a job on a different branch keeps its wave: its inputs did not change"
+    );
+}
+
+/// A branch name identifies a tree only inside one repository. Names like `main`
+/// recur across projects and generated names are unique only per project, so
+/// matching a branch by name alone would let a commit in one project destroy
+/// live review waves in an unrelated one whose tree it never touched.
+#[tokio::test]
+async fn a_commit_spares_a_same_named_branch_in_another_project() {
+    let db = test_db().await;
+    seed_branch_sharers(&db).await;
+    let orch = test_orchestrator(db);
+
+    let near = orch.try_begin_turn_end_checks("j-node").unwrap();
+    let far = orch.try_begin_turn_end_checks("j-far").unwrap();
+
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-task").await;
+
+    assert!(
+        near.is_cancelled(),
+        "the branch's own project still supersedes as before"
+    );
+    assert!(
+        !far.is_cancelled(),
+        "another project's identically named branch is a different tree"
+    );
+}
+
+/// The committing job's own suite is cancelled even when its branch is unknown,
+/// so an unreadable or branchless job row degrades to the previous behavior
+/// rather than to no cancellation at all.
+#[tokio::test]
+async fn a_branchless_job_still_cancels_its_own_suite() {
+    let db = test_db().await;
+    let orch = test_orchestrator(db);
+
+    let own = orch.try_begin_turn_end_checks("j-unknown").unwrap();
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-unknown").await;
+    assert!(own.is_cancelled());
+}
+
+// --- CAIRN-3154: only a turn that really ended earns a review wave -------
+
+/// Replace `j-prod`'s single turn with one in `state`, yielded for `reason`
+/// when given, so the turn-end hook reads one deterministic head turn.
+async fn set_prod_head_turn(db: &LocalDb, state: &str, reason: Option<&str>) {
+    let reason = reason
+        .map(|r| format!("'{r}'"))
+        .unwrap_or_else(|| "NULL".to_string());
+    db.execute_script(&format!(
+        "DELETE FROM turns WHERE job_id='j-prod';
+         INSERT INTO turns(id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at)
+           VALUES('t-prod','s-prod','j-prod',1,'{state}',{reason},'initial',1,1);"
+    ))
+    .await
+    .unwrap();
+}
+
+/// Did the turn-end hook schedule a review wave for `job_id`? The hook claims
+/// the job's single-flight slot before detaching the suite, so the slot is the
+/// observable. The probe restores the slot either way, leaving each subsequent
+/// turn-end in a test independently observable.
+///
+/// Deterministic: under a test runtime `detach_onto_runtime` reaches
+/// `tokio::spawn`, so the detached suite — the only other party that releases
+/// the slot — cannot poll until the test next awaits.
+fn wave_scheduled(orch: &Orchestrator, job_id: &str) -> bool {
+    let claimed_by_probe = orch.try_begin_turn_end_checks(job_id).is_some();
+    orch.end_turn_end_checks(job_id);
+    !claimed_by_probe
+}
+
+/// The reported defect: the heavy `when:review` suites fired at the turn end of
+/// EVERY job, so a builder that delegated work multiplied minutes of exclusive
+/// machine time by its sub-agent turn count, all against intermediate trees
+/// nobody reviews. A delegated task is materialized into the DAG with no node
+/// of its own to ship from, so its turn end now schedules nothing (CAIRN-3334).
+#[tokio::test]
+async fn a_delegated_sub_agents_turn_end_schedules_no_review_wave() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    db.execute_script(
+        "INSERT INTO jobs(id, execution_id, parent_job_id, project_id, issue_id, status,
+                          uri_segment, node_name, branch, task_index, created_at, updated_at)
+           VALUES('j-task','e-rev','j-prod','p-rev','i-rev','complete','explore','Explore','b',0,1,1);
+         INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+           VALUES('t-task','s-task','j-task',1,'complete','initial',1,1);",
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+
+    spawn_turn_end_checks(&orch, "j-task");
+    assert!(
+        !wave_scheduled(&orch, "j-task"),
+        "a sub-agent task ships no PR, so its turn end runs no review cadence"
+    );
+
+    // The builder it belongs to is unaffected: its branch is the one that ships.
+    spawn_turn_end_checks(&orch, "j-prod");
+    assert!(
+        wave_scheduled(&orch, "j-prod"),
+        "the builder whose branch ships the PR still runs its review cadence"
+    );
+}
+
+/// Scoping is by recipe topology, not by agent name: within the SAME recipe the
+/// planner (whose output terminates in a plan artifact) and the review node
+/// (which has no context-out at all) run nothing, while the builder does.
+#[tokio::test]
+async fn only_the_node_whose_branch_ships_runs_the_review_cadence() {
+    for (role, expected) in [
+        (NodeRole::Builder, true),
+        (NodeRole::Planner, false),
+        (NodeRole::Review, false),
+    ] {
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        attach_planbuild_topology(&db, "j-prod", role).await;
+        let orch = test_orchestrator(db);
+
+        spawn_turn_end_checks(&orch, "j-prod");
+        assert_eq!(
+            wave_scheduled(&orch, "j-prod"),
+            expected,
+            "a node's review cadence follows its recipe topology"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_turn_ended_by_self_suspension_schedules_no_review_wave() {
+    // The agent kicked off its own tests and self-suspended waiting on them.
+    // That yield reaches the turn-end hook looking like an idle, but the job is
+    // mid-work: launching the heavy review lanes here would put them in
+    // contention with the very tests being waited on.
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    // A builder that would otherwise qualify, so the mid-work guard is what is
+    // under test here rather than the topology gate ahead of it.
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+
+    for reason in ["wait", "dependency_wait", "user_input", "permission"] {
+        set_prod_head_turn(&orch.db.local, "yielded", Some(reason)).await;
+
+        spawn_turn_end_checks(&orch, "j-prod");
+
+        assert!(
+            !wave_scheduled(&orch, "j-prod"),
+            "a turn yielded on the agent's own {reason} is not a turn end"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_review_wave_lands_once_after_the_resume() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+
+    // Two suspended turn-ends in a row schedule nothing, and leave nothing owed:
+    // there is no make-up wave per skipped turn.
+    for _ in 0..2 {
+        set_prod_head_turn(&orch.db.local, "yielded", Some("wait")).await;
+        spawn_turn_end_checks(&orch, "j-prod");
+        assert!(!wave_scheduled(&orch, "j-prod"));
+    }
+
+    // The wait resolves and the synthetic continuation turn starts. The
+    // suspension's late interrupt ack lands on this hook here; it must not
+    // schedule a wave against the pre-resume tree, nor take the single-flight
+    // slot away from the continuation's own turn-end.
+    set_prod_head_turn(&orch.db.local, "running", None).await;
+    spawn_turn_end_checks(&orch, "j-prod");
+    assert!(
+        !wave_scheduled(&orch, "j-prod"),
+        "the resume boundary must not double-fire ahead of the real turn-end"
+    );
+
+    // The continuation reaches a real turn end: one wave, against the tree that
+    // exists now.
+    set_prod_head_turn(&orch.db.local, "complete", None).await;
+    spawn_turn_end_checks(&orch, "j-prod");
+    assert!(
+        wave_scheduled(&orch, "j-prod"),
+        "the first real turn-end after the resume runs the suite"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_turn_end_still_schedules_its_review_wave() {
+    // The unchanged path: `seed` leaves `t-prod` complete, which is what an
+    // ordinary turn ending through the warm transition looks like.
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+
+    spawn_turn_end_checks(&orch, "j-prod");
+
+    assert!(
+        wave_scheduled(&orch, "j-prod"),
+        "a completed head turn is a real turn end and still fires the cadence"
+    );
+}
+
+/// Startup must re-derive the review wake for a job the check cadence skips
+/// (CAIRN-3347). A planner parked at its plan gate is settled, owns reviewable
+/// output, and ships no PR — so a re-arm that only re-spawns the cadence restores
+/// nothing for it, and its coordinator stays asleep across the restart.
+#[tokio::test]
+async fn startup_rearm_recovers_the_wake_for_a_gated_job_that_ships_no_pr() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Planner).await;
+    db.execute_script(
+        "UPDATE jobs SET status='blocked', branch=NULL WHERE id='j-prod';
+         INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
+                               output_name, created_at, updated_at)
+           VALUES('a-plan','j-prod','plan',0,'{}',1,'plan',1,1);",
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+
+    super::rearm_review_checks_on_startup(&orch).await;
+
+    assert!(
+        !wave_scheduled(&orch, "j-prod"),
+        "a planner's branch ships no PR, so the re-arm schedules no check wave for it"
+    );
+    let pending = list_pending(&orch.db.local, "j-watch").await.unwrap();
+    let review: Vec<&Push> = pending.iter().filter(|p| p.key == REVIEW_KEY).collect();
+    assert_eq!(
+        review.len(),
+        1,
+        "the watcher's wake is re-derived directly, not through the cadence"
+    );
+    assert_eq!(review[0].wake, Wake::Wake);
+    assert!(
+        review[0].content_ref.ends_with("/plan"),
+        "the watcher is pointed at the plan awaiting confirmation, got {}",
+        review[0].content_ref
+    );
+}
+
+/// Every settled stored status is a re-arm candidate, including `cancelled`
+/// (CAIRN-3347). The recompute hook filters derived *transitions* and so can
+/// never see an archived job — cancellation is an explicit sticky override the
+/// sweep skips — which makes this query the only place archived-but-reviewable
+/// work can reach its watcher.
+#[tokio::test]
+async fn every_settled_status_is_a_rearm_candidate() {
+    for status in ["idle", "complete", "failed", "blocked", "cancelled"] {
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        attach_planbuild_topology(&db, "j-prod", NodeRole::Planner).await;
+        db.execute_script(&format!(
+            "UPDATE jobs SET status='{status}', branch=NULL WHERE id='j-prod';
+             INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
+                                   output_name, created_at, updated_at)
+               VALUES('a-plan','j-prod','plan',0,'{{}}',1,'plan',1,1);"
+        ))
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        super::rearm_review_checks_on_startup(&orch).await;
+
+        let pending = list_pending(&orch.db.local, "j-watch").await.unwrap();
+        assert_eq!(
+            pending.iter().filter(|p| p.key == REVIEW_KEY).count(),
+            1,
+            "a settled '{status}' job owning reviewable output must reach its watcher"
+        );
+    }
+}
+
+/// The launchability guard, at the moment it is cheapest to honour: a wave for
+/// a resolved issue or a cancelled job is never armed at all, so it claims no
+/// single-flight slot and spends no minutes planning against a tree nobody will
+/// review (CAIRN-3345).
+#[tokio::test]
+async fn a_wave_is_never_armed_for_a_resolved_issue_or_a_cancelled_job() {
+    for (script, why) in [
+        (
+            "UPDATE issues SET status='merged' WHERE id='i-rev';",
+            "a merged issue has no tree left to review",
+        ),
+        (
+            "UPDATE issues SET status='closed' WHERE id='i-rev';",
+            "a closed issue has no tree left to review",
+        ),
+        (
+            "UPDATE jobs SET status='cancelled' WHERE id='j-prod';",
+            "a cancelled job's work was withdrawn",
+        ),
+    ] {
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+        db.execute_script(script).await.unwrap();
+        let orch = test_orchestrator(db);
+
+        spawn_turn_end_checks(&orch, "j-prod");
+        assert!(!wave_scheduled(&orch, "j-prod"), "{why}");
+    }
+}
+
+/// The negative half, so the guard cannot pass by refusing everything: an active
+/// issue with a live job still arms its wave.
+#[tokio::test]
+async fn a_live_issue_still_arms_its_wave() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+
+    spawn_turn_end_checks(&orch, "j-prod");
+    assert!(wave_scheduled(&orch, "j-prod"));
 }
 
 #[tokio::test]

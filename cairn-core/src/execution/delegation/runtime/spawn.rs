@@ -7,8 +7,7 @@ use crate::execution::delegation::{
     DelegatedTaskPayload, SpawnCallPacketsInput, SpawnTaskPacketsInput, SpawnWorkflowPacketsInput,
 };
 use crate::execution::jobs::{
-    prepare_call_run, prepare_workflow_run, reclaim_ephemeral_call_worktree,
-    reclaim_ephemeral_workflow_worktree, start_call_run, start_workflow_run, CreateCallRunInput,
+    prepare_call_run, prepare_workflow_run, start_call_run, start_workflow_run, CreateCallRunInput,
     CreateWorkflowRunInput,
 };
 use crate::models::{AgentConfig, DelegatedStatus, Model};
@@ -28,6 +27,22 @@ use super::resume::{
 };
 
 const INLINE_TASK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// What a spawning agent reads for a delegated task that outlived its inline
+/// budget, after the summary naming what was spawned.
+///
+/// Like every suspension marker this says what actually happened -- the call is
+/// continuing -- and never implies anyone declined it
+/// (`crate::mcp::handlers::suspension_markers` pins that property). The
+/// transcript also reads it: a row whose result is a hand-off is still in
+/// flight, not settled (`src/components/chat/suspensionHandoff.ts`).
+pub(crate) const DELEGATED_TASKS_SUSPENDED_SUFFIX: &str =
+    "suspended; the run will resume from the real child result(s).";
+
+/// [`DELEGATED_TASKS_SUSPENDED_SUFFIX`] for the MCP-hosted spawn path, which
+/// names the parent explicitly because the child runs are agents of their own.
+pub(crate) const DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX: &str =
+    "suspended; the parent run will resume from the real child result(s).";
 
 /// Resolve the effective agent config for a delegated task payload.
 async fn resolve_task_agent_config(
@@ -194,13 +209,14 @@ pub async fn spawn_task_packets(
 
     // Resolve the parent run's owning database (a team run lives in its replica).
     // The cwd fallback (run_id None) stays on the private DB.
-    let db = match input.run_id {
-        Some(run_id) => crate::execution::routing::owning_db_for_run(&orch.db, run_id)
-            .await
-            .unwrap_or_else(|_| orch.db.local.clone()),
-        None => orch.db.local.clone(),
+    let Some(run_id) = input.run_id else {
+        err!("Authenticated delegated request is missing its run ID".to_string());
     };
-    let parent_ctx = match lookup_run_context(&db, input.run_id, input.cwd).await {
+    let db = match crate::execution::routing::owning_db_for_run(&orch.db, run_id).await {
+        Ok(db) => db,
+        Err(error) => err!(error.to_string()),
+    };
+    let parent_ctx = match lookup_run_context(&db, run_id).await {
         Ok(ctx) => ctx,
         Err(e) => err!(e),
     };
@@ -239,10 +255,7 @@ pub async fn spawn_task_packets(
             &payload,
             &agent_config,
             input.cwd,
-            // The originating tool-use id is the durable resume-group key and the
-            // value the transcript queries child jobs by; fall back to the
-            // synthetic group id only when no tool-use id was forwarded.
-            Some(input.parent_tool_use_id.unwrap_or(input.group_id)),
+            input.parent_tool_use_id,
             input.background,
         )
         .await
@@ -336,13 +349,14 @@ pub async fn spawn_call_packets(
         }
     }
 
-    let db = match input.run_id {
-        Some(run_id) => crate::execution::routing::owning_db_for_run(&orch.db, run_id)
-            .await
-            .unwrap_or_else(|_| orch.db.local.clone()),
-        None => orch.db.local.clone(),
+    let Some(run_id) = input.run_id else {
+        err!("Authenticated delegated request is missing its run ID".to_string());
     };
-    let parent_ctx = match lookup_run_context(&db, input.run_id, input.cwd).await {
+    let db = match crate::execution::routing::owning_db_for_run(&orch.db, run_id).await {
+        Ok(db) => db,
+        Err(error) => err!(error.to_string()),
+    };
+    let parent_ctx = match lookup_run_context(&db, run_id).await {
         Ok(ctx) => ctx,
         Err(e) => err!(e),
     };
@@ -351,9 +365,7 @@ pub async fn spawn_call_packets(
         Err(e) => err!(e),
     };
 
-    // The originating tool-use id is the durable resume-group key; fall back to
-    // the synthetic group id when none was forwarded.
-    let parent_tool_use_id = input.parent_tool_use_id.unwrap_or(input.group_id);
+    let parent_tool_use_id = input.parent_tool_use_id;
     let multiple = input.payloads.len() > 1;
     let mut materialized: Vec<MaterializedTask> = Vec::with_capacity(input.payloads.len());
 
@@ -438,10 +450,10 @@ pub async fn spawn_call_packets(
                 tier: payload.tier.clone(),
                 backend_preference: payload.backend_preference.clone(),
                 output_contract: contract.clone(),
-                worktree: payload.worktree,
+                branch_policy: payload.branch_policy,
                 label: payload.label.clone(),
                 phase: payload.phase.clone(),
-                parent_tool_use_id: Some(parent_tool_use_id.to_string()),
+                parent_tool_use_id: parent_tool_use_id.map(str::to_string),
                 task_index,
                 workflow_journal_link: journal_link,
             },
@@ -451,12 +463,9 @@ pub async fn spawn_call_packets(
         };
 
         // 2. Persist the call packet BEFORE the session starts (close the
-        //    fast-finish resume race). A `none`-mode call has no worktree, so the
-        //    packet's cwd falls back to the caller's cwd for display.
-        let cwd_for_packet = prepared
-            .worktree_path
-            .clone()
-            .unwrap_or_else(|| input.cwd.to_string());
+        //    fast-finish resume race). Packet cwd is non-authoritative; run ID
+        //    carries identity and session start recreates the scratch residence.
+        let cwd_for_packet = "";
         let packet = match persist_call_packet(
             orch,
             &execution_id,
@@ -464,10 +473,10 @@ pub async fn spawn_call_packets(
             &prepared.agent_config.id,
             &payload.description,
             &payload.prompt,
-            &cwd_for_packet,
+            cwd_for_packet,
             contract.clone(),
             &prepared.job_id,
-            Some(parent_tool_use_id),
+            parent_tool_use_id,
             payload.tier.as_deref(),
             task_index,
             input.background,
@@ -475,15 +484,11 @@ pub async fn spawn_call_packets(
         .await
         {
             Ok(packet) => packet,
-            Err(e) => {
-                reclaim_ephemeral_call_worktree(orch, &prepared).await;
-                err!(e);
-            }
+            Err(e) => err!(e),
         };
 
         // 3. Start the backend session now that the packet exists.
         if let Err(e) = start_call_run(orch, &prepared) {
-            reclaim_ephemeral_call_worktree(orch, &prepared).await;
             err!(e);
         }
 
@@ -597,10 +602,7 @@ fn suspend_parent_for_owned_loop(
         format!("{} delegated tasks", materialized.len())
     };
     CallbackResponse {
-        result: format!(
-            "{} suspended; the run will resume from the real child result(s).",
-            summary
-        ),
+        result: format!("{summary} {DELEGATED_TASKS_SUSPENDED_SUFFIX}"),
         ..Default::default()
     }
 }
@@ -716,10 +718,7 @@ fn suspend_parent_for_tasks(
         format!("{} delegated tasks", materialized.len())
     };
     CallbackResponse {
-        result: format!(
-            "{} suspended; the parent run will resume from the real child result(s).",
-            summary
-        ),
+        result: format!("{summary} {DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX}"),
         ..Default::default()
     }
 }
@@ -780,13 +779,14 @@ pub async fn spawn_workflow_packets(
         Err(e) => err!(e),
     };
 
-    let db = match input.run_id {
-        Some(run_id) => crate::execution::routing::owning_db_for_run(&orch.db, run_id)
-            .await
-            .unwrap_or_else(|_| orch.db.local.clone()),
-        None => orch.db.local.clone(),
+    let Some(run_id) = input.run_id else {
+        err!("Authenticated delegated request is missing its run ID".to_string());
     };
-    let parent_ctx = match lookup_run_context(&db, input.run_id, input.cwd).await {
+    let db = match crate::execution::routing::owning_db_for_run(&orch.db, run_id).await {
+        Ok(db) => db,
+        Err(error) => err!(error.to_string()),
+    };
+    let parent_ctx = match lookup_run_context(&db, run_id).await {
         Ok(ctx) => ctx,
         Err(e) => err!(e),
     };
@@ -795,7 +795,7 @@ pub async fn spawn_workflow_packets(
         Err(e) => err!(e),
     };
 
-    let parent_tool_use_id = input.parent_tool_use_id.unwrap_or(input.group_id);
+    let parent_tool_use_id = input.parent_tool_use_id;
     let description = format!("Workflow: {}", input.workflow_id);
 
     // 1. Create the node-less workflow run's rows + turn (no process yet).
@@ -812,10 +812,10 @@ pub async fn spawn_workflow_packets(
             description: description.clone(),
             args_json: input.args_json.clone(),
             output_contract: contract.clone(),
-            worktree: input.worktree,
+            branch_policy: input.branch_policy,
             label: None,
             phase: None,
-            parent_tool_use_id: Some(parent_tool_use_id.to_string()),
+            parent_tool_use_id: parent_tool_use_id.map(str::to_string),
             task_index: None,
         },
     ) {
@@ -826,7 +826,7 @@ pub async fn spawn_workflow_packets(
     // 2. Persist the call packet BEFORE the process starts (close the fast-finish
     //    resume race); `result_artifact_job_id` = the workflow job so completion
     //    resume finds this packet by it.
-    let cwd_for_packet = prepared.working_dir.clone();
+    let cwd_for_packet = "";
     let packet = match persist_call_packet(
         orch,
         &execution_id,
@@ -834,10 +834,10 @@ pub async fn spawn_workflow_packets(
         "workflow",
         &description,
         &input.args_json,
-        &cwd_for_packet,
+        cwd_for_packet,
         contract.clone(),
         &prepared.job_id,
-        Some(parent_tool_use_id),
+        parent_tool_use_id,
         None,
         None,
         input.background,
@@ -845,15 +845,11 @@ pub async fn spawn_workflow_packets(
     .await
     {
         Ok(packet) => packet,
-        Err(e) => {
-            reclaim_ephemeral_workflow_worktree(orch, &prepared).await;
-            err!(e);
-        }
+        Err(e) => err!(e),
     };
 
     // 3. Spawn the supervised bun process now that the packet exists.
     if let Err(e) = start_workflow_run(orch, &prepared).await {
-        reclaim_ephemeral_workflow_worktree(orch, &prepared).await;
         err!(e);
     }
 
@@ -932,7 +928,7 @@ mod journal_replay_tests {
     use super::*;
     use crate::db::DbState;
     use crate::execution::delegation::DelegatedCallPayload;
-    use crate::execution::jobs::CallWorktree;
+    use crate::execution::jobs::CallBranchPolicy;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
@@ -1000,7 +996,7 @@ mod journal_replay_tests {
             tier: None,
             backend_preference: None,
             output_schema: None,
-            worktree: CallWorktree::None,
+            branch_policy: CallBranchPolicy::None,
             label: None,
             phase: None,
             task_index: None,
@@ -1034,9 +1030,7 @@ mod journal_replay_tests {
             &orch,
             SpawnCallPacketsInput {
                 run_id: Some("wf-run"),
-                cwd: "/tmp/p",
                 payloads: &payloads,
-                group_id: "grp",
                 parent_tool_use_id: Some("tu"),
                 background: true,
             },
@@ -1080,9 +1074,7 @@ mod journal_replay_tests {
             &orch,
             SpawnCallPacketsInput {
                 run_id: Some("wf-run"),
-                cwd: "/tmp/p",
                 payloads: &payloads,
-                group_id: "grp",
                 parent_tool_use_id: Some("tu"),
                 background: true,
             },

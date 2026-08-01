@@ -1,3 +1,3 @@
-//! Git operations - worktree management.
+//! Runner-owned branch operations.
 
-pub mod worktree;
+pub mod branch;

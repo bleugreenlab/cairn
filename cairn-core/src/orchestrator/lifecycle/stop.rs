@@ -7,7 +7,9 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbResult, RowExt};
 use crate::transcripts::stream_store::{self, EventInsert};
 use cairn_common::ids;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use tokio::sync::broadcast;
 
 use super::common::*;
 use super::finalize::finalize_run;
@@ -113,6 +115,8 @@ fn run_issue_id(orch: &Orchestrator, run_id: &str) -> Result<Option<String>, Str
     })
 }
 
+pub(crate) const USER_STOP_TOOL_RESULT: &str = "Run interrupted by user stop.";
+
 fn fail_pending_run_tool_results(
     orch: &Orchestrator,
     run_id: &str,
@@ -132,7 +136,6 @@ fn fail_pending_run_tool_results(
                 .map_err(|e| e.to_string())
         }
     })?;
-    let mut sequence = stream_store::get_next_sequence(owning.clone(), run_id)?;
     let now = chrono::Utc::now().timestamp() as i32;
     let mut inserted = 0;
     for pending_result in pending {
@@ -147,7 +150,7 @@ fn fail_pending_run_tool_results(
             tool_input: None,
             tool_uses: None,
             tool_use_id: Some(pending_result.tool_use_id.clone()),
-            tool_result: Some("Run interrupted by user stop.".to_string()),
+            tool_result: Some(USER_STOP_TOOL_RESULT.to_string()),
             is_error: true,
             thinking_ms: None,
             raw: Some(serde_json::json!({ "synthetic": true, "reason": "user_stop" })),
@@ -157,7 +160,6 @@ fn fail_pending_run_tool_results(
             id: event_id.clone(),
             run_id: run_id.to_string(),
             session_id: pending_result.session_id.clone(),
-            sequence,
             timestamp: now,
             event_type: "tool_result".to_string(),
             data: data.clone(),
@@ -184,7 +186,6 @@ fn fail_pending_run_tool_results(
                 ),
             );
         }
-        sequence += 1;
     }
     Ok(inserted)
 }
@@ -297,6 +298,11 @@ fn running_terminals_for_job(orch: &Orchestrator, job_id: &str) -> Vec<(String, 
 /// Durable waits are not crashes. We interrupt the current turn, clean up any
 /// foreground inline commands, and leave the process warm so it can resume when
 /// the awaited dependency resolves.
+///
+/// Call this directly only when no agent-visible tool result is racing the
+/// interrupt (startup reconciliation, tests). Every suspension that answers a
+/// pending tool call goes through [`suspend_run_for_durable_wait_after_handoff`]
+/// instead -- see [`SUSPEND_HANDOFF_GRACE`] for why.
 pub fn suspend_run_for_durable_wait(
     orch: &Orchestrator,
     run_id: &str,
@@ -308,6 +314,180 @@ pub fn suspend_run_for_durable_wait(
     // must remain resumable when the awaited dependency resolves.
     stop_session_internal(orch, run_id, false, InterruptFailurePolicy::WarmAnyway)?;
     Ok(())
+}
+
+/// How long a Cairn-initiated suspension lets its own tool result reach the
+/// agent before the interrupt that ends the turn.
+///
+/// The interrupt cancels whatever tool call is in flight. When it lands before
+/// the suspension's own result has travelled back through the MCP transport, the
+/// agent CLI fills in a result for the cancelled call in its stock rejection
+/// wording -- "The user doesn't want to proceed with this tool use. The tool use
+/// was rejected" -- and writes it into its own session transcript. That text,
+/// not ours, is then what the agent reads for the rest of the session: a routine
+/// pause wearing the user's face. Agents have acted on it, concluding the
+/// operator vetoed them and saying so to the operator (CAIRN-3162).
+///
+/// The window only has to cover an in-process MCP response travelling back
+/// through `cairn-cmd` into the CLI's transcript -- single-digit milliseconds
+/// normally. It is sized well above that because losing the race is permanent
+/// (the false text stays in context for the whole session) while overshooting
+/// costs nothing: the turn is ending regardless, and the run is about to wait on
+/// something far slower. A 75ms window measured a ~10% loss rate in practice.
+pub const SUSPEND_HANDOFF_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One run's pending durable-wait park, shared by every call the run's current
+/// turn is suspending at once.
+struct ParkSlot {
+    /// Bumped by each suspension. Only the timer holding the current generation
+    /// parks; an earlier one stands down when a sibling supersedes it.
+    generation: u64,
+    /// Carries the single park's outcome to every suspension waiting on it,
+    /// including those whose own timer stood down.
+    done: broadcast::Sender<Result<(), String>>,
+}
+
+/// The debounce state behind [`suspend_run_for_durable_wait_after_handoff_then`],
+/// keyed by run.
+///
+/// It lives on the orchestrator so every clone shares it and it is scoped to one
+/// host, exactly like the processes it parks. A park is in-memory control flow
+/// over a live process; nothing here needs to survive a restart, because a
+/// suspension whose park never happened is left for startup reconciliation.
+#[derive(Default)]
+pub struct ParkSlots(Mutex<HashMap<String, ParkSlot>>);
+
+/// Park a run for a durable wait once its pending tool call has had the handoff
+/// grace to receive the suspension's own result.
+///
+/// This is the canonical way a Cairn-initiated suspension ends a turn. See
+/// [`SUSPEND_HANDOFF_GRACE`] for what parking synchronously costs.
+pub fn suspend_run_for_durable_wait_after_handoff(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+) {
+    suspend_run_for_durable_wait_after_handoff_then(orch, run_id, exit_reason, |_| async {})
+}
+
+/// [`suspend_run_for_durable_wait_after_handoff`] with a continuation.
+///
+/// `after_park` receives the park's outcome and runs once the predecessor turn
+/// has actually been interrupted. Anything that can resume the run belongs
+/// there: the park must be the last thing that happens to the predecessor, or an
+/// already-satisfied condition resumes a run the park then re-suspends
+/// (CAIRN-2970).
+///
+/// The park itself is coalesced per run rather than per suspension — see
+/// [`arm_coalesced_park`] — so a turn suspending several of its calls at once is
+/// interrupted once, after the last of them has had its grace.
+pub fn suspend_run_for_durable_wait_after_handoff_then<F, Fut>(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+    after_park: F,
+) where
+    F: FnOnce(Result<(), String>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut parked = arm_coalesced_park(orch, run_id, exit_reason);
+    tokio::spawn(async move {
+        let outcome = match parked.recv().await {
+            Ok(outcome) => outcome,
+            // The park reported nothing at all. Report it as a failed park: a
+            // caller must never resume a run it cannot know was suspended, and
+            // the pending row is left for startup reconciliation.
+            Err(error) => Err(format!("durable-wait park reported no outcome: {error}")),
+        };
+        after_park(outcome).await;
+    });
+}
+
+/// Arm the run's single deferred park, coalescing this suspension with any
+/// sibling call of the same turn.
+///
+/// Each suspension bumps the run's generation and subscribes to the slot's
+/// broadcast, then spawns a timer that parks only if its generation is still
+/// current when the grace elapses. A later sibling therefore supersedes an
+/// earlier one's timer, and the run is parked once — [`SUSPEND_HANDOFF_GRACE`]
+/// after the LAST suspension marker rather than the first.
+///
+/// That is what the coalescing is for. The interrupt cancels whatever call is in
+/// flight, so a park fired on the first sibling's schedule can land before a
+/// later sibling's marker has travelled back through the MCP transport — which
+/// is precisely the CAIRN-3162 misattribution the grace exists to prevent, where
+/// the CLI writes its own "the user doesn't want to proceed" text into the
+/// model's context in place of ours.
+///
+/// Whichever timer does park broadcasts its outcome on the shared sender, so
+/// every sibling learns it, including those whose own timer stood down. A
+/// suspension arriving after the slot is retired opens a fresh one and parks an
+/// already-parked run, which is a benign no-op.
+fn arm_coalesced_park(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+) -> broadcast::Receiver<Result<(), String>> {
+    let (generation, done, parked) = {
+        let mut slots = orch.park_slots.0.lock().unwrap();
+        let slot = slots.entry(run_id.to_string()).or_insert_with(|| ParkSlot {
+            generation: 0,
+            done: broadcast::channel(1).0,
+        });
+        slot.generation += 1;
+        (slot.generation, slot.done.clone(), slot.done.subscribe())
+    };
+    let orch = orch.clone();
+    let run_id = run_id.to_string();
+    let exit_reason = exit_reason.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(SUSPEND_HANDOFF_GRACE).await;
+        // A sibling suspension armed after this one owns the park now.
+        if !park_generation_is_current(&orch, &run_id, generation) {
+            return;
+        }
+        // `suspend_run_for_durable_wait` blocks on DB work, so it never runs on
+        // the async worker itself.
+        let joined = {
+            let orch = orch.clone();
+            let run_id = run_id.clone();
+            tokio::task::spawn_blocking(move || {
+                suspend_run_for_durable_wait(&orch, &run_id, &exit_reason)
+            })
+            .await
+        };
+        let parked = match joined {
+            Ok(result) => result,
+            Err(join_error) => Err(format!("park worker panicked: {join_error}")),
+        };
+        if let Err(error) = &parked {
+            log::warn!("deferred durable-wait park failed for run {run_id}: {error}");
+        }
+        // Retire the slot BEFORE broadcasting, so a suspension arriving
+        // afterwards opens its own rather than waiting on a signal already sent.
+        retire_park_slot(&orch, &run_id, generation);
+        let _ = done.send(parked);
+    });
+    parked
+}
+
+fn park_generation_is_current(orch: &Orchestrator, run_id: &str, generation: u64) -> bool {
+    orch.park_slots
+        .0
+        .lock()
+        .unwrap()
+        .get(run_id)
+        .is_some_and(|slot| slot.generation == generation)
+}
+
+fn retire_park_slot(orch: &Orchestrator, run_id: &str, generation: u64) {
+    let mut slots = orch.park_slots.0.lock().unwrap();
+    if slots
+        .get(run_id)
+        .is_some_and(|slot| slot.generation == generation)
+    {
+        slots.remove(run_id);
+    }
 }
 
 fn child_run_ids_for_run(orch: &Orchestrator, run_id: &str) -> Vec<String> {
@@ -446,7 +626,7 @@ pub async fn stop_workflow(orch: &Orchestrator, workflow_job_id: &str) -> Result
         .process_state
         .workflow_lease(&run_id)
         .ok_or_else(|| format!("workflow {run_id} has no live executor binding"))?;
-    crate::fleet::lifetime::stop(orch, &fence, &run_id).await
+    crate::fleet::residency::stop(orch, &fence, &run_id).await
 }
 
 /// Stop an in-flight workflow child call (CAIRN-2516).
@@ -734,6 +914,16 @@ pub(crate) fn stop_session_internal(
     // interrupt regardless. A self-suspend leaves the inline siblings alone.
     if reap_inline {
         cleanup_inline_commands(orch, run_id);
+        // A stop must also reach the executor. `cleanup_inline_commands` reaps
+        // only host-side children, so a routed batch — including one this run
+        // suspended on — would otherwise keep running with nobody to read its
+        // result.
+        if let Some(job_id) = job_id_for_run(orch, run_id) {
+            let cancelled = orch.fleet.cancel_job_requests(&job_id);
+            if cancelled > 0 {
+                log::info!("stop cancelled {cancelled} in-flight batch(es) for job {job_id}");
+            }
+        }
     }
 
     // Transition to warm state instead of killing
@@ -875,4 +1065,87 @@ pub fn kill_session_with_reason(
     finalize_run(orch, run_id, final_status);
 
     Ok(())
+}
+
+/// The exit reason recorded for an agent stopped because its host is shutting
+/// down. Distinguishes "we stopped it" from the blanket `crash` that startup
+/// reconciliation would otherwise invent for the same row.
+pub const RUNNER_SHUTDOWN_EXIT_REASON: &str = "runner_shutdown";
+
+/// What a host's agent teardown accomplished: enough for the caller's one log
+/// line, and for a test to assert on.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HostShutdownStops {
+    /// Agents stopped and finalized before the budget elapsed.
+    pub stopped: usize,
+    /// Agents whose stop reported an error, left to startup reconciliation.
+    pub failed: usize,
+    /// Agents still stopping when the budget elapsed. Their blocking work cannot
+    /// be aborted, so it continues until the host process exits.
+    pub timed_out: usize,
+}
+
+/// Stop every agent process this host spawned, before the host process exits.
+///
+/// Without this a runner abandons its agents (CAIRN-3287). A run handle's child
+/// is an `Arc<Mutex<Option<Box<dyn ChildProcess>>>>` whose drop does not signal
+/// the OS process, so an exiting runner leaves each agent reparented to
+/// launchd/systemd and still running — while the reader thread that was
+/// persisting its transcript dies with the runner. The agent then works on
+/// against a wall: `dispatch_tool`'s ownership fence refuses its calls, but only
+/// this stops the process from making them.
+///
+/// Each agent goes through [`kill_session_with_reason`] rather than a raw
+/// `graceful_stop`, so its run and turn get the same bookkeeping any other stop
+/// produces and the row records [`RUNNER_SHUTDOWN_EXIT_REASON`] instead of the
+/// `crash` a later startup sweep would invent. A clean restart should therefore
+/// leave startup reconciliation with nothing to reconcile.
+///
+/// Latency is bounded because a successor host is waiting to bind the port:
+/// `graceful_stop` alone spends up to ~3s per process on its SIGTERM poll, so the
+/// stops run concurrently under one overall `budget` and the caller proceeds
+/// regardless of what is still outstanding. Each stop is synchronous and blocks
+/// on database work, so it runs on the blocking pool rather than an async worker.
+pub async fn stop_agents_for_host_shutdown(
+    orch: &Orchestrator,
+    budget: std::time::Duration,
+) -> HostShutdownStops {
+    let mut outcome = HostShutdownStops::default();
+    let run_ids = orch.process_state.run_ids();
+    if run_ids.is_empty() {
+        return outcome;
+    }
+
+    let mut stops = tokio::task::JoinSet::new();
+    for run_id in run_ids {
+        let orch = orch.clone();
+        stops.spawn_blocking(move || {
+            kill_session_with_reason(&orch, &run_id, RUNNER_SHUTDOWN_EXIT_REASON)
+                .map_err(|error| (run_id, error))
+        });
+    }
+
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            joined = stops.join_next() => match joined {
+                None => break,
+                Some(Ok(Ok(()))) => outcome.stopped += 1,
+                Some(Ok(Err((run_id, error)))) => {
+                    outcome.failed += 1;
+                    log::warn!("host shutdown could not stop agent for run {run_id}: {error}");
+                }
+                Some(Err(join_error)) => {
+                    outcome.failed += 1;
+                    log::warn!("host shutdown agent stop panicked: {join_error}");
+                }
+            },
+            _ = &mut deadline => {
+                outcome.timed_out = stops.len();
+                break;
+            }
+        }
+    }
+    outcome
 }

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use turso::{params::IntoParams, Builder, Connection, Row};
 
-use super::content_store::{ContentStore, TeamReplicaContext};
+use super::content_store::{ContentStore, PrivateContentStore, TeamReplicaContext};
 use super::{DbError, DbResult, RowExt};
 use crate::storage::TeamId;
 
@@ -53,6 +53,15 @@ pub fn install_crypto_provider() {
     });
 }
 
+/// How many idle connections one [`LocalDb`] retains for reuse.
+///
+/// This bounds retained file descriptors in a long-lived process, not
+/// concurrency: [`LocalDb::checkout`] creates a connection rather than waiting
+/// when the free-list is empty, and a connection released past the cap is simply
+/// dropped. Warm connections are the point of the pool, so the cap only needs to
+/// cover the realistic peak of *simultaneous* transactions.
+const MAX_IDLE_CONNECTIONS: usize = 32;
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_attempts: usize,
@@ -77,7 +86,7 @@ impl Default for RetryConfig {
 /// helper on `LocalDb` routes through one `connect()` regardless of which engine
 /// backs it. Only `push()`/`pull()` and the journaling pragma differ between
 /// the two arms.
-enum DbHandle {
+pub(super) enum DbHandle {
     /// A plain on-disk (or `:memory:`) database opened via `Builder::new_local`.
     Local(turso::Database),
     /// A Turso Sync replica opened via `turso::sync::Builder::new_remote`. Reads
@@ -94,10 +103,9 @@ impl std::fmt::Debug for DbHandle {
     }
 }
 
-#[derive(Debug)]
 pub struct LocalDb {
     path: PathBuf,
-    database: DbHandle,
+    database: Arc<DbHandle>,
     retry: RetryConfig,
     /// Fired after every successful transaction on a SYNCED replica (never on a
     /// local database). The per-team push task waits on it to push promptly once
@@ -109,8 +117,37 @@ pub struct LocalDb {
     /// private DB carries `None`, so archival/reconstruct branch on
     /// `content_store()` and the local-run inline path is byte-for-byte unchanged.
     team: Option<Arc<TeamReplicaContext>>,
+    content_store: Arc<dyn ContentStore>,
+    /// Connections that hold no open transaction and are free to be reused.
+    ///
+    /// The first `BEGIN CONCURRENT` on a fresh turso connection pays a one-time
+    /// MVCC transaction setup cost; later transactions on that connection are
+    /// substantially cheaper. Opening a connection per call therefore repeated
+    /// avoidable setup on every read and write, in the running app as much as in
+    /// tests. Connections are
+    /// checked out for the duration of one transaction and returned only when
+    /// they are known to hold none.
+    idle: Mutex<Vec<Connection>>,
     #[cfg(test)]
     read_transaction_count: AtomicUsize,
+    /// Connections handed out by [`LocalDb::connect`] over this handle's life.
+    /// Lets tests assert that a run of sequential operations reuses one
+    /// connection rather than creating one per call — a load-independent guard
+    /// against reintroducing per-call connect.
+    #[cfg(test)]
+    connections_created: AtomicUsize,
+}
+
+impl std::fmt::Debug for LocalDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalDb")
+            .field("path", &self.path)
+            .field("database", &self.database)
+            .field("retry", &self.retry)
+            .field("team", &self.team)
+            .field("content_store", &"<dyn ContentStore>")
+            .finish()
+    }
 }
 
 impl LocalDb {
@@ -121,15 +158,21 @@ impl LocalDb {
     pub async fn open_with_retry(path: impl AsRef<Path>, retry: RetryConfig) -> DbResult<Self> {
         let path = path.as_ref().to_path_buf();
         let path_string = path.to_string_lossy().to_string();
-        let database = Builder::new_local(&path_string).build().await?;
+        let database = Arc::new(DbHandle::Local(
+            Builder::new_local(&path_string).build().await?,
+        ));
         let db = Self {
             path,
-            database: DbHandle::Local(database),
+            database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            content_store: Arc::new(PrivateContentStore::new(database)),
+            idle: Mutex::new(Vec::new()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            connections_created: AtomicUsize::new(0),
         };
         db.configure().await?;
         Ok(db)
@@ -168,15 +211,19 @@ impl LocalDb {
         if let Some(token) = auth_token {
             builder = builder.with_auth_token(token);
         }
-        let database = builder.build().await?;
+        let database = Arc::new(DbHandle::Synced(builder.build().await?));
         let db = Self {
             path,
-            database: DbHandle::Synced(database),
+            database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            content_store: Arc::new(PrivateContentStore::new(database)),
+            idle: Mutex::new(Vec::new()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            connections_created: AtomicUsize::new(0),
         };
         db.configure().await?;
         Ok(db)
@@ -205,19 +252,25 @@ impl LocalDb {
         install_crypto_provider();
         let path = path.as_ref().to_path_buf();
         let path_string = path.to_string_lossy().to_string();
-        let database = turso::sync::Builder::new_remote(&path_string)
-            .with_remote_url(remote_url.into())
-            .with_auth_token_fn(token_fn)
-            .build()
-            .await?;
+        let database = Arc::new(DbHandle::Synced(
+            turso::sync::Builder::new_remote(&path_string)
+                .with_remote_url(remote_url.into())
+                .with_auth_token_fn(token_fn)
+                .build()
+                .await?,
+        ));
         let db = Self {
             path,
-            database: DbHandle::Synced(database),
+            database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            content_store: Arc::new(PrivateContentStore::new(database)),
+            idle: Mutex::new(Vec::new()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            connections_created: AtomicUsize::new(0),
         };
         db.configure().await?;
         Ok(db)
@@ -225,7 +278,7 @@ impl LocalDb {
 
     /// Whether this handle is backed by a Turso Sync replica (vs a local file).
     pub fn is_synced(&self) -> bool {
-        matches!(self.database, DbHandle::Synced(_))
+        matches!(self.database.as_ref(), DbHandle::Synced(_))
     }
 
     /// The team id this handle belongs to, or `None` for the private DB. A team
@@ -235,11 +288,10 @@ impl LocalDb {
         self.team.as_ref().map(|ctx| &ctx.team_id)
     }
 
-    /// The per-team content store for a team replica, or `None` for the private
-    /// DB. `Some` is the signal to offload archival bytes (and fetch them back)
-    /// by hash; `None` keeps the local-run inline path.
-    pub fn content_store(&self) -> Option<&Arc<dyn ContentStore>> {
-        self.team.as_ref().map(|ctx| &ctx.store)
+    /// The content store owned by this database. Private databases use
+    /// `cas_cache`; team replicas use their brokered team store.
+    pub fn content_store(&self) -> &Arc<dyn ContentStore> {
+        &self.content_store
     }
 
     /// The private database that owns machine-local route metadata for this team
@@ -251,8 +303,9 @@ impl LocalDb {
     /// Attach a team replica's identity + content store. Called by `open_team`
     /// after construction (and by tests that inject a fake store) before the
     /// handle is shared behind an `Arc`.
-    pub fn set_team_context(&mut self, ctx: TeamReplicaContext) {
+    pub fn set_team_context(&mut self, ctx: TeamReplicaContext, store: Arc<dyn ContentStore>) {
         self.team = Some(Arc::new(ctx));
+        self.content_store = store;
     }
 
     /// The commit signal fired after each successful synced-replica transaction.
@@ -267,7 +320,7 @@ impl LocalDb {
     /// synced engine captures changes via CDC, which is incompatible with MVCC,
     /// so it uses a plain `BEGIN` (writers serialize and retry on Busy instead).
     pub fn concurrent_begin(&self) -> &'static str {
-        match self.database {
+        match self.database.as_ref() {
             DbHandle::Local(_) => "BEGIN CONCURRENT",
             DbHandle::Synced(_) => "BEGIN",
         }
@@ -281,7 +334,7 @@ impl LocalDb {
     /// Returns `DbError::Internal` when called on a local database, or a Turso
     /// error when the push fails.
     pub async fn push(&self) -> DbResult<()> {
-        match &self.database {
+        match self.database.as_ref() {
             DbHandle::Synced(db) => Ok(db.push().await?),
             DbHandle::Local(_) => Err(DbError::internal(
                 "push() called on a local (non-synced) database",
@@ -297,7 +350,7 @@ impl LocalDb {
     /// Returns `DbError::Internal` when called on a local database, or a Turso
     /// error when the pull fails.
     pub async fn pull(&self) -> DbResult<bool> {
-        match &self.database {
+        match self.database.as_ref() {
             DbHandle::Synced(db) => Ok(db.pull().await?),
             DbHandle::Local(_) => Err(DbError::internal(
                 "pull() called on a local (non-synced) database",
@@ -309,14 +362,62 @@ impl LocalDb {
         &self.path
     }
 
+    /// Open a brand-new connection, outside the free-list.
+    ///
+    /// This is the raw escape hatch for the rare caller that needs a connection
+    /// of its own for longer than one transaction — notably
+    /// `MigrationRunner::run_fk_off`, which toggles `PRAGMA foreign_keys` around
+    /// a transaction and must not have that pragma outlive its own use. Ordinary
+    /// data access goes through [`Self::checkout`] instead so it reuses a warm
+    /// connection.
     pub async fn connect(&self) -> DbResult<Connection> {
-        let conn = match &self.database {
+        #[cfg(test)]
+        self.connections_created.fetch_add(1, Ordering::Relaxed);
+        let conn = match self.database.as_ref() {
             DbHandle::Local(db) => db.connect()?,
             DbHandle::Synced(db) => db.connect().await?,
         };
         conn.busy_timeout(self.retry.busy_timeout)?;
+        // Set once, at creation: a pooled connection keeps its pragmas across
+        // checkouts, so re-issuing this per checkout would be pure round-trip.
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
         Ok(conn)
+    }
+
+    /// Take a connection to run one transaction on: an idle one when the
+    /// free-list has any, a fresh one otherwise.
+    ///
+    /// Deliberately never waits on an empty free-list. Creating on demand is
+    /// what makes the pool structurally deadlock-free: a call path that nested
+    /// one database call inside another's transaction closure would get its own
+    /// connection rather than block forever on one its own caller is holding.
+    /// Concurrency is therefore unbounded exactly as it was before pooling;
+    /// [`MAX_IDLE_CONNECTIONS`] bounds only what is *retained* when idle.
+    async fn checkout(&self) -> DbResult<Connection> {
+        let pooled = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop();
+        match pooled {
+            Some(conn) => Ok(conn),
+            None => self.connect().await,
+        }
+    }
+
+    /// Return a connection that provably holds no open transaction.
+    ///
+    /// Every caller passes only connections whose transaction committed or whose
+    /// ROLLBACK succeeded; anything else is dropped instead, so a connection in
+    /// unknown state can never be handed to the next caller's BEGIN.
+    fn release(&self, conn: Connection) {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if idle.len() < MAX_IDLE_CONNECTIONS {
+            idle.push(conn);
+        }
     }
 
     pub async fn read<T>(
@@ -325,8 +426,12 @@ impl LocalDb {
     ) -> DbResult<T> {
         #[cfg(test)]
         self.read_transaction_count.fetch_add(1, Ordering::Relaxed);
-        let conn = self.connect().await?;
-        run_read_tx(&conn, self.concurrent_begin(), f).await
+        let conn = self.checkout().await?;
+        let attempt = run_read_tx(&conn, self.concurrent_begin(), f).await;
+        if attempt.reusable {
+            self.release(conn);
+        }
+        attempt.result
     }
 
     pub async fn write<T>(
@@ -365,13 +470,22 @@ impl LocalDb {
         T: Send + 'static,
     {
         let sql = sql.into();
-        let conn = self.connect().await?;
-        let mut rows = conn.query(&sql, params).await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(map(&row)?);
+        let conn = self.checkout().await?;
+        let result: DbResult<Vec<T>> = async {
+            let mut rows = conn.query(&sql, params).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(map(&row)?);
+            }
+            Ok(out)
         }
-        Ok(out)
+        .await;
+        // Returned only on success: a query abandoned part-way through its rows
+        // leaves a statement whose state this layer has no way to assert on.
+        if result.is_ok() {
+            self.release(conn);
+        }
+        result
     }
 
     /// Runs one SELECT and maps the first row, if present.
@@ -391,9 +505,16 @@ impl LocalDb {
         T: Send + 'static,
     {
         let sql = sql.into();
-        let conn = self.connect().await?;
-        let mut rows = conn.query(&sql, params).await?;
-        rows.next().await?.map(|row| map(&row)).transpose()
+        let conn = self.checkout().await?;
+        let result: DbResult<Option<T>> = async {
+            let mut rows = conn.query(&sql, params).await?;
+            rows.next().await?.map(|row| map(&row)).transpose()
+        }
+        .await;
+        if result.is_ok() {
+            self.release(conn);
+        }
+        result
     }
 
     /// Runs one SELECT and returns the first column of the
@@ -513,8 +634,15 @@ impl LocalDb {
         let mut last_retryable = None;
 
         for attempt in 1..=self.retry.max_attempts {
-            let conn = self.connect().await?;
-            match run_tx(&conn, begin_sql, f).await {
+            let conn = self.checkout().await?;
+            let outcome = run_tx(&conn, begin_sql, f).await;
+            // Released between attempts as well as after the last one, so a
+            // contended write that retries several times still reuses one warm
+            // connection instead of creating one per attempt.
+            if outcome.reusable {
+                self.release(conn);
+            }
+            match outcome.result {
                 Ok(value) => {
                     // Signal the push task that a synced replica committed. Gated
                     // on `is_synced()` so a local database stays zero-cost (the
@@ -555,16 +683,26 @@ impl LocalDb {
     }
 
     pub async fn execute_batch(&self, sql: &str) -> DbResult<()> {
-        let conn = self.connect().await?;
-        conn.execute_batch(sql).await?;
-        Ok(())
+        let conn = self.checkout().await?;
+        let result = conn.execute_batch(sql).await;
+        if result.is_ok() {
+            self.release(conn);
+        }
+        Ok(result?)
     }
 
     pub async fn consume_query(&self, sql: &str) -> DbResult<()> {
-        let conn = self.connect().await?;
-        let mut rows = conn.query(sql, ()).await?;
-        while rows.next().await?.is_some() {}
-        Ok(())
+        let conn = self.checkout().await?;
+        let result: DbResult<()> = async {
+            let mut rows = conn.query(sql, ()).await?;
+            while rows.next().await?.is_some() {}
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            self.release(conn);
+        }
+        result
     }
 
     /// Reclaim freelist space by writing a self-contained, compacted image of
@@ -603,7 +741,7 @@ impl LocalDb {
         // synced handle therefore keeps the sync engine's own journaling and
         // uses a plain BEGIN for transactions (see `concurrent_begin`). Foreign
         // keys are enforced on every connection regardless of backend.
-        if matches!(self.database, DbHandle::Local(_)) {
+        if matches!(self.database.as_ref(), DbHandle::Local(_)) {
             self.consume_query("PRAGMA journal_mode = 'mvcc'").await?;
         }
         self.consume_query("PRAGMA foreign_keys = ON").await?;
@@ -663,25 +801,55 @@ pub fn move_db_set(from_base: &Path, to_base: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// One transaction attempt's result, plus whether its connection may go back on
+/// the free-list.
+///
+/// A connection is reusable only when it is known to hold no open transaction:
+/// the transaction committed, or the ROLLBACK that unwound it succeeded. When a
+/// ROLLBACK itself fails the connection's transaction state is unknown, and
+/// returning it would make some later, unrelated caller fail its BEGIN on a
+/// connection it never touched. Retiring it costs one connection; reusing it
+/// costs a bug that reads as random.
+struct TxAttempt<T> {
+    result: DbResult<T>,
+    reusable: bool,
+}
+
 async fn run_tx<T>(
     conn: &Connection,
     begin_sql: &str,
     f: &mut impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
-) -> DbResult<T> {
-    conn.execute(begin_sql, ()).await?;
+) -> TxAttempt<T> {
+    if let Err(error) = conn.execute(begin_sql, ()).await {
+        // A BEGIN that fails opened nothing, but it also means this connection
+        // was not in the state the pool guarantees. Retire it rather than reason
+        // about why.
+        return TxAttempt {
+            result: Err(error.into()),
+            reusable: false,
+        };
+    }
 
-    let result = f(conn).await;
-    match result {
+    match f(conn).await {
         Ok(value) => match conn.execute("COMMIT", ()).await {
-            Ok(_) => Ok(value),
+            Ok(_) => TxAttempt {
+                result: Ok(value),
+                reusable: true,
+            },
             Err(error) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(error.into())
+                let reusable = conn.execute("ROLLBACK", ()).await.is_ok();
+                TxAttempt {
+                    result: Err(error.into()),
+                    reusable,
+                }
             }
         },
         Err(error) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(error)
+            let reusable = conn.execute("ROLLBACK", ()).await.is_ok();
+            TxAttempt {
+                result: Err(error),
+                reusable,
+            }
         }
     }
 }
@@ -690,18 +858,31 @@ async fn run_read_tx<T>(
     conn: &Connection,
     begin_sql: &str,
     f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
-) -> DbResult<T> {
-    conn.execute(begin_sql, ()).await?;
+) -> TxAttempt<T> {
+    if let Err(error) = conn.execute(begin_sql, ()).await {
+        return TxAttempt {
+            result: Err(error.into()),
+            reusable: false,
+        };
+    }
 
-    let result = f(conn).await;
-    match result {
-        Ok(value) => {
-            conn.execute("ROLLBACK", ()).await?;
-            Ok(value)
-        }
+    match f(conn).await {
+        Ok(value) => match conn.execute("ROLLBACK", ()).await {
+            Ok(_) => TxAttempt {
+                result: Ok(value),
+                reusable: true,
+            },
+            Err(error) => TxAttempt {
+                result: Err(error.into()),
+                reusable: false,
+            },
+        },
         Err(error) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(error)
+            let reusable = conn.execute("ROLLBACK", ()).await.is_ok();
+            TxAttempt {
+                result: Err(error),
+                reusable,
+            }
         }
     }
 }
@@ -736,7 +917,7 @@ mod tests {
         db.read(|conn| {
             Box::pin(async move {
                 let mut rows = conn.query("SELECT 1", ()).await?;
-                Ok(rows.next().await?.unwrap().i64(0)?)
+                rows.next().await?.unwrap().i64(0)
             })
         })
         .await
@@ -746,6 +927,168 @@ mod tests {
             before + 1,
             "multi-statement read API must retain explicit snapshot transactions"
         );
+    }
+
+    /// The load-independent guard against reintroducing per-call connect.
+    ///
+    /// Before the free-list, `LocalDb` opened a fresh connection for every
+    /// `read`, `write`, `execute`, and single-statement helper. A fresh
+    /// connection repeats transaction setup whose absolute duration varies with
+    /// machine load. Asserting on connection COUNT rather than elapsed time
+    /// states the reuse invariant directly and cannot go quiet under load.
+    #[tokio::test]
+    async fn sequential_operations_reuse_one_pooled_connection() {
+        let db = test_db().await.unwrap();
+        let after_open = db.connections_created.load(Ordering::Relaxed);
+        assert_eq!(
+            after_open, 1,
+            "opening and migrating a database should need exactly one connection"
+        );
+
+        for i in 0..20 {
+            db.execute(
+                "INSERT INTO counters(id, value) VALUES (?1, ?2)",
+                (format!("pooled-{i}"), i64::from(i)),
+            )
+            .await
+            .unwrap();
+            db.query_one("SELECT COUNT(*) FROM counters", (), |row| row.i64(0))
+                .await
+                .unwrap();
+            db.read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query("SELECT COUNT(*) FROM counters", ()).await?;
+                    rows.next()
+                        .await?
+                        .ok_or_else(|| DbError::Row("missing count row".to_string()))?
+                        .i64(0)
+                })
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.connections_created.load(Ordering::Relaxed),
+            after_open,
+            "60 sequential operations must reuse the pooled connection, not open one apiece"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_transaction_returns_a_clean_connection_to_the_pool() {
+        let db = test_db().await.unwrap();
+        let before = db.connections_created.load(Ordering::Relaxed);
+
+        let error = db
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO counters(id, value) VALUES ('rolled-back', 1)",
+                        (),
+                    )
+                    .await?;
+                    Err::<(), DbError>(DbError::internal("force rollback"))
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::Internal(_)));
+
+        // Its ROLLBACK succeeded, so the connection went back on the free-list
+        // and the next operation reuses it rather than opening another...
+        db.execute("INSERT INTO counters(id, value) VALUES ('after', 1)", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.connections_created.load(Ordering::Relaxed),
+            before,
+            "a cleanly rolled-back connection must be reused, not retired"
+        );
+
+        // ...carrying no residue from the transaction that was unwound on it.
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM counters WHERE id = 'rolled-back'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM counters WHERE id = 'after'")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// Pooled connections move between tokio tasks on a multi-threaded runtime,
+    /// and concurrent MVCC transactions over them must each commit exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pooled_transactions_each_commit_exactly_once() {
+        let db = Arc::new(test_db().await.unwrap());
+
+        let mut tasks = Vec::new();
+        for task_id in 0..4 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..25 {
+                    db.execute(
+                        "INSERT INTO counters(id, value) VALUES (?1, ?2)",
+                        (format!("t{task_id}-{i}"), 1_i64),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM counters")
+                .await
+                .unwrap(),
+            100,
+            "every concurrent insert must land exactly once"
+        );
+    }
+
+    /// `connect()` sets `PRAGMA foreign_keys = ON` once, at creation, rather than
+    /// on every checkout — so this pins that a recycled connection still carries
+    /// it. If the pragma were ever reset by reuse, enforcement would silently
+    /// lapse after the first transaction and orphan rows would start committing.
+    #[tokio::test]
+    async fn foreign_key_enforcement_survives_connection_recycling() {
+        let db = test_db().await.unwrap();
+        db.execute("INSERT INTO counters(id, value) VALUES ('parent', 1)", ())
+            .await
+            .unwrap();
+
+        for i in 0..10 {
+            db.execute(
+                "INSERT INTO counter_notes(id, counter_id) VALUES (?1, 'parent')",
+                (format!("note-{i}"),),
+            )
+            .await
+            .unwrap();
+        }
+
+        let error = db
+            .execute(
+                "INSERT INTO counter_notes(id, counter_id) VALUES ('orphan', 'missing')",
+                (),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("foreign key"),
+            "expected a foreign-key violation on a recycled connection, got: {error}"
+        );
+        assert_eq!(query_i64(&db, "PRAGMA foreign_keys").await.unwrap(), 1);
     }
 
     const TEST_SCHEMA: &[Migration] = &[Migration::new(
@@ -760,6 +1103,11 @@ mod tests {
             CREATE TABLE unrelated_writes (
                 id TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE counter_notes (
+                id TEXT PRIMARY KEY NOT NULL,
+                counter_id TEXT NOT NULL REFERENCES counters(id)
             );
 
             CREATE TABLE issues (
@@ -1033,18 +1381,24 @@ mod tests {
         // transparent to every query helper without needing a sync server. The
         // synced engine runs CDC (incompatible with MVCC), so it uses a plain
         // BEGIN rather than BEGIN CONCURRENT -- the test below pins that fact.
-        let database = turso::sync::Builder::new_remote(":memory:")
-            .bootstrap_if_empty(false)
-            .build()
-            .await?;
+        let database = Arc::new(DbHandle::Synced(
+            turso::sync::Builder::new_remote(":memory:")
+                .bootstrap_if_empty(false)
+                .build()
+                .await?,
+        ));
         let db = LocalDb {
             path: PathBuf::from(":memory:"),
-            database: DbHandle::Synced(database),
+            database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
             team: None,
+            content_store: Arc::new(PrivateContentStore::new(database)),
+            idle: Mutex::new(Vec::new()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            connections_created: AtomicUsize::new(0),
         };
         db.configure().await?;
         MigrationRunner::new(TEST_SCHEMA.to_vec()).run(&db).await?;

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use crate::mcp::handlers::issues::{create_issue_in_project, CreateExecutionSpec};
+use crate::mcp::handlers::issues::create_issue_in_project;
 use crate::memories::canon::{resolve_role_canon_home, RoleCanonHome};
 use crate::models::Memory;
 use crate::orchestrator::Orchestrator;
@@ -20,15 +20,21 @@ const TRIAGE_NEIGHBOR_LIMIT: usize = 5;
 
 type ScopeSpawnLock = tokio::sync::Mutex<()>;
 
+/// Test hook that pauses a spawn inside its claim window — after the triage issue
+/// exists, before the batch is claimed and linked — so a test can act on the
+/// database at the one moment a batch is mid-formation.
 #[allow(dead_code)]
 struct SpawnSynchronization {
-    entered_count_window: tokio::sync::mpsc::UnboundedSender<()>,
-    release_count_window: Arc<tokio::sync::Notify>,
+    entered_claim_window: tokio::sync::mpsc::UnboundedSender<()>,
+    release_claim_window: Arc<tokio::sync::Notify>,
 }
 
+/// The process-wide registry of live scope spawn locks, keyed by database
+/// identity plus scope name and value.
+type ScopeSpawnLocks = Mutex<HashMap<(usize, String, String), Weak<ScopeSpawnLock>>>;
+
 fn scope_spawn_lock(db: &Arc<LocalDb>, scope: &str, scope_value: &str) -> Arc<ScopeSpawnLock> {
-    static LOCKS: OnceLock<Mutex<HashMap<(usize, String, String), Weak<ScopeSpawnLock>>>> =
-        OnceLock::new();
+    static LOCKS: OnceLock<ScopeSpawnLocks> = OnceLock::new();
 
     let key = (
         Arc::as_ptr(db) as usize,
@@ -70,18 +76,11 @@ async fn pool_db(
     }
 }
 
-async fn record_batch_or_revert(
-    db: &LocalDb,
-    issue_id: &str,
-    memories: &[Memory],
-) -> Result<(), String> {
-    let ids: Vec<String> = memories.iter().map(|memory| memory.id.clone()).collect();
-    match crate::memories::db::record_triage_issue_batch(db, issue_id, &ids).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            revert_claimed(db, memories).await;
-            Err(error.to_string())
-        }
+/// Remove a triage issue that never came to own a batch, rather than leaving an
+/// empty triage issue behind for a human to close.
+async fn discard_batchless_issue(db: &LocalDb, issue_id: &str) {
+    if let Err(error) = crate::issues::crud::delete_db(db, issue_id).await {
+        log::warn!("failed to remove memory triage issue {issue_id} that owns no batch: {error}");
     }
 }
 
@@ -296,80 +295,98 @@ async fn spawn_triage_for_scope_inner(
     synchronization: Option<Arc<SpawnSynchronization>>,
 ) -> Result<Vec<String>, String> {
     let db = pool_db(orch, scope, scope_value).await?;
-    // Count, claim, issue creation, and batch-link recording collectively consume
-    // a cap slot. Serialize that full sequence per owning database and exact scope
-    // so concurrent fast-path and reconcile tasks cannot both observe the same slot.
+    // Counting the cap, reading the pool, creating the issue, and claiming the
+    // batch collectively consume a cap slot. Serialize that full sequence per
+    // owning database and exact scope so concurrent fast-path and reconcile tasks
+    // cannot both observe the same slot.
     let spawn_lock = scope_spawn_lock(&db, scope, scope_value);
     let _scope_guard = spawn_lock.lock().await;
     let mut spawned = Vec::new();
-    let mut synchronized_count_window = false;
+    let mut synchronized_claim_window = false;
     loop {
         let open = crate::memories::db::count_open_triage_issues_for_scope(&db, scope, scope_value)
             .await
             .map_err(|error| error.to_string())?;
-        if !synchronized_count_window {
-            if let Some(synchronization) = &synchronization {
-                synchronization
-                    .entered_count_window
-                    .send(())
-                    .map_err(|_| "triage spawn synchronization receiver dropped".to_string())?;
-                synchronization.release_count_window.notified().await;
-            }
-            synchronized_count_window = true;
-        }
         if open >= max_open_per_scope {
             break;
         }
 
-        let count = crate::memories::db::count_pending_memories_for_scope(&db, scope, scope_value)
-            .await
-            .map_err(|error| error.to_string())?;
-        if count < threshold {
+        // Read the pool WITHOUT claiming. The memories stay `pending` — owned by no
+        // batch and invisible to every sweep that acts on `claimed` — until the
+        // issue identity exists and the claim can record ownership with it.
+        let candidates =
+            crate::memories::db::pending_memories_for_scope(&db, scope, scope_value, threshold)
+                .await
+                .map_err(|error| error.to_string())?;
+        if (candidates.len() as i64) < threshold {
             break;
         }
 
         let target = scope_target(orch, &db, scope, scope_value).await?;
-        let claimed = crate::memories::db::claim_pending_memories_for_scope(
-            &db,
-            scope,
-            scope_value,
-            threshold,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        // Lost the race to another claimer between count and claim; the next
-        // iteration's count reflects the smaller pool and breaks if drained.
-        if claimed.is_empty() {
-            break;
-        }
-        let description = seed_description(orch, &db, &target, &claimed).await;
-        let title = triage_issue_title(&target, claimed.len());
+        let description = seed_description(orch, &db, &target, &candidates).await;
+        let title = triage_issue_title(&target, candidates.len());
+        // The issue is created WITHOUT its execution: the triage agent must not open
+        // on a batch that is not yet claimed, and the claim needs this issue's id.
         let outcome = create_issue_in_project(
             orch,
             &target.project_key,
             title,
             Some(description),
             None,
-            Some(CreateExecutionSpec {
-                recipe: Some(MEMORY_TRIAGE_RECIPE.to_string()),
-                backend: None,
-            }),
             None,
             None,
         )
-        .await;
+        .await?;
 
-        match outcome {
-            Ok(outcome) => {
-                record_batch_or_revert(&db, &outcome.issue_id, &claimed).await?;
-                spawned.push(outcome.uri);
+        if !synchronized_claim_window {
+            if let Some(synchronization) = &synchronization {
+                synchronization
+                    .entered_claim_window
+                    .send(())
+                    .map_err(|_| "triage spawn synchronization receiver dropped".to_string())?;
+                synchronization.release_claim_window.notified().await;
             }
-            Err(error) => {
-                revert_claimed(&db, &claimed).await;
-                return Err(error);
-            }
+            synchronized_claim_window = true;
         }
+
+        let ids: Vec<String> = candidates.iter().map(|memory| memory.id.clone()).collect();
+        let claimed =
+            match crate::memories::db::claim_and_link_pending_batch(&db, &outcome.issue_id, &ids)
+                .await
+            {
+                Ok(claimed) => claimed,
+                // The claim wrote nothing, so the issue owns no batch either way.
+                Err(error) => {
+                    discard_batchless_issue(&db, &outcome.issue_id).await;
+                    return Err(error.to_string());
+                }
+            };
+        if !claimed {
+            // Another claimer took part of the pool between the read and the claim,
+            // so this issue owns nothing and the seeded description no longer
+            // describes a real batch. The next sweep re-reads the smaller pool.
+            discard_batchless_issue(&db, &outcome.issue_id).await;
+            break;
+        }
+
+        if let Err(error) = crate::mcp::handlers::executions::start_execution_from_collection(
+            orch,
+            &target.project_key,
+            outcome.number,
+            Some(MEMORY_TRIAGE_RECIPE),
+            None,
+            None,
+        )
+        .await
+        {
+            // Nothing will ever triage this batch, so release the claim and remove
+            // the issue instead of leaving memories owned by a batch that will never
+            // run.
+            revert_claimed(&db, &candidates).await;
+            discard_batchless_issue(&db, &outcome.issue_id).await;
+            return Err(error);
+        }
+        spawned.push(outcome.uri);
     }
     Ok(spawned)
 }
@@ -1678,8 +1695,8 @@ mod tests {
 
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let synchronization = Arc::new(super::SpawnSynchronization {
-            entered_count_window: entered_tx,
-            release_count_window: Arc::new(tokio::sync::Notify::new()),
+            entered_claim_window: entered_tx,
+            release_claim_window: Arc::new(tokio::sync::Notify::new()),
         });
 
         let first_orch = test.orch.clone();
@@ -1711,20 +1728,23 @@ mod tests {
             .await
         });
 
-        // The first contender is paused immediately after reading open=0. The
-        // second must remain outside that same window until the first links its
-        // issue. Removing the production scope lock makes this receive succeed.
+        // The first contender is paused in its claim window, having read open=0.
+        // The second must remain outside that same window until the first has
+        // claimed its batch. Removing the production scope lock makes this receive
+        // succeed.
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), entered_rx.recv(),)
                 .await
                 .is_err(),
-            "second contender entered the count-to-claim window concurrently"
+            "second contender entered the claim window concurrently"
         );
 
-        synchronization.release_count_window.notify_one();
+        synchronization.release_claim_window.notify_one();
         let first_spawned = first.await.unwrap().unwrap();
-        entered_rx.recv().await.unwrap();
-        synchronization.release_count_window.notify_one();
+        // The second contender now reads the cap the first consumed and stops before
+        // its own claim window. The stored permit releases it anyway if it ever gets
+        // there, so a cap regression fails this test instead of hanging it.
+        synchronization.release_claim_window.notify_one();
         let second_spawned = second.await.unwrap().unwrap();
 
         assert_eq!(first_spawned.len() + second_spawned.len(), 1);
@@ -1742,6 +1762,160 @@ mod tests {
             memory_status_count(&test, "pending", "project", "project-1").await,
             5
         );
+    }
+
+    /// A batch mid-formation cannot be raided by the batch that held its memories
+    /// before.
+    ///
+    /// A memory can ride several batches over its life, and its earlier batch links
+    /// survive as history. The dangerous moment is a spawn in flight: if a memory
+    /// were `claimed` before the new batch's ownership existed, its previous — now
+    /// merged — batch would look like the owner, and merge finalization could apply
+    /// that batch's decision and pull the memory out of the batch being formed.
+    /// Claiming is therefore one transaction with recording ownership, taken only
+    /// after the issue exists: this test pauses a spawn in exactly that window and
+    /// runs the full reconcile sweep against it.
+    #[tokio::test]
+    async fn a_spawn_in_flight_cannot_be_raided_by_an_earlier_merged_batch() {
+        let test = test_orch().await;
+        // The memory rode a batch that has since merged, carrying a decision, and is
+        // back in the pending pool.
+        test.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO issues (id, project_id, number, title, status, merged_at, created_at, updated_at)
+                 VALUES ('issue-earlier', 'project-1', 20, 'Memory triage: project=project-1 (5 pending)', 'merged', 100, 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        for idx in 0..5 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+        link_memory_to_issue(&test, "issue-earlier", "p-0").await;
+        crate::memories::db::record_triage_decision(
+            &test.orch.db.local,
+            "p-0",
+            crate::models::MemoryTriageDecision::Promote,
+            "decided by the earlier batch",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let synchronization = Arc::new(super::SpawnSynchronization {
+            entered_claim_window: entered_tx,
+            release_claim_window: Arc::new(tokio::sync::Notify::new()),
+        });
+        let spawn_orch = test.orch.clone();
+        let spawn_sync = synchronization.clone();
+        let spawning = tokio::spawn(async move {
+            super::spawn_triage_for_scope_inner(
+                &spawn_orch,
+                "project",
+                "project-1",
+                5,
+                1,
+                Some(spawn_sync),
+            )
+            .await
+        });
+        entered_rx.recv().await.unwrap();
+
+        // The spawn is paused with its issue created and its batch not yet claimed.
+        // Drive the sweep steps that act on ownership directly — they are the ones
+        // the per-scope spawn lock does NOT cover, so they can run in exactly this
+        // window. (The composite sweep cannot be called here: its spawn step waits
+        // on the very lock the paused spawn holds.)
+        assert!(
+            crate::memories::db::merged_triage_issues_with_claimed_memories(&test.orch.db.local)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the earlier merged batch owns nothing to finalize"
+        );
+        assert!(
+            crate::memories::db::resolve_triage_batch_on_merge(
+                &test.orch.db.local,
+                "issue-earlier"
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "finalizing the earlier merged batch touches nothing"
+        );
+        assert!(
+            crate::memories::db::revert_orphaned_claimed_memories(&test.orch.db.local)
+                .await
+                .unwrap()
+                .is_empty(),
+            "orphan recovery finds no half-formed claim to reset"
+        );
+        assert_eq!(
+            memory_status_count(&test, "pending", "project", "project-1").await,
+            5,
+            "the forming batch's pool is untouched"
+        );
+        assert_eq!(
+            memory_status_count(&test, "promoted", "project", "project-1").await,
+            0
+        );
+
+        synchronization.release_claim_window.notify_one();
+        let spawned = spawning.await.unwrap().unwrap();
+
+        // The new batch owns all five, including the memory the earlier batch had
+        // decided.
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(
+            memory_status_count(&test, "claimed", "project", "project-1").await,
+            5
+        );
+        let owner = owning_triage_issue_id(&test, "p-0").await;
+        assert_ne!(owner, "issue-earlier");
+        assert_eq!(
+            crate::memories::db::claimed_batch_memories_for_issue(&test.orch.db.local, &owner)
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(
+            crate::memories::db::claimed_batch_memories_for_issue(
+                &test.orch.db.local,
+                "issue-earlier"
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the earlier batch owns none of the re-claimed memories"
+        );
+    }
+
+    /// The triage issue that owns a memory: its most recent batch link.
+    async fn owning_triage_issue_id(test: &TestOrch, memory_id: &str) -> String {
+        test.orch
+            .db
+            .local
+            .query_one(
+                "SELECT issue_id FROM memory_triage_issue_memories \
+                 WHERE memory_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                params![memory_id],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1950,6 +2124,96 @@ mod tests {
             1
         );
         assert_eq!(triage_issue_count(&test).await, 1);
+    }
+
+    /// The production failure this guards (CAIRN-3289): a workspace-pool batch
+    /// where one memory is deferred to a project the integrator named by KEY. The
+    /// key is not a `projects.id`, so finalizing used to write a dangling
+    /// `memories.project_id`, fail the batch's foreign key, roll back its decided
+    /// siblings, and warn again on every sweep forever.
+    #[tokio::test]
+    async fn reconcile_finalizes_a_merged_batch_deferred_to_a_project_by_key() {
+        let test = test_orch().await;
+        test.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO issues (id, project_id, number, title, status, merged_at, created_at, updated_at)
+                 VALUES ('issue-merged', 'project-1', 12, 'Memory triage: workspace=workspace (3 pending)', 'merged', 100, 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        for (idx, id) in ["rescoped", "promoted", "discarded"].iter().enumerate() {
+            insert_memory_with_status(
+                &test,
+                id,
+                "claimed",
+                "workspace",
+                "workspace",
+                "job-main",
+                (idx as i64) + 1,
+                (idx as i64) + 1,
+            )
+            .await;
+            link_memory_to_issue(&test, "issue-merged", id).await;
+        }
+        crate::memories::db::record_triage_decision(
+            &test.orch.db.local,
+            "rescoped",
+            crate::models::MemoryTriageDecision::Defer,
+            "belongs to the project pool",
+            Some(crate::models::MemoryScope::Project),
+            "PRJ".into(),
+        )
+        .await
+        .unwrap();
+        for (id, decision) in [
+            ("promoted", crate::models::MemoryTriageDecision::Promote),
+            ("discarded", crate::models::MemoryTriageDecision::Discard),
+        ] {
+            crate::memories::db::record_triage_decision(
+                &test.orch.db.local,
+                id,
+                decision,
+                "decided at triage time",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        super::reconcile_memory_triage(test.orch.clone())
+            .await
+            .unwrap();
+
+        // The deferred memory re-enters the project pool keyed by project ID.
+        assert_eq!(
+            memory_status_count(&test, "pending", "project", "project-1").await,
+            1
+        );
+        // Its siblings resolved in the same transaction, which is what a rolled-back
+        // batch could not do.
+        assert_eq!(
+            memory_status_count(&test, "promoted", "workspace", "workspace").await,
+            1
+        );
+        assert_eq!(
+            memory_status_count(&test, "discarded", "workspace", "workspace").await,
+            1
+        );
+        assert_eq!(
+            memory_status_count(&test, "claimed", "workspace", "workspace").await,
+            0,
+            "nothing is left claimed, so the sweep has no batch to retry"
+        );
+        assert!(
+            crate::memories::db::merged_triage_issues_with_claimed_memories(&test.orch.db.local)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     async fn migrated_team_db(temp: &TempDir) -> Arc<LocalDb> {

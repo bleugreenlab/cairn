@@ -49,8 +49,8 @@ pub use workspace::{
 
 // Project types
 pub use project::{
-    CheckCommand, CheckPolicy, CheckResourceClass, CheckWhen, CreateProject, MoveProject,
-    PopulateConfig, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject,
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, CreateProject,
+    MoveProject, PopulateConfig, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject,
 };
 
 // Context token snapshot types
@@ -94,13 +94,13 @@ pub use turn::{Turn, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason}
 
 // Recipe types
 pub use recipe::{
-    AccumulationScope, ActionNodeConfig, AgentFilter, AgentFilterMode, AgentGitConfig,
-    AgentNodeConfig, ArtifactNodeConfig, CheckpointNodeConfig, ConditionErrorBehavior,
-    ConditionNodeConfig, ConditionType, ConfirmPolicy, ContextNodeConfig, CreateRecipe,
-    EventFilter, NodeConfig, NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode,
-    RecipeNodeType, RecipeTrigger, RecipeVersionInfo, ScheduleAt, ScheduleConfig, ScheduleEvery,
-    ScheduleInterval, SchedulePeriod, SchemaConfig, TriggerConfig, TriggerScope, UpdateRecipe,
-    WorktreeMode,
+    default_branch_targets, AccumulationScope, ActionNodeConfig, AgentFilter, AgentFilterMode,
+    AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, BranchMode, BranchTarget,
+    CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig, ConditionType,
+    ConfirmPolicy, ContextNodeConfig, CreateRecipe, EventFilter, NodeConfig, NodePosition, Recipe,
+    RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger, RecipeVersionInfo,
+    ScheduleAt, ScheduleConfig, ScheduleEvery, ScheduleInterval, SchedulePeriod, SchemaConfig,
+    TriggerConfig, TriggerScope, UpdateRecipe,
 };
 pub use recipe::{CONTEXT_IN_HANDLE, CONTEXT_OUT_HANDLE, CONTEXT_SELF_HANDLE};
 

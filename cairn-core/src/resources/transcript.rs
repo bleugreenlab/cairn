@@ -421,6 +421,10 @@ fn format_single_event(
                 }
             }
         }
+        crate::transcripts::CONTINUATION_EVENT_TYPE => {
+            output.push_str(crate::transcripts::CONTINUATION_MARKER_LINE);
+            output.push_str("\n\n");
+        }
         "result" | "tool_result" => {
             if let Some(result) = event_data.get("toolResult") {
                 let tool_name = event_data
@@ -1657,6 +1661,14 @@ fn render_block(
                 // reseeds stays bounded.
                 out.push_str("· [reseeded from prior session digest]\n");
             }
+            crate::transcripts::CONTINUATION_EVENT_TYPE => {
+                // Cairn's own resume nudge (CAIRN-3175). It renders as a marker
+                // at every fidelity — `messages=full` included — because there is
+                // no operator message here to render faithfully, and a turn that
+                // opened this way must never read as one the operator started.
+                out.push_str(crate::transcripts::CONTINUATION_MARKER_LINE);
+                out.push('\n');
+            }
             _ => {}
         }
     }
@@ -2044,7 +2056,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let (rendered, matches) = grep_materialized_body(transcript, &payload);
+        let (rendered, matches) = grep_materialized_body(transcript, &payload).unwrap();
         assert_eq!(matches, 2);
         assert_eq!(
             contents(&rendered),
@@ -2062,7 +2074,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let (rendered, _matches) = grep_materialized_body(transcript, &payload);
+        let (rendered, _matches) = grep_materialized_body(transcript, &payload).unwrap();
         assert_eq!(contents(&rendered), vec!["Beta match"]);
 
         // No matches: the shared finalizer's message.
@@ -2076,7 +2088,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let (rendered, matches) = grep_materialized_body(transcript, &payload);
+        let (rendered, matches) = grep_materialized_body(transcript, &payload).unwrap();
         assert_eq!(matches, 0);
         assert_eq!(rendered, "No matches found for pattern 'zeta'");
     }
@@ -2306,6 +2318,56 @@ mod tests {
         );
         assert!(out.contains("**User:**"));
         assert!(out.contains("→ cairn://p/CAIRN/1666/1/builder/chat/turn/1]"));
+    }
+
+    #[test]
+    fn digest_never_attributes_a_synthesized_continuation_to_the_user() {
+        // A resume Cairn synthesized for itself is stored as `user:continuation`
+        // (CAIRN-3175). At every fidelity the digest must render it as a marker
+        // and never under the **User:** label, or an agent reading the transcript
+        // — its own, or another node's — sees an instruction nobody gave.
+        let events = vec![
+            digest_ev(
+                0,
+                "t1",
+                "user:continuation",
+                serde_json::json!({ "content": "Automatic resume: Cairn restarted this turn" }),
+            ),
+            digest_ev(
+                1,
+                "t1",
+                "assistant",
+                serde_json::json!({ "content": "picking the work back up" }),
+            ),
+        ];
+        let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
+        for unabridged in [false, true] {
+            let out = format_transcript_digest_with(
+                &events,
+                "cairn://p/CAIRN/1666/1/builder/chat",
+                &digest_meta(),
+                &turns,
+                &DigestOptions {
+                    latest: false,
+                    turn_offset: None,
+                    turn_limit: None,
+                    unabridged,
+                    inline_diffs: false,
+                },
+            );
+            assert!(
+                out.contains(crate::transcripts::CONTINUATION_MARKER_LINE),
+                "continuation marker missing (unabridged={unabridged}): {out}"
+            );
+            assert!(
+                !out.contains("**User:**"),
+                "a synthesized continuation must never wear the user label (unabridged={unabridged}): {out}"
+            );
+            assert!(
+                !out.contains("Automatic resume: Cairn restarted this turn"),
+                "Cairn's own wake text is not conversation (unabridged={unabridged}): {out}"
+            );
+        }
     }
 
     #[test]

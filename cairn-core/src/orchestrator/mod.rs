@@ -12,6 +12,7 @@ pub mod attention_push;
 pub mod base_advance;
 pub mod build_services;
 pub mod config_resource;
+pub mod conflict_session;
 pub mod device_presence;
 pub mod docs;
 pub mod executor_registry; // Synced visibility; live placement remains in fleet.
@@ -91,6 +92,7 @@ pub struct OrchestratorBuilder {
     provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
+    boot_at: i64,
 }
 
 impl OrchestratorBuilder {
@@ -145,7 +147,19 @@ impl OrchestratorBuilder {
             provider_usage_snapshots: Arc::new(RwLock::new(HashMap::new())),
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
             team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
+            boot_at: chrono::Utc::now().timestamp(),
         }
+    }
+
+    /// Override when this host began owning runs. See [`Orchestrator::boot_at`].
+    ///
+    /// Only test fixtures set this: they seed `runs` rows with epoch timestamps,
+    /// so a fixture orchestrator passes `0` to state that it owns every run in
+    /// its fixture database. The ownership fence's own tests set it explicitly to
+    /// place seeded runs on either side of boot.
+    pub fn boot_at(mut self, boot_at: i64) -> Self {
+        self.boot_at = boot_at;
+        self
     }
 
     pub fn process_state(mut self, process_state: Arc<AgentProcessState>) -> Self {
@@ -304,8 +318,8 @@ impl OrchestratorBuilder {
             self.db.clone(),
             self.api_config.clone(),
         ));
-        let fleet = Arc::new(crate::fleet::Fleet::with_lifetime_route_path(
-            self.config_dir.join("build-slot-lifetime-routes.json"),
+        let fleet = Arc::new(crate::fleet::Fleet::with_residency_route_path(
+            self.config_dir.join("build-slot-residency-routes.json"),
         ));
         Orchestrator {
             db: self.db,
@@ -315,14 +329,11 @@ impl OrchestratorBuilder {
             warm_gc: self.warm_gc,
             pty_state: self.pty_state,
             repl_state: self.repl_state,
-            worktree_search: Arc::new(crate::worktree_search::WorktreeSearchPool::default()),
             project_overlays: Arc::new(
                 crate::mcp::handlers::read::overlay::ProjectOverlayRegistry::default(),
             ),
             call_admission: Arc::new(crate::execution::jobs::CallAdmission::default()),
-            check_admission: Arc::new(
-                crate::execution::check_admission::CheckAdmissionController::default(),
-            ),
+            park_slots: Arc::new(crate::orchestrator::lifecycle::ParkSlots::default()),
             fleet,
             object_plane: Arc::new(crate::orchestrator::object_plane::ObjectPlaneState::default()),
             permission_responses: self.permission_responses,
@@ -341,6 +352,7 @@ impl OrchestratorBuilder {
             config_dir: self.config_dir,
             schema_dir: self.schema_dir,
             mcp_callback_port: self.mcp_callback_port,
+            boot_at: self.boot_at,
             attached_ui: Arc::new(Mutex::new(AttachedUi::default())),
             vibe_state: self.vibe_state,
             embed_tx: Arc::new(Mutex::new(None)),
@@ -359,12 +371,15 @@ impl OrchestratorBuilder {
             team_attention_sender: self.team_attention_sender,
             team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
+            job_launch_locks: Arc::new(Mutex::new(HashMap::new())),
+            job_launch_claims: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_lock_metrics: Arc::new(Mutex::new(HashMap::new())),
-            setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
+            build_service_reconcile: Arc::new(Mutex::new(())),
             build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
+            session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
@@ -482,6 +497,93 @@ fn summarize_bounded(
     }
 }
 
+/// Everything one executor has to say for itself, as reasons.
+///
+/// Free-standing so the mapping can be tested against a machine's shape
+/// directly. The rule it has to hold to is that a healthy machine produces
+/// nothing: a reason is a statement that something needs attention, and one that
+/// a correctly working platform emits forever is noise that makes the whole
+/// vocabulary unreadable.
+fn executor_health_reasons(
+    executor: &cairn_common::executor_protocol::ExecutorHealthSnapshot,
+) -> Vec<cairn_common::executor_protocol::SubstrateHealthReason> {
+    use cairn_common::executor_protocol::{
+        DiskHealthStatus, ExecutorHealthStatus, SubstrateHealthReason,
+    };
+
+    let id = executor.identity.executor_id.clone();
+    let mut reasons = Vec::new();
+    if executor.status == ExecutorHealthStatus::Stale {
+        reasons.push(SubstrateHealthReason::StaleExecutor {
+            executor_id: id.clone(),
+        });
+    }
+    if executor.host.pressure.is_some() {
+        reasons.push(SubstrateHealthReason::HostPressure {
+            executor_id: id.clone(),
+        });
+    }
+    // The link is fine but its facts have aged out. Named separately so an
+    // operator is not sent looking for a dead machine.
+    if executor.telemetry_stale {
+        reasons.push(SubstrateHealthReason::StaleTelemetry {
+            executor_id: id.clone(),
+            age_ms: executor.liveness_age_ms.unwrap_or_default(),
+        });
+    }
+    match executor.disk.status {
+        DiskHealthStatus::Pressured => reasons.push(SubstrateHealthReason::DiskPressured {
+            executor_id: id.clone(),
+        }),
+        DiskHealthStatus::Full => reasons.push(SubstrateHealthReason::DiskFull {
+            executor_id: id.clone(),
+        }),
+        // Unknown disk pressure is exactly the volume reading being a gap, and
+        // the gap loop below names it with its own reason.
+        DiskHealthStatus::Unknown | DiskHealthStatus::Ok => {}
+    }
+    // Each reading this machine needs and cannot take, named. Only placement
+    // inputs qualify: the daemon's own size is unavailable by construction off
+    // macOS, and letting that permanent diagnostic gap become a reason would
+    // hold every healthy Windows and Linux executor at unknown forever. The
+    // classification lives on the protocol type so the panel and the placement
+    // seam cannot drift apart about it.
+    for (measurement, reason) in executor.machine.placement_gaps() {
+        reasons.push(SubstrateHealthReason::MeasurementUnavailable {
+            executor_id: id.clone(),
+            measurement,
+            reason,
+        });
+    }
+    if executor.disk.cleanup_blocked {
+        reasons.push(SubstrateHealthReason::StorageCleanupFailed {
+            executor_id: id.clone(),
+        });
+    }
+    // A partial walk is a measured result that is visibly incomplete, so it
+    // carries the bounded evidence rather than only a count.
+    if let Some(accounting) = executor
+        .machine
+        .disk_accounting
+        .value()
+        .filter(|accounting| accounting.is_partial())
+    {
+        reasons.push(SubstrateHealthReason::DiskAccountingPartial {
+            executor_id: id.clone(),
+            skipped_entries: accounting.skipped_count(),
+            skipped: accounting.skipped.clone(),
+        });
+    }
+    if executor
+        .admission
+        .concurrency_capacity
+        .is_some_and(|capacity| executor.admission.active_reservation.concurrency_units >= capacity)
+    {
+        reasons.push(SubstrateHealthReason::AdmissionSaturated { executor_id: id });
+    }
+    reasons
+}
+
 fn substrate_health_status(
     reasons: &[cairn_common::executor_protocol::SubstrateHealthReason],
 ) -> cairn_common::executor_protocol::SubstrateHealthStatus {
@@ -500,7 +602,7 @@ fn substrate_health_status(
         SubstrateHealthStatus::Healthy
     } else if reasons
         .iter()
-        .all(|reason| matches!(reason, SubstrateHealthReason::ReadingUnavailable { .. }))
+        .all(|reason| matches!(reason, SubstrateHealthReason::MeasurementUnavailable { .. }))
     {
         SubstrateHealthStatus::Unknown
     } else {
@@ -662,12 +764,6 @@ impl TurnEndCancel {
     }
 }
 
-/// Cancel state for an in-flight worktree/setup preparation.
-pub struct SetupHandle {
-    pub cancel: Arc<AtomicBool>,
-    pub child: Arc<Mutex<Option<Box<dyn ChildProcess>>>>,
-}
-
 /// The desktop UI attached over the runner's `/ws` channel, tracked so
 /// `process_info` (and thus `cairn://dev/pid`) can report the *window* pid.
 ///
@@ -704,11 +800,6 @@ pub struct Orchestrator {
     /// Active PTY sessions (terminals)
     pub pty_state: Arc<PtyState>,
     pub repl_state: Arc<crate::mcp::handlers::repl::ReplState>,
-    /// Bounded pool of per-worktree warm search indexes (CAIRN-2303). Repeated
-    /// `?grep=` reads in a worktree hit a resident fff index instead of
-    /// re-walking the tree; cold/ineligible queries fall back to the ripgrep
-    /// walk. Dropped per worktree at teardown and LRU-evicted at capacity.
-    pub worktree_search: Arc<crate::worktree_search::WorktreeSearchPool>,
     /// Runner-owned immutable base tables and SHA-keyed corrections for
     /// store-native branch tree projections.
     pub(crate) project_overlays: Arc<crate::mcp::handlers::read::overlay::ProjectOverlayRegistry>,
@@ -718,6 +809,11 @@ pub struct Orchestrator {
     /// today, so `admit` is a pure passthrough in production. Shared across
     /// clones behind the `Arc`.
     pub(crate) call_admission: Arc<crate::execution::jobs::CallAdmission>,
+
+    /// Per-run debounce for the deferred durable-wait park, so a turn suspending
+    /// several of its calls at once is interrupted once, after the last of them
+    /// has had its handoff grace. Shared across clones behind the `Arc`.
+    pub(crate) park_slots: Arc<crate::orchestrator::lifecycle::ParkSlots>,
 
     // === Broadcast channels for cross-component communication ===
     /// Permission response broadcast: (request_id, response_json)
@@ -803,8 +899,6 @@ pub struct Orchestrator {
     turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
     /// Job ids with a synchronous when:write batch in flight. Runtime-only.
     write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
-    /// Fair, runner-wide resource admission shared by write and review checks.
-    pub(crate) check_admission: Arc<crate::execution::check_admission::CheckAdmissionController>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
@@ -820,6 +914,15 @@ pub struct Orchestrator {
     pub(crate) schema_dir: Option<PathBuf>,
     /// Port for the MCP callback server
     pub mcp_callback_port: u16,
+    /// Unix seconds at which this host process began owning runs.
+    ///
+    /// The orchestrator is constructed once per host process, so this is that
+    /// process's boot time. It is the fence line in `dispatch::dispatch_tool`
+    /// (CAIRN-3287): a `runs` row timestamped before it belongs to a predecessor
+    /// runner, and an agent still calling tools for such a run is a zombie whose
+    /// transcript reader died with the process that spawned it. Runtime-only;
+    /// never persisted.
+    pub boot_at: i64,
     /// Desktop UI attached over the runner's `/ws` channel. The window-owning
     /// Tauri process registers its own `std::process::id()` on connect and
     /// detaches on disconnect; the `process_info` tool reads the current pid so
@@ -905,6 +1008,42 @@ pub struct Orchestrator {
     /// Prevents concurrent `persist_task_packet` calls from losing packets.
     execution_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 
+    /// Per-job locks serializing the decide-to-resume-and-launch critical
+    /// section. Deciding a job is idle, inserting its run, allocating its turn,
+    /// spawning the backend process and registering that process are five
+    /// separate steps; two wake facts routed concurrently for one job each
+    /// passed the idle check before either had created a turn, and each launched
+    /// a process against the same session — two independent agent contexts on
+    /// one session, racing every side effect of the turn (CAIRN-3283).
+    ///
+    /// `std::sync::Mutex`, not `TokioMutex`: the launch funnels
+    /// (`continue_job_impl_with_intent`, `prepare_job`) are synchronous
+    /// functions that already block on `run_db`. Not reentrant — acquire it at
+    /// exactly one level.
+    job_launch_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+
+    /// Jobs whose launch has been admitted but whose process has not registered
+    /// yet, mapped to the run that launch minted.
+    ///
+    /// The launch lock alone cannot cover a cold start. `prepare_job` is
+    /// synchronous and returns before the transport spawns and registers the
+    /// process, so its guard is gone during exactly the interval when the job
+    /// has a run and a turn but no serving process — the shape a resume reads as
+    /// idle. Holding the lock across that gap is not possible: the spawn happens
+    /// after an await, and a `std::sync::MutexGuard` cannot cross one.
+    ///
+    /// So admission is carried instead of locked. `prepare_job` claims its job
+    /// here under the launch lock and hands the claim to the transport, which
+    /// holds it until the process is registered or the start has failed; a
+    /// resume that acquires the launch lock meanwhile sees the claim and
+    /// attaches to its run rather than launching a second process against the
+    /// same session (CAIRN-3283).
+    ///
+    /// Deliberately in memory and RAII-released: a claim cannot outlive the
+    /// process holding it, and unwinding drops it, so no crash or panic can
+    /// leave a job permanently unable to resume the way a durable marker could.
+    job_launch_claims: Arc<Mutex<HashMap<String, String>>>,
+
     /// Per-store locks serializing base-advance reconcile and merge-fold
     /// mutations on a shared jj project store, keyed by the store directory.
     /// Concurrent jj rebase/import ops on one store from forked operation logs
@@ -914,9 +1053,6 @@ pub struct Orchestrator {
     jj_store_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
     jj_store_lock_metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
 
-    /// In-flight worktree/setup preparation handles, keyed by job id.
-    pub setup_registry: Arc<Mutex<HashMap<String, SetupHandle>>>,
-
     /// Launcher handles for supervised Managed Build Service daemons, keyed by
     /// service name. The default sccache daemon runs in the FOREGROUND as Cairn's
     /// child (`SCCACHE_NO_DAEMON`), so its handle controls the server directly:
@@ -924,12 +1060,27 @@ pub struct Orchestrator {
     /// server is stopped on shutdown. See `orchestrator::build_services`.
     build_service_children: Arc<Mutex<HashMap<String, Box<dyn ChildProcess>>>>,
 
+    /// Serializes build-service reconciliation within this process. A settings
+    /// restart, the periodic supervisor tick, and a startup launch can all
+    /// arrive at once; without this they race on one port and produce competing
+    /// daemons instead of a recovery. See `orchestrator::build_services`.
+    build_service_reconcile: Arc<Mutex<()>>,
+
     /// Per-run dedupe for legacy `agent-attention` terminal toasts.
     ///
     /// The completion toast now fires at the turn idle boundary while the same
     /// run may later EOF/finalize. Keying by run id suppresses cleanup-path
     /// duplicates and repeated crash finalization attempts.
     agent_completion_attention_dedupe: Arc<Mutex<HashSet<String>>>,
+
+    /// Session identities whose crashed native resume was already handed to the
+    /// digest-reseed fallback.
+    ///
+    /// One attempt per session: the fallback rotates to a fresh session, which
+    /// passes no `--resume` flag and therefore can never report itself
+    /// unresolvable. A second attempt on the same id is either a duplicate
+    /// finalize or a failure that retrying will not fix.
+    pub(crate) session_reseed_fallback_attempted: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Resolve the `/embed` gateway token: account JWT preferred, anonymous device
@@ -946,21 +1097,38 @@ fn resolve_embed_token(account: &AccountManager, anon: &AnonDeviceManager) -> Op
         .or_else(|| anon.get_anon_jwt().ok().flatten())
 }
 
+/// Ownership of a job's launch across the gap between admission and process
+/// registration. Dropping it re-opens the job to resumes, so it is held by
+/// whoever is responsible for the spawn. See `Orchestrator::job_launch_claims`.
+pub struct JobLaunchClaim {
+    claims: Arc<Mutex<HashMap<String, String>>>,
+    job_id: String,
+}
+
+impl Drop for JobLaunchClaim {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.job_id);
+    }
+}
+
 impl Orchestrator {
     pub fn substrate_health_snapshot(
         &self,
     ) -> cairn_common::executor_protocol::SubstrateHealthSnapshot {
         use cairn_common::executor_protocol::{
-            CellInventoryHealth, CellOccupancy, DiskHealthStatus, ExecutorHealthStatus,
+            CellInventoryHealth, CellLifecycleCensus, ExecutorHealthStatus,
             InventoryAuthorityState, PersistentCellLifecycle, StoreLockHealth,
             SubstrateHealthReason, SubstrateHealthSnapshot, SUBSTRATE_HEALTH_SCHEMA_VERSION,
         };
         let captured_at_unix_ms = self.services.clock.now_u64().saturating_mul(1_000);
         let fleet = self.fleet.snapshot();
         let executors = self.fleet.executor_health(captured_at_unix_ms);
-        let mut occupancy = CellOccupancy {
+        let mut occupancy = CellLifecycleCensus {
             total: fleet.cells.len(),
-            ..CellOccupancy::default()
+            ..CellLifecycleCensus::default()
         };
         for cell in &fleet.cells {
             match cell.lifecycle {
@@ -991,7 +1159,7 @@ impl Orchestrator {
             inventory.checked_out_count += executor.inventory.checked_out_count;
             inventory.idle_count += executor.inventory.idle_count;
             inventory.transient_occupancy += executor.inventory.transient_occupancy;
-            inventory.lifetime_cell_occupancy += executor.inventory.lifetime_cell_occupancy;
+            inventory.resident_occupancy += executor.inventory.resident_occupancy;
             inventory.active_transient_reservation.memory_bytes = inventory
                 .active_transient_reservation
                 .memory_bytes
@@ -1014,26 +1182,26 @@ impl Orchestrator {
                         .active_transient_reservation
                         .concurrency_units,
                 );
-            inventory.active_lifetime_reservation.memory_bytes = inventory
-                .active_lifetime_reservation
+            inventory.active_resident_reservation.memory_bytes = inventory
+                .active_resident_reservation
                 .memory_bytes
-                .saturating_add(executor.inventory.active_lifetime_reservation.memory_bytes);
-            inventory.active_lifetime_reservation.disk_growth_bytes = inventory
-                .active_lifetime_reservation
+                .saturating_add(executor.inventory.active_resident_reservation.memory_bytes);
+            inventory.active_resident_reservation.disk_growth_bytes = inventory
+                .active_resident_reservation
                 .disk_growth_bytes
                 .saturating_add(
                     executor
                         .inventory
-                        .active_lifetime_reservation
+                        .active_resident_reservation
                         .disk_growth_bytes,
                 );
-            inventory.active_lifetime_reservation.concurrency_units = inventory
-                .active_lifetime_reservation
+            inventory.active_resident_reservation.concurrency_units = inventory
+                .active_resident_reservation
                 .concurrency_units
                 .saturating_add(
                     executor
                         .inventory
-                        .active_lifetime_reservation
+                        .active_resident_reservation
                         .concurrency_units,
                 );
             inventory.retirement_in_progress |= executor.inventory.retirement_in_progress;
@@ -1071,55 +1239,7 @@ impl Orchestrator {
             reasons.push(SubstrateHealthReason::NoExecutors);
         }
         for executor in &executors {
-            let id = executor.identity.executor_id.clone();
-            if executor.status == ExecutorHealthStatus::Stale {
-                reasons.push(SubstrateHealthReason::StaleExecutor {
-                    executor_id: id.clone(),
-                });
-            }
-            if executor.host.pressure.is_some() {
-                reasons.push(SubstrateHealthReason::HostPressure {
-                    executor_id: id.clone(),
-                });
-            }
-            match executor.disk.status {
-                DiskHealthStatus::Pressured => reasons.push(SubstrateHealthReason::DiskPressured {
-                    executor_id: id.clone(),
-                }),
-                DiskHealthStatus::Full => reasons.push(SubstrateHealthReason::DiskFull {
-                    executor_id: id.clone(),
-                }),
-                DiskHealthStatus::Unknown => {
-                    reasons.push(SubstrateHealthReason::ReadingUnavailable {
-                        section: format!("executor:{id}:disk"),
-                    })
-                }
-                DiskHealthStatus::Ok => {}
-            }
-            if executor.disk.cleanup_blocked {
-                reasons.push(SubstrateHealthReason::StorageCleanupFailed {
-                    executor_id: id.clone(),
-                });
-            }
-            if let Some(skipped_entries) = executor
-                .disk
-                .accounting_skipped_entries
-                .filter(|skipped_entries| *skipped_entries > 0)
-            {
-                reasons.push(SubstrateHealthReason::DiskAccountingPartial {
-                    executor_id: id.clone(),
-                    skipped_entries,
-                });
-            }
-            if executor
-                .admission
-                .concurrency_capacity
-                .is_some_and(|capacity| {
-                    executor.admission.active_reservation.concurrency_units >= capacity
-                })
-            {
-                reasons.push(SubstrateHealthReason::AdmissionSaturated { executor_id: id });
-            }
+            reasons.extend(executor_health_reasons(executor));
         }
         let status = substrate_health_status(&reasons);
         SubstrateHealthSnapshot {
@@ -1128,10 +1248,21 @@ impl Orchestrator {
             status,
             reasons,
             executors,
+            // Read from the supervisor's cached state. Snapshot construction
+            // stays non-blocking: it must never probe a daemon or run
+            // `--show-stats`, or the panel's own responsiveness would depend on
+            // the health of the thing it is reporting on.
+            compile_cache: self.compile_cache_health(),
             occupancy,
             inventory,
             fleet,
             store_locks,
+            // Read separately from `executors` and left out of every verdict
+            // computed above. A machine that is merely unreachable says nothing
+            // about whether the machines that ARE attached hold an authoritative
+            // inventory, and folding it in would have marked the fleet degraded
+            // every time this runner's laptop left the network.
+            enrolled_remotes: self.fleet.unattached_enrolled_remotes(),
         }
     }
 
@@ -1240,6 +1371,42 @@ impl Orchestrator {
             .clone()
     }
 
+    /// Get or create a per-job lock serializing that job's launch critical
+    /// section (idle decision -> run insert -> turn allocation -> spawn ->
+    /// registry registration). See `job_launch_locks`.
+    pub fn job_launch_lock(&self, job_id: &str) -> Arc<Mutex<()>> {
+        let mut map = self.job_launch_locks.lock().unwrap();
+        map.entry(job_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Claim this job's launch on behalf of `run_id`, for a launch whose process
+    /// registers after the launch lock has been released. Call only while
+    /// holding the job's launch lock. Releasing the returned claim re-opens the
+    /// job to resumes, so hold it until the process is registered or the start
+    /// has failed. See `job_launch_claims`.
+    pub fn claim_job_launch(&self, job_id: &str, run_id: &str) -> JobLaunchClaim {
+        self.job_launch_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id.to_string(), run_id.to_string());
+        JobLaunchClaim {
+            claims: self.job_launch_claims.clone(),
+            job_id: job_id.to_string(),
+        }
+    }
+
+    /// The run of an admitted-but-unregistered launch for this job, if one is
+    /// outstanding. See `job_launch_claims`.
+    pub fn claimed_launch_run(&self, job_id: &str) -> Option<String> {
+        self.job_launch_claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(job_id)
+            .cloned()
+    }
+
     /// Get or create a per-store lock serializing base-advance reconcile and
     /// merge-fold mutations on a shared jj project store. Acquire it once per
     /// logical operation at exactly one level — `TokioMutex` is not reentrant, so
@@ -1250,11 +1417,6 @@ impl Orchestrator {
         map.entry(key)
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn raw_jj_store_lock_for_test(&self, store_dir: &Path) -> Arc<TokioMutex<()>> {
-        self.jj_store_lock(store_dir)
     }
 
     /// Acquire a project store lock while recording slow waits and holds.
@@ -1620,38 +1782,35 @@ impl Orchestrator {
         }
     }
 
+    /// Verify the whole database and repair recoverable index-entry drift.
+    ///
+    /// Whole-database `PRAGMA integrity_check` used to run inside every fk_off
+    /// table rebuild, where its cost scaled with the database rather than the
+    /// migration and where unrelated pre-existing drift could fail an unrelated
+    /// migration and panic the runner's boot (CAIRN-3103). Migrations now verify
+    /// their own rebuilt tables; whole-database verification belongs here, off
+    /// the boot path, where every finding is a report rather than a gate. Gated
+    /// by `integrity_sweep_state` to a weekly cadence, so most boots pay nothing.
+    pub async fn run_integrity_sweep(&self) {
+        if let Err(e) = crate::storage::run_integrity_sweep(&self.db.local).await {
+            log::warn!("integrity sweep failed: {e}");
+        }
+    }
+
+    pub fn spawn_integrity_sweep(&self) {
+        let db = self.db.local.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::storage::run_integrity_sweep(&db).await {
+                log::warn!("integrity sweep failed: {e}");
+            }
+        });
+    }
+
     pub fn spawn_archival_maintenance(&self) {
         let db = self.db.local.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::archival::run_archival_maintenance(&db).await {
                 log::warn!("archival maintenance failed: {e}");
-            }
-        });
-    }
-
-    /// Spawn the periodic worktree garbage collector: once shortly after startup
-    /// (a short delay so it does not compete with launch), then every ~24h.
-    ///
-    /// Reclaims worktree disk that teardown never got to — worktrees of jobs whose
-    /// issue reached a terminal state (the DB pass) and row-less filesystem debris
-    /// plus leftover `*.trash-*` tombstones (the canonical-instance filesystem
-    /// pass), both bounded by the `orphan_cleanup_days` age cutoff. Best-effort;
-    /// errors log and never abort the loop. Must be called from within a tokio
-    /// runtime. Both hosts (cairn-runner, cairn-server) spawn it at startup.
-    pub fn spawn_worktree_gc(&self) {
-        /// Delay before the first pass so it does not compete with launch.
-        const STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
-        /// Cadence after the startup pass.
-        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
-        let orch = self.clone();
-        tokio::spawn(async move {
-            use tracing::Instrument as _;
-            tokio::time::sleep(STARTUP_DELAY).await;
-            loop {
-                crate::execution::worktree_gc::run_worktree_gc(&orch)
-                    .instrument(tracing::info_span!(target: "profiler", "worktree_gc"))
-                    .await;
-                tokio::time::sleep(INTERVAL).await;
             }
         });
     }
@@ -1669,10 +1828,6 @@ impl Orchestrator {
         if let Err(e) = cairn_analytics::run_historical_backfill(&self.db.local).await {
             log::warn!("analytics rollup backfill failed: {e}");
         }
-    }
-
-    pub async fn run_worktree_gc(&self) {
-        crate::execution::worktree_gc::run_worktree_gc(self).await;
     }
 
     pub fn spawn_analytics_rollup_backfill(&self) {
@@ -1701,6 +1856,12 @@ impl Orchestrator {
         crate::execution::scheduler::spawn_recipe_scheduler(self.clone());
     }
 
+    /// Spawn the single host-global scheduler for durable MCP continuations.
+    /// It scans every routed database in bounded batches and arms only due waits.
+    pub fn spawn_mcp_scheduler(&self) {
+        crate::mcp::handlers::mcp_continuation::spawn_scheduler(self.clone());
+    }
+
     /// Re-dispatch workflow runs that were in flight when the process died
     /// (CAIRN-2498): re-spawn each crashed workflow's `bun <script>` for the
     /// SAME run_id so its journal replays already-completed `agent()` calls
@@ -1711,7 +1872,7 @@ impl Orchestrator {
     /// retained terminal conditions resolve immediately; pending conditions are
     /// watched again from their authoritative database rows.
     pub async fn reconcile_owned_waits(&self) {
-        crate::mcp::handlers::owned_wait::reconcile_owned_waits(self).await;
+        crate::mcp::handlers::durable_suspend::reconcile(self).await;
     }
 
     pub async fn redispatch_crashed_workflows(&self) {
@@ -2238,16 +2399,24 @@ impl Orchestrator {
         eviction_set
     }
 
-    /// Periodically trim the warm pool to the memory budget (CAIRN-2543). Once
-    /// spawning stops, an over-budget idle pool would otherwise hold its memory
-    /// forever; this sweep re-measures every ~30s and converges (eviction kills
+    /// The periodic process sweep: reconcile durable run rows against the
+    /// processes this host actually holds, then trim the warm pool to its memory
+    /// budget. Two jobs on one tick because both are decided from the same
+    /// evidence — which runs have a live process handle right now.
+    ///
+    /// Reaping runs unconditionally (`crate::runs::reap`). Nothing else inside a
+    /// live session settles a run whose process vanished without finalizing it,
+    /// and such a row makes its node read as permanently starting to every reader
+    /// until the app restarts (CAIRN-3291).
+    ///
+    /// Warm trimming is a no-op when warm retention is disabled. Once spawning
+    /// stops, an over-budget idle pool would otherwise hold its memory forever
+    /// (CAIRN-2543); this re-measures every ~30s and converges (eviction kills
     /// are async, so a tick can overshoot conservatively and the next tick
-    /// re-measures). Also prunes stale GC view records. A no-op when warm
-    /// retention is disabled. Must be called from within a tokio runtime.
-    pub fn spawn_warm_sweep(&self) {
-        if self.warm_gc.is_none() {
-            return;
-        }
+    /// re-measures). It also prunes stale GC view records.
+    ///
+    /// Must be called from within a tokio runtime.
+    pub fn spawn_process_sweep(&self) {
         const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
         let orch = self.clone();
         tokio::spawn(async move {
@@ -2261,7 +2430,8 @@ impl Orchestrator {
                 // Off the async worker: the eviction lookup and kills block on
                 // DB round-trips, so keep the runtime responsive.
                 if let Err(error) = tokio::task::spawn_blocking(move || {
-                    let _span = tracing::info_span!(target: "profiler", "warm_sweep").entered();
+                    let _span = tracing::info_span!(target: "profiler", "process_sweep").entered();
+                    crate::runs::reap::reap_stale_runs(&orch);
                     orch.collect_warm(false);
                     if let Some(gc) = orch.warm_gc.as_ref() {
                         gc.cleanup_stale_views();
@@ -2269,7 +2439,7 @@ impl Orchestrator {
                 })
                 .await
                 {
-                    log::warn!("GC sweep task failed: {error}");
+                    log::warn!("Process sweep task failed: {error}");
                 }
             }
         });
@@ -2395,7 +2565,10 @@ impl Orchestrator {
             ));
         }
 
-        if backend.eq_ignore_ascii_case("codex") || backend.eq_ignore_ascii_case("openrouter") {
+        if matches!(
+            backend.to_ascii_lowercase().as_str(),
+            "codex" | "openrouter" | "ollama"
+        ) {
             return model.and_then(|model| {
                 self.model_catalog
                     .read()
@@ -2408,28 +2581,32 @@ impl Orchestrator {
         None
     }
 
-    fn refresh_model_catalog(&self) {
-        for backend_name in ["claude", "codex", "openrouter"] {
-            let backend = backend_for_name(Some(backend_name));
-            let entry = match backend.discover_models() {
-                Ok(models) => ProviderModelCatalog {
-                    backend: backend_name.to_string(),
-                    models,
-                    options: backend.option_descriptors(),
-                    refreshed_at: Some(chrono::Utc::now().timestamp()),
-                    error: None,
-                },
-                Err(error) => ProviderModelCatalog {
-                    backend: backend_name.to_string(),
-                    models: Vec::new(),
-                    options: backend.option_descriptors(),
-                    refreshed_at: Some(chrono::Utc::now().timestamp()),
-                    error: Some(error),
-                },
-            };
-            if let Ok(mut catalog) = self.model_catalog.write() {
-                catalog.insert(backend_name.to_string(), entry);
+    fn refresh_provider_model_catalog_blocking(&self, backend_name: &str) -> ProviderModelCatalog {
+        let backend = backend_for_name(Some(backend_name));
+        let (models, error) = if backend_name == "ollama" {
+            crate::backends::ollama::models::discover_catalog_blocking(self)
+        } else {
+            match backend.discover_models() {
+                Ok(models) => (models, None),
+                Err(error) => (Vec::new(), Some(error)),
             }
+        };
+        let entry = ProviderModelCatalog {
+            backend: backend_name.to_string(),
+            models,
+            options: backend.option_descriptors(),
+            refreshed_at: Some(chrono::Utc::now().timestamp()),
+            error,
+        };
+        if let Ok(mut catalog) = self.model_catalog.write() {
+            catalog.insert(backend_name.to_string(), entry.clone());
+        }
+        entry
+    }
+
+    fn refresh_model_catalog(&self) {
+        for backend_name in ["claude", "codex", "openrouter", "ollama"] {
+            self.refresh_provider_model_catalog_blocking(backend_name);
         }
     }
 
@@ -2439,6 +2616,24 @@ impl Orchestrator {
         {
             log::warn!("model catalog refresh task failed: {error}");
         }
+    }
+
+    pub async fn run_provider_model_catalog_refresh(
+        &self,
+        backend: &str,
+    ) -> Result<ProviderModelCatalog, String> {
+        let backend = backend.to_ascii_lowercase();
+        if !matches!(
+            backend.as_str(),
+            "claude" | "codex" | "openrouter" | "ollama"
+        ) {
+            return Err(format!("Unsupported backend: {backend}"));
+        }
+        let orch = self.clone();
+        let name = backend.clone();
+        tokio::task::spawn_blocking(move || orch.refresh_provider_model_catalog_blocking(&name))
+            .await
+            .map_err(|e| format!("model catalog refresh task failed: {e}"))
     }
 
     pub fn spawn_model_catalog_refresh(&self) {
@@ -2477,21 +2672,187 @@ mod tests {
         Arc::new(DbState::new(Arc::new(local), search))
     }
 
+    /// A snapshot shaped like a healthy remote: every reading its platform can
+    /// take, taken.
+    fn healthy_non_macos_executor() -> cairn_common::executor_protocol::ExecutorHealthSnapshot {
+        use cairn_common::executor_protocol::{
+            AdmissionHealth, CpuPressure, DiskAccounting, DiskHealth, DiskHealthStatus,
+            ExecutorAdvertisement, ExecutorCapabilities, ExecutorHealthSnapshot,
+            ExecutorHealthStatus, ExecutorIdentity, ExecutorRuntimePolicy, HostHealth,
+            MachineMemory, MachineTelemetry, MachineVolume, Measurement, MeasurementGap,
+            ProcessTelemetry,
+        };
+
+        let identity = ExecutorIdentity {
+            device_id: "device".into(),
+            executor_id: "bglab-win".into(),
+            display_name: "bglab-win".into(),
+        };
+        ExecutorHealthSnapshot {
+            identity: identity.clone(),
+            colocated: false,
+            status: ExecutorHealthStatus::Online,
+            heartbeat_age_ms: 0,
+            liveness_age_ms: Some(0),
+            telemetry_stale: false,
+            advertisement: ExecutorAdvertisement {
+                identity,
+                capabilities: ExecutorCapabilities {
+                    os: "windows".into(),
+                    arch: "x86_64".into(),
+                    logical_cores: 16,
+                    toolchains: Vec::new(),
+                    projects_served: Vec::new(),
+                    disk_budget_bytes: None,
+                    memory_budget_bytes: None,
+                },
+                current_load: 0,
+                warm_roots: Vec::new(),
+                observed_at_unix_ms: 0,
+                liveness_observed_at_unix_ms: Some(0),
+            },
+            admission: AdmissionHealth::default(),
+            queues: Vec::new(),
+            host: HostHealth::default(),
+            disk: DiskHealth {
+                status: DiskHealthStatus::Ok,
+                ..DiskHealth::default()
+            },
+            machine: MachineTelemetry {
+                cpu: Measurement::measured(
+                    10,
+                    CpuPressure {
+                        utilization: 0.4,
+                        user: 0.3,
+                        system: 0.1,
+                        logical_cores: 16,
+                    },
+                ),
+                memory: Measurement::measured(
+                    10,
+                    MachineMemory {
+                        total_bytes: 64_000,
+                        available_bytes: 40_000,
+                    },
+                ),
+                volume: Measurement::measured(
+                    10,
+                    MachineVolume {
+                        total_bytes: 900_000,
+                        free_bytes: 400_000,
+                    },
+                ),
+                disk_accounting: Measurement::measured(10, DiskAccounting::default()),
+                process: ProcessTelemetry {
+                    // Windows working set: taken. macOS physical footprint: no
+                    // equivalent exists here, and never will.
+                    resident_bytes: Measurement::measured(10, 17_000),
+                    physical_footprint_bytes: Measurement::unavailable(
+                        10,
+                        MeasurementGap::UnsupportedPlatform,
+                    ),
+                },
+            },
+            inventory: Default::default(),
+            connection_generation: 1,
+            applied_policy: ExecutorRuntimePolicy::default(),
+            drain_mode: false,
+            build_skew: None,
+        }
+    }
+
+    /// A machine whose only missing reading is one it was never going to have.
+    ///
+    /// macOS physical footprint has no equivalent anywhere else, so every
+    /// Windows and Linux executor reports it unavailable forever. Counting that
+    /// as a reason made a completely healthy remote hold the entire fleet at
+    /// `Unknown` permanently, and conflated the daemon's own size with the
+    /// machine pressure placement actually reads.
+    #[test]
+    fn a_healthy_non_macos_executor_stays_healthy_despite_its_unsupported_footprint() {
+        use cairn_common::executor_protocol::{
+            MachineMeasurement, MeasurementGap, SubstrateHealthStatus,
+        };
+
+        let executor = healthy_non_macos_executor();
+        // The gap is real and still visible on the machine itself — it is only
+        // barred from the fleet-wide verdict.
+        assert_eq!(
+            executor.machine.gaps(),
+            vec![(
+                MachineMeasurement::ProcessPhysicalFootprint,
+                MeasurementGap::UnsupportedPlatform
+            )]
+        );
+        assert_eq!(executor.machine.placement_gaps(), vec![]);
+
+        let reasons = executor_health_reasons(&executor);
+        assert_eq!(
+            reasons,
+            vec![],
+            "a healthy machine must say nothing; a reason a working platform \
+             emits forever makes the whole vocabulary unreadable"
+        );
+        assert_eq!(
+            substrate_health_status(&reasons),
+            SubstrateHealthStatus::Healthy
+        );
+    }
+
+    /// The diagnostic readings are excluded from the verdict, not from view, and
+    /// a placement input that goes missing still counts.
+    #[test]
+    fn a_missing_placement_input_still_reaches_the_verdict() {
+        use cairn_common::executor_protocol::{
+            MachineMeasurement, Measurement, MeasurementGap, SubstrateHealthReason,
+            SubstrateHealthStatus,
+        };
+
+        let mut executor = healthy_non_macos_executor();
+        executor.machine.memory = Measurement::unavailable(10, MeasurementGap::SamplingFailed);
+        // A failing categorized walk is diagnosis, not a placement input: the
+        // executor admits work against free volume bytes, never against the
+        // storage breakdown.
+        executor.machine.disk_accounting =
+            Measurement::unavailable(10, MeasurementGap::SamplingFailed);
+
+        let reasons = executor_health_reasons(&executor);
+        assert_eq!(
+            reasons,
+            vec![SubstrateHealthReason::MeasurementUnavailable {
+                executor_id: "bglab-win".into(),
+                measurement: MachineMeasurement::Memory,
+                reason: MeasurementGap::SamplingFailed,
+            }]
+        );
+        assert_eq!(
+            substrate_health_status(&reasons),
+            SubstrateHealthStatus::Unknown
+        );
+    }
+
     #[test]
     fn substrate_health_status_precedence_reaches_unknown() {
-        use cairn_common::executor_protocol::{SubstrateHealthReason, SubstrateHealthStatus};
+        use cairn_common::executor_protocol::{
+            MachineMeasurement, MeasurementGap, SkippedEntry, SkippedEntryOperation,
+            SkippedEntryReason, SubstrateHealthReason, SubstrateHealthStatus,
+        };
 
         assert_eq!(substrate_health_status(&[]), SubstrateHealthStatus::Healthy);
         assert_eq!(
-            substrate_health_status(&[SubstrateHealthReason::ReadingUnavailable {
-                section: "executor:one:disk".into(),
+            substrate_health_status(&[SubstrateHealthReason::MeasurementUnavailable {
+                executor_id: "one".into(),
+                measurement: MachineMeasurement::Volume,
+                reason: MeasurementGap::SamplingFailed,
             }]),
             SubstrateHealthStatus::Unknown
         );
         assert_eq!(
             substrate_health_status(&[
-                SubstrateHealthReason::ReadingUnavailable {
-                    section: "executor:one:disk".into(),
+                SubstrateHealthReason::MeasurementUnavailable {
+                    executor_id: "one".into(),
+                    measurement: MachineMeasurement::Volume,
+                    reason: MeasurementGap::SamplingFailed,
                 },
                 SubstrateHealthReason::StaleExecutor {
                     executor_id: "one".into(),
@@ -2503,8 +2864,22 @@ mod tests {
             substrate_health_status(&[SubstrateHealthReason::DiskAccountingPartial {
                 executor_id: "one".into(),
                 skipped_entries: 2,
+                skipped: vec![SkippedEntry {
+                    path: "build-slots/slot-3".into(),
+                    operation: SkippedEntryOperation::ReadDirectory,
+                    reason: SkippedEntryReason::PermissionDenied,
+                }],
             }]),
             SubstrateHealthStatus::Degraded
+        );
+        assert_eq!(
+            substrate_health_status(&[SubstrateHealthReason::StaleTelemetry {
+                executor_id: "one".into(),
+                age_ms: 600_000,
+            }]),
+            SubstrateHealthStatus::Degraded,
+            "aged facts degrade the snapshot; they do not make it unknown, because \
+             the facts are still there"
         );
         assert_eq!(
             substrate_health_status(&[SubstrateHealthReason::NoExecutors]),

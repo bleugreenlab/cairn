@@ -548,6 +548,47 @@ pub(super) async fn read_project_issues(
     }
 }
 
+/// The enumeration behind an image scope.
+///
+/// Every member's address is this collection's URI plus `/{ordinal}`, and the
+/// listing says so, because the point of a scoped ordinal is that an agent can
+/// construct a sibling's address without asking. The rows are the reference
+/// rows, not the blobs: an image's bytes are fetched by reading its own URI.
+pub(super) async fn read_project_images(
+    db: &LocalDb,
+    project_key: &str,
+    issue: Option<i32>,
+) -> String {
+    let project_id =
+        match crate::mcp::handlers::run_context::project_id_by_key(db, project_key).await {
+            Ok(id) => id,
+            Err(error) => return error,
+        };
+    let rows = match crate::images::list_image_refs(db, &project_id, issue).await {
+        Ok(rows) => rows,
+        Err(error) => return error.to_string(),
+    };
+
+    let base = cairn_common::uri::build_project_images_uri(project_key, issue);
+    let scope = match issue {
+        Some(number) => format!("{}-{number}", project_key.to_uppercase()),
+        None => project_key.to_uppercase(),
+    };
+    let mut body = format!("# Images — {scope}\n\n");
+    if rows.is_empty() {
+        body.push_str("No images have been stored in this scope.\n");
+        return body;
+    }
+    body.push_str(&format!("{} image(s)\n\n", rows.len()));
+    for row in &rows {
+        body.push_str(&format!("- `{base}/{}`\n", row.ordinal));
+    }
+    body.push_str(
+        "\nRead any of these URIs to see the image itself. Ordinals are stable and never\nreused, so a member's address can be constructed directly rather than looked up.\n",
+    );
+    body
+}
+
 // ============================================================================
 // Project Readers
 // ============================================================================

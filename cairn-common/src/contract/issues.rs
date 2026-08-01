@@ -28,15 +28,16 @@ pub(crate) const ISSUE_CONTRACT: ResourceContract =
                         KeyType::Array,
                         "full replacement array of issue URIs",
                     ),
-                    KeySpec::new(
-                        "labels",
-                        KeyType::Array,
-                        "full replacement label refs by name or slug",
-                    ),
+                    LABELS,
                     KeySpec::new(
                         "status",
                         KeyType::Str,
                         "record a resolution (merged | closed); to MERGE a PR, patch its create-pr artifact with action:\"merge\" instead — status:merged with an open PR is refused",
+                    ),
+                    KeySpec::new(
+                        "confirm",
+                        KeyType::Bool,
+                        "resolve even though the issue still has live work: running work is stopped (resumable) and work that never started is cancelled; the first unconfirmed attempt lists what is live",
                     ),
                     KeySpec::new(
                         "parent",
@@ -93,7 +94,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe, backend?} to start a new execution programmatically.",
+        description: "Executions for an issue. Append {recipe, backend?, branch?} to start a new execution programmatically.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -104,11 +105,18 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                 KeyType::Str,
                 "recipe id to run; discover ids via cairn://recipes",
             )],
-            optional: &[KeySpec::new(
-                "backend",
-                KeyType::Str,
-                "claude|codex; defaults to the recipe/agent default",
-            )],
+            optional: &[
+                KeySpec::new(
+                    "backend",
+                    KeyType::Str,
+                    "claude|codex; defaults to the recipe/agent default",
+                ),
+                KeySpec::new(
+                    "branch",
+                    KeyType::Str,
+                    "new|base — where this execution's work lands; defaults to new (mint a branch and ship a PR). Only a recipe that declares the target accepts it",
+                ),
+            ],
             label: "start execution",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"build\",backend:\"claude\"}}]})",
         }],

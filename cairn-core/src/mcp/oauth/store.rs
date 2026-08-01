@@ -22,6 +22,10 @@ use super::{refresh_access_token, TokenSet, EXPIRY_SKEW_SECS};
 /// granted scopes, and the tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoredAuth {
+    /// RFC 8414 issuer that issued this server-scoped credential set. Records
+    /// written before issuer binding was introduced omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
     /// Canonical RFC8707 resource identifier bound on every token request.
     pub resource: String,
     pub authorization_endpoint: String,
@@ -269,6 +273,7 @@ mod tests {
 
     fn sample(server_token: &str) -> StoredAuth {
         StoredAuth {
+            issuer: Some("https://auth.example.com".to_string()),
             resource: "https://api.example.com/mcp".to_string(),
             authorization_endpoint: "https://auth.example.com/authorize".to_string(),
             token_endpoint: "https://auth.example.com/token".to_string(),
@@ -334,10 +339,34 @@ mod tests {
     #[test]
     fn records_are_scoped_per_server() {
         mock_keychain::install();
-        save("store-a", &sample("a-token")).unwrap();
-        save("store-b", &sample("b-token")).unwrap();
-        assert_eq!(load("store-a").unwrap().access_token, "a-token");
-        assert_eq!(load("store-b").unwrap().access_token, "b-token");
+        let mut first = sample("a-token");
+        first.issuer = Some("https://issuer-a.example.com".to_string());
+        let mut second = sample("b-token");
+        second.issuer = Some("https://issuer-b.example.com".to_string());
+        save("store-a", &first).unwrap();
+        save("store-b", &second).unwrap();
+        let loaded_first = load("store-a").unwrap();
+        let loaded_second = load("store-b").unwrap();
+        assert_eq!(loaded_first.access_token, "a-token");
+        assert_eq!(
+            loaded_first.issuer.as_deref(),
+            Some("https://issuer-a.example.com")
+        );
+        assert_eq!(loaded_second.access_token, "b-token");
+        assert_eq!(
+            loaded_second.issuer.as_deref(),
+            Some("https://issuer-b.example.com")
+        );
+    }
+
+    #[test]
+    fn legacy_record_without_issuer_remains_readable() {
+        let mut value = serde_json::to_value(sample("legacy-token")).unwrap();
+        value.as_object_mut().unwrap().remove("issuer");
+
+        let auth: StoredAuth = serde_json::from_value(value).unwrap();
+        assert_eq!(auth.issuer, None);
+        assert_eq!(auth.access_token, "legacy-token");
     }
 
     #[test]

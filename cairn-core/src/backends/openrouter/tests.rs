@@ -1,16 +1,20 @@
-use super::context::{
-    context_fit_budget, estimate_conversation_tokens, fit_conversation, trim_conversation_to_budget,
-};
-use super::conversation::{normalize_tool_call_groups, transcript_event_to_chat_message};
-use super::http::{build_provider_object, tool_schemas};
-use super::wire::{
-    default_function_type, ChatMessage, ChatStreamChunk, ChatStreamDelta, StreamingAggregate,
-    ToolCall, ToolFunction,
-};
+use super::http::build_provider_object;
 use super::OpenRouterBackend;
 use crate::agent_process::process::BackendStdin;
+use crate::agent_process::stdin::{MessageContent, MessageImage};
 use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
 use crate::backends::http_loop::HttpTurnStdin;
+use crate::backends::openai_compat::context::{
+    context_fit_budget, estimate_conversation_tokens, fit_conversation, trim_conversation_to_budget,
+};
+use crate::backends::openai_compat::conversation::{
+    normalize_tool_call_groups, transcript_event_to_chat_message,
+};
+use crate::backends::openai_compat::tool_schemas;
+use crate::backends::openai_compat::wire::{
+    default_function_type, ChatContent, ChatMessage, ChatStreamChunk, ChatStreamDelta,
+    StreamingAggregate, ToolCall, ToolFunction,
+};
 use crate::backends::AgentBackend;
 use crate::models::{OpenRouterRouting, OpenRouterSort};
 use serde_json::json;
@@ -33,7 +37,10 @@ fn normalize_tool_results_repairs_missing_and_separated_results() {
     let normalized = normalize_tool_call_groups(messages);
     assert_eq!(normalized[1].tool_call_id.as_deref(), Some("missing"));
     assert_eq!(
-        normalized[1].content.as_deref(),
+        normalized[1]
+            .content
+            .as_ref()
+            .and_then(ChatContent::as_text),
         Some("Interrupted before the tool result was recorded.")
     );
     assert_eq!(normalized[2].tool_call_id.as_deref(), Some("late"));
@@ -51,7 +58,13 @@ fn normalize_tool_results_drops_orphans_and_duplicates() {
     let normalized = normalize_tool_call_groups(messages);
     assert_eq!(normalized.len(), 2);
     assert_eq!(normalized[1].tool_call_id.as_deref(), Some("call"));
-    assert_eq!(normalized[1].content.as_deref(), Some("last"));
+    assert_eq!(
+        normalized[1]
+            .content
+            .as_ref()
+            .and_then(ChatContent::as_text),
+        Some("last")
+    );
 }
 
 #[test]
@@ -154,7 +167,10 @@ fn normalize_tool_results_follows_assistant_tool_call_order() {
     let reordered = normalize_tool_call_groups(messages);
     // Tool results now follow the assistant's tool_calls order: w then r.
     assert_eq!(reordered[2].tool_call_id.as_deref(), Some("w"));
-    assert_eq!(reordered[2].content.as_deref(), Some("real answer"));
+    assert_eq!(
+        reordered[2].content.as_ref().and_then(ChatContent::as_text),
+        Some("real answer")
+    );
     assert_eq!(reordered[3].tool_call_id.as_deref(), Some("r"));
     // Non-tool messages keep their position.
     assert_eq!(reordered[0].role, "user");
@@ -171,6 +187,34 @@ fn normalize_tool_results_is_noop_when_already_ordered() {
     let reordered = normalize_tool_call_groups(messages);
     assert_eq!(reordered[1].tool_call_id.as_deref(), Some("a"));
     assert_eq!(reordered[2].tool_call_id.as_deref(), Some("b"));
+}
+
+#[test]
+fn user_message_serializes_native_openai_image_parts_without_base64_text() {
+    let stable_uri =
+        "cairn://p/CAIRN/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let message = ChatMessage::user_content(&MessageContent {
+        text: format!("inspect {stable_uri}"),
+        images: vec![MessageImage {
+            mime_type: "image/png".to_string(),
+            bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+        }],
+    });
+
+    let request_messages = serde_json::to_value([message]).unwrap();
+    let content = request_messages[0]["content"]
+        .as_array()
+        .expect("multimodal content parts");
+    assert_eq!(
+        content[0],
+        json!({ "type": "text", "text": format!("inspect {stable_uri}") })
+    );
+    assert_eq!(content[1]["type"], "image_url");
+    assert!(content[1]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+    assert!(!content[0]["text"].as_str().unwrap().contains("base64,"));
 }
 
 #[test]
@@ -276,6 +320,70 @@ fn tool_call_without_reasoning_details_omits_key_on_resume() {
         assert_eq!(message.reasoning_details, None);
         let serialized = serde_json::to_value(&message).unwrap();
         assert!(serialized.get("reasoning_details").is_none());
+    }
+}
+
+/// A stored transcript event with everything empty, ready to be narrowed to the
+/// one shape under test.
+fn blank_event(event_type: &str) -> TranscriptEvent {
+    TranscriptEvent {
+        event_type: event_type.to_string(),
+        session_id: Some("s1".to_string()),
+        parent_tool_use_id: None,
+        content: None,
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error: false,
+        thinking_ms: None,
+        raw: None,
+    }
+}
+
+#[test]
+fn blank_stored_content_is_never_replayed_as_an_empty_block() {
+    // The CAIRN-3263 shape, on the assembler Cairn owns: a turn whose text came
+    // back empty must not replay as `{"type":"text","text":""}`, which the
+    // provider rejects on every later turn.
+    for blank in ["", "   ", "\n"] {
+        let mut user = blank_event("user");
+        user.content = Some(blank.to_string());
+        assert!(transcript_event_to_chat_message("user", user).is_none());
+
+        let mut assistant = blank_event("assistant");
+        assistant.content = Some(blank.to_string());
+        assert!(transcript_event_to_chat_message("assistant", assistant).is_none());
+
+        // With tool calls, the turn still replays — as its calls alone.
+        let mut with_calls = blank_event("assistant");
+        with_calls.content = Some(blank.to_string());
+        with_calls.tool_uses = Some(vec![ToolUseInfo {
+            id: "call-1".to_string(),
+            name: "read".to_string(),
+            input: json!({}),
+        }]);
+        let message = transcript_event_to_chat_message("assistant", with_calls)
+            .expect("a tool-call turn still replays");
+        assert!(message.content.is_none());
+        assert_eq!(message.tool_calls.as_ref().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn an_empty_stored_tool_result_is_stated_rather_than_sent_blank() {
+    // Dropping it would orphan its call, so the emptiness is spelled out.
+    let mut event = blank_event("tool_result");
+    event.tool_use_id = Some("call-1".to_string());
+    event.tool_result = Some(String::new());
+    let message =
+        transcript_event_to_chat_message("tool_result", event).expect("tool results always replay");
+    assert_eq!(message.tool_call_id.as_deref(), Some("call-1"));
+    match message.content.expect("tool message carries content") {
+        ChatContent::Text(text) => assert!(!text.trim().is_empty()),
+        other => panic!("unexpected tool content: {other:?}"),
     }
 }
 
@@ -437,23 +545,35 @@ fn trims_oldest_tool_outputs_first_and_protects_system_and_recent() {
     let trimmed = trim_conversation_to_budget(&messages, budget);
 
     // System and user turns are never collapsed.
-    assert_eq!(trimmed[0].content.as_deref(), Some("system prompt"));
-    assert_eq!(trimmed[1].content.as_deref(), Some("do the work"));
+    assert_eq!(
+        trimmed[0].content.as_ref().and_then(ChatContent::as_text),
+        Some("system prompt")
+    );
+    assert_eq!(
+        trimmed[1].content.as_ref().and_then(ChatContent::as_text),
+        Some("do the work")
+    );
     // The oldest eligible tool results collapse to named, line-counted markers.
     assert_eq!(
-        trimmed[3].content.as_deref(),
+        trimmed[3].content.as_ref().and_then(ChatContent::as_text),
         Some("[read output elided — 800 lines]")
     );
     assert_eq!(
-        trimmed[5].content.as_deref(),
+        trimmed[5].content.as_ref().and_then(ChatContent::as_text),
         Some("[run output elided — 800 lines]")
     );
     // Assistant tool-call decisions stay intact (only `tool` messages collapse).
     assert!(trimmed[2].tool_calls.is_some());
     assert!(trimmed[2].content.is_none());
     // The most recent exchanges' tool outputs are protected in full.
-    assert_eq!(trimmed[7].content.as_ref().unwrap().len(), big.len());
-    assert_eq!(trimmed[13].content.as_ref().unwrap().len(), big.len());
+    assert_eq!(
+        trimmed[7].content.as_ref().unwrap().estimated_chars(),
+        big.len()
+    );
+    assert_eq!(
+        trimmed[13].content.as_ref().unwrap().estimated_chars(),
+        big.len()
+    );
     // The trimmed outgoing request now fits under budget.
     assert!(estimate_conversation_tokens(&trimmed) <= budget);
 }

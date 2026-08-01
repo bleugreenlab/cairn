@@ -10,7 +10,15 @@ use std::path::Path;
 pub(crate) fn revset_has_conflict(jj: &JjEnv, store: &Path, revset: &str) -> Result<bool, String> {
     let out = jj.run(
         store,
-        &["log", "-r", revset, "--no-graph", "-T", "self.conflict()"],
+        &[
+            "log",
+            "-r",
+            revset,
+            "--no-graph",
+            "-T",
+            "self.conflict()",
+            "--ignore-working-copy",
+        ],
         "jj dest conflict check",
     )?;
     Ok(out.contains("true"))
@@ -21,24 +29,6 @@ pub(crate) fn revset_has_conflict(jj: &JjEnv, store: &Path, revset: &str) -> Res
 /// gate trusts this over the GitHub mergeable bit for jj projects.
 pub fn branch_has_conflict(jj: &JjEnv, store: &Path, branch: &str) -> Result<bool, String> {
     revset_has_conflict(jj, store, &format!("bookmarks(exact:{:?})", branch))
-}
-
-/// Enumerate the conflicting file paths in a workspace whose conflict markers are
-/// already materialized on disk (callers run [`update_stale`] first). Runs IN the
-/// workspace, not the bare store: `jj resolve --list` is working-copy-scoped, so
-/// it must see the materialized `@`. Each output line is `<path>  <N-sided
-/// conflict>`; the leading whitespace-delimited token is the path. Returns empty
-/// on no conflicts (jj exits non-zero with "No conflicts found", mapped to an Err
-/// and swallowed) or any other error — the file list is advisory detail on a note,
-/// never load-bearing.
-pub(crate) fn conflicted_files(jj: &JjEnv, ws_path: &Path) -> Vec<String> {
-    let Ok(out) = jj.run(ws_path, &["resolve", "--list"], "jj resolve --list") else {
-        return Vec::new();
-    };
-    out.lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(|token| token.to_string())
-        .collect()
 }
 
 /// A commit carrying a recorded conflict, with the paths whose merge did not
@@ -80,7 +70,15 @@ pub(crate) fn conflicted_commits(
     let revset = format!("({range_revset}) & conflicts()");
     let Ok(out) = jj.run(
         store,
-        &["log", "-r", &revset, "--no-graph", "-T", TEMPLATE],
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            TEMPLATE,
+            "--ignore-working-copy",
+        ],
         "jj conflicted commits",
     ) else {
         return Vec::new();
@@ -112,6 +110,27 @@ pub(crate) fn conflicted_commits(
                 files,
             })
         })
+        .collect()
+}
+
+/// The conflicted file paths recorded on `branch`'s own tip, store-side and
+/// scoped to the branch — no workspace involved.
+///
+/// This replaces a `jj resolve --list` probe that could never have answered for a
+/// branch: that command is WORKING-COPY scoped, so aiming it at the bare store
+/// reported on the store's scratch `@` rather than on the sibling whose rebase
+/// conflicted. Callers capture these BETWEEN a conflicting rebase and its
+/// rollback — the one window in which the conflict exists to be read at all.
+///
+/// Advisory: an empty result means "nothing to name", never "nothing conflicted";
+/// the load-bearing gate stays [`branch_has_conflict`].
+pub(crate) fn branch_conflicted_paths(jj: &JjEnv, store: &Path, branch: &str) -> Vec<String> {
+    let revset = format!("bookmarks(exact:{branch:?})");
+    conflicted_commits(jj, store, &revset)
+        .into_iter()
+        .flat_map(|commit| commit.files)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -175,7 +194,15 @@ pub(crate) fn revset_descends_from(
     let revset = format!("{dest_commit}::({tip_revset})");
     jj.run(
         store,
-        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "commit_id",
+            "--ignore-working-copy",
+        ],
         "jj descends check",
     )
     .ok()
@@ -218,7 +245,15 @@ pub(crate) fn branch_is_ancestor_of(
     let revset = format!("({branch_revset})::{dest_commit}");
     jj.run(
         store,
-        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "commit_id",
+            "--ignore-working-copy",
+        ],
         "jj ancestor check",
     )
     .ok()

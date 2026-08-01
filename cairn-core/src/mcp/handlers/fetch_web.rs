@@ -185,7 +185,7 @@ fn missing_key_message(id: FetchProviderId) -> String {
 }
 
 /// Read a reqwest response into markdown: non-2xx becomes a guidance error,
-/// `text/html` is converted, everything else passes through.
+/// and the body is decided by its content type rather than assumed textual.
 async fn read_markdown_response(resp: reqwest::Response, what: &str) -> Result<String, String> {
     let status = resp.status();
     let content_type = resp
@@ -194,12 +194,12 @@ async fn read_markdown_response(resp: reqwest::Response, what: &str) -> Result<S
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = resp
-        .text()
+    let bytes = resp
+        .bytes()
         .await
         .map_err(|e| format!("Failed to read response from `{what}`: {e}"))?;
     if !status.is_success() {
-        let snippet: String = body.chars().take(200).collect();
+        let snippet: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
         let tail = if snippet.trim().is_empty() {
             String::new()
         } else {
@@ -210,7 +210,70 @@ async fn read_markdown_response(resp: reqwest::Response, what: &str) -> Result<S
             status.as_u16()
         ));
     }
-    Ok(convert_body(&content_type, body))
+    body_to_markdown(&content_type, &bytes, what)
+}
+
+/// Turn a fetched body into markdown, refusing anything that is not text.
+///
+/// A tool result is conversation: whatever this returns is persisted into the
+/// agent's transcript and replayed on every later turn. Decoded binary was
+/// observed corrupting a stored conversation outright — a PDF fetched here (a
+/// PDF URL whose path carries no `.pdf` suffix routes to web fetch, not to the
+/// PDF service) was passed through as bytes and broke the harness's transcript
+/// across thirteen lines, destroying a tool result. So a PDF is extracted like
+/// any other PDF, and a body that is not text at all becomes guidance instead of
+/// noise.
+fn body_to_markdown(content_type: &str, bytes: &[u8], what: &str) -> Result<String, String> {
+    let kind = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+
+    if kind == "application/pdf" || kind == "application/x-pdf" {
+        return pdf_extract::extract_text_from_mem(bytes)
+            .map_err(|e| format!("Failed to extract text from the PDF at `{what}`: {e}"));
+    }
+    if !kind.is_empty() && !is_textual_type(&kind) {
+        return Err(format!(
+            "`{what}` returned {kind} ({} bytes), which is not text. Fetch a textual representation, or download it with `run` and read the file.",
+            bytes.len()
+        ));
+    }
+    // An absent or lying content type is common, so the bytes get the final say.
+    let body = std::str::from_utf8(bytes).map_err(|_| {
+        format!(
+            "`{what}` returned {} bytes that are not valid UTF-8 text. Fetch a textual representation, or download it with `run` and read the file.",
+            bytes.len()
+        )
+    })?;
+    if body.contains('\0') {
+        return Err(format!(
+            "`{what}` returned binary content ({} bytes). Fetch a textual representation, or download it with `run` and read the file.",
+            bytes.len()
+        ));
+    }
+    Ok(convert_body(&kind, body.to_string()))
+}
+
+/// Whether a content type carries text an agent can read. Everything outside
+/// this set is refused rather than decoded.
+fn is_textual_type(kind: &str) -> bool {
+    kind.starts_with("text/")
+        || [
+            "json",
+            "xml",
+            "html",
+            "javascript",
+            "ecmascript",
+            "markdown",
+            "yaml",
+            "csv",
+            "x-www-form-urlencoded",
+        ]
+        .iter()
+        .any(|textual| kind.contains(textual))
 }
 
 /// Convert an HTML body to markdown; pass non-HTML bodies through unchanged.
@@ -225,7 +288,7 @@ pub(crate) fn convert_body(content_type: &str, body: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::gateway::{McpResourceDef, McpToolCallResult, McpToolDef};
+    use crate::mcp::gateway::{McpResourceDef, McpToolCallResult, McpToolCatalog};
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -242,8 +305,8 @@ mod tests {
             _: &str,
             _: &str,
             _: &McpServerConfig,
-        ) -> Result<Vec<McpToolDef>, String> {
-            Ok(vec![])
+        ) -> Result<McpToolCatalog, String> {
+            Ok(McpToolCatalog::default())
         }
         async fn list_resources(
             &self,
@@ -304,6 +367,37 @@ mod tests {
         assert_eq!(gw.last_tool.lock().unwrap().as_deref(), Some("fetch"));
         let args = gw.last_args.lock().unwrap().clone().unwrap();
         assert_eq!(args["source"], "https://example.com");
+    }
+
+    #[test]
+    fn binary_bodies_are_refused_rather_than_decoded_into_the_conversation() {
+        // The observed corruption: a PDF fetched through web fetch (its URL has
+        // no `.pdf` suffix, so it never reaches the PDF service).
+        let pdf = b"%PDF-1.4\n\x00\x01\x02 not really a pdf";
+        let error = body_to_markdown("application/pdf", pdf, "https://arxiv.org/pdf/2511.11847")
+            .unwrap_err();
+        assert!(error.contains("extract text from the PDF"), "{error}");
+
+        let error = body_to_markdown("image/png", b"\x89PNG\r\n\x1a\n", "https://x/y").unwrap_err();
+        assert!(error.contains("image/png"), "{error}");
+
+        // No content type at all: the bytes decide.
+        let error = body_to_markdown("", b"\xff\xfe\x00\x01", "https://x/y").unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+
+        // Decodable but NUL-bearing: still binary, still refused.
+        let error = body_to_markdown("text/plain", b"head\0tail", "https://x/y").unwrap_err();
+        assert!(error.contains("binary content"), "{error}");
+    }
+
+    #[test]
+    fn textual_bodies_still_convert_and_pass_through() {
+        let html = body_to_markdown("text/html; charset=utf-8", b"<h1>Hello</h1>", "u").unwrap();
+        assert_eq!(html.trim(), "# Hello");
+        let json = body_to_markdown("application/json", b"{\"a\":1}", "u").unwrap();
+        assert_eq!(json, "{\"a\":1}");
+        let unknown = body_to_markdown("", b"plain words", "u").unwrap();
+        assert_eq!(unknown, "plain words");
     }
 
     #[test]

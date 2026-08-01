@@ -1,7 +1,7 @@
 //! CLI subcommands (thin client: forward to the running app, print to stdout).
 //! `read`/`write`/`watch` build a callback request, forward it over the same
 //! HTTP callback the MCP server uses, and print the result.
-use rmcp::handler::server::tool::Parameters;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use std::env;
 use std::time::Duration;
@@ -130,6 +130,7 @@ fn parse_change_input(raw: &str) -> Result<ChangeInput, String> {
             commit_msg: None,
             preview: None,
             atomic: None,
+            conflict_markers_reason: None,
         })
     } else {
         serde_json::from_value(value).map_err(|e| e.to_string())
@@ -160,7 +161,7 @@ pub(crate) async fn run_cli_read(
     let client = build_cli_client(callback_url);
     let input = ReadFileInput { paths };
     match client
-        .read(Parameters(input), rmcp::model::Meta::default())
+        .read(Parameters(input), rmcp::model::RequestMetaObject::default())
         .await
     {
         Ok(result) => emit_tool_result(&result),
@@ -275,6 +276,94 @@ pub(crate) async fn run_cli_watch(issue_uri: String, since: Option<i64>) -> bool
     }
 }
 
+fn check_run_request(client: &CairnCmd, suite: String, branch: Option<String>) -> CallbackRequest {
+    let mut payload = serde_json::json!({ "suite": suite });
+    if let Some(branch) = branch {
+        payload["branch"] = serde_json::Value::String(branch);
+    }
+    CallbackRequest {
+        thread_id: None,
+        cwd: client.cwd.to_string(),
+        run_id: client.run_id.as_ref().map(ToString::to_string),
+        tool: "check_run".to_string(),
+        payload,
+        tool_use_id: None,
+    }
+}
+
+fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
+    let envelope: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| format!("invalid response from runner: {}", raw.trim_end()))?;
+    if !envelope
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(envelope
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("configured check failed")
+            .to_string());
+    }
+    let result = envelope
+        .get("result")
+        .ok_or_else(|| "runner response omitted the configured check result".to_string())?;
+    let suite = result
+        .get("checkName")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "runner response omitted checkName".to_string())?;
+    let disposition = result
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "runner response omitted disposition".to_string())?;
+    let passed = result
+        .get("passed")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "runner response omitted passed".to_string())?;
+    let commit = result
+        .get("commitSha")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "runner response omitted commitSha".to_string())?;
+    let source = result
+        .get("sourceObservationId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "runner response omitted sourceObservationId".to_string())?;
+    let short_commit = commit.get(..12).unwrap_or(commit);
+    Ok((
+        format!(
+            "{} {suite} ({disposition}, {short_commit}) · source observation {source}",
+            if passed { "✓" } else { "✗" }
+        ),
+        passed,
+    ))
+}
+
+pub(crate) async fn run_cli_check(suite: String, branch: Option<String>) -> bool {
+    let callback_url = cli_callback_url();
+    if !ensure_callback_reachable(&callback_url).await {
+        print_unreachable_callback(&callback_url);
+        return false;
+    }
+    let client = build_cli_client(callback_url);
+    let outcome = client
+        .call_tauri_full(&check_run_request(&client, suite, branch))
+        .await;
+    if !outcome.transport_ok {
+        eprintln!("cairn check run: {}", outcome.result.trim_end());
+        return false;
+    }
+    match render_check_run_response(&outcome.result) {
+        Ok((summary, passed)) => {
+            println!("{summary}");
+            passed
+        }
+        Err(error) => {
+            eprintln!("cairn check run: {error}");
+            false
+        }
+    }
+}
+
 pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<String>) -> bool {
     let raw = match json {
         Some(j) => j,
@@ -305,7 +394,7 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
     }
     let client = build_cli_client(callback_url);
     match client
-        .write(Parameters(input), rmcp::model::Meta::default())
+        .write(Parameters(input), rmcp::model::RequestMetaObject::default())
         .await
     {
         Ok(result) => emit_tool_result(&result),
@@ -344,5 +433,105 @@ mod tests {
         let targets = vec!["file:a.rs".to_string(), "file:b.rs".to_string()];
         let err = fold_cli_scope(&targets, Some(10), None).unwrap_err();
         assert!(err.contains("exactly one target"));
+    }
+
+    #[test]
+    fn check_run_request_omits_default_branch() {
+        let client = CairnCmd::new_with_home_uri(
+            "http://localhost".into(),
+            "/repo".into(),
+            Some("run-1".into()),
+            None,
+            vec![],
+            None,
+        );
+        let request = check_run_request(&client, "rust-tests".into(), None);
+        assert_eq!(request.tool, "check_run");
+        assert_eq!(
+            request.payload,
+            serde_json::json!({ "suite": "rust-tests" })
+        );
+        assert_eq!(request.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn check_run_response_renders_hit_and_source_observation() {
+        let rendered = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "cached",
+                    "passed": true,
+                    "sourceObservationId": "obs-source"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            (
+                "✓ rust-tests (cached, 1234567890ab) · source observation obs-source".to_string(),
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn check_run_response_preserves_a_failed_verdict() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": false,
+                    "sourceObservationId": "obs-failed"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(summary.starts_with("✗ rust-tests"));
+        assert!(
+            !passed,
+            "a rendered red verdict must produce a nonzero CLI exit"
+        );
+    }
+
+    #[test]
+    fn check_run_response_propagates_unknown_suite_as_failure() {
+        let error = render_check_run_response(
+            &serde_json::json!({
+                "ok": false,
+                "error": "configured check unknown was not found"
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown"));
+    }
+
+    #[test]
+    fn check_run_request_forwards_branch_as_an_opaque_revision() {
+        let client = CairnCmd::new_with_home_uri(
+            "http://localhost".into(),
+            "/repo".into(),
+            None,
+            None,
+            vec![],
+            None,
+        );
+        let request = check_run_request(&client, "rust-tests".into(), Some("main@origin".into()));
+        assert_eq!(
+            request.payload,
+            serde_json::json!({
+                "suite": "rust-tests",
+                "branch": "main@origin"
+            })
+        );
     }
 }

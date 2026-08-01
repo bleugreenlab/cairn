@@ -39,7 +39,13 @@ fn sample_uri(contract: &ResourceContract) -> String {
         .replace("{server}", "axon")
         .replace("{task}", "task-1")
         .replace("{content}", "x")
+        .replace("{sha256}", &"a".repeat(64))
         .replace("{project}", "MCP")
+        // A stored image's scoped-ordinal address. `{n}` is safe to substitute
+        // ahead of `{number}`/`{node}`/`{name}`: it only matches the exact
+        // three-character placeholder, never their longer prefixes.
+        .replace("{issue}", "1")
+        .replace("{n}", "1")
         .replace("{number}", "1")
         .replace("{exec}", "1")
         .replace("{node}", "builder")
@@ -85,12 +91,10 @@ async fn table_and_dispatch_match_for_every_kind_and_mode() {
         );
 
         for &mode in ChangeMode::ALL {
-            // Apply is a control mode for the preview->apply round trip, not a
-            // per-resource mutation; preview rejects it before dispatch.
-            // Annotate is a universal facet handled by a catch-all dispatcher arm
-            // rather than a per-kind mutation table row, so it has no owning
-            // ResourceKind to compare in this per-resource parity matrix.
-            if matches!(mode, ChangeMode::Apply) {
+            // Apply is a control mode for the preview->apply round trip, and
+            // revert is a commit-wide bare-file operation. Neither is a
+            // per-resource mutation, so both are validated before dispatch.
+            if matches!(mode, ChangeMode::Apply | ChangeMode::Revert) {
                 continue;
             }
             let spec = mutation_spec(contract.kind, mode);

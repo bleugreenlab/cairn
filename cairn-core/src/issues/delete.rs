@@ -57,7 +57,7 @@ pub(crate) async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<
     // content→execution boundary (CAIRN-2181): runs/teardown stay private.
     let run_ids = run_ids_for_issue(&orch.db.local, issue_id).await?;
 
-    crate::execution::teardown::teardown_worktrees(
+    crate::execution::teardown::cleanup_issue_jobs(
         orch,
         crate::execution::teardown::TeardownScope::Issue(issue_id.to_string()),
         // Deleting the issue is an explicit discard — remove branches as before.

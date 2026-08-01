@@ -1,5 +1,12 @@
-use cairn_common::protocol::WarmSearchDeclineReason;
 use regex::escape;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchTranslationError {
+    StdinInput,
+    UnsupportedProgram,
+    UnsupportedFlag(String),
+    UnsupportedInvocation,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TranslatedSearch {
@@ -83,13 +90,13 @@ struct Token {
 pub(crate) fn translate_search_invocation(
     program: &str,
     argv: &[String],
-) -> Result<TranslatedSearch, WarmSearchDeclineReason> {
+) -> Result<TranslatedSearch, SearchTranslationError> {
     let program = std::path::Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(program);
     if argv.iter().any(|arg| arg == "-") {
-        return Err(WarmSearchDeclineReason::StdinInput);
+        return Err(SearchTranslationError::StdinInput);
     }
     let tokens: Vec<Token> = argv
         .iter()
@@ -102,30 +109,17 @@ pub(crate) fn translate_search_invocation(
     match program {
         "rg" => translate_rg(&tokens),
         "grep" => translate_grep(&tokens),
-        _ => return Err(WarmSearchDeclineReason::UnsupportedProgram),
+        _ => return Err(SearchTranslationError::UnsupportedProgram),
     }
     .ok_or_else(|| classify_invocation_decline(argv))
 }
 
-/// Whether a translated pattern compiles. An uncompilable pattern is not a
-/// translation gap — the invocation's *shape* was understood perfectly — so it
-/// is not this module's business to reject. It is a per-caller serving
-/// decision: the PATH shim declines so the real binary prints its own
-/// diagnostic and exits 2, while the `run` path lets its walk fallback produce
-/// Cairn's canonical `Invalid regex pattern '…'` message.
-pub(crate) fn pattern_compiles(translated: &TranslatedSearch) -> bool {
-    match translated {
-        TranslatedSearch::Grep { pattern, .. } => regex::Regex::new(pattern).is_ok(),
-        TranslatedSearch::Files { .. } => true,
-    }
-}
-
-fn classify_invocation_decline(argv: &[String]) -> WarmSearchDeclineReason {
+fn classify_invocation_decline(argv: &[String]) -> SearchTranslationError {
     argv.iter()
         .find(|arg| arg.starts_with('-') && *arg != "--")
         .cloned()
-        .map(WarmSearchDeclineReason::UnsupportedFlag)
-        .unwrap_or(WarmSearchDeclineReason::UnsupportedInvocation)
+        .map(SearchTranslationError::UnsupportedFlag)
+        .unwrap_or(SearchTranslationError::UnsupportedInvocation)
 }
 
 /// Historical whole-command adapter retained for reconstructed-transcript
@@ -140,23 +134,23 @@ pub(crate) fn translate_search_command(command: &str) -> Option<TranslatedSearch
 /// run dispatcher can fail the read explicitly instead of placing it as a build.
 pub(crate) fn translate_search_command_detailed(
     command: &str,
-) -> Result<TranslatedSearchPipeline, WarmSearchDeclineReason> {
-    let stages = split_pipeline(command).ok_or(WarmSearchDeclineReason::UnsupportedInvocation)?;
+) -> Result<TranslatedSearchPipeline, SearchTranslationError> {
+    let stages = split_pipeline(command).ok_or(SearchTranslationError::UnsupportedInvocation)?;
     let (head, tail) = stages
         .split_first()
-        .ok_or(WarmSearchDeclineReason::UnsupportedInvocation)?;
-    let tokens = tokenize(head).ok_or(WarmSearchDeclineReason::UnsupportedInvocation)?;
+        .ok_or(SearchTranslationError::UnsupportedInvocation)?;
+    let tokens = tokenize(head).ok_or(SearchTranslationError::UnsupportedInvocation)?;
     let first = tokens
         .first()
-        .ok_or(WarmSearchDeclineReason::UnsupportedInvocation)?;
+        .ok_or(SearchTranslationError::UnsupportedInvocation)?;
     let argv: Vec<String> = tokens[1..].iter().map(|token| token.text.clone()).collect();
     if tokens[1..].iter().any(|token| token.has_unquoted_expansion) {
-        return Err(WarmSearchDeclineReason::UnsupportedInvocation);
+        return Err(SearchTranslationError::UnsupportedInvocation);
     }
     let search = translate_search_invocation(&first.text, &argv)?;
     let mut post = Vec::with_capacity(tail.len());
     for stage in tail {
-        let tokens = tokenize(stage).ok_or(WarmSearchDeclineReason::UnsupportedInvocation)?;
+        let tokens = tokenize(stage).ok_or(SearchTranslationError::UnsupportedInvocation)?;
         post.push(parse_post_filter(&tokens).ok_or_else(|| {
             let detail = tokens
                 .iter()
@@ -164,7 +158,7 @@ pub(crate) fn translate_search_command_detailed(
                 .or_else(|| tokens.first())
                 .map(|token| token.text.clone())
                 .unwrap_or_else(|| "pipeline stage".to_string());
-            WarmSearchDeclineReason::UnsupportedFlag(detail)
+            SearchTranslationError::UnsupportedFlag(detail)
         })?);
     }
     Ok(TranslatedSearchPipeline { search, post })
@@ -929,7 +923,7 @@ mod tests {
     fn invocation(
         program: &str,
         argv: &[&str],
-    ) -> Result<TranslatedSearch, WarmSearchDeclineReason> {
+    ) -> Result<TranslatedSearch, SearchTranslationError> {
         translate_search_invocation(
             program,
             &argv
@@ -971,18 +965,11 @@ mod tests {
         ));
         assert_eq!(
             invocation("rg", &["needle", "-"]),
-            Err(WarmSearchDeclineReason::StdinInput)
+            Err(SearchTranslationError::StdinInput)
         );
-        // An uncompilable pattern still *translates*: the shape was understood,
-        // and each caller decides whether to serve it or let its own fallback
-        // report the error.
-        assert!(!pattern_compiles(&invocation("rg", &["(", "."]).unwrap()));
-        assert!(pattern_compiles(
-            &invocation("rg", &["needle", "."]).unwrap()
-        ));
         assert!(matches!(
             invocation("rg", &["--json", "needle", "."]),
-            Err(WarmSearchDeclineReason::UnsupportedFlag(flag)) if flag == "--json"
+            Err(SearchTranslationError::UnsupportedFlag(flag)) if flag == "--json"
         ));
     }
 

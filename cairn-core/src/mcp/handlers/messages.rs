@@ -232,6 +232,8 @@ pub async fn append_project_or_issue_message(
     // in its team replica, and reads are already routed there, so the append must
     // route too or posted messages disappear from the team-replica view.
     let owning_db = orch.db.for_project(project_key).await;
+    let content =
+        crate::durable_content::normalize_text(orch, request, project_key, content).await?;
     let channel_id = resolve_channel_id(&owning_db, project_key, issue_number).await?;
     // content→execution boundary (CAIRN-2181): sender/run resolution is job-keyed
     // and stays private until CAIRN-2182.
@@ -263,7 +265,7 @@ pub async fn append_project_or_issue_message(
         sender_run_id.as_deref(),
         &sender_name,
         None,
-        content,
+        &content,
     )
     .map_err(|e| format!("Failed to send message: {e}"))?;
 
@@ -288,7 +290,7 @@ pub async fn append_project_or_issue_message(
                 project_key,
                 number,
                 source,
-                content,
+                &content,
                 exclude_job_id.as_deref(),
             )
             .await
@@ -409,6 +411,8 @@ pub async fn append_direct_message_with_urgency(
     // resolution stays job-keyed against the private DB, as on the project/issue
     // message path.
     let owning_db = orch.db.for_project(project_key).await;
+    let content =
+        crate::durable_content::normalize_text(orch, request, project_key, content).await?;
     let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;
     let (job_id, recipient_run_id) = find_recipient_job(
         &owning_db,
@@ -436,7 +440,7 @@ pub async fn append_direct_message_with_urgency(
         sender_run_id.as_deref(),
         &sender_name,
         Some(&recipient_run_id),
-        content,
+        &content,
         Some(urgency),
         stable_message_id.as_deref(),
     )
@@ -505,26 +509,32 @@ pub async fn append_direct_message_with_urgency(
         }
     }
 
-    // The user→child side-channel / catch-up notice for the watching parent is a
-    // separate, out-of-scope mechanism (CAIRN-1894); keep emitting it on
-    // user-origin sends.
-    if request.run_id.is_none() {
-        if let Err(error) =
-            crate::messages::side_channel::record_user_child_side_channel_by_issue_number(
-                orch,
-                project_key,
-                issue_number,
-                &addressed_uri,
-                content,
-            )
-            .await
-        {
-            log::warn!(
-                "failed to record user→child side-channel notice for {}: {}",
-                addressed_uri,
-                error
-            );
+    // The watching coordinator's copy of a message addressed to a child node is a
+    // passive catch-up push (CAIRN-1894), fanned out to every derived watcher of
+    // that node's issue (CAIRN-3342). It never wakes them; it rides along on their
+    // next run. The sender's own job is excluded so an agent messaging a child is
+    // not told about its own message. Sender resolution routes to the database
+    // that owns the sender's run (a team agent's run lives in its replica, not
+    // the private DB), matching how the rest of this handler routes by owner.
+    let sender_job_id = match sender_run_id.as_deref() {
+        Some(run_id) => {
+            let sender_db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+                .await
+                .unwrap_or_else(|_| orch.db.local.clone());
+            crate::messages::side_channel::job_id_for_run(&sender_db, run_id).await
         }
+        None => None,
+    };
+    match crate::orchestrator::attention_delivery::create_catchup_pushes_for_watchers(
+        &owning_db,
+        &addressed_uri,
+        sender_job_id.as_deref(),
+    )
+    .await
+    {
+        Ok(created) if created > 0 => orch.notifier.emit_change("attention_pushes"),
+        Ok(_) => {}
+        Err(error) => log::warn!("catch-up push creation for {addressed_uri} failed: {error}"),
     }
 
     // Nudge only when the effective wake still wakes an idle recipient. A muted

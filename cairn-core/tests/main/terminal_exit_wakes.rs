@@ -16,6 +16,7 @@ use cairn_core::internal::services::{
     testing::TestServicesBuilder, RealPtyFactory, TerminalOutputWatcher,
 };
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_core::internal::terminal_host;
 use cairn_db::turso::params;
 use serde_json::{json, Value};
 
@@ -67,7 +68,6 @@ async fn prepare_terminal_repository(
     let worktree = repo_path.parent().unwrap().join("agent-worktree");
     common::provision_jj_workspace(config_dir, repo_path, &worktree, branch);
     let repo_path = repo_path.to_string_lossy().to_string();
-    let worktree_path = worktree.to_string_lossy().to_string();
     db.execute(
         "UPDATE projects SET repo_path = ?1 WHERE key = 'TXW'",
         params![repo_path.as_str()],
@@ -75,8 +75,8 @@ async fn prepare_terminal_repository(
     .await
     .unwrap();
     db.execute(
-        "UPDATE jobs SET worktree_path = ?1, branch = 'agent/TXW-1-builder-0', base_commit = ?2 WHERE id = 'job-1'",
-        params![worktree_path.as_str(), base_commit.as_str()],
+        "UPDATE jobs SET branch = 'agent/TXW-1-builder-0', base_commit = ?1 WHERE id = 'job-1'",
+        params![base_commit.as_str()],
     )
     .await
     .unwrap();
@@ -551,6 +551,187 @@ async fn output_wake_fires_when_process_exits_before_phrase() {
     // The process exits (code 3) before ever printing "neverphrase". The exit must
     // consume the output-phrase subscription so the waiting agent is woken.
     wait_for_output_wake_consumed(&db, "job-1", "neverphrase").await;
+}
+
+/// The (status, exit_code) a terminal row currently records for a slug.
+async fn terminal_state(db: &LocalDb, slug: &str) -> (String, Option<i64>) {
+    let slug = slug.to_string();
+    db.read(|conn| {
+        let slug = slug.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT status, exit_code FROM job_terminals WHERE slug = ?1",
+                    params![slug.as_str()],
+                )
+                .await?;
+            let row = rows.next().await?.expect("terminal row");
+            Ok((row.text(0)?, row.opt_i64(1)?))
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// Block until a terminal finalizes, returning its recorded exit code. Generous
+/// bound: a real PTY start goes through lease acquisition and a sandbox policy
+/// build before the command ever runs.
+async fn wait_for_terminal_exit(db: &LocalDb, slug: &str) -> Option<i64> {
+    for _ in 0..200 {
+        let (status, exit_code) = terminal_state(db, slug).await;
+        if status == "exited" {
+            return exit_code;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("terminal {slug} never finalized");
+}
+
+/// CAIRN-3153: an agent terminal *is* the command it was asked to run, so the
+/// command's own completion finalizes the terminal and carries its real status.
+///
+/// Before that, the command was typed into an interactive shell that outlived it:
+/// the row stayed `running` forever, and every exit wake and
+/// `waitFor … on:"exit"` against it — both of which observe the keyed lifetime
+/// process dying — hung indefinitely. This test fails by timing out under those
+/// old semantics, which is exactly the reported symptom.
+#[tokio::test(flavor = "current_thread")]
+async fn agent_command_terminal_exits_with_the_commands_own_status() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    seed_node(&db).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
+
+    // Deliberately NOT a bare `exit 7`: that is a shell builtin, so typing it
+    // into an interactive shell ends that shell with the same status and the row
+    // would reach `exited` under either mode. A child process that exits
+    // nonzero leaves an interactive shell alive at its prompt, so only a terminal
+    // whose lifetime IS the command can finalize here.
+    let out = change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/tests",
+            "mode": "create",
+            "payload": {"command": "sh -c 'exit 7'"}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert!(out.contains("Started terminal tests"), "{out}");
+
+    assert_eq!(
+        wait_for_terminal_exit(&db, "tests").await,
+        Some(7),
+        "an agent terminal must finalize with its command's own exit code"
+    );
+}
+
+/// The operator's half of the same seam, and the constraint the fix had to keep:
+/// an interactive terminal's shell outlives the command it was created with, so
+/// the human gets a live prompt back instead of a terminal that ended with their
+/// command.
+///
+/// The agent terminal running the identical command is the clock — no arbitrary
+/// sleep. Once it has finalized, an instantly-finishing command has demonstrably
+/// completed in this environment, so an interactive terminal still `running` is
+/// evidence its lifetime is the shell and not the command.
+#[tokio::test(flavor = "current_thread")]
+async fn interactive_terminal_outlives_the_command_it_was_created_with() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    seed_node(&db).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
+
+    terminal_host::create_job_terminal(
+        &orch,
+        "job-1".to_string(),
+        "Operator".to_string(),
+        Some("true".to_string()),
+    )
+    .await
+    .expect("an operator terminal starts");
+
+    change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/agent",
+            "mode": "create",
+            "payload": {"command": "true"}
+        }]),
+        "r-1",
+    )
+    .await;
+    wait_for_terminal_exit(&db, "agent").await;
+
+    let (status, _) = terminal_state(&db, "operator").await;
+    assert_eq!(
+        status, "running",
+        "an operator's shell must survive the command it was handed"
+    );
+}
+
+/// A terminal with no command has only its shell to speak for it, so process
+/// exit remains the honest meaning of exit there: the shell leaving ends the
+/// terminal.
+#[tokio::test(flavor = "current_thread")]
+async fn bare_terminal_exits_when_its_shell_exits() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    seed_node(&db).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
+
+    terminal_host::create_job_terminal(&orch, "job-1".to_string(), "Bare".to_string(), None)
+        .await
+        .expect("a bare terminal starts");
+    let (status, _) = terminal_state(&db, "bare").await;
+    assert_eq!(status, "running", "a bare shell keeps running on its own");
+
+    change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/bare",
+            "mode": "append",
+            "payload": {"content": "exit"}
+        }]),
+    )
+    .await;
+
+    wait_for_terminal_exit(&db, "bare").await;
+}
+
+/// The other half of "never outlive both": when the process dies before its
+/// command could finish, the terminal finalizes on that death, so an exit wait
+/// resolves then rather than waiting for a completion that will never come.
+#[tokio::test(flavor = "current_thread")]
+async fn command_terminal_finalizes_when_its_process_dies_first() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    seed_node(&db).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
+
+    change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/long",
+            "mode": "create",
+            "payload": {"command": "sleep 300"}
+        }]),
+        "r-1",
+    )
+    .await;
+    let (status, _) = terminal_state(&db, "long").await;
+    assert_eq!(status, "running", "the command is still running");
+
+    change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/long",
+            "mode": "delete"
+        }]),
+    )
+    .await;
+
+    wait_for_terminal_exit(&db, "long").await;
 }
 
 #[tokio::test(flavor = "current_thread")]

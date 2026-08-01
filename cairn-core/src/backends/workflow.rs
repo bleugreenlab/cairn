@@ -36,7 +36,7 @@ use super::run_state::{resolve_run_db, transition_run_to_live};
 use crate::models::RunStatus;
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
-use cairn_common::executor_protocol::LifetimeRuntimeAsset;
+use cairn_common::executor_protocol::ResidentRuntimeAsset;
 
 const WORKFLOW_BACKEND_NAME: &str = "Workflow";
 
@@ -46,7 +46,7 @@ pub(crate) struct WorkflowSpawnParams {
     pub project_id: String,
     pub repository_path: PathBuf,
     pub anchor_branch: String,
-    pub worktree_mode: String,
+    pub branch_mode: String,
     pub package_path: PathBuf,
     pub script_path: PathBuf,
     pub args_json: String,
@@ -55,31 +55,12 @@ pub(crate) struct WorkflowSpawnParams {
     pub output_name: String,
 }
 
-#[cfg(test)]
-mod runtime_asset_tests {
-    use super::*;
-
-    #[test]
-    fn installed_runtime_resolves_without_a_source_checkout() {
-        let temp = tempfile::tempdir().unwrap();
-        let package = temp.path().join("runtime/node_modules/@cairn/harness");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("package.json"), "{}").unwrap();
-
-        assert_eq!(
-            installed_workflow_runtime_package(temp.path(), "harness"),
-            Some(package)
-        );
-    }
-}
-
 pub(crate) async fn spawn_workflow_process(
     orch: &Orchestrator,
     params: WorkflowSpawnParams,
 ) -> Result<(), String> {
     use cairn_common::executor_protocol::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     let run_db = resolve_run_db(WORKFLOW_BACKEND_NAME, orch, &params.run_id)?;
     // Resolve every runner-owned input before admission so validation/auth errors
@@ -88,52 +69,51 @@ pub(crate) async fn spawn_workflow_process(
         .mcp_auth
         .get_secret_for_mcp()
         .map_err(|e| format!("Failed to get MCP auth secret: {e}"))?;
-    let tip = crate::fleet::lifetime::resolve_logical_commit(
+    let tip = crate::fleet::residency::resolve_logical_commit(
         orch,
         &params.repository_path,
         &params.anchor_branch,
     )
     .await?;
-    let fence = crate::fleet::lifetime::acquire(
+    let fence = crate::fleet::residency::acquire(
         orch,
-        LifetimeLeaseAcquireRequest {
-            declaration: LifetimeLeaseDeclaration {
-                lease_id: format!("workflow:{}", params.run_id),
-                owner: crate::fleet::lifetime::owner(
-                    LifetimeLeaseOwnerKind::Workflow,
-                    &params.run_id,
-                ),
-                owner_ref: None,
-                name: params.run_id.clone(),
-                purpose: "workflow runtime".into(),
-                repository: RepositoryLocator::ColocatedPath {
-                    project_id: params.project_id.clone(),
-                    repository_id: params.project_id.clone(),
-                    absolute_path: params.repository_path.to_string_lossy().into_owned(),
-                },
-                initial_base_commit: tip.clone(),
-                resource_reservation: ResourceReservation {
-                    memory_bytes: 256 * 1024 * 1024,
-                    disk_growth_bytes: 1024 * 1024 * 1024,
-                    concurrency_units: 1,
-                    source: ResourceReservationSource::Declared,
-                },
-                owner_death_policy: LifetimeOwnerDeathPolicy {
-                    heartbeat_timeout_ms: 30_000,
-                    reclaim_grace_ms: 10_000,
-                },
+        ResidencyAcquireRequest {
+            holder: ResidencyHolder::Workflow {
+                run_id: params.run_id.clone(),
+            },
+            owner_ref: None,
+            selector: None,
+            repository: RepositoryLocator::ColocatedPath {
+                project_id: params.project_id.clone(),
+                repository_id: params.project_id.clone(),
+                absolute_path: params.repository_path.to_string_lossy().into_owned(),
+            },
+            initial_base_commit: tip.clone(),
+            // What the checkout costs while nothing runs in it. The runtime's
+            // concurrency unit is declared on the process that does the work.
+            footprint: ResidencyFootprint {
+                memory_bytes: 256 * 1024 * 1024,
+                disk_growth_bytes: 1024 * 1024 * 1024,
+            },
+            death_policy: OwnerDeathPolicy {
+                heartbeat_timeout_ms: 30_000,
+                reclaim_grace_ms: 10_000,
             },
             priority: CellPriority::AgentInteractive,
-            deadline_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-                + 30_000,
+            // A workflow run has no bound of its own on waiting for room, only
+            // the machine-wide default. Its checkout is large and cold
+            // provisioning is slow, so a tight number here refuses runs on a
+            // machine that was working correctly the whole time.
+            wait_horizon_unix_ms: crate::fleet::default_wait_horizon_unix_ms(
+                &crate::config::settings::load_fleet(&orch.config_dir),
+            ),
+            waiting_since_unix_ms: crate::fleet::unix_time_ms(),
         },
     )
-    .await?;
-    if let Err(error) = crate::fleet::lifetime::refresh(orch, &fence, &tip).await {
-        let _ = crate::fleet::lifetime::release(orch, &fence).await;
+    .await
+    .map_err(|refusal| refusal.diagnostic)?;
+    if let Err(error) = crate::fleet::residency::refresh(orch, &fence, &tip).await {
+        let _ = crate::fleet::residency::release(orch, &fence).await;
         return Err(error);
     }
     let assets = workflow_runtime_assets(&params.package_path)?;
@@ -150,20 +130,20 @@ pub(crate) async fn spawn_workflow_process(
     let (event_generation, event_finished) = (generation.clone(), finished.clone());
     let event_early_exit = early_exit.clone();
     let session_id = params.session_id.clone();
-    orch.fleet.subscribe_lifetime_process_events(move |event| {
+    orch.fleet.subscribe_resident_process_events(move |event| {
         let expected = event_generation.load(Ordering::Acquire);
-        if event.lease_id != event_fence.lease_id
+        if event.holder != event_fence.holder
             || event.incarnation_id != event_fence.incarnation_id
-            || event.lease_epoch != event_fence.lease_epoch
+            || event.cell_epoch != event_fence.cell_epoch
             || event.process_key != event_key
             || (expected != 0 && event.process_generation != expected)
         {
             return;
         }
         if expected == 0 {
-            if let LifetimeProcessEventKind::State {
+            if let ResidentProcessEventKind::State {
                 status:
-                    LifetimeProcessStatus::Exited {
+                    ResidentProcessStatus::Exited {
                         exit_code,
                         executor_lost,
                         ..
@@ -177,17 +157,17 @@ pub(crate) async fn spawn_workflow_process(
             return;
         }
         match event.event {
-            LifetimeProcessEventKind::Output { stream, data, .. } => {
+            ResidentProcessEventKind::Output { stream, data, .. } => {
                 let text = String::from_utf8_lossy(&data);
-                if stream == LifetimeProcessStream::Stderr {
+                if stream == ResidentProcessStream::Stderr {
                     log::error!("workflow stderr: {text}")
-                } else if stream == LifetimeProcessStream::Stdout {
+                } else if stream == ResidentProcessStream::Stdout {
                     log::info!("workflow stdout: {text}")
                 }
             }
-            LifetimeProcessEventKind::State {
+            ResidentProcessEventKind::State {
                 status:
-                    LifetimeProcessStatus::Exited {
+                    ResidentProcessStatus::Exited {
                         exit_code,
                         executor_lost,
                         ..
@@ -207,7 +187,7 @@ pub(crate) async fn spawn_workflow_process(
                         session_id.as_deref(),
                         if executor_lost { None } else { exit_code },
                     );
-                    let _ = crate::fleet::lifetime::release(&orch, &fence).await;
+                    let _ = crate::fleet::residency::release(&orch, &fence).await;
                 });
             }
             _ => {}
@@ -217,25 +197,49 @@ pub(crate) async fn spawn_workflow_process(
         "await import(process.env.CAIRN_RUNTIME_ASSETS + \"/workflow/{}\")",
         entry.replace('"', "\\\"")
     );
+    // A workflow runtime is an agent process like any other, so its confinement
+    // is the run's fence dial and nothing else. Declaring `Confined` outright
+    // would confine a `fence: allow` workflow the moment the resident-process
+    // seam starts honoring the declaration.
+    let sandbox_mode =
+        match crate::mcp::handlers::permission::resolve_fence_policy(orch, Some(&params.run_id))
+            .await
+        {
+            Some(fence) if crate::services::sandbox::sandbox_applies(fence) => {
+                ProcessSandboxMode::Confined
+            }
+            _ => ProcessSandboxMode::Unconfined,
+        };
     let result = orch
         .fleet
-        .operate_lifetime_lease(
+        .operate_residency(
             orch,
-            LifetimeLeaseOperation::StartProcess {
+            ResidencyOperation::StartProcess {
                 fence: fence.clone(),
                 process_key: params.run_id.clone(),
-                process: LifetimeProcessSpec {
+                kind: ResidentProcessKind::WorkflowRuntime {
+                    workflow: params.package_path.to_string_lossy().into_owned(),
+                },
+                // The runtime is the thing that works, so it is the thing that
+                // is charged.
+                reservation: Some(ResourceReservation {
+                    memory_bytes: 0,
+                    disk_growth_bytes: 0,
+                    concurrency_units: 1,
+                    source: ResourceReservationSource::Declared,
+                }),
+                process: ResidentProcessSpec {
                     program: "bun".into(),
                     args: vec!["-e".into(), loader],
-                    cwd: if params.worktree_mode == "inherit" {
+                    cwd: if params.branch_mode == "inherit" {
                         String::new()
                     } else {
                         "runtime-assets/workflow".into()
                     },
-                    cwd_root: if params.worktree_mode == "inherit" {
-                        LifetimeProcessCwdRoot::Checkout
+                    cwd_root: if params.branch_mode == "inherit" {
+                        ResidentProcessCwdRoot::Checkout
                     } else {
-                        LifetimeProcessCwdRoot::LeaseScratch
+                        ResidentProcessCwdRoot::ResidencyScratch
                     },
                     env: vec![
                         ("CAIRN_RUN_ID".into(), params.run_id.clone()),
@@ -254,26 +258,25 @@ pub(crate) async fn spawn_workflow_process(
                         ("CAIRN_WORKFLOW_ARGS".into(), params.args_json),
                         ("CAIRN_WORKFLOW_OUTPUT".into(), params.output_name),
                     ],
-                    sandbox_mode: ProcessSandboxMode::Confined,
+                    sandbox_mode,
                     sandbox_policy: None,
                     runtime_assets: assets,
-                    io: LifetimeProcessIoMode::Pipe,
+                    io: ResidentProcessIoMode::Pipe,
                 },
             },
         )
         .await;
-    let LifetimeLeaseResult::State { cell } = result else {
-        crate::fleet::lifetime::rollback(orch, &fence, &params.run_id).await;
+    let ResidencyResult::State { cell } = result else {
+        crate::fleet::residency::rollback(orch, &fence, &params.run_id).await;
         return Err(format!("failed to start workflow process: {result:?}"));
     };
     let Some(process_generation) = cell
-        .occupant
-        .as_ref()
-        .and_then(CellOccupant::lifetime)
-        .and_then(|lease| lease.processes.get(&params.run_id))
+        .occupancy
+        .processes
+        .get(&params.run_id)
         .map(|p| p.generation)
     else {
-        crate::fleet::lifetime::rollback(orch, &fence, &params.run_id).await;
+        crate::fleet::residency::rollback(orch, &fence, &params.run_id).await;
         return Err("workflow start returned no process generation".to_string());
     };
     generation.store(process_generation, Ordering::Release);
@@ -294,7 +297,7 @@ pub(crate) async fn spawn_workflow_process(
                 params.session_id.as_deref(),
                 if executor_lost { None } else { exit_code },
             );
-            let _ = crate::fleet::lifetime::release(orch, &fence).await;
+            let _ = crate::fleet::residency::release(orch, &fence).await;
             return Ok(());
         }
     }
@@ -303,7 +306,7 @@ pub(crate) async fn spawn_workflow_process(
         while !finished.load(Ordering::Acquire) {
             tokio::time::sleep(Duration::from_secs(10)).await;
             if finished.load(Ordering::Acquire)
-                || crate::fleet::lifetime::renew(&renew_orch, &fence)
+                || crate::fleet::residency::renew(&renew_orch, &fence)
                     .await
                     .is_err()
             {
@@ -314,7 +317,7 @@ pub(crate) async fn spawn_workflow_process(
     Ok(())
 }
 
-fn workflow_runtime_assets(package: &Path) -> Result<Vec<LifetimeRuntimeAsset>, String> {
+fn workflow_runtime_assets(package: &Path) -> Result<Vec<ResidentRuntimeAsset>, String> {
     let mut assets = Vec::new();
     collect_assets(package, Path::new("workflow"), &mut assets)?;
     collect_assets(
@@ -328,10 +331,10 @@ fn workflow_runtime_assets(package: &Path) -> Result<Vec<LifetimeRuntimeAsset>, 
         &mut assets,
     )?;
     let total = assets.iter().map(|asset| asset.data.len()).sum::<usize>();
-    if assets.len() > cairn_common::executor_protocol::MAX_LIFETIME_RUNTIME_ASSETS
-        || total > cairn_common::executor_protocol::MAX_LIFETIME_RUNTIME_ASSETS_BYTES
+    if assets.len() > cairn_common::executor_protocol::MAX_RESIDENT_RUNTIME_ASSETS
+        || total > cairn_common::executor_protocol::MAX_RESIDENT_RUNTIME_ASSETS_BYTES
         || assets.iter().any(|asset| {
-            asset.data.len() > cairn_common::executor_protocol::MAX_LIFETIME_RUNTIME_ASSET_BYTES
+            asset.data.len() > cairn_common::executor_protocol::MAX_RESIDENT_RUNTIME_ASSET_BYTES
         })
     {
         return Err(
@@ -376,7 +379,7 @@ fn installed_workflow_runtime_package(home: &Path, name: &str) -> Option<PathBuf
 fn collect_assets(
     source: &Path,
     destination: &Path,
-    out: &mut Vec<LifetimeRuntimeAsset>,
+    out: &mut Vec<ResidentRuntimeAsset>,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(source).map_err(|e| format!("read {}: {e}", source.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -385,7 +388,7 @@ fn collect_assets(
         if ty.is_dir() {
             collect_assets(&entry.path(), &target, out)?;
         } else if ty.is_file() {
-            out.push(LifetimeRuntimeAsset {
+            out.push(ResidentRuntimeAsset {
                 path: target.to_string_lossy().replace('\\', "/"),
                 data: std::fs::read(entry.path()).map_err(|e| e.to_string())?,
             });
@@ -478,5 +481,23 @@ fn finalize_workflow_run(
 
     if let Ok(mut processes) = orch.process_state.processes.lock() {
         processes.remove(run_id);
+    }
+}
+
+#[cfg(test)]
+mod runtime_asset_tests {
+    use super::*;
+
+    #[test]
+    fn installed_runtime_resolves_without_a_source_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("runtime/node_modules/@cairn/harness");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+
+        assert_eq!(
+            installed_workflow_runtime_package(temp.path(), "harness"),
+            Some(package)
+        );
     }
 }

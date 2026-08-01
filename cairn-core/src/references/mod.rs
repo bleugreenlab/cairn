@@ -114,10 +114,8 @@ pub fn save_reference_description(
 fn resolve_reference_path(config_dir: &Path, reference: &ProjectReference) -> Option<PathBuf> {
     let path = if reference.git.is_some() {
         get_references_dir(config_dir).join(&reference.name)
-    } else if let Some(ref local_path) = reference.path {
-        expand_tilde(local_path)
     } else {
-        return None;
+        expand_tilde(reference.path.as_deref()?)
     };
 
     if path.exists() {
@@ -343,7 +341,7 @@ pub(crate) fn build_references_prompt(
     let mut section = String::from("## Project References\n\n");
     section.push_str(
         "The following reference directories are available. \
-         Use absolute paths with Read, Glob, Grep, or Bash to search and read them.\n\n",
+         Search and read them with absolute paths.\n\n",
     );
     section.push_str(&lines.join("\n"));
     section

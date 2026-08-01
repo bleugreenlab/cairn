@@ -577,7 +577,6 @@ impl CodexBackend {
         client: Arc<AppServerClient>,
         current_turn_id: Arc<Mutex<Option<String>>>,
         oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
-        initial_sequence: i32,
         backend_key: String,
         run_db: Arc<LocalDb>,
         // Some(_) for a pooled ephemeral call (CAIRN-2549): the reader consumes a
@@ -589,7 +588,6 @@ impl CodexBackend {
     ) {
         log::debug!("codex_app_server: reader started");
         let ephemeral = ephemeral_cleanup.is_some();
-        let mut sequence: i32 = initial_sequence;
         let mut streaming_state: Option<StreamingState> = None;
         let mut usage_accumulator = CodexTurnUsageAccumulator::default();
         let mut last_direct_assistant_text: Option<String> = None;
@@ -677,10 +675,8 @@ impl CodexBackend {
             emitter,
             run_id,
             session_id.as_deref(),
-            sequence,
             &init_event,
         );
-        sequence += 1;
 
         for msg in notifications.iter() {
             let method = msg.get("method").and_then(|v| v.as_str());
@@ -873,7 +869,6 @@ impl CodexBackend {
                             run_id,
                             session_id.as_deref(),
                             &mut streaming_state,
-                            &mut sequence,
                             delta,
                         );
                     }
@@ -887,7 +882,6 @@ impl CodexBackend {
                             run_id,
                             session_id.as_deref(),
                             &mut streaming_state,
-                            sequence,
                             text,
                         );
                     }
@@ -904,7 +898,6 @@ impl CodexBackend {
                                     emitter,
                                     &mut streaming_state,
                                     session_id.as_deref(),
-                                    &mut sequence,
                                 );
                                 let tool_use_id = json_string(msg.pointer("/params/item/id"))
                                     .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -950,10 +943,8 @@ impl CodexBackend {
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
-                                    sequence,
                                     &event,
                                 );
-                                sequence += 1;
                             }
                             "fileChange" => {
                                 finalize_streaming(
@@ -962,7 +953,6 @@ impl CodexBackend {
                                     emitter,
                                     &mut streaming_state,
                                     session_id.as_deref(),
-                                    &mut sequence,
                                 );
                                 let tool_use_id = json_string(msg.pointer("/params/item/id"))
                                     .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -1009,10 +999,8 @@ impl CodexBackend {
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
-                                    sequence,
                                     &event,
                                 );
-                                sequence += 1;
                             }
                             "mcpToolCall" => {
                                 finalize_streaming(
@@ -1021,7 +1009,6 @@ impl CodexBackend {
                                     emitter,
                                     &mut streaming_state,
                                     session_id.as_deref(),
-                                    &mut sequence,
                                 );
                                 let tool_use_id = json_string(msg.pointer("/params/item/id"))
                                     .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -1072,10 +1059,8 @@ impl CodexBackend {
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
-                                    sequence,
                                     &event,
                                 );
-                                sequence += 1;
                             }
                             _ => {
                                 log::debug!("Unhandled Codex item/started type: {}", item_type);
@@ -1110,7 +1095,6 @@ impl CodexBackend {
                                         run_id,
                                         session_id.as_deref(),
                                         &mut streaming_state,
-                                        &mut sequence,
                                         text,
                                     );
                                     if streaming_state.is_none() {
@@ -1140,7 +1124,6 @@ impl CodexBackend {
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
-                                    sequence,
                                     &event,
                                 );
                                 if let Some(id) = tool_use_id.as_deref() {
@@ -1150,7 +1133,6 @@ impl CodexBackend {
                                     watchdog.set_pending_tool_count(pending_tool_ids.len());
                                 }
                                 interrupt_terminal_tool_at_boundary!();
-                                sequence += 1;
                             }
                             "fileChange" => {
                                 let tool_use_id = json_string(msg.pointer("/params/item/id"));
@@ -1170,7 +1152,6 @@ impl CodexBackend {
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
-                                    sequence,
                                     &event,
                                 );
                                 if let Some(id) = tool_use_id.as_deref() {
@@ -1180,7 +1161,6 @@ impl CodexBackend {
                                     watchdog.set_pending_tool_count(pending_tool_ids.len());
                                 }
                                 interrupt_terminal_tool_at_boundary!();
-                                sequence += 1;
                             }
                             "mcpToolCall" => {
                                 let tool_use_id = json_string(msg.pointer("/params/item/id"));
@@ -1200,7 +1180,6 @@ impl CodexBackend {
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
-                                    sequence,
                                     &event,
                                 );
                                 if let Some(id) = tool_use_id.as_deref() {
@@ -1210,7 +1189,6 @@ impl CodexBackend {
                                     watchdog.set_pending_tool_count(pending_tool_ids.len());
                                 }
                                 interrupt_terminal_tool_at_boundary!();
-                                sequence += 1;
                             }
                             "contextCompaction" => {
                                 if let Some(event) =
@@ -1222,10 +1200,8 @@ impl CodexBackend {
                                         emitter,
                                         run_id,
                                         session_id.as_deref(),
-                                        sequence,
                                         &event,
                                     );
-                                    sequence += 1;
                                 }
                             }
                             _ => {
@@ -1288,10 +1264,8 @@ impl CodexBackend {
                                 emitter,
                                 run_id,
                                 session_id.as_deref(),
-                                sequence,
                                 &event,
                             );
-                            sequence += 1;
                             last_direct_assistant_text = Some(text);
                         }
                     }
@@ -1370,7 +1344,6 @@ impl CodexBackend {
                         run_id,
                         session_id.as_deref(),
                         &mut streaming_state,
-                        &mut sequence,
                         status,
                         usage_accumulator.take_turn_usage(),
                         ephemeral,
@@ -1408,7 +1381,6 @@ impl CodexBackend {
                         run_id,
                         session_id.as_deref(),
                         &mut streaming_state,
-                        &mut sequence,
                         status,
                         usage_accumulator.take_turn_usage(),
                         ephemeral,
@@ -1463,7 +1435,6 @@ impl CodexBackend {
                                 emitter,
                                 &mut streaming_state,
                                 session_id.as_deref(),
-                                &mut sequence,
                             );
                             if handle_selected_model_capacity_failure(
                                 orch,
@@ -1487,7 +1458,6 @@ impl CodexBackend {
                             emitter,
                             &mut streaming_state,
                             session_id.as_deref(),
-                            &mut sequence,
                         );
                         insert_error_event(
                             orch,
@@ -1502,7 +1472,6 @@ impl CodexBackend {
                             run_id,
                             session_id.as_deref(),
                             &mut streaming_state,
-                            &mut sequence,
                             "error",
                             usage_accumulator.take_turn_usage(),
                             ephemeral,
@@ -1588,7 +1557,6 @@ impl CodexBackend {
             emitter,
             &mut streaming_state,
             session_id.as_deref(),
-            &mut sequence,
         );
 
         // Pooled ephemeral call: drop this call's routing entries so the pool no

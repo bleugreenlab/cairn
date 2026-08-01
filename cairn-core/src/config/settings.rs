@@ -132,7 +132,7 @@ pub struct SettingsFile {
     /// How replies to the special `to: "external"` target are handled.
     #[serde(default)]
     external_replies: Option<ExternalReplyMode>,
-    /// Sensitive paths the OS sandbox hard-denies reads of for worktree agents.
+    /// Sensitive paths the OS sandbox hard-denies reads of from executor cells.
     /// `~` is expanded to the user's home. Absent = the conservative built-in
     /// default (cloud cred stores, ssh/gpg keys, `~/.cairn[-dev]`). See
     /// `docs/worktree-fence.md`.
@@ -144,8 +144,8 @@ pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     browser_network_sensitive_names: Option<Vec<String>>,
     /// Managed Build Services: Cairn-supervised shared daemons (e.g. an sccache
-    /// server) that run under a service sandbox and inject client env into fenced
-    /// agent spawns. Config-only (YAML, not in the Settings DTO). Absent = the
+    /// server) that run under a service sandbox and inject client env into the
+    /// spawns that build inside the roots that sandbox grants. Config-only (YAML, not in the Settings DTO). Absent = the
     /// built-in default (a disabled-unless-`sccache`-on-PATH sccache entry). See
     /// `docs/worktree-fence.md` — Managed Build Services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,12 +202,11 @@ pub struct SettingsFile {
         skip_serializing_if = "Option::is_none"
     )]
     route_calls_via_openrouter: Option<bool>,
-    /// Per-project commands the user has accepted as worktree-fence crossers
-    /// (`projectId -> [command, ...]`). A project terminal command's `write`
-    /// carveout (or coarse fence crossing) is honored only when its command is
-    /// listed here, so a cloned repo can declare a fence-crosser but cannot grant
-    /// itself the crossing — acceptance is user-owned. Config-only (YAML, not in
-    /// the Settings DTO); preserved across saves. See `crate::config::dev_commands`.
+    /// Exact per-project terminal commands the user has accepted to run outside
+    /// the worktree fence (`projectId -> [command, ...]`). Acceptance is
+    /// user-owned, so a cloned repository can declare a shortcut but cannot grant
+    /// it host access. Config-only (YAML, not in the Settings DTO); preserved
+    /// across saves. See `crate::config::dev_commands`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accepted_fence_commands: Option<HashMap<String, Vec<String>>>,
 }
@@ -511,7 +510,7 @@ pub fn load_settings(config_dir: &std::path::Path) -> Settings {
     }
 }
 
-/// Resolve the OS-sandbox read denylist for worktree agents: the configured
+/// Resolve the OS-sandbox read denylist for executor cells: the configured
 /// `sandboxDenyRead` paths (with `~` expanded) if present, otherwise the
 /// conservative built-in default. An empty configured list disables the
 /// denylist (writes are still confined).
@@ -557,9 +556,9 @@ pub(crate) fn load_build_services(
 /// Load the per-project map of user-accepted fence-crossing commands from
 /// workspace settings (`projectId -> [command, ...]`). Empty when unset.
 ///
-/// A terminal command's `write` carveout (or coarse fence crossing) only takes
-/// effect once the user has accepted that command here — so a repo can declare a
-/// fence-crosser but cannot grant itself the crossing. See `config::dev_commands`.
+/// Acceptance is the sole unfencing decision for an exact command that is also
+/// declared as a terminal shortcut by that project. A repository can declare the
+/// shortcut but cannot grant itself host access. See `config::dev_commands`.
 pub fn load_accepted_fence_commands(config_dir: &std::path::Path) -> HashMap<String, Vec<String>> {
     load_settings_file(config_dir)
         .ok()
@@ -1958,18 +1957,33 @@ mod fleet_settings_tests {
     fn fleet_config_is_config_only_and_round_trips() {
         let yaml = r#"
 buildSlots:
-  acquisitionDeadlineSeconds: 15
+  capacityWaitHorizonSeconds: 900
   defaultTimeoutSeconds: 1800
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
         let fleet = file.fleet.as_ref().unwrap();
-        assert_eq!(fleet.acquisition_deadline_seconds, 15);
+        assert_eq!(fleet.capacity_wait_horizon_seconds, 900);
         assert_eq!(fleet.default_timeout_seconds, 1800);
         let serialized = serde_yaml::to_string(&file).unwrap();
         let reparsed: SettingsFile = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.fleet, file.fleet);
         assert!(serialized.contains("buildSlots:"));
         assert!(fleet.remote_executors.is_empty());
+    }
+
+    /// A settings file written before the wait horizon replaced the acquisition
+    /// deadline still loads, so an upgrade does not silently reset a machine's
+    /// tuning to the default.
+    #[test]
+    fn a_settings_file_naming_the_old_acquisition_deadline_still_loads() {
+        let file: SettingsFile = serde_yaml::from_str(
+            "buildSlots:\n  acquisitionDeadlineSeconds: 15\n  defaultTimeoutSeconds: 1800\n",
+        )
+        .unwrap();
+        assert_eq!(
+            file.fleet.as_ref().unwrap().capacity_wait_horizon_seconds,
+            15
+        );
     }
 
     #[test]
@@ -2021,7 +2035,7 @@ buildSlots:
         )
         .unwrap();
         let config = FleetConfig {
-            acquisition_deadline_seconds: 12,
+            capacity_wait_horizon_seconds: 12,
             default_timeout_seconds: 900,
             executor_policies: Default::default(),
             remote_executors: Default::default(),

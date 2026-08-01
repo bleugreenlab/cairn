@@ -39,7 +39,7 @@ where
 pub(crate) fn send_user_message(
     process_state: &AgentProcessState,
     run_id: &str,
-    content: &str,
+    content: &crate::agent_process::stdin::MessageContent,
     session_id: &str,
     parent_tool_use_id: Option<&str>,
     working_dir: Option<&str>,

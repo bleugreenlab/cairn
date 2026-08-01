@@ -4,6 +4,21 @@ use serde_json::Value;
 
 pub(crate) type TranscriptRow = (String, i32, String, String);
 
+/// Transcript event type for a resume prompt Cairn synthesized for itself.
+///
+/// A resume that carries no operator content still needs prompt text, and Cairn
+/// writes it (`SYNTHETIC_CONTINUATION_PROMPT`). Namespacing the stored event
+/// away from plain `user` is what makes the attribution correct by construction:
+/// no projection that renders `user` as the operator can reach this row, and
+/// each projection opts in deliberately with [`CONTINUATION_MARKER_LINE`]
+/// (CAIRN-3175).
+pub(crate) const CONTINUATION_EVENT_TYPE: &str = "user:continuation";
+
+/// The one line every text projection renders for a [`CONTINUATION_EVENT_TYPE`]
+/// event. The prompt body is deliberately not shown: it is Cairn's own wake
+/// text, not conversation, and it stays addressable in the raw stream.
+pub(crate) const CONTINUATION_MARKER_LINE: &str = "· [automatic resume — no operator message]";
+
 /// Format transcript rows into markdown without truncation.
 ///
 /// Intended for reuse in places where we need a faithful text rendering of the
@@ -70,6 +85,10 @@ pub(crate) fn format_transcript_full(events: &[TranscriptRow]) -> String {
                     transcript.push_str(result);
                     transcript.push_str("\n\n");
                 }
+            }
+            CONTINUATION_EVENT_TYPE => {
+                transcript.push_str(CONTINUATION_MARKER_LINE);
+                transcript.push_str("\n\n");
             }
             "system:compact_boundary" => {
                 let provider = event_data

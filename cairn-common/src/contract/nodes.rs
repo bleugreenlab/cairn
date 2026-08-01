@@ -224,6 +224,40 @@ pub(crate) const NODE_DIFF_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeRebase,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/rebase",
+    name: "Node rebase",
+    description: "The active conflict resolution session for this node's branch: what advanced the base, the immutable three-way coordinates, the incoming change's complete file list flagged conflicting or clean-on-retry, whether conflict markers are present in the checkout, and the sanctioned next action. Both sides of the merge are recomputed from immutable commits and paged independently — view=base-ours is what your branch did, view=base-theirs is what arrived. A patch with action:replay asks the store to replay the branch onto the base; slot refs are exports of the runner's jj store, so this is the only way ancestry moves.",
+    read_projections: &[
+        ProjectionSpec {
+            key: "view",
+            values: "base-ours|base-theirs (absent = session summary)",
+        },
+        ProjectionSpec {
+            key: "file",
+            values: "PATH (scope a patch view to one file)",
+        },
+        ProjectionSpec {
+            key: "offset",
+            values: "N (first patch line to render)",
+        },
+        ProjectionSpec {
+            key: "limit",
+            values: "N (patch lines to render; capped by the server)",
+        },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[REBASE_ACTION],
+        optional: &[REBASE_FINGERPRINT],
+        label: "ask the store to replay this branch onto its base",
+        example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\"}}]})",
+    }],
+};
+
 pub(crate) const NODE_TERMINAL_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::NodeTerminal,
@@ -263,23 +297,23 @@ pub(crate) const NODE_REPL_CONTRACT: ResourceContract =
         kind: ResourceKind::NodeRepl,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/repl/{slug}",
         name: "Node REPL",
-        description: "A stateful interpreter session that keeps variables, imports, and definitions alive across run calls. create spawns the eval-server (interpreter python or typescript required; python-only deps optional); delete stops it. Send code by adding the `repl` key to a run item — run({commands:[{code:\"x+1\",interpreter:\"python\",repl:\"SLUG\"}]}) — NOT a resource append. Read returns liveness (interpreter, running/exited, uptime). The session is node-scoped and in-memory only: it survives turn-to-turn suspends but not a host restart, and its state is lost if the process dies.",
+        description: "A stateful interpreter session that keeps variables, imports, and definitions alive across run calls. create spawns the eval-server (interpreter python or typescript, required only for a NEW slug; python-only deps preloads packages via uv — use it instead of pip install inside the session). Send code by adding the `repl` key to a run item — run({commands:[{code:\"x+1\",interpreter:\"python\",repl:\"SLUG\"}]}) — NOT a resource append. Read returns the status banner plus the live namespace (name/type/value per binding; python-only). The REPL itself is durable: its transcript, language, and deps survive the interpreter, so a dead session reads as exited with its fate rather than missing. create on an exited slug RESUMES it — the generation increments, interpreter/deps are inherited, the transcript continues, but THE NAMESPACE STARTS EMPTY. delete is two-stage: it stops a running interpreter (transcript kept), and discards the REPL when called again. Node-scoped; no interpreter survives a host restart.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[
             MutationSpec {
                 mode: ChangeMode::Create,
-                required: &[REPL_INTERPRETER],
-                optional: &[REPL_DEPS],
-                label: "start REPL",
-                example: "write({changes:[{target:\"cairn:~/repl/SLUG\",mode:\"create\",payload:{interpreter:\"python\"}}]})",
+                required: &[],
+                optional: &[REPL_INTERPRETER, REPL_DEPS],
+                label: "start or resume REPL",
+                example: "write({changes:[{target:\"cairn:~/repl/SLUG\",mode:\"create\",payload:{interpreter:\"python\",deps:[\"pandas\"]}}]})",
             },
             MutationSpec {
                 mode: ChangeMode::Delete,
                 required: &[],
                 optional: &[],
-                label: "stop REPL",
+                label: "stop REPL (again to discard it)",
                 example: "write({changes:[{target:\"cairn:~/repl/SLUG\",mode:\"delete\"}]})",
             },
         ],
@@ -290,7 +324,7 @@ pub(crate) const NODE_BROWSER_CONTRACT: ResourceContract =
         kind: ResourceKind::NodeBrowser,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/browser/{slug}",
         name: "Node browser",
-        description: "Execution node shared browser pane (native webview). cairn:~/browser is the default shared session (slug optional; add /SLUG for additional browsers). replace = go to a URL (sets the page; url required). create = open/ensure the pane (url optional). patch = drive it: navigate (url/navigate) or history/interaction (action: back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad; click/type/scroll take a selector, visible text, or a ?interactive handle). delete = close it. create/replace/patch are an idempotent ensure — they reuse the open pane (reopening it if closed) and never error on an existing slug. Read returns the live url/title/status plus current page content (paged via ?offset/?limit); ?screenshot for a native PNG, ?console/?network for captured runtime buffers, ?interactive for actionable elements as durable handles (e1..eN). Add ?return_content=true to a write to get the post-action page inline. The user sees and can drive the same session, which self-heals across an app restart.",
+        description: "Execution node shared browser pane (native webview). cairn:~/browser is the default shared session (slug optional; add /SLUG for additional browsers). replace = go to a URL (sets the page; url required). create = open/ensure the pane (url optional). patch = drive it: navigate (url/navigate) or history/interaction (action: back|forward|reload|click|type|select|drag|scroll|waitFor|waitForNavigation|waitForLoad|clearData; click/type/select/scroll take a selector, visible text, or a ?interactive handle, and drag adds a toSelector/toText/toHandle destination). delete = close it. create/replace/patch are an idempotent ensure — they reuse the open pane (reopening it if closed) and never error on an existing slug. Read returns the live url/title/status plus current page content (paged via ?offset/?limit); ?screenshot for a native PNG, ?console/?network for captured runtime buffers, ?interactive for actionable elements as durable handles (e1..eN). Add ?return_content=true to a write to get the post-action page inline. The user sees and can drive the same session, which self-heals across an app restart.",
         read_projections: BROWSER_READ_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -320,6 +354,12 @@ pub(crate) const NODE_BROWSER_CONTRACT: ResourceContract =
                     BROWSER_HANDLE,
                     BROWSER_VALUE,
                     BROWSER_SUBMIT,
+                    BROWSER_TO_SELECTOR,
+                    BROWSER_TO_TEXT,
+                    BROWSER_TO_HANDLE,
+                    BROWSER_MODE,
+                    BROWSER_STEPS,
+                    BROWSER_DELAY_MS,
                     BROWSER_TO,
                     BROWSER_BY,
                     BROWSER_TIMEOUT_MS,

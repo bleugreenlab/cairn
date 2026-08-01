@@ -8,6 +8,7 @@
 //!   session startup, MCP handlers, action attribution, git commits.
 //!   Resolution converts `IdentityStore` → `UserIdentity` for downstream code.
 
+pub mod claude_profile;
 pub mod crypto;
 pub mod local;
 
@@ -39,6 +40,8 @@ pub enum ClaudeAuth {
     OAuthToken(String),
     /// API key (personal or org-provided)
     ApiKey(String),
+    /// Cairn-managed Claude CLI profile directory.
+    ConfigDir(std::path::PathBuf),
 }
 
 impl ClaudeAuth {
@@ -46,6 +49,7 @@ impl ClaudeAuth {
     pub fn value(&self) -> &str {
         match self {
             ClaudeAuth::OAuthToken(v) | ClaudeAuth::ApiKey(v) => v,
+            ClaudeAuth::ConfigDir(path) => path.to_str().unwrap_or_default(),
         }
     }
 }
@@ -89,6 +93,9 @@ pub enum ApiProvider {
     /// OpenRouter APIs
     #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter,
+    /// Ollama APIs
+    #[serde(rename = "ollama")]
+    Ollama,
     /// GitHub APIs
     #[serde(rename = "github", alias = "git_hub")]
     GitHub,
@@ -101,6 +108,7 @@ impl ApiProvider {
             ApiProvider::OpenAI => "openai",
             ApiProvider::Google => "google",
             ApiProvider::OpenRouter => "openrouter",
+            ApiProvider::Ollama => "ollama",
             ApiProvider::GitHub => "github",
         }
     }
@@ -112,6 +120,7 @@ impl ApiProvider {
             ApiProvider::OpenAI,
             ApiProvider::Google,
             ApiProvider::OpenRouter,
+            ApiProvider::Ollama,
             ApiProvider::GitHub,
         ]
     }
@@ -124,6 +133,7 @@ impl std::fmt::Display for ApiProvider {
             ApiProvider::OpenAI => write!(f, "OpenAI"),
             ApiProvider::Google => write!(f, "Google"),
             ApiProvider::OpenRouter => write!(f, "OpenRouter"),
+            ApiProvider::Ollama => write!(f, "Ollama"),
             ApiProvider::GitHub => write!(f, "GitHub"),
         }
     }
@@ -151,17 +161,40 @@ pub enum ProviderAuth {
     /// OAuth token — CLI-specific (Claude OAuth, ChatGPT OAuth)
     #[serde(rename = "oauth_token", alias = "o_auth_token")]
     OAuthToken { value: String },
+    /// Provider host URL. This is connection metadata, not a secret.
+    #[serde(rename = "base_url")]
+    BaseUrl { url: String },
     /// Ambient CLI auth — no stored credential, uses locally installed CLI
     #[serde(rename = "local_cli")]
     LocalCli,
+    /// Cairn-managed Claude CLI profile. Its path is derived from the account id.
+    #[serde(rename = "claude_profile")]
+    ClaudeProfile,
 }
 
 impl ProviderAuth {
+    /// Parse and canonicalize provider connection metadata at its input boundary.
+    pub fn base_url(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        let parsed = reqwest::Url::parse(value)
+            .map_err(|error| format!("invalid base URL '{value}': {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "invalid base URL '{value}': expected http or https scheme"
+            ));
+        }
+        Ok(Self::BaseUrl {
+            url: parsed.to_string().trim_end_matches('/').to_string(),
+        })
+    }
+
     /// Get the raw credential value, if any.
     fn credential_value(&self) -> Option<&str> {
         match self {
             ProviderAuth::ApiKey { value } | ProviderAuth::OAuthToken { value } => Some(value),
-            ProviderAuth::LocalCli => None,
+            ProviderAuth::BaseUrl { .. } | ProviderAuth::LocalCli | ProviderAuth::ClaudeProfile => {
+                None
+            }
         }
     }
 
@@ -170,9 +203,22 @@ impl ProviderAuth {
         match self {
             ProviderAuth::ApiKey { .. } => "api_key",
             ProviderAuth::OAuthToken { .. } => "oauth_token",
+            ProviderAuth::BaseUrl { .. } => "base_url",
             ProviderAuth::LocalCli => "local_cli",
+            ProviderAuth::ClaudeProfile => "claude_profile",
         }
     }
+}
+
+/// Persisted availability and subscription usage for one provider account.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAccountHealth {
+    #[serde(default)]
+    pub windows: Vec<crate::models::ProviderUsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_until: Option<i64>,
+    pub captured_at: i64,
 }
 
 /// A named credential for an API provider.
@@ -191,6 +237,12 @@ pub struct ProviderAccount {
     pub(crate) sort_order: i32,
     pub(crate) created_at: i64,
     pub(crate) last_used_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) health: Option<ProviderAccountHealth>,
 }
 
 impl ProviderAccount {
@@ -202,6 +254,7 @@ impl ProviderAccount {
             (ApiProvider::OpenAI, ProviderAuth::ApiKey { .. }) => vec!["codex", "native"],
             (ApiProvider::Google, ProviderAuth::ApiKey { .. }) => vec!["native"],
             (ApiProvider::OpenRouter, ProviderAuth::ApiKey { .. }) => vec!["openrouter"],
+            (ApiProvider::Ollama, ProviderAuth::BaseUrl { .. }) => vec!["ollama"],
             (ApiProvider::GitHub, ProviderAuth::ApiKey { .. }) => vec![],
             // OAuth is CLI-specific
             (ApiProvider::Anthropic, ProviderAuth::OAuthToken { .. }) => vec!["claude"],
@@ -211,6 +264,7 @@ impl ProviderAccount {
             (ApiProvider::GitHub, ProviderAuth::OAuthToken { .. }) => vec![],
             // Local CLI is CLI-specific
             (ApiProvider::Anthropic, ProviderAuth::LocalCli) => vec!["claude"],
+            (ApiProvider::Anthropic, ProviderAuth::ClaudeProfile) => vec!["claude"],
             // Codex/ChatGPT OAuth refresh tokens are single-use. Cairn must own
             // and refresh its Codex credential explicitly instead of falling back
             // to ambient CLI state that can be mutated by other processes.
@@ -259,6 +313,7 @@ impl IdentityStore {
             let provider_auth = match auth {
                 ClaudeAuth::ApiKey(v) => ProviderAuth::ApiKey { value: v.clone() },
                 ClaudeAuth::OAuthToken(v) => ProviderAuth::OAuthToken { value: v.clone() },
+                ClaudeAuth::ConfigDir(_) => ProviderAuth::ClaudeProfile,
             };
             accounts.push(ProviderAccount {
                 id: format!("server_{}", uuid::Uuid::new_v4()),
@@ -270,6 +325,9 @@ impl IdentityStore {
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
+                email: None,
+                plan: None,
+                health: None,
             });
         }
         if let Some(auth) = &identity.codex_auth {
@@ -287,6 +345,9 @@ impl IdentityStore {
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
+                email: None,
+                plan: None,
+                health: None,
             });
         }
         if let Some(token) = &identity.github_token {
@@ -302,6 +363,9 @@ impl IdentityStore {
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
+                email: None,
+                plan: None,
+                health: None,
             });
         }
 
@@ -372,6 +436,93 @@ impl IdentityStore {
             .find(|a| a.compatible_backends().contains(&backend))
     }
 
+    pub(crate) fn claude_account_is_available(&self, account_id: &str, now: i64) -> bool {
+        self.accounts.iter().any(|account| {
+            account.id == account_id
+                && matches!(account.auth, ProviderAuth::ClaudeProfile)
+                && account.health.as_ref().is_some_and(|health| {
+                    !health.blocked_until.is_some_and(|until| until > now)
+                        && !health.windows.is_empty()
+                        && health
+                            .windows
+                            .iter()
+                            .all(|window| window.remaining_percent > 0.0)
+                })
+        })
+    }
+
+    /// Select an available managed Claude account by tightest-window headroom.
+    /// Assignments since each account's snapshot break equal-headroom bursts.
+    pub(crate) fn select_claude_account(
+        &self,
+        project_id: Option<&str>,
+        override_id: Option<&str>,
+        excluded_id: Option<&str>,
+        assignments: &[(String, i64)],
+        now: i64,
+    ) -> Option<&ProviderAccount> {
+        let accounts = self.accounts_for_provider(ApiProvider::Anthropic, project_id);
+        if let Some(id) = override_id {
+            return accounts.into_iter().find(|account| {
+                account.id == id
+                    && excluded_id != Some(account.id.as_str())
+                    && account.compatible_backends().contains(&"claude")
+            });
+        }
+
+        accounts
+            .into_iter()
+            .filter(|account| {
+                excluded_id != Some(account.id.as_str())
+                    && matches!(account.auth, ProviderAuth::ClaudeProfile)
+                    && account.compatible_backends().contains(&"claude")
+            })
+            .filter_map(|account| {
+                let health = account.health.as_ref()?;
+                if health.blocked_until.is_some_and(|until| until > now)
+                    || health.windows.is_empty()
+                {
+                    return None;
+                }
+                let headroom = health
+                    .windows
+                    .iter()
+                    .map(|window| window.remaining_percent)
+                    .fold(f64::INFINITY, f64::min);
+                if !headroom.is_finite() || headroom <= 0.0 {
+                    return None;
+                }
+                let burst = assignments
+                    .iter()
+                    .filter(|(id, created_at)| {
+                        id == &account.id && *created_at >= health.captured_at
+                    })
+                    .count();
+                Some((account, headroom, burst))
+            })
+            .max_by(
+                |(left, left_headroom, left_burst), (right, right_headroom, right_burst)| {
+                    left_headroom
+                        .total_cmp(right_headroom)
+                        .then_with(|| right_burst.cmp(left_burst))
+                        .then_with(|| right.sort_order.cmp(&left.sort_order))
+                },
+            )
+            .map(|(account, _, _)| account)
+    }
+
+    pub(crate) fn resolve_with_anthropic_account(
+        &self,
+        project_id: Option<&str>,
+        account_id: &str,
+    ) -> UserIdentity {
+        let mut overrides = project_id
+            .and_then(|id| self.project_overrides.get(id).cloned())
+            .unwrap_or_default();
+        overrides.anthropic_account_id = Some(account_id.to_string());
+        self.resolve(project_id, Some(&overrides))
+    }
+
     /// Get the default git identity (first by sort order).
     fn default_git_identity(&self) -> Option<&GitIdentity> {
         self.git_identities.iter().min_by_key(|g| g.sort_order)
@@ -402,7 +553,10 @@ impl IdentityStore {
             .and_then(|a| match &a.auth {
                 ProviderAuth::ApiKey { value } => Some(ClaudeAuth::ApiKey(value.clone())),
                 ProviderAuth::OAuthToken { value } => Some(ClaudeAuth::OAuthToken(value.clone())),
-                ProviderAuth::LocalCli => None, // Local CLI doesn't need stored auth
+                ProviderAuth::ClaudeProfile => Some(ClaudeAuth::ConfigDir(
+                    crate::identity::claude_profile::profile_dir(&a.id),
+                )),
+                ProviderAuth::BaseUrl { .. } | ProviderAuth::LocalCli => None, // Not Claude auth
             });
 
         // Resolve Codex auth from best OpenAI account
@@ -411,7 +565,9 @@ impl IdentityStore {
             .and_then(|a| match &a.auth {
                 ProviderAuth::ApiKey { value } => Some(CodexAuth::ApiKey(value.clone())),
                 ProviderAuth::OAuthToken { value } => Some(CodexAuth::OAuthToken(value.clone())),
-                ProviderAuth::LocalCli => None,
+                ProviderAuth::BaseUrl { .. }
+                | ProviderAuth::LocalCli
+                | ProviderAuth::ClaudeProfile => None,
             });
 
         // Resolve GitHub token
@@ -492,15 +648,23 @@ pub struct AccountOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountInfo {
-    pub(crate) id: String,
+    /// Public because callers outside this crate thread the id of a returned
+    /// account back into the orchestrator's account APIs. The remaining fields
+    /// stay crate-private and reach consumers by serialization.
+    pub id: String,
     pub(crate) label: String,
     pub(crate) api_provider: ApiProvider,
     pub(crate) source: AccountSource,
     pub(crate) auth_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
     compatible_backends: Vec<String>,
     project_id: Option<String>,
     sort_order: i32,
     last_used_at: Option<i64>,
+    email: Option<String>,
+    plan: Option<String>,
+    health: Option<ProviderAccountHealth>,
 }
 
 impl From<&ProviderAccount> for AccountInfo {
@@ -511,6 +675,10 @@ impl From<&ProviderAccount> for AccountInfo {
             api_provider: account.api_provider,
             source: account.source.clone(),
             auth_type: account.auth.auth_type_label().to_string(),
+            base_url: match &account.auth {
+                ProviderAuth::BaseUrl { url } => Some(url.clone()),
+                _ => None,
+            },
             compatible_backends: account
                 .compatible_backends()
                 .into_iter()
@@ -519,6 +687,9 @@ impl From<&ProviderAccount> for AccountInfo {
             project_id: account.project_id.clone(),
             sort_order: account.sort_order,
             last_used_at: account.last_used_at,
+            email: account.email.clone(),
+            plan: account.plan.clone(),
+            health: account.health.clone(),
         }
     }
 }
@@ -572,6 +743,9 @@ mod tests {
             sort_order: 0,
             created_at: 0,
             last_used_at: None,
+            email: None,
+            plan: None,
+            health: None,
         }
     }
 
@@ -600,6 +774,88 @@ mod tests {
             }],
             project_overrides: Default::default(),
         }
+    }
+
+    fn healthy_claude_account(id: &str, remaining: f64, captured_at: i64) -> ProviderAccount {
+        let mut account = test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile);
+        account.id = id.to_string();
+        account.health = Some(ProviderAccountHealth {
+            windows: vec![crate::models::ProviderUsageWindow {
+                id: "five-hour".to_string(),
+                label: "5h".to_string(),
+                scope: crate::models::ProviderUsageScope::Session,
+                scope_target: None,
+                used_percent: 100.0 - remaining,
+                remaining_percent: remaining,
+                resets_at: None,
+                reset_at_text: None,
+                window_duration_mins: Some(300),
+            }],
+            blocked_until: None,
+            captured_at,
+        });
+        account
+    }
+
+    #[test]
+    fn claude_selection_prefers_headroom_and_skips_unavailable() {
+        let mut store = test_store();
+        store.accounts = vec![
+            healthy_claude_account("busy", 20.0, 100),
+            healthy_claude_account("free", 80.0, 100),
+            test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile),
+        ];
+        let selected = store
+            .select_claude_account(None, None, None, &[], 200)
+            .unwrap();
+        assert_eq!(selected.id, "free");
+
+        store.accounts[1].health.as_mut().unwrap().blocked_until = Some(300);
+        assert_eq!(
+            store
+                .select_claude_account(None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "busy"
+        );
+    }
+
+    #[test]
+    fn claude_selection_spreads_equal_headroom_bursts() {
+        let mut store = test_store();
+        store.accounts = vec![
+            healthy_claude_account("first", 80.0, 100),
+            healthy_claude_account("second", 80.0, 100),
+        ];
+        let assignments = vec![("first".to_string(), 101)];
+        assert_eq!(
+            store
+                .select_claude_account(None, None, None, &assignments, 200)
+                .unwrap()
+                .id,
+            "second"
+        );
+    }
+
+    #[test]
+    fn explicit_claude_override_wins_even_without_health() {
+        let mut store = test_store();
+        let mut explicit = test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile);
+        explicit.id = "explicit".to_string();
+        store.accounts = vec![explicit, healthy_claude_account("healthy", 90.0, 100)];
+        assert_eq!(
+            store
+                .select_claude_account(None, Some("explicit"), None, &[], 200)
+                .unwrap()
+                .id,
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn compatible_backends_claude_profile() {
+        let account = test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile);
+        assert_eq!(account.compatible_backends(), vec!["claude"]);
     }
 
     #[test]
@@ -1062,6 +1318,10 @@ mod tests {
         assert_eq!(api_key_auth("x").auth_type_label(), "api_key");
         assert_eq!(oauth_auth("x").auth_type_label(), "oauth_token");
         assert_eq!(ProviderAuth::LocalCli.auth_type_label(), "local_cli");
+        assert_eq!(
+            ProviderAuth::ClaudeProfile.auth_type_label(),
+            "claude_profile"
+        );
     }
 
     #[test]
@@ -1082,13 +1342,17 @@ mod tests {
 
     #[test]
     fn api_provider_all_returns_every_provider() {
-        let all = ApiProvider::all();
-        assert_eq!(all.len(), 5);
-        assert_eq!(all[0], ApiProvider::Anthropic);
-        assert_eq!(all[1], ApiProvider::OpenAI);
-        assert_eq!(all[2], ApiProvider::Google);
-        assert_eq!(all[3], ApiProvider::OpenRouter);
-        assert_eq!(all[4], ApiProvider::GitHub);
+        assert_eq!(
+            ApiProvider::all(),
+            &[
+                ApiProvider::Anthropic,
+                ApiProvider::OpenAI,
+                ApiProvider::Google,
+                ApiProvider::OpenRouter,
+                ApiProvider::Ollama,
+                ApiProvider::GitHub,
+            ]
+        );
     }
 
     // === Serde alias tests (critical for disk compatibility) ===
@@ -1165,6 +1429,28 @@ mod tests {
         let json = serde_json::to_string(&local).unwrap();
         let parsed: ProviderAuth = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.credential_value(), None);
+
+        let base_url = ProviderAuth::BaseUrl {
+            url: "http://localhost:11434".to_string(),
+        };
+        let json = serde_json::to_string(&base_url).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"base_url","url":"http://localhost:11434"}"#
+        );
+        let parsed: ProviderAuth = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            ProviderAuth::BaseUrl { url } if url == "http://localhost:11434"
+        ));
+        assert_eq!(base_url.credential_value(), None);
+        assert_eq!(base_url.auth_type_label(), "base_url");
+
+        let profile = ProviderAuth::ClaudeProfile;
+        let json = serde_json::to_string(&profile).unwrap();
+        assert_eq!(json, r#"{"type":"claude_profile"}"#);
+        let parsed: ProviderAuth = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, ProviderAuth::ClaudeProfile));
     }
 
     #[test]

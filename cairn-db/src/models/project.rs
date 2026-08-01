@@ -1,6 +1,6 @@
 //! Project types.
 
-use cairn_common::executor_protocol::PlacementConstraints;
+use cairn_common::executor_protocol::ExecutorSelector;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -21,7 +21,7 @@ pub struct Project {
     /// Background-testing checks as JSON (map of check name → CheckCommand).
     pub checks: Option<String>,
     /// Worktree populate config as JSON (copy/symlink pattern lists).
-    pub worktree_populate: Option<String>,
+    pub materialization_populate: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     /// Whether this project is hidden from the sidebar.
@@ -47,23 +47,13 @@ pub struct ProjectRemoteStatus {
 
 /// Terminal shortcut command configuration.
 ///
-/// A blessed, named command for this project. An optional `write` carveout lets a
-/// fenced agent run this command with the out-of-worktree write scopes it needs
-/// (e.g. a dev launcher writing a per-instance state dir) without parking on a
-/// worktree-fence prompt. Because this lives in repo-committed `.cairn/config.yaml`,
-/// the scopes are bounded: they may never intersect the secret-store read
-/// denylist. The dev-command denylist lives in cairn-core's config layer; see
-/// `docs/worktree-fence.md`.
+/// The repository declares only a name and exact command. Whether the command
+/// may run outside the worktree fence is a separate user-owned setting.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalCommand {
     pub name: String,
     pub command: String,
-    /// Writable (and readable) glob scopes pre-approved for this command when it
-    /// runs under the worktree fence. `**` spans path segments, `*` stays within
-    /// one; `~`/`{home}`/`{cairnHome}`/`{worktrees}`/`{worktree}` expand.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub write: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +85,7 @@ pub struct UpdateProject {
     /// Background-testing checks keyed by name. An empty map clears all checks
     /// from `.cairn/config.yaml`; `None` leaves the existing checks untouched.
     pub checks: Option<HashMap<String, CheckCommand>>,
-    pub worktree_populate: Option<PopulateConfig>,
+    pub materialization_populate: Option<PopulateConfig>,
     pub default_branch: Option<String>,
 }
 
@@ -120,6 +110,17 @@ pub struct CheckCommand {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact: Option<Vec<String>>,
+    /// Dependency-graph node(s) whose transitive closure IS this check's input
+    /// set — `rust:<crate>` or `ts:<package>`, one token or a list whose closures
+    /// union. The engine derives the closure from the sealed tree's own
+    /// manifests, so the input set follows the real graph instead of a
+    /// hand-maintained glob list that silently drifts out of date.
+    ///
+    /// Mutually exclusive with `impact`: they are two different definitions of
+    /// the same check's inputs, and a check declaring both reports a config
+    /// error rather than running under one of them. See docs/checks.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CheckScopeSelector>,
     #[serde(
         default = "default_check_policy",
         skip_serializing_if = "is_default_check_policy"
@@ -143,9 +144,77 @@ pub struct CheckCommand {
     /// 60-minute hard ceiling. See docs/checks.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
-    /// Hard executor placement requirements for this check.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constraints: Option<PlacementConstraints>,
+    /// Which machine this check must run on, by public name or platform. The
+    /// names it accepts are the ones `cairn://executors` publishes.
+    ///
+    /// This key had an earlier life as a scalar naming a build slot, and that
+    /// meaning was retired. A config still carrying the scalar reads as no
+    /// selector and is dropped on the next rewrite, exactly as it was before
+    /// this field existed — the alternative is that one stale line stops the
+    /// whole project's check contract from parsing, which takes down every
+    /// check rather than the one that named it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_executor_selector"
+    )]
+    pub executor: Option<ExecutorSelector>,
+    /// Environment variable names whose values can change this check's verdict.
+    /// Values are hashed into environment identity and are never persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verdict_environment: Vec<String>,
+
+    /// Whether this check REWRITES the tree as its job — a formatter, not a
+    /// verifier. Declared fixers run FIRST inside the write cadence's shared
+    /// slot, so every other check in that wave already validates the fixed tree
+    /// and the fold needs no second wave. Discovering a fixer by noticing slot
+    /// dirt cannot buy that: by the time the dirt exists, the rest of the wave
+    /// has already run against the tree the fix replaced. See docs/checks.md.
+    #[serde(default, skip_serializing_if = "is_not_check_fixer")]
+    pub fixes: bool,
+}
+
+/// Read a check's `executor:` key, tolerating the retired scalar form.
+fn deserialize_executor_selector<'de, D>(
+    deserializer: D,
+) -> Result<Option<ExecutorSelector>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Declared {
+        Selector(ExecutorSelector),
+        /// The retired build-slot scalar. Typed as a string so only the retired
+        /// shape is tolerated here — a malformed selector object still reports
+        /// as one rather than being silently swallowed — and the value itself is
+        /// never read, because the whole point is to drop it on the next
+        /// rewrite.
+        Retired(#[allow(dead_code)] String),
+    }
+    Ok(match Option::<Declared>::deserialize(deserializer)? {
+        Some(Declared::Selector(selector)) => Some(selector),
+        Some(Declared::Retired(_)) | None => None,
+    })
+}
+
+/// A check's `scope:` declaration — one dependency-graph node token, or a list
+/// of them whose closures union into a single input set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CheckScopeSelector {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl CheckScopeSelector {
+    /// The declared tokens, in declaration order.
+    pub fn tokens(&self) -> Vec<String> {
+        match self {
+            CheckScopeSelector::One(token) => vec![token.clone()],
+            CheckScopeSelector::Many(tokens) => tokens.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +258,10 @@ fn default_check_resource_class() -> CheckResourceClass {
 
 fn is_default_check_resource_class(resource_class: &CheckResourceClass) -> bool {
     *resource_class == default_check_resource_class()
+}
+
+fn is_not_check_fixer(fixes: &bool) -> bool {
+    !*fixes
 }
 
 fn default_check_when() -> CheckWhen {

@@ -2,20 +2,27 @@
 //!
 //! A REPL is a persistent interpreter subprocess (an "eval-server") that reads
 //! JSON-lines requests on stdin and writes JSON-lines responses on stdout,
-//! holding a live namespace across `run` calls. The live child handles live in
-//! an in-memory, node-scoped registry on the orchestrator ([`ReplState`],
-//! mirroring `pty_state`) with **no database table**: a REPL is explicitly
-//! non-durable, so a DB row would advertise a live session whose process no
-//! longer exists. The registry is the single source of truth; create, read,
-//! delete, and teardown all consult it.
+//! holding a live namespace across `run` calls.
 //!
-//! Lifetime = job/worktree lifetime: the always-on orchestrator owns the child,
-//! so a REPL survives intra-execution turn suspends (the whole point — state
+//! Two halves are deliberately kept apart. The **namespace** is a live interpreter
+//! heap owned by the child process and tracked in an in-memory, node-scoped
+//! registry on the orchestrator ([`ReplState`], mirroring `pty_state`) — there is
+//! no persisting a heap. The **logical REPL** is a durable `job_repls` row with a
+//! lifecycle, a language, a dependency set, and a transcript (see [`store`]), so a
+//! REPL that dies stays visible with its fate recorded, and creating it again
+//! starts the next generation continuing the same transcript.
+//!
+//! Lifetime = job/worktree lifetime: the always-on orchestrator owns the child, so
+//! a REPL survives intra-execution turn suspends (the whole point — state
 //! persisting across `run` calls that span turns) and is killed at node/worktree
-//! teardown (the hard guarantee against orphans). On host restart the registry
-//! is empty, so a prior slug resolves as *unknown* (recreate it), never "died".
+//! teardown (the hard guarantee against orphans). No interpreter survives a host
+//! restart, so the startup reap ([`store::reap_orphans`]) *marks* every stale
+//! `running` row exited rather than reconciling it the way terminal recovery does:
+//! a recovered REPL process would have an empty namespace and is worth nothing.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+pub mod store;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -25,16 +32,12 @@ use serde::{Deserialize, Serialize};
 use crate::mcp::handlers::RunContext;
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
-    CellOccupant, CellPriority, LifetimeLeaseAcquireRequest, LifetimeLeaseDeclaration,
-    LifetimeLeaseFence, LifetimeLeaseOperation, LifetimeLeaseOwnerKind, LifetimeLeaseResult,
-    LifetimeOwnerDeathPolicy, LifetimeProcessCwdRoot, LifetimeProcessEventKind,
-    LifetimeProcessIoMode, LifetimeProcessSpec, LifetimeProcessStatus, LifetimeProcessStream,
-    LifetimeRuntimeAsset, ProcessSandboxMode, RepositoryLocator, ResourceReservation,
-    ResourceReservationSource,
+    ProcessSandboxMode, ResidencyFence, ResidencyOperation, ResidencyResult,
+    ResidentProcessCwdRoot, ResidentProcessEventKind, ResidentProcessIoMode, ResidentProcessKind,
+    ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream, ResidentRuntimeAsset,
 };
+use store::{ReplExitReason, ReplRowStatus};
 
-/// Max exchanges retained per session (bounded ring; oldest evicted first).
-const HISTORY_CAP: usize = 200;
 /// Max bytes retained for a single exchange's stdout/stderr capture. Output
 /// beyond this is truncated and the exchange is flagged `truncated`.
 const OUTPUT_CAP: usize = 64 * 1024;
@@ -101,6 +104,32 @@ pub(crate) struct ReplResponse {
     /// was auto-wrapped, so its `const`/`let` declarations did not persist.
     #[serde(default)]
     pub note: Option<String>,
+    /// Namespace snapshot taken at the end of this evaluation (python only).
+    ///
+    /// A REPL's namespace can only change as the result of a send, so a snapshot
+    /// taken after every eval is not a stale cache — it *is* the live namespace,
+    /// always. Piggybacking it on the eval response rather than asking the
+    /// interpreter on demand also keeps the read path synchronous and avoids a
+    /// real protocol hazard: the response stream is an unkeyed queue, so a
+    /// timed-out introspection reply would later be consumed as the next send's
+    /// response and desynchronize the session.
+    #[serde(default)]
+    pub vars: Option<Vec<ReplBinding>>,
+}
+
+/// One name bound in a REPL's namespace, as summarized by the eval-server.
+///
+/// The summary is deliberately cheap and side-effect-free: listing what is bound
+/// must never execute user code, so only immutable scalars are `repr`'d and
+/// everything else reports its type name (and a length when sized).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplBinding {
+    pub name: String,
+    /// The value's type name (`DataFrame`, `list`, `module`, ...).
+    pub kind: String,
+    /// A short scalar repr or `len N`, when one is safely available.
+    #[serde(default)]
+    pub info: Option<String>,
 }
 
 impl ReplResponse {
@@ -117,6 +146,23 @@ impl ReplResponse {
 pub enum ReplOrigin {
     Agent,
     User,
+}
+
+impl ReplOrigin {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::User => "user",
+        }
+    }
+
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "agent" => Some(Self::Agent),
+            "user" => Some(Self::User),
+            _ => None,
+        }
+    }
 }
 
 /// Terminal status of a settled exchange, or `Pending` while in flight.
@@ -137,14 +183,41 @@ pub enum ReplExchangeStatus {
     Protocol,
 }
 
-/// One recorded request/response pair in a session's in-memory history ring.
-/// Emitted over `repl-exchange` (phase `started` when appended pending, `settled`
-/// when the outcome lands) and replayed to a newly-opened REPL tab via
-/// `get_repl_history`.
+impl ReplExchangeStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Success => "success",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::Died => "died",
+            Self::Protocol => "protocol",
+        }
+    }
+
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "pending" => Self::Pending,
+            "success" => Self::Success,
+            "error" => Self::Error,
+            "timeout" => Self::Timeout,
+            "died" => Self::Died,
+            "protocol" => Self::Protocol,
+            _ => return None,
+        })
+    }
+}
+
+/// One recorded request/response pair in a REPL's durable transcript: a
+/// `repl_exchanges` row, inserted pending on submit and updated in place when it
+/// settles.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplExchange {
     pub seq: u64,
+    /// Which interpreter incarnation ran this send. `seq` is continuous across
+    /// generations, so this is what marks where the session restarted.
+    pub generation: i64,
     pub origin: ReplOrigin,
     pub code: String,
     /// Epoch milliseconds when the send was submitted.
@@ -161,16 +234,26 @@ pub struct ReplExchange {
     pub truncated: bool,
 }
 
-/// Registry-listing view of a live session, for facet projection and the tab
-/// header. Carries no exchange history (that comes from `get_repl_history`).
+/// Listing view of one REPL, for facet projection and the tab header. Durable
+/// fields come from the `job_repls` row (so an exited REPL still lists, with its
+/// fate); `alive`/`busy` come from the live registry. Carries no exchange history
+/// (that comes from `get_repl_history`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplInfo {
     pub job_id: String,
     pub slug: String,
     pub interpreter: String,
-    /// Epoch milliseconds at spawn.
+    /// Epoch milliseconds when the REPL was first created (not this generation).
     pub created_at: i64,
+    /// Which interpreter incarnation is current; a resume bumps it.
+    pub generation: i64,
+    /// `running` | `exited`.
+    pub status: String,
+    /// Why the process is gone, when it is.
+    pub exit_reason: Option<String>,
+    /// The newest exchange's status, which is what colors the facet icon.
+    pub last_status: Option<ReplExchangeStatus>,
     pub alive: bool,
     /// A send is currently in flight on this session's `send_lock`.
     pub busy: bool,
@@ -213,10 +296,25 @@ pub(crate) enum ReplSendResult {
     Protocol(String),
 }
 
-/// A live eval-server session held behind an `Arc` in [`ReplState`].
+/// A live eval-server session held behind an `Arc` in [`ReplState`]. One session
+/// is one *generation* of the durable REPL identified by `repl_id`.
 pub struct ReplSession {
     pub(crate) interpreter: ReplLang,
-    fence: LifetimeLeaseFence,
+    /// The `job_repls` row this generation serves.
+    pub repl_id: String,
+    /// Project scope stamped onto this session's transcript rows, so they route
+    /// with the rest of the project's data. `None` for a project-less test job.
+    project_id: Option<String>,
+    /// Which incarnation of the REPL this process is. Pairs with the row's own
+    /// `generation`: the two must agree, or an exchange records an identity the
+    /// row denies.
+    pub generation: i64,
+    fence: ResidencyFence,
+    /// The repository and logical branch this session's checkout must follow.
+    /// Carried on the session, resolved once at spawn, so re-aligning before an
+    /// eval costs a branch resolution and not a database read.
+    repo_path: std::path::PathBuf,
+    branch: String,
     process_key: String,
     process_generation: u64,
     responses: Mutex<mpsc::Receiver<String>>,
@@ -226,19 +324,19 @@ pub struct ReplSession {
     /// same slug (items run in parallel by default) cannot interleave on the
     /// single-threaded eval-server. Different slugs stay concurrent.
     send_lock: tokio::sync::Mutex<()>,
-    /// Monotonic exchange sequence, shared across agent and user sends.
+    /// Monotonic exchange sequence, shared across agent and user sends and seeded
+    /// from the durable transcript so it continues across generations. Allocated
+    /// in memory rather than from `MAX(seq)+1` per send because two concurrent
+    /// sends to one slug allocate before either takes `send_lock`.
     seq: AtomicU64,
-    /// Bounded, in-memory transcript of this session's exchanges. Non-durable by
-    /// design (a host restart clears the whole registry), consistent with the
-    /// REPL contract; capped at [`HISTORY_CAP`] with oldest-first eviction.
-    history: Mutex<VecDeque<ReplExchange>>,
 }
 
 impl ReplSession {
+    /// Stop the interpreter without touching the lease. The home it runs in
+    /// belongs to the job, not to this REPL, and outlives it.
     pub async fn stop_and_release(&self, orch: &Orchestrator) {
         self.alive.store(false, Ordering::Release);
-        let _ = crate::fleet::lifetime::stop(orch, &self.fence, &self.process_key).await;
-        let _ = crate::fleet::lifetime::release(orch, &self.fence).await;
+        let _ = crate::fleet::residency::stop(orch, &self.fence, &self.process_key).await;
     }
 
     /// True while the child is still running (non-blocking).
@@ -255,34 +353,6 @@ impl ReplSession {
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
-
-    /// Append a (pending) exchange, evicting the oldest past the cap.
-    fn push_history(&self, exchange: ReplExchange) {
-        if let Ok(mut history) = self.history.lock() {
-            history.push_back(exchange);
-            while history.len() > HISTORY_CAP {
-                history.pop_front();
-            }
-        }
-    }
-
-    /// Replace the pending exchange carrying `seq` with its settled form. A no-op
-    /// if the pending entry was already evicted (only at extreme depth).
-    fn settle_history(&self, seq: u64, settled: ReplExchange) {
-        if let Ok(mut history) = self.history.lock() {
-            if let Some(slot) = history.iter_mut().find(|e| e.seq == seq) {
-                *slot = settled;
-            }
-        }
-    }
-
-    /// Snapshot the current transcript (oldest first) for a newly-opened tab.
-    pub fn history_snapshot(&self) -> Vec<ReplExchange> {
-        self.history
-            .lock()
-            .map(|h| h.iter().cloned().collect())
-            .unwrap_or_default()
-    }
 }
 
 /// In-memory, node-scoped registry of live REPL sessions, keyed by
@@ -291,9 +361,38 @@ impl ReplSession {
 #[derive(Default)]
 pub struct ReplState {
     sessions: Mutex<HashMap<(String, String), Arc<ReplSession>>>,
+    /// Per-slug lifecycle serialization. See [`ReplState::lifecycle_lock`].
+    lifecycle_locks: LifecycleLocks,
 }
 
+/// Per-`(job_id, slug)` lifecycle locks held by [`ReplState`].
+type LifecycleLocks = Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+
 impl ReplState {
+    /// The lock that serializes *lifecycle transitions* for one slug: opening,
+    /// resuming, and closing.
+    ///
+    /// Creating a generation spans a durable write and a registry claim, and both
+    /// must land as one indivisible step. Without this, two concurrent opens each
+    /// see a vacant registry, each bumps the row's generation, and only then does
+    /// one win the slot — leaving the winning session's generation disagreeing
+    /// with the row that names it, and the loser having already mutated the
+    /// durable identity it lost.
+    ///
+    /// Sends deliberately do NOT take this lock: a send can run for minutes, and
+    /// serializing lifecycle behind it would stall a close. A send's own exit
+    /// recording is fenced by generation instead (see [`store::mark_exited`]).
+    pub fn lifecycle_lock(&self, job_id: &str, slug: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let Ok(mut locks) = self.lifecycle_locks.lock() else {
+            // A poisoned map would serialize nothing; hand back a private lock so
+            // the caller still runs rather than deadlocking the surface.
+            return Arc::new(tokio::sync::Mutex::new(()));
+        };
+        locks
+            .entry((job_id.to_string(), slug.to_string()))
+            .or_default()
+            .clone()
+    }
     pub fn get(&self, job_id: &str, slug: &str) -> Option<Arc<ReplSession>> {
         self.sessions
             .lock()
@@ -376,56 +475,37 @@ impl ReplState {
             .filter(|(job_id, _)| set.contains(job_id.as_str()))
             .cloned()
             .collect();
-        keys.into_iter()
+        let drained: Vec<(String, String, Arc<ReplSession>)> = keys
+            .into_iter()
             .filter_map(|(job_id, slug)| {
                 sessions
                     .remove(&(job_id.clone(), slug.clone()))
                     .map(|session| (job_id, slug, session))
             })
-            .collect()
+            .collect();
+        // Teardown is the end of the job, so no further lifecycle transition can
+        // arrive for these slugs; drop their locks rather than retaining one per
+        // slug for the life of the process.
+        if let Ok(mut locks) = self.lifecycle_locks.lock() {
+            locks.retain(|(job_id, _), _| !set.contains(job_id.as_str()));
+        }
+        drained
     }
 
-    /// Live-session listing for one job (facet projection + tab list).
-    pub fn list_for_job(&self, job_id: &str) -> Vec<ReplInfo> {
+    /// Liveness of every registered session, keyed `(job_id, slug)`, for joining
+    /// onto a durable listing in one pass.
+    pub fn liveness(&self) -> HashMap<(String, String), (bool, bool)> {
         let Ok(sessions) = self.sessions.lock() else {
-            return Vec::new();
+            return HashMap::new();
         };
         sessions
             .iter()
-            .filter(|((jid, _), _)| jid == job_id)
-            .map(|((jid, slug), session)| repl_info(jid, slug, session))
-            .collect()
-    }
-
-    /// Live-session listing across every job on this host (global facet source).
-    pub fn list_all(&self) -> Vec<ReplInfo> {
-        let Ok(sessions) = self.sessions.lock() else {
-            return Vec::new();
-        };
-        sessions
-            .iter()
-            .map(|((jid, slug), session)| repl_info(jid, slug, session))
+            .map(|(key, session)| (key.clone(), (session.is_alive(), session.is_busy())))
             .collect()
     }
 }
 
-fn repl_info(job_id: &str, slug: &str, session: &Arc<ReplSession>) -> ReplInfo {
-    let created_at = session
-        .created_at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    ReplInfo {
-        job_id: job_id.to_string(),
-        slug: slug.to_string(),
-        interpreter: session.interpreter.label().to_string(),
-        created_at,
-        alive: session.is_alive(),
-        busy: session.is_busy(),
-    }
-}
-
-/// Start an eval server in an executor lifetime lease.
+/// Start an eval server in an executor residency.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_session(
     orch: &Orchestrator,
@@ -447,7 +527,7 @@ pub async fn spawn_session(
     let branch = branch
         .or(base_branch)
         .ok_or_else(|| "REPL job has no logical branch".to_string())?;
-    let tip = crate::fleet::lifetime::resolve_logical_commit(
+    let tip = crate::fleet::residency::resolve_logical_commit(
         orch,
         std::path::Path::new(&repo_path),
         &branch,
@@ -497,6 +577,9 @@ pub async fn spawn_session(
     let policy = crate::mcp::handlers::run::build_run_sandbox_policy(
         orch,
         cwd,
+        // A REPL runs in the job's execution home, which is the agent's own
+        // writable checkout however little it looks like one on disk.
+        crate::mcp::handlers::run::RunCheckout::AgentOwned,
         run_context.map(|c| c.run_id.as_str()),
         Some(project_id),
         None,
@@ -516,7 +599,7 @@ pub async fn spawn_session(
         config
             .sandbox
             .as_ref()
-            .map(|p| cairn_common::executor_protocol::LifetimeSandboxPolicy {
+            .map(|p| cairn_common::executor_protocol::ResidentSandboxPolicy {
                 worktree: p.worktree.to_string_lossy().into_owned(),
                 writable_extra: p
                     .writable_extra
@@ -536,42 +619,25 @@ pub async fn spawn_session(
         .into_iter()
         .filter(|(k, _)| !matches!(k.as_str(), "CAIRN_WORKTREE" | "TMPDIR" | "TMP" | "TEMP"))
         .collect();
-    let owner =
-        crate::fleet::lifetime::owner(LifetimeLeaseOwnerKind::Repl, format!("{job_id}:{slug}"));
-    let request = LifetimeLeaseAcquireRequest {
-        declaration: LifetimeLeaseDeclaration {
-            lease_id: format!("repl:{job_id}:{slug}"),
-            owner,
-            owner_ref: None,
-            name: slug.into(),
-            purpose: "stateful REPL".into(),
-            repository: RepositoryLocator::ColocatedPath {
-                project_id: project_id.into(),
-                repository_id: project_id.into(),
-                absolute_path: repo_path,
-            },
-            initial_base_commit: tip.clone(),
-            resource_reservation: ResourceReservation {
-                memory_bytes: 268435456,
-                disk_growth_bytes: 536870912,
-                concurrency_units: 1,
-                source: ResourceReservationSource::Declared,
-            },
-            owner_death_policy: LifetimeOwnerDeathPolicy {
-                heartbeat_timeout_ms: 180000,
-                reclaim_grace_ms: 30000,
-            },
-        },
-        priority: CellPriority::AgentInteractive,
-        deadline_unix_ms: now_millis() as u64 + 30000,
-    };
-    let fence = crate::fleet::lifetime::acquire(orch, request).await?;
-    if let Err(e) = crate::fleet::lifetime::refresh(orch, &fence, &tip).await {
-        let _ = crate::fleet::lifetime::release(orch, &fence).await;
-        return Err(e);
-    }
+    // A REPL is another long-lived process in the job's one execution home, so
+    // its interpreter sees the same installed packages, the same `$TMPDIR`, and
+    // the same absolute paths as the job's run batches and terminals.
+    let fleet_config = crate::config::settings::load_fleet(&orch.config_dir);
+    let fence = crate::fleet::residency::acquire_job_residency(
+        orch,
+        &orch.db.local,
+        job_id,
+        &tip,
+        crate::fleet::default_wait_horizon_unix_ms(&fleet_config),
+        crate::fleet::unix_time_ms(),
+    )
+    .await
+    .map_err(|refusal| refusal.diagnostic)?;
+    crate::fleet::residency::refresh(orch, &fence, &tip).await?;
 
-    let key = "eval-server".to_string();
+    // Process keys are unique within the home, so a REPL names itself by slug
+    // rather than claiming the one generic key.
+    let key = format!("repl:{slug}");
     let (tx, rx) = mpsc::sync_channel(2);
     let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
     let early_alive = Arc::new(AtomicBool::new(true));
@@ -579,17 +645,17 @@ pub async fn spawn_session(
     let ek = key.clone();
     let eb = buffer.clone();
     let ea = early_alive.clone();
-    orch.fleet.subscribe_lifetime_process_events(move |event| {
-        if event.lease_id != ef.lease_id
+    orch.fleet.subscribe_resident_process_events(move |event| {
+        if event.holder != ef.holder
             || event.incarnation_id != ef.incarnation_id
-            || event.lease_epoch != ef.lease_epoch
+            || event.cell_epoch != ef.cell_epoch
             || event.process_key != ek
         {
             return;
         }
         match event.event {
-            LifetimeProcessEventKind::Output {
-                stream: LifetimeProcessStream::Stdout,
+            ResidentProcessEventKind::Output {
+                stream: ResidentProcessStream::Stdout,
                 data,
                 ..
             } => {
@@ -611,29 +677,36 @@ pub async fn spawn_session(
                     }
                 }
             }
-            LifetimeProcessEventKind::Output {
-                stream: LifetimeProcessStream::Stderr,
+            ResidentProcessEventKind::Output {
+                stream: ResidentProcessStream::Stderr,
                 data,
                 ..
             } => tracing::debug!(diagnostic=%String::from_utf8_lossy(&data),"REPL stderr"),
-            LifetimeProcessEventKind::State {
-                status: LifetimeProcessStatus::Exited { .. },
+            ResidentProcessEventKind::State {
+                status: ResidentProcessStatus::Exited { .. },
             } => ea.store(false, Ordering::Release),
             _ => {}
         }
     });
     let started = orch
         .fleet
-        .operate_lifetime_lease(
+        .operate_residency(
             orch,
-            LifetimeLeaseOperation::StartProcess {
+            ResidencyOperation::StartProcess {
                 fence: fence.clone(),
                 process_key: key.clone(),
-                process: LifetimeProcessSpec {
+                kind: ResidentProcessKind::Repl {
+                    slug: slug.to_string(),
+                },
+                // A REPL session declares nothing: an idle interpreter and one
+                // grinding through a dataframe are the same live process, and
+                // only measurement can tell them apart.
+                reservation: None,
+                process: ResidentProcessSpec {
                     program,
                     args,
                     cwd: String::new(),
-                    cwd_root: LifetimeProcessCwdRoot::Checkout,
+                    cwd_root: ResidentProcessCwdRoot::Checkout,
                     env,
                     sandbox_mode: if sandbox_policy.is_some() {
                         ProcessSandboxMode::Confined
@@ -641,54 +714,67 @@ pub async fn spawn_session(
                         ProcessSandboxMode::Unconfined
                     },
                     sandbox_policy,
-                    runtime_assets: vec![LifetimeRuntimeAsset {
+                    runtime_assets: vec![ResidentRuntimeAsset {
                         path: asset.into(),
                         data: body.as_bytes().to_vec(),
                     }],
-                    io: LifetimeProcessIoMode::Pipe,
+                    io: ResidentProcessIoMode::Pipe,
                 },
             },
         )
         .await;
-    let LifetimeLeaseResult::State { cell } = started else {
-        let _ = crate::fleet::lifetime::release(orch, &fence).await;
+    let ResidencyResult::State { cell } = started else {
+        let _ = crate::fleet::residency::release(orch, &fence).await;
         return Err(format!("failed to start REPL: {started:?}"));
     };
-    let Some(generation) = cell
-        .occupant
-        .as_ref()
-        .and_then(CellOccupant::lifetime)
-        .and_then(|l| l.processes.get(&key))
-        .map(|p| p.generation)
-    else {
-        crate::fleet::lifetime::rollback(orch, &fence, &key).await;
+    let Some(generation) = cell.occupancy.processes.get(&key).map(|p| p.generation) else {
+        let _ = crate::fleet::residency::stop(orch, &fence, &key).await;
         return Err("REPL start returned no process generation".to_string());
     };
+    // The process is up, so open a generation on the durable row: insert it on a
+    // first create, or bump an exited row back to running on a resume. Doing this
+    // after the spawn means a failed spawn never leaves a row claiming to run.
+    let project_ref = (!project_id.is_empty()).then_some(project_id);
+    let record =
+        match store::begin(&orch.db.local, job_id, project_ref, slug, interpreter, deps).await {
+            Ok(record) => record,
+            Err(error) => {
+                let _ = crate::fleet::residency::stop(orch, &fence, &key).await;
+                return Err(format!("failed to record REPL '{slug}': {error}"));
+            }
+        };
+    let start_seq = store::next_seq(&orch.db.local, &record.id)
+        .await
+        .unwrap_or(0);
     let session = Arc::new(ReplSession {
         interpreter,
+        repl_id: record.id.clone(),
+        project_id: record.project_id.clone(),
+        generation: record.generation,
         fence: fence.clone(),
+        repo_path: std::path::PathBuf::from(&repo_path),
+        branch: branch.clone(),
         process_key: key,
         process_generation: generation,
         responses: Mutex::new(rx),
         alive: AtomicBool::new(early_alive.load(Ordering::Acquire)),
         created_at: SystemTime::now(),
         send_lock: tokio::sync::Mutex::new(()),
-        seq: AtomicU64::new(0),
-        history: Mutex::new(VecDeque::new()),
+        seq: AtomicU64::new(start_seq),
     });
     let weak = Arc::downgrade(&session);
     let xf = fence.clone();
     let xk = session.process_key.clone();
-    orch.fleet.subscribe_lifetime_process_events(move |e| {
-        if e.lease_id == xf.lease_id
+    orch.fleet.subscribe_resident_process_events(move |e| {
+        if e.holder == xf.holder
             && e.incarnation_id == xf.incarnation_id
-            && e.lease_epoch == xf.lease_epoch
+            && e.cell_epoch == xf.cell_epoch
             && e.process_key == xk
             && e.process_generation == generation
             && matches!(
                 e.event,
-                LifetimeProcessEventKind::State {
-                    status: LifetimeProcessStatus::Exited { .. }
+                ResidentProcessEventKind::State {
+                    status: ResidentProcessStatus::Exited { .. }
                 }
             )
         {
@@ -709,7 +795,7 @@ pub async fn spawn_session(
             if !s.is_alive() {
                 break;
             }
-            if crate::fleet::lifetime::renew(&ro, &rf).await.is_err() {
+            if crate::fleet::residency::renew(&ro, &rf).await.is_err() {
                 s.alive.store(false, Ordering::Release);
                 break;
             }
@@ -732,9 +818,9 @@ pub(crate) async fn send(
     data.push(b'\n');
     let result = orch
         .fleet
-        .operate_lifetime_lease(
+        .operate_residency(
             orch,
-            LifetimeLeaseOperation::WriteProcessInput {
+            ResidencyOperation::WriteProcessInput {
                 fence: session.fence.clone(),
                 process_key: session.process_key.clone(),
                 process_generation: session.process_generation,
@@ -742,7 +828,7 @@ pub(crate) async fn send(
             },
         )
         .await;
-    if !matches!(result, LifetimeLeaseResult::State { .. }) {
+    if !matches!(result, ResidencyResult::State { .. }) {
         return ReplSendResult::Dead;
     }
     let s = session.clone();
@@ -765,63 +851,41 @@ pub(crate) async fn send(
     }
 }
 
-/// Emit a `repl-exchange` event (phase `started` on submit, `settled` on
-/// outcome) through the orchestrator's generic emitter, which reaches the
-/// desktop over Tauri and cairn-server over its WS bridge with no per-event
-/// wiring.
-fn emit_exchange(
-    orch: &Orchestrator,
-    job_id: &str,
-    slug: &str,
-    phase: &str,
-    exchange: &ReplExchange,
-) {
+/// Announce a transcript change. A REPL exchange is two discrete state changes
+/// (submitted, settled), not a byte stream, so the standard `db-change` emit —
+/// the one path every other entity in the app already invalidates through — is
+/// exactly right, and it works app-wide instead of dying with the REPL pane.
+pub(crate) fn emit_exchange_change(orch: &Orchestrator) {
     let _ = orch.services.emitter.emit(
-        "repl-exchange",
-        serde_json::json!({
-            "jobId": job_id,
-            "slug": slug,
-            "seq": exchange.seq,
-            "phase": phase,
-            "origin": exchange.origin,
-            "code": exchange.code,
-            "status": exchange.status,
-            "value": exchange.value,
-            "stdout": exchange.stdout,
-            "stderr": exchange.stderr,
-            "error": exchange.error,
-            "note": exchange.note,
-            "durationMs": exchange.duration_ms,
-            "truncated": exchange.truncated,
-        }),
+        "db-change",
+        serde_json::json!({"table": "repl_exchanges", "action": "update"}),
     );
 }
 
-/// Emit a `repl-state` lifecycle event (`created` | `exited` | `deleted`).
-pub(crate) fn emit_repl_state(
-    orch: &Orchestrator,
-    job_id: &str,
-    slug: &str,
-    interpreter: ReplLang,
-    status: &str,
-) {
+/// Announce a REPL lifecycle change (created, resumed, exited, removed).
+pub(crate) fn emit_repl_change(orch: &Orchestrator, action: &str) {
     let _ = orch.services.emitter.emit(
-        "repl-state",
-        serde_json::json!({
-            "jobId": job_id,
-            "slug": slug,
-            "interpreter": interpreter.label(),
-            "status": status,
-        }),
+        "db-change",
+        serde_json::json!({"table": "job_repls", "action": action}),
     );
 }
 
-/// The one canonical send funnel: record a pending exchange, run the send,
-/// perform any Dead/Timeout kill-and-unregister, settle the history entry, and
-/// emit the `started`/`settled` `repl-exchange` events (plus a `repl-state`
-/// `exited` on a session-ending outcome). Both the agent path (`run` item) and
-/// the user path (REPL tab composer) route through here so every exchange is
-/// recorded and broadcast identically.
+/// The one hint an agent sees when a slug has no REPL at all. Names `deps`,
+/// because the capability existed from the start yet every surface's example
+/// omitted it — which is why users fell back to shelling out to `pip install`.
+pub(crate) fn create_hint(slug: &str) -> String {
+    format!(
+        "Create it: write cairn:~/repl/{slug} {{interpreter:\"python\", deps:[\"pandas\"]}} \
+         (interpreter python | typescript; deps preloads python packages via uv)"
+    )
+}
+
+/// The one canonical send funnel: record a pending exchange row, run the send,
+/// perform any Dead/Timeout kill-and-unregister, settle that same row in place,
+/// and announce both writes as `db-change` (plus a `job_repls` change on a
+/// session-ending outcome). Both the agent path (`run` item) and the user path
+/// (REPL tab composer) route through here so every exchange is recorded and
+/// broadcast identically.
 ///
 /// Fails closed (`Err`) on a precondition that predates any exchange — an
 /// unknown slug or a language mismatch — so the caller can surface the hint
@@ -839,7 +903,8 @@ pub async fn send_recorded(
 ) -> Result<ReplExchange, String> {
     let session = orch.repl_state.get(job_id, slug).ok_or_else(|| {
         format!(
-            "No REPL named '{slug}' for this node. Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"|\"typescript\"}}"
+            "No REPL named '{slug}' is running for this node. {}",
+            create_hint(slug)
         )
     })?;
     if let Some(lang) = expected_lang {
@@ -852,9 +917,31 @@ pub async fn send_recorded(
         }
     }
 
+    // Every eval is a newly delivered unit of execution, so it runs against the
+    // logical head rather than against whatever the interpreter's checkout held
+    // when it spawned. A REPL is another long-lived process in the job's one
+    // execution home, and aligning only at spawn left it compiling and importing
+    // pre-write source for the rest of its life.
+    //
+    // Fails closed here, before any exchange row exists, for the same reason the
+    // slug and language checks do: a precondition that predates the exchange
+    // belongs in the caller's error, not in a phantom transcript card.
+    let tip =
+        crate::fleet::residency::resolve_logical_commit(orch, &session.repo_path, &session.branch)
+            .await?;
+    crate::fleet::residency::refresh(orch, &session.fence, &tip)
+        .await
+        .map_err(|error| {
+            format!(
+                "REPL '{slug}' was not sent code because its checkout could not be aligned to the \
+                 logical head {tip}: {error}"
+            )
+        })?;
+
     let seq = session.next_seq();
     let mut exchange = ReplExchange {
         seq,
+        generation: session.generation,
         origin,
         code: code.to_string(),
         started_at: now_millis(),
@@ -867,14 +954,25 @@ pub async fn send_recorded(
         note: None,
         truncated: false,
     };
-    session.push_history(exchange.clone());
-    emit_exchange(orch, job_id, slug, "started", &exchange);
+    if let Err(error) = store::insert_pending(
+        &orch.db.local,
+        &session.repl_id,
+        session.project_id.as_deref(),
+        &exchange,
+    )
+    .await
+    {
+        tracing::warn!(%error, slug, "failed to record pending REPL exchange");
+    }
+    emit_exchange_change(orch);
 
     let started = Instant::now();
     let result = send(orch, &session, code, timeout).await;
     exchange.duration_ms = Some(started.elapsed().as_millis() as u64);
 
     let mut session_ended = false;
+    let mut exit_reason = None;
+    let mut bindings = None;
     match result {
         ReplSendResult::Response(response) => {
             exchange.status = if response.succeeded() {
@@ -896,6 +994,7 @@ pub async fn send_recorded(
                 .map(|n| n.trim().to_string())
                 .and_then(some_non_empty);
             exchange.truncated = cut_out || cut_err;
+            bindings = response.vars;
         }
         ReplSendResult::Dead => {
             // Unregister only if this is still the live session: a close+recreate
@@ -903,8 +1002,12 @@ pub async fn send_recorded(
             // which this obsolete outcome must not evict.
             session_ended = orch.repl_state.remove_if(job_id, slug, &session);
             session.stop_and_release(orch).await;
+            exit_reason = Some(ReplExitReason::Died);
             exchange.status = ReplExchangeStatus::Died;
-            exchange.error = Some(format!("REPL '{slug}' died — state lost; recreate it."));
+            exchange.error = Some(format!(
+                "REPL '{slug}' died — its namespace is gone. The transcript is kept; \
+                 create the slug again to resume it with an empty namespace."
+            ));
         }
         ReplSendResult::Timeout => {
             // Kill the timed-out child we hold, but unregister only when it is
@@ -912,49 +1015,152 @@ pub async fn send_recorded(
             // during the send is never removed or killed by this stale outcome.
             session_ended = orch.repl_state.remove_if(job_id, slug, &session);
             session.stop_and_release(orch).await;
+            exit_reason = Some(ReplExitReason::Timeout);
             exchange.status = ReplExchangeStatus::Timeout;
             exchange.error = Some(format!(
-                "REPL '{slug}' send timed out after {}ms; the REPL was killed and its state lost. Recreate it and break long-running work into smaller sends.",
+                "REPL '{slug}' send timed out after {}ms; the interpreter was killed and its \
+                 namespace lost. The transcript is kept — create the slug again to resume it, \
+                 and break long-running work into smaller sends.",
                 timeout.as_millis()
             ));
         }
         ReplSendResult::Protocol(message) => {
             session_ended = orch.repl_state.remove_if(job_id, slug, &session);
             session.stop_and_release(orch).await;
+            exit_reason = Some(ReplExitReason::Protocol);
             exchange.status = ReplExchangeStatus::Protocol;
-            exchange.error = Some(format!("{message}; REPL state lost, recreate it."));
+            exchange.error = Some(format!(
+                "{message}; the namespace is lost. The transcript is kept — create the slug \
+                 again to resume it."
+            ));
         }
     }
 
-    session.settle_history(seq, exchange.clone());
-    emit_exchange(orch, job_id, slug, "settled", &exchange);
+    if let Err(error) = store::settle(&orch.db.local, &session.repl_id, &exchange).await {
+        tracing::warn!(%error, slug, "failed to settle REPL exchange");
+    }
+    // The namespace can only have changed as a result of this send, so the
+    // snapshot that rode back on the response IS the live namespace.
+    if let Some(vars) = bindings.as_deref() {
+        // Generation-fenced: this snapshot describes THIS generation's namespace,
+        // and a resume during the settle would otherwise inherit it and report
+        // bindings its empty interpreter does not have.
+        if let Err(error) =
+            store::set_bindings(&orch.db.local, &session.repl_id, session.generation, vars).await
+        {
+            tracing::warn!(%error, slug, "failed to record REPL bindings");
+        }
+    }
+    emit_exchange_change(orch);
+    // Only when this session is still the registered one: a close+recreate during
+    // the send installs a new generation on the same row, which this obsolete
+    // outcome must not declare dead.
     if session_ended {
-        emit_repl_state(orch, job_id, slug, session.interpreter, "exited");
+        if let Some(reason) = exit_reason {
+            // Generation-fenced: `session_ended` proves this session owned the
+            // registry slot at removal time, but `stop_and_release` above yields,
+            // and a resume can install the next generation in that window. The
+            // guard makes this update match zero rows in that case rather than
+            // declaring the live replacement dead.
+            if let Err(error) =
+                store::mark_exited(&orch.db.local, &session.repl_id, session.generation, reason)
+                    .await
+            {
+                tracing::warn!(%error, slug, "failed to mark REPL exited");
+            }
+        }
+        emit_repl_change(orch, "update");
     }
     Ok(exchange)
 }
 
-/// Render a REPL read: a one-line status banner from the live registry.
-pub(crate) fn render_status(slug: &str, session: Option<&Arc<ReplSession>>) -> String {
-    match session {
-        None => format!(
-            "[repl {slug}: not found] No REPL named '{slug}' for this node. \
-             Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"|\"typescript\"}}"
-        ),
-        Some(session) => {
-            let alive = session.is_alive();
-            let uptime = session
-                .created_at
-                .elapsed()
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let state = if alive { "running" } else { "exited" };
-            format!(
-                "[repl {slug}: {}, {state}, up {uptime}s]",
-                session.interpreter.label()
-            )
+/// Render a REPL read: a status banner plus the live namespace.
+///
+/// The banner is driven by the durable row, so an exited REPL reads as *exited*
+/// with its fate and its transcript intact rather than as `not found` — death is
+/// the most significant event in a REPL's life and must be legible. The registry
+/// contributes only liveness and uptime for the current generation. Stays
+/// synchronous and infallible: everything it renders was already loaded.
+pub fn render_status(
+    slug: &str,
+    record: Option<&store::ReplRecord>,
+    session: Option<&Arc<ReplSession>>,
+) -> String {
+    let Some(record) = record else {
+        return format!(
+            "[repl {slug}: not found] No REPL named '{slug}' for this node. {}",
+            create_hint(slug)
+        );
+    };
+    let live = session.filter(|s| s.is_alive());
+    let running = live.is_some() && record.status == ReplRowStatus::Running;
+
+    let mut banner = format!("[repl {slug}: {}", record.interpreter.label());
+    if running {
+        let uptime = live
+            .and_then(|s| s.created_at.elapsed().ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        banner.push_str(&format!(", running, up {uptime}s"));
+    } else {
+        let reason = record.exit_reason.unwrap_or(ReplExitReason::Closed);
+        banner.push_str(&format!(", exited ({})", reason.as_str()));
+    }
+    banner.push_str(&format!(", gen {}", record.generation));
+    banner.push_str(&format!(
+        ", {} exchange{}",
+        record.exchange_count,
+        if record.exchange_count == 1 { "" } else { "s" }
+    ));
+    if record.bindings.is_empty() {
+        banner.push_str(", no bindings");
+    } else {
+        banner.push_str(&format!(", {} bindings", record.bindings.len()));
+    }
+    banner.push(']');
+
+    let mut out = banner;
+    if !record.bindings.is_empty() {
+        let name_width = record
+            .bindings
+            .iter()
+            .map(|b| b.name.len())
+            .max()
+            .unwrap_or(0);
+        let kind_width = record
+            .bindings
+            .iter()
+            .map(|b| b.kind.len())
+            .max()
+            .unwrap_or(0);
+        for binding in &record.bindings {
+            out.push('\n');
+            match binding.info.as_deref() {
+                Some(info) => out.push_str(&format!(
+                    "{:name_width$}  {:kind_width$}  {info}",
+                    binding.name, binding.kind
+                )),
+                None => out.push_str(&format!("{:name_width$}  {}", binding.name, binding.kind)),
+            }
         }
     }
+    if record.interpreter == ReplLang::Typescript {
+        out.push_str(
+            "\n(binding introspection is python-only: a TS REPL's top-level declarations live \
+             in the global lexical environment, which has no enumeration API)",
+        );
+    }
+    if !running {
+        let reason = record.exit_reason.unwrap_or(ReplExitReason::Closed);
+        out.push_str(&format!(
+            "\nThis REPL is not running ({}). Its transcript is kept. Resume it with \
+             write cairn:~/repl/{slug} {{mode:\"create\"}} — the interpreter and deps are \
+             inherited and the transcript continues, but THE NAMESPACE STARTS EMPTY. \
+             Discard it instead with mode:\"delete\".",
+            reason.describe()
+        ));
+    }
+    out
 }
 
 /// Resolve the top-level node job id for a `NodeRepl` URI's coordinates,
@@ -1061,6 +1267,87 @@ mod lang_tests {
     fn label_round_trips_the_canonical_name() {
         assert_eq!(ReplLang::Python.label(), "python");
         assert_eq!(ReplLang::Typescript.label(), "typescript");
+    }
+}
+
+#[cfg(test)]
+mod render_status_tests {
+    use super::store::{ReplExitReason, ReplRecord, ReplRowStatus};
+    use super::*;
+
+    fn record(interpreter: ReplLang, status: ReplRowStatus) -> ReplRecord {
+        ReplRecord {
+            id: "repl-1".into(),
+            job_id: "job-1".into(),
+            project_id: None,
+            slug: "lex".into(),
+            interpreter,
+            deps: Vec::new(),
+            generation: 2,
+            status,
+            exit_reason: (status == ReplRowStatus::Exited).then_some(ReplExitReason::HostRestart),
+            bindings: Vec::new(),
+            created_at: 0,
+            exited_at: None,
+            exchange_count: 3,
+        }
+    }
+
+    #[test]
+    fn an_unknown_slug_names_deps_in_its_create_hint() {
+        // `deps` has existed since the first REPL commit, but every surface's
+        // example omitted it, so users fell back to `pip install` inside the
+        // session. The hint an agent actually reads must show it.
+        let out = render_status("lex", None, None);
+        assert!(out.contains("not found"), "got: {out}");
+        assert!(out.contains("deps:[\"pandas\"]"), "got: {out}");
+    }
+
+    #[test]
+    fn an_exited_repl_renders_its_fate_and_how_to_resume() {
+        let out = render_status(
+            "lex",
+            Some(&record(ReplLang::Python, ReplRowStatus::Exited)),
+            None,
+        );
+        assert!(!out.contains("not found"), "got: {out}");
+        assert!(out.contains("exited (host_restart)"), "got: {out}");
+        assert!(out.contains("gen 2"), "got: {out}");
+        assert!(out.contains("3 exchanges"), "got: {out}");
+        // Resuming is only honest if it says the namespace does not come back.
+        assert!(out.contains("NAMESPACE STARTS EMPTY"), "got: {out}");
+    }
+
+    #[test]
+    fn bindings_render_as_a_table_under_the_banner() {
+        let mut rec = record(ReplLang::Python, ReplRowStatus::Exited);
+        rec.bindings = vec![
+            ReplBinding {
+                name: "df".into(),
+                kind: "DataFrame".into(),
+                info: Some("len 1000".into()),
+            },
+            ReplBinding {
+                name: "pd".into(),
+                kind: "module".into(),
+                info: None,
+            },
+        ];
+        let out = render_status("lex", Some(&rec), None);
+        assert!(out.contains("2 bindings"), "got: {out}");
+        assert!(out.contains("df  DataFrame  len 1000"), "got: {out}");
+        assert!(out.contains("pd  module"), "got: {out}");
+    }
+
+    #[test]
+    fn a_typescript_read_explains_why_bindings_are_python_only() {
+        let out = render_status(
+            "ts",
+            Some(&record(ReplLang::Typescript, ReplRowStatus::Exited)),
+            None,
+        );
+        assert!(out.contains("python-only"), "got: {out}");
+        assert!(out.contains("global lexical environment"), "got: {out}");
     }
 }
 
@@ -1252,8 +1539,79 @@ mod eval_server_tests {
         assert_eq!(server.eval("7 * 6").value.as_deref(), Some("42"));
     }
 
+    // Every eval response carries a snapshot of the namespace, because a
+    // namespace can only change as the result of a send.
+    #[test]
+    fn python_reports_its_namespace_on_every_response() {
+        let Some(mut server) = EvalServer::start() else {
+            return;
+        };
+        let bound = server.eval("x = 5\nrows = [1, 2, 3]");
+        let vars = bound.vars.unwrap_or_default();
+        let x = vars
+            .iter()
+            .find(|b| b.name == "x")
+            .unwrap_or_else(|| panic!("expected x: {vars:?}"));
+        assert_eq!(x.kind, "int");
+        assert_eq!(x.info.as_deref(), Some("5"));
+        let rows = vars.iter().find(|b| b.name == "rows").expect("rows listed");
+        assert_eq!(rows.kind, "list");
+        assert_eq!(rows.info.as_deref(), Some("len 3"));
+        // Interpreter machinery is not a user binding.
+        assert!(!vars.iter().any(|b| b.name.starts_with("__")), "{vars:?}");
+
+        // A block that raised part-way through still mutated the namespace, so
+        // the error path must snapshot too.
+        let failed = server.eval("partial = 1\nraise ValueError('boom')");
+        assert!(!failed.succeeded());
+        assert!(
+            failed
+                .vars
+                .unwrap_or_default()
+                .iter()
+                .any(|b| b.name == "partial"),
+            "an error response must still report the namespace"
+        );
+    }
+
+    // Listing what is bound must never execute user code, so a value whose
+    // `__repr__` and `__len__` both raise still lists cleanly and cannot fail the
+    // send it rode back on.
+    #[test]
+    fn hostile_bindings_cannot_break_a_send() {
+        let Some(mut server) = EvalServer::start() else {
+            return;
+        };
+        let r = server.eval(
+            "class Hostile:\n    def __repr__(self): raise RuntimeError('nope')\n    def __len__(self): raise RuntimeError('nope')\nh = Hostile()",
+        );
+        assert!(r.succeeded(), "got: {r:?}");
+        let vars = r.vars.unwrap_or_default();
+        let h = vars
+            .iter()
+            .find(|b| b.name == "h")
+            .unwrap_or_else(|| panic!("expected h: {vars:?}"));
+        assert_eq!(h.kind, "Hostile");
+        assert_eq!(h.info, None, "a raising __repr__/__len__ yields no info");
+        // Framing and the session survive.
+        assert_eq!(server.eval("1 + 1").value.as_deref(), Some("2"));
+    }
+
     // --- typescript / bun eval-server (parity + deltas). Each skips when `bun`
     // is absent, mirroring the python3 guard. ---
+
+    // Binding introspection is python-only: the TS eval-server sets no `vars`,
+    // because the global lexical environment holding `const`/`let`/`class`/
+    // `function` has no enumeration API and a partial list would mislead.
+    #[test]
+    fn ts_sends_carry_no_bindings() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        let r = server.eval("const a = 1; a");
+        assert!(r.succeeded(), "got: {r:?}");
+        assert!(r.vars.is_none(), "got: {:?}", r.vars);
+    }
 
     #[test]
     fn ts_state_and_defs_persist_across_requests() {

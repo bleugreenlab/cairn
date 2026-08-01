@@ -1,29 +1,29 @@
 //! VCS mutation seam for the commit-barrier and write-commit paths.
 //!
-//! Every worktree-mutating VCS operation on these paths flows through
-//! [`WorktreeVcs`]. An agent worktree is a `.jj` workspace over a shared store,
-//! so [`JjBackend`] is the production backend there. A non-worktree cwd — the
-//! project's live checkout behind a long-lived triage / read-only agent or other
-//! non-worktree run — resolves to the read-only [`NonWorktreeVcs`]
-//! sentinel instead: changes can only happen in worktrees, so the barrier is a
-//! clean no-op there and never touches (or reverts) the user's checkout.
+//! Physical-checkout VCS helpers retained for user live checkouts and executor
+//! projections. Agent identity and logical file mutations never resolve through
+//! process cwd: the runner-owned branch store and logical-head transaction are
+//! authoritative. The trait remains as a deterministic test seam for physical
+//! checkout barriers used outside agent residence.
 //!
-//! The trait survives the single-backend collapse for one reason: it is the seam
-//! that lets the commit barrier (`run_commit_barrier`) — the "a wrong edit breaks
-//! every agent" code — be unit-tested deterministically without a VCS binary, via
-//! the in-memory `FakeVcs` test double. That keeps always-on coverage of the
-//! barrier's commit/restore/no-op control flow even where `jj` is absent.
-//!
-//! Change-detection lives behind the seam too, not just the mutations: under jj
-//! the in-progress change lives in `@`, so dirty/changed detection is jj-aware.
-//! See `docs/jj-migration.md`.
+//! This trait deliberately carries NO publication operation. An agent process
+//! lives in scratch and owns no jj workspace, so a publication routed through a
+//! worktree resolves to the read-only [`NonWorktreeVcs`] and silently publishes
+//! nothing — which is exactly how commit after commit reported success while the
+//! branch stayed where it was. Publication addresses the shared store instead;
+//! see [`crate::jj::publish_branch_to_origin`].
 
 use std::path::Path;
 use std::time::Duration;
 
 use super::git::{CommitResult, GitAuthor};
 
-pub(crate) const STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a file-target write waits for the project store lock. It is the
+/// shared constant rather than a mirror of one: the wait here and the socket
+/// ceiling `cairn-cmd` sizes above it are the same fact, and a mirror is a place
+/// for them to drift.
+pub(crate) const STORE_LOCK_TIMEOUT: Duration =
+    Duration::from_millis(cairn_common::write_contract::WRITE_STORE_LOCK_WAIT_MS);
 
 pub(crate) async fn acquire_store_lock(
     orch: &crate::orchestrator::Orchestrator,
@@ -43,37 +43,6 @@ pub(crate) async fn acquire_store_lock(
         })
 }
 
-/// Confirm that a runner-owned logical bookmark advanced without materializing
-/// or rebasing any retained workspace. Coordinate-keyed read overlays observe
-/// the new SHA directly, so this seam is intentionally validation-only.
-pub(crate) fn acknowledge_logical_bookmark_advance(
-    orch: &crate::orchestrator::Orchestrator,
-    observation: Option<&ManagedBookmarkObservation>,
-) -> Result<bool, String> {
-    let Some(observation) = observation else {
-        return Ok(false);
-    };
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &observation.repo_path);
-    let after_tip =
-        crate::jj::bookmark_commit(&jj, &store, &observation.branch).ok_or_else(|| {
-            format!(
-                "managed bookmark `{}` disappeared after publication",
-                observation.branch
-            )
-        })?;
-    Ok(Some(after_tip) != observation.before_tip)
-}
-
-/// Publish the current bookmark when the project has an `origin`. Publication
-/// failures propagate, while a project with no remote has nothing to publish.
-pub(crate) fn publish_required_origin(
-    vcs: &dyn WorktreeVcs,
-    worktree: &Path,
-) -> Result<(), String> {
-    vcs.propagate_seal(worktree)
-}
-
 /// Opaque pre-batch working-copy snapshot, captured before a batch runs so the
 /// barrier can attribute new dirt to the call that caused it. Carries the jj `@`
 /// change id.
@@ -85,18 +54,6 @@ impl VcsSnapshot {
     pub fn raw(&self) -> &str {
         &self.0
     }
-}
-
-fn same_workspace_assignment_ignoring_branch_and_base(
-    marker: &crate::jj::WorkspaceIdentity,
-    expected: &crate::jj::WorkspaceIdentity,
-) -> bool {
-    marker.lineage_root_job_id == expected.lineage_root_job_id
-        && marker.owner_job_id == expected.owner_job_id
-        && marker.project_id == expected.project_id
-        && marker.project_root == expected.project_root
-        && marker.worktree_path == expected.worktree_path
-        && marker.workspace_name == expected.workspace_name
 }
 
 /// All worktree-mutating VCS operations on the commit-barrier and write paths.
@@ -122,16 +79,6 @@ pub trait WorktreeVcs: Send + Sync {
         msg: &str,
         author: Option<&GitAuthor>,
     ) -> Result<CommitResult, String>;
-    /// Propagate an already-sealed bookmark to origin. This is intentionally a
-    /// separate operation so callers run network I/O after releasing the store lock.
-    fn propagate_seal(&self, _worktree: &Path) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn workspace_needs_reconcile(&self, worktree: &Path) -> Result<bool, String> {
-        let _ = worktree;
-        Ok(false)
-    }
     /// Discard working-copy changes, returning the worktree to its committed state.
     fn discard(&self, worktree: &Path) -> Result<(), String>;
     /// Clear a STALE working copy by advancing `@` onto the rewritten/advanced
@@ -139,15 +86,6 @@ pub trait WorktreeVcs: Send + Sync {
     /// `discard` leans on it internally; the write-path recovery calls it
     /// explicitly to re-base the worktree before re-applying a batch.
     fn update_stale(&self, worktree: &Path) -> Result<(), String>;
-    /// Pre-flight reconcile of a workspace before a batch runs, so an agent's
-    /// tool call never starts against a stale or behind-its-branch-tip working
-    /// copy. Called at batch start under the per-store lock. No-op by default
-    /// (the non-worktree checkout has no shared store to reconcile). See the
-    /// [`JjBackend`] implementation for the two moves it makes.
-    fn reconcile_workspace(&self, worktree: &Path) -> Result<(), String> {
-        let _ = worktree;
-        Ok(())
-    }
     /// Capture the working copy's current edits as a unified patch, for the
     /// write-path stale-recovery to persist to scratch before a give-up discard
     /// (so "recoverable" is true from the agent's seat, not just the jj operation
@@ -157,12 +95,23 @@ pub trait WorktreeVcs: Send + Sync {
         let _ = worktree;
         None
     }
-    /// Whether this backend can revert the working copy to its committed state.
+    /// Whether Cairn may revert this checkout to its committed state.
     ///
-    /// True for a real worktree (`discard` rolls `@` back). False for the
-    /// project's live checkout, where reverting would destroy the user's own
-    /// uncommitted work — so the no-`commit_msg` barrier must WARN about stray
-    /// dirt rather than (no-op) "revert" it. See [`NonWorktreeVcs`].
+    /// The question is OWNERSHIP, not capability: `discard` is a destructive
+    /// publication — jj's `restore` resets `@` to its parent and takes every
+    /// uncommitted change with it, not merely the ones a batch just wrote — so it
+    /// is only ever Cairn's to perform in a checkout Cairn provisioned. In
+    /// somebody else's checkout the barrier must WARN about stray dirt and leave
+    /// it in place.
+    ///
+    /// The answer takes NO arguments on purpose. The barrier consults it only
+    /// after the batch has run, and the evidence of ownership lives in a file
+    /// inside the very checkout the batch can write, so an implementation that
+    /// re-derived the answer at that point would let a batch decide whether Cairn
+    /// may destroy the surrounding uncommitted work. Every implementation must
+    /// therefore fix its answer BEFORE the batch executes — [`JjBackend`] captures
+    /// it when the backend is constructed — and this signature is what makes that
+    /// the only expressible shape.
     fn can_revert(&self) -> bool {
         true
     }
@@ -171,58 +120,35 @@ pub trait WorktreeVcs: Send + Sync {
 /// jj backend — seals/discards the workspace `@` over the shared store via
 /// `crate::jj`. One addressable commit per tool call; discard is reversible
 /// through the operation log; no blocking mid-transition state.
-pub(crate) const WORKSPACE_LINEAGE_MISMATCH_PREFIX: &str = "workspace lineage mismatch:";
-
-pub(crate) fn is_workspace_lineage_mismatch(error: &str) -> bool {
-    error.starts_with(WORKSPACE_LINEAGE_MISMATCH_PREFIX)
-}
-
 pub struct JjBackend {
     jj: crate::jj::JjEnv,
-    identity: Option<crate::jj::WorkspaceIdentity>,
+    /// The branch Cairn owned in this checkout AT CONSTRUCTION — which is before
+    /// the batch runs, since the backend is resolved during request preflight.
+    ///
+    /// Captured rather than read on demand because the marker lives in the
+    /// checkout the batch can write. Re-reading it at cleanup time would hand a
+    /// batch the power to turn Cairn's destructive rollback ON by planting
+    /// `.jj/cairn-branch` (deliberately, or just by copying workspace metadata
+    /// around), and to turn a legitimate rollback OFF by deleting it. Neither
+    /// direction is the batch's to decide, so the decision predates it.
+    owned_branch: Option<String>,
 }
 
 impl JjBackend {
-    pub(crate) fn new(jj: crate::jj::JjEnv) -> Self {
-        Self { jj, identity: None }
-    }
-
-    pub(crate) fn managed(jj: crate::jj::JjEnv, identity: crate::jj::WorkspaceIdentity) -> Self {
+    /// Resolve the backend for `worktree`, fixing the ownership answer now.
+    pub(crate) fn new(jj: crate::jj::JjEnv, worktree: &Path) -> Self {
         Self {
+            owned_branch: crate::jj::read_branch_marker(worktree),
             jj,
-            identity: Some(identity),
         }
-    }
-
-    fn validate_identity(&self, worktree: &Path) -> Result<(), String> {
-        let Some(expected) = self.identity.as_ref() else {
-            return Ok(());
-        };
-        let actual = crate::jj::read_workspace_identity(worktree).ok_or_else(|| {
-            format!(
-                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} identity marker missing at {}; recovery: cairn:~/workspace-recovery",
-                worktree.display()
-            )
-        })?;
-        let branch_marker = crate::jj::read_branch_marker(worktree);
-        let project_marker = crate::jj::read_project_root_marker(worktree);
-        if actual != *expected
-            || branch_marker.as_deref() != Some(expected.branch.as_str())
-            || project_marker.as_deref() != Some(expected.project_root.as_path())
-            || worktree != expected.worktree_path
-        {
-            return Err(format!(
-                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} callback/database/marker coordinates disagree for job lineage {} at {}; recovery: cairn:~/workspace-recovery",
-                expected.lineage_root_job_id,
-                worktree.display()
-            ));
-        }
-        Ok(())
     }
 
     /// Push the workspace's bookmark to origin after a seal so each `commit_msg`
-    /// seal lands on origin. The branch comes from the workspace's marker;
-    /// best-effort, so a local or remoteless jj project never fails a seal.
+    /// seal lands on origin. Gated on the ownership captured at construction, so a
+    /// jj checkout Cairn did not provision is never healed or published into — and
+    /// a marker the batch itself wrote cannot nominate a branch for Cairn to heal.
+    /// Best-effort beyond that gate, so a local or remoteless jj project never
+    /// fails a seal.
     ///
     /// Before the push, opportunistically HEAL a clean-tip / conflicted-
     /// intermediate branch (see [`Self::heal_conflicted_intermediates`]) so a
@@ -230,7 +156,7 @@ impl JjBackend {
     /// branch instead of a silently-failing push whose origin head goes stale until
     /// the next base advance.
     fn heal_after_seal(&self, worktree: &Path) {
-        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
+        let Some(branch) = self.owned_branch.clone() else {
             return;
         };
         self.heal_conflicted_intermediates(worktree, &branch);
@@ -280,17 +206,6 @@ impl JjBackend {
         match crate::jj::flatten_branch_recovery(&self.jj, worktree, branch, &base_commit, &message)
         {
             Ok(recovered) => {
-                if let Err(e) = crate::jj::advance_workspace_onto(
-                    &self.jj,
-                    worktree,
-                    worktree,
-                    branch,
-                    &recovered.flattened_commit,
-                ) {
-                    log::warn!(
-                        "reseal heal: re-parent workspace {branch} onto flattened tip failed: {e}"
-                    );
-                }
                 log::info!(
                     "reseal heal: flattened {branch} ({} conflicted intermediate(s) collapsed, {} rider(s) re-pointed)",
                     recovered.collapsed_conflicted_commits,
@@ -327,8 +242,19 @@ impl WorktreeVcs for JjBackend {
         msg: &str,
         author: Option<&GitAuthor>,
     ) -> Result<CommitResult, String> {
-        self.validate_identity(worktree)?;
-        let result = crate::jj::seal(&self.jj, worktree, msg, author)?;
+        // The branch comes from the preflight capture, never from a fresh marker
+        // read: a batch that deleted the marker would otherwise get a locally
+        // committed, unpublished seal reported to it as a successful commit on its
+        // branch, and one that planted a marker would opt an unowned checkout into
+        // Cairn publication.
+        let result = crate::jj::seal_paths(
+            &self.jj,
+            worktree,
+            msg,
+            author,
+            &[],
+            self.owned_branch.as_deref(),
+        )?;
         self.heal_after_seal(worktree);
         Ok(result)
     }
@@ -340,32 +266,22 @@ impl WorktreeVcs for JjBackend {
         msg: &str,
         author: Option<&GitAuthor>,
     ) -> Result<CommitResult, String> {
-        self.validate_identity(worktree)?;
         // Path-scope the seal to exactly these paths so unrelated un-sealed dirt
         // in `@` (a prior failed or full-sandbox run's side effects) is NOT
         // folded into this write's commit: a file-scoped write seals only these
         // paths, never the whole working copy. The barrier and full-sandbox path
         // deliberately leave such dirt in `@`, so a later file-scoped write must
         // not claim it.
-        let result = crate::jj::seal_paths(&self.jj, worktree, msg, author, files)?;
+        let result = crate::jj::seal_paths(
+            &self.jj,
+            worktree,
+            msg,
+            author,
+            files,
+            self.owned_branch.as_deref(),
+        )?;
         self.heal_after_seal(worktree);
         Ok(result)
-    }
-
-    fn propagate_seal(&self, worktree: &Path) -> Result<(), String> {
-        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
-            return Ok(());
-        };
-        match crate::jj::push_to_origin(&self.jj, worktree, &branch) {
-            Ok(()) => Ok(()),
-            Err(error) => match crate::jj::discover_origin_presence(&self.jj, worktree) {
-                crate::jj::OriginPresence::Absent => {
-                    log::info!("jj publish: no `origin` remote; nothing to publish for {branch}");
-                    Ok(())
-                }
-                _ => Err(error),
-            },
-        }
     }
 
     fn discard(&self, worktree: &Path) -> Result<(), String> {
@@ -376,29 +292,25 @@ impl WorktreeVcs for JjBackend {
         crate::jj::update_stale(&self.jj, worktree)
     }
 
-    fn reconcile_workspace(&self, worktree: &Path) -> Result<(), String> {
-        self.validate_identity(worktree)?;
-        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
-            return Ok(());
-        };
-        crate::jj::reconcile_managed_workspace(&self.jj, worktree, worktree, &branch, None)?;
-        Ok(())
-    }
-
-    fn workspace_needs_reconcile(&self, worktree: &Path) -> Result<bool, String> {
-        self.validate_identity(worktree)?;
-        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
-            return Ok(false);
-        };
-        crate::jj::managed_workspace_needs_reconcile(&self.jj, worktree, worktree, &branch)
-    }
-
     fn capture_patch(&self, worktree: &Path) -> Option<String> {
         // Best-effort: a diff failure (e.g. jj refusing on a stale copy) yields
         // `None`, so the give-up error simply omits the recovery path.
         crate::jj::working_copy_diff(&self.jj, worktree)
             .ok()
             .filter(|patch| !patch.trim().is_empty())
+    }
+
+    fn can_revert(&self) -> bool {
+        // A `.jj` directory is not a claim of ownership. A user who colocated
+        // their own jj repo, and then ran an ambient agent whose cwd is it,
+        // reaches this backend — and `discard` there would `jj restore` away every
+        // uncommitted change they had, which is the very hazard [`NonWorktreeVcs`]
+        // was introduced to close for plain git. The branch marker is the
+        // predicate that separates the two: Cairn wrote it when it provisioned the
+        // workspace, so its presence means Cairn owns a branch here and the
+        // rollback is Cairn's to perform. Read at construction, never here — see
+        // [`Self::owned_branch`].
+        self.owned_branch.is_some()
     }
 }
 
@@ -419,6 +331,12 @@ const NON_WORKTREE_SEAL_ERROR: &str =
 /// single-backend resolver returned a `JjBackend` here whose `discard` would
 /// `jj restore` in the plain checkout and DESTROY the user's uncommitted work.
 /// Detection is read-only; the warning never reverts. See `docs/worktree-fence.md`.
+///
+/// This type closes that hazard only for a cwd with no `.jj`. The same hazard in
+/// a jj repo the USER colocated is closed one layer up, by
+/// [`JjBackend`] capturing the branch marker when it is constructed — selecting a
+/// backend on `.jj` presence cannot tell a checkout Cairn provisioned from one it
+/// merely found.
 pub struct NonWorktreeVcs;
 
 /// Read-only `git status --porcelain` line set for a checkout, best-effort.
@@ -511,576 +429,29 @@ pub(crate) fn resolve_worktree_vcs(
 ) -> Box<dyn WorktreeVcs> {
     if crate::jj::is_jj_dir(worktree) {
         let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        Box::new(JjBackend::new(jj))
+        Box::new(JjBackend::new(jj, worktree))
     } else {
         Box::new(NonWorktreeVcs)
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ManagedBookmarkObservation {
-    project_id: String,
-    repo_path: std::path::PathBuf,
-    branch: String,
-    source_job_id: String,
-    before_tip: Option<String>,
-}
-
-pub(crate) fn observe_managed_bookmark(
-    orch: &crate::orchestrator::Orchestrator,
-    context: Option<&crate::execution::jobs::workspace_identity::ManagedWorkspaceContext>,
-) -> Option<ManagedBookmarkObservation> {
-    let context = context?;
-    let identity = &context.identity;
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &identity.project_root);
-    Some(ManagedBookmarkObservation {
-        project_id: identity.project_id.clone(),
-        repo_path: identity.project_root.clone(),
-        branch: identity.branch.clone(),
-        source_job_id: context.current_job_id.clone(),
-        before_tip: crate::jj::bookmark_commit(&jj, &store, &identity.branch),
-    })
-}
-
-pub(crate) async fn propagate_observed_bookmark_advance(
-    orch: &crate::orchestrator::Orchestrator,
-    observation: Option<&ManagedBookmarkObservation>,
-) -> Result<Option<crate::orchestrator::base_advance::BranchAdvanceOutcome>, String> {
-    let Some(observation) = observation else {
-        return Ok(None);
-    };
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &observation.repo_path);
-    let after_tip = crate::jj::bookmark_commit(&jj, &store, &observation.branch);
-    if after_tip == observation.before_tip {
-        return Ok(None);
-    }
-    let new_tip = after_tip.ok_or_else(|| {
-        format!(
-            "managed bookmark `{}` disappeared after publication; downstream workspaces were not reconciled",
-            observation.branch
-        )
-    })?;
-    crate::orchestrator::base_advance::reconcile_managed_branch_advance(
-        orch,
-        &observation.project_id,
-        &observation.repo_path.to_string_lossy(),
-        &observation.branch,
-        &new_tip,
-        Some(&observation.source_job_id),
-    )
-    .await
-    .map(Some)
-}
-
-pub(crate) fn resolve_managed_worktree_vcs(
-    orch: &crate::orchestrator::Orchestrator,
-    worktree: &Path,
-    context: Option<&crate::execution::jobs::workspace_identity::ManagedWorkspaceContext>,
-) -> Box<dyn WorktreeVcs> {
-    if crate::jj::is_jj_dir(worktree) {
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        match context {
-            Some(context) => Box::new(JjBackend::managed(jj, context.identity.clone())),
-            None => Box::new(JjBackend::new(jj)),
-        }
-    } else {
-        Box::new(NonWorktreeVcs)
-    }
-}
-
-fn lineage_mismatch_diagnostic(
-    jj: &crate::jj::JjEnv,
-    context: &crate::execution::jobs::workspace_identity::ManagedWorkspaceContext,
-    prior_owner: Option<&str>,
-    reason: &str,
-) -> String {
-    let identity = &context.identity;
-    let current = crate::jj::working_copy_commit(jj, &identity.worktree_path)
-        .unwrap_or_else(|e| format!("unavailable ({e})"));
-    let head = crate::jj::head_commit(jj, &identity.worktree_path)
-        .unwrap_or_else(|e| format!("unavailable ({e})"));
-    let bookmark = crate::jj::bookmark_commit(jj, &identity.worktree_path, &identity.branch)
-        .unwrap_or_else(|| "absent".to_string());
-    let dirty = crate::jj::is_working_copy_dirty(jj, &identity.worktree_path)
-        .map(|v| v.to_string())
-        .unwrap_or_else(|e| format!("unavailable ({e})"));
-    let conflicted = crate::jj::branch_has_conflict(jj, &identity.worktree_path, &identity.branch)
-        .map(|v| v.to_string())
-        .unwrap_or_else(|e| format!("unavailable ({e})"));
-    format!(
-        "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} {reason}; job={}; lineage={}; project={}; path={}; workspace={}; recorded_base={}; current_at={current}; current_head={head}; branch_marker={}; bookmark_tip={bookmark}; prior_owner={}; dirty={dirty}; conflicted={conflicted}; recovery: `workspace-recovery rebind` only repairs proven workspace identity/bookmark lineage or a uniquely rewritten base ID; it does not rebase a child onto an advanced parent. For an ordinary stale parent, run plain `jj rebase` for the child stack onto the current parent bookmark, run `jj workspace update-stale` if requested, then patch/rewrite the `create-pr` artifact to publish the rebased bookmark.",
-        context.current_job_id,
-        identity.lineage_root_job_id,
-        identity.project_id,
-        identity.worktree_path.display(),
-        identity.workspace_name,
-        identity.base_commit,
-        crate::jj::read_branch_marker(&identity.worktree_path).unwrap_or_else(|| "absent".into()),
-        prior_owner.unwrap_or("legacy/unmarked"),
-    )
-}
-
-fn head_commit_healing_stale(jj: &crate::jj::JjEnv, cwd: &Path) -> Result<String, String> {
-    match crate::jj::head_commit(jj, cwd) {
-        Ok(head) => Ok(head),
-        Err(error) if crate::jj::is_stale_error(&error) => {
-            crate::jj::update_stale(jj, cwd).map_err(|heal_error| {
-                format!("working copy was stale and update-stale failed: {heal_error}")
-            })?;
-            crate::jj::head_commit(jj, cwd).map_err(|probe_error| {
-                format!("cannot resolve @- after staleness heal: {probe_error}")
-            })
-        }
-        Err(error) => Err(format!("cannot resolve @-: {error}")),
-    }
-}
-
-fn deterministic_rebind_branch(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    branch: &str,
-    lineage: &str,
-) -> String {
-    let short: String = lineage
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(8)
-        .collect();
-    for attempt in 0..=100 {
-        let suffix = if attempt == 0 {
-            format!("-j{short}")
-        } else {
-            format!("-j{short}-{attempt}")
-        };
-        let candidate = format!("{branch}{suffix}");
-        if crate::jj::bookmark_commit(jj, store, &candidate).is_none() {
-            return candidate;
-        }
-    }
-    format!("{branch}-j{short}-overflow")
-}
-
-/// Resolve, prove, and when necessary non-destructively rebind a managed
-/// workspace before a write/run executes. The caller holds the per-store lock.
-pub(crate) async fn prepare_managed_workspace(
-    orch: &crate::orchestrator::Orchestrator,
-    request: &cairn_common::protocol::CallbackRequest,
-) -> Result<Option<crate::execution::jobs::workspace_identity::ManagedWorkspaceContext>, String> {
-    let cwd = Path::new(&request.cwd);
-    if !crate::jj::is_jj_dir(cwd) {
-        return Ok(None);
-    }
-    let (run, db) =
-        match crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await {
-            Ok(resolved) => resolved,
-            Err(_) if cfg!(any(test, feature = "test-utils")) && request.run_id.is_none() => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-    let mut context = crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
-        db.clone(),
-        run.job_id.clone(),
-    )
-    .await?
-    .ok_or_else(|| {
-        format!(
-            "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} active run {} has no managed workspace assignment; recovery=cairn:~/workspace-recovery action=rebind",
-            run.run_id
-        )
-    })?;
-    let mut identity = context.identity.clone();
-    if cwd != identity.worktree_path {
-        return Err(lineage_mismatch_diagnostic(
-            &crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir),
-            &context,
-            None,
-            "callback cwd does not equal the database assignment",
-        ));
-    }
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &identity.project_root);
-    let mut marker = crate::jj::read_workspace_identity(cwd);
-    if let Some(marker) = marker.as_ref() {
-        if !same_workspace_assignment_ignoring_branch_and_base(marker, &identity) {
-            return Err(lineage_mismatch_diagnostic(
-                &jj,
-                &context,
-                Some(&marker.lineage_root_job_id),
-                "physical identity marker belongs to another assignment",
-            ));
-        }
-    }
-    // Complete an interrupted reconciler-owned base transition before ordinary
-    // ancestry proof. The marker is the write-ahead record: either the database
-    // is still at old_base (finish the CAS) or already at new_base (finalize only).
-    if let Some(actual) = marker.as_mut() {
-        if let Some(pending) = actual.pending_base_transition.clone() {
-            if actual.base_commit != pending.old_base && actual.base_commit != pending.new_base {
-                return Err(lineage_mismatch_diagnostic(
-                    &jj,
-                    &context,
-                    Some(&actual.lineage_root_job_id),
-                    "pending base transition disagrees with the physical marker base",
-                ));
-            }
-            if identity.base_commit != pending.old_base && identity.base_commit != pending.new_base
-            {
-                return Err(lineage_mismatch_diagnostic(
-                    &jj,
-                    &context,
-                    Some(&actual.lineage_root_job_id),
-                    "database base is neither endpoint of the pending base transition",
-                ));
-            }
-            crate::execution::jobs::workspace_identity::apply_base_transition(
-                db.as_ref(),
-                cwd,
-                actual,
-                &pending.old_base,
-                &pending.new_base,
-            )
-            .await
-            .map_err(|error| {
-                lineage_mismatch_diagnostic(
-                    &jj,
-                    &context,
-                    Some(&actual.lineage_root_job_id),
-                    &format!(
-                        "could not resume pending base transition {} -> {}: {error}",
-                        pending.old_base, pending.new_base
-                    ),
-                )
-            })?;
-            identity.base_commit = pending.new_base.clone();
-            context.identity.base_commit = pending.new_base;
-        }
-    }
-
-    let project_marker = crate::jj::read_project_root_marker(cwd);
-    if project_marker.as_deref() != Some(identity.project_root.as_path()) {
-        return Err(lineage_mismatch_diagnostic(
-            &jj,
-            &context,
-            marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
-            "project-root marker disagrees with the database assignment",
-        ));
-    }
-    let head = head_commit_healing_stale(&jj, cwd)
-        .map_err(|reason| lineage_mismatch_diagnostic(&jj, &context, None, &reason))?;
-
-    if let Some(actual) = marker.as_mut() {
-        let lineage = crate::jj::classify_durable_base_lineage(
-            &jj,
-            &store,
-            &actual.base_commit,
-            &identity.base_commit,
-            &head,
-        );
-        if !lineage.repairable() {
-            return Err(lineage_mismatch_diagnostic(
-                &jj,
-                &context,
-                Some(&actual.lineage_root_job_id),
-                &format!(
-                    "durable base mismatch: marker={} (resolved={}, ancestor_or_equal_to_target={}); database={} (resolved={}, ancestor_or_equal_to_target={}); target={head}; relationship={}; inspect the named commits, confirm the workspace assignment, then run cairn:~/workspace-recovery action=rebind; do not force-push or use a destructive reset",
-                    actual.base_commit,
-                    lineage.marker_resolved().unwrap_or("false"),
-                    lineage.marker_on_target,
-                    identity.base_commit,
-                    lineage.database_resolved().unwrap_or("false"),
-                    lineage.database_on_target,
-                    lineage.relationship.label(),
-                ),
-            ));
-        }
-        let chosen = lineage
-            .newer_base
-            .clone()
-            .expect("repairable durable lineage has a normalization point");
-        if actual.base_commit != chosen || identity.base_commit != chosen {
-            log::warn!(
-                "self-healing preflight durable base mismatch: workspace={}, owner_job={}, marker_base={}, database_base={}, resolved_marker={}, resolved_database={}, chosen_base={}, target={}, relationship={}",
-                cwd.display(),
-                identity.owner_job_id,
-                actual.base_commit,
-                identity.base_commit,
-                lineage.marker_resolved().unwrap_or("unresolved"),
-                lineage.database_resolved().unwrap_or("unresolved"),
-                chosen,
-                head,
-                lineage.relationship.label(),
-            );
-            if actual.base_commit != chosen {
-                actual.pending_base_transition = Some(crate::jj::WorkspaceBaseTransition {
-                    old_base: actual.base_commit.clone(),
-                    new_base: chosen.clone(),
-                });
-                crate::jj::write_workspace_identity(cwd, actual)?;
-                actual.base_commit = chosen.clone();
-                actual.pending_base_transition = None;
-                crate::jj::write_workspace_identity(cwd, actual)?;
-            }
-            if identity.base_commit != chosen {
-                let old_base = identity.base_commit.clone();
-                crate::execution::jobs::workspace_identity::apply_base_transition(
-                    db.as_ref(),
-                    cwd,
-                    actual,
-                    &old_base,
-                    &chosen,
-                )
-                .await?;
-            }
-            identity.base_commit = chosen.clone();
-            context.identity.base_commit = chosen;
-        }
-    } else if !crate::jj::revision_descends_from(&jj, &store, &head, &identity.base_commit) {
-        let repaired_base =
-            crate::jj::forward_resolve_ancestor(&jj, &store, &identity.base_commit, &head)
-                .filter(|commit| commit != &identity.base_commit);
-        let Some(repaired_base) = repaired_base else {
-            return Err(lineage_mismatch_diagnostic(
-                &jj,
-                &context,
-                None,
-                "recorded base is not an ancestor of the physical workspace @- and could not be proven as a rewritten predecessor",
-            ));
-        };
-        let old_base = identity.base_commit.clone();
-        crate::execution::jobs::workspace_identity::compare_and_swap_owner_base(
-            db.as_ref(),
-            identity.owner_job_id.clone(),
-            identity.worktree_path.to_string_lossy().to_string(),
-            old_base.clone(),
-            repaired_base.clone(),
-            chrono::Utc::now().timestamp() as i32,
-        )
-        .await
-        .map_err(|error| {
-            lineage_mismatch_diagnostic(
-                &jj,
-                &context,
-                None,
-                &format!(
-                    "recorded base {old_base} rewrote to {repaired_base}, but persisting the repaired lineage coordinate failed: {error}"
-                ),
-            )
-        })?;
-        identity.base_commit = repaired_base.clone();
-        context.identity.base_commit = repaired_base;
-    }
-
-    let branch_marker = crate::jj::read_branch_marker(cwd);
-    if let Some(actual) = marker.as_ref() {
-        if let Some(pending) = actual.pending_rebind.as_ref() {
-            let pending_tip = crate::jj::bookmark_commit(&jj, &store, &pending.new_branch);
-            let marker_position = branch_marker.as_deref();
-            let valid_common = actual.branch == pending.old_branch
-                && pending.sealed_head == head
-                && pending_tip.as_deref() == Some(head.as_str());
-            let database_at_old = identity.branch == pending.old_branch
-                && marker_position == Some(pending.old_branch.as_str());
-            let database_at_new = identity.branch == pending.new_branch
-                && (marker_position == Some(pending.old_branch.as_str())
-                    || marker_position == Some(pending.new_branch.as_str()));
-            if !valid_common || (!database_at_old && !database_at_new) {
-                return Err(lineage_mismatch_diagnostic(
-                    &jj,
-                    &context,
-                    Some(&actual.lineage_root_job_id),
-                    "pending workspace rebind does not agree with the database, bookmark, markers, and sealed head",
-                ));
-            }
-            if database_at_old {
-                crate::execution::jobs::workspace_identity::compare_and_swap_owner_branch(
-                    db.clone(),
-                    identity.owner_job_id.clone(),
-                    identity.worktree_path.to_string_lossy().to_string(),
-                    pending.old_branch.clone(),
-                    pending.new_branch.clone(),
-                    chrono::Utc::now().timestamp() as i32,
-                )
-                .await?;
-                context.identity.branch = pending.new_branch.clone();
-                identity = context.identity.clone();
-            }
-            crate::jj::write_branch_marker(cwd, &pending.new_branch).map_err(|error| {
-                format!(
-                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} pending database rebind is proven but completing the branch marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
-                )
-            })?;
-            identity.pending_rebind = None;
-            crate::jj::write_workspace_identity(cwd, &identity).map_err(|error| {
-                format!(
-                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} pending database rebind is proven but completing the identity marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
-                )
-            })?;
-            context.identity = identity.clone();
-            marker = Some(identity.clone());
-        } else if actual.branch != identity.branch {
-            return Err(lineage_mismatch_diagnostic(
-                &jj,
-                &context,
-                Some(&actual.lineage_root_job_id),
-                "identity marker branch differs from the database assignment without a persisted pending rebind",
-            ));
-        }
-    }
-    if crate::jj::read_branch_marker(cwd).as_deref() != Some(identity.branch.as_str()) {
-        return Err(lineage_mismatch_diagnostic(
-            &jj,
-            &context,
-            marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
-            "branch marker disagrees with the database assignment",
-        ));
-    }
-
-    let ownership = crate::execution::jobs::workspace_identity::branch_ownership_evidence(
-        db.clone(),
-        identity.project_id.clone(),
-        identity.branch.clone(),
-        identity.lineage_root_job_id.clone(),
-    )
-    .await?;
-    let bookmark_tip = crate::jj::bookmark_commit(&jj, &store, &identity.branch);
-    let owner_conflict = ownership.conflicting_owner.is_some();
-    let unmarked_collision = marker.is_none()
-        && bookmark_tip.as_deref().is_some_and(|tip| tip != head)
-        && !ownership.prior_same_lineage;
-
-    if owner_conflict || unmarked_collision {
-        if marker.is_none() {
-            // Install the old, fully-proven assignment before the database CAS.
-            // If the process stops after the CAS, the next recovery can identify
-            // and complete that exact partial transition without guessing the
-            // persisted JJ workspace registration name.
-            crate::jj::write_workspace_identity(cwd, &identity)?;
-        }
-        let new_branch = deterministic_rebind_branch(
-            &jj,
-            &store,
-            &identity.branch,
-            &identity.lineage_root_job_id,
-        );
-        crate::jj::create_bookmark_at(&jj, &store, &new_branch, &head)?;
-        let mut pending_identity = identity.clone();
-        pending_identity.pending_rebind = Some(crate::jj::WorkspaceRebindTransition {
-            old_branch: identity.branch.clone(),
-            new_branch: new_branch.clone(),
-            sealed_head: head.clone(),
-        });
-        crate::jj::write_workspace_identity(cwd, &pending_identity)?;
-        crate::execution::jobs::workspace_identity::compare_and_swap_owner_branch(
-            db,
-            identity.owner_job_id.clone(),
-            identity.worktree_path.to_string_lossy().to_string(),
-            identity.branch.clone(),
-            new_branch.clone(),
-            chrono::Utc::now().timestamp() as i32,
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} created preserved recovery bookmark {new_branch} at {head}, but database compare-and-swap failed: {e}; old bookmark and working copy were left unchanged; recovery=cairn:~/workspace-recovery action=rebind"
-            )
-        })?;
-        context.identity.branch = new_branch.clone();
-        context.identity.pending_rebind = None;
-        crate::jj::write_branch_marker(cwd, &new_branch).map_err(|error| {
-            format!(
-                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} database rebind to {new_branch} succeeded but writing the branch marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
-            )
-        })?;
-        crate::jj::write_workspace_identity(cwd, &context.identity).map_err(|error| {
-            format!(
-                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} database rebind to {new_branch} succeeded but writing the identity marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
-            )
-        })?;
-    } else if marker.is_none() {
-        crate::jj::write_workspace_identity(cwd, &context.identity)?;
-    }
-
-    Ok(Some(context))
-}
-
-pub(crate) async fn workspace_recovery_status(
-    orch: &crate::orchestrator::Orchestrator,
-    request: &cairn_common::protocol::CallbackRequest,
-) -> String {
-    let Ok((run, db)) =
-        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await
-    else {
-        return format!(
-            "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} no active callback run could be resolved; all state was preserved"
-        );
-    };
-    let Ok(Some(context)) =
-        crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
-            db, run.job_id,
-        )
-        .await
-    else {
-        return format!(
-            "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} the active job has no provable managed workspace assignment; all state was preserved"
-        );
-    };
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let marker_owner = crate::jj::read_workspace_identity(&context.identity.worktree_path)
-        .map(|marker| marker.lineage_root_job_id);
-    let diagnostic = lineage_mismatch_diagnostic(
-        &jj,
-        &context,
-        marker_owner.as_deref(),
-        "recovery inspection",
-    );
-    format!(
-        "# Managed workspace recovery\n\n{diagnostic}\n\n## Identity-lineage repair\nwrite {{target:\"cairn:~/workspace-recovery\", mode:\"patch\", payload:{{action:\"rebind\"}}}}\n\n`rebind` only repairs a proven workspace identity/bookmark collision or a uniquely forward-resolvable rewritten base ID. It never resets, moves, or deletes the conflicting bookmark and never changes working-copy files.\n\n## Advanced-parent recovery\nThis resource does not rebase a child onto a parent branch that advanced. For that case, run plain `jj rebase` for the child stack onto the current parent bookmark, run `jj workspace update-stale` if jj requests it, then patch/rewrite the `create-pr` artifact so publication uses the rebased bookmark."
-    )
-}
-
-/// Resolve the per-store serialization lock for an agent cwd, keyed identically
-/// to base-advance reconcile and merge-fold
-/// (`project_store_dir(config_dir, repo_path)`), so the agent seal/discard path
-/// serializes on the SAME lock instance those store mutators hold. An agent seal
-/// running `jj` ops on a shared store concurrently with a reconcile/fold can fork
-/// the operation log and mint divergent conflicted copies; holding this lock
-/// across the seal closes that window.
-///
-/// Returns `None` for a non-worktree cwd (the project's live checkout behind a
-/// no-worktree agent never mutates a shared store, so there is nothing to
-/// serialize) or when the project store cannot be resolved. The `None` fallback
-/// is best-effort by design: the seal still proceeds without the guard, matching
-/// today's behavior — every real agent worktree resolves a run + repo_path, so
-/// the fallback only fires where there is no shared store to protect.
+/// Resolve the runner-owned store lock from authenticated run identity. Process
+/// cwd is deliberately irrelevant: it is only a scratch residence.
 pub(crate) async fn resolve_store_lock(
     orch: &crate::orchestrator::Orchestrator,
     request: &cairn_common::protocol::CallbackRequest,
 ) -> Option<std::path::PathBuf> {
-    let cwd = Path::new(&request.cwd);
-    if !crate::jj::is_jj_dir(cwd) {
-        return None; // NonWorktreeVcs — never touches a shared store.
-    }
-    let (run, db) = crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
+    crate::mcp::handlers::branch::resolve_current_for_read(orch, request)
         .await
-        .ok()?;
-    let repo_path = crate::mcp::handlers::run_context::project_path(&db, &run.project_id)
-        .await
-        .ok()??;
-    Some(crate::jj::project_store_dir(
-        &orch.config_dir,
-        Path::new(&repo_path),
-    ))
+        .ok()
+        .map(|resolution| resolution.repository_path)
 }
 
 /// Env that makes a bare `git`/`jj` shell command run through the run tool
-/// behave correctly inside a jj-only agent worktree. Empty for a non-worktree
-/// cwd (the project's live checkout, where bare git correctly resolves the
-/// checkout), so that path is untouched.
+/// behave correctly inside an explicitly selected jj executor projection. Empty
+/// for a user live checkout, where bare git already resolves the checkout.
 ///
-/// Two distinct fixes compose here, both scoped to a `.jj` worktree:
+/// Two distinct fixes compose here, both scoped to an explicit `.jj` projection:
 ///
 /// 1. **Managed jj identity** ([`crate::jj::JjEnv::shell_env`]). A non-colocated
 ///    jj workspace has no `.git`, so a bare `jj` shell command that never saw
@@ -1134,7 +505,7 @@ pub(crate) fn worktree_shell_vcs_env(
     // The universal `<cairn_home>/bin/jj` shim (installed at startup and already
     // on every agent PATH via `agent_shell_path`) intercepts
     // `jj workspace update-stale` and forwards every other jj to the bundled
-    // binary, so no per-worktree shim dir is composed here anymore and the
+    // binary, so no projection-specific shim dir is composed here anymore and the
     // interception now reaches Windows too. `shell_env` above already carries the
     // managed jj config and non-interactive editor.
     env
@@ -1158,17 +529,24 @@ pub(crate) async fn publish_sealed_commit_pack(
     repository: &Path,
     sealed_commit: &str,
 ) -> Result<(), String> {
-    let Some(store) = db.content_store().cloned() else {
+    let Some(store) = db.team_id().map(|_| db.content_store().clone()) else {
         return Ok(());
     };
     let project_id = project_id.to_string();
+    // A project row whose `repository_id` is absent or empty has no durable
+    // identity to catalog under, and there is no safe identity to guess: the
+    // catalog is keyed by it. Read it NULL-tolerantly so that case reaches the
+    // refusal below instead of surfacing as a row-conversion error.
     let repository_id = db
-        .query_text(
+        .query_opt(
             "SELECT repository_id FROM projects WHERE id = ?1",
             (project_id.clone(),),
+            |row| crate::storage::RowExt::opt_text(row, 0),
         )
         .await
         .map_err(|error| format!("resolve sealed-pack repository identity: {error}"))?
+        .flatten()
+        .filter(|repository_id| !repository_id.is_empty())
         .ok_or_else(|| "project has no durable repository identity".to_string())?;
 
     let tip = git_stdout(
@@ -1420,18 +798,7 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn jj_bin() -> Option<String> {
-        let bin = std::env::var("CAIRN_JJ_BIN")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "jj".to_string());
-        crate::env::command(&bin)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-            .then_some(bin)
-    }
+    use crate::jj::tests::jj_bin;
 
     fn git(repo: &Path, args: &[&str]) {
         assert!(
@@ -1464,68 +831,271 @@ mod tests {
         git(repo, &["commit", "-q", "-m", "base"]);
     }
 
+    mod sealed_packs {
+        use super::{git, git_stdout, init_project};
+        use crate::mcp::vcs::publish_sealed_commit_pack;
+        use crate::orchestrator::object_plane::resolve_catalog_chain;
+        use crate::storage::{
+            migrated_test_db, ContentStore, InMemoryContentStore, LocalDb, RowExt,
+            TeamReplicaContext,
+        };
+        use std::path::Path;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        const PROJECT: &str = "project-sealed";
+        const REPOSITORY: &str = "repository-sealed";
+
+        /// A content store that accepts nothing, for proving that a failed put
+        /// leaves no catalog reference behind.
+        struct RefusingContentStore;
+
+        #[async_trait::async_trait]
+        impl ContentStore for RefusingContentStore {
+            async fn put(&self, _hash: &str, _bytes: &[u8]) -> Result<(), String> {
+                Err("content store offline".into())
+            }
+
+            async fn get(&self, _hash: &str) -> Result<Option<Vec<u8>>, String> {
+                Ok(None)
+            }
+        }
+
+        /// A migrated database that behaves like an open team replica: a team
+        /// identity and a content store are together what makes cloud
+        /// publication possible at all.
+        async fn team_db(store: Arc<dyn ContentStore>) -> LocalDb {
+            let mut db = migrated_test_db("sealed-pack.db").await;
+            db.set_team_context(
+                TeamReplicaContext {
+                    team_id: "team-sealed".into(),
+                    private_db: None,
+                },
+                store,
+            );
+            db
+        }
+
+        async fn seed_project(db: &LocalDb, repository_id: Option<&str>) {
+            db.execute(
+                "INSERT INTO projects
+                 (id, workspace_id, name, key, repo_path, repository_id, created_at, updated_at)
+                 VALUES (?1, 'default', 'Sealed', 'SP', '', ?2, 1, 1)",
+                (PROJECT, repository_id),
+            )
+            .await
+            .unwrap();
+        }
+
+        fn commit(repo: &Path, file: &str, contents: &str) -> String {
+            std::fs::write(repo.join(file), contents).unwrap();
+            git(repo, &["add", "-A"]);
+            git(repo, &["commit", "-q", "-m", file]);
+            git_stdout(repo, &["rev-parse", "HEAD"])
+        }
+
+        /// The catalog entry a sealed commit owns: its bytes, its kind, and the
+        /// base it is expressed against.
+        async fn sealed_entry(db: &LocalDb, tip: &str) -> Option<(String, String, Option<String>)> {
+            let tip = tip.to_owned();
+            db.query_opt(
+                "SELECT c.content_hash, c.kind, c.base_commit FROM pack_catalog c
+                 JOIN pack_catalog_references r
+                   ON r.content_hash = c.content_hash
+                  AND r.project_id = c.project_id
+                  AND r.repository_id = c.repository_id
+                 WHERE c.project_id = ?1 AND c.repository_id = ?2 AND c.tip_commit = ?3
+                   AND c.publication_state = 'published'
+                   AND r.owner_kind = 'sealed_commit' AND r.owner_id = ?3",
+                (PROJECT, REPOSITORY, tip),
+                |row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?)),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Walk the published catalog exactly as a cold executor would, into an
+        /// object database that starts empty, and prove the sealed commit's
+        /// closure is complete once the chain is installed.
+        async fn reconstruct(
+            db: &LocalDb,
+            store: &InMemoryContentStore,
+            tip: &str,
+            objects: &Path,
+        ) -> Result<(), String> {
+            let chain = resolve_catalog_chain(db, PROJECT, REPOSITORY, tip, &[])
+                .await
+                .unwrap();
+            assert!(!chain.is_empty(), "a sealed commit must be resolvable");
+            std::fs::create_dir_all(objects).unwrap();
+            for (hash, byte_count, checksum, _base, _tip) in &chain {
+                let framed = store
+                    .get(hash)
+                    .await
+                    .unwrap()
+                    .expect("a published reference must never outrun its bytes");
+                assert_eq!(framed.len() as u64, *byte_count);
+                let (pack, index) = cairn_codec::transfer::unframe_pack(&framed).unwrap();
+                let validated = cairn_codec::transfer::validate_pack(
+                    &pack,
+                    cairn_codec::transfer::PackLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(validated.index, index);
+                assert_eq!(&validated.manifest.pack_checksum, checksum);
+                cairn_codec::transfer::install_pack(objects, &validated).unwrap();
+            }
+            cairn_codec::transfer::verify_commit_closure(objects, &[], tip).map(|_| ())
+        }
+
+        /// The first cloud-visible seal is self-contained: nothing is cataloged
+        /// beneath it, so the pack must carry the whole reachable closure.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_first_seal_publishes_a_self_contained_reachable_pack() {
+            let repo = TempDir::new().unwrap();
+            init_project(repo.path());
+            let sealed = commit(repo.path(), "first.rs", "first\n");
+            let store = Arc::new(InMemoryContentStore::new());
+            let db = team_db(store.clone()).await;
+            seed_project(&db, Some(REPOSITORY)).await;
+
+            publish_sealed_commit_pack(&db, PROJECT, repo.path(), &sealed)
+                .await
+                .unwrap();
+
+            let (hash, kind, base) = sealed_entry(&db, &sealed).await.expect("catalog entry");
+            assert_eq!(kind, "reachable");
+            assert_eq!(base, None);
+            assert!(store.contains(&hash).await);
+
+            let cold = TempDir::new().unwrap();
+            reconstruct(&db, &store, &sealed, &cold.path().join("objects"))
+                .await
+                .expect("a first seal must stand alone");
+        }
+
+        /// Once the direct parent is covered, a child seal ships only the range
+        /// above it — complete on its own terms (non-thin, so it validates
+        /// against an empty object database) but deliberately not self-
+        /// sufficient, which is what makes the catalog chain load-bearing.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_covered_child_publishes_a_range_that_needs_its_parent() {
+            let repo = TempDir::new().unwrap();
+            init_project(repo.path());
+            let parent = commit(repo.path(), "first.rs", "first\n");
+            let store = Arc::new(InMemoryContentStore::new());
+            let db = team_db(store.clone()).await;
+            seed_project(&db, Some(REPOSITORY)).await;
+            publish_sealed_commit_pack(&db, PROJECT, repo.path(), &parent)
+                .await
+                .unwrap();
+            let child = commit(repo.path(), "second.rs", "second\n");
+
+            publish_sealed_commit_pack(&db, PROJECT, repo.path(), &child)
+                .await
+                .unwrap();
+
+            let (child_hash, kind, base) = sealed_entry(&db, &child).await.expect("catalog entry");
+            assert_eq!(kind, "execution_range");
+            assert_eq!(base.as_deref(), Some(parent.as_str()));
+            let (parent_hash, _, _) = sealed_entry(&db, &parent).await.expect("catalog entry");
+            assert_ne!(child_hash, parent_hash);
+
+            // The range alone is a valid pack and an incomplete history.
+            let partial = TempDir::new().unwrap();
+            let partial_objects = partial.path().join("objects");
+            std::fs::create_dir_all(&partial_objects).unwrap();
+            let framed = store.get(&child_hash).await.unwrap().unwrap();
+            let (pack, _) = cairn_codec::transfer::unframe_pack(&framed).unwrap();
+            let validated = cairn_codec::transfer::validate_pack(
+                &pack,
+                cairn_codec::transfer::PackLimits::default(),
+            )
+            .unwrap();
+            cairn_codec::transfer::install_pack(&partial_objects, &validated).unwrap();
+            assert!(
+                cairn_codec::transfer::verify_commit_closure(&partial_objects, &[], &child)
+                    .is_err(),
+                "a range pack must not masquerade as a complete history"
+            );
+
+            let cold = TempDir::new().unwrap();
+            reconstruct(&db, &store, &child, &cold.path().join("objects"))
+                .await
+                .expect("the resolved chain must reconstruct a complete closure");
+        }
+
+        /// Bytes come first. A store that cannot accept them publishes no
+        /// catalog reference, so the catalog never advertises coverage that
+        /// cannot be fetched.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_refused_put_publishes_no_catalog_reference() {
+            let repo = TempDir::new().unwrap();
+            init_project(repo.path());
+            let sealed = commit(repo.path(), "first.rs", "first\n");
+            let db = team_db(Arc::new(RefusingContentStore)).await;
+            seed_project(&db, Some(REPOSITORY)).await;
+
+            let error = publish_sealed_commit_pack(&db, PROJECT, repo.path(), &sealed)
+                .await
+                .expect_err("a store that refuses bytes must fail loudly");
+            assert!(error.contains("content store offline"), "{error}");
+            assert!(sealed_entry(&db, &sealed).await.is_none());
+            assert!(
+                resolve_catalog_chain(&db, PROJECT, REPOSITORY, &sealed, &[])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        /// Catalog identity is the durable repository id, not the project id. A
+        /// project that has none cannot be published under a guessed identity.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_project_without_a_durable_repository_identity_refuses_to_publish() {
+            let repo = TempDir::new().unwrap();
+            init_project(repo.path());
+            let sealed = commit(repo.path(), "first.rs", "first\n");
+            let store = Arc::new(InMemoryContentStore::new());
+            let db = team_db(store.clone()).await;
+            seed_project(&db, None).await;
+
+            let error = publish_sealed_commit_pack(&db, PROJECT, repo.path(), &sealed)
+                .await
+                .expect_err("a missing repository identity must be explicit");
+            assert!(error.contains("durable repository identity"), "{error}");
+            assert!(store.is_empty().await);
+        }
+
+        /// Intentional: with no team there is no cloud to publish to, and none
+        /// is needed — direct runner object transfer already materializes this
+        /// commit on any executor. Publication is coverage, never a
+        /// precondition of a write.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_teamless_database_publishes_nothing_and_succeeds() {
+            let repo = TempDir::new().unwrap();
+            init_project(repo.path());
+            let sealed = commit(repo.path(), "first.rs", "first\n");
+            let db = migrated_test_db("sealed-pack-local.db").await;
+            seed_project(&db, Some(REPOSITORY)).await;
+
+            publish_sealed_commit_pack(&db, PROJECT, repo.path(), &sealed)
+                .await
+                .unwrap();
+
+            assert!(sealed_entry(&db, &sealed).await.is_none());
+        }
+    }
+    /// `JjBackend::seal_all` lands one addressable commit locally and publishes
+    /// nothing; the store-addressed publication that runs after the caller
+    /// releases the project-store lock is what reaches origin.
     #[test]
     #[serial_test::serial(jj)]
-    fn head_commit_probe_heals_a_genuinely_stale_workspace() {
+    fn jj_backend_seal_all_lands_commit_without_publishing_it() {
         let Some(bin) = jj_bin() else {
             eprintln!(
-                "skipping head_commit_probe_heals_a_genuinely_stale_workspace: jj not resolvable"
+                "skipping jj_backend_seal_all_lands_commit_without_publishing: jj not resolvable"
             );
-            return;
-        };
-        let home = TempDir::new().unwrap();
-        let proj = TempDir::new().unwrap();
-        let wts = TempDir::new().unwrap();
-        init_project(proj.path());
-        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
-        let store = home.path().join("jj-stores").join("proj");
-        crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-        let branch = "agent/CAIRN-2730-builder-1";
-        let sibling = "agent/CAIRN-2731-builder-1";
-        let ws = wts.path().join("job");
-        let sibling_ws = wts.path().join("sibling");
-        crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-        crate::jj::add_workspace(&jj, &store, &sibling_ws, sibling, branch, None).unwrap();
-        std::fs::write(sibling_ws.join("sibling.rs"), "sibling work\n").unwrap();
-        crate::jj::seal(&jj, &sibling_ws, "sibling work", None).unwrap();
-        crate::jj::merge_into_bookmark(&jj, &store, branch, sibling).unwrap();
-        let branch_tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
-
-        let workspace_name = crate::jj::workspace_name_for_branch(branch);
-        jj.run(
-            &store,
-            &[
-                "rebase",
-                "-s",
-                &format!("{workspace_name}@"),
-                "-o",
-                &branch_tip,
-                "--ignore-working-copy",
-            ],
-            "induce genuine staleness",
-        )
-        .unwrap();
-
-        let stale_probe = crate::jj::head_commit(&jj, &ws).unwrap_err();
-        assert!(
-            crate::jj::is_stale_error(&stale_probe),
-            "precondition: head probe must be refused as stale: {stale_probe}"
-        );
-
-        let healed_head = head_commit_healing_stale(&jj, &ws).unwrap();
-        assert_eq!(healed_head, branch_tip);
-        assert_eq!(crate::jj::head_commit(&jj, &ws).unwrap(), branch_tip);
-        assert!(ws.join("sibling.rs").exists());
-    }
-
-    /// `JjBackend::seal_all` lands one addressable commit locally, then the
-    /// post-lock propagation seam pushes its bookmark to a bare origin.
-    #[test]
-    #[serial_test::serial(jj)]
-    fn jj_backend_seal_all_lands_commit_and_pushes() {
-        let Some(bin) = jj_bin() else {
-            eprintln!("skipping jj_backend_seal_all_lands_commit_and_pushes: jj not resolvable");
             return;
         };
         let home = TempDir::new().unwrap();
@@ -1550,7 +1120,7 @@ mod tests {
         crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
         std::fs::write(ws.join("mod.rs"), "code\n").unwrap();
 
-        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
+        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()), &ws);
         let result = backend.seal_all(&ws, "agent work", None).unwrap();
         let refs_before_propagation = git_stdout(
             origin.path(),
@@ -1560,7 +1130,7 @@ mod tests {
             !refs_before_propagation.contains(branch),
             "local sealing must not publish {branch} before the post-lock propagation seam"
         );
-        backend.propagate_seal(&ws).unwrap();
+        crate::jj::push_store_bookmark(&jj, &store, branch).unwrap();
         assert!(
             !result.sha.is_empty(),
             "seal_all returns the sealed commit id"
@@ -1609,7 +1179,7 @@ mod tests {
         std::fs::write(ws.join("stale.txt"), "scratch\n").unwrap();
         std::fs::write(ws.join("wanted.rs"), "wanted\n").unwrap();
 
-        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
+        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()), &ws);
         backend
             .seal_files(&ws, &["wanted.rs"], "seal only wanted", None)
             .unwrap();
@@ -1672,6 +1242,246 @@ mod tests {
             Ok(()),
             "discard must never touch the checkout"
         );
+    }
+
+    /// The branch [`owned_workspace`] provisions, and a name no fixture creates — so
+    /// finding a bookmark or ref under it can only mean a planted marker was
+    /// honoured.
+    const OWNED_BRANCH: &str = "agent/CAIRN-3280-builder-0";
+    const PLANTED_BRANCH: &str = "agent/planted-mid-batch";
+
+    /// A jj workspace Cairn provisioned, with its ownership marker in place.
+    struct OwnedWorkspace {
+        home: TempDir,
+        proj: TempDir,
+        _wts: TempDir,
+        ws: std::path::PathBuf,
+        store: std::path::PathBuf,
+    }
+
+    impl OwnedWorkspace {
+        fn marker(&self) -> std::path::PathBuf {
+            self.ws.join(".jj").join(crate::jj::BRANCH_MARKER)
+        }
+
+        fn jj(&self, bin: &str) -> crate::jj::JjEnv {
+            crate::jj::JjEnv::resolve(bin, self.home.path())
+        }
+
+        /// The backend as request preflight would build it, from the marker state
+        /// on disk right now.
+        fn preflight_backend(&self, bin: &str) -> JjBackend {
+            JjBackend::new(self.jj(bin), &self.ws)
+        }
+
+        fn bookmark(&self, bin: &str, branch: &str) -> Option<String> {
+            crate::jj::bookmark_commit(&self.jj(bin), &self.store, branch)
+        }
+
+        /// The backing checkout's `refs/heads/<branch>`, or `None` when absent.
+        fn git_ref(&self, branch: &str) -> Option<String> {
+            let out = crate::env::git()
+                .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+                .current_dir(self.proj.path())
+                .output()
+                .unwrap();
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+    }
+
+    fn owned_workspace(bin: &str) -> OwnedWorkspace {
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = crate::jj::JjEnv::resolve(bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let ws = wts.path().join("job");
+        crate::jj::add_workspace(&jj, &store, &ws, OWNED_BRANCH, "main", None).unwrap();
+        OwnedWorkspace {
+            home,
+            proj,
+            _wts: wts,
+            ws,
+            store,
+        }
+    }
+
+    /// `JjBackend::can_revert` answers from OWNERSHIP, not from the presence of a
+    /// `.jj` directory.
+    ///
+    /// A revert is a destructive publication: `jj restore` resets `@` to its
+    /// parent and takes every uncommitted change with it, not merely the ones a
+    /// batch just wrote. In a jj repo the USER colocated, that is precisely the
+    /// work-destroying hazard [`NonWorktreeVcs`] was introduced to close for plain
+    /// git — and backend selection, which keys on `.jj` presence, cannot tell that
+    /// checkout from one Cairn provisioned. The branch marker can.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_jj_checkout_cairn_does_not_own_is_never_reverted() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping jj_checkout_cairn_does_not_own_is_never_reverted: jj not resolvable"
+            );
+            return;
+        };
+        let fx = owned_workspace(&bin);
+
+        assert!(
+            fx.preflight_backend(&bin).can_revert(),
+            "Cairn provisioned this workspace, so rolling it back is Cairn's to do"
+        );
+
+        // The same directory, minus the one file that says Cairn owns a branch
+        // here: the shape of a checkout Cairn merely found.
+        std::fs::remove_file(fx.marker()).unwrap();
+        assert!(
+            !fx.preflight_backend(&bin).can_revert(),
+            "an unowned jj checkout must never be reverted — the discard would take the \
+             user's own uncommitted work with it"
+        );
+    }
+
+    /// THE TIME-OF-CHECK PROPERTY. The ownership evidence is a file inside the
+    /// checkout the batch can write, and the barrier consults `can_revert` only
+    /// AFTER the batch has run. So the answer is fixed when the backend is
+    /// constructed — during request preflight, before any command executes — and
+    /// nothing the batch does afterwards moves it.
+    ///
+    /// Both directions matter, and they fail differently:
+    ///
+    /// - Planting `.jj/cairn-branch` mid-batch must not turn the rollback ON. That
+    ///   is the destructive direction: in a user-colocated checkout it would hand
+    ///   Cairn a `jj restore` over the user's own pre-existing uncommitted work. A
+    ///   batch need not be malicious to do it — copying workspace metadata around
+    ///   is enough.
+    /// - Deleting it mid-batch must not turn a legitimate rollback OFF, or a batch
+    ///   could opt its own dirt out of the no-`commit_msg` hygiene gate and have it
+    ///   persist.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn ownership_is_fixed_before_the_batch_and_a_batch_cannot_move_it() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping ownership_is_fixed_before_the_batch: jj not resolvable");
+            return;
+        };
+        let fx = owned_workspace(&bin);
+
+        // A checkout Cairn does not own, as the preflight sees it.
+        std::fs::remove_file(fx.marker()).unwrap();
+        let backend = fx.preflight_backend(&bin);
+        assert!(!backend.can_revert());
+
+        // ... and now the batch writes the marker, exactly as a stray copy of
+        // workspace metadata would.
+        crate::jj::write_branch_marker(&fx.ws, PLANTED_BRANCH).unwrap();
+        assert!(
+            !backend.can_revert(),
+            "a marker written DURING the batch must not authorize Cairn to revert the \
+             checkout: the barrier consults this after the batch, so re-reading the file \
+             here would let a batch destroy the user's uncommitted work"
+        );
+
+        // The converse: ownership established before the batch survives the batch
+        // deleting the evidence, so no batch can opt its dirt out of the gate.
+        let owned = fx.preflight_backend(&bin);
+        assert!(owned.can_revert());
+        std::fs::remove_file(fx.marker()).unwrap();
+        assert!(
+            owned.can_revert(),
+            "a marker deleted DURING the batch must not disable a legitimate rollback"
+        );
+    }
+
+    /// The same time-of-check property on the PUBLICATION side, proven by a real
+    /// seal rather than by the predicate alone.
+    ///
+    /// A batch that deletes the marker must not be able to silence its own
+    /// publication. If the seal re-read the marker it would find `None`, commit
+    /// locally, skip the bookmark advance and the export, and still return a
+    /// `CommitResult` — so the barrier would print `✓ Committed changes (sha)`
+    /// for a commit the branch never received. That is precisely the silent
+    /// unpublished-commit failure this whole change exists to eliminate, so it must
+    /// not be reachable by writing a file.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_marker_deleted_during_a_batch_still_publishes_to_the_captured_branch() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping marker_deleted_during_a_batch_still_publishes: jj not resolvable");
+            return;
+        };
+        let fx = owned_workspace(&bin);
+        let backend = fx.preflight_backend(&bin);
+        let before = fx.bookmark(&bin, OWNED_BRANCH).unwrap();
+
+        // The batch removes the ownership evidence, then leaves work to seal.
+        std::fs::remove_file(fx.marker()).unwrap();
+        assert!(crate::jj::read_branch_marker(&fx.ws).is_none());
+        std::fs::write(fx.ws.join("work.rs"), "agent work\n").unwrap();
+
+        backend.seal_all(&fx.ws, "agent work", None).unwrap();
+
+        let sealed = crate::jj::head_commit(&fx.jj(&bin), &fx.ws).unwrap();
+        assert_ne!(sealed, before, "the seal produced a new commit");
+        assert_eq!(
+            fx.bookmark(&bin, OWNED_BRANCH).as_deref(),
+            Some(sealed.as_str()),
+            "the seal must advance the branch captured at preflight; reporting a commit the \
+             branch never received is the exact failure this change removes"
+        );
+        assert_eq!(
+            fx.git_ref(OWNED_BRANCH).as_deref(),
+            Some(sealed.as_str()),
+            "and the export must reach the backing git ref, which is what everything \
+             outside jj reads"
+        );
+    }
+
+    /// The inverse, also by a real seal: a batch cannot opt an unowned checkout
+    /// INTO Cairn publication by planting a marker. The commit still lands locally
+    /// — withholding is not refusing — but no bookmark moves and no git ref appears,
+    /// under the planted name or the workspace's real branch.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_marker_planted_during_a_batch_publishes_nothing() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping marker_planted_during_a_batch_publishes_nothing: jj not resolvable"
+            );
+            return;
+        };
+        let fx = owned_workspace(&bin);
+
+        // Unowned as of preflight.
+        std::fs::remove_file(fx.marker()).unwrap();
+        let backend = fx.preflight_backend(&bin);
+        let real_before = fx.bookmark(&bin, OWNED_BRANCH).unwrap();
+
+        // The batch plants a marker naming a branch of its choosing.
+        crate::jj::write_branch_marker(&fx.ws, PLANTED_BRANCH).unwrap();
+        std::fs::write(fx.ws.join("work.rs"), "somebody else's work\n").unwrap();
+
+        let sealed = backend.seal_all(&fx.ws, "local commit", None).unwrap();
+
+        assert!(
+            !sealed.sha.is_empty(),
+            "the commit still lands locally — an unowned checkout withholds publication, \
+             it does not refuse the commit"
+        );
+        assert_eq!(
+            fx.bookmark(&bin, OWNED_BRANCH).as_deref(),
+            Some(real_before.as_str()),
+            "the workspace's real branch must not move in a checkout Cairn does not own"
+        );
+        assert_eq!(
+            fx.bookmark(&bin, PLANTED_BRANCH),
+            None,
+            "a branch named by a marker the batch itself wrote must never be created"
+        );
+        assert_eq!(fx.git_ref(PLANTED_BRANCH), None, "and never exported");
     }
 
     /// In a real checkout, the sentinel READ-ONLY detects dirt a run left behind
@@ -1889,8 +1699,6 @@ mod tests {
     // ---- resolve_store_lock: the agent seal/discard serialization seam ----
 
     use crate::orchestrator::Orchestrator;
-    use crate::storage::LocalDb;
-    use cairn_common::protocol::CallbackRequest;
     use std::sync::Arc;
 
     /// Build an Orchestrator rooted at `config_dir` (the dir whose `jj-stores`
@@ -1929,393 +1737,6 @@ mod tests {
         assert!(
             error.contains("sibling reconcile (external advance on main)"),
             "{error}"
-        );
-    }
-
-    /// Seed the minimum rows so `lookup_run`/`project_path` resolve a worktree
-    /// `cwd` to its project repo_path (mirrors the live worktree-run shape: a
-    /// `live` run on a job whose `worktree_path` is the agent cwd).
-    async fn seed_worktree_run(
-        db: &LocalDb,
-        project_id: String,
-        repo_path: String,
-        worktree: String,
-    ) {
-        db.write(move |conn| {
-            let project_id = project_id.clone();
-            let repo_path = repo_path.clone();
-            let worktree = worktree.clone();
-            Box::pin(async move {
-                conn.execute(
-                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES (?1, 'default', 'Project', 'PROJ', ?2, 'main', 1, 1)",
-                    (project_id.as_str(), repo_path.as_str()),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-                     VALUES ('issue-1', ?1, 1, 'Issue', 'active', 1, 1)",
-                    (project_id.as_str(),),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
-                     VALUES ('exec-1', 'recipe-default', 'issue-1', ?1, 'running', 1, 1)",
-                    (project_id.as_str(),),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, base_branch, created_at, updated_at)
-                     VALUES ('job-1', 'exec-1', 'node', 'issue-1', ?1, 'running', ?2, 'main', 1, 1)",
-                    (project_id.as_str(), worktree.as_str()),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
-                     VALUES ('run-1', 'issue-1', ?1, 'job-1', 'live', 1, 1)",
-                    (project_id.as_str(),),
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    /// Provision a config dir, a project repo path, and a `.jj` worktree cwd, plus
-    /// the DB rows resolving that cwd to the project. Returns the orchestrator, a
-    /// run-tool `CallbackRequest` whose `cwd` is the worktree, the project
-    /// repo_path string (for computing the expected store key), and the owning
-    /// TempDir (held by the caller so the tree survives the test).
-    async fn worktree_run_fixture(
-        db_name: &str,
-    ) -> (Orchestrator, CallbackRequest, String, TempDir) {
-        let root = TempDir::new().unwrap();
-        let config_dir = root.path().join("config");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let repo = root.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let ws = root.path().join("ws");
-        std::fs::create_dir_all(ws.join(".jj")).unwrap(); // is_jj_dir(cwd) == true
-        let repo_path = repo.to_string_lossy().into_owned();
-        let ws_path = ws.to_string_lossy().into_owned();
-
-        let orch = orch_with_config(db_name, config_dir).await;
-        seed_worktree_run(
-            &orch.db.local,
-            "proj-1".to_string(),
-            repo_path.clone(),
-            ws_path.clone(),
-        )
-        .await;
-
-        let request = CallbackRequest {
-            thread_id: None,
-            cwd: ws_path,
-            run_id: None,
-            tool: "run".to_string(),
-            payload: serde_json::json!({}),
-            tool_use_id: None,
-        };
-        (orch, request, repo_path, root)
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(jj)]
-    async fn managed_preflight_repairs_a_rewritten_recorded_base_and_preserves_seals() {
-        let Some(bin) = jj_bin() else {
-            eprintln!(
-                "skipping managed_preflight_repairs_a_rewritten_recorded_base_and_preserves_seals: jj not resolvable"
-            );
-            return;
-        };
-        let root = TempDir::new().unwrap();
-        let config_dir = root.path().join("config");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let repo = root.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        init_project(&repo);
-        let ws = root.path().join("ws");
-        let repo_path = repo.to_string_lossy().into_owned();
-        let ws_path = ws.to_string_lossy().into_owned();
-        let mut orch = orch_with_config("vcs_rewritten_base_recovery.db", config_dir.clone()).await;
-        orch.jj_binary_path = bin.clone();
-        let jj = crate::jj::JjEnv::resolve(&bin, &config_dir);
-        let store = crate::jj::project_store_dir(&config_dir, &repo);
-        crate::jj::ensure_project_store(&jj, &store, &repo).unwrap();
-        let branch = "agent/CAIRN-2730-builder-1";
-        crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-        let recorded_base = crate::jj::head_commit(&jj, &ws).unwrap();
-        std::fs::write(ws.join("agent.rs"), "preserved agent work\n").unwrap();
-        crate::jj::seal(&jj, &ws, "agent work", None).unwrap();
-        let sealed_before = crate::jj::head_commit(&jj, &ws).unwrap();
-
-        seed_worktree_run(
-            &orch.db.local,
-            "proj-1".to_string(),
-            repo_path.clone(),
-            ws_path.clone(),
-        )
-        .await;
-        orch.db
-            .local
-            .execute(
-                "UPDATE jobs SET branch = ?1, base_commit = ?2, pack_anchor = ?2 WHERE id = 'job-1'",
-                (branch, recorded_base.as_str()),
-            )
-            .await
-            .unwrap();
-        crate::jj::write_project_root_marker(&ws, &repo).unwrap();
-        let identity = crate::jj::WorkspaceIdentity::new(
-            "job-1",
-            "job-1",
-            "proj-1",
-            repo.clone(),
-            ws.clone(),
-            branch,
-            crate::jj::workspace_name_for_branch(branch),
-            recorded_base.clone(),
-        );
-        crate::jj::write_workspace_identity(&ws, &identity).unwrap();
-
-        jj.run(
-            &store,
-            &[
-                "describe",
-                "-r",
-                &recorded_base,
-                "-m",
-                "rewritten parent base",
-                "--ignore-working-copy",
-            ],
-            "rewrite recorded base from store",
-        )
-        .unwrap();
-        let rewritten_seal = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
-        jj.run(
-            &store,
-            &["new", &rewritten_seal, "--ignore-working-copy"],
-            "create parent branch advance",
-        )
-        .unwrap();
-        jj.run(
-            &store,
-            &[
-                "describe",
-                "-m",
-                "parent branch advanced",
-                "--ignore-working-copy",
-            ],
-            "describe parent branch advance",
-        )
-        .unwrap();
-        jj.run(
-            &store,
-            &[
-                "bookmark",
-                "set",
-                branch,
-                "-r",
-                "@",
-                "--ignore-working-copy",
-            ],
-            "advance parent branch bookmark",
-        )
-        .unwrap();
-        let advanced_tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
-        let workspace_name = crate::jj::workspace_name_for_branch(branch);
-        jj.run(
-            &store,
-            &[
-                "rebase",
-                "-s",
-                &format!("{workspace_name}@"),
-                "-o",
-                &advanced_tip,
-                "--ignore-working-copy",
-            ],
-            "leave rewritten-base workspace physically stale",
-        )
-        .unwrap();
-        assert!(
-            !crate::jj::revision_descends_from(&jj, &store, &advanced_tip, &recorded_base),
-            "the persisted base id is no longer an ancestor after the parent rewrite"
-        );
-        let physical_head = crate::jj::head_commit(&jj, &ws).unwrap();
-        let expected_repaired_base =
-            crate::jj::forward_resolve_ancestor(&jj, &store, &recorded_base, &physical_head)
-                .expect(
-                    "jj can forward-resolve the rewritten recorded base within physical ancestry",
-                );
-        assert!(
-            crate::jj::revision_descends_from(&jj, &store, &physical_head, &expected_repaired_base),
-            "forward base {expected_repaired_base} must be an ancestor of head {physical_head}"
-        );
-
-        // Physical staleness is covered independently by
-        // `head_commit_probe_heals_a_genuinely_stale_workspace`; this regression
-        // exercises the next shared-preflight layer after the working copy is
-        // readable: its persisted base id has been rewritten out of ancestry.
-        let request = CallbackRequest {
-            thread_id: None,
-            cwd: ws_path,
-            run_id: Some("run-1".to_string()),
-            tool: "run".to_string(),
-            payload: serde_json::json!({}),
-            tool_use_id: None,
-        };
-        let context = prepare_managed_workspace(&orch, &request)
-            .await
-            .expect("shared run/write/recovery preflight repairs the rewritten base")
-            .expect("managed context");
-        assert_ne!(context.identity.base_commit, recorded_base);
-        assert!(crate::jj::revision_descends_from(
-            &jj,
-            &store,
-            &crate::jj::head_commit(&jj, &ws).unwrap(),
-            &context.identity.base_commit,
-        ));
-        assert!(
-            ws.join("agent.rs").exists(),
-            "sealed agent bytes survive recovery"
-        );
-        assert_ne!(
-            crate::jj::head_commit(&jj, &ws).unwrap(),
-            sealed_before,
-            "the seal follows the rewritten base to its current commit id"
-        );
-        assert_eq!(
-            orch.db
-                .local
-                .query_text("SELECT base_commit FROM jobs WHERE id = 'job-1'", ())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(context.identity.base_commit.as_str()),
-            "the durable owner metadata is repaired"
-        );
-        assert_eq!(
-            crate::jj::read_workspace_identity(&ws).unwrap().base_commit,
-            context.identity.base_commit,
-            "the physical marker is repaired with the database"
-        );
-
-        // Simulate interruption after the database CAS but before the physical
-        // marker write. The next invocation of this same shared preflight proves
-        // the marker's old base is the rewritten predecessor of the already-valid
-        // database base and completes the transition.
-        let mut interrupted_marker = crate::jj::read_workspace_identity(&ws).unwrap();
-        interrupted_marker.base_commit = recorded_base;
-        crate::jj::write_workspace_identity(&ws, &interrupted_marker).unwrap();
-        let resumed = prepare_managed_workspace(&orch, &request)
-            .await
-            .expect("a DB-at-new/marker-at-old transition resumes in band")
-            .expect("managed context");
-        assert_eq!(resumed.identity.base_commit, context.identity.base_commit);
-        assert_eq!(
-            crate::jj::read_workspace_identity(&ws).unwrap().base_commit,
-            context.identity.base_commit,
-            "the resumed preflight completes the interrupted marker update"
-        );
-    }
-
-    /// Test A — key identity (the load-bearing wiring guarantee). The seal-side
-    /// `resolve_store_lock` must return the SAME `Arc<Mutex>` instance that
-    /// base-advance reconcile and merge-fold acquire via
-    /// `jj_store_lock(project_store_dir(config_dir, repo_path))`. If these keys
-    /// ever drift, serialization silently breaks with no error — this is the
-    /// regression guard.
-    #[tokio::test(flavor = "current_thread")]
-    async fn resolve_store_lock_matches_reconcile_lock_instance() {
-        let (orch, request, repo_path, _root) =
-            worktree_run_fixture("vcs_store_lock_key_identity.db").await;
-
-        let seal_store = crate::mcp::vcs::resolve_store_lock(&orch, &request)
-            .await
-            .expect("a worktree cwd resolves a store lock");
-        let reconcile_store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-        assert_eq!(
-            seal_store, reconcile_store,
-            "seal/discard must resolve the SAME store identity as reconcile/fold"
-        );
-    }
-
-    /// Test B — mutual exclusion through the real lock. With an in-flight
-    /// reconcile holding the store lock, a seal-side acquisition via
-    /// the canonical instrumented acquisition must block until the reconcile
-    /// guard drops, then proceed. Proves serialization is exercised through the
-    /// real per-store mutex, not merely keyed the same.
-    #[tokio::test(flavor = "current_thread")]
-    async fn resolve_store_lock_serializes_behind_in_flight_reconcile() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        let (orch, request, repo_path, _root) =
-            worktree_run_fixture("vcs_store_lock_mutual_exclusion.db").await;
-
-        // Simulate an in-flight reconcile/fold holding the store lock.
-        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-        let reconcile_lock = orch.raw_jj_store_lock_for_test(&store);
-        let reconcile_guard = reconcile_lock.lock().await;
-
-        let acquired = Arc::new(AtomicBool::new(false));
-        let seal_side = {
-            let orch = orch.clone();
-            let request = request.clone();
-            let acquired = acquired.clone();
-            tokio::spawn(async move {
-                let store = crate::mcp::vcs::resolve_store_lock(&orch, &request)
-                    .await
-                    .expect("a worktree cwd resolves a store lock");
-                let _guard = orch
-                    .acquire_jj_store_lock(&store, "test seal-side acquisition")
-                    .await;
-                acquired.store(true, Ordering::SeqCst);
-            })
-        };
-
-        // While reconcile holds the lock, the seal side cannot proceed.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !acquired.load(Ordering::SeqCst),
-            "seal must block while a reconcile holds the store lock"
-        );
-
-        // Releasing the reconcile guard lets the seal side acquire and proceed.
-        drop(reconcile_guard);
-        seal_side.await.unwrap();
-        assert!(
-            acquired.load(Ordering::SeqCst),
-            "seal proceeds once the reconcile releases the store lock"
-        );
-    }
-
-    /// Test C — a non-worktree cwd resolves no lock. The project's live checkout
-    /// (NonWorktreeVcs) never mutates a shared store, so it must not acquire (or
-    /// block on) a store lock. Returns `None` before any DB lookup.
-    #[tokio::test(flavor = "current_thread")]
-    async fn resolve_store_lock_is_none_for_non_worktree_cwd() {
-        let root = TempDir::new().unwrap();
-        let config_dir = root.path().join("config");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let plain = root.path().join("plain"); // no `.jj` — a live checkout
-        std::fs::create_dir_all(&plain).unwrap();
-
-        let orch = orch_with_config("vcs_store_lock_non_worktree.db", config_dir).await;
-        let request = CallbackRequest {
-            thread_id: None,
-            cwd: plain.to_string_lossy().into_owned(),
-            run_id: None,
-            tool: "run".to_string(),
-            payload: serde_json::json!({}),
-            tool_use_id: None,
-        };
-        assert!(
-            crate::mcp::vcs::resolve_store_lock(&orch, &request)
-                .await
-                .is_none(),
-            "a non-worktree cwd must not resolve a store lock"
         );
     }
 
@@ -2395,7 +1816,7 @@ mod tests {
         let ws = wts.path().join("builder");
         crate::jj::add_workspace(&jj, &store, &ws, builder, int, None).unwrap();
         std::fs::write(ws.join("shared.rs"), "builder-edit\n").unwrap();
-        crate::jj::seal(&jj, &ws, "builder edits shared", None).unwrap();
+        crate::jj::seal_paths(&jj, &ws, "builder edits shared", None, &[], Some(builder)).unwrap();
         crate::jj::ensure_bookmark_on_origin(&jj, &store, builder).unwrap();
         let origin_before = git_stdout(origin.path(), &["rev-parse", builder]);
 
@@ -2411,11 +1832,13 @@ mod tests {
             &store,
             &["bookmark", "set", int, "-r", "@", "--ignore-working-copy"],
         );
-        crate::jj::rebase_branch_onto(&jj, &store, builder, int).unwrap();
+        // Unguarded on purpose: this fixture needs the conflicted shape that
+        // `rebase_branch_onto` now rolls back rather than leaves behind.
+        crate::jj::tests::rebase_recording_conflict(&jj, &store, builder, int);
         assert!(crate::jj::branch_has_conflict(&jj, &store, builder).unwrap());
         crate::jj::update_stale(&jj, &ws).unwrap();
         std::fs::write(ws.join("shared.rs"), "resolved\n").unwrap();
-        crate::jj::seal(&jj, &ws, "resolve conflict", None).unwrap();
+        crate::jj::seal_paths(&jj, &ws, "resolve conflict", None, &[], Some(builder)).unwrap();
         assert!(!crate::jj::branch_has_conflict(&jj, &store, builder).unwrap());
 
         // Record the base marker (the integration branch) so the heal can find its
@@ -2434,14 +1857,14 @@ mod tests {
 
         // The local reseal heal flattens and re-parents `@`; propagation runs
         // separately after the caller releases the project-store lock.
-        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
+        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()), &ws);
         backend.heal_after_seal(&ws);
         let origin_after_local_heal = git_stdout(origin.path(), &["rev-parse", builder]);
         assert_eq!(
             origin_before, origin_after_local_heal,
             "local reseal healing must not publish before the post-lock propagation seam"
         );
-        backend.propagate_seal(&ws).unwrap();
+        crate::jj::push_store_bookmark(&jj, &store, builder).unwrap();
 
         assert!(!crate::jj::branch_has_conflict(&jj, &store, builder).unwrap());
         let range = format!("{int_tip}..bookmarks(exact:{builder:?})");
@@ -2486,7 +1909,7 @@ mod tests {
         let ws = wts.path().join("builder");
         crate::jj::add_workspace(&jj, &store, &ws, builder, int, None).unwrap();
         std::fs::write(ws.join("clean.rs"), "clean\n").unwrap();
-        crate::jj::seal(&jj, &ws, "clean builder work", None).unwrap();
+        crate::jj::seal_paths(&jj, &ws, "clean builder work", None, &[], Some(builder)).unwrap();
 
         let int_tip = crate::jj::bookmark_commit(&jj, &store, int).unwrap();
         crate::jj::write_base_marker(&ws, int, &int_tip).unwrap();
@@ -2496,7 +1919,7 @@ mod tests {
         );
 
         let tip_before = crate::jj::bookmark_commit(&jj, &store, builder).unwrap();
-        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
+        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()), &ws);
         backend.heal_after_seal(&ws);
         let tip_after = crate::jj::bookmark_commit(&jj, &store, builder).unwrap();
         assert_eq!(

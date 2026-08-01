@@ -365,11 +365,13 @@ impl DbState {
         // a separate lookup. Storeless when no factory is installed (tests,
         // headless), which keeps the inline path.
         if let Some(factory) = self.content_store_factory.read().await.clone() {
-            db.set_team_context(TeamReplicaContext {
-                team_id: cfg.team_id.clone(),
-                store: factory.store_for(&cfg.team_id),
-                private_db: Some(self.local.clone()),
-            });
+            db.set_team_context(
+                TeamReplicaContext {
+                    team_id: cfg.team_id.clone(),
+                    private_db: Some(self.local.clone()),
+                },
+                factory.store_for(&cfg.team_id),
+            );
             if let Err(error) =
                 crate::storage::pack_catalog::backfill_execution_pack_catalog(&db, 32).await
             {

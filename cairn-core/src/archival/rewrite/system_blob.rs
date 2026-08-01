@@ -1,40 +1,5 @@
+use super::event_shape::sha256_hex;
 use super::*;
-
-#[cfg(test)]
-pub(crate) fn classify_system_blob_columns_for_test(
-    event: &Event,
-    kind: SystemBlobKind,
-) -> Result<
-    (
-        crate::storage::events::encoding::EventColumns,
-        Vec<SegmentBlob>,
-        ArchiveSummary,
-    ),
-    String,
-> {
-    let mut updates = Vec::new();
-    let mut summary = ArchiveSummary::default();
-    summary.bytes_before += event.data.len();
-    let mut blobs = Vec::new();
-    let mut sink = RewriteSystemBlobSink {
-        updates: &mut updates,
-        summary: &mut summary,
-        blobs: &mut blobs,
-    };
-    match kind {
-        SystemBlobKind::Prompt => {
-            push_blobbed_or_zstd(event, kind, build_system_prompt_shape, &mut sink)?
-        }
-        SystemBlobKind::Init => {
-            push_blobbed_or_zstd(event, kind, build_system_init_shape, &mut sink)?
-        }
-    }
-    let update = updates
-        .into_iter()
-        .next()
-        .ok_or_else(|| "system blob classifier produced no update".to_string())?;
-    Ok((update.shape.encode(), blobs, summary))
-}
 
 /// Build the segmented shape and its segment blobs from an event's recorded
 /// boundary map (`raw.segments`, an ordered list of `{kind, byteOffset,

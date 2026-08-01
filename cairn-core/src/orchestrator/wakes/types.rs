@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::messages::queued::DeliveryUrgency;
 use crate::storage::{DbResult, RowExt};
 
-const SOURCE_KIND_ISSUE: &str = "issue";
+pub(super) const SOURCE_KIND_ISSUE: &str = "issue";
 pub(super) const SOURCE_KIND_PEER: &str = "peer";
 const SOURCE_KIND_USER: &str = "user";
 pub(super) const SOURCE_KIND_PROCESS: &str = "process";
@@ -28,6 +28,38 @@ pub(super) const DEFAULT_CHILD_FACT_KINDS: &[&str] = &[
     FACT_KIND_MESSAGE,
 ];
 pub(super) const REVIEW_LEGACY_FACT_KINDS: &[&str] = &["agent_idle_with_work", "pr_state_change"];
+
+/// `created_by` marker on the synthetic parent-axis subscription returned by
+/// [`derived_child_subscription`]. It never reaches the database: the recipient
+/// is resolved live on every wake, so there is no row to go stale.
+pub(super) const CREATED_BY_DERIVED: &str = "derived";
+
+/// The parent-axis child-attention watch as a subscription value, so the derived
+/// coordinator flows through the same matching, mute, and routing rules as a
+/// persisted row. Constructed only when the coordinating node holds no explicit
+/// row of its own (`child::subscriptions_governing_issue`).
+pub(super) fn derived_child_subscription(job_id: &str, issue_uri: &str) -> WakeSubscription {
+    WakeSubscription {
+        id: format!("derived:parent:{job_id}:{issue_uri}"),
+        job_id: job_id.to_string(),
+        source_kind: SOURCE_KIND_ISSUE.to_string(),
+        source_ref: Some(issue_uri.to_string()),
+        fact_kinds: Some(
+            DEFAULT_CHILD_FACT_KINDS
+                .iter()
+                .map(|kind| (*kind).to_string())
+                .collect(),
+        ),
+        state: WakeSubscriptionState::Active,
+        mute_until_kind: None,
+        mute_until_ref: None,
+        created_by: CREATED_BY_DERIVED.to_string(),
+        created_at: 0,
+        updated_at: 0,
+        one_shot: false,
+        match_phrase: None,
+    }
+}
 
 /// Typed source taxonomy for every external wake a job can subscribe to.
 ///

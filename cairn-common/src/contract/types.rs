@@ -20,6 +20,7 @@ pub enum ChangeMode {
     Delete,
     Rename,
     Apply,
+    Revert,
 }
 
 impl ChangeMode {
@@ -33,6 +34,7 @@ impl ChangeMode {
         ChangeMode::Delete,
         ChangeMode::Rename,
         ChangeMode::Apply,
+        ChangeMode::Revert,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,6 +47,7 @@ impl ChangeMode {
             ChangeMode::Delete => "delete",
             ChangeMode::Rename => "rename",
             ChangeMode::Apply => "apply",
+            ChangeMode::Revert => "revert",
         }
     }
 }
@@ -56,6 +59,9 @@ impl ChangeMode {
 pub enum ResourceKind {
     Project,
     ProjectIssues,
+    ProjectCheckResults,
+    ProjectImages,
+    ProjectImage,
     ProjectMessages,
     ProjectTerminal,
     ProjectBrowser,
@@ -74,6 +80,7 @@ pub enum ResourceKind {
     NodeChatEvent,
     NodeArtifact,
     NodeDiff,
+    NodeRebase,
     NodeTerminal,
     NodeRepl,
     NodeBrowser,
@@ -107,6 +114,8 @@ pub enum ResourceKind {
     DevDb,
     DevPid,
     Logs,
+    Executors,
+    Executor,
     Bug,
     Skills,
     Skill,
@@ -149,6 +158,9 @@ impl ResourceKind {
     pub(crate) const ALL: &'static [ResourceKind] = &[
         ResourceKind::Project,
         ResourceKind::ProjectIssues,
+        ResourceKind::ProjectCheckResults,
+        ResourceKind::ProjectImages,
+        ResourceKind::ProjectImage,
         ResourceKind::ProjectMessages,
         ResourceKind::ProjectTerminal,
         ResourceKind::ProjectBrowser,
@@ -167,6 +179,7 @@ impl ResourceKind {
         ResourceKind::NodeChatEvent,
         ResourceKind::NodeArtifact,
         ResourceKind::NodeDiff,
+        ResourceKind::NodeRebase,
         ResourceKind::NodeTerminal,
         ResourceKind::NodeRepl,
         ResourceKind::NodeBrowser,
@@ -200,6 +213,8 @@ impl ResourceKind {
         ResourceKind::DevDb,
         ResourceKind::DevPid,
         ResourceKind::Logs,
+        ResourceKind::Executors,
+        ResourceKind::Executor,
         ResourceKind::Bug,
         ResourceKind::Skills,
         ResourceKind::Skill,

@@ -1,13 +1,13 @@
 //! Job workspace lifecycle over the shared store and the non-snapshotted
 //! `.jj` marker files (branch, base, project-root).
 use super::*;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::mcp::git::GitAuthor;
 
 /// Filename of the non-snapshotted branch marker inside a workspace's `.jj` dir.
-const BRANCH_MARKER: &str = "cairn-branch";
+/// See [`read_branch_marker`] for what its presence and absence mean.
+pub(crate) const BRANCH_MARKER: &str = "cairn-branch";
 
 /// Filename of the non-snapshotted base marker inside a workspace's `.jj` dir.
 /// Records the integration base (branch name + resolved SHA) so in-fence check
@@ -24,73 +24,6 @@ const BASE_MARKER: &str = "cairn-base";
 /// the checkout the way it can from a linked git worktree — so without the
 /// marker there is no on-disk route back. See `scripts/main-checkout.ts`.
 const PROJECT_ROOT_MARKER: &str = "cairn-project-root";
-
-/// Versioned ownership marker binding a physical jj workspace to its durable job
-/// lineage. The database remains authoritative; this marker is the fail-closed
-/// proof checked before destructive retry cleanup or branch-tip reconciliation.
-const WORKSPACE_IDENTITY_MARKER: &str = "cairn-workspace-identity";
-const WORKSPACE_IDENTITY_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceRebindTransition {
-    pub old_branch: String,
-    pub new_branch: String,
-    pub sealed_head: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceBaseTransition {
-    pub(crate) old_base: String,
-    pub(crate) new_base: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceIdentity {
-    version: u32,
-    pub(crate) lineage_root_job_id: String,
-    pub(crate) owner_job_id: String,
-    pub project_id: String,
-    pub(crate) project_root: PathBuf,
-    pub(crate) worktree_path: PathBuf,
-    pub branch: String,
-    pub workspace_name: String,
-    pub base_commit: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_rebind: Option<WorkspaceRebindTransition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) pending_base_transition: Option<WorkspaceBaseTransition>,
-}
-
-impl WorkspaceIdentity {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        lineage_root_job_id: impl Into<String>,
-        owner_job_id: impl Into<String>,
-        project_id: impl Into<String>,
-        project_root: PathBuf,
-        worktree_path: PathBuf,
-        branch: impl Into<String>,
-        workspace_name: impl Into<String>,
-        base_commit: impl Into<String>,
-    ) -> Self {
-        Self {
-            version: WORKSPACE_IDENTITY_VERSION,
-            lineage_root_job_id: lineage_root_job_id.into(),
-            owner_job_id: owner_job_id.into(),
-            project_id: project_id.into(),
-            project_root,
-            worktree_path,
-            branch: branch.into(),
-            workspace_name: workspace_name.into(),
-            base_commit: base_commit.into(),
-            pending_rebind: None,
-            pending_base_transition: None,
-        }
-    }
-}
 
 /// jj workspace names cannot contain `/`; map a git branch to a stable name.
 pub fn workspace_name_for_branch(branch: &str) -> String {
@@ -130,7 +63,7 @@ fn rollback_created_workspace(
     if delete_created_bookmark {
         let _ = jj.run(
             store_dir,
-            &["bookmark", "delete", branch],
+            &["bookmark", "delete", branch, "--ignore-working-copy"],
             "jj bookmark delete",
         );
     }
@@ -164,7 +97,10 @@ pub(crate) fn add_workspace_with_marker_writer(
         ws_path.to_string_lossy().to_string(),
     ]);
     let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    jj.run(store_dir, &argref, "jj workspace add")?;
+    // The one store operation jj will not let Cairn perform without the store's
+    // default workspace — it rejects `--ignore-working-copy` here outright — so
+    // it carries the repair instead. See [`run_needing_store_workspace`].
+    run_needing_store_workspace(jj, store_dir, &argref, "jj workspace add")?;
     if let Err(error) = marker_writer(ws_path, branch) {
         // Bookmark creation occurs only after the marker succeeds, so this
         // failure owns only the new workspace registration and path. A branch
@@ -192,7 +128,14 @@ pub(crate) fn add_workspace_with_marker_writer(
     if bookmark_commit(jj, store_dir, branch).is_none() {
         if let Err(error) = jj.run(
             store_dir,
-            &["bookmark", "create", branch, "-r", base_rev],
+            &[
+                "bookmark",
+                "create",
+                branch,
+                "-r",
+                base_rev,
+                "--ignore-working-copy",
+            ],
             "jj bookmark create",
         ) {
             // This branch is reached only after proving the bookmark absent;
@@ -215,10 +158,24 @@ pub(crate) fn add_workspace_with_marker_writer(
 /// bookmark, commit id, or `root()`). Lets a base ref that is not a project git
 /// ref (an unsealed coordinator bookmark, which lives only in the shared store)
 /// still be handed to `jj workspace add`.
+///
+/// `--ignore-working-copy` is load-bearing rather than conventional here: this
+/// probe answers `false` on ANY jj error, and [`resolve_base_rev`] reads that
+/// `false` as "not a store revset" and falls through to `HEAD` or `root()`. A
+/// stale store default workspace would therefore not fail provisioning — it
+/// would silently provision the job off the wrong base.
 pub fn revset_resolves(jj: &JjEnv, store: &Path, rev: &str) -> bool {
     jj.run(
         store,
-        &["log", "-r", rev, "--no-graph", "-T", "commit_id"],
+        &[
+            "log",
+            "-r",
+            rev,
+            "--no-graph",
+            "-T",
+            "commit_id",
+            "--ignore-working-copy",
+        ],
         "jj log resolve",
     )
     .map(|s| !s.trim().is_empty())
@@ -265,17 +222,6 @@ where
     "root()".to_string()
 }
 
-/// Whether a workspace registration exists in the shared store.
-pub(crate) fn workspace_registered(jj: &JjEnv, store_dir: &Path, workspace_name: &str) -> bool {
-    jj.run(
-        store_dir,
-        &["workspace", "list", "--template", "name ++ \"\\n\""],
-        "jj workspace list",
-    )
-    .map(|out| out.lines().any(|name| name.trim() == workspace_name))
-    .unwrap_or(false)
-}
-
 /// Cleanup for a retry whose exact registration/path ownership was proven by the
 /// orchestration layer. Never call this as collision recovery.
 pub fn cleanup_workspace_retry(
@@ -301,7 +247,12 @@ pub(crate) fn forget_workspace_name(
 ) -> Result<(), String> {
     jj.run(
         store_dir,
-        &["workspace", "forget", workspace_name],
+        &[
+            "workspace",
+            "forget",
+            workspace_name,
+            "--ignore-working-copy",
+        ],
         "jj workspace forget",
     )
     .map(|_| ())
@@ -312,13 +263,30 @@ pub fn forget_workspace(jj: &JjEnv, store_dir: &Path, branch: &str) -> Result<()
     forget_workspace_name(jj, store_dir, &workspace_name_for_branch(branch))
 }
 
-/// Record the real git branch in the workspace's non-snapshotted marker.
+/// Record the real git branch in the workspace's non-snapshotted marker — the
+/// act that makes the workspace Cairn-owned. Written once, by
+/// [`add_workspace_with_marker_writer`], as part of provisioning.
 pub fn write_branch_marker(ws_path: &Path, branch: &str) -> Result<(), String> {
     let p = ws_path.join(".jj").join(BRANCH_MARKER);
     std::fs::write(&p, format!("{branch}\n")).map_err(|e| format!("write branch marker: {e}"))
 }
 
-/// Read the workspace's branch marker, if present.
+/// The OWNERSHIP PREDICATE for a checkout: did Cairn provision it, and does
+/// Cairn own a branch here?
+///
+/// `Some(branch)` means yes, so publishing to that branch and rolling the
+/// working copy back are both this system's to perform. `None` means the
+/// checkout is somebody else's — a user-colocated jj repo is the standing case —
+/// and Cairn must touch nothing in it that publishes or destroys. A caller
+/// therefore WITHHOLDS on `None`; it must not refuse, because absence is not a
+/// fault.
+///
+/// Absence is in fact the only answer production gives today: nothing outside
+/// tests calls [`add_workspace`], so no checkout a run can reach carries a
+/// marker. The predicate survives because it is what keeps an ambient run in a
+/// user's own jj repo from publishing into it or reverting it, and because the
+/// jj suite provisions real marked workspaces to exercise the machinery — seal,
+/// merge, reconcile, base advance — that is still very much live.
 pub fn read_branch_marker(ws_path: &Path) -> Option<String> {
     std::fs::read_to_string(ws_path.join(".jj").join(BRANCH_MARKER))
         .ok()
@@ -355,64 +323,4 @@ pub fn write_project_root_marker(ws_path: &Path, repo_path: &Path) -> Result<(),
     let p = ws_path.join(".jj").join(PROJECT_ROOT_MARKER);
     std::fs::write(&p, format!("{}\n", repo_path.display()))
         .map_err(|e| format!("write project root marker: {e}"))
-}
-
-/// Read the workspace's project-root marker, if present and non-empty.
-pub(crate) fn read_project_root_marker(ws_path: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(ws_path.join(".jj").join(PROJECT_ROOT_MARKER))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-}
-
-/// Atomically persist the stable workspace owner/lineage identity. A temporary
-/// file in `.jj` is renamed over the marker so readers never observe partial JSON.
-pub fn write_workspace_identity(
-    ws_path: &Path,
-    identity: &WorkspaceIdentity,
-) -> Result<(), String> {
-    if identity.version != WORKSPACE_IDENTITY_VERSION {
-        return Err(format!(
-            "unsupported workspace identity version {}",
-            identity.version
-        ));
-    }
-    let dir = ws_path.join(".jj");
-    let marker = dir.join(WORKSPACE_IDENTITY_MARKER);
-    let temporary = dir.join(format!(
-        ".{WORKSPACE_IDENTITY_MARKER}.{}.tmp",
-        std::process::id()
-    ));
-    let mut bytes = serde_json::to_vec_pretty(identity)
-        .map_err(|e| format!("serialize workspace identity: {e}"))?;
-    bytes.push(b'\n');
-    std::fs::write(&temporary, bytes)
-        .map_err(|e| format!("write workspace identity temporary marker: {e}"))?;
-    std::fs::rename(&temporary, &marker)
-        .map_err(|e| format!("install workspace identity marker: {e}"))
-}
-
-pub fn read_workspace_identity(ws_path: &Path) -> Option<WorkspaceIdentity> {
-    let bytes = std::fs::read(ws_path.join(".jj").join(WORKSPACE_IDENTITY_MARKER)).ok()?;
-    let identity: WorkspaceIdentity = serde_json::from_slice(&bytes).ok()?;
-    (identity.version == WORKSPACE_IDENTITY_VERSION).then_some(identity)
-}
-
-/// A half-created same-job retry is safe to clear only when it contains no
-/// workspace files. A valid jj workspace is additionally required to be clean.
-pub(crate) fn workspace_retry_is_clean(jj: &JjEnv, ws_path: &Path) -> bool {
-    if !ws_path.exists() {
-        return true;
-    }
-    if is_jj_dir(ws_path) && is_working_copy_dirty(jj, ws_path).unwrap_or(true) {
-        return false;
-    }
-    std::fs::read_dir(ws_path)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .all(|entry| entry.file_name() == std::ffi::OsStr::new(".jj"))
-        })
-        .unwrap_or(false)
 }

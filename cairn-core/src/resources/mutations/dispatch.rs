@@ -24,6 +24,7 @@ mod nodes;
 mod progress;
 mod projects;
 mod prompts;
+mod rebase;
 mod recipes;
 mod repls;
 mod settings;
@@ -143,56 +144,6 @@ pub(crate) async fn dispatch_resource_change(
     item: &ChangeItem,
     dry_run: bool,
 ) -> ResourceMutationResult<ResourceAppliedChange> {
-    if item.target == "cairn:~/workspace-recovery" || item.target.ends_with("/workspace-recovery") {
-        if item.mode != ChangeMode::Patch {
-            return Err(build_failure(
-                index,
-                item,
-                "workspace recovery accepts only mode=patch",
-            ));
-        }
-        let action = item
-            .payload
-            .as_ref()
-            .and_then(|payload| payload.get("action"))
-            .and_then(serde_json::Value::as_str);
-        if action != Some("rebind") {
-            return Err(build_failure(
-                index,
-                item,
-                "workspace recovery requires payload {action:\"rebind\"}",
-            ));
-        }
-        if !dry_run {
-            let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
-            let _guard = match store.as_deref() {
-                Some(store) => Some(
-                    orch.acquire_jj_store_lock(store, "resource mutation seal")
-                        .await,
-                ),
-                None => None,
-            };
-            crate::mcp::vcs::prepare_managed_workspace(orch, request)
-                .await
-                .map_err(|error| build_failure(index, item, error))?;
-        }
-        return Ok(ResourceAppliedChange {
-            index,
-            target: item.target.clone(),
-            mode: mode_name(item.mode).to_string(),
-            kind: "resource".to_string(),
-            summary: if dry_run {
-                "Would prove and non-destructively rebind the managed workspace bookmark"
-                    .to_string()
-            } else {
-                "Proved managed workspace ownership and rebound its bookmark when required"
-                    .to_string()
-            },
-            data: None,
-            promoted_memory: None,
-        });
-    }
-
     let resource = target_resource_for_request(orch, request, item)
         .await
         .map_err(|e| build_failure(index, item, e))?;
@@ -221,6 +172,10 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         progress::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        rebase::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else if let Some(summary) =

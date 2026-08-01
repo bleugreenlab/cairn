@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// The `file:` URI scheme prefix for worktree and global filesystem targets.
+/// The `file:` URI scheme prefix for logical project and explicit host targets.
 const FILE_URI_SCHEME: &str = "file:";
 
 /// Cap on "did you mean" path suggestions surfaced for a missing `file:` target.
@@ -22,15 +22,43 @@ pub struct ResolvedFileTarget {
     pub(crate) full_path: PathBuf,
 }
 
+/// Resolve a repository-relative logical target without consulting process cwd.
+/// Absolute paths are explicit host capabilities and are therefore not logical
+/// targets. Parent traversal is rejected before any repository lookup.
+pub(crate) fn resolve_logical_file_target(target: &str) -> Result<ResolvedFileTarget, String> {
+    let (uri, relative_path) = match classify_file_target(target)? {
+        FileTargetKind::Root => (FILE_URI_SCHEME.to_string(), String::new()),
+        FileTargetKind::Relative(relative_path) => {
+            if Path::new(&relative_path)
+                .components()
+                .any(|component| component == Component::ParentDir)
+            {
+                return Err(format!("Path escapes the logical project root: {target}"));
+            }
+            (format!("{FILE_URI_SCHEME}{relative_path}"), relative_path)
+        }
+        FileTargetKind::Absolute(_) => {
+            return Err(format!(
+                "Absolute host path is not a logical project target: {target}"
+            ))
+        }
+    };
+    Ok(ResolvedFileTarget {
+        uri,
+        full_path: PathBuf::from(&relative_path),
+        relative_path,
+    })
+}
+
 /// Classification of a `file:` target under shell-style path rules.
 ///
 /// The discriminator is the shell rule: a leading `/` after the scheme means
-/// absolute; anything else is worktree-relative. Bare `file:` is the worktree
+/// absolute; anything else is repository-relative. Bare `file:` is the logical project
 /// root. There are no URI-authority / triple-slash semantics.
 enum FileTargetKind {
-    /// Bare `file:` — the worktree root.
+    /// Bare `file:` — the logical project root.
     Root,
-    /// Worktree-relative path. May contain `..`; escape enforcement is
+    /// Repository-relative path. May contain `..`; escape enforcement is
     /// per-operation (`read` permits escapes, `write` rejects them).
     Relative(String),
     /// Absolute path (leading `/` after the scheme).
@@ -39,21 +67,21 @@ enum FileTargetKind {
 
 fn invalid_file_target_message(target: &str) -> String {
     format!(
-        "Invalid file target '{target}': expected file: (worktree root), file:relative/path, or file:/absolute/path"
+        "Invalid file target '{target}': expected file: (logical project root), file:relative/path, or file:/absolute/path"
     )
 }
 
-fn worktree_only_message(target: &str) -> String {
-    format!("change is worktree-only; use a relative path like file:src/x (got '{target}')")
+fn logical_root_only_message(target: &str) -> String {
+    format!("change must use a repository-relative logical path like file:src/x (got '{target}')")
 }
 
 fn legacy_tilde_message(target: &str) -> String {
     format!(
-        "the file:~ worktree convention was removed; use bare file: for the worktree root or file:<relative/path> for a worktree file (got '{target}')"
+        "the file:~ convention was removed; use bare file: for the logical project root or file:<relative/path> for a repository file (got '{target}')"
     )
 }
 
-/// Normalize the worktree-relative portion of a `file:` target.
+/// Normalize the repository-relative portion of a `file:` target.
 ///
 /// Drops `.` and empty segments and preserves `..` — escape enforcement is the
 /// caller's job, per operation.
@@ -66,6 +94,7 @@ fn normalize_relative_components(path: &str) -> String {
             Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
         }
     }
+
     parts.join("/")
 }
 
@@ -79,7 +108,7 @@ fn classify_file_target(target: &str) -> Result<FileTargetKind, String> {
     if rest.starts_with('/') {
         return Ok(FileTargetKind::Absolute(PathBuf::from(rest)));
     }
-    // Hard cut: the old `file:~`/`file:~/...` worktree convention is gone.
+    // Hard cut: the old `file:~`/`file:~/...` convention is gone.
     if rest == "~" || rest.starts_with("~/") {
         return Err(legacy_tilde_message(target));
     }
@@ -93,24 +122,24 @@ fn classify_file_target(target: &str) -> Result<FileTargetKind, String> {
 
 /// Normalize a `file:` target to its canonical URI string.
 ///
-/// Worktree-relative only: rejects absolute targets, since the only caller
-/// (`write`) is worktree-jailed.
+/// Repository-relative only: absolute targets are explicit host capabilities
+/// and therefore require the crossing-aware resolver.
 pub fn normalize_file_uri(target: &str) -> Result<String, String> {
     match classify_file_target(target)? {
         FileTargetKind::Root => Ok(FILE_URI_SCHEME.to_string()),
         FileTargetKind::Relative(rel) => Ok(format!("{FILE_URI_SCHEME}{rel}")),
-        FileTargetKind::Absolute(_) => Err(worktree_only_message(target)),
+        FileTargetKind::Absolute(_) => Err(logical_root_only_message(target)),
     }
 }
 
 /// Resolve a `file:` target to a concrete path.
 ///
 /// `allow_absolute` co-varies with the jail: when true (read), absolute targets
-/// are permitted and the worktree-escape check is skipped (global reads,
-/// including `..`, are allowed); when false (change), absolute targets are
-/// rejected and the resolved path must stay within the worktree root.
+/// are permitted and the logical-root containment check is skipped (explicit
+/// host reads, including `..`, are allowed); when false (change), absolute
+/// targets are rejected and the resolved path must stay within the supplied root.
 fn resolve_file_target_internal(
-    worktree_path: &Path,
+    root_path: &Path,
     target: &str,
     create_missing_dirs: bool,
     require_exists: bool,
@@ -120,30 +149,30 @@ fn resolve_file_target_internal(
         FileTargetKind::Root => (
             FILE_URI_SCHEME.to_string(),
             String::new(),
-            worktree_path.to_path_buf(),
+            root_path.to_path_buf(),
         ),
         FileTargetKind::Relative(rel) => {
             let uri = format!("{FILE_URI_SCHEME}{rel}");
-            let joined = worktree_path.join(&rel);
+            let joined = root_path.join(&rel);
             (uri, rel, joined)
         }
         FileTargetKind::Absolute(abs) => {
             if !allow_absolute {
-                return Err(worktree_only_message(target));
+                return Err(logical_root_only_message(target));
             }
             let uri = format!("{FILE_URI_SCHEME}{}", abs.display());
             (uri, abs.display().to_string(), abs)
         }
     };
 
-    let worktree_canonical = worktree_path
+    let root_canonical = root_path
         .canonicalize()
-        .map_err(|e| format!("Failed to resolve worktree path: {e}"))?;
+        .map_err(|e| format!("Failed to resolve logical project root: {e}"))?;
 
     if require_exists && !joined_path.exists() {
         return Err(format!(
             "Entered path does not exist: {uri}{}",
-            did_you_mean_block(worktree_path, &uri)
+            did_you_mean_block(root_path, &uri)
         ));
     }
 
@@ -152,8 +181,8 @@ fn resolve_file_target_internal(
             .canonicalize()
             .map_err(|e| format!("Failed to resolve path: {e}"))?;
 
-        if !allow_absolute && !canonical.starts_with(&worktree_canonical) {
-            return Err(format!("Path escapes the worktree root: {uri}"));
+        if !allow_absolute && !canonical.starts_with(&root_canonical) {
+            return Err(format!("Path escapes the logical project root: {uri}"));
         }
 
         canonical
@@ -176,8 +205,8 @@ fn resolve_file_target_internal(
             .canonicalize()
             .map_err(|e| format!("Failed to resolve ancestor path: {e}"))?;
 
-        if !allow_absolute && !canonical_ancestor.starts_with(&worktree_canonical) {
-            return Err(format!("Path escapes the worktree root: {uri}"));
+        if !allow_absolute && !canonical_ancestor.starts_with(&root_canonical) {
+            return Err(format!("Path escapes the logical project root: {uri}"));
         }
 
         joined_path
@@ -190,7 +219,7 @@ fn resolve_file_target_internal(
     })
 }
 
-/// Search the worktree for files sharing the missing target's basename and
+/// Search the supplied project projection for files sharing the missing target's basename and
 /// return up to [`MAX_PATH_SUGGESTIONS`] `file:`-prefixed relative paths,
 /// best-effort. Handles the common "right filename, wrong directory" typo by
 /// ranking paths that are a suffix of the entered path first, then preferring
@@ -198,7 +227,7 @@ fn resolve_file_target_internal(
 /// handlers use, so heavy build dirs (`target/`, `node_modules/`) are skipped.
 /// Returns empty on any error, when the basename can't be determined, or when
 /// nothing matches.
-fn suggest_similar_paths(worktree_path: &Path, missing_uri: &str) -> Vec<String> {
+fn suggest_similar_paths(root_path: &Path, missing_uri: &str) -> Vec<String> {
     let entered = missing_uri
         .strip_prefix(FILE_URI_SCHEME)
         .unwrap_or(missing_uri);
@@ -210,7 +239,7 @@ fn suggest_similar_paths(worktree_path: &Path, missing_uri: &str) -> Vec<String>
         _ => return Vec::new(),
     };
 
-    let walker = ignore::WalkBuilder::new(worktree_path)
+    let walker = ignore::WalkBuilder::new(root_path)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
@@ -234,7 +263,7 @@ fn suggest_similar_paths(worktree_path: &Path, missing_uri: &str) -> Vec<String>
             continue;
         }
         let path = entry.path();
-        let relative = path.strip_prefix(worktree_path).unwrap_or(path);
+        let relative = path.strip_prefix(root_path).unwrap_or(path);
         candidates.push(relative.to_string_lossy().replace('\\', "/"));
         if candidates.len() >= MAX_PATH_CANDIDATES {
             break;
@@ -258,8 +287,8 @@ fn suggest_similar_paths(worktree_path: &Path, missing_uri: &str) -> Vec<String>
 /// Format a "Did you mean:" block (leading newline included) for a missing
 /// `file:` target, or an empty string when there are no close matches. Callers
 /// append it directly to a "does not exist" error message.
-pub(crate) fn did_you_mean_block(worktree_path: &Path, missing_uri: &str) -> String {
-    let suggestions = suggest_similar_paths(worktree_path, missing_uri);
+pub(crate) fn did_you_mean_block(root_path: &Path, missing_uri: &str) -> String {
+    let suggestions = suggest_similar_paths(root_path, missing_uri);
     if suggestions.is_empty() {
         return String::new();
     }
@@ -271,81 +300,48 @@ pub(crate) fn did_you_mean_block(worktree_path: &Path, missing_uri: &str) -> Str
     block
 }
 
-/// Validate that a file URI stays within the worktree (no path traversal).
-pub fn validate_file_path(
-    worktree_path: &Path,
-    file_uri: &str,
-) -> Result<ResolvedFileTarget, String> {
-    resolve_file_target_internal(worktree_path, file_uri, true, false, false)
+/// Validate that a file URI stays within the supplied logical root.
+pub fn validate_file_path(root_path: &Path, file_uri: &str) -> Result<ResolvedFileTarget, String> {
+    resolve_file_target_internal(root_path, file_uri, true, false, false)
 }
 
 /// Validate file URI for read operations.
 pub(crate) fn validate_read_path(
-    worktree_path: &Path,
+    root_path: &Path,
     file_uri: &str,
 ) -> Result<ResolvedFileTarget, String> {
-    resolve_file_target_internal(worktree_path, file_uri, false, true, true)
+    resolve_file_target_internal(root_path, file_uri, false, true, true)
 }
 
-/// Resolve a file URI for a read operation without requiring the target to exist.
-///
-/// Branch-scoped reads serve bytes from a VCS object rather than the current
-/// working tree, so the current checkout cannot be the existence oracle. This
-/// keeps the same URI normalization and absolute-path rules as `validate_read_path`
-/// while deferring existence/type checks to the requested ref.
-pub(crate) fn resolve_read_target_lenient(
-    worktree_path: &Path,
-    file_uri: &str,
-) -> Result<ResolvedFileTarget, String> {
-    resolve_file_target_internal(worktree_path, file_uri, false, false, true)
-}
-
-/// True if `full_path` resolves outside `worktree_path`. For a not-yet-existing
-/// path the nearest existing ancestor is checked, matching how new-file writes
-/// are jailed. Permissive on resolution failure: returns false (no fence) when
-/// neither the worktree nor any ancestor can be canonicalized.
-///
-/// This is the single prefix-comparison the worktree fence uses for reads and
-/// writes, so the escape rule lives in one place.
-pub(crate) fn path_escapes_worktree(worktree_path: &Path, full_path: &Path) -> bool {
-    let Ok(worktree_canonical) = worktree_path.canonicalize() else {
-        return false;
-    };
-    let resolved = if full_path.exists() {
-        full_path.canonicalize().ok()
-    } else {
-        full_path
-            .ancestors()
-            .find(|ancestor| ancestor.exists())
-            .and_then(|ancestor| ancestor.canonicalize().ok())
-    };
-    match resolved {
-        Some(path) => !path.starts_with(&worktree_canonical),
-        None => false,
+/// Classify whether a `file:` target explicitly crosses the logical repository
+/// namespace. This is lexical and fail-closed: process cwd and host
+/// canonicalization never participate in deciding the logical root.
+pub(crate) fn target_crosses_logical_root(target: &str) -> Result<bool, String> {
+    match classify_file_target(target)? {
+        FileTargetKind::Root => Ok(false),
+        FileTargetKind::Absolute(_) => Ok(true),
+        FileTargetKind::Relative(relative) => Ok(Path::new(&relative)
+            .components()
+            .any(|component| component == Component::ParentDir)),
     }
 }
 
 /// Whether a path resolves into any of a set of directories. The canonical
-/// implementation now lives in [`cairn_symbols::search_util`] so the fff
-/// worktree index and this crate's read/write fence checks share one copy;
-/// re-exported here so existing `crate::mcp::file_targets::path_within_any`
-/// call sites keep resolving.
+/// implementation lives in [`cairn_symbols::search_util`] so structural search
+/// and the read/write namespace checks share one copy.
 pub use cairn_symbols::search_util::path_within_any;
 
 /// Resolve a `file:` read target to an absolute path **without** requiring it to
 /// exist. Lets the read denylist gate run before existence validation, so a
 /// denylisted path is denied uniformly whether or not it exists (no
 /// deny-vs-"does not exist" existence enumeration).
-pub(crate) fn resolve_file_path_lenient(
-    worktree_path: &Path,
-    target: &str,
-) -> Result<PathBuf, String> {
-    resolve_file_target_internal(worktree_path, target, false, false, true).map(|t| t.full_path)
+pub(crate) fn resolve_file_path_lenient(root_path: &Path, target: &str) -> Result<PathBuf, String> {
+    resolve_file_target_internal(root_path, target, false, false, true).map(|t| t.full_path)
 }
 
 /// Normalize a `file:` change target, permitting absolute paths when
-/// `allow_escape` (the worktree fence adjudicates the crossing). With
-/// `allow_escape` false this is exactly [`normalize_file_uri`] (worktree-only).
+/// `allow_escape` (the logical namespace fence adjudicates the crossing). With
+/// `allow_escape` false this is exactly [`normalize_file_uri`].
 pub(crate) fn normalize_change_target(target: &str, allow_escape: bool) -> Result<String, String> {
     match classify_file_target(target)? {
         FileTargetKind::Root => Ok(FILE_URI_SCHEME.to_string()),
@@ -354,23 +350,23 @@ pub(crate) fn normalize_change_target(target: &str, allow_escape: bool) -> Resul
             if allow_escape {
                 Ok(format!("{FILE_URI_SCHEME}{}", abs.display()))
             } else {
-                Err(worktree_only_message(target))
+                Err(logical_root_only_message(target))
             }
         }
     }
 }
 
 /// Resolve a `file:` change target to a concrete path, permitting absolute and
-/// escaping targets when `allow_escape`. Used by `write` so the worktree fence
-/// can adjudicate an out-of-worktree write instead of the resolver hard-
+/// escaping targets when `allow_escape`. Used by explicit host writes so the
+/// logical namespace fence can adjudicate the crossing instead of hard-
 /// rejecting it. Never creates directories or requires existence (the caller
 /// checks existence per mutation mode).
 pub(crate) fn resolve_change_target(
-    worktree_path: &Path,
+    root_path: &Path,
     file_uri: &str,
     allow_escape: bool,
 ) -> Result<PathBuf, String> {
-    resolve_file_target_internal(worktree_path, file_uri, false, false, allow_escape)
+    resolve_file_target_internal(root_path, file_uri, false, false, allow_escape)
         .map(|target| target.full_path)
 }
 
@@ -378,6 +374,29 @@ pub(crate) fn resolve_change_target(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn logical_targets_are_normalized_without_a_filesystem_root() {
+        for (target, expected) in [
+            ("file:", ""),
+            ("file:.", ""),
+            ("file:src/lib.rs", "src/lib.rs"),
+            ("file:nonexistent/new.rs", "nonexistent/new.rs"),
+        ] {
+            assert_eq!(
+                resolve_logical_file_target(target).unwrap().relative_path,
+                expected
+            );
+        }
+
+        for invalid in [
+            "file:../outside",
+            "file:src/./nested/../lib.rs",
+            "file:/absolute/path",
+        ] {
+            assert!(resolve_logical_file_target(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn test_normalize_file_uri_root_and_relative() {
@@ -395,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_normalize_file_uri_rejects_absolute_and_non_scheme() {
-        // change is worktree-only: absolute targets are rejected.
+        // Logical project changes reject absolute host targets.
         assert!(normalize_file_uri("file:/tmp/lib.rs").is_err());
         // Bare paths without the scheme are not file targets.
         assert!(normalize_file_uri("src/lib.rs").is_err());
@@ -407,59 +426,22 @@ mod tests {
         for legacy in ["file:~", "file:~/", "file:~/src/lib.rs"] {
             let err = normalize_file_uri(legacy).unwrap_err();
             assert!(
-                err.contains("file:~ worktree convention was removed"),
+                err.contains("file:~ convention was removed"),
                 "expected hard-cut message for {legacy}, got: {err}"
             );
         }
         let temp = tempdir().unwrap();
         let err = validate_read_path(temp.path(), "file:~/Cargo.toml").unwrap_err();
-        assert!(err.contains("file:~ worktree convention was removed"));
+        assert!(err.contains("file:~ convention was removed"));
     }
 
     #[test]
-    fn path_escapes_worktree_detects_inside_and_outside() {
-        let temp = tempdir().unwrap();
-        let worktree = temp.path().join("wt");
-        std::fs::create_dir_all(worktree.join("src")).unwrap();
-        std::fs::write(worktree.join("src/lib.rs"), "x").unwrap();
-        std::fs::write(temp.path().join("outside.txt"), "y").unwrap();
-
-        // Existing in-worktree paths (incl. nested) and the root do not escape.
-        assert!(!path_escapes_worktree(&worktree, &worktree));
-        assert!(!path_escapes_worktree(
-            &worktree,
-            &worktree.join("src/lib.rs")
-        ));
-        // Existing paths outside the worktree escape.
-        assert!(path_escapes_worktree(
-            &worktree,
-            &temp.path().join("outside.txt")
-        ));
-        assert!(path_escapes_worktree(&worktree, Path::new("/etc")));
-    }
-
-    #[test]
-    fn path_escapes_worktree_handles_nonexistent_via_ancestor() {
-        let temp = tempdir().unwrap();
-        let worktree = temp.path().join("wt");
-        std::fs::create_dir_all(worktree.join("src")).unwrap();
-
-        // A not-yet-existing file resolves via its nearest existing ancestor:
-        // an in-worktree ancestor means the new file is in-worktree.
-        assert!(!path_escapes_worktree(
-            &worktree,
-            &worktree.join("src/new.rs")
-        ));
-        assert!(!path_escapes_worktree(
-            &worktree,
-            &worktree.join("brand/new/deep.rs")
-        ));
-        // A not-yet-existing file whose nearest existing ancestor is outside the
-        // worktree escapes.
-        assert!(path_escapes_worktree(
-            &worktree,
-            &temp.path().join("sibling/new.rs")
-        ));
+    fn logical_crossing_classifier_is_lexical_and_fail_closed() {
+        assert!(!target_crosses_logical_root("file:").unwrap());
+        assert!(!target_crosses_logical_root("file:src/lib.rs").unwrap());
+        assert!(target_crosses_logical_root("file:../outside").unwrap());
+        assert!(target_crosses_logical_root("file:/etc/hosts").unwrap());
+        assert!(target_crosses_logical_root("not-a-file-target").is_err());
     }
 
     #[test]
@@ -622,7 +604,7 @@ mod tests {
 
         let result = validate_file_path(worktree, "file:src/../../outside.txt");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("worktree"));
+        assert!(result.unwrap_err().contains("logical project root"));
     }
 
     #[test]
@@ -632,6 +614,8 @@ mod tests {
 
         let result = validate_file_path(worktree, "file:/tmp/outside.txt");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("worktree-only"));
+        assert!(result
+            .unwrap_err()
+            .contains("repository-relative logical path"));
     }
 }

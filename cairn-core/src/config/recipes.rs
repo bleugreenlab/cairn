@@ -93,7 +93,7 @@ pub fn save_recipe(
     // Determine target path
     let path = if file_recipe.file_path.as_os_str().is_empty() {
         // No existing path - determine from scope
-        let filename = format!("{}.yaml", &file_recipe.recipe.id);
+        let filename = format!("{}.yaml", file_recipe.recipe.id);
         if file_recipe.is_project_scoped {
             let proj_path =
                 project_path.ok_or("Project path required for project-scoped recipe")?;
@@ -231,6 +231,7 @@ mod tests {
     fn minimal_recipe(id: &str, name: &str) -> Recipe {
         use crate::models::{NodePosition, RecipeNode, RecipeNodeType, RecipeTrigger};
         Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
             id: id.to_string(),
             name: name.to_string(),
             description: None,

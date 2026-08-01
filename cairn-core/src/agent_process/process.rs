@@ -405,11 +405,34 @@ impl RunRegistry {
         self.session_index.get(session_id).map(|s| s.as_str())
     }
 
-    pub fn register(&mut self, run_id: String, handle: RunHandle) {
-        if let Some(ref sid) = handle.session_id {
-            self.session_index.insert(sid.clone(), run_id.clone());
-        }
+    /// Register a run handle, returning any *other* live handle it displaces
+    /// from the session index.
+    ///
+    /// A session has at most one live process. This insert used to overwrite the
+    /// session index unconditionally while `by_id` kept both handles, so two
+    /// processes spawned against one session were silently accepted and the
+    /// first was orphaned from session lookup while still running (CAIRN-3283).
+    /// Per-job launch serialization is what prevents that; this is the backstop
+    /// at the one moment both processes provably exist. The displaced handle is
+    /// returned rather than stopped here because stopping waits on the child —
+    /// [`AgentProcessState::register_process`] does it outside the registry lock.
+    pub fn register(&mut self, run_id: String, handle: RunHandle) -> Option<RunHandle> {
+        let displaced = handle.session_id.as_ref().and_then(|sid| {
+            let prior_run_id = self.session_index.insert(sid.clone(), run_id.clone())?;
+            if prior_run_id == run_id {
+                return None;
+            }
+            log::error!(
+                "Session {} registered to run {} while run {} still held a live handle for it: \
+                 two agent processes on one session. Stopping the displaced process.",
+                sid,
+                run_id,
+                prior_run_id
+            );
+            self.by_id.remove(&prior_run_id)
+        });
         self.by_id.insert(run_id, handle);
+        displaced
     }
 
     pub(crate) fn remove(&mut self, run_id: &str) -> Option<RunHandle> {
@@ -486,16 +509,15 @@ pub struct AgentProcessState {
     workflow_stop_requested: Mutex<std::collections::HashSet<String>>,
     /// Live workflow executor bindings keyed by run id. Workflow rows are durable,
     /// but the incarnation/epoch fence is intentionally process-local authority.
-    workflow_leases: Mutex<
-        std::collections::HashMap<String, cairn_common::executor_protocol::LifetimeLeaseFence>,
-    >,
+    workflow_leases:
+        Mutex<std::collections::HashMap<String, cairn_common::executor_protocol::ResidencyFence>>,
 }
 
 impl AgentProcessState {
     pub(crate) fn bind_workflow_lease(
         &self,
         run_id: String,
-        fence: cairn_common::executor_protocol::LifetimeLeaseFence,
+        fence: cairn_common::executor_protocol::ResidencyFence,
     ) {
         if let Ok(mut leases) = self.workflow_leases.lock() {
             leases.insert(run_id, fence);
@@ -505,7 +527,7 @@ impl AgentProcessState {
     pub(crate) fn workflow_lease(
         &self,
         run_id: &str,
-    ) -> Option<cairn_common::executor_protocol::LifetimeLeaseFence> {
+    ) -> Option<cairn_common::executor_protocol::ResidencyFence> {
         self.workflow_leases.lock().ok()?.get(run_id).cloned()
     }
 
@@ -539,6 +561,31 @@ impl AgentProcessState {
             .get(run_id)
             .map(|p| p.is_active())
             .unwrap_or(false)
+    }
+
+    /// Whether this host holds a process handle for `run_id` at all — serving,
+    /// awaiting the host, or parked warm — or `None` when the registry could not
+    /// be inspected at all.
+    ///
+    /// The run-level sibling of [`Self::is_active`], which asks the narrower
+    /// question of whether that handle is currently mid-turn. The two answers
+    /// diverge for every warm process, so a caller reasoning about whether a run
+    /// is *alive* (rather than *busy*) must ask this one: the registry is
+    /// in-memory and every backend registers before its run can produce
+    /// anything, which makes handle presence the authoritative answer to "is
+    /// there still a process behind this run row?" (`crate::runs::reap`).
+    ///
+    /// The three-valued answer is the load-bearing difference from `is_active`,
+    /// which collapses a poisoned lock into `false`. That collapse is survivable
+    /// there — the answer only steers a scheduling decision, and a durable
+    /// second opinion sits beside it. Here the answer authorizes permanently
+    /// rewriting a run and its turns, and "the registry panicked mid-operation"
+    /// is not evidence that a process is absent; read as one it would invent a
+    /// crash for every live and warm process on this host at once. So a caller
+    /// on a destructive path must act only on `Some(false)`.
+    pub fn has_process(&self, run_id: &str) -> Option<bool> {
+        let processes = self.processes.lock().ok()?;
+        Some(processes.contains_key(run_id))
     }
 
     /// Transition a process to warm state.
@@ -735,6 +782,23 @@ impl AgentProcessState {
                     .filter_map(|handle| handle.job_id.clone())
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// Every run this host currently holds a process handle for.
+    ///
+    /// The registry is in-memory and starts empty at boot, so this is the
+    /// authoritative answer to "which runs did THIS host process spawn" — the
+    /// sibling question to [`Self::live_job_ids`], one rung down from jobs to runs.
+    ///
+    /// A snapshot rather than a live view: the caller releases the registry lock
+    /// before acting on the ids, so a concurrent lifecycle transition can retire
+    /// one out from under it. Callers must treat an id that no longer resolves as
+    /// already stopped, which is what the stop paths do anyway.
+    pub fn run_ids(&self) -> Vec<String> {
+        self.processes
+            .lock()
+            .map(|processes| processes.iter().map(|(id, _)| id.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -1049,6 +1113,26 @@ impl AgentProcessState {
     pub fn get_backend(&self, run_id: &str) -> Option<String> {
         let processes = self.processes.lock().ok()?;
         processes.get(run_id).and_then(|p| p.backend.clone())
+    }
+
+    /// Register a run handle for `run_id`, then gracefully stop whatever process
+    /// it displaced from the session index. A displacement is an invariant
+    /// violation (two live processes on one session) that
+    /// [`RunRegistry::register`] logs; stopping happens here, outside the
+    /// registry lock, because it waits on the child.
+    pub(crate) fn register_process(&self, run_id: String, handle: RunHandle) -> Result<(), String> {
+        let displaced = {
+            let mut processes = self.processes.lock().map_err(|e| e.to_string())?;
+            processes.register(run_id, handle)
+        };
+        if let Some(displaced) = displaced {
+            if let Ok(mut child_guard) = displaced.child.lock() {
+                if let Some(child) = child_guard.as_mut() {
+                    graceful_stop(child.as_mut());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove a process from the registry (clearing the session index) and then
@@ -1569,6 +1653,88 @@ mod tests {
             processes.get_mut("run-1").unwrap().backend = Some("codex".to_string());
         }
         assert_eq!(state.get_backend("run-1"), Some("codex".to_string()));
+    }
+
+    /// CAIRN-3283: two live processes on one session is an invariant violation,
+    /// not a state the registry may silently hold. The overwrite it used to do
+    /// left the first process running while removing it from session lookup, so
+    /// nothing could ever find it again to stop it.
+    #[test]
+    fn a_second_process_on_one_session_displaces_the_first() {
+        let mut registry = RunRegistry::default();
+        assert!(
+            registry
+                .register(
+                    "run-1".to_string(),
+                    RunHandle::test_handle(Some("sess-1"), Some("job-1"))
+                )
+                .is_none(),
+            "the first registration for a session displaces nothing"
+        );
+
+        let displaced = registry.register(
+            "run-2".to_string(),
+            RunHandle::test_handle(Some("sess-1"), Some("job-1")),
+        );
+
+        assert!(
+            displaced.is_some(),
+            "the prior handle must be handed back for stopping, not left running and unreachable"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "by_id must never hold two live handles for one session"
+        );
+        assert!(registry.get("run-1").is_none());
+        assert_eq!(registry.get_by_session("sess-1"), Some("run-2"));
+    }
+
+    /// Re-registering the same run for its own session (a handle rebuilt in
+    /// place) is not a displacement and must not evict anything.
+    #[test]
+    fn re_registering_the_same_run_displaces_nothing() {
+        let mut registry = RunRegistry::default();
+        registry.register(
+            "run-1".to_string(),
+            RunHandle::test_handle(Some("sess-1"), None),
+        );
+
+        let displaced = registry.register(
+            "run-1".to_string(),
+            RunHandle::test_handle(Some("sess-1"), None),
+        );
+
+        assert!(displaced.is_none());
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.get_by_session("sess-1"), Some("run-1"));
+    }
+
+    /// The state-level wrapper every spawn path goes through: the displaced
+    /// handle leaves the registry rather than lingering in `by_id`.
+    #[test]
+    fn register_process_evicts_the_displaced_handle() {
+        let state = AgentProcessState::default();
+        state
+            .register_process(
+                "run-1".to_string(),
+                RunHandle::test_handle(Some("sess-1"), None),
+            )
+            .unwrap();
+        state
+            .register_process(
+                "run-2".to_string(),
+                RunHandle::test_handle(Some("sess-1"), None),
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.find_process_by_session("sess-1"),
+            Some("run-2".to_string())
+        );
+        let processes = state.processes.lock().unwrap();
+        assert_eq!(processes.len(), 1);
+        assert!(processes.get("run-1").is_none());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use ast_grep_language::SupportLang;
 
-use super::engine::{parse, SymbolNode};
+use super::engine::{lang_for_path, parse, SymbolNode};
 use super::grammar::{self, LangSpec};
 use super::render::{render_locations, render_locations_with_context, LocationHit, Rendered};
 use super::walk::{build_globset, relative, source_files};
@@ -29,6 +29,92 @@ pub enum SymbolOp {
     References,
     Callers,
     Implementations,
+}
+
+/// Run structural navigation over a store-native logical file set.
+pub fn query_texts(
+    files: &[(String, String)],
+    op: Option<SymbolOp>,
+    name: &str,
+    glob: Option<&str>,
+    proj: &NavProjection,
+) -> Rendered {
+    if name.trim().is_empty() {
+        return Rendered::message("append a symbol name (ops: definition|references|callers|implementations; absent op = overview)");
+    }
+    let globset = match glob {
+        Some(raw) => match build_globset(raw) {
+            Ok(set) => Some(set),
+            Err(error) => return Rendered::message(error),
+        },
+        None => None,
+    };
+    let sources = files
+        .iter()
+        .filter(|(path, _)| {
+            globset.as_ref().is_none_or(|set| {
+                let path = Path::new(path);
+                set.is_match(path)
+                    || path
+                        .file_name()
+                        .is_some_and(|name| set.is_match(Path::new(name)))
+            })
+        })
+        .filter_map(|(path, source)| {
+            lang_for_path(Path::new(path)).map(|lang| (path.as_str(), source.as_str(), lang))
+        })
+        .collect::<Vec<_>>();
+    let collect_texts = |op| {
+        let mut hits = Vec::new();
+        for (path, source, lang) in &sources {
+            for line0 in lines_for(source, *lang, op, name) {
+                hits.push(LocationHit {
+                    path: (*path).to_string(),
+                    line: (line0 as u32) + 1,
+                    snippet: line_text(source, line0),
+                });
+            }
+        }
+        hits
+    };
+    match op {
+        Some(op) => {
+            let mut hits = collect_texts(op);
+            if let Some(limit) = proj.limit {
+                hits.truncate(limit);
+            }
+            if proj.before == 0 && proj.after == 0 {
+                render_locations(&hits)
+            } else {
+                let source_map = sources
+                    .iter()
+                    .map(|(path, source, _)| (*path, *source))
+                    .collect();
+                super::render::render_locations_with_text_context(
+                    &source_map,
+                    &hits,
+                    proj.before,
+                    proj.after,
+                )
+            }
+        }
+        None => {
+            let defs = collect_texts(SymbolOp::Definition);
+            let refs = collect_texts(SymbolOp::References).len();
+            let body = if defs.is_empty() {
+                format!("no declaration of '{name}' found\n\nreferences: {refs}")
+            } else {
+                format!(
+                    "definition:\n{}\n\nreferences: {refs}",
+                    defs.iter()
+                        .map(|hit| format!("{}:{}:{}", hit.path, hit.line, hit.snippet))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            Rendered::message(body)
+        }
+    }
 }
 
 impl SymbolOp {

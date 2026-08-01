@@ -25,17 +25,13 @@ fn sha256_hex(text: &str) -> String {
 
 /// Insert the assembled system prompt once per session/content hash so the UI
 /// can display the exact prompt without re-running prompt construction code.
-///
-/// Returns the next transcript sequence the backend reader should use. Even when
-/// the prompt event dedupes, this returns `MAX(sequence) + 1` so resumed streams
-/// append after the existing transcript instead of restarting at zero.
 pub(crate) fn persist_system_prompt_event(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
     backend: &str,
     segments: &[PromptSegment],
-) -> i32 {
+) {
     // Concatenate the segments into the full prompt and record their byte spans as
     // data on the event. Teardown archival uses the spans to content-address the
     // static segments and inline only the dynamic tail, never re-running assembly.
@@ -131,51 +127,43 @@ pub(crate) fn persist_system_prompt_event(
                         crate::storage::next_text(&mut rows, 0).await?
                     };
 
-                    let mut rows = conn
-                        .query(
-                            "SELECT MAX(sequence)
-                             FROM events
-                             WHERE run_id = ?1",
-                            (run_id.as_str(),),
-                        )
-                        .await?;
-                    let next_sequence = rows
-                        .next()
-                        .await?
-                        .map(|row| row.opt_i64(0))
-                        .transpose()?
-                        .flatten()
-                        .unwrap_or(-1)
-                        + 1;
-
                     if latest_data
                         .as_deref()
                         .and_then(|data| serde_json::from_str::<TranscriptEvent>(data).ok())
                         .and_then(|event| event.raw)
-                        .and_then(|raw| raw.get("hash").and_then(|value| value.as_str()).map(str::to_string))
+                        .and_then(|raw| {
+                            raw.get("hash")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string)
+                        })
                         .as_deref()
                         == Some(hash.as_str())
                     {
-                        return Ok((None, next_sequence as i32));
+                        return Ok(false);
                     }
 
-                    conn.execute(
-                        "INSERT INTO events (
-                            id, run_id, session_id, sequence, timestamp, event_type, data,
-                            parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
-                            cache_create_tokens, output_tokens, turn_id
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'system:prompt', ?6, NULL, ?5, NULL, NULL, NULL, NULL, NULL)",
-                        (
-                            event_id.as_str(),
-                            run_id.as_str(),
-                            session_id.as_deref(),
-                            next_sequence,
-                            i64::from(now),
-                            data.as_str(),
-                        ),
+                    crate::transcripts::stream_store::insert_event_conn(
+                        conn,
+                        &crate::transcripts::stream_store::EventInsert {
+                            id: event_id.clone(),
+                            run_id: run_id.clone(),
+                            session_id: session_id.clone(),
+                            timestamp: now,
+                            event_type: "system:prompt".to_string(),
+                            data: data.clone(),
+                            parent_tool_use_id: None,
+                            created_at: now,
+                            input_tokens: None,
+                            cache_read_tokens: None,
+                            cache_create_tokens: None,
+                            output_tokens: None,
+                            thinking_tokens: None,
+                            turn_id: None,
+                            cost_usd: None,
+                        },
                     )
                     .await?;
-                    Ok((Some(next_sequence as i32), next_sequence as i32 + 1))
+                    Ok(true)
                 })
             })
             .await
@@ -183,23 +171,25 @@ pub(crate) fn persist_system_prompt_event(
         }
     });
 
-    let Ok((inserted_sequence, next_sequence)) = insert_result else {
-        return 0;
-    };
-
-    if inserted_sequence.is_some() {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            crate::notify::event_db_change_for_run(
-                orch.db.local.clone(),
-                run_id,
-                session_id,
-                "insert",
-            ),
-        );
+    match insert_result {
+        Ok(true) => {
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                crate::notify::event_db_change_for_run(
+                    orch.db.local.clone(),
+                    run_id,
+                    session_id,
+                    "insert",
+                ),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => log::error!(
+            "Failed to persist system prompt event for run {}: {}",
+            &run_id[..run_id.len().min(8)],
+            error
+        ),
     }
-
-    next_sequence
 }
 
 struct SessionDbContext {
@@ -210,7 +200,7 @@ struct SessionDbContext {
     project_id: Option<String>,
     project_key: Option<String>,
     project_path: Option<std::path::PathBuf>,
-    /// Effective base branch for this run's job (worktree base / PR target),
+    /// Effective base branch for this run's durable coordinate and PR target,
     /// falling back to the project default for project-level runs or legacy rows.
     effective_base_branch: Option<String>,
     /// The run's job id, used to key the per-job scratch dir surfaced in the
@@ -220,12 +210,6 @@ struct SessionDbContext {
     /// living-doc targets for the prompt affordance. `None` for sub-agent task
     /// jobs with no recipe node.
     recipe_node_id: Option<String>,
-    /// The run's job worktree path. `None` for an ambient (no-worktree) job that
-    /// runs directly on the project's live checkout, and also for scratch-dir
-    /// (`CallWorktree::None`) calls/workflows — the two are told apart at the
-    /// orientation-block assembly site by comparing `working_dir` to the repo root
-    /// (see [`is_ambient_run`]).
-    worktree_path: Option<String>,
 }
 
 fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbContext, String> {
@@ -249,8 +233,7 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                                 parent_jobs.uri_segment AS parent_uri_segment,
                                 COALESCE(jobs.base_branch, projects.default_branch) AS effective_base_branch,
                                 runs.job_id,
-                                jobs.recipe_node_id,
-                                jobs.worktree_path
+                                jobs.recipe_node_id
                          FROM runs
                          LEFT JOIN issues ON runs.issue_id = issues.id
                          LEFT JOIN projects ON COALESCE(runs.project_id, issues.project_id) = projects.id
@@ -278,7 +261,6 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                 let effective_base_branch = row.opt_text(8)?;
                 let job_id = row.opt_text(9)?;
                 let recipe_node_id = row.opt_text(10)?;
-                let worktree_path = row.opt_text(11)?;
 
                 // All four components are required. A missing component means the run
                 // record is corrupt or incomplete — fail rather than produce a partial URI.
@@ -316,7 +298,6 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                     effective_base_branch,
                     job_id,
                     recipe_node_id,
-                    worktree_path,
                 })
             })
         })
@@ -354,6 +335,89 @@ fn resolve_ctx_self_targets(
         .map_err(|e| e.to_string())
     })
     .unwrap_or_default()
+}
+
+/// Whether this node is long-running by recipe topology (see
+/// [`crate::execution::jobs::is_long_running_node`]) and so gets the standing-node
+/// framing instead of an output contract. A read failure degrades to `false` — the
+/// ordinary shape — rather than failing session startup.
+fn resolve_is_long_running(
+    orch: &Orchestrator,
+    execution_id: &str,
+    node_id: &str,
+    requires_output: bool,
+) -> bool {
+    let dbs = orch.db.clone();
+    let execution_id = execution_id.to_string();
+    let node_id = node_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.read(|conn| {
+            let execution_id = execution_id.clone();
+            let node_id = node_id.clone();
+            Box::pin(async move {
+                crate::execution::jobs::is_long_running_node_conn(
+                    conn,
+                    &node_id,
+                    &execution_id,
+                    requires_output,
+                )
+                .await
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or(false)
+}
+
+/// The output-artifact section: where this node's terminal artifact goes, the
+/// recipe author's framing for it, its typed fields, and the submit-then-stop
+/// protocol. The schema is not a visible tool input, so this is where the agent
+/// learns the contract.
+fn build_output_artifact_section(
+    info: &crate::models::OutputSchemaInfo,
+    schema_value: &serde_json::Value,
+) -> String {
+    let name = info.artifact_name.as_deref().unwrap_or("artifact");
+    let mut section = format!(
+        "## Output artifact\n\nWhen your work is complete, record your result as this node's output artifact: write it with the `write` verb to `cairn:~/{name}` (mode `create`; use mode `patch` to revise). The payload is validated against the schema below before it is accepted.\n\n"
+    );
+    // The contract's own description is where a recipe author puts the framing
+    // for THIS artifact — what shipping it means and when to write it. It rides
+    // on the node, so it disappears with the node when a transform prunes it.
+    if let Some(description) = info.description.as_deref() {
+        let description = description.trim();
+        if !description.is_empty() {
+            section.push_str(description);
+            section.push_str("\n\n");
+        }
+    }
+    section.push_str(&render_schema_fields(schema_value));
+    // Writing the artifact is itself the signal that the work is ready — it
+    // notifies the user and advances the workflow. The gating sentence is only
+    // true when the node waits on a human.
+    section.push_str(
+        "\nWriting this artifact is the last action of your turn. The write itself signals that your work is ready — it notifies the user and pauses the run for review; a reply to this same session continues it.",
+    );
+    if matches!(info.confirm_policy, crate::models::ConfirmPolicy::User) {
+        section.push_str(
+            " The artifact is held for user confirmation before downstream work proceeds.",
+        );
+    }
+    section
+}
+
+/// The standing-node framing: the exact mirror of the output-artifact section.
+/// A node whose recipe gives it no terminal contract and no downstream action
+/// never finishes — it settles idle at clean turn-end and keeps taking wakes — so
+/// it needs to be told that ending a turn is the normal move, not a failure to
+/// deliver. Emitted only when [`resolve_is_long_running`] holds, which by
+/// construction excludes every node that has an output contract.
+fn build_standing_node_section() -> String {
+    "## Standing node\n\nThis node has no output artifact and never writes one — your recipe gives you no terminal contract, so there is nothing whose delivery would end the run. When a turn has nothing left to add, end it: the node settles idle and wakes again when something it is watching changes. The mission ends when the user closes the issue, not when you decide the work is done.".to_string()
 }
 
 /// Resolve the system-prompt instruction text a running node inherits from its
@@ -467,37 +531,23 @@ fn build_ctx_self_section(
     Some(section)
 }
 
-/// Build the orientation block: the agent's concrete coordinates for this run —
-/// where it sits on disk, its canonical node URI (which `cairn:~/` resolves to),
-/// the project + repo root it operates against, the base branch worktrees fork
-/// from, and the host platform. Folds in the home-URI "Current Location" pointer
-/// that previously stood alone, so an agent no longer has to probe for paths it
-/// can simply be told.
-#[allow(clippy::too_many_arguments)]
+/// Build the orientation block: where this run is, in terms an agent can act on.
+///
+/// Deliberately silent about the CLI process's own directory. Every path an
+/// agent can reach belongs to the environment its commands run in, not to the
+/// process beside them, so naming the latter could only mislead \u{2014} the same
+/// reasoning the scratch line below already follows.
 fn build_orientation_block(
-    working_dir: &str,
     home_uri: &str,
     project_key: Option<&str>,
     repo_root: Option<&str>,
     base_branch: Option<&str>,
     scratch_dir: Option<&str>,
     model: Option<&str>,
-    // Ambient (no-worktree) run: cwd IS the project's live checkout. The block
-    // relabels the cwd and drops the "NOT your working tree" repo-root line so
-    // the coordinates stay accurate. The Version Control tiering itself lives in
-    // the shared CAIRN segment (`cairn_system_prompt(ambient)`), not here — this
-    // function only adjusts per-run coordinates.
-    ambient: bool,
+    _ambient: bool,
 ) -> String {
-    let mut out = String::from("## Orientation\n\nYour coordinates for this run:\n\n");
-    if ambient {
-        out.push_str(&format!(
-            "- Working directory (cwd): `{}` \u{2014} the project's live checkout (shared with the user)\n",
-            working_dir
-        ));
-    } else {
-        out.push_str(&format!("- Working directory (cwd): `{}`\n", working_dir));
-    }
+    let mut out = String::from("## Orientation\n\nFor this run:\n\n");
+    out.push_str("- Working directory: the checkout your commands, terminals, and REPLs share\n");
     out.push_str(&format!(
         "- Node (home URI): `{}` \u{2014} `cairn:~/` resolves here\n",
         home_uri
@@ -505,16 +555,11 @@ fn build_orientation_block(
     if let Some(key) = project_key {
         out.push_str(&format!("- Project: `{}`\n", key));
     }
-    // In ambient mode the repo root IS the cwd, so the standalone
-    // "NOT your working tree; do not `cd` here" repo-root line would contradict
-    // the cwd line above — omit it. A worktree-backed run keeps it.
-    if !ambient {
-        if let Some(root) = repo_root {
-            out.push_str(&format!(
-                "- Repository root (the project's primary checkout, on its own branch \u{2014} NOT your working tree; do not `cd` here): `{}`\n",
-                root
-            ));
-        }
+    if let Some(root) = repo_root {
+        out.push_str(&format!(
+            "- Repository: `{}` \u{2014} the project's own checkout on this machine, read-only for agents and not where your commands run; do not `cd` here\n",
+            root
+        ));
     }
     if let Some(branch) = base_branch {
         out.push_str(&format!("- Base branch: `{}`\n", branch));
@@ -527,26 +572,19 @@ fn build_orientation_block(
     if let Some(model) = model {
         out.push_str(&format!("- Model: `{}`\n", model));
     }
-    if let Some(scratch) = scratch_dir {
-        out.push_str(&format!(
-            "- Scratch dir (TMPDIR): `{}` \u{2014} already exported as `$TMPDIR`/`$TMP`/`$TEMP`; reclaimed at teardown\n",
-            scratch
-        ));
+    if scratch_dir.is_some() {
+        // Deliberately symbolic. An ordinary machine does not brief you on where
+        // its temp directory is; you just use `$TMPDIR`. Naming a path here also
+        // advertised one the agent's own commands could not see, because commands
+        // run in the run's environment rather than beside the CLI process.
+        out.push_str(
+            "- Scratch: `$TMPDIR` \u{2014} one temp directory shared by every command, terminal, and REPL of this run; reclaimed at teardown\n",
+        );
     }
     out.push_str(
-        "\nKeep scratch and temp files in the working directory or the scratch dir above (your `$TMPDIR`); other paths outside the worktree are gated by the fence.",
+        "\nRelative `file:` targets address the project root. Repository commands \u{2014} a build, a test suite, `git log` \u{2014} execute through `run`.",
     );
     out
-}
-
-/// Whether this run is an ambient (no-worktree) job that runs directly on the
-/// project's live checkout. True only when the job has NO worktree AND its cwd is
-/// exactly the project repo root. The repo-root equality guard is load-bearing:
-/// a `CallWorktree::None` call or a workflow also has a NULL `worktree_path`, but
-/// runs in a scratch dir under `$TMPDIR` — those must NOT receive the ambient
-/// framing (they cannot even read the project tree).
-fn is_ambient_run(worktree_path: Option<&str>, working_dir: &str, repo_root: Option<&str>) -> bool {
-    worktree_path.is_none() && repo_root == Some(working_dir)
 }
 
 /// Render the `## Project checks` section: the project's configured `checks`
@@ -563,7 +601,7 @@ fn build_project_checks_section(
     }
 
     let mut entries: Vec<_> = checks.iter().collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(path, _)| *path);
 
     let mut out = String::from("## Project checks\n\n");
     out.push_str(
@@ -1122,40 +1160,28 @@ pub fn insert_error_event(
                 let session_id = session_id.clone();
                 let data = data.clone();
                 Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT MAX(sequence)
-                             FROM events
-                             WHERE run_id = ?1",
-                            (run_id.as_str(),),
-                        )
-                        .await?;
-                    let sequence = rows
-                        .next()
-                        .await?
-                        .map(|row| row.opt_i64(0))
-                        .transpose()?
-                        .flatten()
-                        .unwrap_or(-1)
-                        + 1;
-
-                    conn.execute(
-                        "INSERT INTO events (
-                            id, run_id, session_id, sequence, timestamp, event_type, data,
-                            parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
-                            cache_create_tokens, output_tokens, turn_id
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'system:error', ?6, NULL, ?5, NULL, NULL, NULL, NULL, NULL)",
-                        (
-                            event_id.as_str(),
-                            run_id.as_str(),
-                            session_id.as_deref(),
-                            sequence,
-                            i64::from(now),
-                            data.as_str(),
-                        ),
+                    crate::transcripts::stream_store::insert_event_conn(
+                        conn,
+                        &crate::transcripts::stream_store::EventInsert {
+                            id: event_id.clone(),
+                            run_id: run_id.clone(),
+                            session_id: session_id.clone(),
+                            timestamp: now,
+                            event_type: "system:error".to_string(),
+                            data: data.clone(),
+                            parent_tool_use_id: None,
+                            created_at: now,
+                            input_tokens: None,
+                            cache_read_tokens: None,
+                            cache_create_tokens: None,
+                            output_tokens: None,
+                            thinking_tokens: None,
+                            turn_id: None,
+                            cost_usd: None,
+                        },
                     )
                     .await?;
-                    Ok(sequence as i32)
+                    Ok(())
                 })
             })
             .await
@@ -1163,7 +1189,12 @@ pub fn insert_error_event(
         }
     });
 
-    if insert_result.is_err() {
+    if let Err(error) = insert_result {
+        log::error!(
+            "Failed to store system:error event for run {}: {}",
+            &run_id[..run_id.len().min(8)],
+            error
+        );
         return;
     }
 
@@ -1461,7 +1492,6 @@ pub fn start_agent_session(
     orch: &Orchestrator,
     run_id: &str,
     prompt: &str,
-    working_dir: &str,
     session_start: SessionStart,
     model: Option<Model>,
     _initial_user_message: Option<&str>,
@@ -1489,6 +1519,12 @@ pub fn start_agent_session(
     let db_context = session_db_context(orch, run_id)?;
     let home_uri = db_context.home_uri.clone();
     let session_project_id = db_context.project_id.clone();
+    let process_residence = db_context
+        .job_id
+        .as_deref()
+        .map(|job_id| crate::scratch::ensure_job_scratch_dir(job_id, Some(&home_uri)))
+        .ok_or_else(|| format!("Run {run_id} has no owning job for process residence"))?;
+    let process_residence = process_residence.to_string_lossy().to_string();
     log::info!("Session home URI: {}", home_uri);
 
     if let (Some(project_id), Some(project_path)) = (
@@ -1563,18 +1599,10 @@ pub fn start_agent_session(
     // Use provided agent config (agents are now always explicitly passed)
     let agent_config = agent_config.cloned();
 
-    // Ambient run: no job worktree AND cwd is the project repo root, so the run
-    // operates directly on the user's live checkout (the Manager recipe's
-    // `worktreeMode: none`). A scratch-dir call/workflow also has no worktree but
-    // is NOT ambient — the repo-root guard tells them apart. Resolved once here,
-    // above the prompt-content block, so it selects both the CAIRN system-prompt
-    // tier (via `SessionConfig.ambient`) and the orientation framing, and stays
-    // in scope at `SessionConfig` construction below.
-    let ambient = is_ambient_run(
-        db_context.worktree_path.as_deref(),
-        working_dir,
-        db_context.project_path.as_deref().and_then(|p| p.to_str()),
-    );
+    // Agent sessions are never ambient. Every job, call, task, workflow, and
+    // resume lives in scratch and addresses the repository through its authenticated
+    // logical coordinate. Explicit user/live-checkout operations use separate APIs.
+    let ambient = false;
 
     // Resolve tools, model, prompt, permissions, and select backend.
     // All operations that need agent_config + DB access are grouped here.
@@ -1711,10 +1739,9 @@ pub fn start_agent_session(
         let allowed = resolved.allowed;
         let disallowed = resolved.disallowed;
 
-        // No per-scope tool stripping: the three verbs are always allow-listed
-        // and out-of-worktree file/shell access is gated by the worktree fence
-        // in the verb handlers (governed by the agent's fence setting), not by
-        // removing tools from the allow-list. See CAIRN-1172.
+        // No per-scope tool stripping: the three verbs are always allow-listed.
+        // Logical namespace crossings and explicit host capabilities are adjudicated
+        // by the verb handlers rather than by removing tools from the allow-list.
 
         // The agent submits its output by writing its artifact via `write`
         // (cairn:~/<name>); there is no dedicated submission tool to allow.
@@ -1780,9 +1807,9 @@ pub fn start_agent_session(
 
             // MCP servers affordance block: configured (enabled) external servers
             // reachable through the cairn://mcp gateway, each server's tools listed
-            // by name from the persisted tool store (captured when the server was
-            // saved or authorized in Settings, so it's available synchronously on
-            // the very first session). Full argument schemas stay a
+            // by name from the persisted tool store. Settings captures the initial
+            // catalog and MCP reads lazily refresh it after its TTL expires. Full
+            // argument schemas stay a
             // `read cairn://mcp/<srv>` away; a server with no captured tools renders
             // a read pointer. Gated on `read` since discovery and invocation go
             // through it.
@@ -1864,26 +1891,29 @@ pub fn start_agent_session(
                     orch.schema_dir.as_deref(),
                     &info.schema,
                 ) {
-                    let name = info.artifact_name.as_deref().unwrap_or("artifact");
-                    let mut section = format!(
-                        "## Output artifact\n\nWhen your work is complete, record your result as this node's output artifact: write it with the `write` verb to `cairn:~/{name}` (mode `create`; use mode `patch` to revise). The payload is validated against the schema below before it is accepted.\n\n"
-                    );
-                    section.push_str(&render_schema_fields(&schema_value));
-                    // Writing the artifact is itself the signal that the work is
-                    // ready — it notifies the user and advances the workflow. The
-                    // gating sentence is only true when the node waits on a human.
-                    section.push_str(
-                        "\nWriting this artifact is the last action of your turn. The write itself signals that your work is ready — it notifies the user and pauses the run for review; a reply to this same session continues it.",
-                    );
-                    if matches!(info.confirm_policy, crate::models::ConfirmPolicy::User) {
-                        section.push_str(
-                            " The artifact is held for user confirmation before downstream work proceeds.",
-                        );
-                    }
+                    let section = build_output_artifact_section(info, &schema_value);
                     if !content.is_empty() {
                         content.push_str("\n\n");
                     }
                     content.push_str(&section);
+                }
+            }
+
+            // The mirror of the output-artifact section: a node with no terminal
+            // contract whose recipe ships no terminal action is a standing node,
+            // so it is told how it ends instead of what it delivers. Both
+            // sections are recipe-driven and mutually exclusive by construction
+            // — a node that is neither gets neither.
+            if _output_schema.is_none() {
+                if let (Some(node_id), Some(execution_id)) =
+                    (db_context.recipe_node_id.as_deref(), _execution_id)
+                {
+                    if resolve_is_long_running(orch, execution_id, node_id, false) {
+                        if !content.is_empty() {
+                            content.push_str("\n\n");
+                        }
+                        content.push_str(&build_standing_node_section());
+                    }
                 }
             }
 
@@ -1923,7 +1953,6 @@ pub fn start_agent_session(
                     .to_string()
             });
             content.push_str(&build_orientation_block(
-                working_dir,
                 &home_uri,
                 project_key.as_deref(),
                 project_path_for_prompt.as_ref().and_then(|p| p.to_str()),
@@ -1975,14 +2004,76 @@ pub fn start_agent_session(
         )
     };
 
-    // Resolve identity: explicit override (server) > ambient identity store (desktop)
-    let resolved_identity = identity_override.or_else(|| {
+    // Resolve identity: an explicit server identity always wins. Managed Claude
+    // sessions otherwise retain their durable account pin while it is available;
+    // project overrides win selection outright, and an unavailable pin is replaced.
+    let resolved_identity = if let Some(identity) = identity_override {
+        Some(identity)
+    } else if backend.name() == "Claude" {
+        let session_id = match &session_start {
+            SessionStart::New { session_id }
+            | SessionStart::Resume { session_id, .. }
+            | SessionStart::Fork { session_id, .. } => session_id.clone(),
+        };
+        let session = crate::storage::run_db_blocking({
+            let db = orch.db.local.clone();
+            let session_id = session_id.clone();
+            move || async move { crate::sessions::queries::get(&db, &session_id).await }
+        })?;
+        let project_override = session_project_id.as_ref().and_then(|project_id| {
+            orch.get_identity_store()
+                .and_then(|store| store.project_overrides.get(project_id).cloned())
+                .and_then(|overrides| overrides.anthropic_account_id)
+        });
+        let selected = if let Some(override_id) = project_override.as_deref() {
+            orch.select_claude_identity(session_project_id.as_deref(), Some(override_id), None)
+        } else if let Some(account_id) = session.account_id.as_deref() {
+            orch.resolve_available_claude_account(session_project_id.as_deref(), account_id)
+                .map(|identity| (account_id.to_string(), identity))
+                .or_else(|| orch.select_claude_identity(session_project_id.as_deref(), None, None))
+        } else {
+            orch.select_claude_identity(session_project_id.as_deref(), None, None)
+        };
+
+        if let Some((account_id, identity)) = selected {
+            if session.account_id.as_deref() != Some(account_id.as_str()) {
+                crate::storage::run_db_blocking({
+                    let db = orch.db.local.clone();
+                    let session_id = session_id.clone();
+                    let account_id = account_id.clone();
+                    move || async move {
+                        crate::sessions::queries::set_account_id(&db, &session_id, &account_id)
+                            .await
+                    }
+                })?;
+            }
+            Some(identity)
+        } else {
+            // Unknown/blocked managed profiles must never silently fall through
+            // to the first profile (or the ambient Keychain). Preserve legacy
+            // non-profile auth only when no managed profile exists.
+            let has_managed_profiles = orch.get_identity_store().is_some_and(|store| {
+                store.accounts.iter().any(|account| {
+                    account.api_provider == crate::identity::ApiProvider::Anthropic
+                        && matches!(account.auth, crate::identity::ProviderAuth::ClaudeProfile)
+                })
+            });
+            let mut identity =
+                orch.resolve_identity_for_project(session_project_id.as_deref(), None);
+            if has_managed_profiles {
+                if let Some(identity) = identity.as_mut() {
+                    identity.claude_auth = None;
+                }
+            }
+            identity
+        }
+    } else {
         let project_overrides = session_project_id.as_ref().and_then(|pid| {
             orch.get_identity_store()
                 .and_then(|store| store.project_overrides.get(pid).cloned())
         });
         orch.resolve_identity_for_project(session_project_id.as_deref(), project_overrides.as_ref())
-    });
+    };
 
     // Resolve the native output-constraint schema for a schema-constrained call.
     // Only calls opt in (`constrain_output_natively`); the same contract that
@@ -1996,9 +2087,33 @@ pub fn start_agent_session(
         None
     };
 
+    let project_id = db_context
+        .project_id
+        .clone()
+        .ok_or_else(|| format!("Run {run_id} has no project authority"))?;
+    let project_key = db_context
+        .project_key
+        .clone()
+        .ok_or_else(|| format!("Run {run_id} has no project key authority"))?;
+    let message_text = final_prompt.clone();
+    let resolve_project_id = project_id.clone();
+    let resolve_project_key = project_key.clone();
+    let message_content = crate::storage::run_db_blocking(move || async move {
+        crate::agent_process::stdin::resolve_stable_images(
+            &orch.db,
+            &resolve_project_id,
+            &resolve_project_key,
+            message_text,
+        )
+        .await
+    })?;
+
     let session_config = SessionConfig {
         run_id: run_id.to_string(),
-        working_dir: working_dir.to_string(),
+        working_dir: process_residence,
+        project_id,
+        project_key,
+        message_content,
         prompt: final_prompt,
         system_prompt_content,
         system_prompt_dynamic_tail,
@@ -2041,11 +2156,14 @@ mod tests {
                 crate::config::project_settings::CheckCommand {
                     command: "cargo test {targets}".to_string(),
                     impact: Some(vec!["src-tauri/**".to_string()]),
+                    scope: None,
                     policy: crate::config::project_settings::CheckPolicy::Gate,
                     when: crate::config::project_settings::CheckWhen::Review,
                     resource_class: crate::config::project_settings::CheckResourceClass::Shared,
                     timeout: None,
-                    constraints: None,
+                    executor: None,
+                    verdict_environment: Vec::new(),
+                    fixes: false,
                 },
             ),
             (
@@ -2053,11 +2171,14 @@ mod tests {
                 crate::config::project_settings::CheckCommand {
                     command: "vitest run".to_string(),
                     impact: None,
+                    scope: None,
                     policy: crate::config::project_settings::CheckPolicy::Advisory,
                     when: crate::config::project_settings::CheckWhen::Write,
                     resource_class: crate::config::project_settings::CheckResourceClass::Shared,
                     timeout: None,
-                    constraints: None,
+                    executor: None,
+                    verdict_environment: Vec::new(),
+                    fixes: false,
                 },
             ),
         ]);
@@ -2075,12 +2196,11 @@ mod tests {
     #[test]
     fn orientation_block_states_run_coordinates() {
         let block = build_orientation_block(
-            "/work/CAIRN-1288-builder-0",
             "cairn://p/CAIRN/1288/1/builder",
             Some("CAIRN"),
             Some("/repos/cairn"),
             Some("main"),
-            Some("/tmp/cairn-scratch-job-1"),
+            Some("/home/tester/.cairn/scratch/CAIRN.1288.1.builder"),
             Some("claude-opus-4"),
             false,
         );
@@ -2089,67 +2209,63 @@ mod tests {
         assert!(!block.contains("UTC"));
         // The resolved model is surfaced as part of the per-run dynamic tail.
         assert!(block.contains("Model: `claude-opus-4`"));
-        assert!(block.contains("/work/CAIRN-1288-builder-0"));
+        // The block names the environment the agent's commands run in. It never
+        // names the CLI process's own directory, which no agent surface reaches.
+        assert!(block.contains("Working directory: the checkout your commands"));
+        assert!(!block.contains("/work/CAIRN-1288-builder-0"));
         assert!(block.contains("cairn://p/CAIRN/1288/1/builder"));
         assert!(block.contains("cairn:~/"));
         assert!(block.contains("Project: `CAIRN`"));
-        // Repository root is relabeled so it can't be mistaken for the working tree.
-        assert!(block.contains("Repository root"));
+        // The project's own checkout is a distinct, read-only surface.
+        assert!(block.contains("Repository:"));
+        assert!(block.contains("read-only for agents"));
         assert!(block.contains("do not `cd` here"));
         assert!(block.contains("`/repos/cairn`"));
         assert!(block.contains("Base branch: `main`"));
         // Platform is always present, regardless of optional fields.
         assert!(block.contains(std::env::consts::OS));
-        // Scratch dir is surfaced as the agent's TMPDIR when provided.
-        assert!(block.contains("Scratch dir (TMPDIR): `/tmp/cairn-scratch-job-1`"));
-        assert!(block.contains("$TMPDIR"));
-        // A worktree-backed run carries no ambient framing.
+        // Scratch is named symbolically: the path an agent's commands actually
+        // see belongs to the run's environment, not to the CLI process, so
+        // advertising an absolute path here could only be wrong.
+        assert!(block.contains("Scratch: `$TMPDIR`"));
+        assert!(!block.contains("/home/tester/.cairn/scratch/CAIRN.1288.1.builder"));
+        // An authenticated virtual-residence run carries no ambient framing.
         assert!(!block.contains("## Capability tier"));
     }
 
     #[test]
-    fn orientation_block_ambient_variant_relabels_coordinates() {
-        // Ambient run: cwd IS the repo root, no worktree.
+    fn orientation_block_never_makes_cwd_repository_identity() {
         let block = build_orientation_block(
-            "/repos/cairn",
             "cairn://p/CAIRN/1/1/manager",
             Some("CAIRN"),
             Some("/repos/cairn"),
             Some("main"),
-            Some("/tmp/cairn-scratch-job-1"),
+            Some("/tmp/job-residence"),
             Some("claude-opus-4"),
             true,
         );
-        // cwd is relabeled as the live checkout.
-        assert!(block.contains("the project's live checkout (shared with the user)"));
-        // The contradictory repo-root "do not cd here" line is omitted.
-        assert!(!block.contains("do not `cd` here"));
-        assert!(!block.contains("NOT your working tree"));
-        // Version-control tiering now lives in the shared CAIRN segment
-        // (`cairn_system_prompt(ambient)`), not an orientation override paragraph.
-        assert!(!block.contains("## Capability tier"));
-        assert!(!block.contains("overrides the Version Control section"));
+        // The project's checkout is named and fenced; the CLI's own directory is
+        // not named at all, so it can never be mistaken for the repository.
+        assert!(block.contains("Repository: `/repos/cairn`"));
+        assert!(block.contains("do not `cd` here"));
+        assert!(!block.contains("/tmp/job-residence"));
+        assert!(!block.contains("live checkout"));
     }
 
+    /// The orientation block is the first thing an agent reads about where it is,
+    /// so it is held to the normalcy invariant: no substrate vocabulary.
     #[test]
-    fn is_ambient_run_only_for_no_worktree_on_repo_root() {
-        // Ambient: no worktree, cwd == repo root.
-        assert!(is_ambient_run(None, "/repos/cairn", Some("/repos/cairn")));
-        // Worktree-backed: cwd is the worktree, not the repo root.
-        assert!(!is_ambient_run(
-            Some("/work/wt"),
-            "/work/wt",
-            Some("/repos/cairn")
-        ));
-        // Scratch-dir call/workflow (CallWorktree::None): no worktree, but cwd is
-        // a scratch dir, not the repo root — NOT ambient.
-        assert!(!is_ambient_run(
-            None,
-            "/tmp/cairn-call-xyz",
-            Some("/repos/cairn")
-        ));
-        // No repo root known — cannot be ambient.
-        assert!(!is_ambient_run(None, "/repos/cairn", None));
+    fn orientation_block_carries_no_substrate_vocabulary() {
+        let block = build_orientation_block(
+            "cairn://p/CAIRN/1/1/manager",
+            Some("CAIRN"),
+            Some("/repos/cairn"),
+            Some("main"),
+            Some("/tmp/job-residence"),
+            Some("claude-opus-4"),
+            false,
+        );
+        crate::system_prompt::assert_no_substrate_vocabulary("orientation block", &block);
     }
 
     #[tokio::test]
@@ -2188,24 +2304,76 @@ mod tests {
 
     #[test]
     fn orientation_block_omits_missing_optionals() {
-        let block = build_orientation_block(
-            "/work/wt",
-            "cairn://p/P/1/1/node",
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
-        assert!(block.contains("Working directory (cwd): `/work/wt`"));
+        let block =
+            build_orientation_block("cairn://p/P/1/1/node", None, None, None, None, None, false);
+        assert!(block.contains("Working directory:"));
         assert!(!block.contains("Project:"));
-        assert!(!block.contains("Repository root"));
+        // The trailing guidance mentions repository commands; only the labelled
+        // `Repository:` line is optional.
+        assert!(!block.contains("Repository: "));
         assert!(!block.contains("Base branch:"));
         assert!(!block.contains("Model:"));
         assert!(block.contains("Platform:"));
         // No scratch line when the run has no owning job.
-        assert!(!block.contains("Scratch dir"));
+        assert!(!block.contains("Scratch:"));
+    }
+
+    /// A terminal contract shaped like the coordinator's `create-pr` port.
+    fn pr_contract(description: Option<&str>) -> crate::models::OutputSchemaInfo {
+        crate::models::OutputSchemaInfo {
+            schema: crate::models::OutputSchema::Custom(serde_json::json!({
+                "type": "object",
+                "required": ["title"],
+                "properties": {"title": {"type": "string", "description": "PR title"}},
+            })),
+            artifact_name: Some("create-pr".to_string()),
+            confirm_policy: crate::models::ConfirmPolicy::Auto,
+            tool_name: None,
+            description: description.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn output_artifact_section_renders_the_contract_description() {
+        // The recipe author's framing for THIS artifact rides on the contract,
+        // between the opening sentence and the field list.
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": {"title": {"type": "string"}},
+        });
+        let framed = build_output_artifact_section(
+            &pr_contract(Some("  Your branch is the feature's integration branch.  ")),
+            &schema,
+        );
+        assert!(framed.contains("cairn:~/create-pr"));
+        assert!(framed.contains("Your branch is the feature's integration branch."));
+        let description_at = framed
+            .find("Your branch is")
+            .expect("description is rendered");
+        let fields_at = framed.find("Fields:").expect("fields are rendered");
+        assert!(
+            description_at < fields_at,
+            "the framing precedes the field list"
+        );
+
+        // Without a description the section is exactly what it was before.
+        let plain = build_output_artifact_section(&pr_contract(None), &schema);
+        assert!(!plain.contains("integration branch"));
+        assert!(plain.contains("## Output artifact"));
+        assert!(plain.contains("Fields:"));
+    }
+
+    #[test]
+    fn standing_node_section_states_that_the_node_never_finishes() {
+        // The mirror of the output-artifact section: no artifact, and ending a
+        // turn is the normal move rather than a failure to deliver.
+        let section = build_standing_node_section();
+        assert!(section.starts_with("## Standing node"));
+        assert!(section.contains("no output artifact"));
+        assert!(section.contains("closes the issue"));
+        // The two sections never overlap: this one names no artifact URI.
+        assert!(!section.contains("cairn:~/create-pr"));
     }
 
     fn ctx_self_target(name: &str, schema: serde_json::Value) -> crate::models::OutputSchemaInfo {
@@ -2300,12 +2468,10 @@ mod tests {
             crate::models::TerminalCommand {
                 name: "Dev Server".to_string(),
                 command: "npm run dev".to_string(),
-                write: vec![],
             },
             crate::models::TerminalCommand {
                 name: "Tests".to_string(),
                 command: "bun run test".to_string(),
-                write: vec![],
             },
         ];
         let section = build_available_terminals_section(&cmds)
@@ -2386,7 +2552,6 @@ mod tests {
         db: &LocalDb,
         run_id: &str,
         session_id: Option<&str>,
-        sequence: i32,
         event_type: &str,
     ) {
         let run_id = run_id.to_string();
@@ -2413,20 +2578,25 @@ mod tests {
                     raw: None,
                 };
                 let data = serde_json::to_string(&event).unwrap();
-                conn.execute(
-                    "INSERT INTO events (
-                        id, run_id, session_id, sequence, timestamp, event_type, data,
-                        parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
-                        cache_create_tokens, output_tokens, turn_id
-                     ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, 1, NULL, NULL, NULL, NULL, NULL)",
-                    params![
-                        ids::mint_child(&run_id),
-                        run_id,
-                        session_id,
-                        sequence,
-                        event_type,
+                crate::transcripts::stream_store::insert_event_conn(
+                    conn,
+                    &crate::transcripts::stream_store::EventInsert {
+                        id: ids::mint_child(&run_id),
+                        run_id: run_id.clone(),
+                        session_id: session_id.clone(),
+                        timestamp: 1,
+                        event_type: event_type.clone(),
                         data,
-                    ],
+                        parent_tool_use_id: None,
+                        created_at: 1,
+                        input_tokens: None,
+                        cache_read_tokens: None,
+                        cache_create_tokens: None,
+                        output_tokens: None,
+                        thinking_tokens: None,
+                        turn_id: None,
+                        cost_usd: None,
+                    },
                 )
                 .await?;
                 Ok(())
@@ -2464,7 +2634,7 @@ mod tests {
         seed_run(&db, "run-prompt").await;
         let orch = test_orchestrator(Arc::clone(&db));
 
-        let next_sequence = persist_system_prompt_event(
+        persist_system_prompt_event(
             &orch,
             "run-prompt",
             Some("sess"),
@@ -2472,7 +2642,6 @@ mod tests {
             &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "rendered prompt")],
         );
 
-        assert_eq!(next_sequence, 1);
         let events = fetch_system_prompt_events(&db, "run-prompt").await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "system:prompt");
@@ -2485,30 +2654,23 @@ mod tests {
         assert!(raw.get("hash").and_then(|v| v.as_str()).unwrap().len() >= 64);
     }
 
+    /// The prompt event takes the run's first slot and the backend's own first
+    /// event appends after it — no shared counter, each allocating at insert.
     #[tokio::test]
-    async fn persist_system_prompt_event_returns_sequence_for_next_backend_event() {
+    async fn persist_system_prompt_event_precedes_the_first_backend_event() {
         let db = Arc::new(migrated_db().await);
         seed_run(&db, "run-prompt-sequence").await;
         let orch = test_orchestrator(Arc::clone(&db));
 
-        let mut backend_sequence = persist_system_prompt_event(
+        persist_system_prompt_event(
             &orch,
             "run-prompt-sequence",
             Some("sess"),
             "codex",
             &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "same")],
         );
-        insert_backend_like_event(
-            &db,
-            "run-prompt-sequence",
-            Some("sess"),
-            backend_sequence,
-            "system:init",
-        )
-        .await;
-        backend_sequence += 1;
+        insert_backend_like_event(&db, "run-prompt-sequence", Some("sess"), "system:init").await;
 
-        assert_eq!(backend_sequence, 2);
         assert_eq!(
             fetch_event_sequences(&db, "run-prompt-sequence").await,
             vec![
@@ -2518,29 +2680,24 @@ mod tests {
         );
     }
 
+    /// A re-persist of the same prompt content dedupes (no second row) and a
+    /// changed prompt appends after everything already in the transcript.
     #[tokio::test]
-    async fn persist_system_prompt_event_dedupe_returns_sequence_after_existing_events() {
+    async fn persist_system_prompt_event_dedupes_then_appends_when_changed() {
         let db = Arc::new(migrated_db().await);
         seed_run(&db, "run-prompt-dedupe").await;
         let orch = test_orchestrator(Arc::clone(&db));
 
-        let first_next = persist_system_prompt_event(
+        persist_system_prompt_event(
             &orch,
             "run-prompt-dedupe",
             Some("sess"),
             "codex",
             &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "same")],
         );
-        insert_backend_like_event(
-            &db,
-            "run-prompt-dedupe",
-            Some("sess"),
-            first_next,
-            "system:init",
-        )
-        .await;
+        insert_backend_like_event(&db, "run-prompt-dedupe", Some("sess"), "system:init").await;
 
-        let deduped_next = persist_system_prompt_event(
+        persist_system_prompt_event(
             &orch,
             "run-prompt-dedupe",
             Some("sess"),
@@ -2548,8 +2705,7 @@ mod tests {
             &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "same")],
         );
         let events = fetch_system_prompt_events(&db, "run-prompt-dedupe").await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(deduped_next, 2);
+        assert_eq!(events.len(), 1, "identical prompt content must dedupe");
 
         persist_system_prompt_event(
             &orch,

@@ -3,50 +3,80 @@ use std::collections::{HashMap, HashSet};
 use cairn_db::turso::params;
 
 use crate::labels::crud::{
-    label_from_row, label_from_row_at, list_labels_conn, DEFAULT_WORKSPACE_ID,
+    create_label_conn, label_from_row, label_from_row_at, slugify, DEFAULT_WORKSPACE_ID,
 };
-use crate::models::Label;
+use crate::models::{CreateLabel, Label};
 use crate::storage::{DbResult, RowExt};
 
-async fn resolve_label_ref(
+/// Find the label a reference names: its id, its display name
+/// case-insensitively, or the slug those words produce. The slug arm is what
+/// keeps prose and slug spellings of the same label ("Needs Review",
+/// "needs-review") on one row instead of minting near-duplicates.
+async fn find_label_ref(
     conn: &cairn_db::turso::Connection,
     workspace_id: &str,
-    label_ref: &str,
-) -> Result<Label, String> {
-    let value = label_ref.trim();
-    if value.is_empty() {
-        return Err("label references must be non-empty strings".to_string());
-    }
+    value: &str,
+) -> Result<Option<Label>, String> {
+    // `slugify` falls back to the literal "label" for a reference with no
+    // alphanumerics, which would bind such a reference to an unrelated label
+    // that happens to own that id. Only offer the slug arm when the reference
+    // genuinely derives one.
+    let slug = slugify(value);
+    let slug = value
+        .chars()
+        .any(|ch| ch.is_ascii_alphanumeric())
+        .then_some(slug.as_str());
     let mut rows = conn
         .query(
             "SELECT id, workspace_id, name, color, created_at, updated_at
              FROM labels
-             WHERE workspace_id = ?1 AND (id = ?2 OR name = ?2 COLLATE NOCASE)
-             ORDER BY id ASC
+             WHERE workspace_id = ?1 AND (id = ?2 OR name = ?2 COLLATE NOCASE OR id = ?3)
+             ORDER BY CASE
+                 WHEN id = ?2 THEN 0
+                 WHEN name = ?2 COLLATE NOCASE THEN 1
+                 ELSE 2
+             END, id ASC
              LIMIT 1",
-            params![workspace_id, value],
+            params![workspace_id, value, slug],
         )
         .await
         .map_err(|error| error.to_string())?;
-    if let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        return label_from_row(&row).map_err(|error| error.to_string());
-    }
-
-    let labels = list_labels_conn(conn, workspace_id)
+    rows.next()
         .await
-        .map_err(|error| error.to_string())?;
-    let available = if labels.is_empty() {
-        "none".to_string()
-    } else {
-        labels
-            .iter()
-            .map(|label| label.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    Err(format!(
-        "Unknown label '{value}'. Available: {available}. Create it: write({{changes:[{{target:\"cairn://labels\",mode:\"create\",payload:{{name:\"{value}\"}}}}]}})"
-    ))
+        .map_err(|error| error.to_string())?
+        .map(|row| label_from_row(&row).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+/// Resolve a label reference, creating the label when nothing matches.
+///
+/// A label is a descriptor coined in the same breath as the issue it describes,
+/// so a name the vocabulary has not seen yet is a new label rather than a failed
+/// write. Returns the label and whether this call minted it.
+async fn resolve_or_create_label_ref(
+    conn: &cairn_db::turso::Connection,
+    workspace_id: &str,
+    label_ref: &str,
+    now: i64,
+) -> Result<(Label, bool), String> {
+    let value = label_ref.trim();
+    if value.is_empty() {
+        return Err("label references must be non-empty strings".to_string());
+    }
+    if let Some(label) = find_label_ref(conn, workspace_id, value).await? {
+        return Ok((label, false));
+    }
+    let label = create_label_conn(
+        conn,
+        workspace_id,
+        CreateLabel {
+            name: value.to_string(),
+            color: None,
+        },
+        now,
+    )
+    .await?;
+    Ok((label, true))
 }
 
 pub(crate) async fn list_labels_for_issue(
@@ -103,16 +133,26 @@ pub(crate) async fn list_labels_for_issues(
     Ok(labels)
 }
 
+/// Replace an issue's labels with `refs`, creating any label the workspace
+/// vocabulary does not have yet.
+///
+/// Returns the labels minted along the way so callers that notify the UI can
+/// refresh the vocabulary, not just the issue's chips.
 pub(crate) async fn replace_issue_labels(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
     refs: &[String],
     now: i64,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<Label>, String> {
     let mut label_ids = Vec::with_capacity(refs.len());
+    let mut created = Vec::new();
     let mut seen = HashSet::new();
     for label_ref in refs {
-        let label = resolve_label_ref(conn, DEFAULT_WORKSPACE_ID, label_ref).await?;
+        let (label, was_created) =
+            resolve_or_create_label_ref(conn, DEFAULT_WORKSPACE_ID, label_ref, now).await?;
+        if was_created {
+            created.push(label.clone());
+        }
         if seen.insert(label.id.clone()) {
             label_ids.push(label.id);
         }
@@ -132,32 +172,13 @@ pub(crate) async fn replace_issue_labels(
         .await
         .map_err(|error| error.to_string())?;
     }
-    Ok(label_ids)
-}
-
-pub async fn list_issue_ids_for_label(
-    conn: &cairn_db::turso::Connection,
-    label_ref: &str,
-) -> Result<Vec<String>, String> {
-    let label = resolve_label_ref(conn, DEFAULT_WORKSPACE_ID, label_ref).await?;
-    let mut rows = conn
-        .query(
-            "SELECT DISTINCT issue_id FROM issue_labels WHERE label_id = ?1 ORDER BY issue_id ASC",
-            params![label.id.as_str()],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut issue_ids = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        issue_ids.push(row.text(0).map_err(|error| error.to_string())?);
-    }
-    Ok(issue_ids)
+    Ok(created)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::labels::crud::{create_label_conn, DEFAULT_WORKSPACE_ID};
+    use crate::labels::crud::{create_label_conn, list_labels_conn, DEFAULT_WORKSPACE_ID};
     use crate::models::CreateLabel;
     use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
     use tempfile::tempdir;
@@ -204,26 +225,63 @@ mod tests {
         .id
     }
 
+    async fn label_ids_for_issue(
+        conn: &cairn_db::turso::Connection,
+        issue_id: &str,
+    ) -> Vec<String> {
+        list_labels_for_issue(conn, issue_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|label| label.id)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn resolves_label_by_id_and_name() {
+    async fn resolves_label_by_id_name_and_slug() {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
                 let id = seed_label(conn, "Needs Review").await;
-                assert_eq!(
-                    resolve_label_ref(conn, DEFAULT_WORKSPACE_ID, &id)
+                // A slug-only label: its id is the `slugify` fallback, so an
+                // unslugifiable reference must not resolve to it.
+                seed_label(conn, "label").await;
+                for reference in [id.as_str(), "needs review", "Needs-Review"] {
+                    let (label, created) =
+                        resolve_or_create_label_ref(conn, DEFAULT_WORKSPACE_ID, reference, 3)
+                            .await
+                            .unwrap();
+                    assert_eq!(label.id, id, "reference '{reference}'");
+                    assert!(!created, "reference '{reference}' should reuse the label");
+                }
+
+                let (label, created) =
+                    resolve_or_create_label_ref(conn, DEFAULT_WORKSPACE_ID, "🎉", 3)
                         .await
-                        .unwrap()
-                        .id,
-                    id
-                );
-                assert_eq!(
-                    resolve_label_ref(conn, DEFAULT_WORKSPACE_ID, "needs review")
-                        .await
-                        .unwrap()
-                        .id,
-                    id
-                );
+                        .unwrap();
+                assert!(created, "an unslugifiable reference is its own label");
+                assert_eq!(label.name, "🎉");
+                assert_eq!(label.id, "label-2");
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_blank_label_refs_without_creating_anything() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                let error = resolve_or_create_label_ref(conn, DEFAULT_WORKSPACE_ID, "   ", 3)
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("non-empty"));
+                assert!(list_labels_conn(conn, DEFAULT_WORKSPACE_ID)
+                    .await
+                    .unwrap()
+                    .is_empty());
                 Ok(())
             })
         })
@@ -240,7 +298,7 @@ mod tests {
                 seed_label(conn, "Bug").await;
                 seed_label(conn, "UI").await;
 
-                let replaced = replace_issue_labels(
+                let created = replace_issue_labels(
                     conn,
                     "i-one",
                     &["bug".to_string(), "UI".to_string(), "Bug".to_string()],
@@ -248,7 +306,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(replaced, vec!["bug", "ui"]);
+                assert!(created.is_empty());
                 assert_eq!(list_labels_for_issue(conn, "i-one").await.unwrap().len(), 2);
 
                 replace_issue_labels(conn, "i-one", &[], 4).await.unwrap();
@@ -264,42 +322,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_label_error_lists_available_and_create_action() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_label(conn, "Bug").await;
-                seed_label(conn, "UI").await;
-                let error = resolve_label_ref(conn, DEFAULT_WORKSPACE_ID, "frontend")
-                    .await
-                    .unwrap_err();
-                assert!(error.contains("Unknown label 'frontend'"));
-                assert!(error.contains("Available: bug, ui"));
-                assert!(error.contains("target:\"cairn://labels\""));
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn list_issue_ids_for_label_returns_reverse_lookup() {
+    async fn attaching_an_unknown_label_creates_it() {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
                 seed_issue(conn, "i-one", 1).await;
-                seed_issue(conn, "i-two", 2).await;
                 seed_label(conn, "Bug").await;
-                replace_issue_labels(conn, "i-one", &["bug".to_string()], 3)
-                    .await
-                    .unwrap();
-                replace_issue_labels(conn, "i-two", &["Bug".to_string()], 3)
-                    .await
-                    .unwrap();
+
+                let created = replace_issue_labels(
+                    conn,
+                    "i-one",
+                    &["bug".to_string(), "execution-fabric".to_string()],
+                    3,
+                )
+                .await
+                .unwrap();
+                assert_eq!(created.len(), 1);
+                assert_eq!(created[0].id, "execution-fabric");
+                assert_eq!(created[0].name, "execution-fabric");
                 assert_eq!(
-                    list_issue_ids_for_label(conn, "bug").await.unwrap(),
-                    vec!["i-one".to_string(), "i-two".to_string()]
+                    label_ids_for_issue(conn, "i-one").await,
+                    vec!["bug".to_string(), "execution-fabric".to_string()]
+                );
+
+                // The same label named as prose resolves to the row the first
+                // attach minted instead of minting a near-duplicate.
+                let created_again =
+                    replace_issue_labels(conn, "i-one", &["Execution Fabric".to_string()], 4)
+                        .await
+                        .unwrap();
+                assert!(created_again.is_empty());
+                assert_eq!(
+                    label_ids_for_issue(conn, "i-one").await,
+                    vec!["execution-fabric".to_string()]
+                );
+                assert_eq!(
+                    list_labels_conn(conn, DEFAULT_WORKSPACE_ID)
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
                 );
                 Ok(())
             })

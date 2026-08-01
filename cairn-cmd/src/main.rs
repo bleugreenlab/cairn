@@ -22,11 +22,12 @@ mod server;
 #[cfg(test)]
 mod test_support;
 mod timeouts;
-mod warm_search_shim;
 
-use cli::{default_callback_url, run_cli_change, run_cli_read, run_cli_watch};
+use cli::{default_callback_url, run_cli_change, run_cli_check, run_cli_read, run_cli_watch};
 use schemas::AgentInfo;
 use server::CairnCmd;
+
+cairn_common::sidecar_version_stamp!();
 
 /// Cairn MCP Server - tools for Claude to interact with Cairn
 #[derive(Parser)]
@@ -44,6 +45,35 @@ struct Args {
 #[cfg(test)]
 mod cli_parse_tests {
     use super::*;
+
+    #[test]
+    fn check_run_accepts_suite_and_optional_branch() {
+        let current = Args::try_parse_from(["cairn", "check", "run", "rust-tests"]).unwrap();
+        let Some(Command::Check {
+            command: CheckCommand::Run { suite, branch },
+        }) = current.command
+        else {
+            panic!("expected check run")
+        };
+        assert_eq!(suite, "rust-tests");
+        assert_eq!(branch, None);
+
+        let explicit =
+            Args::try_parse_from(["cairn", "check", "run", "rust-tests", "main"]).unwrap();
+        let Some(Command::Check {
+            command: CheckCommand::Run { branch, .. },
+        }) = explicit.command
+        else {
+            panic!("expected check run")
+        };
+        assert_eq!(branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn check_run_rejects_missing_suite_and_extra_positionals() {
+        assert!(Args::try_parse_from(["cairn", "check", "run"]).is_err());
+        assert!(Args::try_parse_from(["cairn", "check", "run", "suite", "main", "extra"]).is_err());
+    }
 
     #[test]
     fn executor_add_accepts_one_liner_and_repeatable_overrides() {
@@ -104,6 +134,11 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Run a configured project check against an immutable logical tree.
+    Check {
+        #[command(subcommand)]
+        command: CheckCommand,
+    },
     /// Manage runner-supervised SSH remote executors.
     Executor {
         #[command(subcommand)]
@@ -134,14 +169,19 @@ enum Command {
     },
 }
 
+#[derive(clap::Subcommand)]
+enum CheckCommand {
+    /// Run one named configured suite, reusing an exact immutable observation when possible.
+    Run {
+        /// Suite name from the project's `.cairn/config.yaml` `checks` contract.
+        suite: String,
+        /// Optional branch or revision. Defaults to the current logical head.
+        branch: Option<String>,
+    },
+}
+
 fn main() -> Result<()> {
-    // Detect executable-shim invocation before constructing Tokio. The shim uses
-    // reqwest's blocking client and may exec the native binary; doing either
-    // inside an async runtime can panic while the blocking client's private
-    // runtime is dropped.
-    if let Some(program) = warm_search_shim::invoked_program() {
-        warm_search_shim::run(program);
-    }
+    retain_sidecar_version_stamp();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -158,6 +198,7 @@ async fn async_main() -> Result<()> {
         Some(Command::Read { .. })
             | Some(Command::Write { .. })
             | Some(Command::Watch { .. })
+            | Some(Command::Check { .. })
             | Some(Command::Executor { .. })
     );
     // `None` level: the spawning app injects `CAIRN_LOG_LEVEL`, which the filter
@@ -180,6 +221,12 @@ async fn async_main() -> Result<()> {
             limit,
         }) => {
             let ok = run_cli_read(targets, *offset, *limit).await;
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        Some(Command::Check {
+            command: CheckCommand::Run { suite, branch },
+        }) => {
+            let ok = run_cli_check(suite.clone(), branch.clone()).await;
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Executor { command }) => {

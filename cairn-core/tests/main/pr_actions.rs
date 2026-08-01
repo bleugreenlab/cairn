@@ -128,7 +128,17 @@ fn provision_jj_conflict(bin: &str, config_dir: &Path, repo: &Path) {
     jj_cmd(&["describe", "-m", "main advances shared"]);
     jj_cmd(&["bookmark", "set", "main", "-r", "@"]);
     // Rebasing feature onto the advanced main records a conflict on `feature`.
-    jj::rebase_branch_onto(&jj, &store, "feature", "main").unwrap();
+    // Driven through raw jj rather than `rebase_branch_onto`, which now rolls a
+    // conflicting rebase back instead of leaving the conflict on the branch — and
+    // what this fixture needs is precisely a branch carrying one.
+    jj_cmd(&[
+        "rebase",
+        "-b",
+        "feature",
+        "-o",
+        "main",
+        "--ignore-working-copy",
+    ]);
     assert!(
         jj::branch_has_conflict(&jj, &store, "feature").unwrap(),
         "feature must carry a recorded conflict after rebase onto advanced main"
@@ -238,6 +248,32 @@ async fn create_workspace_project(db: &LocalDb, key: &str, repo_path: &str) -> S
 
 async fn orchestrator_with_http(db: LocalDb, http: MockHttpClient) -> (TempDir, Orchestrator) {
     orchestrator_with_http_and_git(db, http, MockGitClient::new()).await
+}
+
+/// Like [`orchestrator_with_http`], but rooted at a caller-owned temp dir.
+///
+/// Needed whenever the jj store must be provisioned BEFORE the HTTP mock is
+/// built — a test whose GitHub response has to carry the branch's real head
+/// commit cannot learn that commit until the store exists.
+async fn orchestrator_with_http_in(
+    db: LocalDb,
+    http: MockHttpClient,
+    cfg: &TempDir,
+) -> Orchestrator {
+    let mut git = MockGitClient::new();
+    git.expect_status()
+        .times(0..)
+        .returning(|_| Ok(String::new()));
+    let db = Arc::new(db);
+    let search = Arc::new(SearchIndex::open_or_create(cfg.path().join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(db, search));
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_http(http)
+            .with_git(git)
+            .build(),
+    );
+    Orchestrator::builder(db_state, services, cfg.path().join("config")).build()
 }
 
 async fn orchestrator_with_http_and_git(
@@ -626,6 +662,16 @@ fn token_response() -> HttpResponse {
 }
 
 fn pr_response(state: &str, merged: bool) -> HttpResponse {
+    pr_response_with_head(state, merged, "abc123")
+}
+
+/// A PR response whose head SHA is chosen by the caller.
+///
+/// The head matters wherever the branch store is real: the artifact compares
+/// GitHub's head against the branch's current commit, so a test that means to
+/// exercise something OTHER than head divergence has to hand GitHub the commit
+/// the branch actually holds.
+fn pr_response_with_head(state: &str, merged: bool, head_sha: &str) -> HttpResponse {
     HttpResponse {
         status: 200,
         body: serde_json::to_vec(&serde_json::json!({
@@ -638,7 +684,7 @@ fn pr_response(state: &str, merged: bool) -> HttpResponse {
             "additions": 12,
             "deletions": 3,
             "merged": merged,
-            "head": { "sha": "abc123" }
+            "head": { "sha": head_sha }
         }))
         .unwrap(),
     }
@@ -727,7 +773,7 @@ async fn refresh_pr_for_job_updates_cache() {
     let (_cfg, orch) = orchestrator_with_http(db, http).await;
 
     let cache = actions::refresh_pr_for_job(&orch, &job).await.unwrap();
-    assert_eq!(cache.pr_number, 5);
+    assert_eq!(cache.pr_number, Some(5));
     assert_eq!(cache.additions, Some(12));
     assert_eq!(cache.deletions, Some(3));
 
@@ -890,6 +936,12 @@ async fn reconcile_after_merge_for_action_run_owner_stores_files_under_parent_jo
     let mut git = MockGitClient::new();
     git.expect_current_branch()
         .returning(|_| Ok("feature".to_string()));
+    git.expect_branch_exists()
+        .withf(|_, branch| branch == "feature")
+        .returning(|_, _| Ok(true));
+    git.expect_delete_branch()
+        .withf(|_, branch, force| branch == "feature" && *force)
+        .returning(|_, _, _| Ok(()));
     git.expect_worktree_list()
         .returning(|_| Ok("worktree /tmp/repo\nHEAD abc\nbranch refs/heads/main\n".to_string()));
     let (_cfg, orch) = orchestrator_with_http_and_git(db, http, git).await;
@@ -1044,6 +1096,12 @@ async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
 /// Pre-flight: the live PR section surfaces a conflicted history BEFORE a merge.
 /// It renders CONFLICTING (over GitHub's false mergeable bit), enumerates the
 /// conflicted commit and file, and flags the inflated diff as stale.
+///
+/// The pull request's head is the branch's REAL current commit here, so this
+/// isolates the conflict override: with a divergent head the answer would be
+/// UNKNOWN instead, which
+/// `render_live_pr_section_publishes_no_verdict_for_a_conflicted_tip_at_a_stale_head`
+/// covers.
 #[tokio::test]
 async fn render_live_pr_section_flags_conflicted_history() {
     let Some(bin) = common::jj_bin() else {
@@ -1059,14 +1117,24 @@ async fn render_live_pr_section_flags_conflicted_history() {
     let job = create_job(&db, &project, &issue).await;
     let _mr = create_merge_request(&db, &job, &project, &issue, 5).await;
 
+    // Provision first so GitHub can be handed the commit `feature` actually
+    // holds; otherwise the head would diverge and no verdict would be published.
+    let cfg = tempfile::tempdir().unwrap();
+    let config_dir = cfg.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    provision_jj_conflict(&bin, &config_dir, repo.path());
+    let feature_head = jj_bookmark_commit(&bin, &config_dir, repo.path(), "feature");
+
     let http = MockHttpClient::new()
         .respond_to("access_tokens", token_response())
         .respond_to("/pulls/5/reviews", empty_array_response())
         .respond_to("/pulls/5/files", files_response())
         .respond_to("/check-runs", check_runs_response())
-        .respond_to("/pulls/5", pr_response("open", false));
-    let (cfg, orch) = orchestrator_with_http(db, http).await;
-    provision_jj_conflict(&bin, &cfg.path().join("config"), repo.path());
+        .respond_to(
+            "/pulls/5",
+            pr_response_with_head("open", false, &feature_head),
+        );
+    let orch = orchestrator_with_http_in(db, http, &cfg).await;
 
     let section =
         actions::render_live_pr_section(&orch, &job, "cairn://p/RVC/1/1/builder/pr", false)
@@ -1093,6 +1161,172 @@ async fn render_live_pr_section_flags_conflicted_history() {
         section.contains("resolve-at-base"),
         "names the recovery path: {section}"
     );
+}
+
+/// Review regression: a divergent head AND a conflicted current tip.
+///
+/// These two probes have different subjects — GitHub's mergeability is about the
+/// head the pull request holds, the conflict report is about the commit the
+/// branch holds now. When the head is stale, letting the conflict probe win
+/// would cache CONFLICTING as a property of a pull request whose tree does not
+/// contain that conflict at all. The verdict must stay UNKNOWN, and both facts
+/// must still be stated in prose.
+///
+/// This combination is the COMMON shape of the stale head in practice: the same
+/// rebase that conflicts a tip also moves the bookmark away from what was pushed.
+#[tokio::test]
+async fn render_live_pr_section_publishes_no_verdict_for_a_conflicted_tip_at_a_stale_head() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping render_live_pr_section_publishes_no_verdict_for_a_conflicted_tip_at_a_stale_head: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    add_github_origin(repo.path());
+    insert_github_app(&db).await;
+    let project = create_project(&db, "RVCS", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    let job = create_job(&db, &project, &issue).await;
+    let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/pulls/5/reviews", empty_array_response())
+        .respond_to("/pulls/5/files", files_response())
+        .respond_to("/check-runs", check_runs_response())
+        // head `abc123` is not the commit the branch holds: the PR is stale.
+        .respond_to("/pulls/5", pr_response("open", false));
+    let (cfg, orch) = orchestrator_with_http(db, http).await;
+    let config_dir = cfg.path().join("config");
+    provision_jj_conflict(&bin, &config_dir, repo.path());
+    let branch_head = jj_bookmark_commit(&bin, &config_dir, repo.path(), "feature");
+
+    let section =
+        actions::render_live_pr_section(&orch, &job, "cairn://p/RVCS/1/1/builder/pr", false)
+            .await
+            .expect("PR artifact should yield a section");
+
+    assert!(
+        section.contains("Mergeable: UNKNOWN"),
+        "a conflict on the current tip is not a verdict on a stale head: {section}"
+    );
+    assert!(
+        !section.contains("Mergeable: CONFLICTING"),
+        "must not attribute the branch's conflict to the pull request: {section}"
+    );
+    // Both facts still reach the reader in prose.
+    assert!(
+        section.contains("version of `feature`") && section.contains(&branch_head[..12]),
+        "names the divergence and both commits: {section}"
+    );
+    assert!(
+        section.contains("Conflicted history") && section.contains("shared.txt"),
+        "still enumerates the conflicted history: {section}"
+    );
+
+    // The refresh-on-read persists UNKNOWN, so the desktop's cached path cannot
+    // serve CONFLICTING about the pull request either.
+    let cached = orch
+        .db
+        .local
+        .read(|conn| {
+            let mr = mr.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT github_mergeable FROM merge_requests WHERE id = ?1",
+                        params![mr.as_str()],
+                    )
+                    .await?;
+                rows.next().await?.unwrap().opt_text(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(cached.as_deref(), Some("UNKNOWN"));
+}
+
+/// CAIRN-3197: a pull request whose head lags its branch read OPEN / MERGEABLE
+/// while the entire merge-blocking fix sat in commits the pull request did not
+/// contain. Every green signal described a tree nobody had validated.
+///
+/// GitHub reports `mergeable: true` for head `abc123`; the branch store holds a
+/// different commit for `feature`. The artifact must name both commits and must
+/// not publish an unqualified verdict — and the downgrade must reach the cached
+/// row too, since the desktop reads that row without probing.
+#[tokio::test]
+async fn render_live_pr_section_flags_a_pull_request_behind_its_branch() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!(
+            "skipping render_live_pr_section_flags_a_pull_request_behind_its_branch: jj not resolvable"
+        );
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    add_github_origin(repo.path());
+    insert_github_app(&db).await;
+    let project = create_project(&db, "RVSTALE", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    let job = create_job(&db, &project, &issue).await;
+    let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/pulls/5/reviews", empty_array_response())
+        .respond_to("/pulls/5/files", files_response())
+        .respond_to("/check-runs", check_runs_response())
+        // mergeable: true, mergeable_state: clean, head.sha: abc123.
+        .respond_to("/pulls/5", pr_response("open", false));
+    let (cfg, orch) = orchestrator_with_http(db, http).await;
+    let config_dir = cfg.path().join("config");
+    // `feature` is sealed one commit ahead of `main`, so the store holds a real
+    // commit that is not the `abc123` GitHub reports as the pull request's head.
+    provision_jj_merge(&config_dir, repo.path());
+    let branch_head = jj_bookmark_commit(&bin, &config_dir, repo.path(), "feature");
+
+    let section =
+        actions::render_live_pr_section(&orch, &job, "cairn://p/RVSTALE/1/1/builder/pr", false)
+            .await
+            .expect("PR artifact should yield a section");
+
+    assert!(
+        section.contains("Mergeable: UNKNOWN"),
+        "GitHub's MERGEABLE describes the head it holds, not the branch: {section}"
+    );
+    assert!(
+        section.contains("version of `feature`"),
+        "says the pull request shows a different version of the branch: {section}"
+    );
+    assert!(
+        section.contains("abc123"),
+        "names the commit the pull request holds: {section}"
+    );
+    assert!(
+        section.contains(&branch_head[..12]),
+        "names the commit the branch holds ({branch_head}): {section}"
+    );
+
+    // The refresh-on-read persists the downgrade, so the desktop's cached path
+    // cannot keep serving the green verdict.
+    let cached = orch
+        .db
+        .local
+        .read(|conn| {
+            let mr = mr.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT github_mergeable FROM merge_requests WHERE id = ?1",
+                        params![mr.as_str()],
+                    )
+                    .await?;
+                rows.next().await?.unwrap().opt_text(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(cached.as_deref(), Some("UNKNOWN"));
 }
 
 /// Regression guard for the post-jj-migration squash default: a PR branch with

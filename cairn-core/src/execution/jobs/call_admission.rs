@@ -196,7 +196,6 @@ mod tests {
             job_id: format!("job-{run_id}"),
             run_id: run_id.to_string(),
             session_id: format!("sess-{run_id}"),
-            owns_ephemeral_worktree: false,
             agent_config: AgentConfig {
                 id: "Explore".into(),
                 name: "Explore".into(),
@@ -217,7 +216,6 @@ mod tests {
                 extras: None,
             },
             selected_model: Some(Model::new("sonnet")),
-            working_dir: "/tmp".into(),
             prompt: "do the thing".into(),
             output_schema: OutputSchemaInfo {
                 schema: OutputSchema::Preset("return".into()),
@@ -227,7 +225,6 @@ mod tests {
                 description: None,
             },
             execution_id: None,
-            worktree_path: None,
         }
     }
 

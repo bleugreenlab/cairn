@@ -59,6 +59,20 @@ async fn seed_second_job(db: &LocalDb) {
         .unwrap();
 }
 
+/// The child-attention fixture's child issue: `cairn://p/P/2`, parented to the
+/// fixture issue `i` that `seed_job` puts jobs on.
+const CHILD_URI: &str = "cairn://p/P/2";
+
+async fn seed_child_issue(db: &LocalDb) {
+    db.execute(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_issue_id, created_at, updated_at)
+             VALUES('child','p',2,'Child','active','active','none','i',2,2)",
+            (),
+        )
+        .await
+        .unwrap();
+}
+
 struct QueueableNodeFixture {
     job_id: &'static str,
     run_id: &'static str,
@@ -82,7 +96,7 @@ async fn seed_queueable_node(db: &LocalDb) -> QueueableNodeFixture {
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES('e','recipe','i','p','running',1,1);
-            INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, worktree_path, status, current_session_id, created_at, updated_at) VALUES('j','e','builder','i','p','builder','builder','/tmp','running','s',1,1);
+            INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, branch, status, current_session_id, created_at, updated_at) VALUES('j','e','builder','i','p','builder','builder','agent/builder','running','s',1,1);
             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at) VALUES('s','j','claude','open',1,1,1);
             INSERT INTO runs(id, project_id, issue_id, job_id, session_id, status, created_at, updated_at) VALUES('r','p','i','j','s','live',1,1);
             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, started_at, updated_at) VALUES('t','s','r','j',1,'running','initial',1,1,1);
@@ -553,13 +567,14 @@ async fn scoped_fact_kinds_match_granularly() {
     );
 }
 
+/// A narrow mute on a derived child watch narrows only what it names. The mute
+/// row is the coordinator's only row for the child, but it must not shrink the
+/// watch itself: unnamed facts still wake.
 #[tokio::test(flavor = "current_thread")]
-async fn narrow_mute_overrides_seeded_broad_default() {
+async fn narrow_mute_downgrades_only_the_facts_it_names() {
     let db = migrated_db().await;
     seed_job(&db).await;
-    seed_default_child_subscription_for_parent_job(&db, "j", "cairn://p/P/2")
-        .await
-        .unwrap();
+    seed_child_issue(&db).await;
     let kinds = vec![
         "pr_state_change".to_string(),
         "agent_idle_with_work".to_string(),
@@ -568,7 +583,7 @@ async fn narrow_mute_overrides_seeded_broad_default() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some(CHILD_URI),
         Some(&kinds),
         None,
         None,
@@ -577,19 +592,31 @@ async fn narrow_mute_overrides_seeded_broad_default() {
     .await
     .unwrap();
 
-    let pr = matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "pr_state_change")
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["j".to_string()],
+        "a muted coordinator still watches its child"
+    );
+    assert_eq!(
+        mute_downgrade(
+            &db,
+            "j",
+            "issue",
+            Some(CHILD_URI),
+            "pr_state_change",
+            Wake::Wake
+        )
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(pr.state, WakeSubscriptionState::Muted);
-    assert_eq!(pr.fact_kinds.as_ref().unwrap().len(), 2);
-
-    let question = matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "question")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(question.state, WakeSubscriptionState::Active);
-    assert_eq!(question.created_by, "system");
+        .unwrap(),
+        Wake::Passive
+    );
+    assert_eq!(
+        mute_downgrade(&db, "j", "issue", Some(CHILD_URI), "question", Wake::Wake)
+            .await
+            .unwrap(),
+        Wake::Wake,
+        "a fact the mute does not name still wakes"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -736,7 +763,7 @@ async fn passive_message_like_wake_respects_subscription_state() {
         "active passive messages remain claimable through their original row, not wake digest"
     );
 
-    unsubscribe_matching(&orch.db.local, "j", "user", None)
+    unsubscribe_matching(&orch.db.local, "j", "user", None, "agent")
         .await
         .unwrap();
     let dropped = route_wake(
@@ -757,57 +784,231 @@ async fn passive_message_like_wake_respects_subscription_state() {
     assert_eq!(dropped, WakeRouteAction::Dropped);
 }
 
+// ---- Child attention: derived from the parent edge (CAIRN-3293) -------------
+//
+// The recipient of a child's attention is the node currently driving the parent
+// issue, resolved at wake time. These cover the three ways a coordinator comes
+// to own a child (it filed the child, someone else filed it pre-parented, it
+// started an execution on an already-parented parent) plus coordinator
+// succession, since a snapshot taken at filing time got the first case right and
+// silently failed the rest.
+
 #[tokio::test(flavor = "current_thread")]
-async fn seeds_default_child_subscription_from_recorded_parent_job() {
+async fn a_parented_child_reaches_its_coordinator_with_no_subscription_row() {
     let db = migrated_db().await;
     seed_job(&db).await;
+    seed_child_issue(&db).await;
+
+    assert_eq!(
+        coordinating_job_for_child_issue(&db, CHILD_URI)
+            .await
+            .unwrap(),
+        Some("j".to_string())
+    );
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["j".to_string()]
+    );
+    assert!(
+        list_subscriptions_for_job(&db, "j")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the watch is derived, so nothing is persisted for it"
+    );
+}
+
+/// Coordinator succession. A second execution's coordinator on the parent issue
+/// owns the parent's children from the moment it exists; the retired one stops
+/// receiving them. Both directions of the CAIRN-3293 defect are this assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_coordinator_execution_takes_over_the_parents_children() {
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    seed_child_issue(&db).await;
+    seed_second_job(&db).await;
+
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["j2".to_string()],
+        "the newest coordinator receives the child's gates, and only it"
+    );
+    assert!(
+        coordinated_child_issue_uris_for_job(&db, "j")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a superseded coordinator coordinates nothing"
+    );
+    assert_eq!(
+        coordinated_child_issue_uris_for_job(&db, "j2")
+            .await
+            .unwrap(),
+        vec![CHILD_URI.to_string()]
+    );
+}
+
+/// Acquisition path 2: a child filed by some *other* job, already parented. The
+/// filer is irrelevant — only the parent edge decides.
+#[tokio::test(flavor = "current_thread")]
+async fn a_child_filed_by_another_job_reaches_the_parents_coordinator() {
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    seed_child_issue(&db).await;
+    db.execute_script(
+            "
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('other','p',3,'Other','active','active','none',3,3);
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+              VALUES('filer','p','other','running','sf',9,9);
+            ",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["j".to_string()],
+        "the filing job never enters the child's watcher set"
+    );
+}
+
+/// Acquisition path 3: the child is already parented before any execution runs on
+/// the parent, and the coordinator arrives later. Execution start mints nothing,
+/// which is exactly why the recipient must be derived rather than minted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_coordinator_started_after_the_child_still_receives_it() {
+    let db = migrated_db().await;
+    db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+    seed_child_issue(&db).await;
+
+    assert!(watcher_jobs_for_issue(&db, CHILD_URI)
+        .await
+        .unwrap()
+        .is_empty());
+
     db.execute(
-            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_issue_id, parent_job_id, created_at, updated_at)
-             VALUES('child', 'p', 2, 'Child', 'active', 'active', 'none', 'i', 'j', 2, 2)",
+            "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+             VALUES('late','p','i','running','sl',5,5)",
             (),
         )
         .await
         .unwrap();
 
-    let seeded = seed_default_child_subscription_for_issue(&db, "child", "cairn://p/P/2")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(seeded.job_id, "j");
-    assert_eq!(seeded.source_kind, "issue");
-    assert_eq!(seeded.source_ref.as_deref(), Some("cairn://p/P/2"));
-    let mut kinds = seeded.fact_kinds.unwrap();
-    kinds.sort();
     assert_eq!(
-        kinds,
-        vec![
-            "message".to_string(),
-            "permission".to_string(),
-            "question".to_string(),
-            "resolved".to_string(),
-            "review".to_string(),
-        ]
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["late".to_string()]
     );
+}
 
-    let subs = list_subscriptions_for_job(&db, "j").await.unwrap();
-    assert_eq!(subs.len(), 1);
+/// A coordinator's delegated sub-task is not a coordinator, even when it is the
+/// newest job on the parent issue and holds a live session. This mis-pick is what
+/// originally motivated snapshotting the spawning job (CAIRN-1302); the
+/// recipe-root filter is what makes the live derivation safe from it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delegated_sub_task_never_coordinates_a_child() {
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    seed_child_issue(&db).await;
+    db.execute(
+            "INSERT INTO jobs(id, project_id, issue_id, parent_job_id, status, current_session_id, created_at, updated_at)
+             VALUES('subtask','p','i','j','complete','ss',9,9)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["j".to_string()]
+    );
+}
+
+/// A failed job, or one that never ran, cannot be the coordinator — attention
+/// falls back to the newest job that can actually receive it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_or_never_run_parent_job_does_not_coordinate() {
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    seed_child_issue(&db).await;
+    db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+              VALUES('failed','p','i','failed','sx',8,8);
+            INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+              VALUES('unstarted','p','i','pending',9,9);
+            ",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["j".to_string()]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn reconcile_child_subscription_moves_default_to_current_parent() {
+async fn an_unparented_issue_has_no_derived_watcher() {
     let db = migrated_db().await;
     seed_job(&db).await;
-    seed_second_job(&db).await;
     db.execute(
-            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_issue_id, parent_job_id, created_at, updated_at)
-             VALUES('child', 'p', 2, 'Child', 'active', 'active', 'none', 'i', 'j2', 2, 2)",
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('child','p',2,'Child','active','active','none',2,2)",
             (),
         )
         .await
         .unwrap();
-    seed_default_child_subscription_for_parent_job(&db, "j", "cairn://p/P/2")
+
+    assert_eq!(
+        coordinating_job_for_child_issue(&db, CHILD_URI)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(watcher_jobs_for_issue(&db, CHILD_URI)
         .await
-        .unwrap();
+        .unwrap()
+        .is_empty());
+}
+
+/// Opting out of a derived watch has no row to flip, so the refusal is recorded
+/// as one. Without that, the derivation would re-add the coordinator on the very
+/// next wake.
+#[tokio::test(flavor = "current_thread")]
+async fn an_explicit_unsubscribe_opts_a_coordinator_out_of_its_derived_watch() {
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    seed_child_issue(&db).await;
+
+    assert_eq!(
+        unsubscribe_matching(&db, "j", "issue", Some(CHILD_URI), "agent")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        watcher_jobs_for_issue(&db, CHILD_URI)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a recorded refusal survives the derivation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manual_watchers_and_the_derived_coordinator_both_watch() {
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    seed_child_issue(&db).await;
     db.execute(
             "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
              VALUES('manual','p','i','complete','sm',3,3)",
@@ -815,70 +1016,48 @@ async fn reconcile_child_subscription_moves_default_to_current_parent() {
         )
         .await
         .unwrap();
-    subscribe(&db, "manual", "issue", Some("cairn://p/P/2"), None, "agent")
+    subscribe(&db, "manual", "issue", Some(CHILD_URI), None, "agent")
         .await
         .unwrap();
 
-    let seeded = reconcile_default_child_subscription_for_issue(&db, "child", "cairn://p/P/2")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(seeded.job_id, "j2");
-
-    assert!(list_subscriptions_for_job(&db, "j")
-        .await
-        .unwrap()
-        .is_empty());
+    // `manual` is the newest recipe-root job on the parent, so it is also the
+    // derived coordinator; its explicit row is what governs it, and no duplicate
+    // recipient appears.
     assert_eq!(
-        list_subscriptions_for_job(&db, "j2").await.unwrap().len(),
-        1
-    );
-    assert_eq!(
-        list_subscriptions_for_job(&db, "manual")
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "manual watcher must be preserved"
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["manual".to_string()]
     );
 }
 
+/// The broadcast router (external message replies on a child issue) resolves the
+/// derived coordinator too, scoped to the default child fact kinds.
 #[tokio::test(flavor = "current_thread")]
-async fn reconcile_child_subscription_orphan_removes_only_system_default() {
+async fn broadcast_child_facts_match_the_derived_coordinator() {
     let db = migrated_db().await;
     seed_job(&db).await;
-    db.execute_script(
-            "
-            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
-              VALUES('child', 'p', 2, 'Child', 'active', 'active', 'none', 2, 2);
-            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-              VALUES('manual','p','i','complete','sm',3,3);
-            ",
-        )
-        .await
-        .unwrap();
-    seed_default_child_subscription_for_parent_job(&db, "j", "cairn://p/P/2")
-        .await
-        .unwrap();
-    subscribe(&db, "manual", "issue", Some("cairn://p/P/2"), None, "agent")
-        .await
-        .unwrap();
+    seed_child_issue(&db).await;
 
-    let reconciled = reconcile_default_child_subscription_for_issue(&db, "child", "cairn://p/P/2")
+    let matched = matching_subscriptions_for_source(&db, "issue", Some(CHILD_URI), "message")
         .await
         .unwrap();
-    assert!(reconciled.is_none());
-    assert!(list_subscriptions_for_job(&db, "j")
-        .await
-        .unwrap()
-        .is_empty());
-    assert_eq!(
-        list_subscriptions_for_job(&db, "manual")
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].job_id, "j");
+    assert_eq!(matched[0].state, WakeSubscriptionState::Active);
+
+    // The derived watch carries exactly the fact vocabulary the seeded default
+    // carried, so what the broadcast router reaches is unchanged. Notably
+    // `external_message_reply` — the one fact still routed this way — is outside
+    // that vocabulary and has always required an explicit broad issue
+    // subscription, which the derivation deliberately does not widen.
+    for outside in ["terminal_exit", "external_message_reply"] {
+        assert!(
+            matching_subscriptions_for_source(&db, "issue", Some(CHILD_URI), outside)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{outside} is outside the child fact vocabulary"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -955,7 +1134,9 @@ async fn default_seed_does_not_reactivate_unsubscribed_scope() {
     let db = migrated_db().await;
     seed_job(&db).await;
     seed_default_job_subscriptions(&db, "j").await.unwrap();
-    unsubscribe_matching(&db, "j", "user", None).await.unwrap();
+    unsubscribe_matching(&db, "j", "user", None, "agent")
+        .await
+        .unwrap();
     seed_default_job_subscriptions(&db, "j").await.unwrap();
 
     let user = matching_subscription(&db, "j", "user", None, "message")

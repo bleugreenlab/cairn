@@ -58,6 +58,10 @@ Line windows use `offset` and `limit`:
 
 Oversized targets end with a footer like `[lines A–B of N — continue: file:src/big.rs?offset=B&limit=...]`; read that continuation URI to keep going. Tail with `offset=-N`.
 
+Read a file as of another revision with `?branch=REF` — a branch name, a commit, or a node URI — without changing what your own branch holds:
+
+    read({paths:["file:src/lib.rs?branch=main"]})
+
 Content search is built into `read` and is ripgrep-backed:
 
     read({paths:["file:src?grep=native_tool_map&glob=**/*.rs"]})
@@ -112,7 +116,7 @@ The unified-diff form applies hunks against one file:
       {target:"file:src/lib.rs", mode:"patch", payload:{diff:"@@ -1,3 +1,3 @@\n fn validate(x) {\n-  old(x)\n+  verify(x)\n }\n"}}
     ], commit_msg:"tighten validation"})
 
-`mode:"rename"` renames an identifier structurally across the worktree. Give `new_name` plus exactly one of `old_name` or `symbol_at`. It previews by default (returns an `apply_uri` you land with `mode:"apply"`); `preview:false` renames in one shot. For the full preview/apply flow, read cairn://skills/structural-code-navigation.
+`mode:"rename"` renames an identifier structurally across the logical project tree. Give `new_name` plus exactly one of `old_name` or `symbol_at`. It previews by default (returns an `apply_uri` you land with `mode:"apply"`); `preview:false` renames in one shot. For the full preview/apply flow, read cairn://skills/structural-code-navigation.
 
 Combo moves keep related edits, todos, and issue notes together:
 
@@ -163,17 +167,24 @@ Write your artifact with create or patch as your turn's last action; it pauses t
       {target:"cairn://skills/testing/scripts/run-coverage"}
     ]})
 
-A `run` whose commands change worktree files must carry `commit_msg` on the call — the batch is committed as one commit when it succeeds, and a file-dirtying batch without `commit_msg` is discarded back to HEAD.
+A `run` whose command changes tracked files must carry `commit_msg` on the call; without it, the changes are discarded.
+
     run({
       commands:[{command:"bun run changelog \"Add user roles\""}],
       commit_msg:"changelog: add user roles",
     })
 
+When the suite you are landing into is not already green, a failure is only yours if it isn't already failing on the base. `branch` answers that in one call, running the batch against another revision instead of your own branch:
+
+    run({commands:[{command:"bun run test"}], branch:"main"})
+
+It takes the same refs `read`'s `?branch=` does, and is verdict-only: tracked files the batch writes are discarded, it cannot be combined with `commit_msg`, and an MCP-tool or REPL batch executes on the host and is rejected.
+
 ### Interpreters
 
 Inline `{code, interpreter}` is the default way to run code that isn't a CLI invocation. The interpreter execs your source directly, with no shell in between, so there is nothing to quote or escape. Reach for it instead of wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`.
 
-`typescript`/`ts` (and `javascript`/`js`) run via `bun`. The worktree's `node_modules` is importable and `@cairn/sdk` is wired with zero config, so a quick SDK batch or data transform is one item:
+`typescript`/`ts` (and `javascript`/`js`) run via `bun`. The executor projection's `node_modules` is importable and `@cairn/sdk` is wired with zero config, so a quick SDK batch or data transform is one item:
 
     run({commands:[{interpreter:"typescript", description:"count active issues", code:`
       import { read } from "@cairn/sdk";
@@ -191,17 +202,17 @@ Inline `{code, interpreter}` is the default way to run code that isn't a CLI inv
       print(requests.get("https://example.com").status_code)
     `}]})
 
-When the worktree has a `pyproject.toml` or `uv.lock`, plain python (no metadata block) runs inside that project environment so project deps import; with neither, it runs against the standard library. If `uv` is ever absent, python falls back to plain `python3`.
+When the logical project has a `pyproject.toml` or `uv.lock`, plain python (no metadata block) runs inside that project environment so project deps import; with neither, it runs against the standard library.
 
 Inline code is for synchronous compute that runs to completion — a transform, a check, a scripted batch. Long-running or background work still belongs in a terminal resource (or a durable workflow script), not an inline item.
 
 For an exploration that builds up state across several `run` calls — load a dataframe once, then query it repeatedly — create a stateful REPL and route code into it with the `repl` key. Variables, imports, and definitions persist across calls, so you don't reload each time:
 
-    write({changes:[{target:"cairn:~/repl/analysis", mode:"create", payload:{interpreter:"python"}}]})
+    write({changes:[{target:"cairn:~/repl/analysis", mode:"create", payload:{interpreter:"python", deps:["pandas"]}}]})
     run({commands:[{interpreter:"python", repl:"analysis", code:"import pandas as pd; df = pd.read_csv('data.csv')"}]})
     run({commands:[{interpreter:"python", repl:"analysis", code:"df['amount'].sum()"}]})
 
-The trailing expression's value comes back as the result. A REPL is python or typescript and lives as long as your node; its state is lost if it dies (recreate and replay). Read `cairn:~/repl/<slug>` for its status, `delete` it to stop it. This is not for large or one-shot work — a fresh inline item is simpler when nothing needs to carry over.
+The trailing expression's value comes back as the result. A REPL is python or typescript; python sessions take a `deps` array (`{interpreter:"python", deps:["pandas"]}`) that preloads packages via uv, so don't install from inside the session. Read `cairn:~/repl/<slug>` for its status and its live namespace (what is currently bound). The REPL is durable even though its namespace is not: if the interpreter dies you keep the transcript and the read says so, and creating the slug again resumes it with an empty namespace. `delete` stops it; `delete` again discards it. This is not for large or one-shot work — a fresh inline item is simpler when nothing needs to carry over.
 
 ## Utilities
 
@@ -209,7 +220,7 @@ Three high-value resources, reached through the verbs above:
 
 - **`cairn:~/browser`** — a persistent browser tab visible to BOTH you and the user as one shared session. `write` it to open or navigate (`{url}`) and to drive the live page (`{action: click|type|scroll|waitFor|back|forward|reload}` with `selector`/`text`/`value` args); `read` it for the live page as markdown (`?format=text` for plain text, `?screenshot` for a rendered image you can actually see). Use a plain web read (`read https://…`) for a one-shot "what does this URL say"; reach for `cairn:~/browser` when you need persistent browsing state, live testing of a running app (open `localhost:<port>` beside a dev terminal), interaction, or a visual check. Full procedure: cairn://skills/browser.
 
-- **`cairn:~/symbols/{name}`** — structural code navigation over the current worktree via the in-process ast-grep / tree-sitter engine (no language server, no index; files parse on demand). Pick an op with `?op=` — `definition`, `references`, `callers`, `implementations` — or omit it for an overview (definition site + signature + reference count). Scope with `?in=<glob>` and add `-A`/`-B`/`-C` for surrounding source. (`?ast=` and `?outline` in the read section are the same engine applied to a file target.) Full surface: cairn://skills/structural-code-navigation.
+- **`cairn:~/symbols/{name}`** — structural code navigation over the logical project tree via the in-process ast-grep / tree-sitter engine. Pick an op with `?op=` — `definition`, `references`, `callers`, `implementations` — or omit it for an overview (definition site + signature + reference count). Scope with `?in=<glob>` and add `-A`/`-B`/`-C` for surrounding source. (`?ast=` and `?outline` in the read section are the same engine applied to a file target.) Full surface: cairn://skills/structural-code-navigation.
 
 - **`cairn://db`** — a read-only SQL projection over the running app's own database. Give `?sql=` a `SELECT`/`WITH` query or a schema `PRAGMA` (read-only — no writes), with `offset`/`limit` row windows. Good for inspecting or analyzing app state across many rows in one query. For live-data inspection and migration patterns, read cairn://skills/database-migrations.
 

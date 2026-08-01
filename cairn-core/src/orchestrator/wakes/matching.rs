@@ -53,13 +53,44 @@ pub(super) async fn matching_subscriptions_for_source(
     source_ref: Option<&str>,
     fact_kind: &str,
 ) -> Result<Vec<WakeSubscription>, String> {
+    // An `issue` source carries the derived parent-axis watch alongside its
+    // persisted rows, so a broadcast child fact reaches the node currently
+    // driving the parent even though no row was ever minted for it (CAIRN-3293).
+    let subscriptions = match (source_kind, source_ref) {
+        (SOURCE_KIND_ISSUE, Some(issue_uri)) => {
+            super::child::subscriptions_governing_issue(db, issue_uri).await?
+        }
+        _ => subscriptions_for_source(db, source_kind, source_ref).await?,
+    };
+    let mut by_job: std::collections::BTreeMap<String, Vec<WakeSubscription>> =
+        std::collections::BTreeMap::new();
+    for subscription in subscriptions {
+        by_job
+            .entry(subscription.job_id.clone())
+            .or_default()
+            .push(subscription);
+    }
+    Ok(by_job
+        .into_values()
+        .filter_map(|subscriptions| {
+            best_matching_subscription(subscriptions, source_kind, source_ref, fact_kind)
+        })
+        .collect())
+}
+
+/// Every persisted subscription on one source, unfiltered by fact kind and
+/// ungrouped. A `peer` row with no `source_ref` watches every peer, so it is
+/// included for any peer reference.
+pub(super) async fn subscriptions_for_source(
+    db: &LocalDb,
+    source_kind: &str,
+    source_ref: Option<&str>,
+) -> Result<Vec<WakeSubscription>, String> {
     let source_kind = source_kind.to_string();
     let source_ref = source_ref.map(ToString::to_string);
-    let fact_kind = fact_kind.to_string();
     db.read(|conn| {
         let source_kind = source_kind.clone();
         let source_ref = source_ref.clone();
-        let fact_kind = fact_kind.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
@@ -74,24 +105,11 @@ pub(super) async fn matching_subscriptions_for_source(
                     params![source_kind.as_str(), source_ref.as_deref()],
                 )
                 .await?;
-            let mut by_job: std::collections::BTreeMap<String, Vec<WakeSubscription>> =
-                std::collections::BTreeMap::new();
+            let mut subscriptions = Vec::new();
             while let Some(row) = rows.next().await? {
-                let sub = subscription_from_row(&row)?;
-                by_job.entry(sub.job_id.clone()).or_default().push(sub);
+                subscriptions.push(subscription_from_row(&row)?);
             }
-            let mut matched = Vec::new();
-            for subscriptions in by_job.into_values() {
-                if let Some(sub) = best_matching_subscription(
-                    subscriptions,
-                    &source_kind,
-                    source_ref.as_deref(),
-                    &fact_kind,
-                ) {
-                    matched.push(sub);
-                }
-            }
-            Ok(matched)
+            Ok(subscriptions)
         })
     })
     .await
@@ -130,7 +148,12 @@ fn fact_kind_matches(subscription_kind: &str, event_kind: &str) -> bool {
 }
 
 fn subscription_match_score(sub: &WakeSubscription) -> (i32, i32, i32, i64) {
-    let creator_score = if sub.created_by == "system" { 0 } else { 1 };
+    // A default (seeded or derived) loses to anything a node chose for itself.
+    let creator_score = if matches!(sub.created_by.as_str(), "system" | CREATED_BY_DERIVED) {
+        0
+    } else {
+        1
+    };
     let ref_specificity_score = if sub.source_ref.is_some() { 1 } else { 0 };
     let fact_specificity_score = match &sub.fact_kinds {
         Some(kinds) => 10_000i32.saturating_sub(kinds.len() as i32),

@@ -161,54 +161,25 @@ pub(super) async fn project_repo_path(db: &LocalDb, project_id: &str) -> Option<
     .flatten()
 }
 
-/// Resolve just the caller's node job_id, using the same run-id-or-cwd
-/// resolution as the self task-spawn pipeline. Exposed at crate visibility so
+/// Resolve just the caller's node job_id from authenticated run identity.
+/// Exposed at crate visibility so
 /// the blocking-append router can compare the caller against each task append's
 /// addressed node when deciding self vs cross-node routing.
-pub(crate) async fn lookup_caller_job_id(
-    db: &LocalDb,
-    run_id: Option<&str>,
-    cwd: &str,
-) -> Result<String, String> {
-    lookup_run_context(db, run_id, cwd)
-        .await
-        .map(|ctx| ctx.job_id)
+pub(crate) async fn lookup_caller_job_id(db: &LocalDb, run_id: &str) -> Result<String, String> {
+    lookup_run_context(db, run_id).await.map(|ctx| ctx.job_id)
 }
 
 pub(super) async fn lookup_run_context(
     db: &LocalDb,
-    run_id: Option<&str>,
-    cwd: &str,
+    run_id: &str,
 ) -> Result<ParentRunContext, String> {
-    if let Some(run_id) = run_id {
-        let run_id = run_id.to_string();
-        db.read(|conn| {
-            Box::pin(async move {
-                lookup_run_context_by_id(conn, &run_id)
-                    .await?
-                    .ok_or_else(|| {
-                        crate::storage::DbError::Row(format!("No run found with id '{}'", run_id))
-                    })
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
-    } else {
-        lookup_run_context_by_cwd(db, cwd).await
-    }
-}
-
-async fn lookup_run_context_by_cwd(db: &LocalDb, cwd: &str) -> Result<ParentRunContext, String> {
-    let cwd = cwd.to_string();
+    let run_id = run_id.to_string();
     db.read(|conn| {
         Box::pin(async move {
-            if let Some(ctx) = lookup_run_context_by_cwd_worktree(conn, &cwd).await? {
-                return Ok(ctx);
-            }
-            lookup_run_context_by_cwd_project(conn, &cwd)
+            lookup_run_context_by_id(conn, &run_id)
                 .await?
                 .ok_or_else(|| {
-                    crate::storage::DbError::Row(format!("No active run found for path '{}'", cwd))
+                    crate::storage::DbError::Row(format!("No run found with id '{}'", run_id))
                 })
         })
     })
@@ -239,62 +210,6 @@ async fn lookup_run_context_by_id(
     rows.next()
         .await?
         .map(|row| run_context_from_row(&row, "implementation"))
-        .transpose()
-}
-
-async fn lookup_run_context_by_cwd_worktree(
-    conn: &cairn_db::turso::Connection,
-    cwd: &str,
-) -> DbResult<Option<ParentRunContext>> {
-    let mut rows = conn
-        .query(
-            "
-            SELECT r.id, r.job_id, j.execution_id, r.issue_id, i.number,
-                   i.project_id, p.key, j.node_name, e.seq
-            FROM runs r
-            JOIN jobs j ON r.job_id = j.id
-            JOIN issues i ON r.issue_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            LEFT JOIN executions e ON j.execution_id = e.id
-            WHERE j.worktree_path = ?1
-              AND r.status IN ('starting', 'live')
-            ORDER BY r.created_at DESC
-            LIMIT 1
-            ",
-            (cwd,),
-        )
-        .await?;
-    rows.next()
-        .await?
-        .map(|row| run_context_from_row(&row, "implementation"))
-        .transpose()
-}
-
-async fn lookup_run_context_by_cwd_project(
-    conn: &cairn_db::turso::Connection,
-    cwd: &str,
-) -> DbResult<Option<ParentRunContext>> {
-    let mut rows = conn
-        .query(
-            "
-            SELECT r.id, r.job_id, j.execution_id, r.issue_id, NULL,
-                   j.project_id, p.key, j.node_name, e.seq
-            FROM runs r
-            JOIN jobs j ON r.job_id = j.id
-            JOIN projects p ON j.project_id = p.id
-            LEFT JOIN executions e ON j.execution_id = e.id
-            WHERE p.repo_path = ?1
-              AND r.status IN ('starting', 'live')
-              AND j.issue_id IS NULL
-            ORDER BY r.created_at DESC
-            LIMIT 1
-            ",
-            (cwd,),
-        )
-        .await?;
-    rows.next()
-        .await?
-        .map(|row| run_context_from_row(&row, "project"))
         .transpose()
 }
 
@@ -334,6 +249,7 @@ pub(super) async fn ensure_task_execution_context(
     let now = chrono::Utc::now().timestamp() as i32;
 
     let snapshot = ExecutionSnapshot {
+        branch_target: Default::default(),
         recipe: RecipeSnapshot {
             id: format!("delegation-{}", parent_ctx.job_id),
             name: "Delegated Work".to_string(),

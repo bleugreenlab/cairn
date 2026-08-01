@@ -215,9 +215,10 @@ fn build_command(config: &SpawnConfig) -> std::process::Command {
 
     if config.sandbox.is_some() {
         // Mark fenced spawns so client tooling (e.g. the rustc cache wrapper)
-        // connects to the Cairn-owned build-service daemon instead of
-        // auto-starting its own confined one. Service-specific env (e.g.
-        // SCCACHE_*) is injected into `config.env` at the spawn seam.
+        // never auto-starts a daemon that would inherit this confinement. Which
+        // daemon a spawn may USE is a separate question, answered by the
+        // build-service client env injected into `config.env` at the spawn seam
+        // (see `config::build_services::MANAGED_BUILD_ROOTS`).
         cmd.env("CAIRN_SANDBOXED", "1");
     }
 

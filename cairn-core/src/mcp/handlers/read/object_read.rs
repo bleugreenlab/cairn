@@ -6,11 +6,24 @@ const SERVE_MAX_DEPTH: usize = 128;
 const SERVE_MAX_ENTRIES: usize = 100_000;
 const SERVE_MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
 
-pub(super) struct ObjectReadService {
+pub(crate) struct ObjectReadService {
     commit_id: String,
     prefix: String,
     store: ObjectStore,
     limits: ObjectReadLimits,
+}
+
+/// The read budget every store-native projection shares: tree depth, entry
+/// count, blob size, and wall clock. Callers that address the project overlay
+/// directly — an intercepted `run` search does — take their limits from here so
+/// they are bounded exactly as an [`ObjectReadService`] read would have been.
+pub(crate) fn serve_limits() -> ObjectReadLimits {
+    ObjectReadLimits::new(
+        SERVE_MAX_DEPTH,
+        SERVE_MAX_ENTRIES,
+        SERVE_MAX_BLOB_BYTES,
+        std::time::Duration::from_secs(30),
+    )
 }
 
 impl ObjectReadService {
@@ -21,12 +34,7 @@ impl ObjectReadService {
     ) -> Result<Self, String> {
         let store = ObjectStore::new(&repository_path, None)
             .map_err(|error| format!("open repository object store: {error}"))?;
-        let limits = ObjectReadLimits::new(
-            SERVE_MAX_DEPTH,
-            SERVE_MAX_ENTRIES,
-            SERVE_MAX_BLOB_BYTES,
-            std::time::Duration::from_secs(30),
-        );
+        let limits = serve_limits();
         Ok(Self {
             commit_id,
             prefix,
@@ -70,6 +78,60 @@ impl ObjectReadService {
     pub fn entries(&self) -> Result<Vec<TreeEntry>, ObjectReadError> {
         self.store
             .entries_at_commit(&self.commit_id, &self.prefix, &self.limits)
+    }
+
+    /// Classify an untracked direct path against the gitignore files stored in
+    /// the selected coordinate. Directory/tree projections remain store-only.
+    pub fn is_ignored_path(&self, path: &str) -> Result<bool, ObjectReadError> {
+        let entries = self
+            .store
+            .walk_commit(&self.commit_id, "", &self.limits)?
+            .into_iter()
+            .filter(|item| item.kind == cairn_codec::objects::TreeEntryKind::Blob)
+            .map(|item| ContentEntry {
+                path: item.path,
+                oid: item.oid,
+                mode: item.mode,
+            })
+            .collect::<Vec<_>>();
+        let mut ignore_files = Vec::new();
+        for entry in &entries {
+            if std::path::Path::new(&entry.path)
+                .file_name()
+                .is_some_and(|name| name == ".gitignore")
+            {
+                ignore_files.push((
+                    entry.path.clone(),
+                    self.store.blob(&entry.oid, &self.limits)?,
+                ));
+            }
+        }
+        let logical = std::path::Path::new(path.trim_matches('/'));
+        let mut ignored = false;
+        for (ignore_path, bytes) in ignore_files {
+            let directory = std::path::Path::new(&ignore_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""));
+            if !logical.starts_with(directory) {
+                continue;
+            }
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(directory);
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                builder
+                    .add_line(Some(std::path::PathBuf::from(&ignore_path)), line)
+                    .map_err(|error| ObjectReadError::InvalidPath(error.to_string()))?;
+            }
+            let matcher = builder
+                .build()
+                .map_err(|error| ObjectReadError::InvalidPath(error.to_string()))?;
+            let matched = matcher.matched_path_or_any_parents(logical, false);
+            if matched.is_ignore() {
+                ignored = true;
+            } else if matched.is_whitelist() {
+                ignored = false;
+            }
+        }
+        Ok(ignored)
     }
 
     pub fn files(&self) -> Result<Vec<(String, Vec<u8>)>, ObjectReadError> {

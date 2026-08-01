@@ -35,7 +35,6 @@ impl AssistantStreamState {
         run_id: &str,
         session_id: &str,
         turn_id: Option<&str>,
-        sequence: i32,
         backend_key: &str,
     ) -> Result<Self, String> {
         let stream = open_stream(
@@ -44,7 +43,6 @@ impl AssistantStreamState {
             Some(session_id),
             turn_id,
             backend_key,
-            Some(sequence),
         )?;
         let _ = orch.services.emitter.emit(
             "db-change",
@@ -173,7 +171,6 @@ pub(super) fn store_assistant_message(
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
-    sequence: i32,
     text: &str,
     usage: Option<&TurnUsage>,
     generation_id: Option<&str>,
@@ -187,7 +184,6 @@ pub(super) fn store_assistant_message(
         Some(session_id),
         turn_id,
         backend_key,
-        Some(sequence),
     )?;
     let appended = append_chunks(
         run_db.clone(),
@@ -293,7 +289,6 @@ pub(super) fn store_assistant_tool_call(
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
-    sequence: i32,
     text: &str,
     tool_calls: &[TurnToolCall],
     usage: Option<&TurnUsage>,
@@ -310,7 +305,6 @@ pub(super) fn store_assistant_tool_call(
         run_id,
         session_id,
         turn_id,
-        sequence,
         TranscriptEvent {
             event_type: "assistant".to_string(),
             session_id: Some(session_id.to_string()),
@@ -350,7 +344,6 @@ pub(super) fn store_tool_result(
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
-    sequence: i32,
     tool_call_id: &str,
     result: &DispatchOutput,
     backend_key: &str,
@@ -361,7 +354,6 @@ pub(super) fn store_tool_result(
         run_id,
         session_id,
         turn_id,
-        sequence,
         TranscriptEvent {
             event_type: "tool_result".to_string(),
             session_id: Some(session_id.to_string()),
@@ -389,7 +381,6 @@ pub(super) fn store_success_result(
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
-    sequence: i32,
     usage: Option<&TurnUsage>,
     generation_id: Option<&str>,
     model: Option<&str>,
@@ -402,7 +393,6 @@ pub(super) fn store_success_result(
         run_id,
         session_id,
         turn_id,
-        sequence,
         TranscriptEvent {
             event_type: "result:success".to_string(),
             session_id: Some(session_id.to_string()),
@@ -436,7 +426,6 @@ fn insert_transcript_event(
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
-    sequence: i32,
     event: TranscriptEvent,
     counts: TokenCounts,
     cost_usd: Option<f64>,
@@ -450,7 +439,6 @@ fn insert_transcript_event(
             id: Uuid::new_v4().to_string(),
             run_id: run_id.to_string(),
             session_id: Some(session_id.to_string()),
-            sequence,
             timestamp: now,
             event_type: event.event_type.clone(),
             data,

@@ -1,9 +1,10 @@
 //! Process execution: spawn, stream, timeout, promote-to-terminal, MCP-call
-//! proxying, warm-search shim injection, and checkpoint-result caching.
+//! proxying and checkpoint-result caching.
 
 use super::output::{strip_streamable_tail, OutputTail};
 use super::sandbox_policy::build_run_sandbox_policy;
 use super::types::{ItemOutcome, McpCallSpec, RunCompletePayload, RunOutputPayload, RunSpec};
+use crate::mcp::gateway::McpCallOutcome;
 use crate::mcp::handlers::{normalize_command, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
@@ -39,7 +40,7 @@ pub(crate) const MAX_BUFFER_SIZE: usize = 64 * 1024;
 /// overrides the env itself (for example `PAGER=less git log`).
 const NON_INTERACTIVE_PAGER: &str = "cat";
 
-pub(crate) const READ_ONLY_CHECKOUT_DENIAL: &str = "This command tried to write the project's live checkout, which is read-only for agents — the write was blocked by the kernel sandbox. Changes can only be made in a worktree; nothing was left in the checkout. Re-run inside a worktree to make changes that persist.";
+pub(crate) const READ_ONLY_CHECKOUT_DENIAL: &str = "This command tried to write the project's own checkout on this machine, which is read-only for agents — the write was blocked by the kernel sandbox, and nothing was left behind. Make the change in your own working directory instead: `write` for file edits, or a `run` batch carrying a `commit_msg`.";
 
 fn apply_non_interactive_pager_env(mut config: SpawnConfig) -> SpawnConfig {
     config = config.env("GIT_PAGER", NON_INTERACTIVE_PAGER);
@@ -74,7 +75,6 @@ pub(crate) async fn run_one(
     cwd: &str,
     tool_use_id: &str,
     run_context: Option<&RunContext>,
-    promote_on_timeout: bool,
     header: String,
     spec: Result<RunSpec, String>,
 ) -> ItemOutcome {
@@ -131,7 +131,7 @@ pub(crate) async fn run_one(
         // MCP calls are proxied RPC through the host gateway, not process
         // exec — handle and return here.
         RunSpec::McpCall(spec) => {
-            return run_mcp_call(orch, run_context, cwd, header, *spec).await;
+            return run_mcp_call(orch, request, run_context, cwd, header, *spec).await;
         }
         // A REPL send writes to a live eval-server's persistent stdin and awaits
         // one framed response — not a process exec.
@@ -145,7 +145,7 @@ pub(crate) async fn run_one(
         }
     };
 
-    let timeout_ms = timeout.unwrap_or(120_000).min(600_000);
+    let timeout_ms = super::clamp_run_item_timeout_ms(timeout);
 
     let mut exec = match execute_process(
         orch,
@@ -158,7 +158,6 @@ pub(crate) async fn run_one(
         shell_command.as_deref(),
         stdin.as_deref(),
         true,
-        promote_on_timeout,
     )
     .await
     {
@@ -166,15 +165,15 @@ pub(crate) async fn run_one(
         Err(e) => return ItemOutcome::failed(header, format!("Failed to spawn command: {e}")),
     };
 
-    // Denial-driven worktree fence: if the kernel sandbox blocked this command,
+    // Denial-driven namespace fence: if the kernel sandbox blocked this command,
     // adjudicate the crossing under the agent's escape policy. On allow we
     // re-execute escalated (sandbox off) so the now-granted crossing proceeds.
     if let Some(denial) = exec.denial.take() {
         use crate::mcp::handlers::fence;
-        // The live checkout is read-only and non-negotiable: a non-worktree cwd
+        // The live checkout is read-only and non-negotiable: an ambient checkout cwd
         // routes a denial to a clear explanation, never a fence prompt. There is
         // no run context to adjudicate and nothing the user can grant — changes
-        // can only be made in a worktree. This replaces the raw EPERM project
+        // can only be published through an executor cell. This replaces the raw EPERM
         // chat would otherwise surface.
         if !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
             let _ = denial;
@@ -186,7 +185,7 @@ pub(crate) async fn run_one(
                     fence::Crossing::shell_path(path.as_path(), &path.display().to_string())
                 }
                 sandbox::SandboxDenial::Command => fence::Crossing::shell_command(
-                    format!("command blocked by the worktree sandbox: {header}"),
+                    format!("command blocked by the executor sandbox: {header}"),
                     shell_command.as_deref().unwrap_or(&program),
                 ),
             };
@@ -203,7 +202,6 @@ pub(crate) async fn run_one(
                         shell_command.as_deref(),
                         stdin.as_deref(),
                         false,
-                        promote_on_timeout,
                     )
                     .await
                     {
@@ -226,7 +224,6 @@ pub(crate) async fn run_one(
                         succeeded: false,
                         suspended: true,
                         images: Vec::new(),
-                        promoted_terminal: None,
                         tracked_modifications: None,
                     }
                 }
@@ -254,7 +251,7 @@ pub(crate) async fn run_one(
     if let Some(ref command) = shell_command {
         if !exec.timed_out {
             if let Some(ctx) = run_context {
-                cache_checkpoint_result(orch, &ctx.job_id, command, cwd, exec.exit_code).await;
+                cache_checkpoint_result(orch, &ctx.job_id, command, exec.exit_code).await;
             }
         }
     }
@@ -266,7 +263,6 @@ pub(crate) async fn run_one(
         succeeded,
         suspended: false,
         images: Vec::new(),
-        promoted_terminal: None,
         tracked_modifications: None,
     }
 }
@@ -275,6 +271,7 @@ pub(crate) async fn run_one(
 /// gateway or a down/erroring server fails this item only — never the batch.
 async fn run_mcp_call(
     orch: &Orchestrator,
+    request: &McpCallbackRequest,
     run_context: Option<&RunContext>,
     cwd: &str,
     header: String,
@@ -297,21 +294,165 @@ async fn run_mcp_call(
         .map(|c| c.job_id.clone())
         .unwrap_or_else(|| cwd.to_string());
 
+    // A gateway call is host work on an attached socket, so its bound is the
+    // host-item bound, not the batch ceiling. `None` stays `None`: the gateway's
+    // own default call timeout is the meaningful floor here.
+    let timeout = super::clamp_host_item_timeout_ms(timeout);
     match gateway
-        .call_tool(&session_key, &credential_key, &config, &tool, args, timeout)
+        .call_tool_once(
+            &session_key,
+            &credential_key,
+            &config,
+            &tool,
+            args.clone(),
+            None,
+            None,
+            timeout,
+            None,
+        )
         .await
     {
-        Ok(result) => ItemOutcome {
+        Ok(McpCallOutcome::Complete(result)) => ItemOutcome {
             header,
             body: result.text,
             succeeded: true,
             suspended: false,
             images: result.images,
-            promoted_terminal: None,
             tracked_modifications: None,
         },
+        Ok(outcome) => {
+            suspend_mcp_call(
+                orch,
+                request,
+                run_context,
+                header,
+                session_key,
+                credential_key,
+                tool,
+                args,
+                config,
+                timeout,
+                outcome,
+            )
+            .await
+        }
         Err(e) => ItemOutcome::failed(header, e),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn suspend_mcp_call(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    run_context: Option<&RunContext>,
+    header: String,
+    session_key: String,
+    server: String,
+    tool: String,
+    arguments: serde_json::Value,
+    config: crate::config::mcp_servers::McpServerConfig,
+    timeout_ms: Option<u32>,
+    outcome: McpCallOutcome,
+) -> ItemOutcome {
+    use crate::mcp::handlers::durable_suspend::{self, Condition, Record};
+    use crate::mcp::handlers::mcp_continuation::{self, McpContinuationState};
+    use crate::mcp::handlers::tool_use_correlation::Claim;
+    let Some(ctx) = run_context else {
+        return ItemOutcome::failed(header, "MCP continuation requires an active run");
+    };
+    let Ok((_, db)) = super::super::run_context::lookup_run_routed(&orch.db, request).await else {
+        return ItemOutcome::failed(header, "MCP continuation database is unavailable");
+    };
+    let Some(turn_id) = durable_suspend::suspending_turn_id(orch, &db, &ctx.run_id).await else {
+        return ItemOutcome::failed(header, "MCP continuation requires an active turn");
+    };
+    let tool_use_id = match request.tool_use_id.clone() {
+        Some(id) => id,
+        None => match super::claim_batch_tool_use_id(&db, &ctx.run_id, &turn_id, &request.payload)
+            .await
+        {
+            Claim::One(id) => id,
+            Claim::None => {
+                return ItemOutcome::failed(
+                    header,
+                    "Could not correlate MCP continuation with its original run call",
+                )
+            }
+            Claim::Ambiguous(_) => {
+                return ItemOutcome::failed(
+                    header,
+                    "MCP continuation matched several original run calls ambiguously",
+                )
+            }
+        },
+    };
+    let Ok(Some(session_id)) = durable_suspend::run_session(&db, &ctx.run_id).await else {
+        return ItemOutcome::failed(header, "MCP continuation requires an active session");
+    };
+    let mut state = McpContinuationState {
+        server,
+        session_key,
+        config,
+        tool,
+        arguments,
+        request_state: None,
+        timeout_ms,
+        pending_operation: None,
+        pending_input_requests: None,
+        task_input_pending: false,
+        mrtr_round: 0,
+        pending_prompt_id: None,
+        task: None,
+        next_poll_at_ms: None,
+        deadline_ms: Some(
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(mcp_continuation::DEFAULT_CONTINUATION_TTL_MS),
+        ),
+    };
+    match outcome {
+        McpCallOutcome::InputRequired {
+            input_requests,
+            request_state,
+        } => {
+            state.pending_input_requests = Some(input_requests);
+            state.request_state = request_state;
+        }
+        McpCallOutcome::Task {
+            task_id,
+            poll_interval_ms,
+            ttl_ms,
+        } => {
+            mcp_continuation::set_task(
+                &mut state,
+                task_id,
+                poll_interval_ms.unwrap_or(500),
+                chrono::Utc::now().timestamp_millis(),
+                ttl_ms,
+            );
+        }
+        McpCallOutcome::Complete(_) => unreachable!(),
+    }
+    let deadline = state.deadline_ms;
+    let record = Record {
+        id: cairn_common::ids::mint_child(&ctx.run_id),
+        job_id: ctx.job_id.clone(),
+        run_id: ctx.run_id.clone(),
+        session_id,
+        turn_id,
+        tool_use_id,
+        condition: Condition::McpContinuation { state },
+        deadline,
+        created: chrono::Utc::now().timestamp_millis(),
+    };
+    if let Err(error) = durable_suspend::suspend(orch, &db, &record).await {
+        return ItemOutcome::failed(header, error);
+    }
+    // The global durable scheduler owns the continuation from here. Its
+    // persisted handoff delay prevents a first transition until this suspension
+    // marker has reached the provider, without retaining a per-call task or
+    // receiver in memory.
+    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None }
 }
 
 /// Send inline code to a live REPL session and compose its outcome. Fails
@@ -336,7 +477,11 @@ async fn run_repl_send(
         );
     };
 
-    let timeout_ms = timeout.unwrap_or(120_000).min(600_000);
+    // A REPL send awaits a live eval server over an attached socket, so it takes
+    // the host-item bound. Preserving the previous 120s default keeps an omitted
+    // bound exactly where it was; only the unreachable ceiling above it moves.
+    let timeout_ms =
+        super::clamp_host_item_timeout_ms(timeout).unwrap_or(super::MAX_HOST_ITEM_TIMEOUT_MS);
     match repl::send_recorded(
         orch,
         &ctx.job_id,
@@ -384,7 +529,6 @@ async fn run_repl_send(
                     succeeded: matches!(exchange.status, ReplExchangeStatus::Success),
                     suspended: false,
                     images: Vec::new(),
-                    promoted_terminal: None,
                     tracked_modifications: None,
                 }
             }
@@ -445,7 +589,6 @@ pub(crate) async fn build_agent_spawn_config(
     args: &[String],
     sandbox_policy: Option<sandbox::SandboxPolicy>,
 ) -> SpawnConfig {
-    let sandboxed = sandbox_policy.is_some();
     // Inject the MCP callback env so an in-run `cairn read|change ...` shell
     // invocation can authenticate and forward to this same app (the basis for
     // composability like `cairn read <uri> | rg ...`). The CLI is a thin client;
@@ -476,6 +619,18 @@ pub(crate) async fn build_agent_spawn_config(
             .env("PATH", &crate::env::agent_shell_path())
             // Shared per-home uv package cache; see the binding above.
             .env("UV_CACHE_DIR", &uv_cache_dir)
+            // The Cairn home this host resolved, stated rather than inherited.
+            // It is the root every Cairn-owned path hangs off, so a spawn that
+            // has it can compose one it was never handed — a node's scratch dir
+            // and its terminal logs at `$CAIRN_HOME/scratch/<node URI tail>`.
+            // Inheritance alone would leave that true only when whoever
+            // launched the host happened to export the variable, while
+            // `cairn_home()` resolved a default regardless; naming it here makes
+            // the child agree with the host by construction.
+            .env(
+                "CAIRN_HOME",
+                &cairn_common::paths::cairn_home().to_string_lossy(),
+            )
             .sandbox(sandbox_policy),
     ));
     // Make bare `git`/`jj` behave correctly inside a jj-only worktree: managed
@@ -489,15 +644,17 @@ pub(crate) async fn build_agent_spawn_config(
     if let Ok(secret) = orch.mcp_auth.get_secret_for_mcp() {
         spawn_config = spawn_config.env("CAIRN_MCP_SECRET", &secret);
     }
-    // Managed Build Services: when this spawn is fenced, inject each enabled
-    // service's client env so the agent's tooling connects to the Cairn-owned
-    // daemon (e.g. the shared sccache server) rather than auto-starting its own
-    // confined one (the cross-worktree EPERM bug). `CAIRN_SANDBOXED` is set by
-    // the process spawner. Inert for projects the env doesn't apply to.
-    if sandboxed {
-        for (k, v) in orch.build_service_client_env(Some(std::path::Path::new(cwd))) {
-            spawn_config = spawn_config.env(&k, &v);
-        }
+    // Managed Build Services: inject each enabled service's client env so the
+    // agent's tooling connects to the Cairn-owned daemon (e.g. the shared sccache
+    // server) rather than auto-starting its own (the cross-worktree EPERM bug).
+    // Empty unless this spawn builds inside a managed build root — the daemon
+    // runs each cache-miss compile itself, so a spawn whose `target/` its sandbox
+    // does not cover would fail to compile rather than merely miss the cache.
+    // Deliberately independent of the fence: supervision and compile caching are
+    // unrelated policies, and gating on the fence switched the cache off entirely
+    // wherever the dial is `allow`.
+    for (k, v) in orch.build_service_client_env(std::path::Path::new(cwd)) {
+        spawn_config = spawn_config.env(&k, &v);
     }
     if let Some(ctx) = run_context {
         spawn_config = spawn_config.env("CAIRN_RUN_ID", &ctx.run_id);
@@ -515,6 +672,12 @@ pub(crate) async fn build_agent_spawn_config(
         // default tooling (mktemp, cargo, compilers, harness logs) writes there
         // with no agent awareness. TMP/TEMP cover tools that ignore TMPDIR.
         let scratch = crate::scratch::ensure_job_scratch_dir(&ctx.job_id, home_uri.as_deref());
+        // Give a helper script written there the dependency resolution a script
+        // inside the checkout gets for free.
+        cairn_common::scratch::link_scratch_dependency_resolution(
+            &scratch,
+            std::path::Path::new(cwd),
+        );
         let scratch = scratch.to_string_lossy().to_string();
         spawn_config = spawn_config
             .env("TMPDIR", &scratch)
@@ -545,152 +708,6 @@ pub(crate) async fn job_home_uri(orch: &Orchestrator, ctx: &RunContext) -> Optio
         parent_segment.as_deref(),
     ))
 }
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct SearchCandidates {
-    rg: bool,
-    grep: bool,
-}
-
-fn apply_warm_search_shim(
-    orch: &Orchestrator,
-    mut config: SpawnConfig,
-    run_context: &RunContext,
-    command: &str,
-) -> SpawnConfig {
-    if !cfg!(unix) {
-        return config;
-    }
-    let candidates = search_candidates(command);
-    if !candidates.rg && !candidates.grep {
-        return config;
-    }
-
-    let real_rg = candidates
-        .rg
-        .then(|| crate::env::find_binary("rg"))
-        .transpose();
-    let real_grep = candidates
-        .grep
-        .then(|| crate::env::find_binary("grep"))
-        .transpose();
-    let (Ok(real_rg), Ok(real_grep)) = (real_rg, real_grep) else {
-        return config;
-    };
-    if let Some(path) = real_rg {
-        config = config.env("CAIRN_REAL_RG", &path);
-    }
-    if let Some(path) = real_grep {
-        config = config.env("CAIRN_REAL_GREP", &path);
-    }
-    config
-        .env("PATH", &crate::env::warm_search_shell_path())
-        .env(
-            "CAIRN_WARM_SEARCH_URL",
-            &format!(
-                "http://127.0.0.1:{}/api/warm-search",
-                orch.mcp_callback_port
-            ),
-        )
-        .env("CAIRN_RUN_ID", &run_context.run_id)
-}
-
-/// Find bare `rg`/`grep` words in executable position without interpreting the
-/// shell program. False negatives are intentional; PATH observability makes a
-/// false positive more costly than falling back to native execution.
-fn search_candidates(command: &str) -> SearchCandidates {
-    if command.contains("command -v")
-        || command.contains("command -V")
-        || command.contains("type ")
-        || command.contains("hash -t")
-        || command.contains("which ")
-        || command.contains("whereis ")
-        || command.contains("whence ")
-    {
-        return SearchCandidates::default();
-    }
-
-    let tokens = shell_candidate_tokens(command);
-    let mut candidates = SearchCandidates::default();
-    let mut command_start = true;
-    for token in tokens {
-        match token.as_str() {
-            ";" | "&&" | "||" | "|" | "(" | ")" | "{" | "}" => command_start = true,
-            "if" | "then" | "elif" | "while" | "until" | "do" | "!" if command_start => {}
-            "rg" if command_start => {
-                candidates.rg = true;
-                command_start = false;
-            }
-            "grep" if command_start => {
-                candidates.grep = true;
-                command_start = false;
-            }
-            word if command_start && word.contains('=') && !word.starts_with('=') => {}
-            _ => command_start = false,
-        }
-    }
-    candidates
-}
-
-fn shell_candidate_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut word = String::new();
-    let mut chars = command.chars().peekable();
-    let mut single = false;
-    let mut double = false;
-    while let Some(ch) = chars.next() {
-        if single {
-            if ch == '\'' {
-                single = false;
-            }
-            continue;
-        }
-        if double {
-            if ch == '"' {
-                double = false;
-            } else if ch == '\\' {
-                let _ = chars.next();
-            }
-            continue;
-        }
-        match ch {
-            '\'' => single = true,
-            '"' => double = true,
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    word.push(next);
-                }
-            }
-            '\n' | '\r' => {
-                if !word.is_empty() {
-                    tokens.push(std::mem::take(&mut word));
-                }
-                tokens.push(";".to_string());
-            }
-            c if c.is_whitespace() => {
-                if !word.is_empty() {
-                    tokens.push(std::mem::take(&mut word));
-                }
-            }
-            ';' | '(' | ')' | '{' | '}' | '|' | '&' => {
-                if !word.is_empty() {
-                    tokens.push(std::mem::take(&mut word));
-                }
-                let mut operator = ch.to_string();
-                if matches!(ch, '|' | '&') && chars.peek() == Some(&ch) {
-                    operator.push(chars.next().unwrap());
-                }
-                tokens.push(operator);
-            }
-            _ => word.push(ch),
-        }
-    }
-    if !word.is_empty() {
-        tokens.push(word);
-    }
-    tokens
-}
-
 /// Spawn a process, stream its stdout/stderr, and wait with a timeout.
 #[allow(clippy::too_many_arguments)]
 async fn execute_process(
@@ -704,10 +721,6 @@ async fn execute_process(
     shell_command: Option<&str>,
     stdin: Option<&str>,
     sandbox_enabled: bool,
-    // Placement decides promotion before this host fallback is reached. Retained
-    // in the internal call shape so check callers continue to state their kill
-    // contract explicitly; host execution always kills at the budget.
-    _promote_on_timeout: bool,
 ) -> Result<ExecOutput, String> {
     let services = &orch.services;
     let tool_use_id = tool_use_id.to_string();
@@ -717,6 +730,9 @@ async fn execute_process(
     // run context, an already-granted command, or platforms without a sandbox
     // primitive). `sandbox_enabled` is false on an escalated
     // re-execution after a fence grant.
+    // Host execution only ever runs in the agent's jj residence or the project's
+    // live checkout, so the path tells the truth here.
+    let checkout_kind = super::sandbox_policy::RunCheckout::infer(cwd);
     let sandbox = if sandbox_enabled {
         // Grant key: the shell command for shell items, else the program for
         // skill scripts — so a command-scoped session grant generalizes to
@@ -724,6 +740,7 @@ async fn execute_process(
         build_run_sandbox_policy(
             orch,
             cwd,
+            checkout_kind,
             run_context.map(|c| c.run_id.as_str()),
             run_context.map(|c| c.project_id.as_str()),
             shell_command.or(Some(program)),
@@ -733,15 +750,14 @@ async fn execute_process(
         None
     };
     // Ask agents get a synthetic command-scoped macOS fallback when path recovery
-    // misses; Deny agents preserve their raw fail-fast output. Non-worktree (live
-    // checkout) runs ALSO enable fallback detection regardless of fence: the
+    // misses; Deny agents preserve their raw fail-fast output. Ambient live-checkout
+    // runs also enable fallback detection regardless of fence: the
     // checkout is read-only, so a kernel block must be recognized even when macOS
     // log recovery misses or a shell masks the exit (`... || true`). run_one
     // routes such a denial to the hard read-only-checkout message, never a fence
-    // prompt — non-worktree is non-grantable, so enabling detection cannot
+    // prompt — a live checkout is non-grantable, so enabling detection cannot
     // synthesize a grant.
-    let readonly_non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
-    let command_scoped_fallback = readonly_non_worktree
+    let command_scoped_fallback = checkout_kind.is_project_live()
         || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
     let sandbox_policy = sandbox.map(|(policy, _)| policy);
     let sandboxed = sandbox_policy.is_some();
@@ -749,19 +765,10 @@ async fn execute_process(
 
     let mut spawn_config =
         build_agent_spawn_config(orch, cwd, run_context, program, args, sandbox_policy).await;
-    // A managed job's command runs against an executor materialization at its
-    // logical coordinate. Never redirect rg/grep back to the stale legacy
-    // worktree index. Keep the shim only for remaining non-managed host runs.
-    if let (Some(ctx), Some(command)) = (run_context, shell_command) {
-        if ctx.worktree_path.is_none() {
-            spawn_config = apply_warm_search_shim(orch, spawn_config, ctx, command);
-        }
-    }
 
     // Capture stdin only when the spec carries a payload to feed (today only
-    // `uv run -`, whose script must arrive on stdin so uv can parse PEP 723
-    // inline metadata that `-c` would skip). Every other item leaves stdin
-    // inherited, unchanged.
+    // `uv run -`, which has no inline-source flag, so its script arrives on
+    // stdin). Every other item leaves stdin inherited, unchanged.
     if stdin.is_some() {
         spawn_config = spawn_config.stdin(true);
     }
@@ -1122,17 +1129,16 @@ pub(crate) async fn cache_checkpoint_callback(
     orch: &Orchestrator,
     job_id: &str,
     command: &str,
-    cwd: &str,
+    _cwd: &str,
     exit_code: Option<i32>,
 ) {
-    cache_checkpoint_result(orch, job_id, command, cwd, exit_code).await;
+    cache_checkpoint_result(orch, job_id, command, exit_code).await;
 }
 
 async fn cache_checkpoint_result(
     orch: &Orchestrator,
     job_id: &str,
     command: &str,
-    cwd: &str,
     exit_code: Option<i32>,
 ) {
     // Check if this command matches the job's checkpoint command
@@ -1148,12 +1154,11 @@ async fn cache_checkpoint_result(
         return; // Command doesn't match checkpoint command
     }
 
-    // Capture jj worktree state for cache validity checking.
-    let commit_sha = match crate::execution::cache::get_current_head_sha(orch, cwd) {
+    let commit_sha = match crate::execution::cache::resolve_job_logical_head(orch, job_id).await {
         Ok(sha) => sha,
         Err(_) => return,
     };
-    let is_dirty = crate::execution::cache::is_worktree_dirty(orch, cwd).unwrap_or(true);
+    let is_dirty = false;
     let now = chrono::Utc::now().timestamp() as i32;
 
     let cache_id = Uuid::new_v4().to_string();
@@ -1260,51 +1265,6 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn warm_search_candidates_only_select_executable_positions() {
-        assert_eq!(
-            search_candidates("cd nested && rg needle ."),
-            SearchCandidates {
-                rg: true,
-                grep: false
-            }
-        );
-        assert_eq!(
-            search_candidates("echo heading; rg needle src | grep -v fixture | head -5"),
-            SearchCandidates {
-                rg: true,
-                grep: true
-            }
-        );
-        assert_eq!(
-            search_candidates("echo rg grep"),
-            SearchCandidates::default()
-        );
-        assert_eq!(
-            search_candidates("/usr/bin/rg needle ."),
-            SearchCandidates::default()
-        );
-        assert_eq!(
-            search_candidates("command -v rg"),
-            SearchCandidates::default()
-        );
-        assert_eq!(search_candidates("type rg"), SearchCandidates::default());
-        assert_eq!(
-            search_candidates("echo heading\nrg needle src"),
-            SearchCandidates {
-                rg: true,
-                grep: false
-            }
-        );
-        assert_eq!(
-            search_candidates("{ rg needle src; }"),
-            SearchCandidates {
-                rg: true,
-                grep: false
-            }
-        );
-    }
 
     #[test]
     fn strip_dev_instance_routing_env_marks_both_keys_for_removal() {

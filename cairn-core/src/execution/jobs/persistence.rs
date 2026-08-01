@@ -10,15 +10,16 @@ fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> {
         job_id: row.opt_text(1)?,
         chat_id: row.opt_text(2)?,
         backend: row.text(3)?,
-        status: row.text(4)?.parse().unwrap_or(SessionStatus::Open),
-        parent_session_id: row.opt_text(5)?,
-        replaced_by_id: row.opt_text(6)?,
-        terminal_reason: row.opt_text(7)?,
-        sequence: row.i64(8)? as i32,
-        created_at: row.i64(9)?,
-        closed_at: row.opt_i64(10)?,
-        updated_at: row.i64(11)?,
-        backend_id: row.opt_text(12)?,
+        account_id: row.opt_text(4)?,
+        status: row.text(5)?.parse().unwrap_or(SessionStatus::Open),
+        parent_session_id: row.opt_text(6)?,
+        replaced_by_id: row.opt_text(7)?,
+        terminal_reason: row.opt_text(8)?,
+        sequence: row.i64(9)? as i32,
+        created_at: row.i64(10)?,
+        closed_at: row.opt_i64(11)?,
+        updated_at: row.i64(12)?,
+        backend_id: row.opt_text(13)?,
     })
 }
 
@@ -204,72 +205,12 @@ pub(super) async fn count_existing_branched_jobs(
     .map_err(|e| db_error("Failed to count existing branched jobs", e))
 }
 
-/// Resolve a worktree's current HEAD as a full commit sha, used as a job's
-/// `base_commit`. Failures (missing git, unborn/detached HEAD) leave it NULL
-/// rather than guessing a value.
-pub(super) fn worktree_head_commit(orch: &Orchestrator, worktree_path: &Path) -> Option<String> {
-    // A jj workspace is `.jj`-only — no git HEAD to read — so resolve the base
-    // jj-side from `@-` (the latest sealed commit, which is the base at job
-    // creation). Same `None`-on-failure contract as the git path.
-    if crate::jj::is_jj_dir(worktree_path) {
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        return match crate::jj::head_commit(&jj, worktree_path) {
-            Ok(sha) => {
-                let sha = sha.trim().to_string();
-                if sha.is_empty() {
-                    log::warn!(
-                        "Empty jj head commit for workspace {}; leaving base_commit NULL",
-                        worktree_path.display()
-                    );
-                    None
-                } else {
-                    Some(sha)
-                }
-            }
-            Err(error) => {
-                log::warn!(
-                    "Failed to resolve jj head commit for workspace {}: {}; leaving base_commit NULL",
-                    worktree_path.display(),
-                    error
-                );
-                None
-            }
-        };
-    }
-    match orch
-        .services
-        .git
-        .rev_parse(worktree_path, vec!["HEAD".to_string()])
-    {
-        Ok(sha) => {
-            let sha = sha.trim().to_string();
-            if sha.is_empty() {
-                log::warn!(
-                    "Empty HEAD sha for worktree {}; leaving base_commit NULL",
-                    worktree_path.display()
-                );
-                None
-            } else {
-                Some(sha)
-            }
-        }
-        Err(error) => {
-            log::warn!(
-                "Failed to resolve HEAD sha for worktree {}: {}; leaving base_commit NULL",
-                worktree_path.display(),
-                error
-            );
-            None
-        }
-    }
-}
-
-/// Resolve the durable `pack_anchor` for a job at worktree-assignment time.
+/// Resolve the durable `pack_anchor` for a job when its branch coordinate is prepared.
 ///
 /// A job based off the project default branch anchors directly on its own
 /// `base_commit`: that commit is reachable from the default branch, hence
 /// durable. A job whose base is an ephemeral integration branch inherits the
-/// parent job's anchor instead — either an inherited-worktree child (explicit
+/// parent job's anchor instead — either an explicitly delegated child
 /// `parent_job_id`) or a child-issue execution (its base branch is a parent
 /// issue's live branch). Inheritance reads the immediate parent's already-stored
 /// `pack_anchor`, falling back to the parent's `base_commit`; because every
@@ -325,7 +266,7 @@ async fn parent_pack_anchor_by_branch_conn(
     let mut rows = conn
         .query(
             "SELECT pack_anchor, base_commit FROM jobs
-             WHERE project_id = ?1 AND branch = ?2 AND worktree_path IS NOT NULL
+             WHERE project_id = ?1 AND branch = ?2
              ORDER BY created_at DESC
              LIMIT 1",
             params![project_id, branch],
@@ -338,20 +279,15 @@ async fn parent_pack_anchor_by_branch_conn(
         .map(Option::flatten)
 }
 
-pub(super) async fn update_job_worktree(
+pub(super) async fn update_job_coordinate(
     db: Arc<LocalDb>,
     job_id: String,
-    worktree_path: Option<String>,
     branch: Option<String>,
     base_commit: Option<String>,
     now: i32,
 ) -> Result<(), String> {
-    if let Some(path) = worktree_path.as_deref() {
-        crate::managed_worktrees::validate_path(Path::new(path))?;
-    }
     db.write(|conn| {
         let job_id = job_id.clone();
-        let worktree_path = worktree_path.clone();
         let branch = branch.clone();
         let base_commit = base_commit.clone();
         Box::pin(async move {
@@ -360,10 +296,9 @@ pub(super) async fn update_job_worktree(
                 .ok_or_else(|| DbError::Row(format!("job not found: {job_id}")))?;
             let pack_anchor = resolve_pack_anchor_conn(conn, &job, base_commit.as_deref()).await?;
             conn.execute(
-                "UPDATE jobs SET worktree_path = ?1, branch = ?2, base_commit = ?3,
-                     pack_anchor = ?4, updated_at = ?5 WHERE id = ?6",
+                "UPDATE jobs SET branch = ?1, base_commit = ?2,
+                     pack_anchor = ?3, updated_at = ?4 WHERE id = ?5",
                 params![
-                    worktree_path.as_deref(),
                     branch.as_deref(),
                     base_commit.as_deref(),
                     pack_anchor.as_deref(),
@@ -376,7 +311,7 @@ pub(super) async fn update_job_worktree(
         })
     })
     .await
-    .map_err(|e| db_error("Failed to update job", e))
+    .map_err(|e| db_error("Failed to update job coordinate", e))
 }
 
 async fn load_session_conn(
@@ -701,13 +636,8 @@ pub(crate) struct ChildInsert {
     /// which has no caller to resume. A top-level insert allocates its segment in
     /// the execution's own namespace and anchors packs on its own `base_commit`.
     pub(crate) parent_job_id: Option<String>,
-    /// The inherited worktree path, or `None` for a worktree-less child (an
-    /// ephemeral `worktree: none` call runs in a scratch dir with no project
-    /// tree binding).
-    pub(crate) worktree_path: Option<String>,
-    /// The child's own branch. `None` for an inherited-worktree child (it shares
-    /// the parent's branch); `Some(ephemeral)` for an ambient parent's ephemeral
-    /// worktree, so teardown can forget the jj workspace and delete the branch.
+    /// The child's durable branch coordinate. `None` means the child is
+    /// repository-independent.
     pub(crate) branch: Option<String>,
     pub(crate) agent_config_id: String,
     pub(crate) project_id: String,
@@ -715,11 +645,8 @@ pub(crate) struct ChildInsert {
     pub(crate) execution_id: Option<String>,
     pub(crate) description: String,
     pub(crate) model: Option<String>,
-    /// HEAD sha of the inherited parent worktree at creation.
+    /// Runner-owned logical head inherited or resolved at creation.
     pub(crate) base_commit: Option<String>,
-    /// 1 when this child owns a throwaway ephemeral worktree (ambient parent);
-    /// reclaimed when the child job terminalizes.
-    pub(crate) owns_ephemeral_worktree: bool,
     /// JSON-serialized `DelegatedOutputContract` (CAIRN-2481): the per-run output
     /// schema the artifact-write handler resolves for this node-less job. `None`
     /// preserves the `task_name -> return` fallback (child tasks).
@@ -738,9 +665,6 @@ pub(crate) async fn insert_child_job_session_run(
     db: Arc<LocalDb>,
     input: ChildInsert,
 ) -> Result<(), String> {
-    if let Some(path) = input.worktree_path.as_deref() {
-        crate::managed_worktrees::validate_path(Path::new(path))?;
-    }
     let seed_db = db.clone();
     let seed_job_id = input.job_id.clone();
     db.write(|conn| {
@@ -749,7 +673,6 @@ pub(crate) async fn insert_child_job_session_run(
             run_id: input.run_id.clone(),
             session_id: input.session_id.clone(),
             parent_job_id: input.parent_job_id.clone(),
-            worktree_path: input.worktree_path.clone(),
             branch: input.branch.clone(),
             agent_config_id: input.agent_config_id.clone(),
             project_id: input.project_id.clone(),
@@ -758,7 +681,6 @@ pub(crate) async fn insert_child_job_session_run(
             description: input.description.clone(),
             model: input.model.clone(),
             base_commit: input.base_commit.clone(),
-            owns_ephemeral_worktree: input.owns_ephemeral_worktree,
             output_contract: input.output_contract.clone(),
             label: input.label.clone(),
             phase: input.phase.clone(),
@@ -773,8 +695,8 @@ pub(crate) async fn insert_child_job_session_run(
                 Some(input.agent_config_id.as_str()),
             );
             // A delegated child dedupes its segment under its parent and follows
-            // the parent's pack lineage (it shares the parent's worktree). A
-            // parent-less top-level node-less job (a standalone workflow launched
+            // the parent's durable pack lineage. A parent-less top-level node-less
+            // job (a standalone workflow launched
             // from the UI, CAIRN-2651) allocates its segment in the execution's own
             // top-level namespace and anchors packs on its own base commit.
             let (uri_segment, pack_anchor) = match input.parent_job_id.as_deref() {
@@ -810,40 +732,38 @@ pub(crate) async fn insert_child_job_session_run(
             conn.execute(
                 "INSERT INTO jobs(
                     id, execution_id, recipe_node_id, parent_job_id,
-                    worktree_path, branch, base_commit, current_session_id, resume_session_id,
+                    branch, base_commit, current_session_id, resume_session_id,
                     status, agent_config_id, issue_id, project_id, task_description,
                     created_at, updated_at, completed_at, parent_tool_use_id, task_index,
                     started_at, model, node_name, base_branch, current_turn_id, uri_segment,
-                    pack_anchor, owns_ephemeral_worktree, output_contract
+                    pack_anchor, output_contract
                 )
                 VALUES (
                     ?1, ?2, NULL, ?3,
-                    ?4, ?19, ?13, ?5, NULL,
-                    'running', ?6, ?7, ?8, ?9,
-                    ?10, ?10, NULL, ?15, ?16,
-                    ?10, ?11, NULL, NULL, NULL, ?12,
-                    ?14, ?18, ?17
+                    ?4, ?5, ?6, NULL,
+                    'running', ?7, ?8, ?9, ?10,
+                    ?11, ?11, NULL, ?12, ?13,
+                    ?11, ?14, NULL, NULL, NULL, ?15,
+                    ?16, ?17
                 )",
                 params![
                     input.job_id.as_str(),
                     input.execution_id.as_deref(),
                     input.parent_job_id.as_deref(),
-                    input.worktree_path.as_deref(),
+                    input.branch.as_deref(),
+                    input.base_commit.as_deref(),
                     input.session_id.as_str(),
                     input.agent_config_id.as_str(),
                     input.issue_id.as_deref(),
                     input.project_id.as_str(),
                     input.description.as_str(),
                     input.now,
-                    input.model.as_deref(),
-                    uri_segment.as_str(),
-                    input.base_commit.as_deref(),
-                    pack_anchor.as_deref(),
                     input.parent_tool_use_id.as_deref(),
                     input.task_index,
+                    input.model.as_deref(),
+                    uri_segment.as_str(),
+                    pack_anchor.as_deref(),
                     input.output_contract.as_deref(),
-                    input.owns_ephemeral_worktree as i64,
-                    input.branch.as_deref(),
                 ],
             )
             .await
@@ -1041,14 +961,6 @@ mod pack_anchor_tests {
     const CHILD_SHA: &str = "3333333333333333333333333333333333333333";
     const DEFAULT_SHA: &str = "4444444444444444444444444444444444444444";
 
-    fn managed_path(name: &str) -> String {
-        crate::managed_worktrees::base_dir()
-            .expect("test environment has a home directory")
-            .join(name)
-            .to_string_lossy()
-            .into_owned()
-    }
-
     async fn job_anchors(db: &LocalDb, job_id: &str) -> (Option<String>, Option<String>) {
         let job_id = job_id.to_string();
         db.read(|conn| {
@@ -1087,10 +999,9 @@ mod pack_anchor_tests {
         .await
         .unwrap();
 
-        update_job_worktree(
+        update_job_coordinate(
             db.clone(),
             "job".to_string(),
-            Some(managed_path("pack-anchor-job")),
             Some("agent/job".to_string()),
             Some(DEFAULT_SHA.to_string()),
             2,
@@ -1115,8 +1026,8 @@ mod pack_anchor_tests {
              VALUES ('parent', 'proj', 1, 'Parent', 'active', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
              VALUES ('child', 'proj', 2, 'Child', 'active', 'parent', 1, 1);
-            INSERT INTO jobs (id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
-             VALUES ('job-parent', 'proj', 'parent', 'running', 'agent/parent-int', '/wt/parent', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, status, branch, created_at, updated_at)
+             VALUES ('job-parent', 'proj', 'parent', 'running', 'agent/parent-int', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, base_branch, created_at, updated_at)
              VALUES ('job-child', 'proj', 'child', 'pending', 'agent/parent-int', 1, 1);
             ",
@@ -1130,10 +1041,9 @@ mod pack_anchor_tests {
         .await
         .unwrap();
 
-        update_job_worktree(
+        update_job_coordinate(
             db.clone(),
             "job-child".to_string(),
-            Some(managed_path("pack-anchor-child")),
             Some("agent/child-int".to_string()),
             Some(CHILD_SHA.to_string()),
             2,
@@ -1146,6 +1056,78 @@ mod pack_anchor_tests {
         // The child's base is the parent's ephemeral integration branch, so the
         // anchor is the parent's durable anchor, not the child's own base_commit.
         assert_eq!(pack_anchor.as_deref(), Some(ROOT_SHA));
+    }
+
+    /// A sub-agent task whose parent recorded no base still spawns.
+    ///
+    /// `create_child_task` and the ephemeral-call path both used to resolve the
+    /// parent's `jobs.base_commit` and abort when it was NULL, which failed an
+    /// agent's `write cairn:~/tasks` over a bookkeeping column that has no
+    /// bearing on whether the task can run — a child places its own runs live,
+    /// and a call owns no checkout at all. Both now carry the value as the
+    /// `Option` it is, and this is the seam where that lands: the row is
+    /// written with a NULL base, and the archival lineage still resolves from
+    /// the parent's own anchor rather than from the missing base.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_child_task_spawns_when_its_parent_recorded_no_base_commit() {
+        let db = Arc::new(migrated_test_db("child-insert-null-base.db").await);
+        db.execute_script(
+            "
+            INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
+            INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('iss', 'proj', 1, 'Issue', 'active', 1, 1);
+            INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec', 'recipe', 'iss', 'proj', 'running', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, execution_id, status, branch, created_at, updated_at)
+             VALUES ('job-parent', 'proj', 'iss', 'exec', 'running', 'agent/parent', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+        // The parent carries a durable anchor but never had its base recorded —
+        // exactly the state of any job that does not run through `prepare_job`.
+        db.execute(
+            "UPDATE jobs SET base_commit = NULL, pack_anchor = ?1 WHERE id = 'job-parent'",
+            params![ROOT_SHA],
+        )
+        .await
+        .unwrap();
+
+        insert_child_job_session_run(
+            db.clone(),
+            ChildInsert {
+                job_id: "job-child".to_string(),
+                run_id: "run-child".to_string(),
+                session_id: "session-child".to_string(),
+                parent_job_id: Some("job-parent".to_string()),
+                branch: Some("agent/parent".to_string()),
+                agent_config_id: "explore".to_string(),
+                project_id: "proj".to_string(),
+                issue_id: Some("iss".to_string()),
+                execution_id: Some("exec".to_string()),
+                description: "map the parser".to_string(),
+                model: None,
+                // The change under test: the parent had nothing to hand down.
+                base_commit: None,
+                output_contract: None,
+                label: None,
+                phase: None,
+                parent_tool_use_id: None,
+                task_index: None,
+                now: 2,
+            },
+        )
+        .await
+        .expect("an unrecorded parent base is not a reason to refuse a task spawn");
+
+        let (base_commit, pack_anchor) = job_anchors(&db, "job-child").await;
+        assert_eq!(base_commit, None, "the child records what the parent had");
+        assert_eq!(
+            pack_anchor.as_deref(),
+            Some(ROOT_SHA),
+            "the archival lineage comes from the parent's anchor, not its base"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1161,10 +1143,10 @@ mod pack_anchor_tests {
              VALUES ('p2', 'proj', 2, 'Parent', 'active', 'gp', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
              VALUES ('c', 'proj', 3, 'Child', 'active', 'p2', 1, 1);
-            INSERT INTO jobs (id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
-             VALUES ('job-gp', 'proj', 'gp', 'running', 'agent/gp-int', '/wt/gp', 1, 1);
-            INSERT INTO jobs (id, project_id, issue_id, status, branch, worktree_path, base_branch, created_at, updated_at)
-             VALUES ('job-p2', 'proj', 'p2', 'running', 'agent/p2-int', '/wt/p2', 'agent/gp-int', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, status, branch, created_at, updated_at)
+             VALUES ('job-gp', 'proj', 'gp', 'running', 'agent/gp-int', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('job-p2', 'proj', 'p2', 'running', 'agent/p2-int', 'agent/gp-int', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, base_branch, created_at, updated_at)
              VALUES ('job-c', 'proj', 'c', 'pending', 'agent/p2-int', 1, 1);
             ",
@@ -1180,10 +1162,9 @@ mod pack_anchor_tests {
         .unwrap();
 
         // Resolve the middle coordinator first: it inherits the grandparent's anchor.
-        update_job_worktree(
+        update_job_coordinate(
             db.clone(),
             "job-p2".to_string(),
-            Some(managed_path("pack-anchor-p2")),
             Some("agent/p2-int".to_string()),
             Some(P2_SHA.to_string()),
             2,
@@ -1194,10 +1175,9 @@ mod pack_anchor_tests {
         assert_eq!(p2_anchor.as_deref(), Some(ROOT_SHA));
 
         // The grandchild inherits through the middle coordinator's stored anchor.
-        update_job_worktree(
+        update_job_coordinate(
             db.clone(),
             "job-c".to_string(),
-            Some(managed_path("pack-anchor-c")),
             Some("agent/c-int".to_string()),
             Some(CHILD_SHA.to_string()),
             3,

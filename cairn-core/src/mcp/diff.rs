@@ -35,7 +35,7 @@ pub(crate) fn apply_unified_diff(content: &str, diff: &str) -> Result<String, St
     } else {
         // Apply hunks in reverse order so line numbers stay valid.
         let mut sorted_hunks = hunks;
-        sorted_hunks.sort_by(|a, b| b.old_start.cmp(&a.old_start));
+        sorted_hunks.sort_by_key(|hunk| std::cmp::Reverse(hunk.old_start));
 
         for hunk in &sorted_hunks {
             lines = apply_hunk(&lines, hunk)?;

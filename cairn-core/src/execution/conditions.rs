@@ -382,42 +382,29 @@ pub struct CheckpointRunOutput {
     pub(crate) stderr: String,
 }
 
-/// Execute a programmatic checkpoint command, capturing its output.
+pub(crate) struct ExecutedCheckpoint {
+    pub(crate) coordinate: String,
+    pub(crate) output: CheckpointRunOutput,
+}
+
+/// Execute a checkpoint as a pure verdict in a disposable executor cell. The
+/// job's durable branch coordinate is resolved from the runner store; no process
+/// residence or user checkout participates in identity or execution.
 pub(crate) async fn execute_programmatic_checkpoint(
-    worktree_path: &str,
+    orch: &crate::orchestrator::Orchestrator,
+    job_id: &str,
+    node_name: &str,
     command: &str,
-) -> Result<CheckpointRunOutput, String> {
-    use tokio::process::Command;
-
-    log::info!(
-        "Running programmatic checkpoint: '{}' in {}",
-        command,
-        worktree_path
-    );
-
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(worktree_path)
-        .env("PATH", crate::env::get_user_path())
-        .output()
+) -> Result<ExecutedCheckpoint, String> {
+    crate::execution::checks::execute_job_verdict(orch, job_id, node_name, command)
         .await
-        .map_err(|e| format!("Failed to execute checkpoint command: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !stdout.is_empty() {
-        log::info!("Checkpoint stdout: {}", stdout);
-    }
-    if !stderr.is_empty() {
-        log::warn!("Checkpoint stderr: {}", stderr);
-    }
-
-    Ok(CheckpointRunOutput {
-        passed: output.status.success(),
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout,
-        stderr,
-    })
+        .map(|result| ExecutedCheckpoint {
+            coordinate: result.coordinate,
+            output: CheckpointRunOutput {
+                passed: result.exit_code == Some(0) && !result.timed_out,
+                exit_code: result.exit_code.unwrap_or(-1),
+                stdout: result.output,
+                stderr: String::new(),
+            },
+        })
 }

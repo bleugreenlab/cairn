@@ -1,15 +1,16 @@
 //! Durable history of programmatic command-checkpoint runs and the pure
 //! helpers that drive the checkpoint <-> agent auto-fix loop.
 //!
-//! A standalone checkpoint node runs a command in the upstream agent's
-//! worktree. On failure the job blocks; instead of being a dead end (resolvable
-//! only by the override-to-pass Confirm), the failure wakes the upstream agent
-//! with the captured output. When the agent commits a fix and goes idle, the
-//! re-arm pass in `reduce_dag` re-runs the checkpoint on the new worktree HEAD.
+//! A standalone checkpoint node runs a command in a disposable executor cell at
+//! the upstream agent's logical head. On failure the job blocks; instead of being
+//! a dead end (resolvable only by the override-to-pass Confirm), the failure wakes
+//! the upstream agent with the captured output. When the agent publishes a fix and
+//! goes idle, the re-arm pass in `reduce_dag` re-runs the checkpoint at the new
+//! logical head.
 //!
 //! The `checkpoint_runs` table is the source of truth for that loop: the row
 //! count is the attempt number (a hard cap bounds flapping), the latest row's
-//! commit SHA gates re-arming (only re-run when the agent actually committed
+//! logical-head commit gates re-arming (only re-run when the agent actually published
 //! something new), and the latest row's output is what the wake message shows.
 //! It lives here rather than on the seeded checkpoint artifact because re-arming
 //! deletes that artifact (so the projection falls back through to Pending).
@@ -290,7 +291,7 @@ pub(crate) fn build_checkpoint_failure_message(
 ) -> String {
     let mut msg = String::new();
     msg.push_str(&format!(
-        "The `{node_name}` checkpoint failed. It ran `{command}` in your worktree and the command exited with code {exit_code}.\n\n"
+        "The `{node_name}` checkpoint failed. It ran `{command}` in an executor cell at your logical head and exited with code {exit_code}.\n\n"
     ));
     let stdout_trimmed = stdout_tail.trim();
     if !stdout_trimmed.is_empty() {
@@ -305,7 +306,7 @@ pub(crate) fn build_checkpoint_failure_message(
         msg.push_str("\n```\n\n");
     }
     msg.push_str(
-        "Fix the underlying problem and commit your changes. When you finish and go idle, the checkpoint re-runs automatically against your updated worktree — no need to re-run the command yourself. If it passes, the workflow continues; if it fails again, you'll be woken with the new output.",
+        "Fix the underlying problem and publish your changes with a normal `commit_msg`. When you finish and go idle, the checkpoint re-runs automatically against your updated logical head; there is no need to re-run the command yourself. If it passes, the workflow continues; if it fails again, you'll be woken with the new output.",
     );
     msg
 }

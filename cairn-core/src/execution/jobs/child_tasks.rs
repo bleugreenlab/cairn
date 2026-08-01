@@ -6,7 +6,7 @@ use super::*;
 
 /// Create a user-initiated child task under a running job.
 ///
-/// The child inherits the parent's worktree. A new backend session is started
+/// The child inherits the parent's durable branch coordinate. A new backend session is started
 /// immediately (not via DAG advancement).
 pub fn create_child_task(
     orch: &Orchestrator,
@@ -117,42 +117,19 @@ pub fn create_child_task(
     agent_config.selection = Some(selection);
     agent_config.extras = Some(extras);
 
-    // Resolve the child task's working directory. A worktree-backed parent shares
-    // its worktree with the child; an ambient (Branch: main / no-worktree) parent
-    // has none to inherit, so the task gets its own ephemeral worktree off the
-    // parent's base branch — isolation from the user's live checkout — reclaimed
-    // when the task job terminalizes (owns_ephemeral_worktree).
-    let (worktree_path, ephemeral_branch, owns_ephemeral_worktree) =
-        match parent_job.worktree_path.clone() {
-            Some(path) => (path, None, false),
-            None => {
-                let repo_path = project_path
-                    .as_ref()
-                    .ok_or("Project has no repo path for ephemeral task worktree")?
-                    .to_string_lossy()
-                    .to_string();
-                let base_ref = parent_job
-                    .base_branch
-                    .clone()
-                    .unwrap_or_else(|| "HEAD".to_string());
-                let (path, branch) = super::worktrees::ensure_ephemeral_task_worktree(
-                    orch,
-                    &repo_path,
-                    &project_id,
-                    &job_id,
-                    issue_id.clone(),
-                    &base_ref,
-                )?;
-                // Record the branch on the child job (below) so teardown can
-                // `jj workspace forget` and delete it — the DAG path gets this from
-                // prepare_job's worktree write, but this synchronous path must set
-                // it explicitly or the ephemeral bookmark leaks in the jj store.
-                (path, Some(branch), true)
-            }
-        };
-
-    // The child's base_commit is its worktree's current HEAD.
-    let base_commit = worktree_head_commit(orch, Path::new(&worktree_path));
+    let branch = parent_job.branch.clone().ok_or_else(|| {
+        format!(
+            "Cannot create child task: parent job {} has no branch",
+            input.parent_job_id
+        )
+    })?;
+    // The parent's recorded base is carried forward as bookkeeping, never as a
+    // coordinate: a child task resolves its own placement live at run time
+    // (`resolve_current_for_read`), and this row's only consumer is the
+    // `pack_anchor` lineage, which already prefers the parent's own anchor.
+    // Its absence therefore has nothing to do with whether this task can run,
+    // and refusing the spawn over it was substrate state failing a verb.
+    let base_commit = parent_job.base_commit.clone();
 
     run_db(insert_child_job_session_run(
         db.clone(),
@@ -161,8 +138,7 @@ pub fn create_child_task(
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             parent_job_id: Some(input.parent_job_id.clone()),
-            worktree_path: Some(worktree_path.clone()),
-            branch: ephemeral_branch,
+            branch: Some(branch),
             agent_config_id: agent_config.id.clone(),
             project_id: project_id.clone(),
             issue_id: issue_id.clone(),
@@ -170,7 +146,6 @@ pub fn create_child_task(
             description: input.description.clone(),
             model: selected_model.as_ref().map(|m| m.to_string()),
             base_commit,
-            owns_ephemeral_worktree,
             // A cross-node child task keeps the fixed `return` contract via the
             // artifact-write handler's `task_name -> return` fallback; it does not
             // persist a per-run output_contract (CAIRN-2481).
@@ -207,7 +182,7 @@ pub fn create_child_task(
     );
 
     // ---- Store user event -----------------------------------------------
-    store_user_event(orch, &run_id, &session_id, &input.prompt, now, -1)?;
+    store_user_event(orch, &run_id, &session_id, &input.prompt, now)?;
 
     // ---- Output schema --------------------------------------------------
     let output_schema = OutputSchemaInfo {
@@ -219,11 +194,10 @@ pub fn create_child_task(
     };
 
     // ---- Start backend session -------------------------------------------
-    if let Err(e) = crate::orchestrator::session::start_agent_session(
+    crate::orchestrator::session::start_agent_session(
         orch,
         &run_id,
         &input.prompt,
-        &worktree_path,
         crate::backends::SessionStart::New {
             session_id: session_id.clone(),
         },
@@ -238,29 +212,7 @@ pub fn create_child_task(
         false,
         execution_id.as_deref(),
         None, // Child task: inherits parent's execution identity
-    ) {
-        // The ephemeral worktree was minted before the session started. On a
-        // startup failure the job never terminalizes, so neither the finalize
-        // reclaim nor the terminal-status GC would fire — discard it now
-        // (best-effort) so a failed spawn cannot strand a worktree + branch.
-        if owns_ephemeral_worktree {
-            let cleanup_orch = orch.clone();
-            let cleanup_job_id = job_id.clone();
-            if let Err(teardown_err) = run_db(async move {
-                crate::execution::teardown::teardown_worktrees(
-                    &cleanup_orch,
-                    crate::execution::teardown::TeardownScope::Job(cleanup_job_id),
-                    crate::execution::teardown::TeardownReason::Discarded,
-                )
-                .await
-            }) {
-                log::warn!(
-                    "failed to reclaim ephemeral task worktree after session start failure: {teardown_err}"
-                );
-            }
-        }
-        return Err(e);
-    }
+    )?;
 
     Ok(CreateChildTaskResult { job_id, run_id })
 }

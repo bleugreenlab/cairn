@@ -799,7 +799,7 @@ impl AgentBackend for CodexBackend {
             let _ = set_session_backend_id(CODEX_BACKEND_NAME, &run_db, sid, &thread_id);
         }
 
-        let initial_sequence = persist_system_prompt_event(
+        persist_system_prompt_event(
             orch,
             &config.run_id,
             session_id.as_deref(),
@@ -810,7 +810,9 @@ impl AgentBackend for CodexBackend {
         let mut turn_params = serde_json::json!({
             "threadId": thread_id.clone(),
             "cwd": config.working_dir,
-            "input": [{ "type": "text", "text": prompt_text }]
+            "input": crate::agent_process::stdin::build_codex_input(
+                &config.message_content.with_text(prompt_text)
+            )?
         });
         if let Some(ref model) = model_str {
             turn_params["model"] = serde_json::json!(model);
@@ -854,11 +856,6 @@ impl AgentBackend for CodexBackend {
             run_job_id(CODEX_BACKEND_NAME, &run_db, &config.run_id);
 
         {
-            let mut processes = orch
-                .process_state
-                .processes
-                .lock()
-                .map_err(|e| e.to_string())?;
             let mut active_process = ActiveProcess::new(
                 child_arc.clone(),
                 stdin_arc.clone(),
@@ -867,7 +864,8 @@ impl AgentBackend for CodexBackend {
             );
             active_process.backend = Some("codex".to_string());
             active_process.model = config.model.as_ref().map(|m| m.as_str().to_string());
-            processes.register(config.run_id.clone(), active_process);
+            orch.process_state
+                .register_process(config.run_id.clone(), active_process)?;
         }
 
         let notification_rx = client.notifications();
@@ -886,7 +884,6 @@ impl AgentBackend for CodexBackend {
                 client,
                 current_turn_id,
                 oauth_state,
-                initial_sequence,
                 "codex".to_string(),
                 run_db,
                 None,
@@ -920,7 +917,7 @@ impl AgentBackend for CodexBackend {
     fn send_user_message(
         &self,
         stdin: &mut dyn BackendStdin,
-        content: &str,
+        content: &crate::agent_process::stdin::MessageContent,
         _session_id: &str,
         _parent_tool_use_id: Option<&str>,
         _working_dir: Option<&str>,
@@ -1369,7 +1366,7 @@ pub(crate) fn start_app_server_session(
         session_id.as_deref().unwrap_or("<none>")
     );
 
-    let initial_sequence = persist_system_prompt_event(
+    persist_system_prompt_event(
         orch,
         &config.run_id,
         session_id.as_deref(),
@@ -1422,11 +1419,6 @@ pub(crate) fn start_app_server_session(
     let process_job_id: Option<String> = run_job_id(profile.backend_name, &run_db, &config.run_id);
 
     {
-        let mut processes = orch
-            .process_state
-            .processes
-            .lock()
-            .map_err(|e| e.to_string())?;
         let mut active_process = ActiveProcess::new(
             child_arc.clone(),
             stdin_arc.clone(),
@@ -1435,7 +1427,8 @@ pub(crate) fn start_app_server_session(
         );
         active_process.backend = Some(profile.backend_key.to_string());
         active_process.model = config.model.as_ref().map(|m| m.as_str().to_string());
-        processes.register(config.run_id.clone(), active_process);
+        orch.process_state
+            .register_process(config.run_id.clone(), active_process)?;
     }
 
     let notification_rx = client.notifications();
@@ -1454,7 +1447,6 @@ pub(crate) fn start_app_server_session(
             client,
             current_turn_id,
             oauth_state,
-            initial_sequence,
             profile.backend_key.to_string(),
             run_db,
             None,
@@ -1705,9 +1697,9 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
     // Register `threadId -> run` and the per-call notification channel BEFORE
     // `turn/start`, so the first tool call routes to this run (demux #2) and the
     // dispatcher can deliver this thread's notifications (demux #1).
-    let notification_rx = server.register_call(&thread_id, &config.run_id, &config.working_dir);
+    let notification_rx = server.register_call(&thread_id, &config.run_id);
 
-    let initial_sequence = persist_system_prompt_event(
+    persist_system_prompt_event(
         orch,
         &config.run_id,
         session_id.as_deref(),
@@ -1718,7 +1710,7 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
     let mut turn_params = serde_json::json!({
         "threadId": thread_id.clone(),
         "cwd": config.working_dir,
-        "input": [{ "type": "text", "text": config.prompt }]
+        "input": crate::agent_process::stdin::build_codex_input(&config.message_content)?
     });
     if let Some(ref model) = model_str {
         turn_params["model"] = serde_json::json!(model);
@@ -1758,16 +1750,12 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
 
     let process_job_id: Option<String> = run_job_id(CODEX_BACKEND_NAME, &run_db, &config.run_id);
     {
-        let mut processes = orch
-            .process_state
-            .processes
-            .lock()
-            .map_err(|e| e.to_string())?;
         let mut active_process =
             ActiveProcess::new(null_child, stdin_arc, session_id.clone(), process_job_id);
         active_process.backend = Some("codex".to_string());
         active_process.model = config.model.as_ref().map(|m| m.as_str().to_string());
-        processes.register(config.run_id.clone(), active_process);
+        orch.process_state
+            .register_process(config.run_id.clone(), active_process)?;
     }
     // `transition_to_active` (CAIRN-2526) is applied by the calls path
     // (`start_call_run_now`) after this returns, exactly like the process path.
@@ -1789,7 +1777,6 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
             // Pool-scoped auth-token refresh is answered by the pool dispatcher
             // (it carries no threadId), so the per-call reader needs no oauth state.
             None,
-            initial_sequence,
             "codex".to_string(),
             run_db,
             Some(cleanup),

@@ -56,7 +56,7 @@ pub(crate) use snapshots::load_nodes_from_execution;
 pub(crate) use job_creation::{create_jobs_for_execution, create_jobs_for_new_nodes_conn};
 pub(crate) use persistence::{load_job, load_project_repo_path, run_advancement_db};
 pub(crate) use recompute::force_fail_job_turn_conn;
-pub(crate) use snapshot_edit::reconcile_removed_nodes_conn;
+pub(crate) use snapshot_edit::{cancel_job_conn, reconcile_removed_nodes_conn};
 pub(crate) use snapshots::{load_execution_snapshot, update_execution_snapshot};
 
 use persistence::*;

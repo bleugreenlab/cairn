@@ -279,7 +279,7 @@ impl WarmProcessGC {
         let effective_rss = |c: &ScoredCandidate| c.rss.unwrap_or(imputed_rss);
 
         // Lowest score first — least relevant evicted first.
-        candidates.sort_by(|a, b| a.score.cmp(&b.score));
+        candidates.sort_by_key(|candidate| candidate.score);
 
         let aggregate_rss: u64 = candidates.iter().map(effective_rss).sum();
         let system = self.probe.system_memory();

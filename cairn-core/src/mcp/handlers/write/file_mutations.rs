@@ -5,7 +5,7 @@ use super::types::{
 use crate::config::agents as config_agents;
 use crate::mcp::diff::PatchEnvelopeFileChange;
 use crate::mcp::file_targets::{
-    did_you_mean_block, normalize_change_target, path_escapes_worktree, resolve_change_target,
+    did_you_mean_block, normalize_change_target, resolve_change_target, resolve_logical_file_target,
 };
 use crate::mcp::git::GitAuthor;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
@@ -14,15 +14,6 @@ use crate::storage::RowExt;
 use cairn_db::turso::params;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-
-/// Rejection returned when a file-target change is attempted in a non-worktree
-/// cwd (the project's live checkout). Changes can only happen in a worktree, so
-/// the batch is refused BEFORE any edit is written and the checkout is never
-/// touched. Resource writes (issues, messages, todos, tasks) are unaffected.
-pub(super) const NON_WORKTREE_CHANGE_ERROR: &str =
-    "Changes can only be made in a worktree. This agent runs on the project's live \
-     checkout (no worktree); file edits are rejected here and the checkout is left \
-     untouched. Resource writes (issues, messages, todos, tasks) still work.";
 
 /// File-target keys parsed from a change item's `payload`. Mirrors how resource
 /// handlers read structured keys from `item.payload`, so every change item is
@@ -44,9 +35,9 @@ pub(super) struct FileChangePayload {
 }
 
 pub(super) fn logical_paths_for_changes(
-    worktree: &std::path::Path,
+    _worktree: &std::path::Path,
     changes: &[IndexedChange<'_>],
-    allow_escape: bool,
+    _allow_escape: bool,
 ) -> Result<Vec<String>, String> {
     let mut paths = std::collections::BTreeSet::new();
     for change in changes {
@@ -69,14 +60,13 @@ pub(super) fn logical_paths_for_changes(
                     | PatchEnvelopeFileChange::Update { path, .. }
                     | PatchEnvelopeFileChange::Delete { path } => path,
                 };
-                paths.insert(path.trim_start_matches('/').to_string());
+                let target = envelope_path_to_target(&path);
+                paths.insert(resolve_logical_file_target(&target)?.relative_path);
             }
             continue;
         }
-        let target = normalize_change_target(&item.target, allow_escape)?;
-        let full = resolve_change_target(worktree, &target, allow_escape)?;
-        if !path_escapes_worktree(worktree, &full) {
-            paths.insert(target.strip_prefix("file:").unwrap_or_default().to_string());
+        if let Ok(target) = resolve_logical_file_target(&item.target) {
+            paths.insert(target.relative_path);
         }
     }
     Ok(paths.into_iter().collect())
@@ -89,8 +79,13 @@ pub(super) fn apply_logical_file_batch(
     snapshot: &std::collections::HashMap<String, Option<String>>,
 ) -> IndexedResult<FileBatchSuccess> {
     let worktree = std::path::Path::new(&request.cwd);
-    let (prepared, summaries) =
-        prepare_file_changes_with_snapshot(worktree, changes, allow_escape, snapshot.clone())?;
+    let (prepared, summaries) = prepare_file_changes_with_snapshot(
+        worktree,
+        changes,
+        allow_escape,
+        snapshot.clone(),
+        true,
+    )?;
     apply_prepared_logical(changes, &prepared, &summaries, snapshot)
 }
 
@@ -205,66 +200,38 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-async fn resolve_project_id_for_cwd(orch: &Orchestrator, cwd: &str) -> Option<String> {
-    let cwd = cwd.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT j.project_id
-                        FROM runs r
-                        JOIN jobs j ON r.job_id = j.id
-                        JOIN projects p ON j.project_id = p.id
-                        WHERE r.status IN ('starting', 'live')
-                          AND (j.worktree_path = ?1 OR (p.repo_path = ?1 AND j.issue_id IS NULL))
-                        ORDER BY
-                            CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
-                            r.created_at DESC
-                        LIMIT 1
-                        ",
-                        params![cwd.as_str()],
-                    )
-                    .await?;
-
-                crate::storage::next_text(&mut rows, 0).await
-            })
-        })
+async fn resolve_git_author_for_run(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Option<GitAuthor> {
+    let (context, _) = crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
         .await
-        .ok()
-        .flatten()
-}
-
-async fn resolve_git_author_for_cwd(orch: &Orchestrator, cwd: &str) -> Option<GitAuthor> {
-    let project_id = resolve_project_id_for_cwd(orch, cwd).await;
-    orch.resolve_git_identity_for_project(project_id.as_deref())
+        .ok()?;
+    orch.resolve_git_identity_for_project(Some(&context.project_id))
         .map(|(name, email)| GitAuthor::new(name, email))
 }
 
-async fn get_agent_commit_prefix_async(orch: &Orchestrator, cwd: &str) -> Result<String, String> {
-    let cwd = cwd.to_string();
-    let job_data = orch
-        .db
-        .local
+async fn get_agent_commit_prefix_async(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Result<String, String> {
+    let (context, db) =
+        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
+    let job_id = context.job_id;
+    let job_data = db
         .read(|conn| {
+            let job_id = job_id.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
                         "
                         SELECT j.agent_config_id, j.project_id, p.repo_path
-                        FROM runs r
-                        JOIN jobs j ON r.job_id = j.id
+                        FROM jobs j
                         JOIN projects p ON j.project_id = p.id
-                        WHERE r.status IN ('starting', 'live')
-                          AND (j.worktree_path = ?1 OR (p.repo_path = ?1 AND j.issue_id IS NULL))
-                        ORDER BY
-                            CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
-                            r.created_at DESC
+                        WHERE j.id = ?1
                         LIMIT 1
                         ",
-                        (cwd.as_str(),),
+                        (job_id.as_str(),),
                     )
                     .await?;
 
@@ -291,76 +258,114 @@ async fn get_agent_commit_prefix_async(orch: &Orchestrator, cwd: &str) -> Result
     }
 }
 
-pub(crate) async fn record_file_change_async(
-    orch: &Orchestrator,
-    cwd: &str,
+async fn record_file_change_for_job(
+    db: std::sync::Arc<crate::storage::LocalDb>,
+    job_id: &str,
     file_path: &str,
     status: &str,
     additions: i32,
     deletions: i32,
     previous_path: Option<&str>,
 ) -> Result<(), String> {
-    let cwd = cwd.to_string();
+    let job_id = job_id.to_string();
     let file_path = file_path.to_string();
     let status = status.to_string();
     let previous_path = previous_path.map(str::to_string);
-    orch.db
-        .local
-        .write(|conn| {
-            let cwd = cwd.clone();
-            let file_path = file_path.clone();
-            let status = status.clone();
-            let previous_path = previous_path.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT j.id
-                        FROM runs r
-                        JOIN jobs j ON r.job_id = j.id
-                        JOIN projects p ON j.project_id = p.id
-                        WHERE r.status IN ('starting', 'live')
-                          AND (j.worktree_path = ?1 OR (p.repo_path = ?1 AND j.issue_id IS NULL))
-                        ORDER BY
-                            CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
-                            r.created_at DESC
-                        LIMIT 1
-                        ",
-                        (cwd.as_str(),),
-                    )
-                    .await?;
-
-                let Some(row) = rows.next().await? else {
-                    return Ok(());
-                };
-                let job_id = row.text(0)?;
-                let id = uuid::Uuid::new_v4().to_string();
-                let now = chrono::Utc::now().timestamp() as i32;
-
-                conn.execute(
-                    "
-                    INSERT INTO file_changes (
-                        id, job_id, file_path, status, additions, deletions, previous_path, created_at
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                    ",
-                    params![
-                        id.as_str(),
-                        job_id.as_str(),
-                        file_path.as_str(),
-                        status.as_str(),
-                        additions,
-                        deletions,
-                        previous_path.as_deref(),
-                        now
-                    ],
+    db.write(|conn| {
+        let job_id = job_id.clone();
+        let file_path = file_path.clone();
+        let status = status.clone();
+        let previous_path = previous_path.clone();
+        Box::pin(async move {
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().timestamp() as i32;
+            conn.execute(
+                "
+                INSERT INTO file_changes (
+                    id, job_id, file_path, status, additions, deletions, previous_path, created_at
                 )
-                .await?;
-                Ok(())
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ",
+                params![
+                    id.as_str(),
+                    job_id.as_str(),
+                    file_path.as_str(),
+                    status.as_str(),
+                    additions,
+                    deletions,
+                    previous_path.as_deref(),
+                    now
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub(super) fn reverted_file_changes(
+    resolution: &super::super::branch::BranchResolution,
+    landed_head: &str,
+    paths: &[String],
+) -> Result<Vec<RecordFileChange>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            let before = super::super::read::file_at_commit(
+                resolution.object_repository_path.clone(),
+                resolution.commit_id.clone(),
+                path,
+            )?;
+            let after = super::super::read::file_at_commit(
+                resolution.object_repository_path.clone(),
+                landed_head.to_string(),
+                path,
+            )?;
+            let status = match (&before, &after) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "deleted",
+                _ => "modified",
+            };
+            let before_text = before
+                .as_deref()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok());
+            let after_text = after
+                .as_deref()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok());
+            let (additions, deletions) = changed_line_counts(before_text, after_text);
+            Ok(RecordFileChange {
+                path: path.clone(),
+                status,
+                additions,
+                deletions,
             })
         })
-        .await
-        .map_err(|e| e.to_string())
+        .collect()
+}
+
+pub(crate) async fn record_agent_file_change(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    file_path: &str,
+    status: &str,
+    additions: i32,
+    deletions: i32,
+    previous_path: Option<&str>,
+) -> Result<(), String> {
+    let (context, db) =
+        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
+    record_file_change_for_job(
+        db,
+        &context.job_id,
+        file_path,
+        status,
+        additions,
+        deletions,
+        previous_path,
+    )
+    .await
 }
 
 pub(crate) fn changed_line_counts(before: Option<&str>, after: Option<&str>) -> (i32, i32) {
@@ -450,8 +455,13 @@ pub(super) struct PostSealPublication {
 
 pub(super) struct CompletedCommit {
     pub(super) report: Option<CommitReport>,
+    /// The jj→git export leg of this commit's publication. `Err` means the
+    /// bookmark advanced but `refs/heads/<branch>` did not, so the commit is
+    /// sealed locally and unpublished.
+    pub(super) export: Result<(), String>,
     pub(super) publication_requirement: crate::merge_requests::queries::PublicationRequirement,
     pub(super) publication: Option<PostSealPublication>,
+    pub(super) affected_paths: Vec<String>,
 }
 
 pub(super) enum CommitOutcome {
@@ -809,6 +819,7 @@ fn read_in_flight_or_disk(
     in_flight: &std::collections::HashMap<String, Option<String>>,
     change: &IndexedChange<'_>,
     item: &ChangeItem,
+    outside_logical_namespace: bool,
 ) -> IndexedResult<String> {
     if let Some(content) = in_flight.get(normalized_target) {
         return content.clone().ok_or_else(|| {
@@ -817,19 +828,27 @@ fn read_in_flight_or_disk(
                 item,
                 format!(
                     "File does not exist{}",
-                    did_you_mean_block(worktree, normalized_target)
+                    if outside_logical_namespace {
+                        did_you_mean_block(worktree, normalized_target)
+                    } else {
+                        String::new()
+                    }
                 ),
             )
         });
     }
 
-    if !full_path.exists() {
+    if !outside_logical_namespace || !full_path.exists() {
         return Err(build_failure(
             change.index,
             item,
             format!(
                 "File does not exist{}",
-                did_you_mean_block(worktree, normalized_target)
+                if outside_logical_namespace {
+                    did_you_mean_block(worktree, normalized_target)
+                } else {
+                    String::new()
+                }
             ),
         ));
     }
@@ -855,12 +874,35 @@ fn in_flight_is_new(
     full_path: &std::path::Path,
     normalized_target: &str,
     in_flight: &std::collections::HashMap<String, Option<String>>,
+    outside_logical_namespace: bool,
 ) -> bool {
     match in_flight.get(normalized_target) {
         Some(None) => true,
         Some(Some(_)) => false,
-        None => !full_path.exists(),
+        None => !outside_logical_namespace || !full_path.exists(),
     }
+}
+
+fn resolve_mutation_target(
+    worktree: &std::path::Path,
+    normalized_target: &str,
+    allow_escape: bool,
+    logical_snapshot_authoritative: bool,
+) -> Result<(std::path::PathBuf, bool), String> {
+    if logical_snapshot_authoritative {
+        if let Ok(logical) = resolve_logical_file_target(normalized_target) {
+            // This path is a logical name only. It must never become a host path or
+            // be joined to process cwd; the snapshot and logical-head transaction
+            // supply all content and mutation authority.
+            return Ok((std::path::PathBuf::from(logical.relative_path), false));
+        }
+    }
+
+    let full_path = resolve_change_target(worktree, normalized_target, allow_escape)?;
+    // The legacy preview adapter still reads its supplied projection directory.
+    // It never applies these prepared changes; authoritative apply always takes
+    // the logical branch above and only marks explicit host paths as external.
+    Ok((full_path, true))
 }
 
 struct PreparedSinks<'a> {
@@ -872,6 +914,7 @@ struct PreparedSinks<'a> {
 struct UnifiedPatchContext<'a> {
     worktree: &'a std::path::Path,
     allow_escape: bool,
+    logical_snapshot_authoritative: bool,
     change_pos: usize,
     change: &'a IndexedChange<'a>,
     item: &'a ChangeItem,
@@ -908,19 +951,27 @@ fn prepare_unified_patch_change(
         .strip_prefix("file:")
         .unwrap_or_default()
         .to_string();
-    let full_path = resolve_change_target(ctx.worktree, &normalized_target, ctx.allow_escape)
-        .map_err(|e| {
-            build_failure(
-                ctx.change.index,
-                ctx.item,
-                format!("Invalid file target: {e}"),
-            )
-        })?;
-    let outside_worktree = path_escapes_worktree(ctx.worktree, &full_path);
-
+    let (full_path, outside_worktree) = resolve_mutation_target(
+        ctx.worktree,
+        &normalized_target,
+        ctx.allow_escape,
+        ctx.logical_snapshot_authoritative,
+    )
+    .map_err(|e| {
+        build_failure(
+            ctx.change.index,
+            ctx.item,
+            format!("Invalid file target: {e}"),
+        )
+    })?;
     match envelope_change {
         PatchEnvelopeFileChange::Add { content, .. } => {
-            let is_new = in_flight_is_new(&full_path, &normalized_target, sinks.in_flight);
+            let is_new = in_flight_is_new(
+                &full_path,
+                &normalized_target,
+                sinks.in_flight,
+                outside_worktree,
+            );
             sinks
                 .in_flight
                 .insert(normalized_target.clone(), Some(content.clone()));
@@ -943,6 +994,7 @@ fn prepare_unified_patch_change(
                 sinks.in_flight,
                 ctx.change,
                 ctx.item,
+                outside_worktree,
             )?;
             let patched = crate::mcp::diff::apply_unified_diff(&content, &diff).map_err(|e| {
                 build_failure(
@@ -991,6 +1043,7 @@ pub(super) fn prepare_file_changes(
         changes,
         allow_escape,
         std::collections::HashMap::new(),
+        false,
     )
 }
 
@@ -999,6 +1052,7 @@ pub(super) fn prepare_file_changes_with_snapshot(
     changes: &[IndexedChange<'_>],
     allow_escape: bool,
     mut in_flight: std::collections::HashMap<String, Option<String>>,
+    logical_snapshot_authoritative: bool,
 ) -> IndexedResult<PreparedFileChanges> {
     let mut prepared: Vec<PreparedChange> = Vec::with_capacity(changes.len());
     let mut summaries: Vec<String> = Vec::with_capacity(changes.len());
@@ -1031,12 +1085,17 @@ pub(super) fn prepare_file_changes_with_snapshot(
                         format!("mode={} requires content", mode_name(item.mode)),
                     )
                 })?;
-                let full_path = resolve_change_target(worktree, &normalized_target, allow_escape)
-                    .map_err(|e| {
+                let (full_path, outside_worktree) = resolve_mutation_target(
+                    worktree,
+                    &normalized_target,
+                    allow_escape,
+                    logical_snapshot_authoritative,
+                )
+                .map_err(|e| {
                     build_failure(change.index, item, format!("Invalid file target: {e}"))
                 })?;
-                let outside_worktree = path_escapes_worktree(worktree, &full_path);
-                let is_new = in_flight_is_new(&full_path, &normalized_target, &in_flight);
+                let is_new =
+                    in_flight_is_new(&full_path, &normalized_target, &in_flight, outside_worktree);
                 in_flight.insert(normalized_target.clone(), Some(content.clone()));
                 prepared.push(PreparedChange::Write {
                     change_pos,
@@ -1058,12 +1117,17 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 let appended = fp.content.clone().ok_or_else(|| {
                     build_failure(change.index, item, "mode=append requires content")
                 })?;
-                let full_path = resolve_change_target(worktree, &normalized_target, allow_escape)
-                    .map_err(|e| {
+                let (full_path, outside_worktree) = resolve_mutation_target(
+                    worktree,
+                    &normalized_target,
+                    allow_escape,
+                    logical_snapshot_authoritative,
+                )
+                .map_err(|e| {
                     build_failure(change.index, item, format!("Invalid file target: {e}"))
                 })?;
-                let outside_worktree = path_escapes_worktree(worktree, &full_path);
-                let is_new = in_flight_is_new(&full_path, &normalized_target, &in_flight);
+                let is_new =
+                    in_flight_is_new(&full_path, &normalized_target, &in_flight, outside_worktree);
                 let content = match read_in_flight_or_disk(
                     worktree,
                     &normalized_target,
@@ -1071,6 +1135,7 @@ pub(super) fn prepare_file_changes_with_snapshot(
                     &in_flight,
                     change,
                     item,
+                    outside_worktree,
                 ) {
                     Ok(existing) => format!("{existing}{appended}"),
                     Err(_) if is_new => appended,
@@ -1089,12 +1154,15 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 summaries.push(format!("~{normalized_target}"));
             }
             ChangeMode::Patch => {
-                let full_path = resolve_change_target(worktree, &normalized_target, allow_escape)
-                    .map_err(|e| {
+                let (full_path, outside_worktree) = resolve_mutation_target(
+                    worktree,
+                    &normalized_target,
+                    allow_escape,
+                    logical_snapshot_authoritative,
+                )
+                .map_err(|e| {
                     build_failure(change.index, item, format!("Invalid file target: {e}"))
                 })?;
-                let outside_worktree = path_escapes_worktree(worktree, &full_path);
-
                 let content = read_in_flight_or_disk(
                     worktree,
                     &normalized_target,
@@ -1102,6 +1170,7 @@ pub(super) fn prepare_file_changes_with_snapshot(
                     &in_flight,
                     change,
                     item,
+                    outside_worktree,
                 )?;
 
                 let patched = if let Some(ref diff_text) = fp.diff {
@@ -1149,8 +1218,9 @@ pub(super) fn prepare_file_changes_with_snapshot(
                                     &content,
                                     &literal_old,
                                     matches,
-                                    std::fs::read_to_string(&full_path)
-                                        .is_ok_and(|disk_content| disk_content == content),
+                                    outside_worktree
+                                        && std::fs::read_to_string(&full_path)
+                                            .is_ok_and(|disk_content| disk_content == content),
                                 ),
                             ));
                         } else if replace_all {
@@ -1202,6 +1272,7 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 let ctx = UnifiedPatchContext {
                     worktree,
                     allow_escape,
+                    logical_snapshot_authoritative,
                     change_pos,
                     change,
                     item,
@@ -1225,11 +1296,15 @@ pub(super) fn prepare_file_changes_with_snapshot(
                 ));
             }
             ChangeMode::Delete => {
-                let full_path = resolve_change_target(worktree, &normalized_target, allow_escape)
-                    .map_err(|e| {
+                let (full_path, outside_worktree) = resolve_mutation_target(
+                    worktree,
+                    &normalized_target,
+                    allow_escape,
+                    logical_snapshot_authoritative,
+                )
+                .map_err(|e| {
                     build_failure(change.index, item, format!("Invalid file target: {e}"))
                 })?;
-                let outside_worktree = path_escapes_worktree(worktree, &full_path);
                 in_flight.insert(normalized_target.clone(), None);
                 prepared.push(PreparedChange::Delete {
                     change_pos,
@@ -1254,13 +1329,6 @@ pub(super) fn prepare_file_changes_with_snapshot(
     }
 
     Ok((prepared, summaries))
-}
-
-pub(crate) fn emit_worktree_changed(orch: &Orchestrator, cwd: &str) {
-    let _ = orch.services.emitter.emit(
-        "worktree-changed",
-        serde_json::json!({"worktree_path": cwd}),
-    );
 }
 
 /// Parse a `mode:"rename"` item's payload into the route file, the symbol
@@ -1365,7 +1433,7 @@ pub(super) fn prepare_rename_changes(
     };
 
     for edit in &plan.file_edits {
-        let src_rel = rel(&edit.worktree_path);
+        let src_rel = rel(&edit.path);
         let src_target = format!("file:{src_rel}");
         match (&edit.new_content, &edit.move_to) {
             (Some(content), Some(dest)) => {
@@ -1385,7 +1453,7 @@ pub(super) fn prepare_rename_changes(
                     change_pos: 0,
                     target_uri: src_target.clone(),
                     repo_path: src_rel,
-                    full_path: edit.worktree_path.clone(),
+                    full_path: edit.path.clone(),
                     outside_worktree: false,
                 });
                 summaries.push(format!("-{src_target}"));
@@ -1403,7 +1471,7 @@ pub(super) fn prepare_rename_changes(
                     change_pos: 0,
                     target_uri: src_target.clone(),
                     repo_path: src_rel,
-                    full_path: edit.worktree_path.clone(),
+                    full_path: edit.path.clone(),
                     content: content.clone(),
                     is_new: false,
                     outside_worktree: false,
@@ -1420,7 +1488,7 @@ pub(super) fn prepare_rename_changes(
                     change_pos: 0,
                     target_uri: src_target.clone(),
                     repo_path: src_rel,
-                    full_path: edit.worktree_path.clone(),
+                    full_path: edit.path.clone(),
                     outside_worktree: false,
                 });
                 summaries.push(format!("-{src_target}"));
@@ -1436,6 +1504,40 @@ pub(super) fn prepare_rename_changes(
     (prepared, applied, summaries)
 }
 
+/// The request field an agent sets to commit deliberate literal conflict
+/// markers. Named in every refusal, so the escape is discoverable from the
+/// refusal itself rather than only from the schema.
+pub(crate) const MARKER_ESCAPE_KEY: &str = "conflict_markers_reason";
+
+/// Every conflict-marker line in the content this batch proposes to publish.
+///
+/// Only [`crate::jj::ProposedPublication::Mutations`] carries agent-authored
+/// content: it is the write path's complete resulting content for each path,
+/// which is exactly what the guard must screen. `Revert` republishes a tree that
+/// already exists in history, and `DeltaCommit` never reaches this carrier —
+/// `run` commits go through the barrier instead, where the same scan runs
+/// against the working tree.
+fn proposed_conflict_markers(
+    proposed: &crate::jj::ProposedPublication,
+) -> Vec<cairn_common::conflict_scaffolding::ConflictMarkerHit> {
+    let crate::jj::ProposedPublication::Mutations(mutations) = proposed else {
+        return Vec::new();
+    };
+    mutations
+        .iter()
+        .filter_map(|mutation| {
+            let content = mutation.content.as_ref()?;
+            Some(
+                cairn_common::conflict_scaffolding::conflict_markers_in_content(
+                    &mutation.path,
+                    content,
+                ),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finalize_file_commit(
     orch: &Orchestrator,
@@ -1446,35 +1548,70 @@ pub(super) async fn finalize_file_commit(
     first_change: &IndexedChange<'_>,
     promoted_memory_uris: &[String],
     logical_resolution: &super::super::branch::BranchResolution,
-    logical_mutations: &[cairn_vcs::LogicalTreeMutation],
+    proposed: crate::jj::ProposedPublication,
+    marker_escape: Option<&str>,
 ) -> IndexedResult<CommitOutcome> {
-    if affected_paths.is_empty() {
+    if affected_paths.is_empty()
+        && matches!(&proposed, crate::jj::ProposedPublication::Mutations(mutations) if mutations.is_empty())
+    {
         return Ok(CommitOutcome::Done(CompletedCommit {
             report: None,
+            // Nothing was published, so there was nothing to export.
+            export: Ok(()),
             publication_requirement:
                 crate::merge_requests::queries::PublicationRequirement::DeferredUntilPublication,
             publication: None,
+            affected_paths: Vec::new(),
         }));
     }
 
-    // Route worktree mutations through the VCS seam (jj for a worktree). A
-    // non-worktree cwd is rejected up front in `handle_write`, so this path
-    // always sees a jj workspace.
-    let (managed_context, routed_db) =
-        match super::super::run_context::lookup_run_routed(&orch.db, request).await {
-            Ok((run, db)) => {
-                let context =
-                    crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
-                        db.clone(),
-                        run.job_id,
-                    )
-                    .await
-                    .ok()
-                    .flatten();
-                (context, Some(db))
+    // The durable boundary for conflict scaffolding. Markers may live in a
+    // working tree for the length of a resolution session; they may never become
+    // history. Screened here rather than deeper in `jj::publish` because this is
+    // where the batch that authored the content can still be refused whole, with
+    // an index and target the agent can act on.
+    let marker_hits = proposed_conflict_markers(&proposed);
+    if !marker_hits.is_empty() {
+        match marker_escape {
+            Some(reason) => log::warn!(
+                "write: conflict-marker guard bypassed on {} — {reason}",
+                marker_hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => {
+                let error = cairn_common::conflict_scaffolding::conflict_marker_refusal(
+                    "commit",
+                    &marker_hits,
+                    MARKER_ESCAPE_KEY,
+                    cairn_common::conflict_scaffolding::MarkerSource::ProposedContent,
+                );
+                return Err(Box::new(IndexedFailure {
+                    failure: ChangeFailure {
+                        index: first_change.index,
+                        target: first_change.item.target.clone(),
+                        mode: mode_name(first_change.item.mode).to_string(),
+                        kind: "file".to_string(),
+                        error: error.clone(),
+                    },
+                    commit: Some(CommitReport {
+                        status: "failed".to_string(),
+                        sha: None,
+                        pr_number: None,
+                        message: Some(error),
+                    }),
+                }));
             }
-            Err(_) => (None, None),
-        };
+        }
+    }
+
+    let routed_run = super::super::run_context::lookup_run_routed(&orch.db, request)
+        .await
+        .ok();
     let Some(commit_msg) = commit_msg else {
         let error = "File edits require a descriptive commit_msg; no project tree changes were published. Pass commit_msg so the proposed tree can be committed.".to_string();
         return Err(Box::new(IndexedFailure {
@@ -1514,7 +1651,7 @@ pub(super) async fn finalize_file_commit(
         }));
     }
 
-    let agent_prefix = get_agent_commit_prefix_async(orch, &request.cwd)
+    let agent_prefix = get_agent_commit_prefix_async(orch, request)
         .await
         .unwrap_or_default();
     let final_commit_msg = if commit_msg == "^" {
@@ -1531,78 +1668,51 @@ pub(super) async fn finalize_file_commit(
         )
     };
 
-    let author = resolve_git_author_for_cwd(orch, &request.cwd).await;
+    let author = resolve_git_author_for_run(orch, request).await;
 
-    let mut unique_paths: Vec<&str> = Vec::new();
-    let mut seen_paths = std::collections::HashSet::new();
-    for path in affected_paths {
-        if seen_paths.insert(path.as_str()) {
-            unique_paths.push(path.as_str());
-        }
-    }
-
+    // Carried for BOTH modes: an amend re-stamps the committer even though it
+    // preserves the author, so withholding the identity here leaves the amended
+    // commit unpushable.
+    let publication_identity = author.map(|author| cairn_vcs::PublicationIdentity {
+        name: author.name,
+        email: author.email,
+    });
     let publication_mode = if commit_msg == "^" {
         cairn_vcs::PublicationMode::Amend
     } else {
         cairn_vcs::PublicationMode::Child {
             description: final_commit_msg,
-            author: author.map(|author| cairn_vcs::PublicationAuthor {
-                name: author.name,
-                email: author.email,
-            }),
         }
     };
-    let repository_path = logical_resolution.repository_path.clone();
-    let branch = logical_resolution.rev.clone();
-    let expected_head = logical_resolution.commit_id.clone();
-    let mutations = logical_mutations.to_vec();
-    let publication = tokio::task::spawn_blocking(move || {
-        cairn_vcs::publish_logical_mutations(
-            &repository_path,
-            &branch,
-            &expected_head,
-            mutations,
-            publication_mode,
-        )
-    })
-    .await
-    .map_err(|error| {
-        Box::new(IndexedFailure {
-            failure: ChangeFailure {
-                index: first_change.index,
-                target: first_change.item.target.clone(),
-                mode: mode_name(first_change.item.mode).to_string(),
-                kind: "file".to_string(),
-                error: format!("Logical-head publication worker failed: {error}"),
-            },
-            commit: None,
-        })
-    })?;
+    let publication = crate::jj::publish_logical_head_exported(
+        &crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir),
+        &logical_resolution.repository_path,
+        &logical_resolution.rev,
+        &logical_resolution.commit_id,
+        proposed,
+        publication_identity,
+        publication_mode,
+    )
+    .await;
     match publication {
         Ok(result) => {
-            // File changes were already recorded above (on apply); committing
-            // does not re-record them.
-            emit_worktree_changed(orch, &request.cwd);
-            let publication = match (&managed_context, &routed_db) {
-                (Some(context), Some(db)) => Some(PostSealPublication {
-                    db: db.clone(),
-                    project_id: context.identity.project_id.clone(),
-                    repository: context.identity.project_root.clone(),
-                }),
-                _ => None,
-            };
-            let publication_requirement = match (&managed_context, &routed_db) {
-                (Some(context), Some(db)) => {
+            let publication = routed_run.as_ref().map(|(run, db)| PostSealPublication {
+                db: db.clone(),
+                project_id: run.project_id.clone(),
+                repository: logical_resolution.object_repository_path.clone(),
+            });
+            let publication_requirement = match routed_run.as_ref() {
+                Some((run, db)) => {
                     crate::merge_requests::queries::publication_requirement_for_managed_branch(
                         db,
-                        &context.current_job_id,
-                        &context.identity.project_id,
-                        &context.identity.branch,
+                        &run.job_id,
+                        &run.project_id,
+                        &logical_resolution.rev,
                     )
                     .await
                 }
-                // An unmanaged or ambiguously routed sealed workspace cannot be
-                // proven to have no open PR, so preserve the fail-closed behavior.
+                // An unresolvable authenticated run cannot prove that no open PR
+                // requires publication, so preserve the fail-closed behavior.
                 _ => crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr,
             };
             Ok(CommitOutcome::Done(CompletedCommit {
@@ -1613,11 +1723,13 @@ pub(super) async fn finalize_file_commit(
                         "committed"
                     }
                     .to_string(),
-                    sha: Some(result.head),
+                    sha: Some(result.landed.head),
                     pr_number: None,
-                    message: result.amend_note,
+                    message: result.landed.amend_note,
                 }),
+                export: result.export,
                 publication_requirement,
+                affected_paths: result.landed.affected_paths,
                 publication,
             }))
         }

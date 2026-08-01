@@ -2,24 +2,6 @@
 //! hashes and entries via the git backend.
 use super::*;
 use std::path::Path;
-
-/// The repo-relative paths currently visible in `@` (the working-copy diff vs
-/// its parent), parsed from `jj diff --summary`. Each summary line is
-/// `<status> <path>` (e.g. `A src/new.rs`); the status letter is dropped. Used
-/// by populate's security backstop to enumerate any populated path that leaked
-/// into the snapshot.
-pub(crate) fn working_copy_dirty_paths(jj: &JjEnv, ws: &Path) -> Result<Vec<String>, String> {
-    let out = jj.run(ws, &["diff", "--summary"], "jj diff --summary")?;
-    Ok(out
-        .lines()
-        .filter_map(|line| {
-            line.split_once(' ')
-                .map(|(_, path)| path.trim().to_string())
-        })
-        .filter(|path| !path.is_empty())
-        .collect())
-}
-
 /// Capture the working copy's diff vs its parent as a git-format unified patch
 /// (`jj diff --git`). The write-path stale-recovery captures this BEFORE any
 /// `update-stale`/`discard` so a give-up can persist the agent's would-be-lost
@@ -29,23 +11,6 @@ pub(crate) fn working_copy_dirty_paths(jj: &JjEnv, ws: &Path) -> Result<Vec<Stri
 pub(crate) fn working_copy_diff(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     jj.run(ws, &["diff", "--git"], "jj diff --git")
 }
-
-/// Stop tracking `paths` in the working copy without deleting them from disk
-/// (`jj file untrack`). Used by populate's backstop to un-track a path a
-/// conservative glob translation failed to keep out of the snapshot, after the
-/// path has been added to `snapshot.auto-track`. No-op for an empty slice.
-pub(crate) fn untrack_paths(jj: &JjEnv, ws: &Path, paths: &[String]) -> Result<(), String> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    // `jj file untrack` takes fileset args too, so quote each path literally
-    // (a bare quoted string is the default "files" pattern, matching the path).
-    let quoted: Vec<String> = paths.iter().map(|p| quote_fileset(p)).collect();
-    let mut args: Vec<&str> = vec!["file", "untrack"];
-    args.extend(quoted.iter().map(|s| s.as_str()));
-    jj.run(ws, &args, "jj file untrack").map(|_| ())
-}
-
 /// List the files tracked in the workspace's working-copy commit
 /// (`jj file list`), workspace-relative, one per line, sorted. This is jj's own
 /// notion of the tracked-file set — exactly what the agent edits, commits, and
@@ -87,42 +52,6 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
         "jj log -r @-",
     )
 }
-
-pub(crate) fn working_copy_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
-    jj.run(
-        ws,
-        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
-        "jj log -r @",
-    )
-}
-
-/// Graph proof used only after database/path/marker ownership coordinates agree.
-/// It proves the physical workspace's sealed head descends from the job's
-/// recorded base; it never establishes lineage on its own.
-pub(crate) fn revision_descends_from(
-    jj: &JjEnv,
-    store: &Path,
-    revision: &str,
-    ancestor: &str,
-) -> bool {
-    let revset = format!("{ancestor}::{revision} & {revision}");
-    jj.run(
-        store,
-        &[
-            "log",
-            "-r",
-            &revset,
-            "--no-graph",
-            "-T",
-            "commit_id",
-            "--ignore-working-copy",
-        ],
-        "jj ancestry proof",
-    )
-    .map(|out| !out.trim().is_empty())
-    .unwrap_or(false)
-}
-
 /// The git directory backing the shared jj store. `ensure_project_store` points
 /// the store's git backend at the project's existing `.git` via
 /// `jj git init --git-repo`, and `jj git root` reports that path from any
@@ -206,20 +135,6 @@ pub(crate) fn sealed_tree_hash_via_git(
     }
     Ok(tree)
 }
-
-/// The sealed commit's tree as flat `(path, blob_id)` entries, read through the
-/// git backend. This is the substrate for per-check INPUT hashing: filtering
-/// these entries by a check's impact globs and hashing the matching
-/// `(path, blob_id)` pairs yields a content identity that changes iff a matching
-/// file's content (or the matched path set) changes — so a check's cached verdict
-/// can be keyed by just its own inputs rather than the whole tree. Entries are
-/// sorted by path. Errs (so callers fall back to whole-tree keying) when the git
-/// backend can't be resolved or `git ls-tree` fails.
-pub(crate) fn sealed_tree_entries(jj: &JjEnv, ws: &Path) -> Result<Vec<(String, String)>, String> {
-    let commit = head_commit(jj, ws)?;
-    tree_entries(jj, ws, &commit)
-}
-
 /// Flat `(path, blob_id)` entries for an arbitrary commit or tree object in the
 /// jj workspace's git backend. This is intentionally treeish-based so check-cache
 /// consumers can compare the current sealed tree with a previously cached baseline
@@ -242,6 +157,93 @@ pub(crate) fn tree_entries(
         ));
     }
     Ok(parse_ls_tree(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Blob CONTENT for a set of object ids, in ONE `git cat-file --batch`.
+///
+/// [`tree_entries`] gives paths and object ids; check-input derivation needs the
+/// bytes of a handful of them (the manifests) to build the project's dependency
+/// graph without materializing a checkout. Ids are streamed on stdin and the
+/// batch records are parsed back out, so reading twenty manifests costs one
+/// subprocess rather than twenty. Ids the object database does not know are
+/// simply absent from the result.
+///
+/// The child terminates on its own: `cat-file --batch` exits when stdin closes,
+/// which happens as soon as the writer thread finishes the (small, fixed) id
+/// list. There is no unbounded input to stall on.
+pub(crate) fn read_blobs(
+    jj: &JjEnv,
+    ws: &Path,
+    ids: &[&str],
+) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let git_dir = git_backend_root(jj, ws)?;
+    let mut command = crate::env::git();
+    command
+        .args(["--git-dir", &git_dir, "cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("git cat-file --batch: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file --batch: no stdin")?;
+    let request: Vec<u8> = ids
+        .iter()
+        .flat_map(|id| id.bytes().chain(std::iter::once(b'\n')))
+        .collect();
+    let writer = std::thread::spawn(move || stdin.write_all(&request));
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git cat-file --batch: {e}"))?;
+    let _ = writer.join();
+    if !out.status.success() {
+        return Err(format!(
+            "git cat-file --batch failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_cat_file_batch(&out.stdout))
+}
+
+/// Parse `git cat-file --batch` output. Each record is
+/// `<oid> SP <type> SP <size> LF <content> LF`, or `<name> SP missing LF` for an
+/// id the object database does not hold. Content is binary and length-delimited
+/// by the declared size, so it is never scanned for line structure. A record
+/// that does not parse ends the scan rather than desynchronizing the rest.
+pub(crate) fn parse_cat_file_batch(output: &[u8]) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut blobs = std::collections::HashMap::new();
+    let mut cursor = 0usize;
+    while cursor < output.len() {
+        let Some(newline) = output[cursor..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&output[cursor..cursor + newline]).to_string();
+        cursor += newline + 1;
+        let mut fields = header.split_whitespace();
+        let (Some(oid), Some(kind), Some(size)) = (fields.next(), fields.next(), fields.next())
+        else {
+            // `<name> missing` and anything else header-shaped carries no body.
+            continue;
+        };
+        let Ok(size) = size.parse::<usize>() else {
+            break;
+        };
+        if cursor + size > output.len() {
+            break;
+        }
+        if kind == "blob" {
+            blobs.insert(oid.to_string(), output[cursor..cursor + size].to_vec());
+        }
+        // The batch record ends with a newline after the body.
+        cursor += size + 1;
+    }
+    blobs
 }
 
 /// Parse `git ls-tree -r -z` output into sorted `(path, blob_id)` pairs. Each

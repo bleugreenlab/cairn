@@ -161,9 +161,9 @@ pub(crate) const NODE_CALLS_CONTRACT: ResourceContract = ResourceContract {
                 "preset name or inline JSON Schema; defaults to the return contract",
             ),
             KeySpec::new(
-                "worktree",
+                "branch",
                 KeyType::Str,
-                "inherit (default; caller's worktree) | none (scratch dir, no project tree)",
+                "inherit (default; the caller's branch) | none (no repository access)",
             ),
             KeySpec::new(
                 "tier",

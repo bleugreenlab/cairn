@@ -5,8 +5,6 @@ use std::time::Duration;
 use cairn_common::protocol::CallbackRequest;
 use cairn_common::uri::{parse_uri as parse_cairn_uri, CairnResource};
 
-use crate::schemas::{RunInput, RunItemInput};
-
 // ---------------------------------------------------------------------------
 // cairn-cmd -> host HTTP callback timeout
 //
@@ -16,21 +14,47 @@ use crate::schemas::{RunInput, RunItemInput};
 // `mcp/handlers/run.rs` for the host per-item budget this mirrors.
 // ---------------------------------------------------------------------------
 
-/// Host per-item execution budget for `run` items, mirroring
-/// `mcp/handlers/run.rs` (`timeout.unwrap_or(120_000).min(600_000)` ms). The
-/// host is the only layer that returns partial output on expiry.
-const HOST_ITEM_TIMEOUT_DEFAULT_MS: u64 = 120_000;
-const HOST_ITEM_TIMEOUT_MAX_MS: u64 = 600_000;
+/// The host's grace window for a `run` batch. A batch that settles inside it
+/// returns synchronously; past it the host returns a suspend marker and the
+/// agent resumes durably. Either way the host answers within this window, so an
+/// item's own `timeout` no longer bears on how long the socket stays open.
+///
+/// It is the shared constant rather than a mirror of one: the socket sizing here
+/// and the host's own window are the same fact, and a mirror is a place for them
+/// to drift.
+const HOST_RUN_GRACE_MS: u64 = cairn_common::run_contract::RUN_GRACE_WINDOW_MS;
 
-/// Margin added above a `run` batch's host budget so the HTTP socket always
-/// outlives the host's own per-item timeout and the host's (partial) result
-/// wins the race.
+/// Margin added above the host's grace window so the HTTP socket always
+/// outlives the host's own answer and the host's result wins the race.
 const CALLBACK_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
+
+/// HTTP callback ceiling for a `run` batch. It is a constant, not a function of
+/// the batch: an item's `timeout` decides when that item is killed, never when
+/// the host answers. Deriving it per item is what used to let a no-timeout
+/// command fail the agent at a 180-second socket while the host ran on for ten
+/// minutes.
+const RUN_CALLBACK_TIMEOUT: Duration =
+    Duration::from_millis(HOST_RUN_GRACE_MS + CALLBACK_TIMEOUT_MARGIN.as_millis() as u64);
+
+/// The longest bounded host wait beneath this module's default ceiling: how long
+/// a file-target `write` may queue on the project store lock behind another
+/// writer. Like [`HOST_RUN_GRACE_MS`] it is the shared constant rather than a
+/// mirror of one.
+const HOST_WRITE_STORE_LOCK_WAIT_MS: u64 = cairn_common::write_contract::WRITE_STORE_LOCK_WAIT_MS;
 
 /// HTTP callback ceiling for verbs whose host work is bounded and short: a
 /// `read`, a non-blocking `write`, a resource read, or a `watch` long-poll (the
 /// host returns its `pending` sentinel at 290s, comfortably under this).
-const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
+///
+/// Derived, not stated. This was an independent 600s that happened to EQUAL the
+/// host's store-lock wait rather than sit above it — the one arrangement this
+/// module's doctrine forbids. A write that queued on the lock behind a base
+/// advance could have its socket fire while the host went on to land the commit,
+/// handing the agent a transport error for a write that had in fact succeeded,
+/// whose natural next move is to re-issue an already-applied batch (CAIRN-3264).
+const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_millis(
+    HOST_WRITE_STORE_LOCK_WAIT_MS + CALLBACK_TIMEOUT_MARGIN.as_millis() as u64,
+);
 
 /// HTTP callback ceiling for verbs that block on an unbounded external event
 /// with no host-side timeout below them: a blocking `write` append to a node's
@@ -42,38 +66,6 @@ const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
 /// (`MCP_TOOL_TIMEOUT` / Codex `tool_timeout_sec`, set to 7 days) so the agent
 /// never abandons cairn-cmd mid-await.
 const UNBOUNDED_CALLBACK_TIMEOUT: Duration = Duration::from_secs(6 * 24 * 60 * 60);
-
-/// Effective host timeout for one `run` item, in milliseconds (mirrors
-/// `run.rs`: caller value or the 120s default, clamped to the 600s ceiling).
-fn effective_run_item_timeout_ms(item: &RunItemInput) -> u64 {
-    item.timeout
-        .map(u64::from)
-        .unwrap_or(HOST_ITEM_TIMEOUT_DEFAULT_MS)
-        .min(HOST_ITEM_TIMEOUT_MAX_MS)
-}
-
-/// HTTP callback timeout for a `run` batch. The host runs items sequentially
-/// (sum of per-item budgets) or in parallel (max of per-item budgets), plus a
-/// margin so the socket outlives the host's own per-item timeout. An empty
-/// batch falls back to the single-item default.
-fn run_callback_timeout(input: &RunInput) -> Duration {
-    let sequential = input.sequential.unwrap_or(false);
-    let budget_ms: u64 = if sequential {
-        input
-            .commands
-            .iter()
-            .map(effective_run_item_timeout_ms)
-            .sum()
-    } else {
-        input
-            .commands
-            .iter()
-            .map(effective_run_item_timeout_ms)
-            .max()
-            .unwrap_or(HOST_ITEM_TIMEOUT_DEFAULT_MS)
-    };
-    Duration::from_millis(budget_ms) + CALLBACK_TIMEOUT_MARGIN
-}
 
 /// True if a `write` payload contains a blocking append to a node's
 /// tasks/questions collection — an await with no host-side timeout below it
@@ -100,14 +92,12 @@ fn change_has_blocking_append(payload: &serde_json::Value) -> bool {
 
 /// HTTP callback timeout for a request. The host owns execution; this ceiling
 /// must sit strictly above whatever the host can legally take so the HTTP layer
-/// never undercuts the host's own timeout. `run` derives its budget from the
-/// batch; blocking `write` appends await an unbounded external event; everything
+/// never undercuts the host's own timeout. `run` always answers within its grace
+/// window; blocking `write` appends await an unbounded external event; everything
 /// else uses the short default.
 pub(crate) fn callback_timeout(request: &CallbackRequest) -> Duration {
     match request.tool.as_str() {
-        "run" => serde_json::from_value::<RunInput>(request.payload.clone())
-            .map(|input| run_callback_timeout(&input))
-            .unwrap_or(DEFAULT_CALLBACK_TIMEOUT),
+        "run" => RUN_CALLBACK_TIMEOUT,
         "write" if change_has_blocking_append(&request.payload) => UNBOUNDED_CALLBACK_TIMEOUT,
         _ => DEFAULT_CALLBACK_TIMEOUT,
     }
@@ -116,7 +106,6 @@ pub(crate) fn callback_timeout(request: &CallbackRequest) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::run_input;
 
     // ---- callback timeout derivation -------------------------------------
 
@@ -131,82 +120,38 @@ mod tests {
         }
     }
 
+    /// The socket ceiling is a property of the host's grace window, not of the
+    /// batch. An item's `timeout` decides when that item is killed; it must not
+    /// move when the host answers, or a long item fails the agent at the socket
+    /// while the host is still working.
     #[test]
-    fn effective_item_timeout_defaults_to_120s() {
-        let input = run_input(serde_json::json!({ "commands": [{ "command": "echo hi" }] }));
+    fn callback_timeout_for_run_is_constant_across_item_timeouts() {
+        let batches = [
+            serde_json::json!({ "commands": [{ "command": "echo hi" }] }),
+            serde_json::json!({
+                "commands": [{ "command": "sleep 1", "timeout": 5_000_000u32 }]
+            }),
+            serde_json::json!({
+                "commands": [
+                    { "command": "sleep 150", "timeout": 300_000u32 },
+                    { "command": "sleep 150", "timeout": 300_000u32 }
+                ],
+                "sequential": true
+            }),
+            serde_json::json!({
+                "commands": [{ "command": "a" }, { "command": "b" }]
+            }),
+        ];
+        for payload in batches {
+            assert_eq!(
+                callback_timeout(&callback_request("run", payload.clone())),
+                RUN_CALLBACK_TIMEOUT,
+                "item timeouts must not move the socket ceiling: {payload}"
+            );
+        }
         assert_eq!(
-            effective_run_item_timeout_ms(&input.commands[0]),
-            HOST_ITEM_TIMEOUT_DEFAULT_MS
-        );
-    }
-
-    #[test]
-    fn effective_item_timeout_clamps_to_host_ceiling() {
-        let input = run_input(serde_json::json!({
-            "commands": [{ "command": "sleep 1", "timeout": 5_000_000u32 }]
-        }));
-        assert_eq!(
-            effective_run_item_timeout_ms(&input.commands[0]),
-            HOST_ITEM_TIMEOUT_MAX_MS
-        );
-    }
-
-    #[test]
-    fn run_timeout_sequential_sums_item_budgets_plus_margin() {
-        // Two items at 300s each, run in order: host budget is the sum.
-        let input = run_input(serde_json::json!({
-            "commands": [
-                { "command": "sleep 150", "timeout": 300_000u32 },
-                { "command": "sleep 150", "timeout": 300_000u32 }
-            ],
-            "sequential": true
-        }));
-        assert_eq!(
-            run_callback_timeout(&input),
-            Duration::from_millis(600_000) + CALLBACK_TIMEOUT_MARGIN
-        );
-    }
-
-    #[test]
-    fn run_timeout_parallel_takes_max_item_budget_plus_margin() {
-        // Default (parallel): host runs concurrently, so the budget is the max.
-        let input = run_input(serde_json::json!({
-            "commands": [
-                { "command": "sleep 100", "timeout": 200_000u32 },
-                { "command": "sleep 300", "timeout": 500_000u32 }
-            ]
-        }));
-        assert_eq!(
-            run_callback_timeout(&input),
-            Duration::from_millis(500_000) + CALLBACK_TIMEOUT_MARGIN
-        );
-    }
-
-    #[test]
-    fn run_timeout_uses_defaults_when_items_omit_timeout() {
-        let input = run_input(serde_json::json!({
-            "commands": [{ "command": "a" }, { "command": "b" }],
-            "sequential": true
-        }));
-        assert_eq!(
-            run_callback_timeout(&input),
-            Duration::from_millis(2 * HOST_ITEM_TIMEOUT_DEFAULT_MS) + CALLBACK_TIMEOUT_MARGIN
-        );
-    }
-
-    #[test]
-    fn callback_timeout_run_derives_from_batch() {
-        let payload = serde_json::json!({
-            "commands": [
-                { "command": "sleep 150", "timeout": 300_000u32 },
-                { "command": "sleep 150", "timeout": 300_000u32 }
-            ],
-            "sequential": true
-        });
-        let request = callback_request("run", payload);
-        assert_eq!(
-            callback_timeout(&request),
-            Duration::from_millis(600_000) + CALLBACK_TIMEOUT_MARGIN
+            RUN_CALLBACK_TIMEOUT,
+            Duration::from_millis(HOST_RUN_GRACE_MS) + CALLBACK_TIMEOUT_MARGIN
         );
     }
 
@@ -247,6 +192,36 @@ mod tests {
         });
         let request = callback_request("write", payload);
         assert_eq!(callback_timeout(&request), DEFAULT_CALLBACK_TIMEOUT);
+    }
+
+    /// The property the whole module exists to hold, for the one ceiling that
+    /// did not hold it. Equality is not enough: the socket and the host budget
+    /// must be ordered, or a wait that runs its full length races the socket
+    /// that wraps it and the loser is whichever fires first.
+    #[test]
+    fn the_default_ceiling_sits_strictly_above_the_host_wait_it_wraps() {
+        assert!(
+            DEFAULT_CALLBACK_TIMEOUT > Duration::from_millis(HOST_WRITE_STORE_LOCK_WAIT_MS),
+            "the callback socket must outlive the store-lock wait beneath it, \
+             or a write can fail at the socket while the host goes on to land it: \
+             ceiling {DEFAULT_CALLBACK_TIMEOUT:?} vs wait {HOST_WRITE_STORE_LOCK_WAIT_MS}ms"
+        );
+        assert_eq!(
+            DEFAULT_CALLBACK_TIMEOUT,
+            Duration::from_millis(HOST_WRITE_STORE_LOCK_WAIT_MS) + CALLBACK_TIMEOUT_MARGIN
+        );
+    }
+
+    /// Every ceiling this module hands out is ordered above the host budget it
+    /// wraps, so a socket never decides an answer the host was still computing.
+    #[test]
+    fn every_ceiling_sits_above_its_host_budget() {
+        assert!(RUN_CALLBACK_TIMEOUT > Duration::from_millis(HOST_RUN_GRACE_MS));
+        assert!(DEFAULT_CALLBACK_TIMEOUT > Duration::from_millis(HOST_WRITE_STORE_LOCK_WAIT_MS));
+        // A blocking append awaits an unbounded external event with no host
+        // timeout below it, so its ceiling must outrun every bounded one.
+        assert!(UNBOUNDED_CALLBACK_TIMEOUT > DEFAULT_CALLBACK_TIMEOUT);
+        assert!(UNBOUNDED_CALLBACK_TIMEOUT > RUN_CALLBACK_TIMEOUT);
     }
 
     #[test]

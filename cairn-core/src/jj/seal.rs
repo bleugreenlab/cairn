@@ -23,21 +23,6 @@ pub(crate) fn sealed_commit_is_lost(
     sealed_commit_probe(jj, ws, pre_dirty).map(|(_, lost)| lost)
 }
 
-pub(crate) const SYSTEM_PROTECTION_BOOKMARK: &str = "cairn-system-fix-protection";
-const SYSTEM_FIX_COMMIT_MESSAGE: &str = "fix: apply write-check changes";
-
-pub(crate) fn retire_system_protection(jj: &JjEnv, ws: &Path) {
-    if let Err(error) = jj.run(
-        ws,
-        &["bookmark", "delete", SYSTEM_PROTECTION_BOOKMARK],
-        "retire system fix protection",
-    ) {
-        if !error.contains("No matching bookmarks") {
-            log::warn!("failed to retire system fix protection bookmark: {error}");
-        }
-    }
-}
-
 /// The change id of `@` (stable across the working copy's content amendments).
 pub(crate) fn snapshot_change_id(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     jj.run(
@@ -135,40 +120,24 @@ fn parse_sealed_commit_probe(probe: &str) -> Result<(String, bool, String), Stri
     Ok((sha.to_string(), empty, cid.to_string()))
 }
 
-#[cfg(test)]
-mod probe_tests {
-    use super::parse_sealed_commit_probe;
-
-    #[test]
-    fn malformed_sealed_commit_probe_is_rejected() {
-        for malformed in [
-            "",
-            "sha|maybe|change",
-            "sha|true|",
-            "|false|change",
-            "sha|false|change|extra",
-        ] {
-            assert!(
-                parse_sealed_commit_probe(malformed).is_err(),
-                "accepted {malformed:?}"
-            );
-        }
-        assert_eq!(
-            parse_sealed_commit_probe("abc|false|def").unwrap(),
-            ("abc".into(), false, "def".into())
-        );
-    }
-}
-
-/// Seal the whole `@` into one addressable commit (the run-path seal: seals the
-/// entire working copy). See [`seal_paths`].
+/// Seal the whole `@` into one addressable commit, resolving this workspace's
+/// branch ownership from its marker AT CALL TIME.
+///
+/// That resolution is only sound when nothing has run between the read and the
+/// seal, so the production barrier path deliberately does not use this: it
+/// captures ownership during request preflight and passes it to [`seal_paths`],
+/// because the marker lives in a checkout the batch can write and a batch must
+/// not be able to redirect its own publication — or silence it and still be told
+/// the commit landed. This wrapper serves fixtures that provision a workspace and
+/// seal it in the same breath, which is every remaining caller.
 pub fn seal(
     jj: &JjEnv,
     ws: &Path,
     msg: &str,
     author: Option<&GitAuthor>,
 ) -> Result<CommitResult, String> {
-    seal_paths(jj, ws, msg, author, &[])
+    let branch = read_branch_marker(ws);
+    seal_paths(jj, ws, msg, author, &[], branch.as_deref())
 }
 
 /// Seal `@` into one addressable commit and open a fresh empty `@`. When `paths`
@@ -177,19 +146,30 @@ pub fn seal(
 /// effects) stays in the working copy and is NOT folded into this commit: a
 /// file-scoped seal touches only those paths. An empty slice seals the whole `@`.
 /// `^` folds the scoped paths into the prior sealed commit (git `--amend`
-/// equivalent). Advances the workspace's git bookmark to the sealed commit and
-/// exports it to the project's git (best-effort). Returns the sealed commit id.
+/// equivalent).
+///
+/// `branch` is the branch Cairn owns in this workspace, and it is a PARAMETER
+/// rather than a marker read because ownership has to be settled before whatever
+/// produced these changes ran. `Some` means Cairn owns it, so advancing that
+/// branch's bookmark to the sealed commit and exporting it to the project's git
+/// are part of this operation's contract, and a failure at either step rolls the
+/// seal back rather than reporting a commit the branch does not carry. `None`
+/// means the checkout is not Cairn's, so the seal commits locally and publishes
+/// nothing. Returns the sealed commit id.
+///
+/// Both answers are load-bearing and neither is safe to re-derive here. Deciding
+/// `None` late would report a successful commit while silently skipping the
+/// publication its caller was told happened; deciding `Some` late would publish
+/// to a branch the caller never owned. [`seal`] resolves it from the marker for
+/// fixtures; the barrier path passes what it captured at preflight.
 pub(crate) fn seal_paths(
     jj: &JjEnv,
     ws: &Path,
     msg: &str,
     author: Option<&GitAuthor>,
     paths: &[&str],
+    branch: Option<&str>,
 ) -> Result<CommitResult, String> {
-    // Read the workspace's own branch up front: it drives both the amend-share
-    // guard here and the fast-forward guard / bookmark advance further down.
-    let branch = read_branch_marker(ws);
-
     let mut args: Vec<String> = JjEnv::author_args(author);
     // Set when a `^` amend is CONVERTED to a child commit because `@-` is shared.
     let mut amend_note: Option<String> = None;
@@ -205,7 +185,7 @@ pub(crate) fn seal_paths(
         let foreign: Vec<String> = local_bookmarks_at(jj, ws, "@-")
             .unwrap_or_default()
             .into_iter()
-            .filter(|b| branch.as_deref() != Some(b.as_str()))
+            .filter(|b| branch != Some(b.as_str()))
             .collect();
         if foreign.is_empty() {
             args.extend(["squash".into(), "--use-destination-message".into()]);
@@ -260,7 +240,7 @@ pub(crate) fn seal_paths(
     // a follow-up advance can fix it. The healthy case (bookmark == `@-`) and an
     // amend (the bookmark follows the rewrite) both fast-forward. With the
     // post-fold workspace advance in place this is unreachable on the happy path.
-    if let Some(branch) = branch.as_deref() {
+    if let Some(branch) = branch {
         if !seal_is_fast_forward(jj, ws, branch)? {
             // The fast-forward guard refused: `@` does not descend from the branch
             // bookmark. Two structurally different causes need OPPOSITE handling,
@@ -337,22 +317,22 @@ pub(crate) fn seal_paths(
         }
         return Err(LOST_SEAL_MSG.to_string());
     }
-    // Advance the project's git branch ref to the sealed commit so push and
-    // git-side reads stay current. The pre-commit fast-forward check above
-    // guarantees this is a forward move, so it stays best-effort: a transient ref
-    // failure never fails an otherwise-good seal (a stale ref self-heals next
-    // seal).
-    if let Some(branch) = branch.as_deref() {
-        if let Err(e) = jj.run(
-            ws,
-            &["bookmark", "set", branch, "-r", "@-"],
-            "jj bookmark set",
-        ) {
-            log::warn!("jj bookmark set after seal (best-effort, continuing): {e}");
-        }
-        let _ = export_git_preserving_checkout(jj, ws, false, "jj git export");
-        if msg != SYSTEM_FIX_COMMIT_MESSAGE {
-            retire_system_protection(jj, ws);
+    // Cairn owns `branch` in this checkout, so landing the sealed commit ON that
+    // branch is what the caller asked for, not incidental cleanup. Both steps
+    // therefore FAIL CLOSED, and a failure rolls the seal back to the pre-seal
+    // operation — the same invariant the integrity probe above keeps, that a
+    // failed seal leaves no orphan commit behind.
+    if let Some(branch) = branch {
+        if let Err(error) = publish_sealed_commit(jj, ws, branch) {
+            restore_operation(jj, ws, &pre_seal_operation).map_err(|restore_error| format!(
+                "commit {sha} was sealed locally but remains unpublished on `{branch}` ({error}); \
+                 restoring the pre-seal operation also failed ({restore_error}) — this workspace now \
+                 carries a commit its branch does not"
+            ))?;
+            return Err(format!(
+                "commit {sha} was sealed locally but remains unpublished on `{branch}`, so the seal \
+                 was rolled back: {error}"
+            ));
         }
     }
     Ok(CommitResult {
@@ -401,70 +381,22 @@ fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, Str
     Ok(!hit.is_empty())
 }
 
-/// Outcome of folding a `when:write` check's tracked changes into the sealed
-/// commit: the repo-relative paths the check modified (also the inline summary's
-/// content). `fold_worktree_into_seal` returns `None` instead of an empty list
-/// when there was nothing to fold.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FoldOutcome {
-    pub(crate) folded_files: Vec<String>,
-}
-
-/// Fold a `when:write` check's tracked working-copy changes into the just-sealed
-/// commit (`jj squash` of `@` into `@-`), leaving `@` clean == the amended sealed
-/// tip.
+/// Land a sealed commit on the branch this workspace owns: advance the branch's
+/// bookmark to `@-`, then PROVE the advance reached the project's git ref.
 ///
-/// A check is an observer of the sealed commit, but its command may legitimately
-/// rewrite tracked files (a formatter, `lint --fix`, regenerated snapshots).
-/// Folding does two jobs at once: it delivers those edits into the commit AND
-/// restores the seal-clean invariant, so a concurrent base-advance / reconcile in
-/// the lock-free check window can never snapshot or rebase a dirty `@` into the
-/// stale / divergent / behind-tip tangle that wedges the next seal (CAIRN-2260).
-///
-/// Only TRACKED changes fold: gitignored writes (vitest/tsc caches) are excluded
-/// from the working-copy snapshot (gitignore + `snapshot.auto-track`), so they
-/// never enter `@` and are never committed — they stay as ignored files on disk.
-/// `jj squash` keeps the sealed commit's message and author, so the folded edits
-/// ride the agent's original commit. The bookmark follows the rewrite onto the
-/// amended commit; the git ref and origin are re-published (best-effort) so they
-/// reflect the new tree (an amend-push jj tracks via the remote bookmark).
-///
-/// Returns `Ok(None)` when `@` carried no tracked change (a pure verify check) —
-/// the amend is then a no-op and `@` was already clean.
-pub fn fold_worktree_into_seal(jj: &JjEnv, ws: &Path) -> Result<Option<FoldOutcome>, String> {
-    // The tracked files the check changed. Empty => pure verify check: nothing to
-    // fold, `@` already clean. (A stale `@` makes this error and propagate, so the
-    // caller falls back to the next seal's stale recovery rather than amending
-    // blindly.)
-    let changed = jj.run(ws, &["diff", "-r", "@", "--name-only"], "jj fold diff")?;
-    let folded_files: Vec<String> = changed
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
-    if folded_files.is_empty() {
-        return Ok(None);
-    }
-    // Fold `@`'s tracked changes into the sealed parent and open a fresh empty `@`.
-    jj.run(ws, &["squash"], "jj squash (fold check changes)")?;
-    // Re-establish bookmark / git ref / origin at the amended commit, mirroring a
-    // seal. The bookmark auto-follows the rewrite; `bookmark set` is idempotent
-    // belt-and-braces, and the export/push propagate the amended tree.
-    if let Some(branch) = read_branch_marker(ws) {
-        if let Err(e) = jj.run(
-            ws,
-            &["bookmark", "set", &branch, "-r", "@-"],
-            "jj bookmark set (fold)",
-        ) {
-            log::warn!("fold: bookmark set after squash (best-effort): {e}");
-        }
-        let _ = export_git_preserving_checkout(jj, ws, false, "jj git export (fold)");
-        if let Err(e) = push_to_origin(jj, ws, &branch) {
-            log::warn!("jj push failed (fold succeeded locally): {e}");
-        }
-    }
-    Ok(Some(FoldOutcome { folded_files }))
+/// Both steps publish: external state reads the git ref (a child workspace cut
+/// from it, a push, GitHub's view of a PR head), so neither is best-effort
+/// cleanup. The export in particular cannot be discarded — jj reports a refused
+/// ref on stderr and still exits 0, and the refusal does NOT self-heal on the
+/// next seal, so a swallowed failure is a branch that silently stops carrying
+/// the work every later caller is told it carries.
+fn publish_sealed_commit(jj: &JjEnv, ws: &Path, branch: &str) -> Result<(), String> {
+    jj.run(
+        ws,
+        &["bookmark", "set", branch, "-r", "@-"],
+        "jj bookmark set",
+    )?;
+    export_bookmark_advance(jj, ws, false, branch, "jj git export")
 }
 
 /// Discard working-copy changes by resetting `@` to its parent. Reversible via
@@ -483,13 +415,53 @@ pub fn fold_worktree_into_seal(jj: &JjEnv, ws: &Path) -> Result<Option<FoldOutco
 pub(crate) fn discard(jj: &JjEnv, ws: &Path) -> Result<(), String> {
     match jj.run(ws, &["restore"], "jj restore") {
         Ok(_) => Ok(()),
-        Err(e) if is_stale_error(&e) => {
+        Err(stale) if is_stale_error(&stale) => {
             // update-stale advances `@` and discards the loose edits → clean.
             update_stale(jj, ws)?;
-            // Belt-and-braces: a now-unblocked restore guarantees `@` == parent.
-            let _ = jj.run(ws, &["restore"], "jj restore (post update-stale)");
-            Ok(())
+            // The now-unblocked restore guarantees `@` == parent, and its result
+            // is the verdict rather than a belt-and-braces afterthought. It was
+            // discarded with `let _`, so this arm returned `Ok` unconditionally:
+            // if the recovery did not take, the commit barrier went on to tell
+            // the agent its worktree had been restored to HEAD when it had not.
+            // The arm is reachable without genuine jj-staleness — `is_stale_error`
+            // also matches the seal path's own "behind its branch tip" — and in
+            // that state `update-stale` correctly reports the working copy is not
+            // stale and changes nothing, which is precisely when the unchecked
+            // restore mattered.
+            jj.run(ws, &["restore"], "jj restore (post update-stale)")
+                .map(|_| ())
+                .map_err(|retry| {
+                    format!(
+                        "the working copy was stale ({stale}) and remained unreconciled after \
+                         `jj workspace update-stale`: {retry}"
+                    )
+                })
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::parse_sealed_commit_probe;
+
+    #[test]
+    fn malformed_sealed_commit_probe_is_rejected() {
+        for malformed in [
+            "",
+            "sha|maybe|change",
+            "sha|true|",
+            "|false|change",
+            "sha|false|change|extra",
+        ] {
+            assert!(
+                parse_sealed_commit_probe(malformed).is_err(),
+                "accepted {malformed:?}"
+            );
+        }
+        assert_eq!(
+            parse_sealed_commit_probe("abc|false|def").unwrap(),
+            ("abc".into(), false, "def".into())
+        );
     }
 }

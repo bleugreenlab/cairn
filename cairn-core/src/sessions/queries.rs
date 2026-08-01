@@ -1,6 +1,7 @@
 //! Session CRUD operations and rotation logic.
 
 use crate::models::{Session, SessionStatus};
+use crate::services::EventEmitter;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
 use cairn_db::turso::params;
@@ -56,7 +57,7 @@ async fn create_with_id_and_lineage(
 pub async fn get(db: &LocalDb, session_id: &str) -> Result<Session, String> {
     let session_id = session_id.to_string();
     db.query_opt(
-        "SELECT id, job_id, chat_id, backend, status, parent_session_id,
+        "SELECT id, job_id, chat_id, backend, account_id, status, parent_session_id,
                 replaced_by_id, terminal_reason, sequence, created_at,
                 closed_at, updated_at, backend_id
          FROM sessions
@@ -111,8 +112,9 @@ pub(crate) async fn rotate_job_session(
     db: &LocalDb,
     old: &Session,
     job_id: &str,
+    emitter: &dyn EventEmitter,
 ) -> Result<Session, String> {
-    rotate_session(db, old, job_id, true, None).await
+    rotate_session(db, old, job_id, true, None, emitter).await
 }
 
 /// Rotate a job's session onto a different backend.
@@ -126,16 +128,37 @@ pub(crate) async fn rotate_job_session_to_backend(
     old: &Session,
     job_id: &str,
     new_backend: &str,
+    emitter: &dyn EventEmitter,
 ) -> Result<Session, String> {
-    rotate_session(db, old, job_id, true, Some(new_backend.to_string())).await
+    rotate_session(
+        db,
+        old,
+        job_id,
+        true,
+        Some(new_backend.to_string()),
+        emitter,
+    )
+    .await
 }
 
+/// Mint the successor session and, when it becomes the job's active session,
+/// announce the job change.
+///
+/// The emit is taken here rather than at the call sites because rotation is the
+/// one write that swaps `jobs.current_session_id` out from under whatever is
+/// already on screen. Every surface that reads a node through a session id — the
+/// chat minimap's skyline bars, the context-usage meter, the last-event digest —
+/// keys off the job's *current* session, so without this emit they keep polling
+/// a session nobody writes to again and go silently stale until a reload
+/// (CAIRN-3262). Owning the emit inside the rotation seam is what makes that
+/// impossible to forget when a fourth rotation trigger is added.
 async fn rotate_session(
     db: &LocalDb,
     source: &Session,
     job_id: &str,
     make_active: bool,
     target_backend: Option<String>,
+    emitter: &dyn EventEmitter,
 ) -> Result<Session, String> {
     let source = source.clone();
     let job_id = job_id.to_string();
@@ -143,7 +166,7 @@ async fn rotate_session(
     // The successor inherits the source backend unless a switch was requested.
     let backend = target_backend.unwrap_or_else(|| source.backend.clone());
 
-    db.write(|conn| {
+    let rotated = db.write(|conn| {
         let source = source.clone();
         let job_id = job_id.clone();
         let new_id = new_id.clone();
@@ -190,7 +213,16 @@ async fn rotate_session(
         })
     })
     .await
-    .map_err(|e| format!("Failed to rotate session: {e}"))
+    .map_err(|e| format!("Failed to rotate session: {e}"))?;
+
+    if make_active {
+        let _ = emitter.emit(
+            "db-change",
+            crate::notify::job_db_change_for_id(db, &job_id, "update").await,
+        );
+    }
+
+    Ok(rotated)
 }
 
 async fn create_with_id_and_lineage_conn(
@@ -234,7 +266,7 @@ async fn load_session_conn(
 ) -> DbResult<Option<Session>> {
     let mut rows = conn
         .query(
-            "SELECT id, job_id, chat_id, backend, status, parent_session_id,
+            "SELECT id, job_id, chat_id, backend, account_id, status, parent_session_id,
                     replaced_by_id, terminal_reason, sequence, created_at,
                     closed_at, updated_at, backend_id
              FROM sessions
@@ -249,21 +281,107 @@ async fn load_session_conn(
 }
 
 fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> {
-    let status = row.text(4)?.parse().map_err(|e: String| DbError::Row(e))?;
+    let status = row.text(5)?.parse().map_err(|e: String| DbError::Row(e))?;
 
     Ok(Session {
         id: row.text(0)?,
         job_id: row.opt_text(1)?,
         chat_id: row.opt_text(2)?,
         backend: row.text(3)?,
+        account_id: row.opt_text(4)?,
         status,
-        parent_session_id: row.opt_text(5)?,
-        replaced_by_id: row.opt_text(6)?,
-        terminal_reason: row.opt_text(7)?,
-        sequence: row.i64(8)? as i32,
-        created_at: row.i64(9)?,
-        closed_at: row.opt_i64(10)?,
-        updated_at: row.i64(11)?,
-        backend_id: row.opt_text(12)?,
+        parent_session_id: row.opt_text(6)?,
+        replaced_by_id: row.opt_text(7)?,
+        terminal_reason: row.opt_text(8)?,
+        sequence: row.i64(9)? as i32,
+        created_at: row.i64(10)?,
+        closed_at: row.opt_i64(11)?,
+        updated_at: row.i64(12)?,
+        backend_id: row.opt_text(13)?,
     })
+}
+
+/// Persist the provider account selected for this backend conversation.
+pub async fn set_account_id(
+    db: &LocalDb,
+    session_id: &str,
+    account_id: &str,
+) -> Result<(), String> {
+    let changed = db
+        .execute(
+            "UPDATE sessions SET account_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![account_id, chrono::Utc::now().timestamp(), session_id],
+        )
+        .await
+        .map_err(|e| format!("Failed to pin session account: {e}"))?;
+    if changed == 0 {
+        return Err(format!("Session not found: {session_id}"));
+    }
+    Ok(())
+}
+
+/// Count sessions assigned to each account after its latest health snapshot.
+/// The per-account cutoff is applied by the caller because snapshots differ.
+pub async fn account_assignments(db: &LocalDb) -> Result<Vec<(String, i64)>, String> {
+    db.query_all(
+        "SELECT account_id, created_at FROM sessions WHERE account_id IS NOT NULL",
+        (),
+        |row| Ok((row.text(0)?, row.i64(1)?)),
+    )
+    .await
+    .map_err(|e| format!("Failed to load session account assignments: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::testing::CapturingEmitter;
+
+    #[tokio::test]
+    async fn rotating_the_active_session_announces_the_job_change() {
+        // Every surface that reads a node through a session id keys off
+        // `jobs.current_session_id`. Rotation swaps it, so rotation owes the
+        // frontend a scoped `jobs` emit — without it the chat minimap, the
+        // context meter, and the last-event digest keep reading a session that
+        // will never be written to again (CAIRN-3262).
+        let db = crate::storage::migrated_test_db("session-rotation-emit.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+              VALUES ('ws-rot', 'Workspace', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES ('proj-rot', 'ws-rot', 'Project', 'ROT', '/tmp/rot', 1, 1);
+             INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+              VALUES ('job-rot', 'proj-rot', 'running', 'sess-rot-1', 1, 1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+              VALUES ('sess-rot-1', 'job-rot', 'claude', 'open', 1, 1, 1);",
+        )
+        .await
+        .expect("seed a node on its first session");
+
+        let source = get(&db, "sess-rot-1").await.expect("source session");
+        let emitter = CapturingEmitter::new();
+        let successor = rotate_job_session(&db, &source, "job-rot", &emitter)
+            .await
+            .expect("rotation succeeds");
+
+        assert_eq!(successor.parent_session_id.as_deref(), Some("sess-rot-1"));
+
+        let changes = emitter.events_named("db-change");
+        assert_eq!(changes.len(), 1, "exactly one announcement: {changes:?}");
+        assert_eq!(changes[0]["table"], "jobs");
+        assert_eq!(changes[0]["jobId"], "job-rot");
+        // The frontend invalidates precisely from these ids and has no
+        // cache-scan fallback, so the payload must carry project scope too.
+        assert_eq!(changes[0]["projectId"], "proj-rot");
+
+        let current = db
+            .query_one(
+                "SELECT current_session_id FROM jobs WHERE id = ?1",
+                params!["job-rot"],
+                |row| row.text(0),
+            )
+            .await
+            .expect("read back the active session");
+        assert_eq!(current, successor.id);
+    }
 }

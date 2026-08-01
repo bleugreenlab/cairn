@@ -12,11 +12,10 @@ pub(crate) fn read_workspace_instructions() -> Option<String> {
     }
 }
 
-/// Best-effort read of a run's project-level instruction file
-/// (`<repo_root>/AGENTS.md`). `repo_root` is the agent's worktree cwd — the
-/// exact checkout the agent operates in — so this reflects branch-specific
-/// `AGENTS.md` edits. Returns `None` when the file is absent, empty, or
-/// unreadable — never errors.
+/// Best-effort read of a project-level instruction file from an explicitly
+/// materialized repository projection. Agent session assembly uses the store-
+/// native logical view instead of process cwd. Returns `None` when the file is
+/// absent, empty, or unreadable.
 pub(crate) fn read_project_instructions(repo_root: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(repo_root.join("AGENTS.md")).ok()?;
     let trimmed = content.trim();

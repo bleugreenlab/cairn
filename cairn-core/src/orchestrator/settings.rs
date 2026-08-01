@@ -12,7 +12,7 @@ impl Orchestrator {
         settings::load_settings(&self.config_dir)
     }
 
-    /// The OS-sandbox read denylist for worktree agents (configured
+    /// The OS-sandbox read denylist for executor cells (configured
     /// `sandboxDenyRead` or the narrow built-in default: external secret stores).
     pub(crate) fn sandbox_deny_read(&self) -> Vec<std::path::PathBuf> {
         settings::load_sandbox_deny_read(&self.config_dir)

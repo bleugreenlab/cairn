@@ -3,7 +3,14 @@
 
 Reads one JSON request per line on stdin: {"code": "..."}.
 Writes one JSON response per line on a PRIVATE duplicate of stdout:
-  {"type": "success"|"error", "value"?, "error"?, "stdout", "stderr"}
+  {"type": "success"|"error", "value"?, "error"?, "stdout", "stderr", "vars"}
+
+`vars` is a snapshot of the live namespace taken at the end of every evaluation.
+A namespace can only change as the result of a send, so a snapshot taken here is
+not a stale cache -- it is exactly the live namespace. Piggybacking it on the
+response (rather than answering an on-demand introspection request) keeps the
+host's read path synchronous and avoids desynchronizing this unkeyed protocol
+stream with a late reply.
 
 A single module-level namespace dict persists across requests, so variables,
 imports, and definitions carry over between `run` calls — the whole point of the
@@ -38,6 +45,50 @@ os.dup2(_DEVNULL_FD, 1)
 
 # Persistent execution namespace, shared as globals across every request.
 _NAMESPACE = {"__name__": "__cairn_repl__", "__builtins__": __builtins__}
+
+# Names the namespace carries for machinery rather than for the user.
+_HIDDEN = {"__name__", "__builtins__", "__doc__", "__package__",
+           "__loader__", "__spec__", "__file__"}
+_MAX_BINDINGS = 200
+_MAX_INFO = 60
+
+
+def _info(value):
+    """A cheap, side-effect-free summary of one binding.
+
+    Only immutable scalars are repr'd, so listing what is bound can never invoke
+    a user-defined __repr__ -- reporting the namespace must not execute arbitrary
+    user code, and must not be slow for a large object.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return repr(value if len(value) <= _MAX_INFO else value[:_MAX_INFO - 3] + "...")
+    try:
+        return "len %d" % len(value)
+    except Exception:
+        return None
+
+
+def _bindings():
+    """Summarize the live namespace: name, type, and a safe short description."""
+    out = []
+    for name in sorted(_NAMESPACE):
+        if name in _HIDDEN or name.startswith("__"):
+            continue
+        value = _NAMESPACE[name]
+        try:
+            kind = type(value).__name__
+        except Exception:
+            kind = "?"
+        try:
+            info = _info(value)
+        except Exception:
+            info = None
+        out.append({"name": name, "kind": kind, "info": info})
+        if len(out) >= _MAX_BINDINGS:
+            break
+    return out
 
 
 def _write_response(response):
@@ -119,6 +170,13 @@ def _run(code):
 
     response["stdout"] = captured_out
     response["stderr"] = captured_err
+    # Snapshot the namespace on BOTH paths: a block that raised part-way through
+    # still mutated it. Taken after _restore_fds so introspection cannot write
+    # into the capture, and wrapped so it can never fail a send.
+    try:
+        response["vars"] = _bindings()
+    except Exception:
+        pass
     return response
 
 

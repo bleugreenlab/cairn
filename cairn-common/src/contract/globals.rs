@@ -82,6 +82,30 @@ pub(crate) const LOGS_CONTRACT: ResourceContract =
         mutations: NO_MUTATIONS,
     };
 
+pub(crate) const EXECUTORS_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::Executors,
+        uri_template: "cairn://executors",
+        name: "Fleet",
+        description: "Every machine enrolled with this runner, listed by the public name that addresses it. One row per executor: name, platform, toolchains, link state, and how loaded it is right now. These names are exactly what a placement request accepts — run({executor:{name:\"bglab-ub\"}}) or a check's `executor:` block — so what you can target is what you can read here. Read cairn://executors/<name> for one machine in full. This serves the runner's cached fleet state and never provokes a fresh probe.",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NO_MUTATIONS,
+    };
+
+pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::Executor,
+        uri_template: "cairn://executors/{name}",
+        name: "Executor",
+        description: "One enrolled machine in full: identity and platform, link/build/protocol state, advertised toolchains, the placement telemetry it last measured (each reading with its own collection time, or a named gap where there is none), admission and queue state, and the cells and work resident on it. This is what to read before deciding a batch belongs somewhere specific, and what makes a placement refusal legible afterwards. Read-only: an operator renames a machine with `cairn executor rename <current-name> <new-name>`, which is a runner-side lifecycle operation rather than a resource mutation.",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NO_MUTATIONS,
+    };
+
 pub(crate) const MCP_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Mcp,

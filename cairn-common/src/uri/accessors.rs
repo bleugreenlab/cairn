@@ -14,7 +14,10 @@ impl CairnResource {
         use CairnResource::*;
         match self {
             Project { project, .. }
+            | ProjectImage { project, .. }
+            | ProjectImages { project, .. }
             | ProjectIssues { project, .. }
+            | ProjectCheckResults { project, .. }
             | Issue { project, .. }
             | Node { project, .. }
             | NodeChat { project, .. }
@@ -58,6 +61,7 @@ impl CairnResource {
             | IssueComment { project, .. }
             | IssueExecution { project, .. }
             | NodeDiff { project, .. }
+            | NodeRebase { project, .. }
             | ProjectTerminal { project, .. }
             | ProjectBrowser { project, .. }
             | ProjectSkills { project, .. }
@@ -248,6 +252,7 @@ impl CairnResource {
             | Self::IssueComment { .. }
             | Self::IssueExecution { .. }
             | Self::NodeDiff { .. }
+            | Self::NodeRebase { .. }
             | Self::Skills
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
@@ -275,6 +280,8 @@ impl CairnResource {
             | Self::DevDb
             | Self::DevPid
             | Self::Logs
+            | Self::Executors
+            | Self::Executor { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -282,7 +289,13 @@ impl CairnResource {
             | Self::Workflow { .. }
             | Self::ProjectWorkflows { .. }
             | Self::ProjectWorkflow { .. }
-            | Self::Mcp { .. } => None,
+            | Self::Mcp { .. }
+            | Self::ProjectImage { .. }
+            // The issue segment scopes the collection's NAME, not an issue
+            // sub-resource: an image collection routes by project, so reporting
+            // an issue number here would send it down the issue-content path.
+            | Self::ProjectImages { .. }
+            | Self::ProjectCheckResults { .. } => None,
         }
     }
 
@@ -291,7 +304,10 @@ impl CairnResource {
             Self::ProjectSettings { project } => Some(project),
             Self::Settings | Self::Projects => None,
             Self::Project { project }
+            | Self::ProjectImage { project, .. }
+            | Self::ProjectImages { project, .. }
             | Self::ProjectIssues { project }
+            | Self::ProjectCheckResults { project, .. }
             | Self::Issue { project, .. }
             | Self::Node { project, .. }
             | Self::NodeChat { project, .. }
@@ -335,6 +351,7 @@ impl CairnResource {
             | Self::IssueExecutions { project, .. }
             | Self::IssueExecution { project, .. }
             | Self::NodeDiff { project, .. }
+            | Self::NodeRebase { project, .. }
             | Self::ProjectTerminal { project, .. }
             | Self::ProjectBrowser { project, .. }
             | Self::ProjectBrowserNetworkRequest { project, .. }
@@ -371,6 +388,8 @@ impl CairnResource {
             | Self::DevDb
             | Self::DevPid
             | Self::Logs
+            | Self::Executors
+            | Self::Executor { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -423,11 +442,13 @@ impl CairnResource {
             | Self::IssueExecutions { number, .. }
             | Self::IssueExecution { number, .. }
             | Self::NodeDiff { number, .. }
+            | Self::NodeRebase { number, .. }
             | Self::NodeMemories { number, .. }
             | Self::NodeMemory { number, .. }
             | Self::NodeSymbols { number, .. } => Some(*number),
             Self::Project { .. }
             | Self::ProjectIssues { .. }
+            | Self::ProjectCheckResults { .. }
             | Self::ProjectMessages { .. }
             | Self::ProjectTerminal { .. }
             | Self::ProjectBrowser { .. }
@@ -462,10 +483,13 @@ impl CairnResource {
             | Self::DevDb
             | Self::DevPid
             | Self::Logs
+            | Self::Executors
+            | Self::Executor { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,
+            Self::ProjectImage { .. } | Self::ProjectImages { .. } => None,
         }
     }
 
@@ -503,6 +527,7 @@ impl CairnResource {
             | Self::NodeProgress { node_id, .. }
             | Self::TaskMessages { node_id, .. }
             | Self::NodeDiff { node_id, .. }
+            | Self::NodeRebase { node_id, .. }
             | Self::NodeMemories { node_id, .. }
             | Self::NodeMemory { node_id, .. }
             | Self::NodeSymbols { node_id, .. } => Some(node_id),

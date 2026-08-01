@@ -59,6 +59,8 @@ pub struct Session {
     pub job_id: Option<String>,
     pub chat_id: Option<String>,
     pub backend: String,
+    /// Provider account selected for this conversation. None for unpinned sessions.
+    pub account_id: Option<String>,
     pub status: SessionStatus,
     pub parent_session_id: Option<String>,
     pub replaced_by_id: Option<String>,

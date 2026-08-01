@@ -151,6 +151,7 @@ async fn marking_issue_closed_stops_active_runs() {
         "issue-1",
         "closed",
         cairn_core::issues::status::ResolutionActor::User,
+        cairn_core::issues::status::Confirmation::Given,
     )
     .await
     .unwrap();
@@ -201,40 +202,41 @@ async fn insert_issue_with_job(db: &LocalDb, project_id: &str, job_status: &str)
     .unwrap();
 }
 
-/// An automated (recipe/coordinator) terminal resolution must see an active
-/// reviewer/job on the issue as a blocker so it refuses rather than resolving
-/// out from under live work.
+/// A recipe/coordinator terminal resolution must see a running job on the issue
+/// as live work so it refuses rather than resolving out from under it.
 #[tokio::test]
-async fn terminal_resolution_blockers_flag_active_job() {
+async fn live_work_includes_a_running_job() {
     let (_temp, orch) = common::test_orchestrator().await;
     let project_id = common::create_project(&orch.db.local, "GATE").await;
     insert_issue_with_job(&orch.db.local, &project_id, "running").await;
 
-    let blockers = cairn_core::issues::status::terminal_resolution_blockers(&orch, "issue-1")
+    let live_work = cairn_core::issues::status::live_work_for_issue(&orch, "issue-1")
         .await
         .unwrap();
 
-    assert!(
-        !blockers.is_empty(),
-        "a running job on the issue should block automated resolution"
+    assert_eq!(
+        live_work.len(),
+        1,
+        "a running job is live work: {live_work:?}"
     );
+    assert!(live_work[0].is_started());
 }
 
-/// Once the issue's jobs are terminal, the gate is clear and the automated
-/// resolution may proceed.
+/// Once the issue's jobs are terminal, nothing is live and the resolution may
+/// proceed with no confirmation.
 #[tokio::test]
-async fn terminal_resolution_blockers_empty_when_jobs_complete() {
+async fn live_work_is_empty_when_jobs_are_complete() {
     let (_temp, orch) = common::test_orchestrator().await;
     let project_id = common::create_project(&orch.db.local, "GATE").await;
     insert_issue_with_job(&orch.db.local, &project_id, "complete").await;
 
-    let blockers = cairn_core::issues::status::terminal_resolution_blockers(&orch, "issue-1")
+    let live_work = cairn_core::issues::status::live_work_for_issue(&orch, "issue-1")
         .await
         .unwrap();
 
     assert!(
-        blockers.is_empty(),
-        "a complete job should not block automated resolution, got {blockers:?}"
+        live_work.is_empty(),
+        "a complete job is not live work, got {live_work:?}"
     );
 }
 
@@ -348,4 +350,123 @@ async fn stop_session_fails_pending_run_tool_result() {
         1,
         "non-run pending tools should not get synthetic run failure results"
     );
+}
+
+/// A real OS process behind the `ChildProcess` seam, so a shutdown test observes
+/// an actual process being stopped instead of a mock recording that it was asked
+/// to be. The whole defect this covers is that dropping a handle does NOT stop
+/// the process, which only a real one can demonstrate.
+struct RealChild(std::process::Child);
+
+impl cairn_core::internal::services::ChildProcess for RealChild {
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn std::io::BufRead + Send>> {
+        None
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn std::io::BufRead + Send>> {
+        None
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn std::io::Write + Send>> {
+        None
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.0.kill()
+    }
+}
+
+/// Whether `pid` still exists, via signal 0. A stopped-and-reaped child is gone;
+/// the process this asks about was spawned by this test, so there is no window in
+/// which another process could claim its id.
+fn process_alive(pid: u32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+}
+
+/// CAIRN-3287: a runner must not exit while its agents keep running. The teardown
+/// stops the real process, empties the registry, and records that WE stopped it
+/// rather than leaving `crash` for a later startup sweep to invent.
+#[tokio::test]
+async fn host_shutdown_stops_the_agent_process_it_spawned() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "running").await;
+
+    let child = std::process::Command::new("sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn a stand-in agent process");
+    let pid = child.id();
+    let handle = cairn_core::internal::agent_process::process::RunHandle::new(
+        std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(RealChild(child))))),
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
+        Some("session-1".to_string()),
+        Some("job-1".to_string()),
+    );
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run-1".to_string(), handle);
+    assert!(process_alive(pid), "the stand-in agent should be running");
+
+    let stops =
+        lifecycle::stop_agents_for_host_shutdown(&orch, std::time::Duration::from_secs(10)).await;
+
+    assert_eq!(
+        stops,
+        lifecycle::HostShutdownStops {
+            stopped: 1,
+            failed: 0,
+            timed_out: 0
+        }
+    );
+    assert!(
+        !process_alive(pid),
+        "the agent process must be gone before the runner exits, not reparented to launchd"
+    );
+    assert!(
+        orch.process_state.run_ids().is_empty(),
+        "a stopped agent must leave the registry"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some(lifecycle::RUNNER_SHUTDOWN_EXIT_REASON),
+        "the row must say we stopped it, not that it crashed"
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some("exited")
+    );
+}
+
+/// The common case — an idle runner restarting — must cost nothing and report
+/// nothing, so the shutdown log stays quiet unless agents were actually stopped.
+#[tokio::test]
+async fn host_shutdown_with_no_agents_is_a_silent_no_op() {
+    let (_temp, orch) = common::test_orchestrator().await;
+
+    let stops =
+        lifecycle::stop_agents_for_host_shutdown(&orch, std::time::Duration::from_secs(1)).await;
+
+    assert_eq!(stops, lifecycle::HostShutdownStops::default());
 }

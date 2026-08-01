@@ -45,10 +45,50 @@ pub enum SegmentKind {
 
 /// A base64-encoded image block, surfaced as a separate `CallToolResult` content
 /// block by the CLI after the composed text.
+///
+/// The base64 payload reaches the agent only: a transcript keeps a tool result's
+/// text, not its native content blocks. `uri` is the durable stored-image
+/// reference the read path promoted these bytes
+/// to, and it is what makes the same read visible to the *user* — the composer
+/// renders it as a markdown reference in the segment text, which the transcript
+/// does keep and the frontend resolves back out of the content store. `None` when
+/// the bytes were not promoted (no authenticated run, or a storage refusal), in
+/// which case no reference is rendered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageBlock {
     pub mime_type: String,
     pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
+impl ImageBlock {
+    /// An un-promoted block carrying only the inline bytes. Producers build this;
+    /// the read path fills `uri` in afterward when it can store the bytes.
+    pub fn inline(mime_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: data.into(),
+            uri: None,
+        }
+    }
+
+    /// A block that already has an address: the bytes were fetched *through* a
+    /// stored-image URI, so that URI is what names them. Promotion skips a block
+    /// carrying a `uri`, which is what keeps reading an image by its own address
+    /// from minting a second reference to the same blob and then citing the
+    /// reference the caller did not ask for.
+    pub fn stored(
+        mime_type: impl Into<String>,
+        data: impl Into<String>,
+        uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: data.into(),
+            uri: Some(uri.into()),
+        }
+    }
 }
 
 /// An opaque, post-truncation-appended, dedupe-by-kind affordance block.

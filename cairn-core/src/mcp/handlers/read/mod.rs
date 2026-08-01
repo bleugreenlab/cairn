@@ -6,8 +6,9 @@
 //! enriched `=== uri [suffix] ===` header and an always-valid continue footer.
 
 pub mod batch;
+pub(crate) mod durable_images;
 pub mod file;
-mod object_read;
+pub(crate) mod object_read;
 pub(crate) mod overlay;
 
 use cairn_common::read::ReadSegment;
@@ -16,7 +17,7 @@ pub(crate) use batch::handle_read_batch;
 pub use file::handle_read_file;
 pub(crate) use file::produce_file_segment;
 
-pub(crate) fn files_at_commit(
+pub fn files_at_commit(
     repository_path: std::path::PathBuf,
     commit_id: String,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
@@ -25,7 +26,7 @@ pub(crate) fn files_at_commit(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn file_at_commit(
+pub fn file_at_commit(
     repository_path: std::path::PathBuf,
     commit_id: String,
     path: &str,
@@ -135,6 +136,52 @@ pub(crate) fn grep_counts(body: &str) -> (usize, usize) {
     (matches, files.len())
 }
 
+/// The header counts for a rendered grep body, read in the shape the effective
+/// output mode wrote.
+///
+/// Each mode renders a different body: `content` is `path:N:text` match lines
+/// (see [`grep_counts`]), `files_with_matches` is one path per line, and `count`
+/// is one `path:N` tally per line. Reading a non-content body as content lines
+/// finds no `path:N:` coordinates and reports zero matches for a body that is
+/// nothing but matches — a positive result presented as an absence. Returns
+/// `(match_count, file_count)`; `match_count` is `None` for
+/// `files_with_matches`, whose body carries no match dimension at all and whose
+/// honest suffix is the file count.
+pub(crate) fn grep_body_counts(
+    body: &str,
+    output_mode: &str,
+    pattern: &str,
+) -> (Option<usize>, usize) {
+    if body == crate::mcp::handlers::search::grep_no_matches_body(pattern) {
+        return match output_mode {
+            "files_with_matches" => (None, 0),
+            _ => (Some(0), 0),
+        };
+    }
+    match output_mode {
+        "files_with_matches" => (None, body.lines().filter(|line| !line.is_empty()).count()),
+        "count" => {
+            let mut matches = 0usize;
+            let mut files = 0usize;
+            for line in body.lines() {
+                let Some((_, tally)) = line.rsplit_once(':') else {
+                    continue;
+                };
+                let Ok(tally) = tally.parse::<usize>() else {
+                    continue;
+                };
+                matches += tally;
+                files += 1;
+            }
+            (Some(matches), files)
+        }
+        _ => {
+            let (matches, files) = grep_counts(body);
+            (Some(matches), files)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +202,38 @@ mod tests {
         let (matches, files) = grep_counts(body);
         assert_eq!(matches, 1);
         assert_eq!(files, 1);
+    }
+
+    #[test]
+    fn grep_body_counts_reads_each_mode_in_its_own_shape() {
+        // A `count` body is `path:N` tallies and a `files_with_matches` body is
+        // bare paths. Parsed as content lines both look empty, which rendered a
+        // `[0 matches]` header over a body full of matches.
+        assert_eq!(
+            grep_body_counts("src/a.rs:4\nsrc/b.rs:2", "count", "needle"),
+            (Some(6), 2)
+        );
+        assert_eq!(
+            grep_body_counts("src/a.rs\nsrc/b.rs", "files_with_matches", "needle"),
+            (None, 2)
+        );
+        assert_eq!(
+            grep_body_counts("src/a.rs:10:hit", "content", "needle"),
+            (Some(1), 1)
+        );
+    }
+
+    #[test]
+    fn grep_body_counts_reports_an_empty_result_as_empty_in_every_mode() {
+        // The no-match body is one line of prose; counting it as a matched file
+        // would render an absence as `[1 files]`.
+        let empty = crate::mcp::handlers::search::grep_no_matches_body("needle");
+        assert_eq!(
+            grep_body_counts(&empty, "files_with_matches", "needle"),
+            (None, 0)
+        );
+        assert_eq!(grep_body_counts(&empty, "count", "needle"), (Some(0), 0));
+        assert_eq!(grep_body_counts(&empty, "content", "needle"), (Some(0), 0));
     }
 
     #[test]

@@ -96,7 +96,7 @@ pub struct DelegatedCallPayload {
     /// Optional per-call output schema: a preset name or an inline custom JSON
     /// Schema. `None` preserves the default `return` contract.
     pub(crate) output_schema: Option<OutputSchema>,
-    pub(crate) worktree: crate::execution::jobs::CallWorktree,
+    pub(crate) branch_policy: crate::execution::jobs::CallBranchPolicy,
     pub(crate) label: Option<String>,
     pub(crate) phase: Option<String>,
     pub(crate) task_index: Option<i32>,
@@ -108,11 +108,7 @@ pub struct DelegatedCallPayload {
 
 pub(crate) struct SpawnCallPacketsInput<'a> {
     pub(crate) run_id: Option<&'a str>,
-    pub(crate) cwd: &'a str,
     pub(crate) payloads: &'a [DelegatedCallPayload],
-    /// Synthetic batch id, the resume-group fallback when no tool-use id is
-    /// available.
-    pub(crate) group_id: &'a str,
     pub(crate) parent_tool_use_id: Option<&'a str>,
     pub(crate) background: bool,
 }
@@ -123,7 +119,6 @@ pub(crate) struct SpawnCallPacketsInput<'a> {
 /// to wake the caller with the workflow's output artifact.
 pub(crate) struct SpawnWorkflowPacketsInput<'a> {
     pub(crate) run_id: Option<&'a str>,
-    pub(crate) cwd: &'a str,
     pub(crate) workflow_id: &'a str,
     /// Absolute path to the workflow's resolved script entry.
     pub(crate) script_path: std::path::PathBuf,
@@ -132,8 +127,7 @@ pub(crate) struct SpawnWorkflowPacketsInput<'a> {
     pub(crate) output_schema: Option<OutputSchema>,
     /// The validated named args, forwarded to the script as `CAIRN_WORKFLOW_ARGS`.
     pub(crate) args_json: String,
-    pub(crate) worktree: crate::execution::jobs::CallWorktree,
-    pub(crate) group_id: &'a str,
+    pub(crate) branch_policy: crate::execution::jobs::CallBranchPolicy,
     pub(crate) parent_tool_use_id: Option<&'a str>,
     pub(crate) background: bool,
 }
@@ -142,12 +136,12 @@ pub(crate) struct SpawnTaskPacketsInput<'a> {
     pub(crate) run_id: Option<&'a str>,
     pub(crate) cwd: &'a str,
     pub(crate) payloads: &'a [DelegatedTaskPayload],
-    /// Synthetic batch id, used as the resume-group fallback when the originating
-    /// tool-use id is unavailable.
-    pub(crate) group_id: &'a str,
-    /// The originating `write` tool-use id. When present it is persisted as each
-    /// packet's (and child job's) `parent_tool_use_id`, which the transcript uses
-    /// to locate the spawned child jobs. Falls back to `group_id` when absent.
+    /// The originating tool call's provider id, persisted as each packet's (and
+    /// child job's) `parent_tool_use_id`. It is what the transcript locates the
+    /// spawned children by and what the completion resume binds the synthetic
+    /// `tool_result` to, so only a real provider id belongs here: `None` means
+    /// there is no call to bind to, and the result resumes as a visible
+    /// continuation event instead (CAIRN-3230).
     pub(crate) parent_tool_use_id: Option<&'a str>,
     pub(crate) background: bool,
 }
@@ -296,6 +290,7 @@ mod call_packet_tests {
 
     fn empty_snapshot() -> ExecutionSnapshot {
         ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "r".to_string(),
                 name: "n".to_string(),

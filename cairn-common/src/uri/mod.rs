@@ -12,14 +12,18 @@
 //!   `issue_number`, `node_id`, `project_key`, `to_route`).
 //! - `build` — the `build_*` URI constructors and `to_uri()`.
 //! - `parse` — `parse_uri` and `parse_resource_uri`.
+//! - `scan` — finding the cairn:// URIs written into free text, by handing
+//!   candidates to `parse` rather than restating the URI grammar.
 
 mod accessors;
 mod build;
 mod parse;
+mod scan;
 mod types;
 
 pub use build::*;
 pub use parse::*;
+pub use scan::*;
 pub use types::*;
 
 #[cfg(test)]

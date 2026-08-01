@@ -34,23 +34,26 @@ pub async fn dispatch_tool(
     read_cursors: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
 ) -> DispatchOutput {
     // Pooled Codex call (CAIRN-2549): one app-server hosts N call threads sharing
-    // ONE `cairn-cmd` MCP subprocess, so the process-global `CAIRN_RUN_ID`/`cwd`
-    // it was spawned with cannot attribute a tool call to the right run — nor run
-    // its `file:`/`run` operations in the right directory. Codex injects the
+    // ONE `cairn-cmd` MCP subprocess, so the process-global `CAIRN_RUN_ID`
+    // cannot attribute a tool call to the right run. Codex injects the
     // originating thread as `_meta.threadId`, which `cairn-cmd` forwards as
-    // `thread_id`. Resolve it back to the owning run AND working directory HERE,
-    // before any handler reads `run_id`/`cwd` — so tool-result persistence,
-    // `cairn:~/` home expansion, reminder augmentation, and every `file:`/`run`/
-    // write handler (which resolve against `request.cwd`) all attribute to the
-    // right run's own worktree. Absent `thread_id` (every non-pooled caller)
+    // `thread_id`. Resolve it back to the owning run before any handler reads
+    // `run_id`, so persistence and logical project operations use the correct
+    // authenticated coordinate. Absent `thread_id` (every non-pooled caller)
     // leaves the request untouched.
     let resolved = resolve_pooled_thread_request(orch, request);
     let request = resolved.as_ref().unwrap_or(request);
 
+    // Ownership fence (CAIRN-3287). Fenced AFTER pooled resolution so a pooled
+    // Codex call is judged on the run it actually belongs to, and BEFORE any
+    // handler runs so a refusal costs no side effects.
+    if let Some(refusal) = refuse_disowned_run(orch, request).await {
+        return refusal;
+    }
+
     let content = dispatch_with_dedup(orch, request, read_cursors).await;
     let mut reminders = Vec::new();
     augment_with_queued_dms(orch, request, &mut reminders).await;
-    augment_with_dirty_worktree_notice(orch, request, &mut reminders).await;
     augment_with_terminal_poll_nudge(orch, request, &mut reminders).await;
     DispatchOutput { content, reminders }
 }
@@ -71,11 +74,176 @@ fn resolve_pooled_thread_request(
     let binding = orch.codex_pool.binding_for_thread(thread_id)?;
     let mut resolved = request.clone();
     resolved.run_id = Some(binding.run_id);
-    // Override cwd too: the shared app-server (and its one cairn-cmd) was spawned
-    // in the first call's directory, but this call's `file:`/`run`/write ops must
-    // resolve against ITS OWN worktree.
-    resolved.cwd = binding.cwd;
     Some(resolved)
+}
+
+/// Refuse a tool call whose run this runner process does not own, before any
+/// handler can produce a side effect (CAIRN-3287).
+///
+/// An agent process outlives the runner that spawned it: the child handle's drop
+/// does not signal the OS process, so a runner that exits leaves its agents
+/// reparented and running. Their tool calls keep arriving here with a bearer
+/// token that is machine-global and stable across restarts, and the successor
+/// runner used to serve them — for 38 minutes in the specimen incident, changing
+/// files the whole time. Nothing recorded any of it, because transcript
+/// ingestion is an in-process reader thread over the agent's stdout that died
+/// with its runner. Serving such a call is therefore strictly worse than
+/// refusing it: the work happens and leaves no record that it happened.
+///
+/// Two independent signals, both required before refusing, so a false positive
+/// (which would block every tool call of a genuinely live agent) needs both to
+/// be wrong at once:
+///
+/// 1. The run has no handle in this runner's process registry. That registry is
+///    in-memory and starts empty at boot, so a run it holds was spawned here by
+///    definition — and every serving run reaches the registry at spawn. This is
+///    also the fast path: an owned run pays one mutex, no query.
+/// 2. The run's own row disowns it — see [`disowned_reason`].
+///
+/// Fail-open everywhere else: a request with no run id, a run that resolves in
+/// no database, or a database that cannot answer all dispatch normally, leaving
+/// each handler's existing "No run found with id" behavior alone. The fence adds
+/// a refusal for runs positively identified as unowned; it does not become a
+/// second gate on run resolution.
+async fn refuse_disowned_run(
+    orch: &crate::orchestrator::Orchestrator,
+    request: &crate::mcp::types::McpCallbackRequest,
+) -> Option<DispatchOutput> {
+    let run_id = request
+        .run_id
+        .as_deref()
+        .filter(|run_id| !run_id.is_empty())?;
+
+    if orch
+        .process_state
+        .processes
+        .lock()
+        .is_ok_and(|processes| processes.contains_key(run_id))
+    {
+        return None;
+    }
+
+    // Route the lookup the way every other run-scoped read routes it: a team
+    // replica's run must resolve against that replica rather than missing in the
+    // private database and falling through unfenced.
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+        .await
+        .ok()?;
+    let reason = disowned_reason(&load_run_ownership(&db, run_id).await?, orch.boot_at)?;
+
+    // An operator seeing this line is seeing a zombie run — the signal that was
+    // entirely absent from the incident's logs.
+    log::warn!(
+        "run_ownership_fence: refused tool={} run={run_id} reason={reason:?} boot_at={}",
+        request.tool,
+        orch.boot_at
+    );
+    Some(DispatchOutput {
+        content: reason.refusal(),
+        reminders: Vec::new(),
+    })
+}
+
+/// The `runs` columns that decide whether this runner owns a run.
+#[derive(Debug, Clone)]
+struct RunOwnership {
+    started_at: Option<i64>,
+    created_at: i64,
+    status: Option<String>,
+}
+
+/// Why a run is not this runner process's to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disowned {
+    /// Spawned before this runner booted, so its owner was a predecessor process
+    /// — which took the transcript reader with it when it exited.
+    PredatesBoot,
+    /// Already finalized: whatever is still calling tools for it has outlived
+    /// the bookkeeping that would record what it does.
+    Finalized,
+}
+
+impl Disowned {
+    /// What the agent reads instead of a tool result.
+    ///
+    /// [`DispatchOutput`] has no error channel by design, so a refusal is
+    /// content. Phrased to make a model stop rather than retry: it names the
+    /// terminal fact (nothing is recording this run), rules out retrying, and
+    /// names what would work instead. Modelled on the closed-session refusal in
+    /// `execution::jobs::lifecycle`.
+    fn refusal(self) -> String {
+        let cause = match self {
+            Disowned::PredatesBoot => {
+                "The Cairn runner process that started this session has exited"
+            }
+            Disowned::Finalized => "This run has already been finalized",
+        };
+        format!(
+            "This run is no longer served. {cause}, so nothing is recording this session's \
+             transcript: any file this call changed would be changed with no record that it \
+             happened. Stop here. Retrying will not help and no further tool call for this run \
+             will be served. The work carries forward in a new execution on the issue, which \
+             starts a fresh session whose transcript is intact."
+        )
+    }
+}
+
+/// Whether a run's own row disowns it, given the host's boot time.
+///
+/// The pre-boot test is [`crate::runs::ownership::predates_host_boot`], the single
+/// definition of that boundary — startup reconciliation selects its candidates
+/// with the same predicate, so the fence and the sweep cannot disagree about which
+/// runs a predecessor left behind.
+fn disowned_reason(ownership: &RunOwnership, boot_at: i64) -> Option<Disowned> {
+    if crate::runs::ownership::predates_host_boot(
+        ownership.started_at,
+        ownership.created_at,
+        boot_at,
+    ) {
+        return Some(Disowned::PredatesBoot);
+    }
+    // Defense in depth for the window before startup reconciliation has swept —
+    // it took 15s in the specimen incident while the callback was already being
+    // served. Every path that marks a run terminal either kills its process
+    // first (`lifecycle::kill_session_with_reason`, `finalize_run` on exit) or is
+    // reconciling a run whose process is already unregistered, so a terminal run
+    // still calling tools is an anomaly by construction. An absent or
+    // unparseable status is not terminal, and fails open.
+    ownership
+        .status
+        .as_deref()
+        .and_then(|status| status.parse::<crate::models::RunStatus>().ok())
+        .filter(|status| status.is_terminal())
+        .map(|_| Disowned::Finalized)
+}
+
+/// Read one run's ownership columns. `None` when the row is absent or the read
+/// fails, both of which leave the call unfenced.
+async fn load_run_ownership(db: &crate::storage::LocalDb, run_id: &str) -> Option<RunOwnership> {
+    use crate::storage::RowExt;
+    let run_id = run_id.to_string();
+    db.read(|conn| {
+        let run_id = run_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT started_at, created_at, status FROM runs WHERE id = ?1 LIMIT 1",
+                    cairn_db::turso::params![run_id.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            Ok(Some(RunOwnership {
+                started_at: row.opt_i64(0)?,
+                created_at: row.i64(1)?,
+                status: row.opt_text(2)?,
+            }))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Execute a read-family call with content-aware dedup, or execute any other
@@ -172,8 +340,10 @@ async fn execute_tool(
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| NO_ATTACHED_UI_PID.to_string()),
 
-        // Run tool
+        // Run tools. `check_run` is the trusted configured-suite producer; unlike
+        // `run`, its payload cannot carry executable text or asserted evidence.
         "run" => crate::mcp::handlers::run::handle_run(orch, request).await,
+        "check_run" => crate::mcp::handlers::check_run::handle_check_run(orch, request).await,
 
         // Externally-driven attention long-poll (no polling)
         "watch" => crate::mcp::handlers::watch::handle_watch(orch, request).await,
@@ -274,72 +444,6 @@ fn canonical_json(value: &serde_json::Value) -> String {
     let mut out = String::new();
     write_canonical(value, &mut out);
     out
-}
-
-/// Collect a persistent clean-worktree reminder for worktree-bound agent runs
-/// while the worktree has uncommitted changes. The body is pushed as data; the
-/// CLI wraps it in the `<system-reminder>` envelope.
-async fn augment_with_dirty_worktree_notice(
-    orch: &crate::orchestrator::Orchestrator,
-    request: &crate::mcp::types::McpCallbackRequest,
-    reminders: &mut Vec<String>,
-) {
-    if !dirty_notice_applies_to_request(orch, request).await {
-        return;
-    }
-
-    // Route the dirty check through the VCS seam so it is jj-aware: a `.jj`-only
-    // workspace has no `.git`, so a raw `git status` would error and fail open,
-    // never warning the agent about un-sealed `@` dirt.
-    let cwd = std::path::Path::new(&request.cwd);
-    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, cwd);
-    if let Ok(true) = vcs.is_dirty(cwd) {
-        reminders.push(
-            "The worktree has uncommitted changes. The tree must be clean between tool calls — commit them with a run/write commit_msg, or discard them. Uncommitted edits are lost if the worktree is cleaned up.".to_string(),
-        );
-    }
-}
-
-async fn dirty_notice_applies_to_request(
-    orch: &crate::orchestrator::Orchestrator,
-    request: &crate::mcp::types::McpCallbackRequest,
-) -> bool {
-    if let Some(run_id) = request.run_id.as_deref() {
-        if let Some(applies) = dirty_notice_scope_cache()
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(run_id).copied())
-        {
-            return applies;
-        }
-
-        let applies = matches!(
-            crate::mcp::handlers::fence::resolve_run_fence(orch, request).await,
-            Some((
-                _run_id,
-                crate::models::Fence::Ask | crate::models::Fence::Deny
-            ))
-        );
-        if let Ok(mut cache) = dirty_notice_scope_cache().lock() {
-            cache.insert(run_id.to_string(), applies);
-        }
-        return applies;
-    }
-
-    matches!(
-        crate::mcp::handlers::fence::resolve_run_fence(orch, request).await,
-        Some((
-            _run_id,
-            crate::models::Fence::Ask | crate::models::Fence::Deny
-        ))
-    )
-}
-
-fn dirty_notice_scope_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>>
-{
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Nudge an agent that is busy-polling a still-running terminal toward setting a
@@ -731,6 +835,97 @@ mod tests {
         assert!(!is_read_family("watch"));
         // read_batch re-applies dedup per segment; the outer family must exclude it.
         assert!(!is_read_family("read_batch"));
+    }
+
+    fn ownership(started_at: Option<i64>, created_at: i64, status: &str) -> RunOwnership {
+        RunOwnership {
+            started_at,
+            created_at,
+            status: Some(status.to_string()),
+        }
+    }
+
+    #[test]
+    fn disowned_reason_refuses_a_run_spawned_before_boot() {
+        assert_eq!(
+            disowned_reason(&ownership(Some(100), 99, "live"), 200),
+            Some(Disowned::PredatesBoot)
+        );
+    }
+
+    #[test]
+    fn disowned_reason_serves_a_run_spawned_during_the_boot_second() {
+        // Seconds granularity: `started_at == boot_at` is a run this runner
+        // spawned, so the comparison must be strict `<` and never `<=`.
+        assert_eq!(
+            disowned_reason(&ownership(Some(200), 199, "live"), 200),
+            None
+        );
+        assert_eq!(
+            disowned_reason(&ownership(Some(201), 200, "live"), 200),
+            None
+        );
+    }
+
+    #[test]
+    fn disowned_reason_falls_back_to_created_at_when_started_at_is_null() {
+        // A run still `starting` has no `started_at` yet; `created_at` decides.
+        assert_eq!(
+            disowned_reason(&ownership(None, 100, "starting"), 200),
+            Some(Disowned::PredatesBoot)
+        );
+        assert_eq!(
+            disowned_reason(&ownership(None, 250, "starting"), 200),
+            None
+        );
+    }
+
+    #[test]
+    fn disowned_reason_refuses_a_post_boot_run_that_is_already_finalized() {
+        for status in ["exited", "crashed"] {
+            assert_eq!(
+                disowned_reason(&ownership(Some(250), 250, status), 200),
+                Some(Disowned::Finalized),
+                "{status} is terminal"
+            );
+        }
+        for status in ["starting", "live"] {
+            assert_eq!(
+                disowned_reason(&ownership(Some(250), 250, status), 200),
+                None,
+                "{status} is a run still doing work"
+            );
+        }
+    }
+
+    #[test]
+    fn disowned_reason_fails_open_on_an_unreadable_status() {
+        // An absent or unrecognized status says nothing about liveness, and the
+        // fence must never refuse on a guess.
+        for status in [None, Some("running".to_string()), Some(String::new())] {
+            assert_eq!(
+                disowned_reason(
+                    &RunOwnership {
+                        started_at: Some(250),
+                        created_at: 250,
+                        status,
+                    },
+                    200
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn every_refusal_tells_the_agent_to_stop_rather_than_retry() {
+        for reason in [Disowned::PredatesBoot, Disowned::Finalized] {
+            let refusal = reason.refusal();
+            assert!(refusal.contains("no longer served"), "{refusal}");
+            assert!(refusal.contains("Stop here"), "{refusal}");
+            assert!(refusal.contains("Retrying will not help"), "{refusal}");
+            assert!(refusal.contains("new execution"), "{refusal}");
+        }
     }
 
     #[test]

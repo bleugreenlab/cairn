@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 /// optional fields can be filled in only where they matter via `..Default::default()`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CallbackRequest {
-    /// Current working directory - fallback for run identification.
+    /// Process residence reported for diagnostics and non-project host operations.
+    /// Repository identity and relative logical paths never resolve from this value.
     pub cwd: String,
-    /// Run ID - preferred method for accurate run identification.
+    /// Authenticated run identity required by project-scoped agent operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     /// Tool name to invoke.
@@ -38,8 +39,8 @@ pub struct CallbackRequest {
 /// Response from Tauri backend to MCP server.
 ///
 /// `result` is the handler's output and is NEVER mutated by the augmentation
-/// layer. System-reminder augmentation (queued direct messages, the
-/// dirty-worktree notice) rides separately in `reminders` as data, so a handler
+/// layer. System-reminder augmentation (for example queued direct messages and
+/// terminal polling guidance) rides separately in `reminders` as data, so a handler
 /// that returns structured JSON (e.g. the read-batch envelope, a change report)
 /// stays parseable end-to-end. The CLI assembles the model-visible text at the
 /// transport edge: `result` first, then each reminder wrapped in a
@@ -56,75 +57,4 @@ pub struct CallbackResponse {
     /// text only; the CLI wraps it in the `<system-reminder>` envelope.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reminders: Vec<String>,
-}
-
-/// Expanded search invocation offered by the `rg`/`grep` PATH shim.
-///
-/// The helper reports only runtime facts. The runner resolves `run_id` to its
-/// authoritative worktree and never trusts a client-supplied worktree path.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WarmSearchRequest {
-    pub run_id: String,
-    pub cwd: String,
-    pub program: String,
-    pub argv: Vec<String>,
-    pub stdin: WarmSearchStdin,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WarmSearchStdin {
-    Inherited,
-    Terminal,
-    Pipe,
-    File,
-    Other,
-}
-
-/// Bounded reasons a warm search can decline without changing native behavior.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
-pub enum WarmSearchDeclineReason {
-    UnsupportedProgram,
-    UnsupportedFlag(String),
-    UnsupportedInvocation,
-    NonRecursiveGrep,
-    StdinInput,
-    EnvironmentSensitiveConfiguration,
-    NonUtf8Argv,
-    InvalidRegex,
-    RunNotFound,
-    MissingWorktree,
-    ScopeDecline,
-    ColdOrIncompleteIndex,
-    ParityUncertain,
-    TransportFailure,
-}
-
-/// Raw-byte response consumed by the executable shim.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "decision")]
-pub enum WarmSearchResponse {
-    Serve {
-        stdout_base64: String,
-        stderr_base64: String,
-        exit_code: i32,
-    },
-    PassThrough {
-        reason: WarmSearchDeclineReason,
-    },
-}
-
-#[cfg(test)]
-mod warm_search_tests {
-    use super::*;
-
-    #[test]
-    fn warm_search_request_uses_stable_snake_case_json() {
-        let json = r#"{"run_id":"run-test","cwd":"/tmp","program":"rg","argv":["needle","."],"stdin":"inherited"}"#;
-        let request: WarmSearchRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.run_id, "run-test");
-        assert_eq!(request.stdin, WarmSearchStdin::Inherited);
-        assert_eq!(serde_json::to_string(&request).unwrap(), json);
-    }
 }

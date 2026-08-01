@@ -1,0 +1,237 @@
+use crate::backends::DiscoveredModel;
+use crate::identity::{ApiProvider, ProviderAuth};
+use crate::orchestrator::Orchestrator;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::time::Duration;
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+#[derive(Debug, Deserialize)]
+struct TagsResponse {
+    #[serde(default)]
+    models: Vec<TagModel>,
+}
+#[derive(Debug, Deserialize)]
+struct TagModel {
+    name: String,
+}
+#[derive(Debug, Default, Deserialize)]
+struct ShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    model_info: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Debug)]
+struct HostModels {
+    account_id: String,
+    label: String,
+    models: Vec<(String, ShowResponse)>,
+}
+
+#[derive(Default)]
+struct MergedModel {
+    account_ids: Vec<String>,
+    host_labels: Vec<String>,
+    context_window: Option<i64>,
+    supports_tools: bool,
+}
+#[allow(dead_code)]
+pub(crate) fn discover_models_blocking(
+    orch: &Orchestrator,
+) -> Result<Vec<DiscoveredModel>, String> {
+    let (models, error) = discover_catalog_blocking(orch);
+    if models.is_empty() {
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+    Ok(models)
+}
+pub(crate) fn discover_catalog_blocking(
+    orch: &Orchestrator,
+) -> (Vec<DiscoveredModel>, Option<String>) {
+    let Some(store) = orch.get_identity_store() else {
+        return (vec![], Some("No Ollama hosts configured".into()));
+    };
+    let hosts = store
+        .accounts_for_provider(ApiProvider::Ollama, None)
+        .into_iter()
+        .filter_map(|a| match &a.auth {
+            ProviderAuth::BaseUrl { url } => Some((a.id.clone(), a.label.clone(), url.clone())),
+            _ => None,
+        })
+        .collect();
+    discover_hosts_with_errors(hosts)
+}
+#[cfg(test)]
+fn discover_hosts(hosts: Vec<(String, String, String)>) -> Result<Vec<DiscoveredModel>, String> {
+    let (models, error) = discover_hosts_with_errors(hosts);
+    if models.is_empty() {
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+    Ok(models)
+}
+fn discover_hosts_with_errors(
+    hosts: Vec<(String, String, String)>,
+) -> (Vec<DiscoveredModel>, Option<String>) {
+    if hosts.is_empty() {
+        return (vec![], Some("No Ollama hosts configured".into()));
+    }
+    let mut ok = Vec::new();
+    let mut errors = Vec::new();
+    for (id, label, url) in hosts {
+        match discover_host(&id, &label, &url) {
+            Ok(v) => ok.push(v),
+            Err(e) => errors.push(format!("{label}: {e}")),
+        }
+    }
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    (merge_hosts(ok), error)
+}
+fn discover_host(account_id: &str, label: &str, base_url: &str) -> Result<HostModels, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(DISCOVERY_TIMEOUT)
+        .timeout(DISCOVERY_TIMEOUT)
+        .build()
+        .map_err(|e| format!("client failed: {e}"))?;
+    let response = client
+        .get(format!("{}/api/tags", base_url.trim_end_matches('/')))
+        .send()
+        .map_err(|e| format!("tags request failed: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|e| format!("tags body failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("tags returned HTTP {}: {}", status.as_u16(), body));
+    }
+    let tags: TagsResponse =
+        serde_json::from_str(&body).map_err(|e| format!("tags JSON failed: {e}"))?;
+    let mut models = Vec::new();
+    for tag in tags.models {
+        let response = client
+            .post(format!("{}/api/show", base_url.trim_end_matches('/')))
+            .json(&serde_json::json!({"model":tag.name}))
+            .send()
+            .map_err(|e| format!("show {} failed: {e}", tag.name))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .map_err(|e| format!("show {} body failed: {e}", tag.name))?;
+        if !status.is_success() {
+            return Err(format!(
+                "show {} returned HTTP {}: {}",
+                tag.name,
+                status.as_u16(),
+                body
+            ));
+        }
+        let show = serde_json::from_str(&body)
+            .map_err(|e| format!("show {} JSON failed: {e}", tag.name))?;
+        models.push((tag.name, show));
+    }
+    Ok(HostModels {
+        account_id: account_id.into(),
+        label: label.into(),
+        models,
+    })
+}
+fn context_length(info: &serde_json::Map<String, serde_json::Value>) -> Option<i64> {
+    info.iter()
+        .find_map(|(k, v)| k.ends_with(".context_length").then(|| v.as_i64()).flatten())
+}
+fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
+    let mut merged: BTreeMap<String, MergedModel> = BTreeMap::new();
+    for host in hosts {
+        for (tag, show) in host.models {
+            let entry = merged.entry(tag).or_default();
+            let is_priority_host = entry.account_ids.is_empty();
+            entry.account_ids.push(host.account_id.clone());
+            entry.host_labels.push(host.label.clone());
+            if is_priority_host {
+                // Discovery receives hosts in account priority order. Keep the
+                // advertised runtime metadata aligned with the host routing will
+                // select, while retaining every serving account for failover.
+                entry.context_window = context_length(&show.model_info);
+                entry.supports_tools = show.capabilities.iter().any(|c| c == "tools");
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(tag, entry)| DiscoveredModel {
+            id: tag.clone(),
+            model: tag.clone(),
+            display_name: tag,
+            description: Some(format!("Served by {}", entry.host_labels.join(", "))),
+            hidden: false,
+            is_default: false,
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: vec![],
+            context_window: entry.context_window,
+            canonical_slug: Some(entry.account_ids.join(",")),
+            pricing: None,
+            supported_parameters: if entry.supports_tools {
+                vec!["tools".into()]
+            } else {
+                vec![]
+            },
+            router: false,
+            architecture_modality: None,
+        })
+        .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn show(w: i64, t: bool) -> ShowResponse {
+        ShowResponse {
+            capabilities: if t { vec!["tools".into()] } else { vec![] },
+            model_info: serde_json::from_value(serde_json::json!({"llama.context_length":w}))
+                .unwrap(),
+        }
+    }
+    #[test]
+    fn maps_capabilities_context_and_merges_hosts() {
+        let m = merge_hosts(vec![
+            HostModels {
+                account_id: "a".into(),
+                label: "Fast".into(),
+                models: vec![("qwen".into(), show(32768, false))],
+            },
+            HostModels {
+                account_id: "b".into(),
+                label: "Large".into(),
+                models: vec![
+                    ("qwen".into(), show(131072, true)),
+                    ("llama".into(), show(8192, false)),
+                ],
+            },
+        ]);
+        assert_eq!(m.len(), 2);
+        let q = m.iter().find(|m| m.id == "qwen").unwrap();
+        assert_eq!(q.context_window, Some(32768));
+        assert_eq!(q.canonical_slug.as_deref(), Some("a,b"));
+        assert!(q.supported_parameters.is_empty());
+    }
+    #[test]
+    fn reports_empty_host_configuration() {
+        assert!(discover_hosts(vec![])
+            .unwrap_err()
+            .contains("No Ollama hosts"));
+    }
+
+    #[test]
+    fn aggregates_host_labels_for_discovery_errors() {
+        let (models, error) = discover_hosts_with_errors(vec![
+            ("a".into(), "Studio".into(), "://invalid-a".into()),
+            ("b".into(), "Laptop".into(), "://invalid-b".into()),
+        ]);
+        assert!(models.is_empty());
+        let error = error.expect("host errors");
+        assert!(error.contains("Studio: tags request failed"));
+        assert!(error.contains("Laptop: tags request failed"));
+    }
+}

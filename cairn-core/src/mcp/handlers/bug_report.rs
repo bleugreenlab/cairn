@@ -142,42 +142,6 @@ async fn lookup_agent_type(db: &LocalDb, request: &McpCallbackRequest) -> DbResu
         })
         .await
     } else {
-        let cwd = request.cwd.clone();
-        db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT j.node_name,
-                               CASE
-                                   WHEN j.issue_id IS NULL THEN 'project'
-                                   ELSE 'implementation'
-                               END
-                        FROM runs r
-                        JOIN jobs j ON r.job_id = j.id
-                        LEFT JOIN projects p ON j.project_id = p.id
-                        WHERE r.status IN ('starting', 'live')
-                          AND (j.worktree_path = ?1 OR (p.repo_path = ?1 AND j.issue_id IS NULL))
-                        ORDER BY
-                            CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
-                            r.created_at DESC
-                        LIMIT 1
-                        ",
-                        (cwd.as_str(),),
-                    )
-                    .await?;
-
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        let job_name = row.opt_text(0)?;
-                        let job_type = row.text(1)?;
-                        Ok(job_name.or(Some(job_type)))
-                    })
-                    .transpose()
-                    .map(|value| value.flatten())
-            })
-        })
-        .await
+        Ok(None)
     }
 }

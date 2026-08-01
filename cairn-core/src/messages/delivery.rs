@@ -114,26 +114,66 @@ pub(crate) fn queue_system_direct_once_confirmed(
     )
 }
 
-/// Is this job's agent **self-suspended** — its head turn `yielded` waiting on
-/// its OWN pending work (a sub-agent task/batch or dependency wait, its own open
-/// question/prompt, or its own pending permission)?
+/// What a job's head turn says its agent is doing right now.
 ///
-/// A self-suspended agent is not idle: it resumes only when its own pending work
-/// resolves (the task returns, the question is answered, the permission is
-/// decided, the dependency unblocks), draining any queued external push then. It
-/// must NOT be woken by an external attention push, even a `wake`/`interrupt`
-/// one (`docs/attention-redesign.md` — "Wakeable vs self-suspended"; CAIRN-1876).
-///
-/// A yielded head turn reliably means self-suspended: a normally-idle agent's
-/// head turn is `complete` (the warm transition completes the turn — see
-/// `orchestrator::lifecycle::transition_to_warm_state`), and a stopped agent's is
-/// `interrupted`/`cancelled`; only the three durable-wait yields land a `yielded`
-/// head turn. The reason check guards against any future non-self-suspend yield.
 /// Head turn = `jobs.current_turn_id` when present, mirroring the canonical
 /// head-turn query in `jobs::queries::node_status_indicators`. The fallback is
 /// only for legacy rows without the pointer; turn sequence is session-local and
 /// restarts after cold-resume reseed rotation.
-async fn head_turn_self_suspended(db: &LocalDb, job_id: &str) -> Result<bool, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadTurn {
+    /// No turn yet, or the head turn finished (`complete`, `failed`,
+    /// `interrupted`, `cancelled`). The agent is at rest and takes another turn
+    /// only when something hands it one.
+    Idle,
+    /// The head turn is still live: `running`, `pending`, or `yielded` for a
+    /// reason that is not the agent's own pending work (the host holds the turn,
+    /// so the agent is still not idle).
+    Live,
+    /// The head turn `yielded` waiting on the agent's OWN pending work — a
+    /// sub-agent task/batch or dependency wait, its own open question or prompt,
+    /// its own pending permission, or a durable `waitFor` / `run` suspension.
+    ///
+    /// Self-suspended is not idle: the agent resumes only when its own pending
+    /// work resolves (the task returns, the question is answered, the permission
+    /// is decided, the wait fires), draining anything queued for it then. Two
+    /// consequences follow. It must NOT be woken by an external attention push,
+    /// even a `wake`/`interrupt` one (`docs/attention-redesign.md` — "Wakeable vs
+    /// self-suspended"; CAIRN-1876). And background work must NOT be scheduled
+    /// against it as though its turn had ended — notably the turn-end project
+    /// check cadence, whose heavy lanes would otherwise compete with the very
+    /// tests the agent is suspended waiting on (CAIRN-3154).
+    SelfSuspended,
+}
+
+impl HeadTurn {
+    /// Why this job is mid-work rather than idle, phrased for a log line, or
+    /// `None` when it is genuinely idle. One accessor over the whole
+    /// classification, so a caller that only asks "is a turn in progress" cannot
+    /// drift from one that asks which kind.
+    pub(crate) fn mid_work_reason(self) -> Option<&'static str> {
+        match self {
+            HeadTurn::Idle => None,
+            HeadTurn::Live => Some("its head turn is still live (the agent already resumed)"),
+            HeadTurn::SelfSuspended => Some("it is self-suspended on its own pending work"),
+        }
+    }
+
+    /// Is the agent suspended on its own pending work, specifically?
+    pub(crate) fn is_self_suspended(self) -> bool {
+        matches!(self, HeadTurn::SelfSuspended)
+    }
+}
+
+/// Classify a job's head turn. See [`HeadTurn`] for what each answer means and
+/// which callers depend on the distinction.
+///
+/// A yielded head turn reliably means self-suspended: a normally-idle agent's
+/// head turn is `complete` (the warm transition completes the turn — see
+/// `orchestrator::lifecycle::transition_to_warm_state`), and a stopped agent's is
+/// `interrupted`/`cancelled`; only the durable-wait yields land a `yielded` head
+/// turn. The reason check guards against any future non-self-suspend yield.
+async fn head_turn(db: &LocalDb, job_id: &str) -> Result<HeadTurn, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();
@@ -157,28 +197,52 @@ async fn head_turn_self_suspended(db: &LocalDb, job_id: &str) -> Result<bool, St
                 )
                 .await?;
             let Some(row) = rows.next().await? else {
-                return Ok(false);
+                return Ok(HeadTurn::Idle);
             };
-            if row.text(0)? != "yielded" {
-                return Ok(false);
-            }
-            Ok(row
-                .opt_text(1)?
-                .as_deref()
-                .map(is_self_suspend_reason)
-                .unwrap_or(false))
+            let state = row.text(0)?;
+            Ok(match state.as_str() {
+                "yielded" => {
+                    if row
+                        .opt_text(1)?
+                        .as_deref()
+                        .map(is_self_suspend_reason)
+                        .unwrap_or(false)
+                    {
+                        HeadTurn::SelfSuspended
+                    } else {
+                        HeadTurn::Live
+                    }
+                }
+                "running" | "pending" => HeadTurn::Live,
+                _ => HeadTurn::Idle,
+            })
         })
     })
     .await
     .map_err(|e| e.to_string())
 }
 
-/// Sync wrapper for [`head_turn_self_suspended`] for use from the non-async
-/// flush-on-idle resume gate.
-fn head_turn_self_suspended_sync(db: &LocalDb, job_id: &str) -> bool {
+/// [`head_turn`] for the non-async flush-on-idle resume gate. Fails open to
+/// [`HeadTurn::Idle`] so a read error never silently suppresses a caller's
+/// normal behaviour.
+fn head_turn_sync(db: &LocalDb, job_id: &str) -> HeadTurn {
     let job_id = job_id.to_string();
-    run_db_blocking(move || async move { head_turn_self_suspended(db, &job_id).await })
-        .unwrap_or(false)
+    run_db_blocking(move || async move { head_turn(db, &job_id).await }).unwrap_or(HeadTurn::Idle)
+}
+
+/// [`head_turn`] for a job id, routed to the job's owning database, for the
+/// synchronous turn-end hooks in `orchestrator::lifecycle`. Fails open to
+/// [`HeadTurn::Idle`] for the same reason as [`head_turn_sync`].
+pub(crate) fn head_turn_for_job(orch: &Orchestrator, job_id: &str) -> HeadTurn {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        head_turn(&db, &job_id).await
+    })
+    .unwrap_or(HeadTurn::Idle)
 }
 
 /// The recipient job's node URI, used as a `direct:` push's wake-card link. The
@@ -540,7 +604,7 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
     // separate delivery mechanism (migrated in a later slice) and keep their
     // existing wake-on-idle behavior. (docs/attention-redesign.md — "Wakeable vs
     // self-suspended".)
-    let self_suspended = head_turn_self_suspended_sync(db, &job_id);
+    let self_suspended = head_turn_sync(db, &job_id).is_self_suspended();
 
     // CAIRN-1881/1900: a pending rousing (`wake`/`interrupt`) push for this job is
     // a reason to resume an *idle* agent — but never a self-suspended one.
@@ -787,7 +851,7 @@ mod tests {
     }
 
     /// Replace the job's head turn with one of the given `state` / `yield_reason`
-    /// so `head_turn_self_suspended` reads a single, deterministic head turn.
+    /// so `head_turn` reads a single, deterministic head turn.
     async fn set_head_turn(db: &LocalDb, job_id: &str, state: &str, reason: Option<&str>) {
         let job_id = job_id.to_string();
         let state = state.to_string();
@@ -833,34 +897,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn head_turn_self_suspended_classifies_yield_reasons() {
+    async fn head_turn_classifies_state_and_yield_reason() {
         let db = migrated_db().await;
         seed_run(&db, "run-1", "job-1").await;
 
-        // No head turn at all -> not self-suspended (a fresh/idle job).
-        assert!(!head_turn_self_suspended(&db, "job-1").await.unwrap());
+        // No head turn at all -> a fresh job is idle.
+        assert_eq!(head_turn(&db, "job-1").await.unwrap(), HeadTurn::Idle);
 
-        // All three yielded waits are self-suspends (own task/dependency,
-        // own question, own permission).
-        for reason in ["dependency_wait", "user_input", "permission"] {
+        // Every durable-wait yield is a self-suspend: an own task/dependency
+        // wait, an own question, an own permission, and a `waitFor` / long `run`.
+        for reason in ["dependency_wait", "user_input", "permission", "wait"] {
             set_head_turn(&db, "job-1", "yielded", Some(reason)).await;
-            assert!(
-                head_turn_self_suspended(&db, "job-1").await.unwrap(),
+            assert_eq!(
+                head_turn(&db, "job-1").await.unwrap(),
+                HeadTurn::SelfSuspended,
                 "yielded/{reason} must read as self-suspended"
             );
         }
 
-        // A completed head turn is the normal idle case, not self-suspended.
+        // A yield for some future non-self-suspend reason is not self-suspended,
+        // but the host holds the turn — so it is live, not idle.
+        set_head_turn(&db, "job-1", "yielded", Some("host_takeover")).await;
+        assert_eq!(head_turn(&db, "job-1").await.unwrap(), HeadTurn::Live);
+        assert!(!head_turn(&db, "job-1").await.unwrap().is_self_suspended());
+
+        // A completed head turn is the normal idle case.
         set_head_turn(&db, "job-1", "complete", None).await;
-        assert!(!head_turn_self_suspended(&db, "job-1").await.unwrap());
+        assert_eq!(head_turn(&db, "job-1").await.unwrap(), HeadTurn::Idle);
 
         // A stopped (interrupted) head turn is idle/terminal, not self-suspended.
         set_head_turn(&db, "job-1", "interrupted", None).await;
-        assert!(!head_turn_self_suspended(&db, "job-1").await.unwrap());
+        assert_eq!(head_turn(&db, "job-1").await.unwrap(), HeadTurn::Idle);
 
-        // A running head turn is active, not self-suspended.
-        set_head_turn(&db, "job-1", "running", None).await;
-        assert!(!head_turn_self_suspended(&db, "job-1").await.unwrap());
+        // A running or pending head turn is active work, not idle.
+        for state in ["running", "pending"] {
+            set_head_turn(&db, "job-1", state, None).await;
+            let head = head_turn(&db, "job-1").await.unwrap();
+            assert_eq!(head, HeadTurn::Live, "{state} must read as live");
+            assert!(!head.is_self_suspended());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

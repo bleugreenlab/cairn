@@ -4,12 +4,25 @@
 //! ## Why this exists
 //!
 //! Agent tooling writes scratch files (build temp, harness logs) to the system
-//! temp dir by default. Those writes are already in-bounds for the worktree
-//! fence — the system temp root is in the sandbox writable set
-//! (`services::sandbox::default_writable_extra`), so a write there takes no
-//! prompt. The job-scoped subdir adds two things on top of that: tools spawned
-//! by concurrent jobs no longer collide on shared temp filenames, and the whole
-//! dir is removed together at worktree teardown instead of littering temp.
+//! temp dir by default. This directory is also the agent CLI process residence:
+//! it contains no repository checkout and conveys no project identity. The
+//! job-scoped subdir prevents concurrent tools from colliding and gives job
+//! teardown one reclaimable scratch tree.
+//!
+//! ## Where it lives
+//!
+//! Under [`cairn_common::scratch::scratch_root`] — `<cairn_home>/scratch` — in a
+//! directory named for the job's canonical node URI, so a whole path reads as
+//! `~/.cairn/scratch/CAIRN.2695.1.builder/terminals/gates.log`. That matters
+//! because these paths are advertised to people and to agents (a terminal log
+//! line, a chat attachment, the residence a command runs in) and then retyped;
+//! the platform temp root this tree used to sit under contributed an opaque
+//! per-user hash segment to every one of them and nothing else.
+//!
+//! The root is outside the platform temp dirs the fence grants wholesale, so
+//! `services::sandbox::default_writable_extra` grants it by name — a write here
+//! remains in-bounds for both `run` (OS sandbox) and the `write` verb, and takes
+//! no prompt.
 //!
 //! ## Not a security boundary
 //!
@@ -19,16 +32,13 @@
 //! (both are agents acting for the same user with broad read reach). The value
 //! is collision avoidance and tidy cleanup, plus eliminating the escape-prompt
 //! noise a scratch write would otherwise raise if it landed outside any
-//! sanctioned dir. We therefore do **not** narrow the `/tmp` write-allow to
-//! gain a false sense of containment.
+//! sanctioned dir. We therefore do **not** narrow the platform temp write-allow
+//! to gain a false sense of containment.
 //!
-//! The dir lives under [`std::env::temp_dir`], which is already in the sandbox
-//! writable set, so no fence widening is needed: the scratch path is in-bounds
-//! for both `run` (OS sandbox) and the `write` verb by construction.
-
+use cairn_common::scratch::scratch_root;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Compaction cap for a persisted terminal log. When the file grows past this we
 /// rewrite it down to its trailing [`TERMINAL_LOG_KEEP_BYTES`] — for a
@@ -37,12 +47,27 @@ const TERMINAL_LOG_MAX_BYTES: u64 = 24 * 1024 * 1024;
 /// Bytes retained when a terminal log is compacted.
 const TERMINAL_LOG_KEEP_BYTES: u64 = 12 * 1024 * 1024;
 
-const SCRATCH_PREFIX: &str = "cairn-scratch-";
 const SCRATCH_NAME_MAX_BYTES: usize = 220;
-const SCRATCH_MAP_DIR: &str = ".cairn-scratch-jobs";
+/// Hidden sibling of the job directories holding the job-id -> name registry.
+/// Hidden so `ls <cairn_home>/scratch` shows nothing but readable job names.
+const SCRATCH_MAP_DIR: &str = ".jobs";
 
-fn legacy_job_scratch_dir(job_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{job_id}"))
+/// The directory a job gets before its canonical node URI is known. Job
+/// preparation provisions a residence before session startup has resolved the
+/// URI, so this is the opening state of an ordinary job rather than a legacy
+/// shape; [`ensure_job_scratch_dir`] promotes it in place once the URI arrives.
+fn unnamed_job_scratch_dir(job_id: &str) -> PathBuf {
+    scratch_root().join(encode_component(job_id))
+}
+
+/// Whether a registered name addresses one ordinary directory directly under the
+/// scratch root. A traversal (`..`) or a nested path would let a job's teardown
+/// reach outside its own tree, and a hidden name would collide with the registry
+/// itself — removing [`SCRATCH_MAP_DIR`] would unregister every other job.
+fn is_job_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && Path::new(name).file_name().is_some_and(|file| file == name)
 }
 
 fn encode_component(value: &str) -> String {
@@ -61,7 +86,7 @@ fn encode_component(value: &str) -> String {
 }
 
 fn scratch_map_path(job_id: &str) -> PathBuf {
-    std::env::temp_dir()
+    scratch_root()
         .join(SCRATCH_MAP_DIR)
         .join(encode_component(job_id))
 }
@@ -69,47 +94,58 @@ fn scratch_map_path(job_id: &str) -> PathBuf {
 fn mapped_job_scratch_dir(job_id: &str) -> Option<PathBuf> {
     let name = std::fs::read_to_string(scratch_map_path(job_id)).ok()?;
     let name = name.trim();
-    if !name.starts_with(SCRATCH_PREFIX)
-        || name.is_empty()
-        || std::path::Path::new(name).components().count() != 1
-    {
+    if !is_job_dir_name(name) {
         return None;
     }
-    Some(std::env::temp_dir().join(name))
+    Some(scratch_root().join(name))
 }
 
-fn friendly_scratch_name(job_id: &str, home_uri: &str) -> String {
+/// The directory name for a job that knows its canonical node URI: the URI tail
+/// with its segment boundaries preserved, so `cairn://p/CAIRN/2695/1/builder`
+/// becomes `CAIRN.2695.1.builder`. No prefix — the enclosing directory is
+/// already named `scratch` inside the Cairn home, and a `cairn-scratch-` prefix
+/// under it would only stutter.
+fn node_scratch_name(job_id: &str, home_uri: &str) -> String {
     let uri_tail = home_uri.strip_prefix("cairn://p/").unwrap_or(home_uri);
-    let mut name = format!("{SCRATCH_PREFIX}{}", encode_component(uri_tail));
+    let mut name = encode_component(uri_tail);
     if name.len() > SCRATCH_NAME_MAX_BYTES {
         let suffix: String = encode_component(job_id).chars().take(12).collect();
         name.truncate(SCRATCH_NAME_MAX_BYTES - suffix.len() - 2);
         name.push_str("--");
         name.push_str(&suffix);
     }
-    name
+    // A URI shaped so that its tail encodes to something the registry would
+    // later refuse (empty, or leading `.` from a leading separator) must not
+    // silently split a job across two directories: fall back to the name every
+    // job can always be given.
+    if is_job_dir_name(&name) {
+        name
+    } else {
+        encode_component(job_id)
+    }
 }
 
 /// The scratch directory currently registered for a job. Session startup names
-/// it from the canonical node URI; the small temp-root registry lets command,
-/// terminal, and teardown paths recover that same directory from the internal
-/// job id. Legacy or not-yet-started jobs fall back to their UUID-keyed path.
-fn job_scratch_dir(job_id: &str) -> PathBuf {
-    mapped_job_scratch_dir(job_id).unwrap_or_else(|| legacy_job_scratch_dir(job_id))
+/// it from the canonical node URI; the small registry beside the job directories
+/// lets command, terminal, and teardown paths recover that same directory from
+/// the internal job id. A job whose URI has not resolved yet uses its
+/// job-id-keyed path.
+pub fn job_scratch_dir(job_id: &str) -> PathBuf {
+    mapped_job_scratch_dir(job_id).unwrap_or_else(|| unnamed_job_scratch_dir(job_id))
 }
 
 /// Register and provision a readable scratch directory for a job. Supplying the
-/// node's canonical home URI produces names such as
-/// `cairn-scratch-CAIRN-2695-1-builder`; callers without URI context reuse an
-/// existing registration or retain the legacy job-id fallback.
+/// node's canonical home URI produces `<cairn_home>/scratch/CAIRN.2695.1.builder`;
+/// callers without URI context reuse an existing registration or retain the
+/// job-id-keyed directory.
 ///
 /// Best-effort: on a create failure the path is still returned (callers export
 /// it as `TMPDIR` regardless; a tool then falls back to its own temp handling).
 /// Idempotent, so it is safe to call on every spawn and across resumes.
 pub fn ensure_job_scratch_dir(job_id: &str, home_uri: Option<&str>) -> PathBuf {
     let dir = if let Some(home_uri) = home_uri {
-        let name = friendly_scratch_name(job_id, home_uri);
-        let friendly = std::env::temp_dir().join(&name);
+        let name = node_scratch_name(job_id, home_uri);
+        let named = scratch_root().join(&name);
         let map_path = scratch_map_path(job_id);
         let mapping_registered = map_path
             .parent()
@@ -118,22 +154,25 @@ pub fn ensure_job_scratch_dir(job_id: &str, home_uri: Option<&str>) -> PathBuf {
             .is_some();
 
         if mapping_registered {
-            let legacy = legacy_job_scratch_dir(job_id);
-            if legacy.exists() && !friendly.exists() {
-                if let Err(e) = std::fs::rename(&legacy, &friendly) {
+            // Carry across whatever the job already wrote while its URI was
+            // still unresolved, so naming the directory never costs a job an
+            // attachment or a terminal log it had already produced.
+            let unnamed = unnamed_job_scratch_dir(job_id);
+            if unnamed != named && unnamed.exists() && !named.exists() {
+                if let Err(e) = std::fs::rename(&unnamed, &named) {
                     log::warn!(
                         "Failed to migrate job scratch dir {} to {}: {e}",
-                        legacy.display(),
-                        friendly.display()
+                        unnamed.display(),
+                        named.display()
                     );
                 }
             }
-            friendly
+            named
         } else {
             log::warn!(
-                "Failed to register readable scratch dir for job {job_id}; using legacy name"
+                "Failed to register readable scratch dir for job {job_id}; using job-id name"
             );
-            legacy_job_scratch_dir(job_id)
+            unnamed_job_scratch_dir(job_id)
         }
     } else {
         job_scratch_dir(job_id)
@@ -145,19 +184,18 @@ pub fn ensure_job_scratch_dir(job_id: &str, home_uri: Option<&str>) -> PathBuf {
     dir
 }
 
-/// Remove a job's registered scratch dir and legacy fallback (idempotent,
-/// best-effort). Called at worktree teardown for every job that referenced the
-/// torn-down worktree. A missing dir is success (the OS may have reaped it, or
-/// the job never spawned a command).
+/// Remove a job's registered scratch residence and its job-id-keyed directory
+/// (idempotent, best-effort). A missing directory is success: the OS may have
+/// reaped it, or the job may never have spawned a process.
 pub fn remove_job_scratch_dir(job_id: &str) {
     let mapped = mapped_job_scratch_dir(job_id);
-    let legacy = legacy_job_scratch_dir(job_id);
+    let unnamed = unnamed_job_scratch_dir(job_id);
     let mut dirs = Vec::with_capacity(2);
     if let Some(dir) = mapped {
         dirs.push(dir);
     }
-    if !dirs.contains(&legacy) {
-        dirs.push(legacy);
+    if !dirs.contains(&unnamed) {
+        dirs.push(unnamed);
     }
 
     for dir in dirs {
@@ -338,17 +376,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scratch_dir_is_stable_and_under_temp_root() {
+    fn scratch_dir_is_stable_and_under_the_cairn_scratch_root() {
         let a = job_scratch_dir("job-abc");
         let b = job_scratch_dir("job-abc");
         // Deterministic for a given job id.
         assert_eq!(a, b);
-        // Lives under the system temp root, so it is already in the sandbox
-        // writable set — no fence widening required.
-        assert!(a.starts_with(std::env::temp_dir()));
-        assert!(a.to_string_lossy().contains("cairn-scratch-job-abc"));
-        // Distinct unregistered jobs retain distinct legacy fallbacks.
+        // Lives under Cairn's own scratch root, which the fence grants by name.
+        assert_eq!(a.parent(), Some(scratch_root().as_path()));
+        assert!(a.ends_with("job-abc"));
+        // Distinct unregistered jobs keep distinct directories.
         assert_ne!(job_scratch_dir("job-abc"), job_scratch_dir("job-xyz"));
+    }
+
+    /// The whole point of the move: an agent-visible scratch path carries no
+    /// segment a person cannot read back, remember, and retype.
+    #[test]
+    fn a_scratch_path_carries_no_opaque_segment() {
+        let job_id = format!("test-{}", uuid::Uuid::new_v4());
+        let name = node_scratch_name(&job_id, "cairn://p/CAIRN/2695/1/builder");
+        let path = scratch_root().join(&name);
+        assert_eq!(name, "CAIRN.2695.1.builder");
+        // Every segment below the user's home is one Cairn chose and a person
+        // can read: no platform temp root, and so no per-user hash.
+        let rendered = path.to_string_lossy().into_owned();
+        assert!(!rendered.contains("/var/folders/"), "{rendered}");
+        assert!(
+            rendered.ends_with("/scratch/CAIRN.2695.1.builder"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -358,7 +413,7 @@ mod tests {
             ensure_job_scratch_dir(&job_id, Some("cairn://p/CAIRN/2695/1/builder/task/review"));
         assert_eq!(
             dir.file_name().and_then(|name| name.to_str()),
-            Some("cairn-scratch-CAIRN.2695.1.builder.task.review")
+            Some("CAIRN.2695.1.builder.task.review")
         );
         assert_eq!(job_scratch_dir(&job_id), dir);
         remove_job_scratch_dir(&job_id);
@@ -366,33 +421,58 @@ mod tests {
         assert!(!scratch_map_path(&job_id).exists());
     }
 
+    /// Naming a job's directory must carry its existing contents across, or a
+    /// chat attachment uploaded before session startup would be stranded in the
+    /// job-id-keyed directory that nothing looks in again.
+    #[test]
+    fn naming_a_started_job_carries_its_contents_across() {
+        let job_id = format!("test-{}", uuid::Uuid::new_v4());
+        let unnamed = ensure_job_scratch_dir(&job_id, None);
+        std::fs::write(unnamed.join("report.pdf"), b"fixture").unwrap();
+
+        let named = ensure_job_scratch_dir(&job_id, Some("cairn://p/CAIRN/2695/1/builder"));
+
+        assert_ne!(named, unnamed);
+        assert!(!unnamed.exists());
+        assert_eq!(std::fs::read(named.join("report.pdf")).unwrap(), b"fixture");
+        remove_job_scratch_dir(&job_id);
+    }
+
     #[test]
     fn uri_structure_remains_visible_and_stable_without_a_hash() {
         let top_level = "cairn://p/CAIRN/2695/1/builder-task-review";
         let task = "cairn://p/CAIRN/2695/1/builder/task/review";
 
-        let top_level_name = friendly_scratch_name("job-top", top_level);
-        let task_name = friendly_scratch_name("job-task", task);
-        assert_eq!(
-            top_level_name,
-            "cairn-scratch-CAIRN.2695.1.builder-task-review"
-        );
-        assert_eq!(task_name, "cairn-scratch-CAIRN.2695.1.builder.task.review");
+        let top_level_name = node_scratch_name("job-top", top_level);
+        let task_name = node_scratch_name("job-task", task);
+        assert_eq!(top_level_name, "CAIRN.2695.1.builder-task-review");
+        assert_eq!(task_name, "CAIRN.2695.1.builder.task.review");
         assert_ne!(top_level_name, task_name);
-        assert_eq!(
-            friendly_scratch_name("another-job", top_level),
-            top_level_name
-        );
-        assert_eq!(friendly_scratch_name("another-job", task), task_name);
+        assert_eq!(node_scratch_name("another-job", top_level), top_level_name);
+        assert_eq!(node_scratch_name("another-job", task), task_name);
     }
 
     #[test]
     fn unsafe_uri_bytes_are_encoded_into_one_path_component() {
-        let name = friendly_scratch_name("job-abc", "cairn://p/CAIRN/1/1/a b/%2F._2F");
-        assert_eq!(name, "cairn-scratch-CAIRN.1.1.a_20b._252F_2E_5F2F");
+        let name = node_scratch_name("job-abc", "cairn://p/CAIRN/1/1/a b/%2F._2F");
+        assert_eq!(name, "CAIRN.1.1.a_20b._252F_2E_5F2F");
         assert_eq!(std::path::Path::new(&name).components().count(), 1);
         assert_ne!(encode_component("a/b"), encode_component("a.b"));
         assert_ne!(encode_component("_2F"), encode_component("/"));
+    }
+
+    /// A registered name is read back off disk, so it decides which directory a
+    /// later teardown removes. Only an ordinary directory directly under the
+    /// root may be named.
+    #[test]
+    fn a_registered_name_can_only_address_one_directory_under_the_root() {
+        for rejected in ["", ".", "..", "../elsewhere", "a/b", ".jobs"] {
+            assert!(!is_job_dir_name(rejected), "must reject {rejected:?}");
+        }
+        assert!(is_job_dir_name("CAIRN.2695.1.builder"));
+        // A URI tail that would encode to a rejected name falls back rather than
+        // registering a name the lookup would later refuse.
+        assert_eq!(node_scratch_name("job-abc", "cairn://p/"), "job-abc");
     }
 
     #[test]

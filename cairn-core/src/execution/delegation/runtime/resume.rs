@@ -15,9 +15,6 @@ use crate::orchestrator::attention_push::{
     latest_push_fingerprint, push_with_fingerprint, Boundary, Wake,
 };
 
-const DEFERRED_TASK_PARENT_SUSPEND_GRACE: std::time::Duration =
-    std::time::Duration::from_millis(75);
-
 pub(super) fn prepare_parent_for_delegated_wait(
     orch: &Orchestrator,
     parent_ctx: &ParentRunContext,
@@ -178,70 +175,45 @@ async fn get_successor_turn(db: &LocalDb, predecessor_id: &str) -> Result<Option
         .map_err(|e| format!("Failed to query successor turn: {}", e))
 }
 
-fn finish_deferred_parent_suspend_for_delegated_wait(
-    orch: &Orchestrator,
-    parent_run_id: &str,
-    parent_job_id: &str,
-    child_job_id: &str,
-) -> Result<(), String> {
-    crate::orchestrator::lifecycle::suspend_run_for_durable_wait(
-        orch,
-        parent_run_id,
-        "delegated_wait_suspended",
-    )?;
-    if let Err(error) = resume_suspended_parent_after_task_completion(orch, child_job_id) {
-        log::warn!(
-            "Post-suspend resume check failed for parent job {} via child {}: {}",
-            parent_job_id,
-            child_job_id,
-            error
-        );
-    }
-    Ok(())
-}
-
+/// Park the parent on the shared durable-wait primitive, then re-check whether
+/// the child finished while the park was pending.
+///
+/// The park is deferred so the `tasks` call's own "suspended" result reaches the
+/// agent ahead of the interrupt; the re-check is what keeps a child that
+/// completed inside that window from leaving the parent parked forever.
 pub(super) fn schedule_deferred_parent_suspend_for_delegated_wait(
     orch: Orchestrator,
     parent_run_id: String,
     parent_job_id: String,
     child_job_id: String,
 ) {
-    tokio::spawn(async move {
-        tokio::time::sleep(DEFERRED_TASK_PARENT_SUSPEND_GRACE).await;
-
-        let worker_orch = orch.clone();
-        let worker_parent_run_id = parent_run_id.clone();
-        let worker_parent_job_id = parent_job_id.clone();
-        let worker_child_job_id = child_job_id.clone();
-        match tokio::task::spawn_blocking(move || {
-            finish_deferred_parent_suspend_for_delegated_wait(
-                &worker_orch,
-                &worker_parent_run_id,
-                &worker_parent_job_id,
-                &worker_child_job_id,
-            )
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                log::warn!(
-                    "Deferred suspend worker failed for parent job {} run {}: {}",
-                    parent_job_id,
-                    parent_run_id,
-                    error
-                );
+    let after_park_orch = orch.clone();
+    crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff_then(
+        &orch,
+        &parent_run_id,
+        "delegated_wait_suspended",
+        move |parked| async move {
+            if parked.is_err() {
+                return;
             }
-            Err(join_error) => {
-                log::warn!(
-                    "Deferred suspend worker panicked for parent job {} run {}: {}",
-                    parent_job_id,
-                    parent_run_id,
-                    join_error
-                );
+            let worker_orch = after_park_orch;
+            let worker_parent_job_id = parent_job_id.clone();
+            let worker_child_job_id = child_job_id.clone();
+            let checked = tokio::task::spawn_blocking(move || {
+                resume_suspended_parent_after_task_completion(&worker_orch, &worker_child_job_id)
+            })
+            .await;
+            match checked {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::warn!(
+                    "Post-suspend resume check failed for parent job {worker_parent_job_id} via child {child_job_id}: {error}"
+                ),
+                Err(join_error) => log::warn!(
+                    "Post-suspend resume check panicked for parent job {worker_parent_job_id}: {join_error}"
+                ),
             }
-        }
-    });
+        },
+    );
 }
 
 fn delegated_result_text(

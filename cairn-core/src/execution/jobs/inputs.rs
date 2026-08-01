@@ -763,6 +763,85 @@ pub(crate) fn is_long_running_node(
     })
 }
 
+/// Load the execution snapshot and derive whether `node_id` is long-running (see
+/// [`is_long_running_node`]). The prompt assembler uses this to decide whether a
+/// node gets the standing-node framing; the fact itself is derived in exactly one
+/// place.
+pub(crate) async fn is_long_running_node_conn(
+    conn: &cairn_db::turso::Connection,
+    node_id: &str,
+    execution_id: &str,
+    requires_output: bool,
+) -> DbResult<bool> {
+    let snapshot = require_execution_snapshot_conn(conn, execution_id).await?;
+    Ok(is_long_running_node(&snapshot, node_id, requires_output))
+}
+
+/// Derive whether a node's work is destined for a pull request — whether the
+/// context it produces flows into a `pr` node — from the execution's recipe
+/// topology, not from any node flag or agent name. The walk follows the node's
+/// `context-out` edges: a `pr` target answers yes, an `artifact` target carries
+/// its producer's output onward so the walk continues through it, and every
+/// other target (notably another agent, which consumes the context rather than
+/// carrying it) ends that branch of the walk.
+///
+/// This is what separates a node whose branch will actually ship — the builder
+/// of `build`/`planbuild`, the executor of `task-list`, the integrator of
+/// `memory-triage`, a coordinator running on its own integration branch — from
+/// every node that merely reads or reviews that work: a planner (whose
+/// `context-out` terminates in a plan artifact consumed by the builder), a
+/// review node (which has no `context-out` at all), and a delegated sub-agent
+/// task (materialized with an inbound context edge and no outbound one). A job
+/// with no recipe node of its own has no topology and therefore no PR.
+///
+/// The turn-end (`when:review`) check cadence is scoped on exactly this fact:
+/// the heavy suites run for the tree a human will review, and nowhere else.
+pub(crate) fn node_ships_a_pr(snapshot: &ExecutionSnapshot, node_id: &str) -> bool {
+    let node_map: HashMap<&str, &RecipeNode> = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    let mut frontier: Vec<&str> = vec![node_id];
+    let mut walked: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    walked.insert(node_id);
+    while let Some(current) = frontier.pop() {
+        for edge in snapshot.recipe.edges.iter().filter(|edge| {
+            edge.edge_type == crate::models::RecipeEdgeType::Context
+                && edge.source_node_id == current
+                && edge.source_handle == crate::models::CONTEXT_OUT_HANDLE
+        }) {
+            let Some(target) = node_map.get(edge.target_node_id.as_str()) else {
+                continue;
+            };
+            if target.node_type == crate::models::RecipeNodeType::Pr {
+                return true;
+            }
+            // An artifact node carries its producer's output onward rather than
+            // consuming it, so the walk continues through it. Every other node
+            // type ends this branch of the walk.
+            if target.node_type == crate::models::RecipeNodeType::Artifact
+                && walked.insert(target.id.as_str())
+            {
+                frontier.push(target.id.as_str());
+            }
+        }
+    }
+    false
+}
+
+/// Load the execution snapshot and derive whether `node_id` ships a PR (see
+/// [`node_ships_a_pr`]).
+pub(crate) async fn node_ships_a_pr_conn(
+    conn: &cairn_db::turso::Connection,
+    node_id: &str,
+    execution_id: &str,
+) -> DbResult<bool> {
+    let snapshot = require_execution_snapshot_conn(conn, execution_id).await?;
+    Ok(node_ships_a_pr(&snapshot, node_id))
+}
+
 /// Assemble the system-prompt instruction text a running node inherits from its
 /// upstream Instruction nodes. Loads the execution snapshot and delegates to
 /// [`instruction_prompt_from_snapshot`] for the selection and ordering rules.
@@ -978,6 +1057,7 @@ mod port_model_tests {
 
     fn snapshot(nodes: Vec<RecipeNode>, edges: Vec<RecipeEdge>) -> ExecutionSnapshot {
         ExecutionSnapshot {
+            branch_target: Default::default(),
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),
@@ -1343,6 +1423,190 @@ mod port_model_tests {
         // Without the exclusion, the latest-across-job fallback returns `plan`
         // — the exact pre-fix behavior that opened the PR with the wrong content.
         assert_eq!(by_handle_unfiltered.unwrap().0, "plan");
+    }
+
+    /// A delegated sub-agent task is materialized into the DAG as a trigger +
+    /// context + agent triple wired INBOUND only (see
+    /// `effects::dag::delegation::expand_delegated_packets`): its context-in
+    /// carries the work packet and it has no context-out at all. Nothing it
+    /// commits is destined for a PR of its own, which is why its turn end runs
+    /// no review cadence (CAIRN-3334).
+    #[test]
+    fn a_delegated_sub_agent_node_ships_nothing() {
+        let mut context_node = artifact_node("delegated-1-context", "packet", ConfirmPolicy::Auto);
+        context_node.node_type = RecipeNodeType::Context;
+        let snap = snapshot(
+            vec![
+                agent("builder"),
+                pr_node("pr", "create-pr"),
+                context_node,
+                agent("delegated-1-agent"),
+            ],
+            vec![
+                ctx_edge("e1", "builder", "context-out", "pr", "context-in"),
+                ctx_edge(
+                    "e2",
+                    "delegated-1-context",
+                    "context-out",
+                    "delegated-1-agent",
+                    "context-in",
+                ),
+            ],
+        );
+        assert!(node_ships_a_pr(&snap, "builder"));
+        assert!(!node_ships_a_pr(&snap, "delegated-1-agent"));
+        // A job with no recipe node of its own has no topology and no PR.
+        assert!(!node_ships_a_pr(&snap, "no-such-node"));
+    }
+
+    /// The builder feeds the PR node AND fans its context out to a review agent
+    /// (the shape of the shipped `build` recipe). The fanout must not hide the
+    /// PR, and the reviewer — which consumes context rather than carrying it —
+    /// must not inherit the builder's answer.
+    #[test]
+    fn context_fanout_to_an_agent_neither_hides_nor_spreads_the_pr() {
+        let snap = snapshot(
+            vec![
+                agent("builder"),
+                agent("reviewer"),
+                pr_node("pr", "create-pr"),
+            ],
+            vec![
+                ctx_edge("e1", "builder", "context-out", "reviewer", "context-in"),
+                ctx_edge("e2", "builder", "context-out", "pr", "context-in"),
+            ],
+        );
+        assert!(node_ships_a_pr(&snap, "builder"));
+        assert!(!node_ships_a_pr(&snap, "reviewer"));
+    }
+
+    /// An artifact node carries its producer's output onward rather than
+    /// consuming it, so a PR reached through one still counts — while a plan
+    /// artifact consumed by a downstream BUILDER does not make its planner a
+    /// shipper.
+    #[test]
+    fn an_artifact_carries_the_walk_onward_but_an_agent_ends_it() {
+        let carried = snapshot(
+            vec![
+                agent("builder"),
+                artifact_node("draft", "draft", ConfirmPolicy::Auto),
+                pr_node("pr", "create-pr"),
+            ],
+            vec![
+                ctx_edge("e1", "builder", "context-out", "draft", "context-in"),
+                ctx_edge("e2", "draft", "context-out", "pr", "context-in"),
+            ],
+        );
+        assert!(node_ships_a_pr(&carried, "builder"));
+
+        // planner -> plan -> builder -> pr: only the builder ships.
+        let planbuild = planbuild_snapshot(false);
+        assert!(node_ships_a_pr(&planbuild, "builder"));
+        assert!(!node_ships_a_pr(&planbuild, "planner"));
+    }
+
+    /// A context-self living doc is the node's own scratch surface, never a
+    /// hand-off. A coordinator's board must not be mistaken for a PR path, and
+    /// a cycle through one must terminate.
+    #[test]
+    fn a_ctx_self_doc_is_not_a_pr_path() {
+        let snap = snapshot(
+            vec![
+                agent("coordinator"),
+                artifact_node("board", "board", ConfirmPolicy::Auto),
+            ],
+            vec![
+                ctx_edge("e1", "coordinator", "context-self", "board", "context-in"),
+                // A self-referential carrier: the walk must not loop forever.
+                ctx_edge("e2", "board", "context-out", "board", "context-in"),
+            ],
+        );
+        assert!(!node_ships_a_pr(&snap, "coordinator"));
+    }
+
+    const BUILD_YAML: &str = include_str!("../../../../../recipes/build.yaml");
+    const PLANBUILD_YAML: &str = include_str!("../../../../../recipes/planbuild.yaml");
+    const TASK_LIST_YAML: &str = include_str!("../../../../../recipes/task-list.yaml");
+    const COORDINATOR_YAML: &str = include_str!("../../../../../recipes/coordinator.yaml");
+    const MEMORY_TRIAGE_YAML: &str = include_str!("../../../../../recipes/memory-triage.yaml");
+    const SETUP_YAML: &str = include_str!("../../../../../recipes/setup.yaml");
+
+    /// The bundled recipes, parsed the way an execution snapshot is built from
+    /// them. `into_recipe` reassigns node ids, so agent nodes are keyed by their
+    /// agent config id.
+    fn bundled_snapshot(yaml: &str) -> ExecutionSnapshot {
+        let recipe = crate::models::RecipeFile::from_yaml(yaml)
+            .expect("bundled recipe parses")
+            .into_recipe(Some("default".to_string()), None);
+        snapshot(recipe.nodes.clone(), recipe.edges.clone())
+    }
+
+    fn agent_node_id(snap: &ExecutionSnapshot, agent_config_id: &str) -> String {
+        snap.recipe
+            .nodes
+            .iter()
+            .find(|node| {
+                node.agent_config
+                    .as_ref()
+                    .and_then(|c| c.agent_config_id.as_deref())
+                    == Some(agent_config_id)
+            })
+            .unwrap_or_else(|| panic!("recipe has an agent node for '{agent_config_id}'"))
+            .id
+            .clone()
+    }
+
+    /// Read against the recipes Cairn actually ships: in each one exactly the
+    /// agent whose branch becomes the pull request qualifies, and every agent
+    /// that only reads, plans, or reviews that work does not. This is the rule
+    /// the turn-end review cadence is scoped on (CAIRN-3334).
+    #[test]
+    fn bundled_recipes_qualify_only_the_agent_whose_branch_ships() {
+        let cases: [(&str, &str, &[&str]); 6] = [
+            (BUILD_YAML, "build", &[]),
+            (PLANBUILD_YAML, "build", &["planner", "pr-review"]),
+            (TASK_LIST_YAML, "executor", &["task-planner"]),
+            (COORDINATOR_YAML, "coordinator", &[]),
+            (MEMORY_TRIAGE_YAML, "integrator", &[]),
+            (SETUP_YAML, "cairn-setup", &[]),
+        ];
+        for (yaml, shipper, bystanders) in cases {
+            let snap = bundled_snapshot(yaml);
+            let name = &snap.recipe.name;
+            assert!(
+                node_ships_a_pr(&snap, &agent_node_id(&snap, shipper)),
+                "{name}: '{shipper}' ships the PR"
+            );
+            for bystander in bystanders {
+                assert!(
+                    !node_ships_a_pr(&snap, &agent_node_id(&snap, bystander)),
+                    "{name}: '{bystander}' does not ship a PR"
+                );
+            }
+        }
+    }
+
+    /// A coordinator on the BASE branch is a standing node: it has no branch and
+    /// no PR of its own, and `apply_branch_target` expresses that by pruning the
+    /// recipe's PR nodes. The cadence scope needs no special case for it — the
+    /// same topology walk simply finds nothing to ship to.
+    #[test]
+    fn a_standing_coordinator_ships_nothing() {
+        let recipe = crate::models::RecipeFile::from_yaml(COORDINATOR_YAML)
+            .expect("bundled recipe parses")
+            .into_recipe(Some("default".to_string()), None);
+        let declared = recipe.branch_targets.clone();
+        let mut snap = snapshot(recipe.nodes.clone(), recipe.edges.clone());
+        let coordinator = agent_node_id(&snap, "coordinator");
+        assert!(node_ships_a_pr(&snap, &coordinator));
+
+        crate::execution::branch_target::apply_branch_target(
+            &mut snap,
+            crate::models::BranchTarget::Base,
+            &declared,
+        )
+        .expect("the coordinator recipe declares the base target");
+        assert!(!node_ships_a_pr(&snap, &coordinator));
     }
 
     /// A consumer on a direct context edge must not receive the producer's

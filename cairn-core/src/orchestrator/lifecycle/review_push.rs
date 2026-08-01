@@ -99,19 +99,118 @@ pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
     true
 }
 
-/// Fire the turn-end (`when:review`) project checks for a job that just idled,
-/// detached onto a background task so the minutes-long suite never
-/// blocks the turn from ending. Skipped for a trailing memory-review turn (not a
-/// work turn) and when a run is already in flight for the job (single-flight).
-/// Runs UNSANDBOXED in the background; on any check failure it resumes the idle
-/// builder with the failure inlined. Invoked at BOTH turn-end callers
-/// (`finalize_run` and `transition_to_warm_state`) so the two stay mirrored.
+/// Synchronously answer whether this job's work ships a pull request, from the
+/// execution's recipe topology (`node_ships_a_pr` in `execution::jobs::inputs`,
+/// which owns the derivation).
+///
+/// A job with no recipe node of its own — every delegated sub-agent task, whose
+/// materialized node carries an inbound context edge and no outbound one — is a
+/// definitive `false` decided by the job row alone, so the dominant skip costs
+/// one small query and never loads a snapshot. `Err` means the topology could
+/// not be read at all; the caller decides what to do with that.
+fn job_ships_a_pr(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT recipe_node_id, execution_id FROM jobs WHERE id = ?1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(false);
+                };
+                let (Some(node_id), Some(execution_id)) = (row.opt_text(0)?, row.opt_text(1)?)
+                else {
+                    return Ok(false);
+                };
+                crate::execution::jobs::node_ships_a_pr_conn(conn, &node_id, &execution_id).await
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// Fire the turn-end (`when:review`) project checks for a job whose turn just
+/// ended, detached onto a background task so the minutes-long suite never blocks
+/// the turn from ending. Runs UNSANDBOXED in the background; on any check
+/// failure it resumes the idle builder with the failure inlined. Invoked at BOTH
+/// turn-end callers (`finalize_run` and `transition_to_warm_state`) so the two
+/// stay mirrored.
+///
+/// Four guards skip it: a job whose work never ships a PR (the topology gate
+/// below), a trailing memory-review turn (not a work turn), a job still mid-work
+/// rather than at a real turn end (CAIRN-3154, see the gate below), and a run
+/// already in flight for the job (single-flight).
 pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     let short = &job_id[..job_id.len().min(8)];
+    // The review cadence exists to validate the tree a human will review, so it
+    // is scoped to the jobs that produce one: those whose recipe node feeds a
+    // `pr` node (CAIRN-3334). Without this, every delegated sub-agent's turn end
+    // multiplied the heaviest exclusive suites across intermediate trees nobody
+    // gates on — minutes of contended machine time per sub-agent turn, and a
+    // cache full of verdicts for trees that are never reviewed.
+    match job_ships_a_pr(orch, job_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::debug!(
+                "turn-end checks for job {short}: skipped, no downstream PR node in the execution topology"
+            );
+            return;
+        }
+        // Unresolvable topology is an infrastructure fault, not a verdict. Running
+        // the suite wastes machine time; skipping it would silently drop the
+        // review gate on a shipping branch, so this fails open and says why.
+        Err(error) => log::warn!(
+            "turn-end checks for job {short}: PR topology unresolved ({error}); running the cadence anyway"
+        ),
+    }
     if latest_turn_is_memory_review(orch, job_id) {
         log::debug!(
             "turn-end checks for job {short}: skipped, latest turn is a memory-review turn (not a work turn)"
         );
+        return;
+    }
+    // Only a turn that actually ENDED earns a review wave. Two ways this hook
+    // fires for a job that is still mid-work (CAIRN-3154):
+    //
+    // - Self-suspended. `waitFor`, a `run` batch that outlived its inline grace
+    //   window, and a blocking question/task append all park the agent by
+    //   YIELDING its turn, and the park reaches this hook looking like an idle.
+    //   It is not one: the agent resumes when its own pending work resolves, and
+    //   launching the heavy review lanes here put them in contention with the
+    //   very tests the agent was suspended waiting on.
+    // - Already resumed. The suspension's interrupt ack is asynchronous, so it
+    //   can land after the wait resolved and the continuation turn started. A
+    //   wave launched there would check the pre-resume tree AND hold the
+    //   single-flight slot against the continuation's own real turn-end.
+    //
+    // A skipped wave is not owed: nothing is queued for replay, and the job's
+    // next real turn-end runs one suite against the tree that exists then. The
+    // classification is the canonical one message delivery already uses to
+    // decline resuming a self-suspended agent, so the two cannot drift.
+    if let Some(reason) =
+        crate::messages::delivery::head_turn_for_job(orch, job_id).mid_work_reason()
+    {
+        log::debug!("turn-end checks for job {short}: skipped, {reason}");
+        return;
+    }
+    // The same launchability decision the runner takes again immediately before
+    // submission, asked here so a wave for a resolved issue never claims the
+    // single-flight slot or spends minutes planning against a tree nobody will
+    // review. This is a gate on LIVE turn-end arming only: readiness recovery
+    // re-evaluates settled jobs through `evaluate_review_readiness`, which has
+    // its own origin and is not routed through here.
+    if let Some(withdrawal) = withdrawn_turn_end_wave(orch, job_id) {
+        log::debug!("turn-end checks for job {short}: skipped, {withdrawal}");
         return;
     }
     // Claim the single-flight slot; a concurrent run for this job means skip. The
@@ -145,6 +244,28 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
             orch_for_release.end_turn_end_checks(&job_id_for_release);
         },
     );
+}
+
+/// Why this job's turn-end wave must not be armed, if it must not be.
+///
+/// The synchronous face of [`crate::execution::checks_turn_end::turn_end_launchability`],
+/// which is the single place the decision is made. This hook runs on an agent
+/// backend's plain stdout thread with no ambient runtime, so the async guard is
+/// driven the same way the PR-topology gate above drives its query.
+fn withdrawn_turn_end_wave(orch: &Orchestrator, job_id: &str) -> Option<String> {
+    use crate::execution::checks_turn_end::{turn_end_launchability, WaveLaunchability};
+    let orch = orch.clone();
+    let job_id = job_id.to_string();
+    let launchability = run_db_blocking(move || async move {
+        Ok::<_, String>(turn_end_launchability(&orch, &job_id).await)
+    });
+    match launchability {
+        Ok(WaveLaunchability::Withdrawn(withdrawal)) => Some(withdrawal.describe()),
+        // Ready, or a guard that could not be driven at all. Both arm the wave:
+        // the runner asks again before it submits anything, so failing open here
+        // costs planning time rather than a dropped review gate.
+        _ => None,
+    }
 }
 
 /// Detach `fut` onto a runtime that is guaranteed to run it, without ever
@@ -286,7 +407,6 @@ async fn resolve_producing_job_for_issue(
                          WHERE a.job_id = j.id
                            AND a.artifact_type IN ('create-pr', 'plan')
                        ) THEN 0 ELSE 1 END,
-                       CASE WHEN j.worktree_path IS NOT NULL THEN 0 ELSE 1 END,
                        j.created_at DESC
                      LIMIT 1",
                     (issue_id.as_str(),),
@@ -302,13 +422,34 @@ async fn resolve_producing_job_for_issue(
     .map_err(|e| e.to_string())
 }
 
-/// Startup re-arm (CAIRN-2483). The turn-end-check single-flight marker is
-/// in-memory, so a restart mid-suite loses the completion edge and would strand
-/// the parent's review wake. For each job at status `idle`/terminal on a
-/// non-terminal issue that still has reviewable output, re-spawn the turn-end
-/// checks: the input-hash cache makes this cheap (unchanged inputs → all-cached
-/// exit → evaluator → push restored). Called once at startup after outbox replay.
+/// Startup re-arm (CAIRN-2483). A restart loses every in-memory edge that would
+/// otherwise have created a parent's review wake, so startup re-derives it for
+/// each settled job on a non-terminal issue that still has reviewable output.
+///
+/// Two things happen per candidate, and the order matters. The review wake is
+/// evaluated DIRECTLY, because it is the durable half and must not depend on the
+/// advisory check cadence: a candidate whose branch ships no PR (a planner parked
+/// at its plan gate) is skipped by that cadence entirely, and routing its wake
+/// through the cadence is exactly the coupling that let plan gates strand
+/// (CAIRN-3347). The turn-end checks are then re-spawned for their own sake — the
+/// in-memory single-flight marker is lost on restart, and the input-hash cache
+/// makes an unchanged re-run cheap. Called once at startup after outbox replay.
 pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) {
+    // The un-suppression edge (CAIRN-3245). A check bounded off after repeated
+    // infrastructure failures stays bounded off for as long as its inputs are
+    // unchanged, which is correct while the substrate is still broken and wrong
+    // the moment an operator repairs it. A restart is when that repair — a fixed
+    // toolchain, a revived daemon, a corrected wrapper — actually takes effect,
+    // and it is already the edge that re-arms the cadence, so clearing here means
+    // every freed triple is immediately re-evaluated rather than merely eligible.
+    match crate::execution::cache::clear_infra_suppressions(&orch.db.local).await {
+        Ok(0) => {}
+        Ok(freed) => log::info!(
+            "review-checks startup re-arm: cleared infrastructure suppression on {freed} check \
+             result(s); they will be re-evaluated below"
+        ),
+        Err(e) => log::warn!("review-checks startup re-arm: suppression clear failed: {e}"),
+    }
     let candidates = match rearm_candidate_jobs(&orch.db.local).await {
         Ok(jobs) => jobs,
         Err(e) => {
@@ -320,25 +461,45 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) {
         return;
     }
     log::info!(
-        "review-checks startup re-arm: re-spawning turn-end checks for {} settled job(s)",
+        "review-checks startup re-arm: re-deriving the review wake and re-spawning turn-end \
+         checks for {} settled job(s)",
         candidates.len()
     );
-    for job_id in candidates {
-        spawn_turn_end_checks(orch, &job_id);
+    let mut evaluated: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (job_id, issue_id) in &candidates {
+        if evaluated.insert(issue_id.as_str()) {
+            evaluate_review_readiness(orch, issue_id).await;
+        }
+        spawn_turn_end_checks(orch, job_id);
     }
 }
 
-/// Jobs eligible for the startup review-checks re-arm: settled (`idle`/terminal)
-/// jobs on a non-terminal issue that still own reviewable output.
-async fn rearm_candidate_jobs(db: &crate::storage::LocalDb) -> Result<Vec<String>, String> {
+/// Jobs eligible for the startup review-checks re-arm, as `(job_id, issue_id)`:
+/// settled jobs on a non-terminal issue that still own reviewable output.
+///
+/// `blocked` counts as settled here alongside `idle`/terminal. It is the status of
+/// a job parked at a confirmation gate — an unconfirmed plan artifact is
+/// reviewable output by the very predicate this query uses, and its owner is
+/// blocked precisely because someone still owes it a review (CAIRN-3347).
+///
+/// `cancelled` counts too. It is terminal by `JobStatus::is_terminal` and settled
+/// by `issue_settled`, and unlike the recompute hook — which filters derived
+/// TRANSITIONS, and so can never see an archived job — this query filters stored
+/// status, where a cancelled job holding reviewable output is perfectly visible.
+/// Excluding it would make restart the one moment archived-but-reviewable work
+/// became permanently invisible to its watcher. This is recovery, not live
+/// coverage: archival has no evaluation edge of its own (CAIRN-3349).
+async fn rearm_candidate_jobs(
+    db: &crate::storage::LocalDb,
+) -> Result<Vec<(String, String)>, String> {
     db.read(|conn| {
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT DISTINCT j.id FROM jobs j
+                    "SELECT DISTINCT j.id, j.issue_id FROM jobs j
                      JOIN issues i ON i.id = j.issue_id
                      WHERE i.status NOT IN ('merged', 'closed')
-                       AND j.status IN ('idle', 'complete', 'failed')
+                       AND j.status IN ('idle', 'complete', 'failed', 'blocked', 'cancelled')
                        AND (
                          EXISTS (
                            SELECT 1 FROM artifacts a
@@ -358,7 +519,7 @@ async fn rearm_candidate_jobs(db: &crate::storage::LocalDb) -> Result<Vec<String
                 .await?;
             let mut ids = Vec::new();
             while let Some(row) = rows.next().await? {
-                ids.push(row.text(0)?);
+                ids.push((row.text(0)?, row.text(1)?));
             }
             Ok::<_, DbError>(ids)
         })
@@ -436,8 +597,7 @@ async fn create_review_push_rows(
         return Ok(Vec::new());
     };
     let key = format!("review:{issue_uri}");
-    let watchers =
-        crate::orchestrator::attention_delivery::subscriber_jobs_for_issue(db, &issue_uri).await?;
+    let watchers = crate::orchestrator::wakes::watcher_jobs_for_issue(db, &issue_uri).await?;
     log::debug!(
         "review push: job={} content_ref={} fp={} watchers={}",
         &producing_job_id[..producing_job_id.len().min(8)],

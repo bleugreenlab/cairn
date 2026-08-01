@@ -55,8 +55,8 @@ use crate::config::presets::{
 use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
 use crate::execution::Initiator;
 use crate::models::{
-    Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, Model, ModelSelection, RecipeNode,
-    RecipeNodeType, RecipeSnapshot, RuntimeExtras, SkillSnapshot, SnapshotOverrides,
+    BranchTarget, Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, Model, ModelSelection,
+    RecipeNode, RecipeNodeType, RecipeSnapshot, RuntimeExtras, SkillSnapshot, SnapshotOverrides,
     TriggerContext, TriggerType,
 };
 use crate::orchestrator::Orchestrator;
@@ -95,6 +95,7 @@ pub(crate) fn start_recipe_execution_and_advance(
     project_id: &str,
     backend: Option<&str>,
     initiated_via: Option<&str>,
+    branch_target: Option<BranchTarget>,
     trigger_type: TriggerType,
 ) -> Result<Execution, String> {
     let execution = start_recipe_execution_impl(
@@ -107,6 +108,7 @@ pub(crate) fn start_recipe_execution_and_advance(
         None,
         initiated_via,
         None,
+        branch_target,
         trigger_type,
     )?;
     let _jobs = create_jobs_for_execution(orch, &execution.id)?;
@@ -132,6 +134,10 @@ pub(crate) fn start_recipe_execution_and_advance(
 /// `initiated_via` stamps attribution on the snapshot's trigger context
 /// (`Some("external")` for an authenticated external/CLI caller, `None` for the
 /// default user start). Display/audit only.
+///
+/// `branch_target` says where this execution's work lands (`None` = the recipe's
+/// default, `new`). It is resolved into node topology once, here, so every
+/// downstream derivation reads a snapshot that already has the right shape.
 #[allow(clippy::too_many_arguments)]
 pub fn start_recipe_execution_impl(
     orch: &Orchestrator,
@@ -147,6 +153,7 @@ pub fn start_recipe_execution_impl(
     // whose owner-side sweep then claims and runs the jobs. The picker enforces
     // that the chosen device has a clone; core stamps the resolved id.
     runner_device_id: Option<String>,
+    branch_target: Option<BranchTarget>,
     trigger_type: TriggerType,
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
@@ -281,6 +288,14 @@ pub fn start_recipe_execution_impl(
         }
     }
 
+    // Resolve the branch target LAST, so a launch-time graph edit from the
+    // composer is transformed too rather than bypassing it.
+    crate::execution::branch_target::apply_branch_target(
+        &mut snapshot,
+        branch_target.unwrap_or_default(),
+        &recipe.branch_targets,
+    )?;
+
     let snapshot_json = snapshot.to_json()?;
 
     // Calculate next seq for this issue
@@ -330,6 +345,7 @@ pub fn start_manual_execution_impl(
     recipe_id: &str,
     project_id: &str,
     initiator: Option<Initiator>,
+    branch_target: Option<BranchTarget>,
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
 
@@ -342,7 +358,7 @@ pub fn start_manual_execution_impl(
     let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
 
     // Build execution snapshot
-    let snapshot = build_execution_snapshot_from_files(
+    let mut snapshot = build_execution_snapshot_from_files(
         &orch.config_dir,
         Some(&project_path),
         &recipe.id,
@@ -351,6 +367,11 @@ pub fn start_manual_execution_impl(
         TriggerType::Manual,
         None,
         None,
+    )?;
+    crate::execution::branch_target::apply_branch_target(
+        &mut snapshot,
+        branch_target.unwrap_or_default(),
+        &recipe.branch_targets,
     )?;
     let snapshot_json = snapshot.to_json()?;
 

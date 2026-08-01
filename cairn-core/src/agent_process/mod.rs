@@ -8,6 +8,7 @@
 pub mod args;
 pub mod gc;
 pub mod memory;
+pub mod orphan;
 pub mod process;
 pub mod stdin;
 pub mod stream;

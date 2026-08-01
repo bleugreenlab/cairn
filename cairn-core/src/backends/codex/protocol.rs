@@ -36,8 +36,11 @@ impl CodexStdin {
         }
     }
 
-    pub(super) fn send_turn(&self, content: &str) -> Result<(), String> {
-        let input = serde_json::json!([{ "type": "text", "text": content }]);
+    pub(super) fn send_turn(
+        &self,
+        content: &crate::agent_process::stdin::MessageContent,
+    ) -> Result<(), String> {
+        let input = crate::agent_process::stdin::build_codex_input(content)?;
         let mut params = serde_json::json!({
             "threadId": self.thread_id,
             "cwd": self.cwd,
@@ -234,6 +237,27 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn warm_turn_sends_native_image_without_encoded_text() {
+        let (stdin, requests, _) =
+            scripted_stdin(None, vec![Ok(json!({ "turn": { "id": "turn-image" } }))]);
+        let content = crate::agent_process::stdin::MessageContent {
+            text: "inspect image".to_string(),
+            images: vec![crate::agent_process::stdin::MessageImage {
+                mime_type: "image/png".to_string(),
+                bytes: b"warm-image-payload".to_vec(),
+            }],
+        };
+        stdin.send_turn(&content).unwrap();
+
+        let requests = requests.lock().unwrap();
+        let input = requests[0].pointer("/params/input").unwrap();
+        assert_eq!(input[1]["type"], "image");
+        let url = input[1]["url"].as_str().unwrap();
+        let encoded = url.split_once(',').unwrap().1;
+        assert!(!input[0]["text"].as_str().unwrap().contains(encoded));
     }
 
     #[test]

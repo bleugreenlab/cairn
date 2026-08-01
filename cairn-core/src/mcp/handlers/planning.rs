@@ -21,6 +21,18 @@ use super::{emit_attention, AttentionEvent};
 
 const INLINE_PROMPT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// What the agent reads for a question that outlived the inline budget.
+///
+/// This is the whole agent-visible surface of a durably-suspended question, so
+/// it says what actually happened -- the call is continuing -- and never implies
+/// anyone declined it. `super::suspension_markers` pins that property.
+pub(crate) const PROMPT_SUSPENDED_MARKER: &str =
+    "Prompt suspended; resume will continue from the real response.";
+
+/// What an owned-loop backend reads for the same suspension.
+pub(crate) const PROMPT_SUSPENDED_OWNED_LOOP_MARKER: &str =
+    "Prompt suspended; the run will resume when the user answers.";
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -38,6 +50,29 @@ pub async fn ask_questions(
     payload: AskUserPayload,
     background: bool,
     tool_use_id: Option<&str>,
+) -> String {
+    ask_questions_owned(orch, request, payload, background, tool_use_id, None).await
+}
+
+/// Create the ordinary Cairn question surface for input requested by an
+/// external MCP call. The durable MCP wait owns the answer, so this path never
+/// binds a provider tool use and never yields or resumes the asking agent turn.
+pub(crate) async fn ask_mcp_questions(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    payload: AskUserPayload,
+    mcp_wait_id: &str,
+) -> String {
+    ask_questions_owned(orch, request, payload, true, None, Some(mcp_wait_id)).await
+}
+
+async fn ask_questions_owned(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    payload: AskUserPayload,
+    background: bool,
+    tool_use_id: Option<&str>,
+    mcp_wait_id: Option<&str>,
 ) -> String {
     log::info!(
         "Prompting user for cwd={} with {} questions (background={})",
@@ -87,12 +122,23 @@ pub async fn ask_questions(
         // Originating `write` tool_use id. Persisted so the slow-path (>45s)
         // resume can attach a synthetic tool_result to the same Question call
         // the fast path resolves inline.
-        let request_tool_use_id = tool_use_id
-            .map(str::to_string)
-            .or_else(|| request.tool_use_id.clone());
+        let request_tool_use_id = if mcp_wait_id.is_some() {
+            None
+        } else {
+            tool_use_id
+                .map(str::to_string)
+                .or_else(|| request.tool_use_id.clone())
+        };
+        let mcp_wait_id = mcp_wait_id.map(str::to_string);
 
-        // Current turn ID for this run (used to yield/resume in the foreground path).
-        let current_turn_id = orch.process_state.get_current_turn_id(&ctx.run_id);
+        // An MCP-owned question belongs to its durable wait, not to the agent's
+        // current turn. Leaving turn_id null is what prevents an independent
+        // prompt successor even if answer handling regresses.
+        let current_turn_id = if mcp_wait_id.is_some() {
+            None
+        } else {
+            orch.process_state.get_current_turn_id(&ctx.run_id)
+        };
 
         let insert_result = owning_db
             .write(|conn| {
@@ -102,6 +148,7 @@ pub async fn ask_questions(
                 let current_turn_id = current_turn_id.clone();
                 let issue_id = ctx.issue_id.clone();
                 let request_tool_use_id = request_tool_use_id.clone();
+                let mcp_wait_id = mcp_wait_id.clone();
                 Box::pin(async move {
                     // Stable per-node ordinal: count this node's existing prompts.
                     let mut count_rows = conn
@@ -133,26 +180,36 @@ pub async fn ask_questions(
                         None => (None, None),
                     };
 
-                    conn.execute(
-                        "
+                    let inserted = conn
+                        .execute(
+                            "
                         INSERT INTO prompts (
                             id, run_id, job_id, questions, response,
-                            created_at, answered_at, turn_id, uri_segment, tool_use_id
+                            created_at, answered_at, turn_id, uri_segment, tool_use_id,
+                            mcp_wait_id
                         )
-                        VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8)
+                        SELECT ?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9
+                        WHERE ?9 IS NULL OR EXISTS (
+                            SELECT 1 FROM agent_waits
+                            WHERE id = ?9 AND state IN ('pending', 'resolving')
+                        )
                         ",
-                        params![
-                            prompt_id.as_str(),
-                            run_id.as_str(),
-                            job_id.as_deref(),
-                            questions_json.as_str(),
-                            now,
-                            current_turn_id.as_deref(),
-                            uri_segment.as_str(),
-                            request_tool_use_id.as_deref()
-                        ],
-                    )
-                    .await?;
+                            params![
+                                prompt_id.as_str(),
+                                run_id.as_str(),
+                                job_id.as_deref(),
+                                questions_json.as_str(),
+                                now,
+                                current_turn_id.as_deref(),
+                                uri_segment.as_str(),
+                                request_tool_use_id.as_deref(),
+                                mcp_wait_id.as_deref()
+                            ],
+                        )
+                        .await?;
+                    if mcp_wait_id.is_some() && inserted == 0 {
+                        return Err(DbError::internal("MCP continuation wait is not active"));
+                    }
 
                     // Background prompts never yield the parent turn.
                     let yielded_turn = if !background {
@@ -371,7 +428,7 @@ pub async fn ask_questions(
     if owns_turn_loop {
         orch.process_state
             .request_suspend(&run_id, crate::agent_process::process::SuspendKind::Prompt);
-        return "Prompt suspended; the run will resume when the user answers.".to_string();
+        return PROMPT_SUSPENDED_OWNED_LOOP_MARKER.to_string();
     }
 
     // Block waiting for user response (like the permission wait does)
@@ -458,20 +515,20 @@ pub async fn ask_questions(
         }
         Ok(Err(msg)) => {
             log::warn!("Prompt wait channel ended for run {}: {}", run_id, msg);
-            let _ = crate::orchestrator::lifecycle::suspend_run_for_durable_wait(
+            crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff(
                 orch,
                 &run_id,
                 "prompt_wait_suspended",
             );
-            "Prompt suspended; resume will continue from the real response.".to_string()
+            PROMPT_SUSPENDED_MARKER.to_string()
         }
         Err(_) => {
-            let _ = crate::orchestrator::lifecycle::suspend_run_for_durable_wait(
+            crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff(
                 orch,
                 &run_id,
                 "prompt_wait_suspended",
             );
-            "Prompt suspended; resume will continue from the real response.".to_string()
+            PROMPT_SUSPENDED_MARKER.to_string()
         }
     }
 }
@@ -485,6 +542,7 @@ pub struct PromptAnswerOutcome {
 #[derive(Debug, Clone)]
 struct PromptResume {
     run_id: String,
+    mcp_wait_id: Option<String>,
     session_id: Option<String>,
     predecessor_turn_id: Option<String>,
     successor_turn_id: Option<String>,
@@ -776,6 +834,16 @@ async fn answer_prompt_id(
         crate::notify::run_db_change_for_id(&owning_db, &resume.run_id, "update").await;
     let _ = orch.services.emitter.emit("db-change", run_change);
 
+    // The committed answer is level-triggered persisted state. The singleton
+    // scheduler observes it through the prompt-owner query; answer handling must
+    // not create a second, per-wait drive mechanism.
+    if resume.mcp_wait_id.is_some() {
+        return Ok(PromptAnswerOutcome {
+            duplicate: resume.duplicate,
+            response,
+        });
+    }
+
     if let Some(job_id) = job_id {
         let suppress_user_event = if let (Some(tool_use_id), Some(session_id)) =
             (resume.tool_use_id.as_deref(), resume.session_id.as_deref())
@@ -891,6 +959,13 @@ async fn record_prompt_response_conn(
     response: &str,
     answered_at: i64,
 ) -> DbResult<PromptResume> {
+    let mcp_claim = super::mcp_continuation::record_and_claim_answer_conn(
+        conn,
+        prompt_id,
+        response,
+        answered_at.saturating_mul(1000),
+    )
+    .await?;
     let mut rows = conn
         .query(
             "
@@ -916,8 +991,19 @@ async fn record_prompt_response_conn(
     let session_id = row.opt_text(4)?;
     let tool_use_id = row.opt_text(5)?;
     let already_answered = row.i64(6)? != 0;
+    let (mcp_wait_id, mcp_duplicate) = match mcp_claim {
+        Some(super::mcp_continuation::AnswerClaim::Claimed { wait_id, .. }) => {
+            (Some(wait_id), false)
+        }
+        Some(super::mcp_continuation::AnswerClaim::AlreadyConsumed { wait_id }) => {
+            (Some(wait_id), true)
+        }
+        None => (None, false),
+    };
 
-    let duplicate = if already_answered {
+    let duplicate = if mcp_wait_id.is_some() {
+        mcp_duplicate
+    } else if already_answered {
         true
     } else {
         conn.execute(
@@ -932,7 +1018,7 @@ async fn record_prompt_response_conn(
             == 0
     };
 
-    let successor_turn_id = if !duplicate {
+    let successor_turn_id = if mcp_wait_id.is_none() && !duplicate {
         if let (Some(pred_turn_id), Some(job_id), Some(session_id)) = (
             predecessor_turn_id.as_deref(),
             job_id.as_deref(),
@@ -952,6 +1038,7 @@ async fn record_prompt_response_conn(
 
     Ok(PromptResume {
         run_id,
+        mcp_wait_id,
         session_id,
         predecessor_turn_id,
         successor_turn_id,

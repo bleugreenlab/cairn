@@ -5,7 +5,7 @@ use super::*;
 /// Returns agent jobs that are ready to start. All operations flow through
 /// the typed effects system: `reduce_dag` produces effects, `execute_effects`
 /// processes them through the core effect loop. Actions, checkpoints,
-/// conditions, and worktree creation are all handled inline by the loop.
+/// conditions, and branch-coordinate preparation are all handled inline by the loop.
 ///
 /// This is the canonical entry point for DAG advancement. All callers —
 /// event listeners, direct async calls, scheduler — go through this function,
@@ -287,7 +287,7 @@ async fn find_parent_job_id_conn(
 // (resumable), then `wake_upstream_after_checkpoint_failure` resumes the
 // upstream agent with the captured failure. When that agent commits a fix and
 // goes idle, `rearm_blocked_checkpoints` (a pre-pass in `reduce_dag`) re-pends
-// the checkpoint so it re-runs against the new worktree HEAD. The loop is
+// the checkpoint so it re-runs against the new logical head. The loop is
 // bounded by `CHECKPOINT_MAX_ATTEMPTS` and the SHA-change progress gate.
 
 use crate::execution::checkpoint_runs::{
@@ -295,7 +295,7 @@ use crate::execution::checkpoint_runs::{
     latest_checkpoint_run, reset_checkpoint_runs, CHECKPOINT_MAX_ATTEMPTS,
 };
 
-/// Resume the upstream agent that owns a failed checkpoint's worktree, with the
+/// Resume the upstream agent that owns a failed checkpoint's branch, with the
 /// captured command output. Best-effort: if the attempt cap is exhausted, or the
 /// checkpoint has no agent upstream (no session to resume), the checkpoint stays
 /// Blocked for manual resolution. Reads the failure detail from the latest
@@ -429,7 +429,7 @@ fn job_has_session(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
 /// the execution that is eligible (upstream committed new work, upstream not
 /// running, under the attempt cap), delete its checkpoint artifact and set it
 /// Pending. The subsequent pending-scan claims it Running and re-runs the
-/// command against the new worktree HEAD. A cheap no-op when nothing is eligible.
+/// command against the new logical head. A cheap no-op when nothing is eligible.
 pub fn rearm_blocked_checkpoints(orch: &Orchestrator, execution_id: &str) -> Result<(), String> {
     // Map checkpoint node ids from the execution snapshot.
     let exec_db = run_advancement_db({
@@ -453,11 +453,9 @@ pub fn rearm_blocked_checkpoints(orch: &Orchestrator, execution_id: &str) -> Res
 
     let blocked = load_blocked_checkpoint_jobs(orch, execution_id, &checkpoint_node_ids)?;
     for job in blocked {
-        let worktree =
-            resolve_checkpoint_worktree(orch, execution_id, job.parent_job_id.as_deref())?;
-        let head_sha = worktree
-            .as_deref()
-            .and_then(|w| crate::execution::cache::get_current_head_sha(orch, w).ok());
+        let head_sha = job.parent_job_id.as_deref().and_then(|parent| {
+            crate::execution::cache::get_job_logical_head_sha(orch, parent).ok()
+        });
         let last_run = latest_checkpoint_run(orch, &job.id)?;
         let last_run_sha = last_run.as_ref().and_then(|r| r.commit_sha.clone());
         let attempts = checkpoint_attempt_count(orch, &job.id)?;
@@ -579,54 +577,6 @@ fn load_blocked_checkpoint_jobs(
         })
         .await
         .map_err(|e| format!("Failed to load blocked checkpoint jobs: {e}"))
-    })
-}
-
-fn resolve_checkpoint_worktree(
-    orch: &Orchestrator,
-    execution_id: &str,
-    parent_job_id: Option<&str>,
-) -> Result<Option<String>, String> {
-    let execution_id = execution_id.to_string();
-    let db = run_advancement_db({
-        let dbs = orch.db.clone();
-        let execution_id = execution_id.clone();
-        async move {
-            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    let parent_job_id = parent_job_id.map(str::to_string);
-    run_advancement_db(async move {
-        db.read(|conn| {
-            let execution_id = execution_id.clone();
-            let parent_job_id = parent_job_id.clone();
-            Box::pin(async move {
-                if let Some(parent) = parent_job_id.as_deref() {
-                    let mut rows = conn
-                        .query(
-                            "SELECT worktree_path FROM jobs WHERE id = ?1 AND worktree_path IS NOT NULL",
-                            (parent,),
-                        )
-                        .await?;
-                    if let Some(row) = rows.next().await? {
-                        return Ok(Some(row.text(0)?));
-                    }
-                }
-                let mut rows = conn
-                    .query(
-                        "SELECT worktree_path FROM jobs
-                         WHERE execution_id = ?1 AND worktree_path IS NOT NULL
-                         LIMIT 1",
-                        (execution_id.as_str(),),
-                    )
-                    .await?;
-                crate::storage::next_text(&mut rows, 0).await
-            })
-        })
-        .await
-        .map_err(|e| format!("Failed to resolve checkpoint worktree: {e}"))
     })
 }
 

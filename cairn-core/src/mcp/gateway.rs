@@ -28,10 +28,39 @@ use crate::config::mcp_servers::McpServerConfig;
 /// blocks the server returned, preserved rather than flattened to a placeholder
 /// so they can reach the agent as real image content blocks — mirroring the read
 /// path's text/image split (`cairn_common::read`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpToolCallResult {
     pub text: String,
     pub images: Vec<ImageBlock>,
+}
+
+/// One protocol round of an external MCP tool call. Intermediate outcomes are
+/// deliberately serializable: core persists them before yielding the agent turn,
+/// then a later host can reconnect and continue without retaining an rmcp value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpCallOutcome {
+    Complete(McpToolCallResult),
+    InputRequired {
+        input_requests: serde_json::Value,
+        request_state: Option<String>,
+    },
+    Task {
+        task_id: String,
+        poll_interval_ms: Option<u64>,
+        ttl_ms: Option<u64>,
+    },
+}
+
+/// Durable result of polling an MCP task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum McpTaskOutcome {
+    Working { poll_interval_ms: Option<u64> },
+    InputRequired { input_requests: serde_json::Value },
+    Complete(McpToolCallResult),
+    Failed { message: String },
+    Cancelled,
 }
 
 /// A tool advertised by an external MCP server.
@@ -47,6 +76,14 @@ pub struct McpToolDef {
     /// JSON Schema for the tool's arguments (the `inputSchema`), surfaced so the
     /// agent can construct a correct `run` payload.
     pub input_schema: serde_json::Value,
+}
+
+/// A complete `tools/list` catalog and its server-provided cache hints.
+#[derive(Debug, Clone, Default)]
+pub struct McpToolCatalog {
+    pub tools: Vec<McpToolDef>,
+    pub ttl_ms: Option<u64>,
+    pub cache_scope: Option<String>,
 }
 
 /// A resource advertised by an external MCP server.
@@ -68,6 +105,7 @@ pub struct McpResourceDef {
 /// env-expanded server configuration resolved from workspace + project
 /// settings; the gateway connects lazily on first use.
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait McpGateway: Send + Sync {
     /// List the tools advertised by `server`.
     async fn list_tools(
@@ -75,7 +113,7 @@ pub trait McpGateway: Send + Sync {
         session_key: &str,
         server: &str,
         config: &McpServerConfig,
-    ) -> Result<Vec<McpToolDef>, String>;
+    ) -> Result<McpToolCatalog, String>;
 
     /// List the resources advertised by `server` (empty if unsupported).
     async fn list_resources(
@@ -94,8 +132,30 @@ pub trait McpGateway: Send + Sync {
         uri: &str,
     ) -> Result<String, String>;
 
-    /// Proxy a `tools/call`. `args` is the tool's argument object. Returns the
-    /// composed text plus any image content blocks the tool returned.
+    /// Execute exactly one `tools/call` protocol round. The caller, rather than
+    /// the transport, owns MRTR's persisted round bound and task lifecycle.
+    async fn call_tool_once(
+        &self,
+        session_key: &str,
+        server: &str,
+        config: &McpServerConfig,
+        tool: &str,
+        args: serde_json::Value,
+        input_responses: Option<serde_json::Value>,
+        request_state: Option<String>,
+        timeout_ms: Option<u32>,
+        operation_id: Option<&str>,
+    ) -> Result<McpCallOutcome, String> {
+        let _ = operation_id;
+        if input_responses.is_some() || request_state.is_some() {
+            return Err("this MCP host does not support continuation rounds".to_string());
+        }
+        self.call_tool(session_key, server, config, tool, args, timeout_ms)
+            .await
+            .map(McpCallOutcome::Complete)
+    }
+
+    /// Compatibility convenience for callers that only accept a final result.
     async fn call_tool(
         &self,
         session_key: &str,
@@ -104,8 +164,145 @@ pub trait McpGateway: Send + Sync {
         tool: &str,
         args: serde_json::Value,
         timeout_ms: Option<u32>,
-    ) -> Result<McpToolCallResult, String>;
+    ) -> Result<McpToolCallResult, String> {
+        match self
+            .call_tool_once(
+                session_key,
+                server,
+                config,
+                tool,
+                args,
+                None,
+                None,
+                timeout_ms,
+                None,
+            )
+            .await?
+        {
+            McpCallOutcome::Complete(result) => Ok(result),
+            McpCallOutcome::InputRequired { .. } => Err("MCP tool requires user input".to_string()),
+            McpCallOutcome::Task { task_id, .. } => Err(format!("MCP tool started task {task_id}")),
+        }
+    }
+
+    async fn get_task(
+        &self,
+        _session_key: &str,
+        _server: &str,
+        _config: &McpServerConfig,
+        task_id: &str,
+    ) -> Result<McpTaskOutcome, String> {
+        Err(format!(
+            "MCP task '{task_id}' cannot be polled by this host"
+        ))
+    }
+
+    async fn update_task(
+        &self,
+        _session_key: &str,
+        _server: &str,
+        _config: &McpServerConfig,
+        task_id: &str,
+        input_responses: serde_json::Value,
+        operation_id: Option<&str>,
+    ) -> Result<(), String> {
+        let _ = (input_responses, operation_id);
+        Err(format!(
+            "MCP task '{task_id}' cannot accept input in this host"
+        ))
+    }
 
     /// Tear down all pooled connections for a finished session.
     async fn close_session(&self, session_key: &str);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_outcomes_round_trip_all_continuation_fields() {
+        let outcomes = [
+            McpCallOutcome::InputRequired {
+                input_requests: serde_json::json!([{"id": "approval", "type": "boolean"}]),
+                request_state: Some("round-2".to_string()),
+            },
+            McpCallOutcome::Task {
+                task_id: "task-7".to_string(),
+                poll_interval_ms: Some(250),
+                ttl_ms: Some(30_000),
+            },
+        ];
+
+        for outcome in outcomes {
+            let json = serde_json::to_value(&outcome).unwrap();
+            let decoded: McpCallOutcome = serde_json::from_value(json.clone()).unwrap();
+            match decoded {
+                McpCallOutcome::InputRequired {
+                    input_requests,
+                    request_state,
+                } => {
+                    assert_eq!(json["kind"], "input_required");
+                    assert_eq!(input_requests[0]["id"], "approval");
+                    assert_eq!(request_state.as_deref(), Some("round-2"));
+                }
+                McpCallOutcome::Task {
+                    task_id,
+                    poll_interval_ms,
+                    ttl_ms,
+                } => {
+                    assert_eq!(json["kind"], "task");
+                    assert_eq!(task_id, "task-7");
+                    assert_eq!(poll_interval_ms, Some(250));
+                    assert_eq!(ttl_ms, Some(30_000));
+                }
+                McpCallOutcome::Complete(_) => panic!("unexpected complete outcome"),
+            }
+        }
+    }
+
+    #[test]
+    fn task_outcomes_round_trip_non_terminal_and_terminal_states() {
+        let outcomes = [
+            McpTaskOutcome::Working {
+                poll_interval_ms: Some(500),
+            },
+            McpTaskOutcome::InputRequired {
+                input_requests: serde_json::json!([{"id": "choice"}]),
+            },
+            McpTaskOutcome::Complete(McpToolCallResult {
+                text: "done".to_string(),
+                images: vec![],
+            }),
+            McpTaskOutcome::Failed {
+                message: "broken".to_string(),
+            },
+            McpTaskOutcome::Cancelled,
+        ];
+
+        for outcome in outcomes {
+            let json = serde_json::to_value(&outcome).unwrap();
+            let status = json["status"].as_str().unwrap().to_string();
+            let decoded: McpTaskOutcome = serde_json::from_value(json).unwrap();
+            match decoded {
+                McpTaskOutcome::Working { poll_interval_ms } => {
+                    assert_eq!(status, "working");
+                    assert_eq!(poll_interval_ms, Some(500));
+                }
+                McpTaskOutcome::InputRequired { input_requests } => {
+                    assert_eq!(status, "input_required");
+                    assert_eq!(input_requests[0]["id"], "choice");
+                }
+                McpTaskOutcome::Complete(result) => {
+                    assert_eq!(status, "complete");
+                    assert_eq!(result.text, "done");
+                }
+                McpTaskOutcome::Failed { message } => {
+                    assert_eq!(status, "failed");
+                    assert_eq!(message, "broken");
+                }
+                McpTaskOutcome::Cancelled => assert_eq!(status, "cancelled"),
+            }
+        }
+    }
 }

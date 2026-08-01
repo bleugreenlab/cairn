@@ -53,6 +53,42 @@ impl Orchestrator {
         })
     }
 
+    /// Select a managed Claude account and resolve the runtime identity to it.
+    pub(crate) fn select_claude_identity(
+        &self,
+        project_id: Option<&str>,
+        override_id: Option<&str>,
+        excluded_account_id: Option<&str>,
+    ) -> Option<(String, UserIdentity)> {
+        let assignments = crate::storage::run_db_blocking({
+            let db = self.db.local.clone();
+            move || async move { crate::sessions::queries::account_assignments(&db).await }
+        })
+        .unwrap_or_default();
+        let store = self.get_identity_store()?;
+        let account = store.select_claude_account(
+            project_id,
+            override_id,
+            excluded_account_id,
+            &assignments,
+            chrono::Utc::now().timestamp(),
+        )?;
+        let account_id = account.id.clone();
+        let identity = store.resolve_with_anthropic_account(project_id, &account_id);
+        Some((account_id, identity))
+    }
+
+    pub(crate) fn resolve_available_claude_account(
+        &self,
+        project_id: Option<&str>,
+        account_id: &str,
+    ) -> Option<UserIdentity> {
+        let store = self.get_identity_store()?;
+        store
+            .claude_account_is_available(account_id, chrono::Utc::now().timestamp())
+            .then(|| store.resolve_with_anthropic_account(project_id, account_id))
+    }
+
     /// Resolve only the git author/committer identity for a project.
     pub(crate) fn resolve_git_identity_for_project(
         &self,
@@ -131,6 +167,9 @@ impl Orchestrator {
             sort_order: max_sort + 1,
             created_at: now,
             last_used_at: None,
+            email: None,
+            plan: None,
+            health: None,
         };
 
         let info = AccountInfo::from(&account);
@@ -215,6 +254,9 @@ impl Orchestrator {
                 sort_order: 0,
                 created_at: now,
                 last_used_at: Some(now),
+                email: None,
+                plan: None,
+                health: None,
             };
             let info = AccountInfo::from(&account);
             store.accounts.push(account);
@@ -224,6 +266,57 @@ impl Orchestrator {
         self.save_identity_store(store)?;
         self.emit_config_changed();
         Ok(info)
+    }
+
+    /// Record provider-reported metadata after a managed login completes.
+    pub fn update_account_metadata(
+        &self,
+        id: &str,
+        email: Option<String>,
+        plan: Option<String>,
+    ) -> Result<AccountInfo, String> {
+        let mut store = self.get_identity_store().ok_or("No identity store")?;
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .ok_or_else(|| format!("Account not found: {id}"))?;
+        account.email = email.clone();
+        account.plan = plan;
+        if let Some(email) = email {
+            account.label = email;
+        }
+        let info = AccountInfo::from(&*account);
+        self.save_identity_store(store)?;
+        self.emit_config_changed();
+        Ok(info)
+    }
+
+    /// Mark a provider account unavailable from an authoritative blocking event.
+    pub(crate) fn mark_account_blocked(
+        &self,
+        id: &str,
+        windows: Vec<crate::models::ProviderUsageWindow>,
+        blocked_until: Option<i64>,
+    ) -> Result<String, String> {
+        let mut store = self.get_identity_store().ok_or("No identity store")?;
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .ok_or_else(|| format!("Account not found: {id}"))?;
+        account.health = Some(crate::identity::ProviderAccountHealth {
+            windows,
+            blocked_until,
+            captured_at: chrono::Utc::now().timestamp(),
+        });
+        let label = account
+            .email
+            .clone()
+            .unwrap_or_else(|| account.label.clone());
+        self.save_identity_store(store)?;
+        self.emit_config_changed();
+        Ok(label)
     }
 
     /// Update an existing account's label.
@@ -249,6 +342,22 @@ impl Orchestrator {
     /// Remove an account from the store.
     pub fn remove_account(&self, id: &str) -> Result<(), String> {
         let mut store = self.get_identity_store().ok_or("No identity store")?;
+
+        let account = store
+            .accounts
+            .iter()
+            .find(|account| account.id == id)
+            .cloned()
+            .ok_or_else(|| format!("Account not found: {id}"))?;
+        if matches!(account.auth, ProviderAuth::ClaudeProfile) {
+            let claude = crate::env::find_binary("claude").map_err(|_| {
+                "Claude CLI not found. Install it before removing this login.".to_string()
+            })?;
+            crate::identity::claude_profile::logout(
+                std::path::Path::new(&claude),
+                &crate::identity::claude_profile::profile_dir_in(&self.config_dir, id),
+            )?;
+        }
 
         let initial_len = store.accounts.len();
         store.accounts.retain(|a| a.id != id);

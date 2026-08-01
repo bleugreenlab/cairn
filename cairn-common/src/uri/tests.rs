@@ -211,6 +211,46 @@ fn parses_and_roundtrips_logs() {
     );
 }
 
+/// The fleet collection is workspace-scoped: machines are not owned by
+/// projects, so it sits at the root beside `cairn://skills`.
+#[test]
+fn parses_and_roundtrips_the_executor_collection() {
+    assert_eq!(
+        parse_uri("cairn://executors"),
+        Some(CairnResource::Executors)
+    );
+    assert_eq!(CairnResource::Executors.to_uri(), "cairn://executors");
+    assert_eq!(CairnResource::Executors.kind(), ResourceKind::Executors);
+    assert_eq!(CairnResource::Executors.project(), None);
+    assert_eq!(CairnResource::Executors.issue_number(), None);
+    assert_eq!(CairnResource::Executors.to_route(), None);
+}
+
+/// A name in the URI is normalized by the same helper placement uses, so the
+/// address an agent reads out of the collection and a label an operator typed
+/// reach the same machine. Without that, a resource could be readable at one
+/// spelling and targetable only at another.
+#[test]
+fn an_executor_uri_normalizes_to_the_name_placement_accepts() {
+    let expected = CairnResource::Executor {
+        name: "bglab-ub".to_string(),
+    };
+    for uri in [
+        "cairn://executors/bglab-ub",
+        "cairn://executors/BGLab-UB",
+        "cairn://executors/bglab_ub",
+    ] {
+        assert_eq!(parse_uri(uri), Some(expected.clone()), "{uri}");
+    }
+    assert_eq!(expected.to_uri(), "cairn://executors/bglab-ub");
+    assert_eq!(expected.kind(), ResourceKind::Executor);
+    assert_eq!(expected.project(), None);
+    assert_eq!(expected.to_route(), None);
+    // A segment carrying nothing that can be part of an address is not an
+    // executor URI at all, rather than an executor named "".
+    assert_eq!(parse_uri("cairn://executors/---"), None);
+}
+
 #[test]
 fn parses_type_named_node_artifact() {
     // A trailing non-reserved segment is a type-named artifact.
@@ -771,6 +811,18 @@ fn task_checks_uri_parses_and_round_trips() {
 }
 
 #[test]
+fn project_check_results_uri_parses_and_round_trips() {
+    let uri = "cairn://p/CAIRN/check-results/main";
+    let resource = CairnResource::ProjectCheckResults {
+        project: "CAIRN".to_string(),
+        revision: "main".to_string(),
+    };
+    assert_eq!(parse_uri(uri), Some(resource.clone()));
+    assert_eq!(resource.to_uri(), uri);
+    assert_eq!(parse_uri("cairn://p/CAIRN/check-results/"), None);
+}
+
+#[test]
 fn round_trips_every_resource_family() {
     let resources = vec![
         CairnResource::Project {
@@ -778,6 +830,10 @@ fn round_trips_every_resource_family() {
         },
         CairnResource::ProjectIssues {
             project: "CAIRN".to_string(),
+        },
+        CairnResource::ProjectCheckResults {
+            project: "CAIRN".to_string(),
+            revision: "0123456789abcdef".to_string(),
         },
         CairnResource::Issue {
             project: "CAIRN".to_string(),
@@ -1445,4 +1501,60 @@ fn browser_network_request_uris_round_trip_in_all_scopes() {
         parse_uri("cairn://p/CAIRN/browser/default/network/has space"),
         None
     );
+}
+
+#[test]
+fn project_image_uri_round_trips_and_rejects_malformed_hashes() {
+    let hash = "a".repeat(64);
+    let uri = format!("cairn://p/cairn/images/{hash}");
+    let parsed = parse_uri(&uri).unwrap();
+    assert_eq!(parsed.to_uri(), format!("cairn://p/CAIRN/images/{hash}"));
+    assert_eq!(parsed.kind(), ResourceKind::ProjectImage);
+    assert_eq!(parsed.project_key(), Some("CAIRN"));
+    assert!(parse_uri("cairn://p/CAIRN/images/abc").is_none());
+    assert!(parse_uri(&format!("cairn://p/CAIRN/images/{}", "A".repeat(64))).is_none());
+}
+
+#[cfg(test)]
+mod node_rebase_uri {
+    use crate::uri::{parse_uri, CairnResource};
+
+    /// `rebase` has to be a RESERVED node segment, not a type-named artifact.
+    /// Without that, `cairn:~/rebase` parses as an artifact lookup and the
+    /// resource is unreachable by the very name the wake tells agents to use.
+    #[test]
+    fn a_node_rebase_uri_round_trips() {
+        let uri = "cairn://p/CAIRN/3352/1/builder/rebase";
+        let resource = parse_uri(uri).expect("parses");
+        match &resource {
+            CairnResource::NodeRebase {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => {
+                assert_eq!(project, "CAIRN");
+                assert_eq!(*number, 3352);
+                assert_eq!(*exec_seq, 1);
+                assert_eq!(node_id, "builder");
+            }
+            other => panic!("expected NodeRebase, got {other:?}"),
+        }
+        assert_eq!(
+            resource.to_uri(),
+            uri,
+            "the canonical form survives a rebuild"
+        );
+    }
+
+    /// A task's home-relative rebase must not silently resolve to something else:
+    /// the segment is reserved everywhere a node sub-resource can appear.
+    #[test]
+    fn rebase_is_never_parsed_as_an_artifact() {
+        let resource = parse_uri("cairn://p/CAIRN/3352/1/builder/rebase").unwrap();
+        assert!(
+            !matches!(resource, CairnResource::NodeArtifact { .. }),
+            "got {resource:?}"
+        );
+    }
 }

@@ -5,8 +5,6 @@
 //! loop in `run.rs` handles core-internal effects directly and dispatches
 //! host-crossing effects to an `EffectExecutor` trait implementation.
 
-use std::path::PathBuf;
-
 use crate::messages::system::JobEvent;
 use crate::models::Job;
 
@@ -82,7 +80,7 @@ pub enum WorkflowEffect {
     },
 
     // ── Host effects (dispatched to EffectExecutor) ────────────────────
-    /// Start ready agent jobs (host prepares worktree + spawns process).
+    /// Start ready agent jobs from their durable branch coordinates.
     StartAgentJobs(Vec<Job>),
 
     /// Execute an action node (built-in or shell command).
@@ -98,7 +96,6 @@ pub enum WorkflowEffect {
         job_id: String,
         node_name: String,
         command: String,
-        worktree_path: PathBuf,
         cached_pass: bool,
         ctx: EffectContext,
     },

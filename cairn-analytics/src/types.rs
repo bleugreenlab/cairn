@@ -110,6 +110,26 @@ pub struct BackendCostPoint {
     pub(crate) billable_tokens: i64,
 }
 
+/// Billable tokens for one (time bucket, model) group; the dashboard's main
+/// tokens-over-time chart. Per-bucket model heights sum to that bucket's total
+/// billable tokens, so the stack reads as "which models spent this bucket".
+///
+/// The stratification axis is the model alias alone, not (model, backend): the
+/// same alias served through two providers is one model to the reader.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTokenPoint {
+    pub(crate) bucket_start: i64,
+    /// The model alias (`opus`, `gpt-5.6-sol`); `unknown` when unrecorded.
+    pub(crate) model: String,
+    pub(crate) billable_tokens: i64,
+    /// Input-side tokens (`input + cache_read + cache_create`).
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    /// Cost of this group under the canonical exact-or-priced rule.
+    pub(crate) cost_usd: f64,
+}
+
 /// Token components (by type) for one time bucket; the stacked token-composition
 /// chart. Input / cache-read / cache-create / output / thinking sum to the
 /// bucket's total tokens.

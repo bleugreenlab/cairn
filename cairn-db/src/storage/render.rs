@@ -144,8 +144,7 @@ fn fair_share_budgets(lengths: &[usize], total_budget: usize) -> Vec<usize> {
         remaining_count -= 1;
         index += 1;
     }
-    if remaining_count > 0 {
-        let floor = remaining_budget / remaining_count;
+    if let Some(floor) = remaining_budget.checked_div(remaining_count) {
         let extra = remaining_budget % remaining_count;
         for (extra_index, (original_index, _)) in by_length[index..].iter().enumerate() {
             budgets[*original_index] = floor + usize::from(extra_index < extra);
@@ -326,16 +325,58 @@ fn segment_suffix(meta: &SegmentMeta, shown: usize) -> Option<String> {
                 total
             ))
         }
-        SegmentKind::Grep => {
-            let matches = meta.match_count?;
-            match meta.file_count {
-                Some(files) => Some(format!("{matches} matches in {files} files")),
-                None => Some(format!("{matches} matches")),
-            }
-        }
+        SegmentKind::Grep => match (meta.match_count, meta.file_count) {
+            (Some(matches), Some(files)) => Some(format!("{matches} matches in {files} files")),
+            (Some(matches), None) => Some(format!("{matches} matches")),
+            // A `files_with_matches` grep has no match dimension: its body is the
+            // list of files that matched, so the file count is the honest count.
+            // Without it the header falls silent and a hit reads like a miss.
+            (None, Some(files)) => Some(format!("{files} files")),
+            (None, None) => None,
+        },
         SegmentKind::Glob => Some(format!("{} files", meta.file_count?)),
         SegmentKind::Directory | SegmentKind::Image | SegmentKind::Error => None,
     }
+}
+
+/// The display label for an image read's durable reference: the target's final
+/// path segment (`file:plots/fig.png` -> `fig.png`, `cairn:~/browser?screenshot`
+/// -> `browser`), falling back to the whole identity when there is nothing
+/// shorter to say.
+fn image_label(uri: &str) -> &str {
+    let identity = uri.split('?').next().unwrap_or(uri);
+    let tail = identity
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(identity);
+    // A legacy hash-addressed image would otherwise be labeled with its own
+    // 64-character content hash, which says nothing. Friendly image URIs need no
+    // substitute: their own tail is a short ordinal.
+    if tail.len() == 64 && tail.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return "image";
+    }
+    tail.strip_prefix("file:").unwrap_or(tail)
+}
+
+/// The durable-reference trailer for a segment's promoted images: one markdown
+/// reference per stored image, appended after the body and any continue footer.
+///
+/// This trailer is the *only* part of an image read that survives into the
+/// transcript. The base64 [`ImageBlock`] rides beside the text as a native
+/// content block and reaches the agent alone; a recorded tool result keeps text.
+/// Composing the reference here — in the one composer both the live batch and
+/// archival reconstruction run — keeps the two byte-identical and means no
+/// producer has to know about durable storage. A block with no `uri` (nothing was
+/// promoted, or a legacy archived read reconstructed from bytes alone) renders
+/// nothing, exactly as before.
+fn image_reference_trailer(images: &[ImageBlock], target: &str) -> String {
+    let label = image_label(target);
+    images
+        .iter()
+        .filter_map(|image| image.uri.as_deref())
+        .map(|uri| format!("\n![{label}]({uri})"))
+        .collect()
 }
 
 fn header(meta: &SegmentMeta, shown: usize, truncated: bool) -> String {
@@ -456,6 +497,7 @@ pub fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
         .filter(|h| !h.is_empty())
         .map(|h| format!("\n\n{h}"))
         .unwrap_or_default();
+    let image_trailer = image_reference_trailer(&images, &meta.uri);
 
     let logical_full_lines = (meta.shown_units > 0).then_some(meta.shown_units);
     let full_lines = logical_full_lines.unwrap_or_else(|| body.lines().count());
@@ -469,7 +511,8 @@ pub fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
     let mut content_budget = budget;
     loop {
         let header_estimate = header(&meta, full_lines, true).len();
-        let body_budget = content_budget.saturating_sub(header_estimate + 1 + history_suffix.len());
+        let body_budget = content_budget
+            .saturating_sub(header_estimate + 1 + history_suffix.len() + image_trailer.len());
         let cut = cut_body(&body, body_budget, numbered, logical_full_lines);
         let truncated = cut.budget_truncated || window_short || cut.char_offset.is_some();
 
@@ -514,6 +557,7 @@ pub fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
             candidate.push('\n');
             candidate.push_str(footer);
         }
+        candidate.push_str(&image_trailer);
         candidate.push_str(&history_suffix);
 
         if candidate.len() <= budget || content_budget == 0 || cut.shown_lines == 0 {
@@ -561,10 +605,12 @@ fn render_record_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
         .filter(|h| !h.is_empty())
         .map(|h| format!("\n\n{h}"))
         .unwrap_or_default();
+    let image_trailer = image_reference_trailer(&images, &meta.uri);
 
     let produced_shown = meta.shown_units;
     let header_estimate = header(&meta, produced_shown, true).len();
-    let body_budget = budget.saturating_sub(header_estimate + 1 + history_suffix.len());
+    let body_budget =
+        budget.saturating_sub(header_estimate + 1 + history_suffix.len() + image_trailer.len());
     let cut = cut_body(&body, body_budget, false, None);
     let shown = match meta.record_prelude_lines {
         Some(prelude_lines) if cut.budget_truncated => cut
@@ -607,6 +653,7 @@ fn render_record_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
             text.push_str(&record_footer(&meta.uri, meta.offset, shown, total, noun));
         }
     }
+    text.push_str(&image_trailer);
     text.push_str(&history_suffix);
 
     meta.truncated = truncated;
@@ -628,7 +675,8 @@ fn estimate_len(segment: &ReadSegment) -> usize {
     let header = format!("=== {} ===", segment.meta.uri).len() + 28;
     let footer = 220;
     let history = segment.history.as_ref().map(|h| h.len() + 2).unwrap_or(0);
-    header + usize::from(!segment.body.is_empty()) + segment.body.len() + footer + history
+    let images = image_reference_trailer(&segment.images, &segment.meta.uri).len();
+    header + usize::from(!segment.body.is_empty()) + segment.body.len() + footer + history + images
 }
 
 /// Compose produced segments into one envelope under a single budget. Affordances
@@ -709,6 +757,81 @@ mod tests {
         meta.total_units = Some(total);
         meta.offset = offset;
         ReadSegment::text(numbered_body, meta)
+    }
+
+    fn image_seg(uri: &str, stored: Option<&str>) -> ReadSegment {
+        let mut seg = ReadSegment::text(
+            String::new(),
+            SegmentMeta::new(uri, SegmentKind::Image, NaturalUnit::Line),
+        );
+        let mut image = ImageBlock::inline("image/png", "b64");
+        image.uri = stored.map(str::to_string);
+        seg.images.push(image);
+        seg
+    }
+
+    const STORED_IMAGE: &str =
+        "cairn://p/CAIRN/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn promoted_image_renders_a_durable_reference_under_the_header() {
+        // The base64 block reaches the agent as a native content block; this
+        // reference is the only part of the read the transcript keeps, so it must
+        // be in the composed text.
+        let r = render_segment(image_seg("file:plots/fig.png", Some(STORED_IMAGE)), 10_000);
+        assert_eq!(
+            r.text,
+            format!("=== file:plots/fig.png ===\n![fig.png]({STORED_IMAGE})")
+        );
+    }
+
+    #[test]
+    fn reading_a_stored_image_uri_is_not_labelled_with_its_hash() {
+        let r = render_segment(image_seg(STORED_IMAGE, Some(STORED_IMAGE)), 10_000);
+        assert!(r.text.ends_with(&format!("![image]({STORED_IMAGE})")));
+    }
+
+    #[test]
+    fn unpromoted_image_renders_exactly_as_before() {
+        // Archival reconstruction rebuilds blocks from bytes alone and can carry
+        // no durable URI; those reads must still compose byte-for-byte as they
+        // originally did.
+        let r = render_segment(image_seg("file:logo.png", None), 10_000);
+        assert_eq!(r.text, "=== file:logo.png ===");
+    }
+
+    #[test]
+    fn image_reference_follows_a_body_and_its_continue_footer() {
+        // A browser screenshot carries a status banner; the reference is a
+        // trailer after everything the body and footer say, like issue history.
+        let mut seg = image_seg("cairn:~/browser?screenshot", Some(STORED_IMAGE));
+        seg.body = "Browser: https://example.com".to_string();
+        seg.meta.kind = SegmentKind::Resource;
+        seg.meta.total_units = Some(1);
+        let r = render_segment(seg, 10_000);
+        assert_eq!(
+            r.text,
+            format!(
+                "=== cairn:~/browser?screenshot [lines 1\u{2013}1 of 1] ===\nBrowser: https://example.com\n![browser]({STORED_IMAGE})"
+            )
+        );
+    }
+
+    #[test]
+    fn image_reference_survives_a_budget_that_truncates_the_body() {
+        // The reference is budgeted like history: a tight budget cuts body lines,
+        // never the one line that makes the image visible at all.
+        let mut seg = image_seg("cairn:~/browser?screenshot", Some(STORED_IMAGE));
+        seg.body = (1..=200)
+            .map(|i| format!("line {i} {}", "x".repeat(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        seg.meta.kind = SegmentKind::Resource;
+        seg.meta.total_units = Some(200);
+        let r = render_segment(seg, 1_500);
+        assert!(r.text.len() <= 1_500);
+        assert!(r.meta.truncated);
+        assert!(r.text.ends_with(&format!("![browser]({STORED_IMAGE})")));
     }
 
     #[test]

@@ -170,6 +170,49 @@ pub enum AccumulationScope {
     Issue,
 }
 
+/// Where an execution's work lands. One property of the execution, resolved at
+/// launch into the per-node branch topology (`BranchMode` on agent nodes, and
+/// whether the terminal `pr` node survives) by
+/// `execution::branch_target::apply_branch_target`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BranchTarget {
+    /// Agent nodes mint their own branch; the terminal `pr` node ships it.
+    #[default]
+    New,
+    /// The execution works on its resolved base branch: agent nodes take
+    /// `BranchMode::None` and terminal `pr` nodes are pruned from the snapshot.
+    Base,
+}
+
+impl std::fmt::Display for BranchTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BranchTarget::New => write!(f, "new"),
+            BranchTarget::Base => write!(f, "base"),
+        }
+    }
+}
+
+impl std::str::FromStr for BranchTarget {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "new" => Ok(BranchTarget::New),
+            "base" => Ok(BranchTarget::Base),
+            _ => Err(format!("Unknown branch target: {}", s)),
+        }
+    }
+}
+
+/// The branch targets a recipe supports when none are declared: only `new`.
+/// Offering `base` prunes the terminal `pr` node, which turns a shipping recipe
+/// into one whose builder never completes, so it must be opted into per recipe.
+pub fn default_branch_targets() -> Vec<BranchTarget> {
+    vec![BranchTarget::New]
+}
+
 /// Recipe - a workflow definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,6 +232,11 @@ pub struct Recipe {
     pub child_recipe_id: Option<String>,
     pub nodes: Vec<RecipeNode>,
     pub edges: Vec<RecipeEdge>,
+    /// Branch targets this recipe's graph is meaningful under. Defaults to
+    /// `[new]`; a recipe declares `base` only when pruning its terminal `pr`
+    /// node still leaves a coherent workflow.
+    #[serde(default = "default_branch_targets")]
+    pub branch_targets: Vec<BranchTarget>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -506,38 +554,38 @@ pub struct TriggerConfig {
     pub event_filter: Option<EventFilter>,
 }
 
-/// Worktree mode for agent nodes
+/// Durable branch-coordinate policy for agent nodes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum WorktreeMode {
-    /// Creates new worktree/branch (default behavior)
+pub enum BranchMode {
+    /// Mint an isolated child branch from the resolved base coordinate.
     #[default]
-    Own,
-    /// Shares upstream agent's worktree (runs as child run under parent job)
+    Isolate,
+    /// Inherit the upstream agent's branch and logical head.
     Inherit,
-    /// No worktree (for read-only/analysis agents running on main)
+    /// Stay on the resolved base coordinate without minting a branch.
     None,
 }
 
-impl std::fmt::Display for WorktreeMode {
+impl std::fmt::Display for BranchMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorktreeMode::Own => write!(f, "own"),
-            WorktreeMode::Inherit => write!(f, "inherit"),
-            WorktreeMode::None => write!(f, "none"),
+            BranchMode::Isolate => write!(f, "isolate"),
+            BranchMode::Inherit => write!(f, "inherit"),
+            BranchMode::None => write!(f, "none"),
         }
     }
 }
 
-impl std::str::FromStr for WorktreeMode {
+impl std::str::FromStr for BranchMode {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "own" => Ok(WorktreeMode::Own),
-            "inherit" => Ok(WorktreeMode::Inherit),
-            "none" => Ok(WorktreeMode::None),
-            _ => Err(format!("Unknown worktree mode: {}", s)),
+            "isolate" => Ok(BranchMode::Isolate),
+            "inherit" => Ok(BranchMode::Inherit),
+            "none" => Ok(BranchMode::None),
+            _ => Err(format!("Unknown branch mode: {}", s)),
         }
     }
 }
@@ -546,14 +594,29 @@ impl std::str::FromStr for WorktreeMode {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentGitConfig {
-    /// Worktree mode: "own" (default), "inherit", or "none"
-    #[serde(default, skip_serializing_if = "is_default_worktree_mode")]
-    pub worktree_mode: WorktreeMode,
+    /// Branch policy: "isolate" (default), "inherit", or "none".
+    #[serde(default, skip_serializing_if = "is_default_branch_mode")]
+    pub branch_mode: BranchMode,
+    /// Whether inheritance must land on the parent branch's live head, refusing
+    /// to start when the store cannot resolve it.
+    ///
+    /// Plain `inherit` degrades instead: if the bookmark is gone it falls back to
+    /// the parent's recorded base and then to the base branch, so the node starts
+    /// *somewhere* rather than not at all. That is the right trade for a node
+    /// whose value survives a degraded coordinate.
+    ///
+    /// A delegated task is the opposite case. It exists to work on its parent's
+    /// in-flight state, so a task seeded anywhere else produces confidently wrong
+    /// work — green tests over code the parent already replaced (CAIRN-3309).
+    /// Refusing is strictly better: the delegating agent gets an error it can act
+    /// on instead of a child that quietly does the wrong thing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_parent_head: bool,
 }
 
-/// Helper to skip serializing default worktree_mode
-fn is_default_worktree_mode(mode: &WorktreeMode) -> bool {
-    *mode == WorktreeMode::Own
+/// Helper to skip serializing default branch_mode
+fn is_default_branch_mode(mode: &BranchMode) -> bool {
+    *mode == BranchMode::Isolate
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1018,9 +1081,9 @@ mod tests {
             ("ai", ConditionType::Ai),
         ]);
         assert_parse_cases(&[
-            ("own", WorktreeMode::Own),
-            ("inherit", WorktreeMode::Inherit),
-            ("none", WorktreeMode::None),
+            ("isolate", BranchMode::Isolate),
+            ("inherit", BranchMode::Inherit),
+            ("none", BranchMode::None),
         ]);
         assert_parse_cases(&[
             ("usedefault", ConditionErrorBehavior::UseDefault),
@@ -1047,9 +1110,9 @@ mod tests {
             ("AI", ConditionType::Ai),
         ]);
         assert_parse_cases(&[
-            ("OWN", WorktreeMode::Own),
-            ("Inherit", WorktreeMode::Inherit),
-            ("NONE", WorktreeMode::None),
+            ("ISOLATE", BranchMode::Isolate),
+            ("Inherit", BranchMode::Inherit),
+            ("NONE", BranchMode::None),
         ]);
         assert_parse_cases(&[
             ("USEDEFAULT", ConditionErrorBehavior::UseDefault),
@@ -1139,6 +1202,7 @@ mod tests {
     #[test]
     fn recipe_scope_returns_trigger_node_scope() {
         let recipe = Recipe {
+            branch_targets: crate::models::default_branch_targets(),
             id: "r1".into(),
             name: "Test".into(),
             description: None,
@@ -1178,6 +1242,7 @@ mod tests {
     #[test]
     fn recipe_scope_defaults_to_issue_when_no_trigger_node() {
         let recipe = Recipe {
+            branch_targets: crate::models::default_branch_targets(),
             id: "r1".into(),
             name: "Test".into(),
             description: None,
@@ -1199,6 +1264,7 @@ mod tests {
     #[test]
     fn recipe_scope_defaults_to_issue_when_trigger_has_no_scope() {
         let recipe = Recipe {
+            branch_targets: crate::models::default_branch_targets(),
             id: "r1".into(),
             name: "Test".into(),
             description: None,
@@ -1390,26 +1456,26 @@ mod tests {
     }
 
     // =========================================================================
-    // WorktreeMode tests
+    // BranchMode tests
     // =========================================================================
 
     #[test]
-    fn worktree_mode_display() {
-        assert_eq!(WorktreeMode::Own.to_string(), "own");
-        assert_eq!(WorktreeMode::Inherit.to_string(), "inherit");
-        assert_eq!(WorktreeMode::None.to_string(), "none");
+    fn branch_mode_display() {
+        assert_eq!(BranchMode::Isolate.to_string(), "isolate");
+        assert_eq!(BranchMode::Inherit.to_string(), "inherit");
+        assert_eq!(BranchMode::None.to_string(), "none");
     }
 
     #[test]
-    fn worktree_mode_from_str_invalid() {
-        let result = "invalid".parse::<WorktreeMode>();
+    fn branch_mode_from_str_invalid() {
+        let result = "invalid".parse::<BranchMode>();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unknown worktree mode"));
+        assert!(result.unwrap_err().contains("Unknown branch mode"));
     }
 
     #[test]
-    fn worktree_mode_default() {
-        assert_eq!(WorktreeMode::default(), WorktreeMode::Own);
+    fn branch_mode_default() {
+        assert_eq!(BranchMode::default(), BranchMode::Isolate);
     }
 
     // =========================================================================
@@ -1501,7 +1567,7 @@ mod tests {
 
     #[test]
     fn try_from_db_recipe_node_agent_with_git_config() {
-        let config = r#"{"agentConfigId": "agent-123", "gitConfig": {"worktreeMode": "inherit"}}"#;
+        let config = r#"{"agentConfigId": "agent-123", "gitConfig": {"branchMode": "inherit"}}"#;
         let db = make_db_recipe_node("agent", Some(config));
 
         let node = RecipeNode::try_from(db).unwrap();
@@ -1509,7 +1575,7 @@ mod tests {
         let agent_config = node.agent_config.unwrap();
         assert!(agent_config.git_config.is_some());
         let git_config = agent_config.git_config.unwrap();
-        assert_eq!(git_config.worktree_mode, WorktreeMode::Inherit);
+        assert_eq!(git_config.branch_mode, BranchMode::Inherit);
     }
 
     #[test]

@@ -51,6 +51,28 @@ pub struct WwwAuthenticate {
     error: Option<String>,
 }
 
+/// Validate the authorization server identifier returned with an authorization
+/// response before the code is sent to a token endpoint. When the authorization
+/// server advertises RFC 9207 support, `iss` is required. Otherwise omission is
+/// allowed, but a returned value must still match exactly; URL normalization
+/// here would weaken the mix-up defense.
+pub fn validate_callback_issuer(
+    expected: &str,
+    received: Option<&str>,
+    issuer_parameter_supported: bool,
+) -> Result<(), String> {
+    match received {
+        Some(issuer) if issuer == expected => Ok(()),
+        Some(issuer) => Err(format!(
+            "Authorization issuer mismatch: expected '{expected}', received '{issuer}'; aborting"
+        )),
+        None if issuer_parameter_supported => {
+            Err("Authorization callback omitted required issuer (`iss`); aborting".to_string())
+        }
+        None => Ok(()),
+    }
+}
+
 impl WwwAuthenticate {
     /// Whether this challenge is an `insufficient_scope` step-up (RFC6750 §3.1).
     pub fn is_insufficient_scope(&self) -> bool {
@@ -193,6 +215,10 @@ pub struct AuthServerMetadata {
     code_challenge_methods_supported: Vec<String>,
     #[serde(default)]
     pub grant_types_supported: Vec<String>,
+    /// RFC 9207: whether authorization responses are guaranteed to include
+    /// their authorization-server identifier in the `iss` parameter.
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// Parse an authorization-server metadata JSON document.
@@ -527,12 +553,12 @@ pub struct Probe {
     pub challenge: WwwAuthenticate,
 }
 
-/// A minimal MCP `initialize` request body. MCP servers gate authorization on
-/// the JSON-RPC POST (a bare GET often `405`s in method routing *before* the
-/// auth middleware runs), so the auth challenge only surfaces on this request.
-const INITIALIZE_PROBE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cairn","version":"0"}}}"#;
+/// A stateless MCP `server/discover` request. The request carries the protocol
+/// version and client identity in `_meta`, so it is valid without a preceding
+/// initialization handshake while still reaching POST-only authorization middleware.
+const DISCOVER_PROBE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"cairn","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
 
-/// Probe the endpoint for an auth challenge. Tries an `initialize` POST first
+/// Probe the endpoint for an auth challenge. Tries a stateless `server/discover` POST first
 /// (the streamable-HTTP case), then falls back to a GET (legacy SSE endpoints
 /// that challenge on the stream open). Returns the first response that demands
 /// authorization; otherwise the POST result.
@@ -613,7 +639,7 @@ pub async fn probe_requires_auth_quick(url: &str) -> ProbeOutcome {
     }
 }
 
-/// One probe request (POST `initialize` or GET), parsing any challenge header.
+/// One probe request (POST `server/discover` or GET), parsing any challenge header.
 async fn probe_request(client: &reqwest::Client, url: &str, post: bool) -> Option<Probe> {
     let builder = if post {
         client
@@ -623,7 +649,7 @@ async fn probe_request(client: &reqwest::Client, url: &str, post: bool) -> Optio
                 "application/json, text/event-stream",
             )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(INITIALIZE_PROBE_BODY)
+            .body(DISCOVER_PROBE_BODY)
     } else {
         client.get(url).header(
             reqwest::header::ACCEPT,
@@ -718,6 +744,7 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<String, Strin
 #[derive(Debug, Serialize)]
 struct RegistrationRequest<'a> {
     client_name: &'a str,
+    application_type: &'static str,
     redirect_uris: Vec<&'a str>,
     grant_types: Vec<&'a str>,
     response_types: Vec<&'a str>,
@@ -773,6 +800,7 @@ pub async fn register_client(
     let client = oauth_http_client()?;
     let req = RegistrationRequest {
         client_name,
+        application_type: "native",
         redirect_uris: vec![redirect_uri],
         grant_types: scoped_grant_types(grant_types_supported),
         response_types: vec!["code"],
@@ -980,6 +1008,48 @@ mod tests {
     }
 
     #[test]
+    fn callback_issuer_follows_advertised_support_and_always_rejects_mismatch() {
+        let expected = "https://auth.example.com/tenant";
+        assert!(validate_callback_issuer(expected, Some(expected), true).is_ok());
+        assert!(
+            validate_callback_issuer(expected, Some("https://evil.example.com/tenant"), false)
+                .unwrap_err()
+                .contains("issuer mismatch")
+        );
+        assert!(validate_callback_issuer(expected, None, true)
+            .unwrap_err()
+            .contains("omitted required issuer"));
+        assert!(validate_callback_issuer(expected, None, false).is_ok());
+    }
+
+    #[test]
+    fn auth_server_metadata_models_callback_issuer_support() {
+        let advertised = parse_auth_server_metadata(
+            r#"{"authorization_response_iss_parameter_supported":true}"#,
+        )
+        .unwrap();
+        assert!(advertised.authorization_response_iss_parameter_supported);
+
+        let legacy = parse_auth_server_metadata("{}").unwrap();
+        assert!(!legacy.authorization_response_iss_parameter_supported);
+    }
+
+    #[test]
+    fn registration_identifies_cairn_as_a_native_application() {
+        let request = RegistrationRequest {
+            client_name: "Cairn",
+            application_type: "native",
+            redirect_uris: vec!["http://127.0.0.1:1234/callback"],
+            grant_types: vec!["authorization_code"],
+            response_types: vec!["code"],
+            token_endpoint_auth_method: "none",
+            scope: None,
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["application_type"], "native");
+    }
+
+    #[test]
     fn state_is_random_and_urlsafe() {
         let a = generate_state();
         let b = generate_state();
@@ -1031,6 +1101,21 @@ mod tests {
         )
         .unwrap();
         assert!(!url.contains("scope="));
+    }
+
+    #[test]
+    fn discover_probe_is_stateless_and_self_describing() {
+        let body: serde_json::Value = serde_json::from_str(DISCOVER_PROBE_BODY).unwrap();
+        assert_eq!(body["method"], "server/discover");
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+            "cairn"
+        );
+        assert!(body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"].is_object());
     }
 
     #[test]

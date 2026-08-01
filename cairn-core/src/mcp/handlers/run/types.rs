@@ -2,7 +2,7 @@
 //! per-item outcomes, the promoted-terminal marker, and streaming payloads.
 
 use crate::config::mcp_servers::McpServerConfig;
-use cairn_common::{executor_protocol::PlacementConstraints, read::ImageBlock};
+use cairn_common::{executor_protocol::ExecutorSelector, read::ImageBlock};
 use serde::{Deserialize, Serialize};
 
 /// Payload for run tool from MCP server.
@@ -29,10 +29,15 @@ pub struct RunPayload {
     /// verdict-only build slot. Cannot be combined with commit_msg.
     #[serde(default)]
     pub(crate) branch: Option<String>,
-    /// Hard executor placement requirements for the entire batch. Omitted batches
-    /// retain the colocated-executor compatibility path.
+    /// Which machine this batch must run on, by public name or platform. An
+    /// omitted selector retains the colocated-executor compatibility path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) constraints: Option<PlacementConstraints>,
+    pub(crate) executor: Option<ExecutorSelector>,
+    /// A written reason for committing files that contain literal Git conflict
+    /// markers. Absent (the default) means the commit barrier refuses the seal
+    /// and leaves the tree intact; see `cairn_common::conflict_scaffolding`.
+    #[serde(default)]
+    pub(crate) conflict_markers_reason: Option<String>,
 }
 
 /// A single run invocation: exactly one of three kinds — a shell `command`, a
@@ -72,7 +77,9 @@ pub struct RunItem {
     /// instead of a fresh process, so variables/imports/defs persist across
     /// `run` calls. Requires `code` + `interpreter` (which must match the REPL's
     /// language); rejects `command`/`target`/`payload`. An item without `repl`
-    /// is unchanged.
+    /// is unchanged. Create the REPL first with
+    /// `write cairn:~/repl/<slug> {interpreter:"python", deps:["pandas"]}`. Create the session first with
+    /// `write cairn:~/repl/<slug> {interpreter:"python", deps:["pandas"]}`.
     #[serde(default)]
     pub(crate) repl: Option<String>,
     /// Suspend the owning turn until the condition fires. A wait item must be
@@ -93,7 +100,10 @@ pub enum WaitFor {
         #[serde(rename = "ref")]
         reference: String,
         on: TerminalWaitEvent,
-        #[serde(default)]
+        // Serializes back to the shape the model sends, in lockstep with
+        // cairn-cmd's `WaitForInput`: without the skip, an absent phrase came
+        // back out as an explicit null.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         phrase: Option<String>,
     },
 }
@@ -178,7 +188,12 @@ pub(crate) struct McpCallSpec {
 }
 
 /// Per-item execution result used to compose the batch output.
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// This is the runner's in-memory composition type, not a wire shape. Items
+/// executed in a cell arrive as [`ProcessBatchItemOutcome`] and are converted
+/// below; deriving `Deserialize` here instead would put a second, silently
+/// diverging decoder on the protocol's field names.
+#[derive(Clone)]
 pub(crate) struct ItemOutcome {
     /// Header shown above this item's output (`=== <header> ===`): the command
     /// or the skill-script target URI.
@@ -192,11 +207,25 @@ pub(crate) struct ItemOutcome {
     /// returns them today; collected across the batch into the run envelope so the
     /// transport edge delivers them as real image content blocks (read-path mirror).
     pub(crate) images: Vec<ImageBlock>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) promoted_terminal: Option<cairn_common::executor_protocol::PromotedTerminalProcess>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tracked_modifications:
         Option<cairn_common::executor_protocol::TrackedModificationEvidence>,
+}
+
+impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutcome {
+    fn from(outcome: cairn_common::executor_protocol::ProcessBatchItemOutcome) -> Self {
+        Self {
+            header: outcome.header,
+            body: outcome.body,
+            succeeded: outcome.succeeded,
+            suspended: outcome.suspended,
+            images: outcome
+                .images
+                .into_iter()
+                .filter_map(|image| serde_json::from_value(image).ok())
+                .collect(),
+            tracked_modifications: outcome.tracked_modifications,
+        }
+    }
 }
 
 impl ItemOutcome {
@@ -209,7 +238,6 @@ impl ItemOutcome {
             succeeded: false,
             suspended: false,
             images: Vec::new(),
-            promoted_terminal: None,
             tracked_modifications: None,
         }
     }
@@ -272,6 +300,71 @@ pub struct CheckStatusEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `WaitFor` must serialize back to the shape the model sends, so a
+    /// round-trip through JSON is lossless in both directions. Correlation no
+    /// longer depends on this (it compares parsed values), but an absent
+    /// optional re-emitted as an explicit null is the kind of asymmetry that
+    /// silently broke it before.
+    #[test]
+    fn wait_for_round_trips_through_the_json_the_model_sends() {
+        for wire in [
+            serde_json::json!({"duration":"3m"}),
+            serde_json::json!({"duration":25}),
+            serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/tests","on":"exit"}),
+            serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/dev","on":"output","phrase":"ready"}),
+        ] {
+            let parsed: WaitFor = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
+        }
+    }
+
+    /// A cell reports its batch as `ProcessBatchItemOutcome` JSON, which is
+    /// camelCase. Decoding it into a look-alike struct with snake_case field
+    /// names is silent — the fields simply arrive as `None` — so this pins the
+    /// conversion rather than the field list.
+    #[test]
+    fn cell_batch_outcome_conversion_preserves_tracked_modifications() {
+        use cairn_common::executor_protocol::{
+            ProcessBatchItemOutcome, TrackedModificationEvidence,
+        };
+
+        let wire = ProcessBatchItemOutcome {
+            header: "bun dev".into(),
+            body: "listening".into(),
+            succeeded: true,
+            suspended: false,
+            images: Vec::new(),
+            exit_code: None,
+            timed_out: true,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: 2,
+            duration_ms: 1,
+            peak_rss_bytes: None,
+            disk_delta_bytes: None,
+            sandbox_denials: Vec::new(),
+            tracked_modifications: Some(TrackedModificationEvidence {
+                paths: vec!["src/lib.rs".into()],
+                files_changed: 1,
+                lines_added: 2,
+                lines_deleted: 1,
+            }),
+        };
+
+        let encoded = serde_json::to_string(&vec![wire]).unwrap();
+        let decoded: Vec<ProcessBatchItemOutcome> = serde_json::from_str(&encoded).unwrap();
+        let outcome = ItemOutcome::from(decoded.into_iter().next().unwrap());
+
+        assert_eq!(outcome.header, "bun dev");
+        assert!(outcome.succeeded);
+        assert_eq!(
+            outcome
+                .tracked_modifications
+                .expect("tracked modifications must survive the cell boundary")
+                .paths,
+            vec!["src/lib.rs".to_string()]
+        );
+    }
 
     #[test]
     fn run_payload_deserializes_batch_shape() {

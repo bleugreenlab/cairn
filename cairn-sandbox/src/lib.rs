@@ -14,9 +14,9 @@
 //!
 //! The policy confines **writes** to `{worktree, tmp, granted paths}`, allows
 //! **reads broadly** (the toolchain reads `~/.cargo`, `~/.npm`, `~/.gitconfig`,
-//! `/usr/lib`, …), and **hard-denies reads** of a sensitive denylist (cloud
-//! credential stores plus Cairn's own `~/.cairn[-dev]`, which hold the MCP
-//! callback secret and the local DB). See `docs/worktree-fence.md`.
+//! `/usr/lib`, …), and **hard-denies reads** of a narrow sensitive denylist of
+//! external credential stores (see [`default_deny_read`], which deliberately
+//! does *not* deny Cairn's own `~/.cairn[-dev]`). See `docs/worktree-fence.md`.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -165,6 +165,56 @@ impl SandboxPolicy {
             deny_read,
             writable_regex: writable_globs.iter().map(|g| glob_to_regex(g)).collect(),
             worktree_writable: true,
+        }
+    }
+
+    /// Grant the writes an **interactive shell** makes on its own behalf.
+    ///
+    /// A PTY terminal deliberately boots the user's real shell, so that shell's
+    /// startup config runs inside the fence: it rewrites its universal
+    /// variables, appends history, and lets plugins update their state under the
+    /// XDG data and state homes. None of that is the work a fence exists to
+    /// contain — it is the cost of having chosen the user's shell over a bare
+    /// one — and denying it makes every terminal open print kernel-denial
+    /// stanzas before the prompt appears (`mktemp: … Operation not permitted`,
+    /// fish's `Unable to open universal variable file`). Commands typed into the
+    /// shell inherit the spawn's confinement, so this widens what they may write
+    /// by exactly the named leaves below, and by nothing else.
+    ///
+    /// Opt-in per spawn, because only the terminal seam boots a shell: a `run`
+    /// batch executes through `/bin/sh -c`, which sources no user config and
+    /// needs nothing here.
+    ///
+    /// The grant names individual leaves — the shell's own directory under each
+    /// XDG base, and the state directories of plugins that write as a side
+    /// effect of the shell running. The bases themselves stay unwritable,
+    /// because a write rule is recursive and granting `~/.local/share` would
+    /// hand every command typed into the terminal write access to every
+    /// application's state beneath it.
+    ///
+    /// Ensures those bases exist as a side effect: the kernel permits creating a
+    /// granted leaf that does not exist yet, but only when its parent already
+    /// does (see [`ensure_shell_state_bases`]).
+    pub fn grant_interactive_shell_state(&mut self, shell_path: &str) {
+        ensure_shell_state_bases();
+        self.grant_state_dirs(interactive_shell_state_dirs(shell_path));
+    }
+
+    /// Add writable roots, skipping any the read denylist covers. A grant is
+    /// re-allowed for reads (see [`Self::readable_paths`]), so admitting a
+    /// denied subtree here would silently undo the denial.
+    fn grant_state_dirs(&mut self, dirs: Vec<PathBuf>) {
+        for dir in dirs {
+            if self
+                .deny_read
+                .iter()
+                .any(|denied| paths_overlap(&dir, denied))
+            {
+                continue;
+            }
+            if !self.writable_extra.contains(&dir) {
+                self.writable_extra.push(dir);
+            }
         }
     }
 
@@ -386,6 +436,15 @@ pub fn default_writable_extra() -> Vec<PathBuf> {
             dirs.push(uv_cache);
         }
     }
+    // Cairn's own per-job scratch root (`<cairn_home>/scratch`), which every
+    // spawn's `TMPDIR`/`TMP`/`TEMP` may name and whose job directory is the
+    // residence of a command that has no checkout. It used to live under the
+    // platform temp root and be covered by that wholesale grant; naming it here
+    // is what keeps a scratch write prompt-free now that the root is readable
+    // instead. Granted unconditionally rather than existence-filtered: the very
+    // first spawn of a fresh install writes there, and an absent path is inert
+    // in the generated rules.
+    dirs.push(cairn_common::scratch::scratch_root());
     dirs
 }
 
@@ -425,6 +484,113 @@ fn toolchain_writable_dirs_in(home: &Path) -> Vec<PathBuf> {
     .collect();
     dirs.retain(|p| p.exists());
     dirs
+}
+
+/// Directory names of shell plugins that write state as a side effect of the
+/// shell simply running: directory trackers that record every `cd`, and history
+/// stores. Each is named individually because the XDG bases they sit under also
+/// hold unrelated application state, and a write rule is recursive — granting a
+/// base would hand every command typed into the terminal write access to all of
+/// it. A plugin that is not listed surfaces as an ordinary, visible denial,
+/// which is the signal to add it here deliberately rather than to widen the
+/// boundary.
+const SHELL_PLUGIN_STATE_DIRS: [&str; 5] = ["z", "zoxide", "autojump", "fasd", "atuin"];
+
+/// The paths an interactive shell writes for its own bookkeeping: its own
+/// directory beneath each XDG base (fish keeps `fish_variables` under the config
+/// home and its history under the data home), the state directories of the
+/// plugins in [`SHELL_PLUGIN_STATE_DIRS`], and the history files zsh and bash
+/// keep directly in `$HOME`.
+///
+/// Deliberately **not** filtered to paths that already exist: a grant naming a
+/// path that does not exist yet is exactly what lets a first-run shell create
+/// it, and the OS rule is inert until something does. The XDG bases are never
+/// granted, only entered.
+pub fn interactive_shell_state_dirs(shell_path: &str) -> Vec<PathBuf> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    interactive_shell_state_dirs_in(
+        &home,
+        &xdg_base(&home, "XDG_CONFIG_HOME", ".config"),
+        &xdg_base(&home, "XDG_DATA_HOME", ".local/share"),
+        &xdg_base(&home, "XDG_STATE_HOME", ".local/state"),
+        shell_path,
+    )
+}
+
+/// Best-effort creation of the XDG base directories a shell keeps its state
+/// under.
+///
+/// The grants name leaves beneath these bases rather than the bases themselves,
+/// which is what keeps unrelated application state out of the writable set. The
+/// kernel will let a confined shell create a granted leaf that does not exist
+/// yet — but only if the parent already does, since `mkdir -p
+/// ~/.local/share/fish` on a fresh home must create `~/.local/share` first and
+/// that path is not granted. Creating the standard bases before confining the
+/// shell is what makes a first-run home behave like an established one. Mirrors
+/// `env::ensure_uv_cache_dir`, which exists for the same reason.
+fn ensure_shell_state_bases() {
+    let Some(home) = home_dir() else {
+        return;
+    };
+    for base in [
+        xdg_base(&home, "XDG_CONFIG_HOME", ".config"),
+        xdg_base(&home, "XDG_DATA_HOME", ".local/share"),
+        xdg_base(&home, "XDG_STATE_HOME", ".local/state"),
+    ] {
+        let _ = std::fs::create_dir_all(base);
+    }
+}
+
+/// Resolve an XDG base directory, falling back to its default under `home`. A
+/// relative value is ignored, as the XDG spec requires.
+fn xdg_base(home: &Path, var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(fallback))
+}
+
+fn interactive_shell_state_dirs_in(
+    home: &Path,
+    config_home: &Path,
+    data_home: &Path,
+    state_home: &Path,
+    shell_path: &str,
+) -> Vec<PathBuf> {
+    let shell = shell_basename(shell_path);
+    let mut dirs = Vec::new();
+    if !shell.is_empty() {
+        // nushell is the one common shell whose dir is not its binary name.
+        let name = if shell == "nu" { "nushell" } else { &shell };
+        dirs.push(config_home.join(name));
+        dirs.push(data_home.join(name));
+        dirs.push(state_home.join(name));
+    }
+    for plugin in SHELL_PLUGIN_STATE_DIRS {
+        dirs.push(data_home.join(plugin));
+        dirs.push(state_home.join(plugin));
+    }
+    // Shells that keep history in `$HOME` rather than under an XDG base.
+    let home_state: &[&str] = match shell.as_str() {
+        "zsh" => &[".zsh_history", ".zsh_sessions"],
+        "bash" => &[".bash_history"],
+        _ => &[],
+    };
+    dirs.extend(home_state.iter().map(|relative| home.join(relative)));
+    dirs
+}
+
+/// The shell's lowercased binary name, without directory or `.exe` suffix.
+fn shell_basename(shell_path: &str) -> String {
+    Path::new(shell_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+        .trim_end_matches(".exe")
+        .to_string()
 }
 
 fn temp_dirs() -> Vec<PathBuf> {
@@ -511,6 +677,91 @@ mod tests {
     }
 
     #[test]
+    fn interactive_shell_state_dirs_are_scoped_to_the_shell_not_the_xdg_bases() {
+        let home = Path::new("/home/tester");
+        let (config, data, state) = (
+            home.join(".config"),
+            home.join(".local/share"),
+            home.join(".local/state"),
+        );
+
+        let dirs =
+            interactive_shell_state_dirs_in(home, &config, &data, &state, "/opt/homebrew/bin/fish");
+
+        // The shell's own directory beneath each base: `fish_variables` under
+        // the config home, history under the data home.
+        assert!(dirs.contains(&config.join("fish")));
+        assert!(dirs.contains(&data.join("fish")));
+        assert!(dirs.contains(&state.join("fish")));
+        // Plugins that write as a side effect of the shell running.
+        assert!(dirs.contains(&data.join("z")));
+        // The bases themselves are never granted. A write rule is recursive, so
+        // granting one would open every application's state beside the shell's
+        // to anything typed into the terminal.
+        assert!(!dirs.contains(&config));
+        assert!(!dirs.contains(&data));
+        assert!(!dirs.contains(&state));
+        assert!(!dirs.contains(&home.to_path_buf()));
+    }
+
+    #[test]
+    fn interactive_shell_state_dirs_are_creation_safe_and_shell_specific() {
+        // A home where nothing exists yet: the paths are granted all the same,
+        // because naming a path that does not exist is what lets a first-run
+        // shell create it.
+        let home = Path::new("/home/never-logged-in");
+        let (config, data, state) = (
+            home.join(".config"),
+            home.join(".local/share"),
+            home.join(".local/state"),
+        );
+
+        let dirs = interactive_shell_state_dirs_in(home, &config, &data, &state, "/bin/zsh");
+
+        assert!(dirs.contains(&data.join("zsh")));
+        assert!(dirs.contains(&home.join(".zsh_history")));
+        assert!(
+            !dirs.contains(&home.join(".bash_history")),
+            "another shell's history is not this shell's state"
+        );
+        assert!(
+            !dirs.contains(&config.join("fish")),
+            "another shell's config is not this shell's state"
+        );
+    }
+
+    #[test]
+    fn interactive_shell_grant_never_reopens_a_denied_root() {
+        let denied = PathBuf::from("/home/x/.local/share");
+        let mut policy = SandboxPolicy::for_run(Path::new("/work/wt"), &[], vec![denied.clone()]);
+
+        policy.grant_state_dirs(vec![
+            denied.clone(),
+            denied.join("z"),
+            PathBuf::from("/home/x/.config/fish"),
+        ]);
+
+        // A grant is re-allowed for reads, so a denied root — or anything inside
+        // one — must never enter the writable set through this door.
+        assert!(!policy.writable_extra.contains(&denied));
+        assert!(!policy.writable_extra.contains(&denied.join("z")));
+        assert!(policy
+            .writable_extra
+            .contains(&PathBuf::from("/home/x/.config/fish")));
+
+        policy.grant_state_dirs(vec![PathBuf::from("/home/x/.config/fish")]);
+        assert_eq!(
+            policy
+                .writable_extra
+                .iter()
+                .filter(|path| *path == &PathBuf::from("/home/x/.config/fish"))
+                .count(),
+            1,
+            "repeated grants must not accumulate duplicates"
+        );
+    }
+
+    #[test]
     fn for_run_grant_is_writable_and_read_reallowed() {
         let wt = PathBuf::from("/work/wt");
         let deny = vec![PathBuf::from("/home/x/.aws"), PathBuf::from("/secret/data")];
@@ -559,6 +810,23 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    /// Cairn's scratch root left the platform temp root, which the fence grants
+    /// wholesale; without a grant of its own, every ordinary scratch write
+    /// (`mktemp`, a compiler's temp file, a helper script) would become an
+    /// out-of-worktree crossing.
+    #[test]
+    fn the_cairn_scratch_root_stays_writable() {
+        let scratch = cairn_common::scratch::scratch_root();
+        assert!(
+            default_writable_extra().contains(&scratch),
+            "the scratch root must be writable: {}",
+            scratch.display()
+        );
+        let policy = SandboxPolicy::for_run(Path::new("/project/wt"), &[], vec![]);
+        assert!(policy.writable_paths().contains(&scratch));
+        assert!(policy.readable_paths().contains(&scratch));
     }
 
     #[test]

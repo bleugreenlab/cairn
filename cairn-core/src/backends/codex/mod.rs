@@ -56,7 +56,7 @@ pub(crate) fn send_app_server_user_message(
     content: &str,
 ) -> Result<(), String> {
     if let Some(app_stdin) = stdin.as_any_mut().downcast_mut::<protocol::CodexStdin>() {
-        app_stdin.send_turn(content)
+        app_stdin.send_turn(&crate::agent_process::stdin::MessageContent::text(content))
     } else {
         Err("Codex app-server stdin unavailable".to_string())
     }

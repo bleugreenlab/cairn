@@ -391,21 +391,53 @@ pub(crate) async fn unmute_matching(
     .await
 }
 
+/// Unsubscribe a job from a source.
+///
+/// Flips every matching row to `unsubscribed`, and when a scoped source matched
+/// nothing it *records* the opt-out as a row instead of reporting a silent no-op.
+/// That tombstone is what makes opting out of a **derived** watch possible: a
+/// coordinator's child-attention watch is derived from the parent edge and has no
+/// row to flip, so without a recorded refusal the derivation would keep
+/// re-adding it (CAIRN-3293). An unscoped unsubscribe (`ref` omitted, meaning
+/// "every row of this kind") stays a pure state flip — there is no single source
+/// to tombstone.
 pub(crate) async fn unsubscribe_matching(
     db: &LocalDb,
     job_id: &str,
     source_kind: &str,
     source_ref: Option<&str>,
+    created_by: &str,
 ) -> Result<usize, String> {
     let source = WakeSource::from_parts(source_kind, source_ref)?;
-    update_state_matching(
+    let changed = update_state_matching(
         db,
         job_id,
         source.kind(),
         source.reference(),
         WakeSubscriptionState::Unsubscribed,
     )
-    .await
+    .await?;
+    if changed > 0 {
+        return Ok(changed);
+    }
+    let Some(reference) = source.reference() else {
+        return Ok(0);
+    };
+    upsert_subscription(
+        db,
+        job_id,
+        source.kind(),
+        Some(reference),
+        None,
+        WakeSubscriptionState::Unsubscribed,
+        None,
+        None,
+        created_by,
+        false,
+        None,
+    )
+    .await?;
+    Ok(1)
 }
 
 async fn update_state_matching(

@@ -173,37 +173,6 @@ fn notice_from_wake(wake: crate::orchestrator::wakes::SuppressedWake) -> SideCha
     }
 }
 
-async fn record_user_child_side_channel_async(
-    orch: &Orchestrator,
-    child_issue_id: &str,
-    child_uri: &str,
-    _content: &str,
-) -> Result<Option<SideChannelNotice>, String> {
-    let Some(parent_job_id) =
-        crate::orchestrator::parent_wake::load_parent_job(&orch.db.local, child_issue_id)?
-    else {
-        return Ok(None);
-    };
-
-    // CAIRN-1894: the parent's copy of a user→child message is a passive
-    // `catchup:{child-job}` push, resolved at delivery against the parent's single
-    // read cursor (scoped to the addressed child node's job). It never wakes the
-    // parent; it rides along on the parent's next run and renders the child's chat
-    // from the message through the child's current tail. The child still receives
-    // the message live through its own delivery path.
-    match crate::orchestrator::attention_delivery::create_catchup_push(
-        &orch.db.local,
-        &parent_job_id,
-        child_uri,
-    )
-    .await
-    {
-        Ok(()) => orch.notifier.emit_change("attention_pushes"),
-        Err(e) => log::warn!("catch-up push creation failed: {e}"),
-    }
-    Ok(None)
-}
-
 pub async fn record_issue_comment_side_channel_async(
     orch: &Orchestrator,
     issue_id: &str,
@@ -338,21 +307,6 @@ pub(crate) async fn record_issue_message_side_channel_by_issue_number(
         return Ok(0);
     };
     record_issue_message_side_channel_async(orch, &issue_id, source, content, exclude_job_id).await
-}
-
-pub(crate) async fn record_user_child_side_channel_by_issue_number(
-    orch: &Orchestrator,
-    project_key: &str,
-    issue_number: i32,
-    child_uri: &str,
-    content: &str,
-) -> Result<Option<SideChannelNotice>, String> {
-    let Some(child_issue_id) =
-        issue_id_for_key_number(&orch.db.local, project_key, issue_number).await?
-    else {
-        return Ok(None);
-    };
-    record_user_child_side_channel_async(orch, &child_issue_id, child_uri, content).await
 }
 
 pub(crate) async fn peek_pending_side_channel_for_job_async(

@@ -66,11 +66,33 @@ pub(crate) fn render_locations(hits: &[LocationHit]) -> Rendered {
 /// `root` resolves each hit's relative path back to its file for source lines.
 /// Context lines are shown untrimmed (like grep) so indentation is visible;
 /// the no-context path keeps the existing trimmed `path:N:snippet` rows.
+pub(crate) fn render_locations_with_text_context(
+    sources: &std::collections::HashMap<&str, &str>,
+    hits: &[LocationHit],
+    before: usize,
+    after: usize,
+) -> Rendered {
+    render_locations_with_source(hits, before, after, |path| {
+        sources.get(path).map(|source| (*source).to_string())
+    })
+}
+
 pub(crate) fn render_locations_with_context(
     root: &Path,
     hits: &[LocationHit],
     before: usize,
     after: usize,
+) -> Rendered {
+    render_locations_with_source(hits, before, after, |path| {
+        std::fs::read_to_string(root.join(path)).ok()
+    })
+}
+
+fn render_locations_with_source(
+    hits: &[LocationHit],
+    before: usize,
+    after: usize,
+    mut source: impl FnMut(&str) -> Option<String>,
 ) -> Rendered {
     if hits.is_empty() {
         return Rendered {
@@ -94,8 +116,8 @@ pub(crate) fn render_locations_with_context(
     // `--` separates non-contiguous blocks, within a file and between files.
     let mut blocks: Vec<String> = Vec::new();
     for (path, group) in &groups {
-        match std::fs::read_to_string(root.join(path)) {
-            Ok(src) => {
+        match source(path) {
+            Some(src) => {
                 let lines: Vec<&str> = src.lines().collect();
                 let total = lines.len();
                 let match_lines: BTreeSet<usize> = group.iter().map(|h| h.line as usize).collect();
@@ -132,7 +154,7 @@ pub(crate) fn render_locations_with_context(
                     blocks.push(rows);
                 }
             }
-            Err(_) => {
+            None => {
                 // Source unreadable: emit this file's hits as bare snippet rows
                 // so a partial result still renders.
                 if !blocks.is_empty() {

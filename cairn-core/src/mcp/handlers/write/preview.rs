@@ -428,7 +428,7 @@ pub(super) async fn preview_change(
                     .replace('\\', "/")
             };
             for edit in &plan.file_edits {
-                let src_target = format!("file:{}", rel(&edit.worktree_path));
+                let src_target = format!("file:{}", rel(&edit.path));
                 match hash_file_target_uri(worktree, &src_target) {
                     Ok(hash) => target_hashes.push(hash),
                     Err(error) => {
@@ -653,6 +653,8 @@ pub(super) async fn preview_change(
         event_uri: event_uri.clone(),
         apply_uri: event_uri,
         target_hashes,
+        // A preview applies nothing, so it is never a replay to suppress.
+        replayed: None,
     })
     .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
 }

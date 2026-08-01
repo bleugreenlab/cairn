@@ -68,7 +68,14 @@ pub(super) async fn dispatch(
                     None => format!("Would create issue in project {project}: {title}"),
                 }
             } else {
-                let description = payload_str(payload, "description", &[]).map(ToOwned::to_owned);
+                let description = match payload_str(payload, "description", &[]) {
+                    Some(description) => Some(
+                        crate::durable_content::normalize_text(orch, request, project, description)
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?,
+                    ),
+                    None => None,
+                };
                 let outcome = issues::create_issue_in_project(
                     orch,
                     project,
@@ -77,7 +84,6 @@ pub(super) async fn dispatch(
                     labels,
                     execution,
                     parent,
-                    request.run_id.clone(),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -187,6 +193,28 @@ pub(super) async fn dispatch(
                     Some(status.to_string())
                 }
             };
+            // `confirm` acknowledges that resolving the issue stops the work
+            // still live on it (CAIRN-3212). It has meaning only alongside a
+            // resolution, so it is rejected on its own rather than silently
+            // ignored.
+            let confirm = match payload.get("confirm") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        "payload.confirm must be a boolean",
+                    ))
+                }
+            };
+            if confirm && status.is_none() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload.confirm applies to a resolution; pass it with payload.status",
+                ));
+            }
             // Re-parenting: absent leaves the parent untouched, null/empty
             // orphans the issue, a string adopts it under that canonical issue
             // URI. Existence, same-project, and cycle checks happen in the txn.
@@ -230,7 +258,14 @@ pub(super) async fn dispatch(
                 }
             } else {
                 let title = payload_str(payload, "title", &[]).map(ToOwned::to_owned);
-                let description = payload_str(payload, "description", &[]).map(ToOwned::to_owned);
+                let description = match payload_str(payload, "description", &[]) {
+                    Some(description) => Some(
+                        crate::durable_content::normalize_text(orch, request, project, description)
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?,
+                    ),
+                    None => None,
+                };
                 issues::update_issue_by_project_number(
                     orch,
                     request,
@@ -242,6 +277,7 @@ pub(super) async fn dispatch(
                         depends_on,
                         labels,
                         status,
+                        confirm,
                         parent,
                     },
                 )

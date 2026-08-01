@@ -298,11 +298,13 @@ async fn get_event_vibes_for_session_filters_and_orders() {
         Some(session_a),
     )
     .await;
+    // `sequence` is scoped to the RUN, not the session, so the second session's
+    // event takes the next free slot on this run rather than restarting at 1.
     let eb = create_test_event_with_session(
         &db,
         &run_id,
         "assistant",
-        1,
+        3,
         r#"{"content":"b1"}"#,
         Some(session_b),
     )

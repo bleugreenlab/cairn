@@ -1,22 +1,17 @@
 //! One-time, idempotent archival backfill for already-torn-down executions.
 //!
-//! The teardown writer ([`super::rewrite::archive_target`]) archives an
-//! execution's events at the moment its worktree is removed. That only covers
-//! executions torn down *after* the writer shipped; the bulk of historical event
-//! bytes belong to executions whose worktrees are already gone. The dividing line
-//! between what the two writers can apply is the *addressing scheme*, not the
-//! event — **git-addressed paths need the live worktree; hash-addressed paths
-//! apply in both writers**:
+//! This one-time backfill compresses historical full event rows. Agent jobs have
+//! no persistent checkout, so eligibility is row-shaped rather than keyed to a
+//! filesystem lifecycle. The dividing line between archival encodings is their
+//! addressing scheme:
 //!
-//! - **Git-addressed paths need the live worktree.** A gitcoord read or write
-//!   resolves bytes from objects reachable only while the worktree (and its
-//!   branch and `jobs.base_commit`) still exist. For a torn-down execution those
-//!   are gone by construction, so this backfill gives everything git-addressed the
-//!   **zstd backstop**: no replay, no pack, no gitcoord.
+//! - **Git-addressed paths need a durable archived object coordinate.** Historical
+//!   rows without one receive the **zstd backstop**: no replay, pack, or guessed
+//!   coordinate.
 //! - **Hash-addressed paths apply in both writers.** The two content-addressed
 //!   forms — the near-constant `system:init` handshake and the assembled
 //!   `system:prompt` — reconstruct from blobs in `archival_blobs` keyed purely by
-//!   content, needing no worktree, no branch, and no commit. They reconstruct
+//!   content, needing no materialization, branch, or commit. They reconstruct
 //!   identically whether stripped at teardown or swept up here. Both are
 //!   high-volume system events, so deduping the historical backlog (not just
 //!   future teardowns) is the bulk of their win. A byte-exact verify gates each
@@ -26,23 +21,6 @@
 //!   back too.
 //!
 //! The full per-path writer-coverage matrix lives in [`super`]'s module header.
-//!
-//! ## What counts as "unreachable by the writer"
-//!
-//! The writer runs from `teardown_worktrees` for jobs whose `worktree_path` is
-//! still present on disk, immediately before removing the worktree. Nothing ever
-//! nulls `jobs.worktree_path`, so "already torn down" is **not** a NULL path — it
-//! is a path whose directory no longer exists. An execution is therefore
-//! unreachable by the writer when its owning jobs either never had a worktree
-//! (`worktree_path IS NULL`) or had one that has since been removed
-//! (`!Path::exists`). Anything whose worktree still exists is left alone: it is
-//! live or will be archived at its own teardown.
-//!
-//! This composes safely with the writer. The writer only rewrites `full` events
-//! and removes the worktree *after* it finishes, so by the time a directory is
-//! gone its events are no longer `full` and this backfill skips them. A writer
-//! that failed (rows left `full`) and then lost its worktree is correctly swept
-//! up here as a plain zstd fallback.
 //!
 //! ## Completion + reclamation
 //!
@@ -82,8 +60,6 @@
 //! still the substantive win: it removes the ~2 GB of logical event bytes and
 //! frees those pages for reuse, so the file stops growing even before it is
 //! compacted.
-
-use std::path::Path;
 
 use super::rewrite::{
     build_system_init_shape, build_system_prompt_shape, build_tool_map, event_tool_use_id,
@@ -145,52 +121,22 @@ pub async fn run_archival_maintenance(db: &LocalDb) -> Result<(), String> {
     Ok(())
 }
 
-/// Drain every eligible worktree bucket and return the pass summary. A single
-/// pass compresses all eligible-bucket events — there is no per-row deferral — so
-/// the caller marks the backfill complete unconditionally afterward.
+/// Drain all historical full rows, one transaction per batch. Eligibility is
+/// independent of any materialization: persistent executor cells are disposable
+/// projections and never archival authorities.
 async fn run_backfill(db: &LocalDb) -> Result<BackfillSummary, String> {
-    let buckets = candidate_buckets(db)
-        .await
-        .map_err(|e| format!("loading archival candidate buckets: {e}"))?;
-
     let mut summary = BackfillSummary::default();
-    for bucket in buckets {
-        if !is_eligible_bucket(bucket.as_deref()) {
-            // Worktree still on disk: live, or the writer's territory at teardown.
-            continue;
-        }
-        drain_bucket(db, bucket.as_deref(), &mut summary).await?;
-    }
-    Ok(summary)
-}
-
-/// A worktree path is eligible when it never existed (`None`) or its directory is
-/// gone. An empty string is treated as "never had a worktree".
-fn is_eligible_bucket(worktree_path: Option<&str>) -> bool {
-    match worktree_path {
-        None | Some("") => true,
-        Some(path) => !Path::new(path).exists(),
-    }
-}
-
-/// Compress every compressible event in one bucket, one transaction per batch,
-/// until the bucket is empty.
-async fn drain_bucket(
-    db: &LocalDb,
-    worktree_path: Option<&str>,
-    summary: &mut BackfillSummary,
-) -> Result<(), String> {
     loop {
-        let batch = load_bucket_batch(db, worktree_path, BATCH_SIZE)
+        let batch = load_batch(db, BATCH_SIZE)
             .await
             .map_err(|e| format!("loading archival backfill batch: {e}"))?;
         if batch.is_empty() {
             break;
         }
-        let (updates, blobs) = classify(&batch, summary)?;
+        let (updates, blobs) = classify(&batch, &mut summary)?;
         apply(db, updates, blobs).await?;
     }
-    Ok(())
+    Ok(summary)
 }
 
 /// Classify a batch into archival updates, reusing the teardown writer's helpers
@@ -378,55 +324,16 @@ async fn apply(
 // Queries.
 // ---------------------------------------------------------------------------
 
-/// Distinct `worktree_path` values (NULL included) of jobs that own at least one
-/// candidate event (`full`/NULL storage with no blob). Bounded by execution count.
-async fn candidate_buckets(db: &LocalDb) -> DbResult<Vec<Option<String>>> {
-    db.query_all(
-        "SELECT DISTINCT j.worktree_path
-         FROM jobs j
-         WHERE EXISTS (
-             SELECT 1 FROM runs r JOIN events e ON e.run_id = r.id
-             WHERE r.job_id = j.id
-               AND (e.storage_mode IS NULL OR e.storage_mode = 'full')
-               AND e.data_blob IS NULL
-         )",
-        (),
-        |row| row.opt_text(0),
-    )
-    .await
-}
-
-/// Compressible events for one bucket: `full`/NULL storage, no blob, owned by a
-/// job with this worktree path.
-async fn load_bucket_batch(
-    db: &LocalDb,
-    worktree_path: Option<&str>,
-    limit: i64,
-) -> DbResult<Vec<Event>> {
-    // The concrete-path bucket binds the path at ?1, so the LIMIT shifts to ?2;
-    // the NULL bucket has no path bind, so LIMIT is ?1.
-    let (predicate, limit_placeholder) = match worktree_path {
-        Some(_) => ("j.worktree_path = ?1", "?2"),
-        None => ("j.worktree_path IS NULL", "?1"),
-    };
+/// Compressible historical events: `full`/NULL storage with no archival blob.
+async fn load_batch(db: &LocalDb, limit: i64) -> DbResult<Vec<Event>> {
     let sql = format!(
         "SELECT {EVENT_COLUMNS} FROM events e
          WHERE (e.storage_mode IS NULL OR e.storage_mode = 'full')
            AND e.data_blob IS NULL
-           AND e.run_id IN (
-               SELECT r.id FROM runs r JOIN jobs j ON r.job_id = j.id
-               WHERE {predicate}
-           )
          ORDER BY e.created_at ASC, e.sequence ASC
-         LIMIT {limit_placeholder}"
+         LIMIT ?1"
     );
-    match worktree_path {
-        Some(path) => {
-            let path = path.to_string();
-            db.query_all(sql, (path, limit), event_from_row).await
-        }
-        None => db.query_all(sql, (limit,), event_from_row).await,
-    }
+    db.query_all(sql, (limit,), event_from_row).await
 }
 
 // ---------------------------------------------------------------------------
@@ -455,21 +362,16 @@ async fn mark_backfill_complete(db: &LocalDb) -> DbResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archival::rewrite::{classify_system_blob_columns_for_test, SystemBlobKind};
     use crate::storage::event_fixture::{
-        assistant_read, assistant_text, system_init_claude, system_prompt, tool_result, user_text,
+        assistant_read, assistant_text, system_prompt, tool_result, user_text,
     };
     use crate::storage::reconstruct_events;
     use crate::storage::{migrated_test_db, SearchIndex};
     use cairn_db::turso::params;
 
-    /// Seed a project/execution/job/run chain. `worktree_path` is the job's
-    /// recorded path: `None` (never had a worktree) and a nonexistent path are
-    /// both eligible buckets; an existing directory is the writer's territory.
-    async fn seed(db: &LocalDb, worktree_path: Option<&str>) {
-        let worktree_path = worktree_path.map(str::to_string);
+    /// Seed a project/execution/job/run chain for store-native maintenance.
+    async fn seed(db: &LocalDb) {
         db.write(move |conn| {
-            let worktree_path = worktree_path.clone();
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('ws','w',1,1)",
@@ -488,9 +390,9 @@ mod tests {
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO jobs(id, execution_id, project_id, status, worktree_path, created_at, updated_at)
-                     VALUES('job','exec','proj','complete',?1,1,1)",
-                    params![worktree_path.as_deref()],
+                    "INSERT INTO jobs(id, execution_id, project_id, status, created_at, updated_at)
+                     VALUES('job','exec','proj','complete',1,1)",
+                    (),
                 )
                 .await?;
                 conn.execute(
@@ -505,35 +407,6 @@ mod tests {
         .await
         .unwrap();
     }
-
-    fn event_fixture(id: &str, seq: i32, event_type: &str, data: &str) -> Event {
-        Event {
-            id: id.to_string(),
-            run_id: "run".to_string(),
-            session_id: None,
-            sequence: seq,
-            timestamp: seq as i64,
-            event_type: event_type.to_string(),
-            data: data.to_string(),
-            parent_tool_use_id: None,
-            created_at: seq as i64,
-            input_tokens: None,
-            cache_read_tokens: None,
-            cache_create_tokens: None,
-            output_tokens: None,
-            turn_id: None,
-            thinking_tokens: None,
-            cost_usd: None,
-            storage_mode: None,
-            content_commit: None,
-            content_change_id: None,
-            content_render_sha: None,
-            data_blob: None,
-            codec: None,
-            read_segments: None,
-        }
-    }
-
     async fn insert_event(db: &LocalDb, id: &str, seq: i64, event_type: &str, data: &str) {
         let id = id.to_string();
         let event_type = event_type.to_string();
@@ -600,58 +473,10 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn hash_addressed_system_events_match_teardown_writer_columns() {
-        let backend_base = "CLAUDE-BASE ".repeat(40);
-        let cairn = "\n\nCAIRN-PROMPT body".to_string();
-        let workspace = "\n\n## Workspace Instructions\n\nworkspace doctrine".to_string();
-        let agent = "\n\n<agent_role>\nbuilder role body".to_string();
-        let (prompt_data, _) = system_prompt(&[
-            ("backend_base", &backend_base),
-            ("cairn", &cairn),
-            ("workspace", &workspace),
-            ("agent", &agent),
-            ("dynamic", "\n\ncwd=/work/run-1"),
-        ]);
-        let init_data = system_init_claude(
-            "sess-1",
-            "uuid-1",
-            "/work/run-1",
-            &["mcp__cairn__read", "Glob", "Grep", "mcp__cairn__write"],
-        );
-
-        for (kind, event_type, data) in [
-            (SystemBlobKind::Prompt, "system:prompt", prompt_data),
-            (SystemBlobKind::Init, "system:init", init_data),
-        ] {
-            let event = event_fixture(event_type, 1, event_type, &data);
-
-            let (rewrite_cols, rewrite_blobs, rewrite_summary) =
-                classify_system_blob_columns_for_test(&event, kind).unwrap();
-
-            let mut backfill_summary = BackfillSummary::default();
-            let (backfill_updates, backfill_blobs) =
-                classify(std::slice::from_ref(&event), &mut backfill_summary).unwrap();
-            assert_eq!(backfill_updates.len(), 1);
-            let backfill_cols = backfill_updates[0].shape.encode();
-
-            assert_eq!(
-                backfill_cols, rewrite_cols,
-                "{event_type} must encode to identical EventColumns in both writers"
-            );
-            assert_eq!(
-                backfill_blobs, rewrite_blobs,
-                "{event_type} must insert identical content-addressed blobs"
-            );
-            assert_eq!(backfill_summary.bytes_after, rewrite_summary.bytes_after);
-            assert_eq!(backfill_summary.rows_compressed, 1);
-        }
-    }
-
     #[tokio::test]
     async fn compresses_and_round_trips_a_torn_down_execution() {
         let db = migrated_test_db("backfill-roundtrip.db").await;
-        seed(&db, Some("/nonexistent/worktree-gone")).await;
+        seed(&db).await;
 
         let a1 = assistant_read("t1", &["file:x"]);
         let e1 = tool_result("t1", "a large rendered file body that should be compressed");
@@ -691,25 +516,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaves_a_live_worktree_untouched() {
-        let db = migrated_test_db("backfill-live.db").await;
-        let live = tempfile::tempdir().unwrap();
-        seed(&db, Some(live.path().to_str().unwrap())).await;
-        insert_event(&db, "u1", 1, "user", &user_text("live")).await;
-
-        run_archival_maintenance(&db).await.unwrap();
-
-        // The worktree still exists, so its events stay full: the teardown writer
-        // owns this execution.
-        let (mode, _, has_blob) = row_state(&db, "u1").await;
-        assert_ne!(mode.as_deref(), Some("zstd"));
-        assert!(!has_blob);
-    }
-
-    #[tokio::test]
     async fn compresses_not_yet_embedded_assistants() {
         let db = migrated_test_db("backfill-assistant.db").await;
-        seed(&db, Some("/nonexistent/worktree-gone")).await;
+        seed(&db).await;
         insert_event(&db, "a1", 1, "assistant", &assistant_text("unembedded")).await;
         insert_event(&db, "u1", 2, "user", &user_text("ready")).await;
 
@@ -724,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn backfill_scan_is_idempotent() {
         let db = migrated_test_db("backfill-idempotent.db").await;
-        seed(&db, None).await; // never had a worktree
+        seed(&db).await;
         for i in 0..5 {
             insert_event(
                 &db,
@@ -747,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn compresses_across_batch_boundaries() {
         let db = migrated_test_db("backfill-batches.db").await;
-        seed(&db, None).await;
+        seed(&db).await;
         let total = (BATCH_SIZE + 100) as usize; // forces multiple batches
         for i in 0..total {
             insert_event(&db, &format!("u{i}"), i as i64, "user", &user_text("x")).await;
@@ -761,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn maintenance_runs_once_then_short_circuits() {
         let db = migrated_test_db("backfill-once.db").await;
-        seed(&db, None).await;
+        seed(&db).await;
         insert_event(&db, "u1", 1, "user", &user_text("done")).await;
 
         run_archival_maintenance(&db).await.unwrap();
@@ -778,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn backfilled_text_is_searchable_after_rebuild() {
         let db = migrated_test_db("backfill-fts.db").await;
-        seed(&db, Some("/nonexistent/worktree-gone")).await;
+        seed(&db).await;
         insert_event(&db, "u1", 1, "user", &user_text("zephyr backfilled needle")).await;
 
         let index_dir = tempfile::tempdir().unwrap();
@@ -804,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn backfills_system_prompt_segments_through_the_blob_path() {
         let db = migrated_test_db("backfill-sysprompt.db").await;
-        seed(&db, Some("/nonexistent/worktree-gone")).await;
+        seed(&db).await;
 
         // Two runs share four static segments and differ only in the dynamic tail,
         // exactly as the assembled prompt is recorded with its `raw.segments` map.
@@ -879,7 +688,7 @@ mod tests {
     #[tokio::test]
     async fn backfills_unsegmented_system_prompt_as_zstd() {
         let db = migrated_test_db("backfill-sysprompt-legacy.db").await;
-        seed(&db, Some("/nonexistent/worktree-gone")).await;
+        seed(&db).await;
         // No `raw.segments`: the historical shape from before CAIRN-1562.
         let data = serde_json::json!({
             "eventType": "system:prompt",

@@ -1,17 +1,15 @@
 //! Integration tests for the command-checkpoint <-> agent auto-fix loop.
 //!
 //! Drives a real execution DAG (agent -> checkpoint(command) -> agent) through
-//! `advance_execution_with_actions` against a real temp jj agent workspace, so
-//! the checkpoint command actually runs and the worktree HEAD SHA gate is
-//! exercised end to end: fail -> Blocked + recorded run, fix+seal -> re-arm ->
-//! re-run -> pass -> downstream advances; plus the no-progress and hard-cap
-//! termination paths and the manual Re-run entry.
+//! `advance_execution_with_actions` against a runner-owned jj branch and attached
+//! test executor. The checkpoint command runs in a disposable projection and the
+//! logical-head commit gate is exercised end to end: fail -> Blocked + recorded
+//! run, publish fix -> re-arm -> re-run -> pass -> downstream advances; plus the
+//! no-progress, hard-cap, and manual re-run paths.
 //!
-//! The worktree is a NON-colocated `.jj` workspace (the production shape), not a
-//! git worktree: CAIRN-1970 ported the checkpoint cache's head/dirty reads off
-//! git porcelain to `jj log -r @-` / `jj diff`, so a git-only worktree never
-//! advances the head the re-arm gate reads. A real agent's "fix and commit" is
-//! modeled by writing the file and sealing (`jj::seal`), which advances `@-`.
+//! The temporary jj workspace below is only a test authoring fixture for advancing
+//! the runner store bookmark. The job never owns or resolves identity through it;
+//! checkpoint execution materializes the branch independently in the test executor.
 
 use crate::common;
 
@@ -55,6 +53,7 @@ async fn ctx() -> Ctx {
     let db_state = Arc::new(DbState::new(db.clone(), search_index));
     let services = Arc::new(TestServicesBuilder::new().build());
     let orch = Orchestrator::builder(db_state, services, config_dir.clone()).build();
+    common::attach_test_executor(&orch);
     Ctx {
         orch,
         db,
@@ -67,8 +66,7 @@ async fn ctx() -> Ctx {
 
 struct CheckpointLoop {
     c: Ctx,
-    worktree: Worktree,
-    path: String,
+    worktree: BranchFixture,
     sha: String,
 }
 
@@ -98,9 +96,14 @@ async fn checkpoint_loop_with_status(
     include_downstream: bool,
 ) -> Option<CheckpointLoop> {
     let c = ctx().await;
-    let worktree = Worktree::try_new(&c.config_dir)?;
-    let path = worktree.path();
+    let worktree = BranchFixture::try_new(&c.config_dir)?;
     let sha = worktree.head();
+    c.db.execute(
+        "UPDATE projects SET repo_path = ?1 WHERE id = ?2",
+        params![worktree.repository_path().as_str(), c.project_id.as_str()],
+    )
+    .await
+    .unwrap();
     insert_execution(&c.db, EXEC_ID, &snapshot(command)).await;
     insert_job(
         &c.db,
@@ -110,7 +113,7 @@ async fn checkpoint_loop_with_status(
         BUILDER_JOB,
         "complete",
         None,
-        Some(&path),
+        Some("branch-coordinate"),
         None,
         "Builder",
     )
@@ -146,12 +149,7 @@ async fn checkpoint_loop_with_status(
         .await;
     }
 
-    Some(CheckpointLoop {
-        c,
-        worktree,
-        path,
-        sha,
-    })
+    Some(CheckpointLoop { c, worktree, sha })
 }
 
 async fn advance_execution(h: &CheckpointLoop) {
@@ -173,14 +171,11 @@ async fn assert_latest_checkpoint_passed(h: &CheckpointLoop, passed: bool) {
     assert_eq!(latest_passed(&h.c.db, CHECKPOINT_JOB).await, Some(passed));
 }
 
-// ── jj worktree harness ──────────────────────────────────────────────────────
+// ── runner branch authoring fixture ──────────────────────────────────────────
 //
-// A real agent worktree is a NON-colocated `.jj` workspace over a shared store
-// (no `.git` in the workspace dir). The re-arm SHA gate reads the head via
-// `jj log -r @-`, so the harness must advance that head by sealing — a git-only
-// worktree (the pre-CAIRN-1970 harness) never moves it and the checkpoint stays
-// blocked. A colocated `jj git init --colocate` repo would carry a `.git` and
-// mask exactly this git-vs-jj mismatch, so `try_new` asserts there is none.
+// The fixture creates commits directly in the runner's shared jj store. It is not
+// a job residence or execution target; the attached executor independently
+// materializes the resulting branch coordinate for each checkpoint command.
 
 /// Initialize a throwaway project git repo with one commit, the store's base.
 fn init_git_repo(repo: &Path) {
@@ -204,16 +199,16 @@ fn init_git_repo(repo: &Path) {
     git(&["commit", "-q", "-m", "init"]);
 }
 
-/// A non-colocated jj agent workspace over a shared store, mirroring production
-/// worktree provisioning. The head advances only via [`Worktree::commit_file`]
-/// (a real agent seal), the same `jj log -r @-` the production gate reads.
-struct Worktree {
-    _project: TempDir,
+/// A branch-authoring fixture over a shared store. It exists only to publish test
+/// commits into the runner-owned coordinate; no agent process resides in or
+/// identifies through this directory.
+struct BranchFixture {
+    project: TempDir,
     dir: TempDir,
     config_dir: PathBuf,
 }
 
-impl Worktree {
+impl BranchFixture {
     /// Provision the workspace, or `None` to self-skip when jj is unavailable.
     /// `config_dir` MUST be the orchestrator's config dir so the checkpoint
     /// gate's `JjEnv` resolves the same store.
@@ -235,7 +230,7 @@ impl Worktree {
             "jj workspace must be non-colocated (no .git)"
         );
         Some(Self {
-            _project: project,
+            project,
             dir,
             config_dir: config_dir.to_path_buf(),
         })
@@ -245,8 +240,8 @@ impl Worktree {
         JjEnv::resolve("jj", &self.config_dir)
     }
 
-    fn path(&self) -> String {
-        self.dir.path().to_string_lossy().to_string()
+    fn repository_path(&self) -> String {
+        self.project.path().to_string_lossy().to_string()
     }
 
     /// The workspace head (`jj log -r @-`), the representation the production
@@ -337,7 +332,7 @@ async fn insert_job(
     node_id: &str,
     status: &str,
     parent_job_id: Option<&str>,
-    worktree_path: Option<&str>,
+    _legacy_coordinate_fixture: Option<&str>,
     session_id: Option<&str>,
     node_name: &str,
 ) {
@@ -350,7 +345,7 @@ async fn insert_job(
         node_name.to_string(),
     );
     let parent_job_id = parent_job_id.map(str::to_string);
-    let worktree_path = worktree_path.map(str::to_string);
+    let branch = "agent/CKL-1-builder-0".to_string();
     let session_id = session_id.map(str::to_string);
     let now = chrono::Utc::now().timestamp();
     db.write(move |conn| {
@@ -363,12 +358,12 @@ async fn insert_job(
             node_name.clone(),
         );
         let parent_job_id = parent_job_id.clone();
-        let worktree_path = worktree_path.clone();
+        let branch = branch.clone();
         let session_id = session_id.clone();
         Box::pin(async move {
             conn.execute(
                 "INSERT INTO jobs (
-                    id, execution_id, recipe_node_id, parent_job_id, worktree_path,
+                    id, execution_id, recipe_node_id, parent_job_id, branch,
                     current_session_id, status, project_id, node_name, created_at, updated_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
@@ -376,7 +371,7 @@ async fn insert_job(
                     exec_id.as_str(),
                     node_id.as_str(),
                     parent_job_id.as_deref(),
-                    worktree_path.as_deref(),
+                    branch.as_str(),
                     session_id.as_deref(),
                     status.as_str(),
                     project_id.as_str(),
@@ -609,8 +604,9 @@ async fn manual_rerun_resets_and_passes() {
     // A prior failed run exists at the original SHA.
     insert_failed_run(&h.c.db, CHECKPOINT_JOB, 1, &h.sha).await;
 
-    // The worktree is already fixed (no new commit needed — manual bypasses SHA).
-    std::fs::write(format!("{}/fixed.txt", h.path), "x").unwrap();
+    // Publish the fix to the runner-owned logical head. Manual re-run bypasses
+    // the automatic re-arm gate and executes that current coordinate immediately.
+    h.commit_file("fixed.txt");
 
     rerun_checkpoint_job(&h.c.orch, CHECKPOINT_JOB)
         .await
@@ -625,11 +621,6 @@ async fn manual_rerun_resets_and_passes() {
 #[tokio::test]
 async fn rerun_rejects_non_checkpoint() {
     let c = ctx().await;
-    let Some(wt) = Worktree::try_new(&c.config_dir) else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    let path = wt.path();
     insert_execution(&c.db, EXEC_ID, &snapshot("exit 0")).await;
     // An agent job with a session is not a command checkpoint.
     insert_job(
@@ -640,7 +631,7 @@ async fn rerun_rejects_non_checkpoint() {
         BUILDER_JOB,
         "blocked",
         None,
-        Some(&path),
+        Some("branch-coordinate"),
         Some("sess-1"),
         "Builder",
     )

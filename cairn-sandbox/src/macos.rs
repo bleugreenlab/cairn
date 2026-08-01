@@ -95,9 +95,10 @@ pub(crate) fn wrap_argv(
     ("/usr/bin/sandbox-exec".to_string(), wrapped)
 }
 
-/// Build a space-joined run of `(subpath "...")` clauses for canonicalized,
-/// existing paths. Non-existent paths are dropped (subpath of a missing path
-/// is inert), and each literal is escaped for SBPL.
+/// Build a space-joined run of `(subpath "...")` clauses for canonicalized
+/// paths, each literal escaped for SBPL. A path that does not exist yet still
+/// gets a clause: the rule is inert until something appears there, and emitting
+/// it is what lets a confined process create a path the policy has granted.
 fn subpath_rules(paths: &[PathBuf]) -> String {
     let mut seen: Vec<String> = Vec::new();
     for p in paths {
@@ -309,31 +310,62 @@ mod tests {
     // sandbox-exec and assert the kernel enforces the policy. Runs only on
     // macOS, where sandbox-exec is present.
     //
-    // These tests spawn a real `sandbox-exec`. When the test process is itself
-    // already confined by a Cairn worktree fence (`CAIRN_SANDBOXED=1`, set on
-    // every fenced `run`/skill/PTY spawn), the nested `sandbox-exec` cannot
-    // perform even the in-bounds writes they assert, so they cannot run
-    // meaningfully. Each live test detects that and skips rather than fails;
-    // unfenced CI still runs them for real kernel-level coverage. This is what
-    // lets `bun run test:rust` go fully green inside an agent fence without a
-    // hand-maintained skip-list.
-    fn skip_when_fenced(test: &str) -> bool {
-        if std::env::var_os("CAIRN_SANDBOXED").is_some() {
-            eprintln!(
-                "skipping {test}: nested sandbox-exec is unsupported inside a Cairn worktree fence"
+    // macOS sandboxes do not nest: inside an outer sandbox a nested
+    // `sandbox-exec` cannot write even where its own profile permits it, so there
+    // is no policy left to observe. That refusal IS the behavior here, which makes
+    // these the one family of tests a skip legitimately belongs to — but the skip
+    // has to state a measured fact rather than a guess about the environment.
+    // Reading `CAIRN_SANDBOXED` was such a guess, and it was wrong in both
+    // directions: inherited down a spawn chain where no sandbox existed, and
+    // absent where one did (CAIRN-3164). So each live test PROBES the capability
+    // and records a skip naming it, declared in `src-tauri/skip-manifest.toml`.
+    //
+    // The probe costs one process spawn and every live test asks, so it resolves
+    // once per test binary.
+    fn nested_sandbox_exec_available() -> bool {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let Ok(dir) = tempdir() else {
+                return false;
+            };
+            // The narrowest form of what every live test below does: a write the
+            // profile explicitly permits.
+            let policy = SandboxPolicy {
+                worktree: dir.path().to_path_buf(),
+                writable_extra: vec![],
+                deny_read: vec![],
+                writable_regex: vec![],
+                worktree_writable: true,
+            };
+            let probe = dir.path().join("probe");
+            let (program, args) = wrap_argv(
+                "/bin/bash",
+                &["-c".into(), format!("echo ok > {}", probe.display())],
+                &policy,
             );
-            record_fence_skip(test);
-            true
-        } else {
-            false
-        }
+            Command::new(program)
+                .args(args)
+                .output()
+                .is_ok_and(|out| out.status.success())
+                && probe.exists()
+        })
     }
 
-    // Best-effort: append a self-skipped test name to `$CAIRN_SKIP_LOG` (set by
-    // `scripts/test-rust.ts`) so the runner can report how many tests skipped
-    // under the fence. libtest swallows the skip message of a passing test, so
-    // without this the skip is indistinguishable from a real pass. (#157)
-    fn record_fence_skip(test: &str) {
+    fn skip_without_nested_sandbox_exec(test: &str) -> bool {
+        if nested_sandbox_exec_available() {
+            return false;
+        }
+        eprintln!("skipping {test}: a nested sandbox-exec cannot write inside its own profile");
+        record_skip(test, "nested-sandbox-exec");
+        true
+    }
+
+    // Best-effort: append `name<TAB>reason` to `$CAIRN_SKIP_LOG` (set by
+    // `scripts/test-rust.ts`) so the runner moves this test out of `passed` and
+    // checks it against `src-tauri/skip-manifest.toml`. libtest counts an early
+    // return as a pass and swallows its message, so without this record the skip
+    // is indistinguishable from real coverage (#157).
+    fn record_skip(test: &str, reason: &str) {
         if let Some(log) = std::env::var_os("CAIRN_SKIP_LOG") {
             use std::io::Write as _;
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -343,14 +375,14 @@ mod tests {
             {
                 // One write_all (vs writeln!'s multiple syscalls) keeps the
                 // append atomic when parallel test threads all skip at once.
-                let _ = f.write_all(format!("{test}\n").as_bytes());
+                let _ = f.write_all(format!("{test}\t{reason}\n").as_bytes());
             }
         }
     }
 
     #[test]
     fn enforces_write_confinement_and_read_denylist_live() {
-        if skip_when_fenced("enforces_write_confinement_and_read_denylist_live") {
+        if skip_without_nested_sandbox_exec("enforces_write_confinement_and_read_denylist_live") {
             return;
         }
         let wt = tempdir().unwrap();
@@ -410,7 +442,7 @@ mod tests {
     // while a sensitive sibling under the same denied base is blocked.
     #[test]
     fn worktree_under_denied_prefix_stays_readable_live() {
-        if skip_when_fenced("worktree_under_denied_prefix_stays_readable_live") {
+        if skip_without_nested_sandbox_exec("worktree_under_denied_prefix_stays_readable_live") {
             return;
         }
         let base = tempdir().unwrap();
@@ -445,9 +477,145 @@ mod tests {
         );
     }
 
+    // The interactive-shell grant has two properties worth proving at the
+    // kernel rather than in the derivation: a shell can create its own state on
+    // a home that has never run it, and nothing else under the same XDG base
+    // becomes writable in the process.
+    #[test]
+    fn interactive_shell_state_grant_creates_shell_paths_but_not_neighbours_live() {
+        if skip_without_nested_sandbox_exec(
+            "interactive_shell_state_grant_creates_shell_paths_but_not_neighbours_live",
+        ) {
+            return;
+        }
+        let wt = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let data = home.path().join(".local/share");
+        // The host ensures the base exists; the shell's own dir does not yet.
+        std::fs::create_dir_all(&data).unwrap();
+        let neighbour = data.join("some-other-app");
+        std::fs::create_dir_all(&neighbour).unwrap();
+
+        let policy = SandboxPolicy {
+            worktree: wt.path().to_path_buf(),
+            writable_extra: vec![data.join("fish"), data.join("z")],
+            deny_read: vec![],
+            writable_regex: vec![],
+            worktree_writable: true,
+        };
+        let run = |cmd: &str| -> std::process::Output {
+            let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
+            Command::new(program).args(args).output().unwrap()
+        };
+
+        let fish = data.join("fish");
+        let out = run(&format!(
+            "mkdir -p {0} && echo hi > {0}/fish_history",
+            fish.display()
+        ));
+        assert!(
+            out.status.success(),
+            "a first-run shell must be able to create its own state: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(fish.join("fish_history").exists());
+
+        let out = run(&format!("echo x > {}/db", neighbour.display()));
+        assert!(
+            !out.status.success(),
+            "an unrelated application's state under the same base must stay unwritable"
+        );
+
+        let out = run(&format!("mkdir {}/newly-invented-app", data.display()));
+        assert!(
+            !out.status.success(),
+            "the XDG base itself must stay unwritable"
+        );
+    }
+
+    /// What a read-only-checkout profile actually costs, at the kernel. Dropping
+    /// the checkout from the writable set also drops every carve-out that
+    /// contains it, so the writable set narrows to the explicit grants: the
+    /// checkout's own build directory and any Cairn state directory beside it
+    /// (a jj store, a sibling cell) become unwritable while both stay readable.
+    ///
+    /// That is the mechanism behind every specimen denial in CAIRN-3227. Which
+    /// spawns receive this profile is the fence dial's decision and lives in
+    /// `cairn-core`; what the profile does once applied is this.
+    #[test]
+    fn readonly_checkout_profile_denies_the_checkout_and_neighbouring_state_live() {
+        if skip_without_nested_sandbox_exec(
+            "readonly_checkout_profile_denies_the_checkout_and_neighbouring_state_live",
+        ) {
+            return;
+        }
+        let base = tempdir().unwrap();
+        let checkout = base.path().join("live-checkout");
+        let build_dir = checkout.join("target");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), "[package]").unwrap();
+        // Stands in for `~/.cairn/jj-stores/<store>`: Cairn's own state, beside
+        // the checkout and in nobody's writable set.
+        let store = base.path().join("cairn-home/jj-stores/store");
+        std::fs::create_dir_all(&store).unwrap();
+        // Stands in for the per-job scratch the executor grants explicitly.
+        let scratch = base.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let policy = SandboxPolicy::for_readonly_checkout(
+            &checkout,
+            &[scratch.to_string_lossy().into_owned()],
+            vec![],
+        );
+        let confined = |cmd: &str| -> std::process::Output {
+            let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
+            Command::new(program).args(args).output().unwrap()
+        };
+
+        let build_probe = build_dir.join("probe");
+        let store_probe = store.join("working_copy.lock");
+        let scratch_probe = scratch.join("probe");
+        let write = |path: &Path| format!("echo x > {}", path.display());
+
+        assert!(
+            !confined(&write(&build_probe)).status.success(),
+            "a read-only checkout denies its own build directory"
+        );
+        assert!(
+            !confined(&write(&store_probe)).status.success(),
+            "Cairn's own state beside the checkout is denied too"
+        );
+        assert!(
+            confined(&format!("cat {}", checkout.join("Cargo.toml").display()))
+                .status
+                .success(),
+            "the checkout stays readable"
+        );
+        assert!(
+            confined(&write(&scratch_probe)).status.success(),
+            "an explicit grant stays writable"
+        );
+
+        // The control is the whole point of the dial: with no policy applied —
+        // what every spawn surface produces for a `fence: allow` agent — the same
+        // three operations are ordinary filesystem writes.
+        std::fs::remove_file(&scratch_probe).unwrap();
+        for path in [&build_probe, &store_probe, &scratch_probe] {
+            let out = Command::new("/bin/bash")
+                .args(["-c", &write(path)])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success() && path.exists(),
+                "unconfined spawn must perform the specimen write: {}",
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn writable_extra_carveout_permits_writes_live() {
-        if skip_when_fenced("writable_extra_carveout_permits_writes_live") {
+        if skip_without_nested_sandbox_exec("writable_extra_carveout_permits_writes_live") {
             return;
         }
         let wt = tempdir().unwrap();
@@ -547,7 +715,9 @@ mod tests {
     // This is the regression guard for the Managed Build Services fix.
     #[test]
     fn service_sandbox_permits_worktree_target_writes_only_live() {
-        if skip_when_fenced("service_sandbox_permits_worktree_target_writes_only_live") {
+        if skip_without_nested_sandbox_exec(
+            "service_sandbox_permits_worktree_target_writes_only_live",
+        ) {
             return;
         }
         let base = tempdir().unwrap();

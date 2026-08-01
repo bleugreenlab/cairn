@@ -54,31 +54,6 @@ pub async fn recompute_issue_status(db: &LocalDb, issue_id: &str) {
         .await;
 }
 
-pub async fn resolve_issue(
-    db: &LocalDb,
-    emitter: &dyn EventEmitter,
-    issue_id: &str,
-    resolution: Resolution,
-) -> Result<(), String> {
-    crud::resolve(db, &RealClock, issue_id, resolution)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let issue = crud::get(db, issue_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Issue not found after resolution: {issue_id}"))?;
-    let _ = emitter.emit(
-        "db-change",
-        crate::notify::issue_db_change(&issue, "update"),
-    );
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "sessions", "action": "update"}),
-    );
-    Ok(())
-}
-
 pub async fn unresolve_issue(
     db: &LocalDb,
     emitter: &dyn EventEmitter,
@@ -256,33 +231,6 @@ mod tests {
         db
     }
 
-    async fn insert_open_issue_with_session(db: &LocalDb) {
-        db.execute_script(
-            "
-            INSERT INTO workspaces (id, name, created_at, updated_at)
-             VALUES ('workspace-1', 'Workspace', 1, 1);
-            INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'workspace-1', 'Project', 'PROJ', '/tmp/proj', 1, 1);
-            INSERT INTO issues (
-                id, project_id, number, title, status, progress, attention,
-                created_at, updated_at
-             ) VALUES ('issue-1', 'project-1', 1, 'Issue', 'active', 'active',
-                'required', 1, 1);
-            INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
-             VALUES ('exec-1', 'recipe-1', 'issue-1', 'project-1', 'running', 1, 1);
-            INSERT INTO jobs (
-                id, execution_id, recipe_node_id, issue_id, project_id, status,
-                node_name, uri_segment, created_at, updated_at
-             ) VALUES ('job-1', 'exec-1', 'node-1', 'issue-1', 'project-1',
-                'running', 'Node', 'node', 1, 1);
-            INSERT INTO sessions (id, job_id, status, created_at, updated_at)
-             VALUES ('session-1', 'job-1', 'open', 1, 1);
-            ",
-        )
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn transition_job_readiness_sets_started_at_and_emits_scoped_changes() {
         let db = migrated_db().await;
@@ -377,55 +325,5 @@ mod tests {
 
         assert!(error.contains("only support pending/running"));
         assert!(emitter.events_named("db-change").is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolve_issue_sets_completion_attention_and_emits_changes() {
-        let db = migrated_db().await;
-        insert_open_issue_with_session(&db).await;
-        let emitter = CapturingEmitter::new();
-
-        resolve_issue(&db, &emitter, "issue-1", Resolution::Merged)
-            .await
-            .unwrap();
-
-        db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT status, progress, attention, completed_at, merged_at
-                         FROM issues WHERE id = ?1",
-                        params!["issue-1"],
-                    )
-                    .await?;
-                let row = rows.next().await?.expect("resolved issue row");
-                assert_eq!(row.text(0)?, "merged");
-                assert_eq!(row.text(1)?, "merged");
-                assert_eq!(row.text(2)?, "none");
-                assert!(row.opt_i64(3)?.is_some());
-                assert!(row.opt_i64(4)?.is_some());
-
-                let mut rows = conn
-                    .query(
-                        "SELECT status, terminal_reason FROM sessions WHERE id = ?1",
-                        params!["session-1"],
-                    )
-                    .await?;
-                let row = rows.next().await?.expect("closed session row");
-                assert_eq!(row.text(0)?, "closed");
-                assert_eq!(row.opt_text(1)?.as_deref(), Some("issue_merged"));
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        let db_changes = emitter.events_named("db-change");
-        assert!(db_changes
-            .iter()
-            .any(|payload| payload["table"] == "issues"));
-        assert!(db_changes
-            .iter()
-            .any(|payload| payload["table"] == "sessions"));
     }
 }

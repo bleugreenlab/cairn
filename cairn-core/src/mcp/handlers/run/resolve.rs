@@ -1,6 +1,8 @@
 //! Run-item resolution: classify each item into a shell command, inline code, a
 //! skill-script spec, or a proxied MCP `tools/call`.
 
+use base64::Engine as _;
+
 use super::types::{McpCallSpec, RunItem, RunSpec};
 use crate::config::mcp_servers::McpServerConfig;
 use crate::mcp::handlers::{skills_resources, unwrap_shell_launcher, RunContext};
@@ -99,9 +101,20 @@ fn resolve_matlab_spec(
         "MATLAB was not found on the agent PATH or in /Applications/MATLAB_R*.app/bin/matlab. Install MATLAB there or add its bin directory to PATH, then read cairn://skills/matlab for setup guidance."
             .to_string()
     })?;
+    // `matlab -batch` evaluates only the first line of its argument: the rest
+    // is discarded without ever being parsed, so a multi-line snippet exits 0
+    // having run one statement, and even a syntax error below line one goes
+    // unreported. Hand MATLAB a single-line `eval` of the base64-encoded
+    // source instead. That restores whole-snippet execution (comments,
+    // control blocks, quotes, and non-ASCII text all survive verbatim) and
+    // lets failures anywhere in the snippet propagate as a nonzero exit.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(code);
     Ok((
         program.to_string_lossy().into_owned(),
-        vec!["-batch".to_string(), code.to_string()],
+        vec![
+            "-batch".to_string(),
+            format!("eval(native2unicode(matlab.net.base64decode('{encoded}'),'UTF-8'))"),
+        ],
         None,
     ))
 }
@@ -290,11 +303,12 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
 /// When uv resolves, delegate to `uv run -` and hand the code to it on **stdin**.
 /// uv itself does the project detection and PEP 723 inline-metadata parsing, so a
 /// `# /// script` dependency block, a surrounding `pyproject.toml`'s deps, or
-/// plain stdlib code all run correctly with no mode branching here. Stdin is
-/// required, not merely convenient: `uv run -c` never parses PEP 723 metadata,
-/// and feeding stdin keeps `cwd` at the worktree so uv's project detection sees
-/// the real project (a temp script in `$TMPDIR` would sit outside the worktree
-/// and defeat that).
+/// plain stdlib code all run correctly with no mode branching here. Stdin is how
+/// uv accepts source at all: `uv run` has no inline-source flag, so the only
+/// alternative is a temp file, and stdin carries no lifecycle. That choice is
+/// about simplicity rather than correctness — uv detects a project from `cwd`,
+/// never from where the source lives, so a script written to `$TMPDIR` resolves
+/// the same project a piped one does.
 ///
 /// When uv is absent, fall back byte-for-byte to today's `python3 -c <code>`.
 /// This fallback is the ladder's ONLY silent downgrade and is debug-logged at the
@@ -628,25 +642,64 @@ mod tests {
         assert_eq!(
             args,
             vec!["run".to_string(), "-".to_string()],
-            "uv reads the script from stdin, not from an argv flag"
+            "uv has no inline-source flag; it reads the script from stdin"
         );
         assert_eq!(
             stdin.as_deref(),
             Some("print(1)"),
-            "the code must be delivered on stdin so uv parses PEP 723 metadata"
+            "the code must be delivered on stdin for uv to receive it at all"
         );
     }
 
+    /// Decode the base64 payload back out of a `-batch` argument.
+    fn decode_batch_payload(argument: &str) -> String {
+        let encoded = argument
+            .split('\'')
+            .nth(1)
+            .expect("the eval wrapper quotes its base64 payload");
+        String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("payload is valid base64"),
+        )
+        .expect("payload is valid UTF-8")
+    }
+
     #[test]
-    fn resolve_matlab_spec_uses_direct_batch_argv() {
+    fn resolve_matlab_spec_uses_single_line_batch_argv() {
         let (program, args, stdin) = resolve_matlab_spec(
             "disp('hello world')",
             Some(std::path::PathBuf::from("/opt/matlab/bin/matlab")),
         )
         .unwrap();
         assert_eq!(program, "/opt/matlab/bin/matlab");
-        assert_eq!(args, vec!["-batch", "disp('hello world')"]);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-batch");
+        assert_eq!(decode_batch_payload(&args[1]), "disp('hello world')");
         assert_eq!(stdin, None);
+    }
+
+    /// `matlab -batch` silently drops everything past the first newline, so a
+    /// multi-line snippet must reach MATLAB as one line that reconstitutes the
+    /// original source rather than as the raw text.
+    #[test]
+    fn resolve_matlab_spec_preserves_every_line_of_a_multiline_snippet() {
+        let code = "% set up\ntotal = 0;\nfor k = 1:4\n    total = total + k;\nend\nfprintf('%d\\n', total);";
+        let (_program, args, _stdin) = resolve_matlab_spec(
+            code,
+            Some(std::path::PathBuf::from("/opt/matlab/bin/matlab")),
+        )
+        .unwrap();
+        assert!(
+            !args[1].contains('\n'),
+            "the -batch argument must stay single-line or MATLAB truncates it: {}",
+            args[1]
+        );
+        assert_eq!(
+            decode_batch_payload(&args[1]),
+            code,
+            "MATLAB must receive the snippet verbatim"
+        );
     }
 
     #[test]

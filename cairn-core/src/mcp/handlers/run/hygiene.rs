@@ -1,8 +1,6 @@
 //! Working-directory hygiene: path normalization, `cd`-command advisory notes,
 //! and branch-checkout tracked-change verification.
 
-use crate::orchestrator::Orchestrator;
-
 /// Extract the target path from a command that begins with `cd`.
 ///
 /// Returns `None` when the command does not start with `cd ` or when no usable
@@ -52,7 +50,7 @@ pub(super) fn expand_tilde(path: &str) -> String {
 /// resolve `.` and `..` components without touching the filesystem. This is a
 /// pure string operation — no canonicalize, no symlink resolution — so it works
 /// for paths that may not exist yet and stays consistent across comparisons.
-fn normalize_path(path: &str, cwd: &str) -> String {
+pub(super) fn normalize_path(path: &str, cwd: &str) -> String {
     let expanded = expand_tilde(path);
     let p = std::path::Path::new(&expanded);
     let absolute = if p.is_absolute() {
@@ -77,57 +75,7 @@ fn normalize_path(path: &str, cwd: &str) -> String {
 }
 
 /// Scan resolved command headers for `cd` commands and produce advisory notes.
-///
-/// A `cd` to the current working directory (the worktree) gets an informational
-/// note: the worktree is already the cwd, so no navigation prefix is needed.
-/// A `cd` to the project's primary checkout (the repo root) gets a warning:
-/// commands should be run from the worktree, not the main checkout, because
-/// changes made outside the worktree are not tracked or committed.
-///
-/// Notes are deduplicated: at most one informational and one warning note per
-/// batch, regardless of how many commands repeat the same `cd`.
-fn checkout_tracked_status(
-    orch: &Orchestrator,
-    checkout: &std::path::Path,
-) -> Result<String, String> {
-    if crate::jj::is_jj_dir(checkout) {
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        return crate::jj::working_copy_dirty_paths(&jj, checkout)
-            .map(|paths| paths.join("\n"))
-            .map_err(|error| {
-                format!(
-                    "jj diff --summary failed for {}: {error}",
-                    checkout.display()
-                )
-            });
-    }
-    let ctx = format!("git status for {}", checkout.display());
-    let output = crate::jj::bounded_command_output(
-        crate::env::git().arg("-C").arg(checkout).args([
-            "status",
-            "--porcelain",
-            "--untracked-files=no",
-        ]),
-        crate::jj::JJ_DEFAULT_TIMEOUT,
-        &ctx,
-    )?;
-    if !output.status.success() {
-        return Err(format!(
-            "git status failed for {}: {}",
-            checkout.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-pub(super) fn checkout_has_tracked_changes(
-    orch: &Orchestrator,
-    checkout: &std::path::Path,
-) -> Result<bool, String> {
-    Ok(!checkout_tracked_status(orch, checkout)?.is_empty())
-}
-
+/// Notes are deduplicated per batch.
 pub(super) fn check_cd_commands<'a, I>(headers: I, cwd: &str, repo_root: Option<&str>) -> String
 where
     I: IntoIterator<Item = &'a str>,
@@ -153,10 +101,9 @@ where
             if normalized_target == *repo && !noted_repo {
                 noted_repo = true;
                 notes.push(format!(
-                    "\u{26a0}\u{fe0f} Warning: `cd {target}` navigates to the project's primary \
-                     checkout, not your worktree. Commands should be run from the worktree \
-                     (`{cwd}`), not the main repository checkout. Changes can only be made \
-                     in a worktree."
+                    "\u{26a0}\u{fe0f} Warning: `cd {target}` targets the user's live checkout. \
+                     Repository commands run in executor cells; the agent process residence \
+                     (`{cwd}`) is scratch and does not grant live-checkout authority."
                 ));
             }
         }
@@ -284,8 +231,9 @@ mod tests {
         let cwd = "/work/myproject-builder-0";
         let notes = check_cd_commands(["cd /repos/cairn && git status"], cwd, Some("/repos/cairn"));
         assert!(notes.contains('\u{26a0}'));
-        assert!(notes.contains("primary checkout"));
-        assert!(notes.contains("worktree"));
+        assert!(notes.contains("user's live checkout"));
+        assert!(notes.contains("executor cells"));
+        assert!(notes.contains("process residence"));
     }
 
     #[test]

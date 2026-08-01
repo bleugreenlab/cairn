@@ -73,6 +73,48 @@ fn schema_config_from_output_contract(contract: &DelegatedOutputContract) -> Sch
     }
 }
 
+/// The agent node a delegated packet materializes into.
+///
+/// Its branch mode is [`BranchMode::Inherit`]: a delegated task continues the
+/// branch of the job that spawned it, so what it reads, builds, and tests is the
+/// parent's logical head at spawn time rather than the base branch the parent
+/// was originally cut from. Seeding is the delegation-edge half of the CAIRN-3278
+/// invariant — what you read is what you build — and it is what makes a task's
+/// tests exercise the parent's in-flight work instead of pre-change code.
+///
+/// The mode is the whole coordinate decision. `reparent_delegated_jobs` records
+/// the lineage inheritance depends on before the node can activate, and
+/// `prepare_job` re-resolves the parent's live bookmark at activation and
+/// persists the exact commit the child starts from.
+///
+/// This emitted [`BranchMode::None`] until CAIRN-3309, contradicting every
+/// comment around it. That mode leaves `jobs.branch` NULL, and a job without a
+/// branch of its own reads and writes its `base_branch` — so every delegated
+/// task ran against `main` while its parent held unpushed commits.
+fn delegated_agent_node(agent_id: String, packet: &DelegatedWorkPacket) -> RecipeNode {
+    RecipeNode {
+        id: agent_id,
+        node_type: RecipeNodeType::Agent,
+        name: packet.title.clone(),
+        position: NodePosition { x: 400.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config: Some(AgentNodeConfig {
+            agent_config_id: Some(packet.agent_config_id.clone()),
+            output_schema: Some(schema_config_from_output_contract(&packet.output_contract)),
+            git_config: Some(AgentGitConfig {
+                branch_mode: BranchMode::Inherit,
+                require_parent_head: true,
+            }),
+        }),
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: None,
+        condition_config: None,
+        context_config: None,
+    }
+}
+
 pub(super) fn expand_delegated_packets(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
@@ -178,40 +220,11 @@ pub(super) fn expand_delegated_packets(
             });
         }
 
-        // An ambient (no-worktree) parent's delegated task cannot inherit a
-        // worktree and must not run in the user's live checkout, so the node owns
-        // a fresh ephemeral worktree (WorktreeMode::Own) off the default branch,
-        // reclaimed when the task job terminalizes. A worktree-backed parent's
-        // task inherits the parent's worktree via reparenting (WorktreeMode::None,
-        // unchanged). `reparent_delegated_jobs` marks the ambient case
-        // `owns_ephemeral_worktree`.
-        let worktree_mode = if parent_job_has_worktree(db, &packet_view.parent_job_id)? {
-            WorktreeMode::None
-        } else {
-            WorktreeMode::Own
-        };
-
         if !snapshot.recipe.nodes.iter().any(|node| node.id == agent_id) {
-            snapshot.recipe.nodes.push(RecipeNode {
-                id: agent_id.clone(),
-                node_type: RecipeNodeType::Agent,
-                name: packet_view.title.clone(),
-                position: NodePosition { x: 400.0, y: 0.0 },
-                parent_id: None,
-                trigger_config: None,
-                agent_config: Some(AgentNodeConfig {
-                    agent_config_id: Some(packet_view.agent_config_id.clone()),
-                    output_schema: Some(schema_config_from_output_contract(
-                        &packet_view.output_contract,
-                    )),
-                    git_config: Some(AgentGitConfig { worktree_mode }),
-                }),
-                action_config: None,
-                checkpoint_config: None,
-                artifact_config: None,
-                condition_config: None,
-                context_config: None,
-            });
+            snapshot
+                .recipe
+                .nodes
+                .push(delegated_agent_node(agent_id.clone(), &packet_view));
             new_agent_node_ids.insert(agent_id.clone());
         }
 
@@ -287,35 +300,6 @@ pub(super) fn expand_delegated_packets(
     Ok(new_agent_node_ids)
 }
 
-/// Whether the delegating parent job owns a worktree. An ambient (Branch: main /
-/// no-worktree) parent returns `false`, which routes its task onto its own
-/// ephemeral worktree (`WorktreeMode::Own` at materialization,
-/// `owns_ephemeral_worktree` at reparenting).
-fn parent_job_has_worktree(db: &Arc<LocalDb>, parent_job_id: &str) -> Result<bool, String> {
-    let db = db.clone();
-    let parent_job_id = parent_job_id.to_string();
-    run_advancement_db(async move {
-        db.read(|conn| {
-            let parent_job_id = parent_job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT worktree_path FROM jobs WHERE id = ?1",
-                        params![parent_job_id.as_str()],
-                    )
-                    .await?;
-                let has_worktree = match rows.next().await? {
-                    Some(row) => row.opt_text(0)?.is_some(),
-                    None => false,
-                };
-                Ok(has_worktree)
-            })
-        })
-        .await
-        .map_err(|e| format!("Failed to read parent worktree state: {e}"))
-    })
-}
-
 fn find_job_id_for_node(
     db: &Arc<LocalDb>,
     execution_id: &str,
@@ -385,6 +369,18 @@ fn assign_delegated_job_metadata(
 /// parent-unique `uri_segment` (kept in lockstep with `node_name`). Extracted
 /// from `assign_delegated_job_metadata` so the disambiguation is unit-testable.
 ///
+/// This establishes lineage before activation: `parent_job_id`, the parent's
+/// branch, and the addressing a child is reachable by. It is not where the
+/// child's start commit is decided. The `base_commit` copied here is the
+/// parent's archival row, carried forward for `pack_anchor` bookkeeping;
+/// `prepare_job` resolves the parent branch's live bookmark at activation and
+/// overwrites it with the commit the child actually starts from.
+///
+/// A parent with no branch is refused rather than silently re-parented onto the
+/// base branch: without a parent coordinate there is nothing for the child to
+/// inherit, and starting from base is precisely the failure this edge exists to
+/// prevent.
+///
 /// `ordered_jobs` is `(job_id, recipe_node_id)` pre-sorted by packet order.
 pub(super) async fn reparent_delegated_jobs(
     db: &LocalDb,
@@ -412,16 +408,24 @@ pub(super) async fn reparent_delegated_jobs(
 
                 let mut parent_rows = conn
                     .query(
-                        "SELECT worktree_path FROM jobs WHERE id = ?1",
+                        "SELECT branch, base_commit, base_branch FROM jobs WHERE id = ?1",
                         (packet.parent_job_id.as_str(),),
                     )
                     .await?;
-                let parent_worktree = parent_rows
-                    .next()
-                    .await?
-                    .map(|row| row.opt_text(0))
-                    .transpose()?
-                    .flatten();
+                let parent_row = parent_rows.next().await?.ok_or_else(|| {
+                    DbError::Row(format!(
+                        "delegating parent job {} was not found",
+                        packet.parent_job_id
+                    ))
+                })?;
+                let parent_branch = parent_row.opt_text(0)?.ok_or_else(|| {
+                    DbError::Row(format!(
+                        "delegating parent job {} has no logical branch",
+                        packet.parent_job_id
+                    ))
+                })?;
+                let parent_base_commit = parent_row.opt_text(1)?;
+                let parent_base_branch = parent_row.opt_text(2)?;
 
                 // Reserve against existing siblings' uri_segment — the column the
                 // (parent_job_id, uri_segment) unique index actually guards — so a
@@ -453,14 +457,6 @@ pub(super) async fn reparent_delegated_jobs(
                     .or_default()
                     .insert(slug.clone());
 
-                // An ambient (no-worktree) parent leaves `parent_worktree` NULL:
-                // the reparented job keeps a NULL worktree_path (its
-                // WorktreeMode::Own node mints a fresh worktree at activation) and
-                // is marked `owns_ephemeral_worktree` so it is reclaimed on
-                // completion. A worktree-backed parent inherits its path here and
-                // is not an ephemeral owner.
-                let owns_ephemeral_worktree: i64 = if parent_worktree.is_none() { 1 } else { 0 };
-
                 // Keep node_name and uri_segment in lockstep so the addressable
                 // segment is the disambiguated, parent-unique slug. Carry the
                 // packet's parent_tool_use_id onto the job so the transcript can
@@ -470,20 +466,22 @@ pub(super) async fn reparent_delegated_jobs(
                 conn.execute(
                     "UPDATE jobs
                          SET parent_job_id = ?1,
-                             worktree_path = ?2,
-                             task_index = ?3,
-                             node_name = ?4,
-                             uri_segment = ?4,
-                             parent_tool_use_id = ?5,
-                             owns_ephemeral_worktree = ?6
-                         WHERE id = ?7",
+                             branch = ?2,
+                             base_commit = ?3,
+                             base_branch = ?4,
+                             task_index = ?5,
+                             node_name = ?6,
+                             uri_segment = ?6,
+                             parent_tool_use_id = ?7
+                         WHERE id = ?8",
                     params![
                         packet.parent_job_id.as_str(),
-                        parent_worktree.as_deref(),
+                        parent_branch.as_str(),
+                        parent_base_commit.as_deref(),
+                        parent_base_branch.as_deref(),
                         packet.task_index,
                         slug.as_str(),
                         packet.parent_tool_use_id.as_deref(),
-                        owns_ephemeral_worktree,
                         job_id.as_str(),
                     ],
                 )
@@ -515,34 +513,20 @@ mod tests {
         db
     }
 
-    #[tokio::test]
-    async fn reparented_delegated_job_inherits_parent_worktree_path() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
-                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
-                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
-                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, worktree_path, uri_segment, node_name, created_at, updated_at) VALUES ('parent-job','e-1','i-1','p-1','running','/tmp/parent-worktree','executor','Executor',1,1)", ()).await?;
-                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, recipe_node_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('child-job','e-1','i-1','p-1','delegated-agent','pending','child','Child',1,1)", ()).await?;
-                Ok::<_, DbError>(())
-            })
-        })
-        .await
-        .unwrap();
-
-        let packet = DelegatedWorkPacket {
-            id: "packet-1".to_string(),
-            parent_job_id: "parent-job".to_string(),
-            parent_turn_id: Some("turn-1".to_string()),
-            parent_tool_use_id: Some("tool-1".to_string()),
+    /// A packet delegating `title` from `parent_job_id`, materialized onto
+    /// `node_id`.
+    fn packet(id: &str, parent_job_id: &str, title: &str, node_id: &str) -> DelegatedWorkPacket {
+        DelegatedWorkPacket {
+            id: id.into(),
+            parent_job_id: parent_job_id.into(),
+            parent_turn_id: Some("turn-1".into()),
+            parent_tool_use_id: Some("tool-1".into()),
             origin: DelegationOrigin::TaskTool,
-            title: "Implement child".to_string(),
-            problem_statement: "Do the child task".to_string(),
-            agent_config_id: "build".to_string(),
+            title: title.into(),
+            problem_statement: "Do the child task".into(),
+            agent_config_id: "build".into(),
             ownership: DelegatedOwnershipScope {
-                cwd: "/not/the/process/cwd".to_string(),
+                cwd: "/scratch".into(),
                 fence: None,
                 sandbox: None,
                 on_escape: None,
@@ -550,146 +534,398 @@ mod tests {
             session: DelegatedSessionStrategy::default(),
             acceptance: vec![],
             output_contract: DelegatedOutputContract {
-                schema_type: crate::models::OutputSchema::Preset("return".to_string()),
+                schema_type: crate::models::OutputSchema::Preset("return".into()),
                 tool_name: None,
                 description: None,
             },
             status: DelegatedStatus::Materialized,
-            materialized_node_ids: vec!["delegated-agent".to_string()],
+            materialized_node_ids: vec![node_id.into()],
             result_artifact_job_id: None,
             task_index: Some(7),
             tier_override: None,
             backend_preference: None,
             background: false,
             created_at: 1,
-        };
+        }
+    }
 
-        reparent_delegated_jobs(
-            &db,
-            vec![("child-job".to_string(), Some("delegated-agent".to_string()))],
-            vec![packet],
-        )
-        .await
-        .unwrap();
-
-        let inherited = db
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT parent_job_id, worktree_path, task_index, uri_segment, parent_tool_use_id FROM jobs WHERE id = 'child-job'",
-                            (),
-                        )
-                        .await?;
-                    let row = rows
-                        .next()
-                        .await?
-                        .ok_or_else(|| DbError::Row("child job missing".to_string()))?;
-                    Ok::<_, DbError>((
-                        row.opt_text(0)?,
-                        row.opt_text(1)?,
-                        row.opt_i64(2)?,
-                        row.opt_text(3)?,
-                        row.opt_text(4)?,
-                    ))
-                })
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(inherited.0.as_deref(), Some("parent-job"));
-        assert_eq!(inherited.1.as_deref(), Some("/tmp/parent-worktree"));
-        assert_eq!(inherited.2, Some(7));
-        assert_eq!(inherited.3.as_deref(), Some("implement-child"));
-        assert_eq!(inherited.4.as_deref(), Some("tool-1"));
+    async fn child_coordinate(
+        db: &LocalDb,
+        job_id: &'static str,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) {
+        db.read(|conn| Box::pin(async move {
+            let mut rows = conn.query("SELECT parent_job_id, branch, base_commit, base_branch, task_index, uri_segment, parent_tool_use_id FROM jobs WHERE id = ?1", (job_id,)).await?;
+            let row = rows.next().await?.ok_or_else(|| DbError::Row("child job missing".into()))?;
+            Ok::<_, DbError>((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?, row.opt_text(3)?, row.opt_i64(4)?, row.opt_text(5)?, row.opt_text(6)?))
+        })).await.unwrap()
     }
 
     #[tokio::test]
-    async fn reparented_delegated_job_ambient_parent_marks_ephemeral() {
-        // An ambient (Branch: main / no-worktree) parent's delegated task keeps a
-        // NULL worktree_path (its WorktreeMode::Own node mints a fresh worktree at
-        // activation) and is marked owns_ephemeral_worktree so it is reclaimed on
-        // completion — never inheriting, never running in the live checkout.
+    async fn reparented_delegated_job_inherits_parent_coordinate() {
         let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
-                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
-                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
-                // Ambient parent: a branch but NO worktree_path.
-                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, uri_segment, node_name, created_at, updated_at) VALUES ('parent-job','e-1','i-1','p-1','running','agent/main','parent','Parent',1,1)", ()).await?;
-                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, recipe_node_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('child-job','e-1','i-1','p-1','delegated-agent','pending','child','Child',1,1)", ()).await?;
-                Ok::<_, DbError>(())
-            })
-        })
+        db.write(|conn| Box::pin(async move {
+            conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+            conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_commit, base_branch, uri_segment, node_name, created_at, updated_at) VALUES ('parent-job','e-1','i-1','p-1','running','agent/parent','head-1','main','executor','Executor',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, recipe_node_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('child-job','e-1','i-1','p-1','delegated-agent','pending','child','Child',1,1)", ()).await?;
+            Ok::<_, DbError>(())
+        })).await.unwrap();
+        reparent_delegated_jobs(
+            &db,
+            vec![("child-job".into(), Some("delegated-agent".into()))],
+            vec![packet(
+                "packet-1",
+                "parent-job",
+                "Implement child",
+                "delegated-agent",
+            )],
+        )
         .await
         .unwrap();
+        let coordinate = child_coordinate(&db, "child-job").await;
+        assert_eq!(coordinate.0.as_deref(), Some("parent-job"));
+        assert_eq!(coordinate.1.as_deref(), Some("agent/parent"));
+        assert_eq!(coordinate.2.as_deref(), Some("head-1"));
+        assert_eq!(coordinate.3.as_deref(), Some("main"));
+        assert_eq!(coordinate.4, Some(7));
+        assert_eq!(coordinate.5.as_deref(), Some("implement-child"));
+        assert_eq!(coordinate.6.as_deref(), Some("tool-1"));
+    }
 
-        let packet = DelegatedWorkPacket {
-            id: "packet-1".to_string(),
-            parent_job_id: "parent-job".to_string(),
-            parent_turn_id: Some("turn-1".to_string()),
-            parent_tool_use_id: Some("tool-1".to_string()),
-            origin: DelegationOrigin::TaskTool,
-            title: "Explore something".to_string(),
-            problem_statement: "Do the child task".to_string(),
-            agent_config_id: "explore".to_string(),
-            ownership: DelegatedOwnershipScope {
-                cwd: "/not/the/process/cwd".to_string(),
-                fence: None,
-                sandbox: None,
-                on_escape: None,
-            },
-            session: DelegatedSessionStrategy::default(),
-            acceptance: vec![],
-            output_contract: DelegatedOutputContract {
-                schema_type: crate::models::OutputSchema::Preset("return".to_string()),
-                tool_name: None,
-                description: None,
-            },
-            status: DelegatedStatus::Materialized,
-            materialized_node_ids: vec!["delegated-agent".to_string()],
-            result_artifact_job_id: None,
-            task_index: Some(0),
-            tier_override: None,
-            backend_preference: None,
-            background: false,
-            created_at: 1,
-        };
+    /// A task that delegates its own task. Nesting needs no special case, but it
+    /// only works because a task now carries a branch of its own: while
+    /// delegated jobs were left branchless, every nested delegation was refused
+    /// or started from base.
+    #[tokio::test]
+    async fn a_nested_delegation_carries_the_same_branch_one_level_down() {
+        let db = test_db().await;
+        db.write(|conn| Box::pin(async move {
+            conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+            conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_commit, base_branch, uri_segment, node_name, created_at, updated_at) VALUES ('parent-job','e-1','i-1','p-1','running','agent/parent','head-1','main','executor','Executor',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, recipe_node_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('child-job','e-1','i-1','p-1','delegated-agent','pending','child','Child',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, recipe_node_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('grandchild-job','e-1','i-1','p-1','delegated-nested-agent','pending','grandchild','Grandchild',1,1)", ()).await?;
+            Ok::<_, DbError>(())
+        })).await.unwrap();
 
         reparent_delegated_jobs(
             &db,
-            vec![("child-job".to_string(), Some("delegated-agent".to_string()))],
-            vec![packet],
+            vec![("child-job".into(), Some("delegated-agent".into()))],
+            vec![packet(
+                "packet-1",
+                "parent-job",
+                "Implement child",
+                "delegated-agent",
+            )],
+        )
+        .await
+        .unwrap();
+        // The child is now itself a delegating parent. Its branch is what its own
+        // task must inherit.
+        reparent_delegated_jobs(
+            &db,
+            vec![(
+                "grandchild-job".into(),
+                Some("delegated-nested-agent".into()),
+            )],
+            vec![packet(
+                "packet-2",
+                "child-job",
+                "Implement grandchild",
+                "delegated-nested-agent",
+            )],
         )
         .await
         .unwrap();
 
-        let (worktree_path, owns_ephemeral): (Option<String>, i64) = db
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT worktree_path, owns_ephemeral_worktree FROM jobs WHERE id = 'child-job'",
-                            (),
-                        )
-                        .await?;
-                    let row = rows
-                        .next()
-                        .await?
-                        .ok_or_else(|| DbError::Row("child job missing".to_string()))?;
-                    Ok::<_, DbError>((row.opt_text(0)?, row.i64(1)?))
-                })
-            })
-            .await
+        let coordinate = child_coordinate(&db, "grandchild-job").await;
+        assert_eq!(coordinate.0.as_deref(), Some("child-job"));
+        assert_eq!(
+            coordinate.1.as_deref(),
+            Some("agent/parent"),
+            "a nested task continues the same logical branch as its grandparent"
+        );
+    }
+
+    // ---- The delegation edge's coordinate --------------------------------
+    //
+    // Three steps decide where a delegated task starts: expansion emits the
+    // node's branch mode, `resolve_node_behavior` reads that mode back off the
+    // stored node, and `select_job_coordinate` turns it into the commit the
+    // child begins from. The whole defect lived in the first step while the
+    // other two were correct, so these run all three against a real jj store
+    // rather than asserting an enum in isolation.
+
+    use crate::execution::dag::recipe_node_to_db;
+    use crate::execution::jobs::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
+    use crate::execution::step_behavior::{resolve_node_behavior, StepBehavior};
+    use crate::jj::tests::{git_stdout, init_project, jj_bin};
+    use crate::jj::{create_bookmark_at, ensure_project_store, JjEnv};
+    use tempfile::TempDir;
+
+    /// The behavior a delegated packet's node resolves to, taken through the
+    /// same serialization the execution snapshot stores it with.
+    fn delegated_behavior() -> StepBehavior {
+        let node = delegated_agent_node(
+            "delegated-packet-1-agent".into(),
+            &packet(
+                "packet-1",
+                "parent-job",
+                "Implement child",
+                "delegated-packet-1-agent",
+            ),
+        );
+        resolve_node_behavior(&recipe_node_to_db(&node, "recipe-1"))
+    }
+
+    #[test]
+    fn a_delegated_node_requests_its_parents_coordinate() {
+        let behavior = delegated_behavior();
+        assert!(
+            behavior.inherits_branch,
+            "a delegated task continues its parent's branch; without inheritance it \
+             has no branch of its own and reads and writes its base branch instead"
+        );
+        assert!(
+            !behavior.mints_branch,
+            "a task shares its parent's branch rather than minting a sibling"
+        );
+        assert!(
+            behavior.requires_parent_head,
+            "a task that cannot be seeded at the parent's head must refuse, not degrade: \
+             every rung below that head is code the parent has already moved past"
+        );
+    }
+
+    struct ParentAhead {
+        _home: TempDir,
+        _project: TempDir,
+        jj: JjEnv,
+        store: PathBuf,
+        main_tip: String,
+        parent_head: String,
+    }
+
+    /// A store whose `main` sits at the project's git tip while `agent/parent`
+    /// holds one further commit reachable from no other branch: a builder with
+    /// unpushed work, at the moment it delegates a task.
+    ///
+    /// `None` when jj is not resolvable on this machine, matching the skip
+    /// convention the rest of the real-store suites use.
+    fn parent_ahead_of_main() -> Option<ParentAhead> {
+        let bin = jj_bin()?;
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        init_project(project.path());
+        let main_tip = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, project.path()).unwrap();
+        jj.run(
+            &store,
+            &["new", "main", "-m", "parent work", "--ignore-working-copy"],
+            "test: parent commit",
+        )
+        .unwrap();
+        let parent_head = jj
+            .run(
+                &store,
+                &[
+                    "log",
+                    "-r",
+                    "@",
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "--ignore-working-copy",
+                ],
+                "test: parent head",
+            )
             .unwrap();
+        create_bookmark_at(&jj, &store, "agent/parent", &parent_head).unwrap();
+        assert_ne!(parent_head, main_tip, "the parent is ahead of main");
+        Some(ParentAhead {
+            _home: home,
+            _project: project,
+            jj,
+            store,
+            main_tip,
+            parent_head,
+        })
+    }
+
+    /// THE defect (CAIRN-3309): a task delegated by a job holding unpushed
+    /// commits was cut from `main`, so anything it read, built, or tested was
+    /// the pre-change code its parent had already moved past.
+    ///
+    /// Every input here is the one production supplies: the node expansion
+    /// pushes, the lineage reparenting records, and a parent row whose
+    /// `base_commit` is stale at the commit main was on when the parent started.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_delegated_task_starts_at_the_parent_head_not_the_base_branch() {
+        let Some(fx) = parent_ahead_of_main() else {
+            eprintln!("skipping a_delegated_task_starts_at_the_parent_head: no jj");
+            return;
+        };
+        let stale_recorded_base = fx.main_tip.clone();
+
+        let (branch, base_commit) = select_job_coordinate(
+            &delegated_behavior(),
+            CoordinateRequest {
+                job_id: "child-job",
+                parent_job_id: Some("parent-job"),
+                existing_branch: Some("agent/parent"),
+                base_ref: "main",
+            },
+            &fx.jj,
+            &fx.store,
+            |_| {
+                Ok(ParentCoordinate {
+                    branch: Some("agent/parent".into()),
+                    recorded_base: Some(stale_recorded_base),
+                })
+            },
+            || unreachable!("a delegated task never mints a branch of its own"),
+            |_| None,
+        )
+        .unwrap();
 
         assert_eq!(
-            worktree_path, None,
-            "ambient task keeps a NULL worktree_path"
+            branch.as_deref(),
+            Some("agent/parent"),
+            "the task continues the parent's branch"
         );
-        assert_eq!(owns_ephemeral, 1, "ambient task is marked ephemeral-owning");
+        assert_eq!(
+            base_commit.as_deref(),
+            Some(fx.parent_head.as_str()),
+            "the task starts at the parent's live logical head"
+        );
+        assert_ne!(
+            base_commit.as_deref(),
+            Some(fx.main_tip.as_str()),
+            "starting from the base branch is the defect: the parent's work would be invisible"
+        );
+    }
+
+    /// The second form of the same defect: the parent's branch *name* is intact,
+    /// so lineage looks healthy, but the store cannot resolve the bookmark. The
+    /// degrading ladder would answer with the parent's recorded base and then
+    /// `main` — a child row reading `branch = agent/parent` whose commit is
+    /// pre-change code. A delegated task refuses instead.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_delegated_task_refuses_a_parent_branch_the_store_cannot_resolve() {
+        let Some(fx) = parent_ahead_of_main() else {
+            eprintln!("skipping a_delegated_task_refuses_an_unresolvable_parent_branch: no jj");
+            return;
+        };
+        let recorded_base = fx.main_tip.clone();
+
+        let error = select_job_coordinate(
+            &delegated_behavior(),
+            CoordinateRequest {
+                job_id: "child-job",
+                parent_job_id: Some("parent-job"),
+                existing_branch: Some("agent/vanished"),
+                base_ref: "main",
+            },
+            &fx.jj,
+            &fx.store,
+            |_| {
+                Ok(ParentCoordinate {
+                    // Never created in this store, and a recorded base that
+                    // resolves — the exact shape the ladder would accept.
+                    branch: Some("agent/vanished".into()),
+                    recorded_base: Some(recorded_base),
+                })
+            },
+            || unreachable!("a delegated task never mints a branch of its own"),
+            |_| None,
+        )
+        .expect_err("an unresolvable parent branch must refuse rather than degrade to base");
+
+        assert!(error.contains("child-job"), "{error}");
+        assert!(error.contains("parent job parent-job"), "{error}");
+        assert!(error.contains("agent/vanished"), "{error}");
+    }
+
+    /// The strict grade is scoped to the delegation edge. An authored `inherit`
+    /// node — the PR review node is the one in the bundled recipes — keeps the
+    /// ladder that CAIRN-3226 weighed and kept, so this change cannot have
+    /// quietly made every inheriting node fail-closed.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_authored_inherit_node_still_degrades() {
+        let Some(fx) = parent_ahead_of_main() else {
+            eprintln!("skipping an_authored_inherit_node_still_degrades: no jj");
+            return;
+        };
+        let recorded_base = fx.main_tip.clone();
+        let authored = resolve_node_behavior(&recipe_node_to_db(
+            &RecipeNode {
+                id: "review-1".into(),
+                node_type: RecipeNodeType::Agent,
+                name: "Review".into(),
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: None,
+                agent_config: Some(AgentNodeConfig {
+                    agent_config_id: Some("pr-review".into()),
+                    output_schema: None,
+                    git_config: Some(AgentGitConfig {
+                        branch_mode: BranchMode::Inherit,
+                        require_parent_head: false,
+                    }),
+                }),
+                action_config: None,
+                checkpoint_config: None,
+                artifact_config: None,
+                condition_config: None,
+                context_config: None,
+            },
+            "recipe-1",
+        ));
+
+        let (_, base_commit) = select_job_coordinate(
+            &authored,
+            CoordinateRequest {
+                job_id: "review-job",
+                parent_job_id: Some("parent-job"),
+                existing_branch: None,
+                base_ref: "main",
+            },
+            &fx.jj,
+            &fx.store,
+            |_| {
+                Ok(ParentCoordinate {
+                    branch: Some("agent/vanished".into()),
+                    recorded_base: Some(recorded_base),
+                })
+            },
+            || unreachable!("an inheriting job mints nothing"),
+            |_| None,
+        )
+        .expect("an authored inherit node degrades rather than refusing");
+
+        assert_eq!(
+            base_commit.as_deref(),
+            Some(fx.main_tip.as_str()),
+            "the ladder's verified recorded-base rung still carries an authored inherit node"
+        );
     }
 
     #[test]

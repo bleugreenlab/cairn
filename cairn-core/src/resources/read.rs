@@ -3,6 +3,7 @@
 //! Provides read support for `cairn://*` URIs. Transport protocols should
 //! decode their own payloads and delegate here.
 
+use super::check_results::read_project_check_results;
 use super::common::{
     affordance_for_kind, find_query_value, reject_query_params, resolve_home_relative_resource_uri,
 };
@@ -24,6 +25,7 @@ use super::node::{
     read_task_permission, read_task_permissions,
 };
 use super::progress::read_node_progress;
+use super::rebase::read_node_rebase;
 use super::symbols::{read_node_symbols, read_project_symbols};
 
 use super::actions::{read_action, read_actions_collection};
@@ -985,20 +987,6 @@ pub(crate) async fn produce_cairn_resource(
         }
     };
 
-    if split.identity == "cairn:~/workspace-recovery" {
-        let content = crate::mcp::vcs::workspace_recovery_status(orch, request).await;
-        return RenderedResource::line(
-            content,
-            Some(Affordance {
-                kind: SegmentKind::Resource,
-                block: "## Actions\n- rebind: write {target:\"cairn:~/workspace-recovery\", mode:\"patch\", payload:{action:\"rebind\"}}"
-                    .to_string(),
-            }),
-            None,
-            None,
-        );
-    }
-
     let identity =
         match resolve_home_relative_resource_uri(&orch.db, request, &split.identity).await {
             Ok(identity) => identity,
@@ -1096,6 +1084,53 @@ pub(crate) async fn produce_cairn_resource(
         })
     };
 
+    // Stored images are immutable native blocks. They do not support text projections,
+    // workspace paths, or leases.
+    if let CairnResource::ProjectImage { project, reference } = &resource {
+        if let Some(error) = reject_query_params("project image", &split.params) {
+            return RenderedResource::line(error, affordance, None, None);
+        }
+        let db = if request.run_id.is_some() {
+            match crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await {
+                Ok((run, db)) if run.project_key.eq_ignore_ascii_case(project) => db,
+                Ok(_) => {
+                    return RenderedResource::line(
+                        "Stored image URI does not belong to the authenticated run project"
+                            .to_string(),
+                        affordance,
+                        None,
+                        None,
+                    );
+                }
+                Err(error) => {
+                    return RenderedResource::line(error, affordance, None, None);
+                }
+            }
+        } else {
+            orch.db.for_project(project).await
+        };
+        let project_id =
+            match crate::mcp::handlers::run_context::project_id_by_key(&db, project).await {
+                Ok(id) => id,
+                Err(error) => return RenderedResource::line(error, affordance, None, None),
+            };
+        return match crate::images::fetch_image_by_reference(&db, &project_id, reference).await {
+            Ok(image) => {
+                let mut rendered = RenderedResource::line(String::new(), affordance, None, None);
+                // The target IS this image's address, so the block carries it
+                // verbatim rather than being re-promoted into a second
+                // reference to the same blob.
+                rendered.images.push(ImageBlock::stored(
+                    image.mime_type,
+                    base64::engine::general_purpose::STANDARD.encode(image.bytes),
+                    resource.to_uri(),
+                ));
+                rendered
+            }
+            Err(error) => RenderedResource::line(error.to_string(), affordance, None, None),
+        };
+    }
+
     // Universal view-window params, consumed centrally.
     let view_offset = find_query_value(&split.params, "offset").and_then(|v| v.parse::<i64>().ok());
     let view_limit = find_query_value(&split.params, "limit").and_then(|v| v.parse::<usize>().ok());
@@ -1143,8 +1178,15 @@ pub(crate) async fn produce_cairn_resource(
             } else {
                 render_resource_body(orch, request, &resource, body_params).await
             };
-            let (content, match_count) =
-                crate::mcp::handlers::search::grep_materialized_body(&rendered_body, &payload);
+            let (content, match_count) = match crate::mcp::handlers::search::grep_materialized_body(
+                &rendered_body,
+                &payload,
+            ) {
+                Ok(result) => result,
+                // A failed search is not a grep result: rendering it as one
+                // would head an error with a match count.
+                Err(error) => return RenderedResource::line(error, affordance, None, None),
+            };
             return RenderedResource::grep(content, match_count, affordance);
         }
         Ok(None) => {}
@@ -1342,6 +1384,43 @@ async fn render_resource_body(
         CairnResource::DevDb => produce_dev_db_sql_resource(&params, None).await.content,
         CairnResource::DevPid => produce_dev_pid_resource(&params, None).await.content,
         CairnResource::Logs => logs_resource_body(&cairn_common::paths::cairn_log_dir(), &params),
+        // The fleet is machine-scoped, so both arms read the runner's cached
+        // projection rather than any project's database. `captured_at` is taken
+        // once so every age on the rendering is derived from one instant.
+        CairnResource::Executors => match reject_query_params("executors", &params) {
+            Some(error) => error,
+            None => {
+                let captured_at = crate::fleet::unix_time_ms();
+                crate::resources::executors::render_executors(
+                    &orch.fleet.inspect_executors(captured_at),
+                    &orch.fleet.unattached_enrolled_remotes(),
+                    captured_at,
+                )
+            }
+        },
+        CairnResource::Executor { name } => match reject_query_params("executor", &params) {
+            Some(error) => error,
+            None => {
+                let captured_at = crate::fleet::unix_time_ms();
+                let executors = orch.fleet.inspect_executors(captured_at);
+                let enrolled = orch.fleet.unattached_enrolled_remotes();
+                match executors.iter().find(|executor| executor.name == name) {
+                    Some(executor) => crate::resources::executors::render_executor(executor),
+                    // A name that addresses an enrolled machine addresses
+                    // something real; answering "no such executor" for a machine
+                    // whose link is down is the silent absence this resource
+                    // exists to end.
+                    None => match enrolled.iter().find(|remote| remote.name == name) {
+                        Some(remote) => {
+                            crate::resources::executors::render_enrolled_remote(remote, captured_at)
+                        }
+                        None => crate::resources::executors::unknown_executor(
+                            &name, &executors, &enrolled,
+                        ),
+                    },
+                }
+            }
+        },
         CairnResource::Project { project } => {
             if find_query_value(&params, "search").is_some() {
                 read_project_search(orch, &project, &params).await
@@ -1353,6 +1432,19 @@ async fn render_resource_body(
         }
         CairnResource::ProjectIssues { project } => {
             read_project_issues(db, &project, &params).await
+        }
+        CairnResource::ProjectCheckResults { project, revision } => {
+            read_project_check_results(orch, request, &project, &revision, &params).await
+        }
+        CairnResource::ProjectImage { .. } => {
+            unreachable!("project images are intercepted before text rendering")
+        }
+        CairnResource::ProjectImages { project, issue } => {
+            if let Some(error) = reject_query_params("project images", &params) {
+                error
+            } else {
+                crate::resources::project::read_project_images(db, &project, issue).await
+            }
         }
         CairnResource::Issue { project, number } => {
             if let Some(error) = reject_query_params("issue", &params) {
@@ -1736,6 +1828,12 @@ async fn render_resource_body(
             exec_seq,
             node_id,
         } => read_node_diff(orch, &project, number, exec_seq, &node_id, &params).await,
+        CairnResource::NodeRebase {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => read_node_rebase(orch, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::ProjectMessages { project } => {
             read_project_messages(db, &project, &params).await
         }
@@ -2055,10 +2153,12 @@ async fn render_resource_body(
         | CairnResource::ProjectTerminal { .. } => {
             "Terminal URIs are handled by read_resource".to_string()
         }
-        // A REPL read renders a live status banner from the in-memory registry
-        // (interpreter, running/exited, uptime) — no cursor, no buffered output,
-        // so it flows through the generic resource read path, not the terminal
-        // JSON-extraction path.
+        // A REPL read renders the durable row (interpreter, running/exited with
+        // its fate, generation, transcript depth) plus the live namespace snapshot
+        // and, when running, uptime from the registry. It falls back to the row so
+        // a dead REPL reads as EXITED rather than `not found` — no cursor, no
+        // buffered output, so it flows through the generic resource read path, not
+        // the terminal JSON-extraction path.
         CairnResource::NodeRepl {
             project,
             number,
@@ -2076,7 +2176,13 @@ async fn render_resource_body(
                 let session = job_id
                     .as_deref()
                     .and_then(|jid| orch.repl_state.get(jid, &slug));
-                crate::mcp::handlers::repl::render_status(&slug, session.as_ref())
+                let record = match job_id.as_deref() {
+                    Some(jid) => crate::mcp::handlers::repl::store::load(db, jid, &slug)
+                        .await
+                        .unwrap_or_default(),
+                    None => None,
+                };
+                crate::mcp::handlers::repl::render_status(&slug, record.as_ref(), session.as_ref())
             }
         }
         // Browser reads render the durable job_browsers row (url/title/status)
@@ -2788,7 +2894,7 @@ line2', X'0001020AFF', 2.5),
         let payload = body_grep_payload(&db_params("grep=ERROR"), false)
             .unwrap()
             .unwrap();
-        let (rendered, matches) = grep_materialized_body(&body, &payload);
+        let (rendered, matches) = grep_materialized_body(&body, &payload).unwrap();
         assert_eq!(matches, 1);
         assert!(rendered.contains("boom"));
         assert!(!rendered.contains("all good"));
