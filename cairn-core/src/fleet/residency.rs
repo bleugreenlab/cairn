@@ -178,6 +178,25 @@ pub(crate) async fn acquire(
     orch: &Orchestrator,
     request: ResidencyAcquireRequest,
 ) -> Result<ResidencyFence, PlacementRefusal> {
+    acquire_with_logging(orch, request, true).await
+}
+
+/// Acquire residency without emitting the generic failure warning.
+///
+/// Supervisors that retry an ambient service own failure reporting so they can
+/// collapse an unchanged outage instead of amplifying it on every probe.
+pub(crate) async fn acquire_quietly(
+    orch: &Orchestrator,
+    request: ResidencyAcquireRequest,
+) -> Result<ResidencyFence, PlacementRefusal> {
+    acquire_with_logging(orch, request, false).await
+}
+
+async fn acquire_with_logging(
+    orch: &Orchestrator,
+    request: ResidencyAcquireRequest,
+    log_failure: bool,
+) -> Result<ResidencyFence, PlacementRefusal> {
     let holder = request.holder.clone();
     let result = orch
         .fleet
@@ -202,7 +221,9 @@ pub(crate) async fn acquire(
                 cell_outcome.as_deref(),
                 orch.fleet.link_restoration(),
             );
-            tracing::warn!(%holder, ?kind, ?verdict, %diagnostic, "residency acquisition failed");
+            if log_failure {
+                tracing::warn!(%holder, ?kind, ?verdict, %diagnostic, "residency acquisition failed");
+            }
             return Err(PlacementRefusal {
                 verdict,
                 diagnostic,

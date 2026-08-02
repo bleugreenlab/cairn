@@ -29,23 +29,20 @@ impl CheckResultIdentity {
 /// so a caller reports the row it produced instead of re-deriving a key and
 /// hoping a second lookup finds it.
 ///
-/// Re-deriving is not a theoretical hazard. A verdict produced on another machine
-/// is recorded under an EMPTY environment fingerprint, because Cairn cannot yet
-/// identify a remote machine's verdict environment and must not publish its row
-/// under a coordinator-derived key. No key the requesting side computes can match
-/// that row, so a lookup-derived reply calls every remotely executed check
-/// unrecorded. The recorder is the only thing that knows what it wrote; this is
-/// how it says so.
+/// Re-deriving is not a theoretical hazard. Legacy remote executors recorded an
+/// empty environment fingerprint, which deliberately cannot match a requesting
+/// machine's key. The recorder is the only reliable source of which row a run
+/// wrote, including those diagnostic-only legacy rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecordedCheckObservation {
     pub id: String,
     /// The environment identity this observation and its commit alias are keyed
-    /// by. EMPTY when a remote executor produced the verdict: the row is
-    /// addressable by id and readable as diagnosis, but nothing may reuse it.
+    /// by. Empty for legacy remote executors, whose rows remain addressable by id
+    /// for diagnosis but cannot be reused.
     pub environment_fingerprint: String,
     /// Whether this observation may suppress a later execution of the same
-    /// triple. False keeps a red, incomplete, or remotely produced verdict out of
-    /// the reuse path while still returning it to whoever asked for it.
+    /// triple. False keeps red, incomplete, or fingerprint-less verdicts out of
+    /// the reuse path while still returning them to whoever asked for them.
     pub reusable: bool,
 }
 

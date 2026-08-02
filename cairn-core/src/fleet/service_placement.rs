@@ -130,7 +130,7 @@ pub(crate) async fn acquire_service_lease(
         .map_err(ServicePlacementError::InvalidRequest)?;
 
     let acquire_request = service_acquire_request(service.id, selector, footprint, death_policy);
-    let fence = super::residency::acquire(orch, acquire_request.clone())
+    let fence = super::residency::acquire_quietly(orch, acquire_request.clone())
         .await
         .map_err(|error| ServicePlacementError::Unavailable(error.to_string()))?;
 

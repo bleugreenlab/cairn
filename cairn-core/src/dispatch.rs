@@ -14,6 +14,14 @@ pub struct DispatchOutput {
     pub reminders: Vec<String>,
 }
 
+pub(crate) fn is_standalone_cli(request: &crate::mcp::types::McpCallbackRequest) -> bool {
+    request
+        .payload
+        .get("_cairn_origin")
+        .and_then(|value| value.as_str())
+        == Some("cli")
+}
+
 /// `process_info` response when the windowless runner has no desktop connected.
 /// This must never fall back to the runner's own pid: callers use the value to
 /// target the native GUI, and the daemon cannot own that window.
@@ -276,8 +284,10 @@ async fn dispatch_with_dedup(
 ) -> String {
     let result = execute_tool(orch, request, read_cursors).await;
 
-    // Only read-family calls with an active run/turn are dedup-eligible.
-    if !is_read_family(&request.tool) {
+    // The duplicate stub is guidance for an agent that already holds the prior
+    // body in context. Standalone CLI stdout may be consumed by a polling program,
+    // so it must always receive the real body.
+    if is_standalone_cli(request) || !is_read_family(&request.tool) {
         return result;
     }
     let Some(run_id) = request.run_id.as_deref() else {

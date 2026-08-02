@@ -6,7 +6,6 @@ use crate::execution::inputs::InputSelector;
 pub const CHECK_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const CHECK_PARSER_VERSION: u32 = 1;
 const CONTENT_IDENTITY_VERSION: &str = "check-content-v1";
-const ENVIRONMENT_IDENTITY_VERSION: &str = "check-environment-v1";
 
 /// Runtime declarations used by the Rust self-skip ledger. Their values change
 /// whether a self-skip is authorized, so Rust checks include them even when the
@@ -79,6 +78,31 @@ pub fn verdict_environment_names(check: &CheckCommand) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// The platform families whose result for this check the project counts as its
+/// verdict.
+///
+/// Empty means "any platform's answer counts", which a check states only by
+/// declaring an empty `verdictPlatforms` list. Executor selectors are an
+/// independent capability constraint and never broaden this trust set.
+///
+/// Undeclared resolves to the runner's own platform, because that is what a
+/// project's gate has always meant. Checks ran on the machine holding the
+/// checkout, so that machine's platform is the only one any green was ever
+/// observed on; reading the silence as "anywhere" is what let one idle Windows
+/// box publish `#[cfg(windows)]` dead-code findings as a PR's lane verdict.
+pub fn verdict_platforms(check: &CheckCommand) -> Vec<String> {
+    check
+        .verdict_platforms
+        .clone()
+        .unwrap_or_else(|| vec![gating_platform().to_string()])
+}
+
+/// The platform a project gates on when it has not said otherwise: the one the
+/// runner is on, which is the machine every undeclared check has always run on.
+pub fn gating_platform() -> &'static str {
+    std::env::consts::OS
 }
 
 fn is_rust_check(command: &str) -> bool {
@@ -166,7 +190,8 @@ pub fn environment_identity(
     names.sort();
     names.dedup();
     let variables = names
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|name| {
             let mut value = Sha256::new();
             match read_variable(&name) {
@@ -183,20 +208,33 @@ pub fn environment_identity(
         })
         .collect::<Vec<_>>();
 
-    let mut hasher = Sha256::new();
-    field(&mut hasher, ENVIRONMENT_IDENTITY_VERSION);
-    field(&mut hasher, &os);
-    field(&mut hasher, &arch);
-    option(&mut hasher, executor_id.as_deref());
-    option(&mut hasher, device_id.as_deref());
-    strings(&mut hasher, &capabilities);
-    option(&mut hasher, runner_build_id.as_deref());
-    for variable in &variables {
-        field(&mut hasher, &variable.name);
-        field(&mut hasher, &variable.value_hash);
-    }
+    let fingerprint = if executor_id.is_none() && device_id.is_none() {
+        cairn_common::check_environment::fingerprint(
+            &os,
+            &arch,
+            capabilities.clone(),
+            runner_build_id.as_deref(),
+            names,
+            &read_variable,
+        )
+    } else {
+        // Reserved for identities that intentionally bind a verdict to one device.
+        let mut hasher = Sha256::new();
+        field(&mut hasher, "check-environment-v1");
+        field(&mut hasher, &os);
+        field(&mut hasher, &arch);
+        option(&mut hasher, executor_id.as_deref());
+        option(&mut hasher, device_id.as_deref());
+        strings(&mut hasher, &capabilities);
+        option(&mut hasher, runner_build_id.as_deref());
+        for variable in &variables {
+            field(&mut hasher, &variable.name);
+            field(&mut hasher, &variable.value_hash);
+        }
+        digest(hasher)
+    };
     CheckEnvironmentIdentity {
-        fingerprint: digest(hasher),
+        fingerprint,
         os,
         arch,
         executor_id,
@@ -218,7 +256,9 @@ pub fn local_environment_identity(
             executor_id: None,
             device_id: None,
             capabilities: capabilities.into_iter().collect(),
-            runner_build_id: cairn_common::build_identity::current_executable_build_id().ok(),
+            runner_build_id: Some(
+                cairn_common::check_environment::implementation_identity().to_string(),
+            ),
             variable_names: variable_names.into_iter().collect(),
         },
         |name| std::env::var(name).ok(),
@@ -260,6 +300,57 @@ mod tests {
         );
         let non_rust = command("command: bunx tsc --noEmit\n");
         assert!(verdict_environment_names(&non_rust).is_empty());
+    }
+
+    #[test]
+    fn undeclared_verdict_platforms_resolve_to_the_runner_s_own_platform() {
+        let check = command("command: bunx tsc --noEmit\n");
+        assert_eq!(verdict_platforms(&check), vec![gating_platform()]);
+    }
+
+    #[test]
+    fn a_declared_platform_set_is_lowercased_sorted_and_deduplicated() {
+        let check = command(
+            "command: bun run check:rust\nverdictPlatforms:\n  - macOS\n  - linux\n  - MACOS\n",
+        );
+        assert_eq!(verdict_platforms(&check), vec!["linux", "macos"]);
+    }
+
+    /// The opt-out is a declaration like any other: a lane that genuinely does
+    /// not care which platform answers says so, rather than being guessed at.
+    #[test]
+    fn an_empty_declared_list_counts_every_platform() {
+        let check = command("command: bun run lint\nverdictPlatforms: []\n");
+        assert!(verdict_platforms(&check).is_empty());
+    }
+
+    #[test]
+    fn executor_selectors_do_not_broaden_platform_trust() {
+        let named = command(
+            "command: bun run check:rust\nexecutor:\n  name: bglab-win\nverdictPlatforms: [macos]\n",
+        );
+        assert_eq!(verdict_platforms(&named), vec!["macos"]);
+        let platform = command(
+            "command: bun run check:rust\nexecutor:\n  os: windows\nverdictPlatforms: [macos]\n",
+        );
+        assert_eq!(verdict_platforms(&platform), vec!["macos"]);
+        // A toolchain requirement narrows the fleet without settling a
+        // platform, so trust still applies.
+        let toolchain =
+            command("command: bun run check:rust\nexecutor:\n  requiredToolchains:\n    - rust\n");
+        assert_eq!(verdict_platforms(&toolchain), vec![gating_platform()]);
+    }
+
+    #[test]
+    fn malformed_platform_declarations_are_rejected_instead_of_broadening_trust() {
+        assert!(serde_yaml::from_str::<CheckCommand>(
+            "command: bun run lint\nverdictPlatforms: [' ']\n"
+        )
+        .is_err());
+        assert!(serde_yaml::from_str::<CheckCommand>(
+            "command: bun run lint\nverdictPlatforms: [plan9]\n"
+        )
+        .is_err());
     }
 
     #[test]

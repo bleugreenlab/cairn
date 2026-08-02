@@ -172,10 +172,7 @@ pub(crate) async fn run_cli_read(
     }
     let client = build_cli_client(callback_url);
     let input = ReadFileInput { paths };
-    match client
-        .read(Parameters(input), rmcp::model::RequestMetaObject::default())
-        .await
-    {
+    match client.read_cli(input).await {
         Ok(result) => emit_tool_result(&result),
         Err(e) => {
             eprintln!("cairn read failed: {e}");
@@ -411,30 +408,40 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     ))
 }
 
-pub(crate) async fn run_cli_check(suite: String, branch: Option<String>) -> bool {
+pub(crate) async fn run_cli_check(suites: Vec<String>, branch: Option<String>) -> bool {
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
         return false;
     }
     let client = build_cli_client(callback_url);
-    let outcome = client
-        .call_tauri_full(&check_run_request(&client, suite, branch))
-        .await;
-    if !outcome.transport_ok {
-        eprintln!("cairn check run: {}", outcome.result.trim_end());
-        return false;
-    }
-    match render_check_run_response(&outcome.result) {
-        Ok((summary, passed)) => {
-            println!("{summary}");
-            passed
+    let requests = suites
+        .into_iter()
+        .map(|suite| check_run_request(&client, suite, branch.clone()));
+    let outcomes = futures::future::join_all(requests.map(|request| {
+        let client = &client;
+        async move { client.call_tauri_full(&request).await }
+    }))
+    .await;
+    let mut all_passed = true;
+    for outcome in outcomes {
+        if !outcome.transport_ok {
+            eprintln!("cairn check run: {}", outcome.result.trim_end());
+            all_passed = false;
+            continue;
         }
-        Err(error) => {
-            eprintln!("cairn check run: {error}");
-            false
+        match render_check_run_response(&outcome.result) {
+            Ok((summary, passed)) => {
+                println!("{summary}");
+                all_passed &= passed;
+            }
+            Err(error) => {
+                eprintln!("cairn check run: {error}");
+                all_passed = false;
+            }
         }
     }
+    all_passed
 }
 
 pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<String>) -> bool {

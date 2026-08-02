@@ -615,7 +615,7 @@ fn build_project_checks_section(
          commands exist for iterating on a failure a check surfaced, not for re-verifying a \
          finished diff. When a suite verdict on another revision is genuinely the question — is \
          this red already on the base, is there a baseline for whoever comes next — \
-         `cairn check run <suite> [branch]` answers it and records the observation through the \
+         `cairn check run <suite>... [--branch <revision>]` answers it and records the observation through the \
          same trusted path; a suite you run in a shell answers only for that shell. What checks \
          do NOT cover: live UI/feature verification and cross-system integration still need a \
          browser or a dev instance.\n\n",
@@ -2162,6 +2162,7 @@ mod tests {
                     timeout: None,
                     executor: None,
                     verdict_environment: Vec::new(),
+                    verdict_platforms: None,
                     fixes: false,
                 },
             ),
@@ -2177,6 +2178,7 @@ mod tests {
                     timeout: None,
                     executor: None,
                     verdict_environment: Vec::new(),
+                    verdict_platforms: None,
                     fixes: false,
                 },
             ),

@@ -896,6 +896,7 @@ mod slot_publication_tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -2088,6 +2089,9 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 // "nothing further to say", not "put it anywhere".
                 placement_mobility:
                     cairn_common::executor_protocol::PlacementMobility::PinnedOrColocated,
+                // An agent's batch publishes output, not a verdict, so no
+                // platform's answer counts more than another's here.
+                verdict_platforms: Vec::new(),
                 command_resource_identity: None,
                 resource_reservation: Default::default(),
                 learned_estimate: None,
@@ -3577,6 +3581,7 @@ mod tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -4061,7 +4066,7 @@ mod tests {
                 )
             ]
         );
-        // An attribution run (`cairn check run rust-tests main`) reads another
+        // An attribution run (`cairn check run rust-tests --branch main`) reads another
         // revision but is still the caller's own run acting on it.
         assert_eq!(
             placed_batch_env(Some("run-7"), Some("main"), None),
@@ -4110,6 +4115,7 @@ mod tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,

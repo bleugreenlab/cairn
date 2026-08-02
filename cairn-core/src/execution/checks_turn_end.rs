@@ -330,7 +330,10 @@ async fn run_turn_end_checks_inner(
     cancel: &TurnEndCancel,
 ) -> Result<(), String> {
     // 1. Resolve the node's durable branch coordinate and base anchors.
-    let Some(coords) = resolve_job_coords(&orch.db.local, job_id).await? else {
+    let owning_db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(coords) = resolve_job_coords(&owning_db, job_id).await? else {
         return Ok(());
     };
     // Nothing that follows is owed if this wave may not launch: its verdicts
@@ -699,10 +702,15 @@ async fn run_turn_end_checks_inner(
                 command: plan.command.clone(),
                 stream_id: crate::mcp::handlers::run::check_stream_id(&checks_tool_id, index),
                 env: extra_env.clone(),
+                verdict_environment_names: plan.verdict_environment_names.clone(),
                 timeout_ms: timeouts[index],
                 executor: checks
                     .get(&plan.name)
                     .and_then(|check| check.executor.clone()),
+                verdict_platforms: checks
+                    .get(&plan.name)
+                    .map(crate::execution::check_identity::verdict_platforms)
+                    .unwrap_or_default(),
                 resource_class: plan.resource_class,
             }
         })
@@ -1386,6 +1394,7 @@ mod tests {
 
     fn cell_held_by(holder: ResidencyHolder, phase: ResidencyPhase) -> PersistentCellState {
         PersistentCellState {
+            warm_command_classes: Vec::new(),
             executor_id: "executor".into(),
             executor_display_name: None,
             project_id: "p".into(),

@@ -7,7 +7,7 @@ pub mod sync_server;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cairn_common::executor_protocol::{
     ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, ExecutorMessage,
@@ -39,6 +39,90 @@ pub async fn migrated_db() -> (TempDir, LocalDb) {
         .await
         .unwrap();
     (temp, db)
+}
+
+/// The exact jj executable this host's integration suite should use.
+///
+/// Prefer the build-slot artifact provisioned before Cargo starts. Installed app
+/// sidecars are shared mutable state, and a reused slot may contain artifacts for
+/// several foreign targets, so neither `CAIRN_JJ_BIN` nor a prefix scan is a
+/// trustworthy first answer.
+fn jj_candidate() -> Option<PathBuf> {
+    let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        _ => return None,
+    };
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../binaries")
+        .join(format!("jj-{triple}{suffix}"));
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+
+    // Provisioning is best-effort on an offline fresh checkout. Preserve the
+    // historical supported path where jj is explicitly configured or installed
+    // on PATH even though no bundled artifact could be fetched.
+    std::env::var("CAIRN_JJ_BIN")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|bin| bin.is_file())
+        .or_else(|| cairn_common::toolchain_path::locate_program("jj"))
+}
+
+/// A process-lifetime snapshot of the real jj executable.
+///
+/// Whole-workspace checks can replace their shared sidecar while this integration
+/// binary is running. Resolving that live path once per command creates a TOCTOU
+/// race: `jj --version` succeeds, then `jj git init` fails because the path was
+/// replaced between the two spawns. Copying the executable into an owned tempdir
+/// makes the fixture's toolchain as immutable as its repository and config.
+fn pinned_jj_bin() -> &'static Path {
+    struct PinnedJj {
+        _temp: TempDir,
+        bin: PathBuf,
+    }
+
+    static PINNED: OnceLock<PinnedJj> = OnceLock::new();
+    PINNED
+        .get_or_init(|| {
+            let source = jj_candidate()
+                .expect("jj must be provisioned in the build slot or available on PATH");
+
+            // Open before copying. The open handle remains a stable coordinate
+            // even if a platform permits the source directory entry to change.
+            let mut source_file =
+                std::fs::File::open(&source).expect("open jj executable snapshot");
+            let source_permissions = source_file
+                .metadata()
+                .expect("read jj executable metadata")
+                .permissions();
+            let temp = tempdir().expect("create pinned jj directory");
+            let bin = temp.path().join(source.file_name().unwrap_or_default());
+            let mut pinned_file = std::fs::File::create(&bin).expect("create pinned jj executable");
+            std::io::copy(&mut source_file, &mut pinned_file).expect("snapshot jj executable");
+            std::fs::set_permissions(&bin, source_permissions)
+                .expect("preserve jj executable permissions");
+            let probe = Command::new(&bin)
+                .arg("--version")
+                .output()
+                .expect("run pinned jj executable");
+            assert!(probe.status.success(), "pinned jj --version must succeed");
+
+            // Production paths exercised after fixture setup resolve jj again.
+            // Every test thread observes the same OnceLock value, so this pins
+            // those calls to the same immutable executable without per-test env
+            // mutation.
+            std::env::set_var("CAIRN_JJ_BIN", &bin);
+            PinnedJj { _temp: temp, bin }
+        })
+        .bin
+        .as_path()
 }
 
 /// A fixture orchestrator that owns every run in its database.
@@ -522,18 +606,16 @@ pub async fn create_job(
 
 /// The jj binary for the test, or `None` to self-skip when jj is unavailable.
 /// jj-backed integration tests gate on this and print a skip note rather than
-/// fail when jj cannot be resolved (honoring `CAIRN_JJ_BIN` when set).
+/// fail when jj cannot be resolved. The exact host build-slot artifact wins;
+/// `CAIRN_JJ_BIN` and PATH are offline-checkout fallbacks.
 pub fn jj_bin() -> Option<String> {
-    let bin = std::env::var("CAIRN_JJ_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "jj".to_string());
+    let bin = jj_candidate()?;
     Command::new(&bin)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-        .then_some(bin)
+        .then(|| bin.to_string_lossy().into_owned())
 }
 
 /// The git `HEAD` commit sha of `repo`, used to base a jj workspace on the
@@ -583,7 +665,7 @@ pub fn provision_jj_workspace(
     assert!(project_repo.join(".git").exists());
     assert!(!project_repo.join(".jj").exists());
 
-    let jj = JjEnv::resolve("jj", config_dir);
+    let jj = JjEnv::with_binary(pinned_jj_bin().to_string_lossy(), config_dir);
     let store = jj::project_store_dir(config_dir, project_repo);
     jj::ensure_project_store(&jj, &store, project_repo).unwrap();
     let base = head_sha(project_repo);
@@ -624,7 +706,7 @@ pub fn stale_sibling_advance(
     primary_ws: &Path,
     primary_branch: &str,
 ) {
-    let jj = JjEnv::resolve("jj", config_dir);
+    let jj = JjEnv::with_binary(pinned_jj_bin().to_string_lossy(), config_dir);
     let store = jj::project_store_dir(config_dir, project_repo);
     let primary_name = primary_ws
         .file_name()

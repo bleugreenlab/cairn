@@ -563,6 +563,7 @@ mod tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,

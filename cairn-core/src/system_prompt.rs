@@ -323,7 +323,7 @@ mod tests {
         for ambient in [false, true] {
             let prompt = cairn_system_prompt(ambient);
             assert!(prompt.contains(r#"], branch:"main"})"#));
-            assert!(prompt.contains("cairn check run <suite> [branch]"));
+            assert!(prompt.contains("cairn check run <suite>... [--branch <revision>]"));
             assert!(prompt.contains(r#"read({paths:["file:src/lib.rs?branch=main"]})"#));
             assert!(prompt.contains("cannot be combined with `commit_msg`"));
             // `run` presents shell, inline code, MCP tools, and REPL sends as

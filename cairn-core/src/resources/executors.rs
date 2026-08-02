@@ -22,7 +22,8 @@
 
 use cairn_common::executor_protocol::{
     ExecutorHealthStatus, ExecutorInspection, Measurement, MeasurementReading, PlacementOutcome,
-    PlacementSyncCost, ReservationRationale, MIN_CONFIDENT_RESERVATION_SAMPLES,
+    PlacementPrediction, PlacementSyncCost, ReservationRationale,
+    MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 // Deliberately its own statement rather than folded into the import above. That
 // list is edited by whoever touches the reservation rendering; keeping the
@@ -553,6 +554,9 @@ fn render_placements(out: &mut String, executor: &ExecutorInspection) {
                     ));
                 }
                 out.push_str(&format!("  - {}\n", selection.observation_reuse.describe()));
+                if let Some(prediction) = &selection.prediction {
+                    render_prediction(out, "Predicted", prediction);
+                }
             }
             PlacementOutcome::Refused { diagnostic } => {
                 out.push_str(&format!("  - Refused: {diagnostic}\n"));
@@ -564,9 +568,71 @@ fn render_placements(out: &mut String, executor: &ExecutorInspection) {
                 rejection.executor_name,
                 rejection.reason.describe()
             ));
+            // A machine that was actually ranked shows its own numbers here, so
+            // "why not that one" is answered by the same record that answered
+            // "why this one". A structurally rejected machine was never priced
+            // and prints nothing rather than a fabricated total.
+            if let Some(prediction) = &rejection.prediction {
+                render_prediction(out, "    Predicted", prediction);
+            }
         }
     }
     out.push('\n');
+}
+
+/// What one machine was predicted to cost, with every component's evidence.
+///
+/// The total and its legs are rendered together and always in the same order,
+/// because a total on its own is indistinguishable from a constant. A leg that
+/// is unknown says so in words; nothing here renders an absent measurement as a
+/// zero, which is the failure that let an unreadable machine look like an empty
+/// one.
+fn render_prediction(out: &mut String, label: &str, prediction: &PlacementPrediction) {
+    out.push_str(&format!(
+        "  - {label}: {} to a verdict\n",
+        duration_ms(prediction.predicted_verdict_ms)
+    ));
+    out.push_str(&format!(
+        "    - Queue: {}\n",
+        match prediction.queue.predicted_ms() {
+            Some(value) => format!("{} · {}", duration_ms(value), prediction.queue.describe()),
+            None => prediction.queue.describe(),
+        }
+    ));
+    out.push_str(&format!(
+        "    - Run: {} · {}\n",
+        duration_ms(prediction.run.predicted_ms),
+        prediction.run.describe()
+    ));
+    out.push_str(&format!("    - Cache: {}\n", prediction.warmth.describe()));
+    // Preparation is evidence, never a summand. No transfer history exists to
+    // turn missing object bytes into milliseconds, and inventing a rate would be
+    // exactly the kind of proxy this ranking replaced.
+    out.push_str(&format!(
+        "    - Preparation: {}\n",
+        prediction.preparation.describe()
+    ));
+    out.push_str(&format!(
+        "    - Profile: `{}` on {}\n",
+        prediction
+            .run
+            .profile_key
+            .as_deref()
+            .unwrap_or("no command identity"),
+        prediction.run.profile_context
+    ));
+}
+
+/// Milliseconds an operator can read at a glance, without losing the unit.
+fn duration_ms(value: u64) -> String {
+    if value < 1_000 {
+        return format!("{value}ms");
+    }
+    let seconds = value as f64 / 1_000.0;
+    if seconds < 90.0 {
+        return format!("{seconds:.1}s");
+    }
+    format!("{:.1}m", seconds / 60.0)
 }
 
 /// How a reservation came to be the number it is, in one line.
@@ -1455,10 +1521,11 @@ mod tests {
             selector: None,
             pinned_executor_id: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
+                prediction: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,
-                reason: PlacementReason::MeasuredIdle,
+                reason: PlacementReason::PredictedEarliestVerdict,
                 readings: PlacementReadings {
                     cpu: Measurement::measured(
                         CAPTURED_AT - 2_000,
@@ -1508,6 +1575,7 @@ mod tests {
                 observation_reuse: ObservationReuse::UntrustedRemoteEnvironment,
             })),
             rejected: vec![PlacementRejection {
+                prediction: None,
                 executor_name: "local".into(),
                 executor_id: "colocated".into(),
                 reason: PlacementRejectionReason::TelemetryGap {
@@ -1521,7 +1589,7 @@ mod tests {
         assert!(rendered.contains("## Placement"), "{rendered}");
         assert!(rendered.contains("check-cadence-7"), "{rendered}");
         assert!(rendered.contains("spillEligible"), "{rendered}");
-        assert!(rendered.contains("measuredIdle"), "{rendered}");
+        assert!(rendered.contains("predictedEarliestVerdict"), "{rendered}");
         assert!(
             rendered.contains("3% busy across 16 cores"),
             "the reading that decided it is on the record: {rendered}"

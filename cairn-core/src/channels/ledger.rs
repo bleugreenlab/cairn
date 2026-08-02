@@ -17,6 +17,16 @@ pub struct NewOutbound<'a> {
     pub created_at: i64,
 }
 
+pub async fn mark_expired(db: &LocalDb, id: &str, expired_at: i64) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound SET status = 'expired', resolved_at = ?2 WHERE id = ?1 AND status = 'pending'",
+        params![id.to_string(), expired_at],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundRecord {
     pub id: String,

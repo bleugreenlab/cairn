@@ -75,7 +75,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 // Isolated checks carry their configured executor selector into the immutable request.
@@ -107,6 +107,49 @@ use cairn_common::executor_protocol::{
 pub(crate) enum CheckExecMode {
     Isolated,
     Shared,
+}
+
+fn substrate_failure_kind(failure: &SubstrateFailure) -> CheckFailureKind {
+    if failure.shape() == SubstrateFailureShape::Capacity {
+        CheckFailureKind::Capacity
+    } else {
+        CheckFailureKind::Infrastructure
+    }
+}
+
+fn check_phase_status(
+    phase: Option<&str>,
+    label: Option<&str>,
+    diagnostic: Option<String>,
+) -> CheckPhaseStatus {
+    let label = match phase {
+        Some("queued") => Some("queued".to_string()),
+        _ => label.map(str::to_string),
+    };
+    debug_assert!(label.as_deref().is_none_or(|value| {
+        !value.contains('·') && !value.to_ascii_lowercase().contains("behind")
+    }));
+    CheckPhaseStatus {
+        phase: phase.map(str::to_string),
+        label,
+        diagnostic,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn queued_phase_label_never_carries_its_blocker_list() {
+    let diagnostic = "Queued behind dead-code · frontend-build · rust-lint.".to_string();
+    let status = check_phase_status(
+        Some("queued"),
+        Some("queued behind dead-code · frontend-build · rust-lint"),
+        Some(diagnostic.clone()),
+    );
+
+    assert_eq!(status.label.as_deref(), Some("queued"));
+    assert_eq!(status.diagnostic.as_deref(), Some(diagnostic.as_str()));
+    let label = status.label.unwrap();
+    assert!(!label.contains('·') && !label.to_ascii_lowercase().contains("behind"));
 }
 
 const SLOT_CHECK_DEV_DEBUG_ENV: (&str, &str) = ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only");
@@ -216,13 +259,19 @@ where
     .await
 }
 
-type CheckStatusNotify =
-    Arc<dyn Fn(Vec<CheckStatusEntry>, Option<String>, Option<String>) + Send + Sync>;
+#[derive(Clone, Default)]
+struct CheckPhaseStatus {
+    phase: Option<String>,
+    label: Option<String>,
+    diagnostic: Option<String>,
+}
+
+type CheckStatusNotify = Arc<dyn Fn(Vec<CheckStatusEntry>, CheckPhaseStatus) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct CheckStatusBoard {
     entries: Arc<std::sync::Mutex<Vec<CheckStatusEntry>>>,
-    phase: Arc<std::sync::Mutex<(Option<String>, Option<String>)>>,
+    phase: Arc<std::sync::Mutex<CheckPhaseStatus>>,
     notify: CheckStatusNotify,
 }
 
@@ -241,15 +290,15 @@ impl CheckStatusBoard {
                     })
                     .collect(),
             )),
-            phase: Arc::new(std::sync::Mutex::new((None, None))),
+            phase: Arc::new(std::sync::Mutex::new(CheckPhaseStatus::default())),
             notify,
         }
     }
 
     fn emit(&self) {
         let entries = self.entries.lock().unwrap().clone();
-        let (phase, detail) = self.phase.lock().unwrap().clone();
-        (self.notify)(entries, phase, detail);
+        let phase = self.phase.lock().unwrap().clone();
+        (self.notify)(entries, phase);
     }
 
     fn emit_initial(&self) {
@@ -265,7 +314,11 @@ impl CheckStatusBoard {
             }
         }
         if state == "running" {
-            *self.phase.lock().unwrap() = (Some("running".into()), None);
+            *self.phase.lock().unwrap() = CheckPhaseStatus {
+                phase: Some("running".into()),
+                label: Some("running checks".into()),
+                diagnostic: None,
+            };
         } else if self
             .entries
             .lock()
@@ -273,13 +326,13 @@ impl CheckStatusBoard {
             .iter()
             .all(|entry| entry.state == "passed" || entry.state == "failed")
         {
-            *self.phase.lock().unwrap() = (None, None);
+            *self.phase.lock().unwrap() = CheckPhaseStatus::default();
         }
         self.emit();
     }
 
-    fn set_phase(&self, phase: Option<&str>, detail: Option<String>) {
-        *self.phase.lock().unwrap() = (phase.map(str::to_string), detail);
+    fn set_phase(&self, phase: Option<&str>, label: Option<&str>, diagnostic: Option<String>) {
+        *self.phase.lock().unwrap() = check_phase_status(phase, label, diagnostic);
         self.emit();
     }
 }
@@ -484,11 +537,9 @@ pub struct ManualConfiguredCheckResult {
     pub commit_sha: String,
     pub tree_hash: String,
     pub input_hash: String,
-    /// The environment identity the recorded observation is keyed by. EMPTY when
-    /// a remote executor produced the verdict — Cairn cannot yet identify that
-    /// machine's verdict environment, so the row is addressable by id and
-    /// readable as diagnosis while nothing reuses it — and empty when this run
-    /// recorded nothing at all.
+    /// The environment identity the recorded observation is keyed by. Empty when
+    /// a legacy remote executor did not report one, and when this run recorded
+    /// nothing at all.
     pub environment_fingerprint: String,
     /// The observation this run recorded, or `None` when it recorded none: a
     /// suppressed check never ran, and a failed write leaves a real verdict
@@ -677,8 +728,12 @@ pub async fn run_manual_configured_check(
                             command,
                             stream_id,
                             env: Vec::new(),
+                            verdict_environment_names: Vec::new(),
                             timeout_ms,
                             executor: check.executor.clone(),
+                            verdict_platforms: crate::execution::check_identity::verdict_platforms(
+                                &check,
+                            ),
                             resource_class: submission_resource_class,
                         }],
                         run_context: None,
@@ -886,6 +941,7 @@ fn split_write_check_batch_outcome(
                             provenance.duration_ms = Some(item.duration_ms);
                             provenance.peak_rss_bytes = item.peak_rss_bytes;
                             provenance.disk_delta_bytes = item.disk_delta_bytes;
+                            provenance.environment_fingerprint = item.environment_fingerprint;
                             Ok(CheckExecResult {
                                 exit_code: item.exit_code,
                                 output,
@@ -1272,6 +1328,43 @@ fn merge_batch_executor(
     Ok((!merged.is_empty()).then_some(merged))
 }
 
+/// The platforms whose answer counts for EVERY check in one batch.
+///
+/// A batch is placed by a single decision, so the platforms it may be placed on
+/// are the ones every member counts — an intersection, never a union. A member
+/// that counts any platform constrains nothing and drops out of the fold.
+///
+/// An empty intersection is a conflict rather than a result, because empty is
+/// already the vocabulary for "any platform counts": returning it would silently
+/// invert two checks that agree on nothing into a batch that will run anywhere.
+/// The pure-verdict path never reaches that, having already split the wave by
+/// placement; the write cadence cannot split (its checks share one working tree,
+/// in order), so there the conflict is real and is reported as the configuration
+/// error it is.
+fn merge_batch_verdict_platforms(items: &[PlannedCheckBatchItem]) -> Result<Vec<String>, String> {
+    let mut merged: Option<Vec<String>> = None;
+    for item in items {
+        if item.verdict_platforms.is_empty() {
+            continue;
+        }
+        merged = Some(match merged {
+            None => item.verdict_platforms.clone(),
+            Some(current) => current
+                .into_iter()
+                .filter(|platform| item.verdict_platforms.contains(platform))
+                .collect(),
+        });
+        if merged.as_ref().is_some_and(|merged| merged.is_empty()) {
+            return Err(format!(
+                "checks batched together count their verdicts from disjoint platforms: {} counts only {}, which no other check in this batch shares",
+                item.name,
+                item.verdict_platforms.join(", ")
+            ));
+        }
+    }
+    Ok(merged.unwrap_or_default())
+}
+
 pub(crate) struct JobVerdictResult {
     pub(crate) coordinate: String,
     pub(crate) exit_code: Option<i32>,
@@ -1368,11 +1461,19 @@ pub(crate) async fn execute_job_verdict(
                 command: command.to_string(),
                 stream_id: format!("checkpoint:{job_id}"),
                 env: Vec::new(),
+                verdict_environment_names: Vec::new(),
                 timeout_ms: fleet
                     .default_timeout_seconds
                     .saturating_mul(1_000)
                     .min(u32::MAX as u64) as u32,
                 executor: None,
+                // A checkpoint is an undeclared command whose exit status gates a
+                // workflow, which is a verdict by every meaning that matters. It
+                // gets the same default as an undeclared project check: the
+                // platform the runner is on.
+                verdict_platforms: vec![
+                    crate::execution::check_identity::gating_platform().to_string()
+                ],
                 resource_class: CheckResourceClass::Shared,
             }],
             run_context: None,
@@ -1453,227 +1554,73 @@ pub(crate) fn reserve_batch_items(
     (admitted, refused)
 }
 
-/// Extra immediate attempts a capacity refusal earns before it is allowed to
-/// become an agent-visible infrastructure result.
-///
-/// A verdictless red check costs an agent a wake, a re-read, and a re-run of the
-/// whole suite, so a momentary contention spike is worth a second and third ask
-/// before it is reported as a failure of anything.
-const CAPACITY_RETRY_ATTEMPTS: usize = 2;
-/// Pause before each retry, so a retry does not simply re-ask a host that is
-/// still finishing whatever displaced it.
-const CAPACITY_RETRY_BACKOFF_MS: [u64; CAPACITY_RETRY_ATTEMPTS] = [2_000, 5_000];
+/// Pause before re-presenting a request whose selected executor disappeared or
+/// otherwise returned a capacity-shaped outcome instead of keeping its queue entry.
+const CAPACITY_RETRY_BACKOFF_MS: u64 = 2_000;
 
-/// The least patience any check batch declares, whatever else it knows.
-///
-/// Below a minute a lane cannot outlast even a short contention spike, which is
-/// the one thing every retry policy here exists to absorb.
-const CHECK_PATIENCE_FLOOR_MS: u64 = 60_000;
+/// Elapsed time cannot evict a parked check. Requester liveness and explicit
+/// cancellation still remove abandoned or no-longer-wanted entries.
+const PARKED_CHECK_WAIT_HORIZON_UNIX_MS: u64 = u64::MAX;
 
-/// The most a write-cadence batch waits on load Cairn cannot account for.
-///
-/// A write-cadence verdict is appended to the tool result of the commit that
-/// triggered it, so an agent's turn is stopped for the whole of this wait. That
-/// makes the ceiling a statement about an agent's time: past it, a red
-/// infrastructure row that re-runs next cadence costs the session less than
-/// continuing to hold its turn open for a machine nothing here can reason about.
-const WRITE_CADENCE_FOREIGN_CEILING_MS: u64 = 3 * 60_000;
-
-/// The most a review-cadence batch waits on load Cairn cannot account for.
-///
-/// Nothing is blocked on a turn-end wave: it runs after the turn, it is
-/// cancelled outright when its issue resolves, and a verdict that lands late is
-/// still the verdict. So its ceiling is set by how long a result stays worth
-/// having rather than by who is waiting, and on a fleet where a whole-workspace
-/// suite runs for minutes, ten of them is one suite's worth of queueing.
-const REVIEW_CADENCE_FOREIGN_CEILING_MS: u64 = 10 * 60_000;
-
-/// Margin added to a predicted relief time before it becomes a bound.
-///
-/// The prediction says when the occupant finishes; it does not cover the
-/// executor noticing, this request winning the next admission pass, and the
-/// cell being handed the command. Without the margin a correct prediction would
-/// still surface a refusal moments before the room it predicted opened.
-const PREDICTION_MARGIN_MS: u64 = 30_000;
-
-/// The two relations the clamp in [`CheckPatience::declare`] depends on, held
-/// where they can be broken rather than where they would be noticed. A floor
-/// above a ceiling inverts `clamp` (which panics), and a write ceiling above the
-/// review one would mean the cadence that holds an agent's turn open is the
-/// patient one — both are facts about these constants, so they are checked when
-/// the constants are compiled.
-const _: () = assert!(
-    CHECK_PATIENCE_FLOOR_MS <= WRITE_CADENCE_FOREIGN_CEILING_MS,
-    "the floor must fit inside every ceiling or a wait is over before it begins"
-);
-const _: () = assert!(
-    WRITE_CADENCE_FOREIGN_CEILING_MS < REVIEW_CADENCE_FOREIGN_CEILING_MS,
-    "holding an agent's turn open is the more expensive wait"
-);
-
-fn foreign_ceiling_ms(priority: &CellPriority) -> u64 {
-    match priority {
-        // Both of these hold something open while they wait. Interactive work
-        // has an agent inside it by definition, and no check batch submits at
-        // this priority today -- naming it here keeps a future one from
-        // inheriting the ceiling meant for work nobody is sitting on.
-        CellPriority::WriteCheck | CellPriority::AgentInteractive => {
-            WRITE_CADENCE_FOREIGN_CEILING_MS
-        }
-        CellPriority::ReviewCheck => REVIEW_CADENCE_FOREIGN_CEILING_MS,
-    }
-}
-
-/// How long this batch will wait for capacity in total, and why that long.
-///
-/// One budget, declared once and spent across every presentation of the same
-/// request, so the added latency an agent can meet is the budget rather than
-/// the budget times the attempt count. Where it comes from is the point:
-///
-/// - When Cairn's own placed work is what holds the machine, the budget is that
-///   work's predicted remaining time. A bound taken from measurement is the
-///   only kind that can say "this should have been enough" when it is not, and
-///   it is why a lane no longer abandons a machine it could have named the
-///   occupant of (CAIRN-3429).
-/// - Otherwise the budget is the cadence's ceiling. A machine held by an
-///   operator's own build, a dev harness, or work with no measured duration is
-///   one nothing here can predict, and the honest answer is to wait a bounded
-///   while and then say so — which is the CAIRN-3345 floor, unchanged.
-///
-/// The fleet-wide default horizon is deliberately not consulted. It documents
-/// itself as the answer for a caller with no tighter answer of its own, and a
-/// check has one: a four-second formatter and an interactive REPL should not
-/// share a number, and the day they did, one stale value took the whole check
-/// fabric down at once.
 struct CheckPatience {
-    started: std::time::Instant,
-    foreign_ceiling: std::time::Duration,
     mobility: PlacementMobility,
 }
 
-/// The wait ONE selector group declares, against the machines that group can
-/// actually land on.
-///
-/// A batch is not one wait. Pure-verdict items partition by executor selector
-/// and each group is presented separately, so a Linux-targeted group and an
-/// unconstrained one are queued behind different work and are relieved at
-/// different moments. Deriving one basis for the whole batch would hand a
-/// targeted group a horizon sized by a machine it can never land on — and then
-/// print the wrong occupant's name on the row that went red.
 struct GroupWait {
-    horizon_ms: u64,
-    /// Whether the capacity this group is waiting on is held by Cairn's own
-    /// measured work. A wait on Cairn does not expire; only a wait on load Cairn
-    /// cannot account for does.
-    self_inflicted: bool,
     description: String,
 }
 
 impl CheckPatience {
     fn declare(batch: &PlannedCheckBatchRequest) -> Self {
         Self {
-            started: std::time::Instant::now(),
-            foreign_ceiling: std::time::Duration::from_millis(foreign_ceiling_ms(&batch.priority)),
             mobility: batch_placement_mobility(&batch.mutation_policy),
         }
     }
 
-    /// What remains of the ceiling that governs waiting on load Cairn cannot
-    /// account for.
-    ///
-    /// Never zero. A presentation with no horizon is evicted from the queue the
-    /// instant it arrives, which would spend an admission to learn nothing; the
-    /// bound that ends that wait is [`Self::foreign_patience_spent`], checked
-    /// before a retry.
-    fn remaining_foreign_ceiling_ms(&self) -> u64 {
-        let elapsed_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        (self.foreign_ceiling.as_millis() as u64)
-            .saturating_sub(elapsed_ms)
-            .max(CAPACITY_RETRY_BACKOFF_MS[0])
-    }
-
-    fn foreign_patience_spent(&self) -> bool {
-        self.started.elapsed() >= self.foreign_ceiling
-    }
-
-    /// Read what holds this group's eligible machines, and turn it into a
-    /// horizon and a sentence.
-    ///
-    /// Taken fresh at each presentation rather than once at declaration: a retry
-    /// exists precisely because the world may have changed, and a forecast from
-    /// before the last wait would answer a question about a machine that no
-    /// longer looks like that.
     fn for_group(
         &self,
         orch: &Orchestrator,
         batch: &PlannedCheckBatchRequest,
         selector: Option<&ExecutorSelector>,
+        verdict_platforms: &[String],
     ) -> GroupWait {
-        // The same repository locator the submission below states. Eligibility
-        // turns on it -- a checkout that exists on only one machine cannot be
-        // recreated elsewhere -- so a forecast that omitted it would be scoped
-        // differently from the placement it is trying to predict.
         let repository = RepositoryLocator::ColocatedPath {
             project_id: batch.project_id.clone(),
             repository_id: batch.project_id.clone(),
             absolute_path: batch.repository.clone(),
         };
-        GroupWait::from_occupancy(
-            orch.fleet.occupancy_for(crate::fleet::PlacementScope {
-                project_id: &batch.project_id,
-                repository: &repository,
-                selector,
-                // Checks never pin: `require_colocated_population` may pin a
-                // request later, and does so only for a batch that needs the
-                // runner's ignored content -- which is already pinned here by
-                // its mutation policy's mobility.
-                pinned_executor_id: None,
-                mobility: self.mobility,
-            }),
-            self.remaining_foreign_ceiling_ms(),
-        )
+        GroupWait::from_occupancy(orch.fleet.occupancy_for(crate::fleet::PlacementScope {
+            project_id: &batch.project_id,
+            repository: &repository,
+            selector,
+            pinned_executor_id: None,
+            mobility: self.mobility,
+            verdict_platforms,
+        }))
     }
 }
 
 impl GroupWait {
-    /// The wait a reading implies, separated from the fleet so the policy can be
-    /// exercised against a stated occupancy rather than a live machine.
-    fn from_occupancy(
-        occupancy: crate::fleet::occupancy::MachineOccupancy,
-        remaining_foreign_ceiling_ms: u64,
-    ) -> Self {
-        let crate::fleet::occupancy::MachineOccupancy::Predicted(forecast) = occupancy else {
-            return Self {
-                horizon_ms: remaining_foreign_ceiling_ms,
-                self_inflicted: false,
-                description: format!(
-                    "the machines this check can use are held by work with no measured duration, so there is nothing to queue behind knowingly; waiting up to {}",
-                    describe_ms(remaining_foreign_ceiling_ms)
-                ),
-            };
+    fn from_occupancy(occupancy: crate::fleet::occupancy::MachineOccupancy) -> Self {
+        let description = match occupancy {
+            crate::fleet::occupancy::MachineOccupancy::Predicted(forecast) => {
+                let others = match forecast.occupant_count.saturating_sub(1) {
+                    0 => String::new(),
+                    1 => ", behind 1 other cell".to_string(),
+                    more => format!(", behind {more} other cells"),
+                };
+                format!(
+                    "parked behind {}, predicted to finish in {}{others}; holding this check's queue entry until capacity is released",
+                    forecast.blocking,
+                    describe_ms(forecast.relief_ms),
+                )
+            }
+            crate::fleet::occupancy::MachineOccupancy::Unforecastable =>
+                "parked behind resident or external work with no measured duration; holding this check's queue entry until capacity is released".into(),
+            crate::fleet::occupancy::MachineOccupancy::Idle =>
+                "parked in the admission queue; holding this check's queue entry until capacity is released".into(),
         };
-        let others = match forecast.occupant_count.saturating_sub(1) {
-            0 => String::new(),
-            1 => ", behind 1 other cell".to_string(),
-            more => format!(", behind {more} other cells"),
-        };
-        Self {
-            // No ceiling. This presentation is sized to outlast the occupant it
-            // is queued behind, and if that occupant is replaced by another the
-            // next presentation is sized to outlast THAT one. The floor still
-            // applies, because a horizon shorter than a minute is evicted before
-            // the queue can do anything with it.
-            horizon_ms: forecast
-                .relief_ms
-                .saturating_add(PREDICTION_MARGIN_MS)
-                .max(CHECK_PATIENCE_FLOOR_MS),
-            self_inflicted: true,
-            description: format!(
-                "queued behind {}, predicted to finish in {}{others}; holding this check's place until it frees",
-                forecast.blocking,
-                describe_ms(forecast.relief_ms),
-            ),
-        }
+        Self { description }
     }
 }
 
@@ -1717,57 +1664,16 @@ pub(crate) async fn submit_planned_check_batch(
         .map(|item| item.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let mut attempt = 0;
     let mut outcome = loop {
         let presented = submit_reserved_check_batch(orch, batch.clone(), &patience).await?;
-        let CapacityRetry::Again { backoff } = capacity_retry_decision(attempt, &presented.outcome)
-        else {
+        let CapacityRetry::Again { backoff } = capacity_retry_decision(&presented.outcome) else {
             break presented.outcome;
         };
-        // The room was taken by Cairn's own finite work, so this check is queued
-        // rather than failing. It keeps its place: no attempt is spent, no
-        // ceiling is consulted, and the next presentation is sized against
-        // whatever holds the machine then.
-        //
-        // Several agents working at once is what this fabric is FOR, so the
-        // contention it creates in normal operation must not be able to produce
-        // a red row about someone's change. A check that reports failure because
-        // it grew tired of waiting for Cairn is stating something false about
-        // the diff under test, and the cost lands on a merge.
-        //
-        // This does not wait forever on a wedged machine, and the reason is in
-        // `fleet::occupancy` rather than here: an occupant that outlives its own
-        // learned duration stops being explainable, the reading becomes
-        // unforecastable, and the next presentation is bounded by the ceiling
-        // below. Patience is extended only while the wait keeps being accounted
-        // for.
-        if presented.self_inflicted {
-            log::info!(
-                "check batch [{names}] is queued behind Cairn's own work; holding its place — {}",
-                describe_capacity_waits(&presented.outcome)
-            );
-            tokio::time::sleep(backoff).await;
-            continue;
-        }
-        // Nothing here can account for what holds the machine, so the wait is
-        // bounded and the refusal is honest when it comes (CAIRN-3345).
-        if patience.foreign_patience_spent() {
-            log::info!(
-                "check batch [{names}] found no capacity within its declared patience — {}",
-                describe_capacity_waits(&presented.outcome)
-            );
-            break presented.outcome;
-        }
         log::info!(
-            "check batch [{names}] found no capacity; {}; retrying ({} of {CAPACITY_RETRY_ATTEMPTS})",
-            describe_capacity_waits(&presented.outcome),
-            attempt + 1,
+            "check batch [{names}] retained no executor queue entry after a capacity response; re-presenting for placement — {}",
+            describe_capacity_waits(&presented.outcome)
         );
-        // Cancellation stops this immediately: the caller holds this future, and
-        // a resolved issue or an ended wave drops it mid-sleep rather than
-        // waiting out a retry nobody wants any more.
         tokio::time::sleep(backoff).await;
-        attempt += 1;
     };
     outcome.results.extend(refused);
     Ok(outcome)
@@ -1834,46 +1740,26 @@ enum CapacityRetry {
 /// structural refusal (no matching machine, a toolchain fault, a draining host),
 /// a cancellation, a storage failure, and anything that happened after the
 /// command ran are all re-presented unchanged, so none of them retry.
-fn capacity_retry_decision(attempt: usize, outcome: &PlannedCheckBatchOutcome) -> CapacityRetry {
-    let wholly_transient = !outcome.results.is_empty()
+fn capacity_retry_decision(outcome: &PlannedCheckBatchOutcome) -> CapacityRetry {
+    let wholly_capacity = !outcome.results.is_empty()
         && outcome.results.values().all(|result| {
             matches!(
                 result,
-                Err(CheckExecutionFailure::Substrate(failure)) if failure.shape().is_transient()
+                Err(CheckExecutionFailure::Substrate(failure))
+                    if failure.shape() == SubstrateFailureShape::Capacity
             )
         });
-    match CAPACITY_RETRY_BACKOFF_MS.get(attempt) {
-        Some(backoff) if wholly_transient => CapacityRetry::Again {
-            backoff: std::time::Duration::from_millis(*backoff),
-        },
-        _ => CapacityRetry::Surface,
+    if wholly_capacity {
+        CapacityRetry::Again {
+            backoff: std::time::Duration::from_millis(CAPACITY_RETRY_BACKOFF_MS),
+        }
+    } else {
+        CapacityRetry::Surface
     }
 }
 
-/// One presentation of a batch, and whether what refused it was Cairn's own
-/// work.
-///
-/// The second fact decides whether the batch queues or gives up, and it is a
-/// property of THIS presentation rather than of the batch: a group refused by a
-/// named sibling suite is queued, while the same batch refused by an operator's
-/// own build is on a clock. A batch split across selectors is treated as queued
-/// only if every group that was refused for capacity was refused by Cairn — one
-/// group waiting on something nobody can account for puts the whole batch back
-/// on the bounded path, because it is the batch that has to end somewhere.
 struct PresentedBatch {
     outcome: PlannedCheckBatchOutcome,
-    self_inflicted: bool,
-}
-
-/// Whether this group's outcome is a capacity refusal at all.
-fn refused_for_capacity(outcome: &PlannedCheckBatchOutcome) -> bool {
-    outcome.results.values().any(|result| {
-        matches!(
-            result,
-            Err(CheckExecutionFailure::Substrate(failure))
-                if failure.shape() == SubstrateFailureShape::Capacity
-        )
-    })
 }
 
 async fn submit_reserved_check_batch(
@@ -1882,7 +1768,7 @@ async fn submit_reserved_check_batch(
     patience: &CheckPatience,
 ) -> Result<PresentedBatch, String> {
     if batch.mutation_policy == MutationPolicy::PureVerdict {
-        let mut groups = partition_check_items_by_executor(std::mem::take(&mut batch.items));
+        let mut groups = partition_check_items_by_placement(std::mem::take(&mut batch.items));
         if groups.len() > 1 {
             let mut combined = PlannedCheckBatchOutcome {
                 results: HashMap::new(),
@@ -1890,16 +1776,19 @@ async fn submit_reserved_check_batch(
                 delta: None,
                 store_dir: Some(batch.store_dir.clone()),
             };
-            let mut refused_groups = 0_usize;
-            let mut queued_groups = 0_usize;
-            for (selector, items) in groups {
+            for (placement, items) in groups {
                 // Each group derives its own wait, from its own eligible
                 // machines, at the moment it is presented. Groups also run one
                 // after another, so each re-reads what is LEFT of the shared
                 // ceiling -- otherwise a batch naming two executors could wait
                 // twice as long as it declared, and a ten-machine one, ten
                 // times.
-                let wait = patience.for_group(orch, &batch, selector.as_ref());
+                let wait = patience.for_group(
+                    orch,
+                    &batch,
+                    placement.executor.as_ref(),
+                    &placement.verdict_platforms,
+                );
                 let mut outcome = submit_single_planned_check_batch(
                     orch,
                     PlannedCheckBatchRequest {
@@ -1910,33 +1799,27 @@ async fn submit_reserved_check_batch(
                 )
                 .await?;
                 attribute_capacity_wait(&mut outcome, &wait);
-                if refused_for_capacity(&outcome) {
-                    refused_groups += 1;
-                    queued_groups += usize::from(wait.self_inflicted);
-                }
                 combined.results.extend(outcome.results);
             }
-            return Ok(PresentedBatch {
-                outcome: combined,
-                self_inflicted: refused_groups > 0 && refused_groups == queued_groups,
-            });
+            return Ok(PresentedBatch { outcome: combined });
         }
         batch.items = groups.pop().map(|(_, items)| items).unwrap_or_default();
     }
     // One group, whose selector is whatever its items agree on. A conflict is a
     // configuration error the submission below reports; there is no forecast to
     // scope by a selector that cannot exist, so it reads as unconstrained here.
+    let forecast_selector = merge_batch_executor(&batch.items).ok().flatten();
+    let forecast_verdict_platforms =
+        merge_batch_verdict_platforms(&batch.items).unwrap_or_default();
     let wait = patience.for_group(
         orch,
         &batch,
-        merge_batch_executor(&batch.items).ok().flatten().as_ref(),
+        forecast_selector.as_ref(),
+        &forecast_verdict_platforms,
     );
     let mut outcome = submit_single_planned_check_batch(orch, batch, &wait).await?;
     attribute_capacity_wait(&mut outcome, &wait);
-    Ok(PresentedBatch {
-        self_inflicted: wait.self_inflicted && refused_for_capacity(&outcome),
-        outcome,
-    })
+    Ok(PresentedBatch { outcome })
 }
 
 /// Whether a planned check batch is free for placement policy to move.
@@ -1964,19 +1847,36 @@ fn batch_placement_mobility(policy: &MutationPolicy) -> PlacementMobility {
     }
 }
 
-fn partition_check_items_by_executor(
+/// The placement question one batch can ask: where its checks may run, and which
+/// platforms' answers they count.
+///
+/// A batch travels as one cell, so every check in it is placed by a single
+/// decision. Two checks that disagree about either half cannot share that
+/// decision — a wave carrying one macOS-gated suite and one platform-agnostic
+/// suite splits and each half is placed on its own terms, rather than the whole
+/// wave travelling to wherever the strictest or the loosest member allowed.
+#[derive(Clone, PartialEq, Eq)]
+struct CheckBatchPlacement {
+    executor: Option<ExecutorSelector>,
+    verdict_platforms: Vec<String>,
+}
+
+fn partition_check_items_by_placement(
     items: Vec<PlannedCheckBatchItem>,
-) -> Vec<(Option<ExecutorSelector>, Vec<PlannedCheckBatchItem>)> {
-    let mut groups: Vec<(Option<ExecutorSelector>, Vec<PlannedCheckBatchItem>)> = Vec::new();
+) -> Vec<(CheckBatchPlacement, Vec<PlannedCheckBatchItem>)> {
+    let mut groups: Vec<(CheckBatchPlacement, Vec<PlannedCheckBatchItem>)> = Vec::new();
     for item in items {
-        let selector = item.executor.clone().filter(|value| !value.is_empty());
+        let placement = CheckBatchPlacement {
+            executor: item.executor.clone().filter(|value| !value.is_empty()),
+            verdict_platforms: item.verdict_platforms.clone(),
+        };
         if let Some((_, items)) = groups
             .iter_mut()
-            .find(|(candidate, _)| candidate == &selector)
+            .find(|(candidate, _)| candidate == &placement)
         {
             items.push(item);
         } else {
-            groups.push((selector, vec![item]));
+            groups.push((placement, vec![item]));
         }
     }
     groups
@@ -1987,10 +1887,10 @@ async fn submit_single_planned_check_batch(
     batch: PlannedCheckBatchRequest,
     wait: &GroupWait,
 ) -> Result<PlannedCheckBatchOutcome, String> {
-    let wait_horizon_ms = wait.horizon_ms;
     // Configuration conflicts are deterministic caller errors and must surface
     // before any transient infrastructure preflight can obscure them.
     let executor = merge_batch_executor(&batch.items)?;
+    let verdict_platforms = merge_batch_verdict_platforms(&batch.items)?;
     if let Some(failure) =
         active_build_service_failure(&orch.build_service_diagnostic_snapshot("sccache"))
     {
@@ -2053,7 +1953,8 @@ async fn submit_single_planned_check_batch(
         // that planned this check will plan it again. It is derived from NOW on
         // every presentation, so a retry re-enters admission with a live wait
         // rather than one that already expired.
-        wait_horizon_unix_ms: unix_time_ms_for_checks().saturating_add(wait_horizon_ms),
+        // Park until admission; requester liveness and cancellation remain the bounds.
+        wait_horizon_unix_ms: PARKED_CHECK_WAIT_HORIZON_UNIX_MS,
         waiting_since_unix_ms: unix_time_ms_for_checks(),
         timeout_ms,
         mutation_policy: batch.mutation_policy.clone(),
@@ -2062,6 +1963,7 @@ async fn submit_single_planned_check_batch(
         executor,
         pinned_executor_id: None,
         placement_mobility: batch_placement_mobility(&batch.mutation_policy),
+        verdict_platforms,
         command_resource_identity: None,
         resource_reservation: declared_batch_reservation(&batch.items),
         learned_estimate: None,
@@ -2089,6 +1991,7 @@ async fn submit_single_planned_check_batch(
                     version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
                     key: item.resource_identity_key,
                 }),
+                verdict_environment_names: item.verdict_environment_names,
             },
         })
         .collect();
@@ -2103,7 +2006,11 @@ async fn submit_single_planned_check_batch(
         // slot" told an operator watching their own fleet only that Cairn was
         // waiting on Cairn, which is the one thing they could already see.
         if let Some(board) = &batch.status_board {
-            board.set_phase(Some("queued"), Some(wait.description.clone()));
+            board.set_phase(
+                Some("queued"),
+                Some("queued"),
+                Some(wait.description.clone()),
+            );
         }
         let outcome = orch
             .fleet
@@ -2168,67 +2075,46 @@ pub(crate) struct PlannedCheckBatchItem {
     pub command: String,
     pub stream_id: String,
     pub env: Vec<(String, String)>,
+    pub verdict_environment_names: Vec<String>,
     pub timeout_ms: u32,
     pub executor: Option<ExecutorSelector>,
-    /// The project's declaration of whether this check can co-run with others.
-    /// Carried onto the submission so the scheduler's budget sees an exclusive
-    /// lane as the whole-machine work it is.
+    /// The platforms whose answer counts as this check's verdict, resolved by
+    /// [`crate::execution::check_identity::verdict_platforms`]. Carried onto the
+    /// submission so placement can only choose a machine the project gates on.
+    pub verdict_platforms: Vec<String>,
+    /// Legacy project metadata retained for configuration compatibility. CPU
+    /// demand does not participate in admission; the learned memory profile does.
     pub resource_class: CheckResourceClass,
 }
 
-/// What a check batch's cell will actually fan out to.
+/// Compatibility reservation for a configured check.
 ///
-/// This is DEMAND, not enforcement. The check system is the only party that
-/// knows what it is asking for; capping an admitted cell's internal parallelism
-/// and yielding to interactive work belong to the executor (CAIRN-3248). A batch
-/// that declares honestly cannot overrun a budget by itself — it just lets the
-/// scheduler plan against the work rather than against the request count.
-///
-/// Concurrency is STATED by the project, never inferred from the command text.
-/// A tool that parallelizes internally — cargo across the crate graph, vitest
-/// across workers, a bundler across modules — uses the cores that happen to be
-/// free when it runs; it does not require them. Charging that opportunistic
-/// parallelism as an admission reservation makes every ordinary build claim the
-/// whole host, which is exactly how a 16-core machine came to report `17 of 16`
-/// concurrency units reserved at ~31% utilization while five-second checks died
-/// at their acquisition deadlines (CAIRN-3345). Only
-/// [`CheckResourceClass::Exclusive`] — the project's own statement that a check
-/// needs a quiet machine — reserves the whole executor.
-///
-/// The command still classifies the work ([`batch_command_class`]) for the
-/// per-class memory, disk, and duration profiles, which is a different question:
-/// how much a run costs, not how many lanes it must be handed.
-///
-/// Memory and disk are deliberately left at zero: those are learned per command
-/// identity from observed runs, and a declaration here would suppress a better
-/// estimate than any submitter could write down.
+/// Memory and disk are resolved from measured command profiles. CPU is a
+/// compressible resource and therefore carries no admission charge, regardless
+/// of the legacy resource class value.
 pub(crate) fn declared_check_reservation(
-    resource_class: CheckResourceClass,
+    _resource_class: CheckResourceClass,
 ) -> ResourceReservation {
     ResourceReservation {
         memory_bytes: 0,
         disk_growth_bytes: 0,
-        concurrency_units: match resource_class {
-            CheckResourceClass::Exclusive => ResourceReservation::WHOLE_MACHINE_CONCURRENCY,
-            CheckResourceClass::Shared => 1,
-        },
+        concurrency_units: 0,
         source: ResourceReservationSource::Declared,
     }
 }
 
-/// Demand for a batch that runs several checks in one cell: as heavy as the
-/// heaviest DECLARED class among its items, since they share the cell.
+/// Compatibility reservation for a batch. Resource classes no longer affect
+/// admission, so every composition has the same zero CPU charge.
 pub(crate) fn declared_batch_reservation(items: &[PlannedCheckBatchItem]) -> ResourceReservation {
-    let heaviest = items.iter().map(|item| item.resource_class).fold(
-        CheckResourceClass::Shared,
-        |heaviest, class| match (heaviest, class) {
-            (CheckResourceClass::Exclusive, _) | (_, CheckResourceClass::Exclusive) => {
-                CheckResourceClass::Exclusive
-            }
-            _ => CheckResourceClass::Shared,
-        },
-    );
-    declared_check_reservation(heaviest)
+    let compatibility_class = if items
+        .iter()
+        .any(|item| item.resource_class == CheckResourceClass::Exclusive)
+    {
+        CheckResourceClass::Exclusive
+    } else {
+        CheckResourceClass::Shared
+    };
+    declared_check_reservation(compatibility_class)
 }
 
 /// The command class of a batch: the heaviest class among its items.
@@ -2377,6 +2263,7 @@ impl SubstrateFailureShape {
     /// fault, a draining host), a cancellation, and anything that happened after
     /// the command ran are all re-presented unchanged, so retrying them would
     /// only spend the machine twice for the same answer.
+    #[cfg(test)]
     fn is_transient(self) -> bool {
         matches!(self, Self::Capacity | Self::EnvironmentRetired)
     }
@@ -2559,7 +2446,7 @@ impl SubstrateFailure {
     pub(crate) fn agent_message(&self) -> String {
         match &self.waited_on {
             Some(waited_on) => format!(
-                "{} It was {waited_on}. {SUBSTRATE_FAILURE_CONSEQUENCE}",
+                "{} {waited_on}. {SUBSTRATE_FAILURE_CONSEQUENCE}",
                 self.shape.lead()
             ),
             None => format!("{} {SUBSTRATE_FAILURE_CONSEQUENCE}", self.shape.lead()),
@@ -2651,6 +2538,8 @@ pub enum CheckFailureKind {
     Killed,
     /// Positive evidence identifies a host, toolchain, or shared-service failure.
     Infrastructure,
+    /// Fleet admission could not obtain capacity before its knowledge-bounded wait expired.
+    Capacity,
     /// A recognized test runner exited abnormally without assertion failures.
     RunnerError,
 }
@@ -2661,6 +2550,7 @@ impl CheckFailureKind {
             self,
             CheckFailureKind::SpawnError
                 | CheckFailureKind::Infrastructure
+                | CheckFailureKind::Capacity
                 | CheckFailureKind::RunnerError
         )
     }
@@ -2671,6 +2561,7 @@ impl CheckFailureKind {
             CheckFailureKind::SpawnError => "spawn_error",
             CheckFailureKind::Killed => "killed",
             CheckFailureKind::Infrastructure => "infrastructure",
+            CheckFailureKind::Capacity => "capacity",
             CheckFailureKind::RunnerError => "runner_error",
         }
     }
@@ -2684,6 +2575,7 @@ impl CheckFailureKind {
             "spawn_error" => Some(CheckFailureKind::SpawnError),
             "killed" => Some(CheckFailureKind::Killed),
             "infrastructure" => Some(CheckFailureKind::Infrastructure),
+            "capacity" => Some(CheckFailureKind::Capacity),
             "runner_error" => Some(CheckFailureKind::RunnerError),
             _ => None,
         }
@@ -2699,6 +2591,7 @@ impl CheckFailureKind {
             CheckFailureKind::SpawnError => "failed to spawn".to_string(),
             CheckFailureKind::Killed => "killed (signal)".to_string(),
             CheckFailureKind::Infrastructure => "infrastructure/toolchain failure".to_string(),
+            CheckFailureKind::Capacity => "executor capacity unavailable".to_string(),
             CheckFailureKind::RunnerError => "test runner failed".to_string(),
         }
     }
@@ -3202,15 +3095,16 @@ async fn run_write_checks_after_seal_inner(
     // suppressed triples before admission. A coordinator-local hit must not erase
     // a command that the scheduler may place remotely.
     let miss_indices: Vec<usize> = (0..keyed.len()).collect();
-    let status_notify: CheckStatusNotify = Arc::new(move |checks, phase, phase_detail| {
+    let status_notify: CheckStatusNotify = Arc::new(move |checks, phase_status| {
         let _ = emitter.emit(
             "check-status",
             serde_json::to_value(CheckStatusPayload {
                 run_id: notify_run_id.clone(),
                 tool_use_id: notify_tool_use_id.clone(),
                 checks,
-                phase,
-                phase_detail,
+                phase: phase_status.phase,
+                phase_label: phase_status.label,
+                phase_diagnostic: phase_status.diagnostic,
             })
             .unwrap_or(serde_json::Value::Null),
         );
@@ -3218,6 +3112,7 @@ async fn run_write_checks_after_seal_inner(
     let status_board = CheckStatusBoard::new(&keyed, status_notify);
     status_board.set_phase(
         (!miss_indices.is_empty()).then_some("dispatching"),
+        (!miss_indices.is_empty()).then_some("dispatching checks"),
         (!miss_indices.is_empty()).then(|| "preparing check request".to_string()),
     );
     for (index, (plan, input_hash)) in keyed.iter().enumerate() {
@@ -3511,15 +3406,24 @@ async fn submit_write_check_batch_for(
             command: keyed[*index].0.command.clone(),
             stream_id: crate::mcp::handlers::run::check_stream_id(tool_use_id, *index),
             env: slot_env.to_vec(),
+            verdict_environment_names: keyed[*index].0.verdict_environment_names.clone(),
             timeout_ms: timeouts[*index],
             executor: checks
                 .get(&keyed[*index].0.name)
                 .and_then(|check| check.executor.clone()),
+            verdict_platforms: checks
+                .get(&keyed[*index].0.name)
+                .map(crate::execution::check_identity::verdict_platforms)
+                .unwrap_or_default(),
             resource_class: keyed[*index].0.resource_class,
         })
         .collect();
     if let Some(board) = status_board.as_ref() {
-        board.set_phase(Some("provisioning"), Some("resolving build slot".into()));
+        board.set_phase(
+            Some("provisioning"),
+            Some("preparing build slot"),
+            Some("resolving build slot".into()),
+        );
     }
     let repository = resolve_check_repository(
         orch,
@@ -4134,9 +4038,9 @@ pub(crate) struct CheckOutcome {
     pub(crate) suppressed_after: Option<i64>,
     /// The immutable observation this evaluation recorded, as the recorder wrote
     /// it. A caller that must name the row reads it from here rather than
-    /// re-deriving a key: a remote verdict is keyed by an empty environment
-    /// fingerprint that no coordinator-side key can match, and a coalesced
-    /// sibling's row was never this caller's to compute. `None` is the honest
+    /// re-deriving a key: a legacy remote verdict can be keyed by an empty
+    /// fingerprint, and a coalesced sibling's row was never this caller's to
+    /// compute. `None` is the honest
     /// answer when nothing was recorded — a suppressed triple never ran, and a
     /// failed write leaves the verdict standing without a durable row.
     pub(crate) recorded: Option<crate::execution::cache::RecordedCheckObservation>,
@@ -4180,41 +4084,16 @@ pub(crate) fn suppressed_check_message(streak: i64, last_diagnostic: &str) -> St
 }
 
 /// Versioned identity of the host tools that can affect project-check outcomes.
-/// Probes run at most once per runner process; cache lookups never shell out.
-static CHECK_TOOLCHAIN_IDENTITY: OnceLock<String> = OnceLock::new();
-
 pub(crate) fn check_platform_identity() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 pub fn check_toolchain_identity() -> &'static str {
-    CHECK_TOOLCHAIN_IDENTITY
-        .get_or_init(|| {
-            fn version(program: &str, args: &[&str]) -> String {
-                std::process::Command::new(program)
-                    .args(args)
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                    .filter(|output| !output.is_empty())
-                    .unwrap_or_else(|| "unavailable".to_string())
-            }
-            format!(
-                "rustc={};bun={}",
-                version("rustc", &["--version", "--verbose"]),
-                version("bun", &["--version"])
-            )
-        })
-        .as_str()
+    cairn_common::check_environment::toolchain_identity()
 }
 
 fn check_environment_fingerprint(variable_names: impl IntoIterator<Item = String>) -> String {
-    crate::execution::check_identity::local_environment_identity(
-        vec![check_toolchain_identity().to_string()],
-        variable_names,
-    )
-    .fingerprint
+    cairn_common::check_environment::local_fingerprint(variable_names)
 }
 
 fn plan_environment_fingerprint(plan: &CheckPlan) -> String {
@@ -4329,11 +4208,12 @@ fn fresh_observation_write(
         })
         .unwrap_or_default();
     // A remote executor's verdict environment is not the coordinator's environment.
-    // Until executor admission returns the selected machine's full advertised identity
-    // and locally hashed verdict variables, retain the observation for diagnosis but
-    // never publish it as reusable under a coordinator-derived cache key.
-    let remote_environment_unknown =
-        provenance.is_some_and(|meta| meta.executor_id != crate::fleet::COLOCATED_EXECUTOR_ID);
+    // Modern executors report the identity they computed where the check ran; legacy
+    // executors remain diagnostic-only rather than being keyed under a coordinator guess.
+    let remote_environment_unknown = provenance.is_some_and(|meta| {
+        meta.executor_id != crate::fleet::COLOCATED_EXECUTOR_ID
+            && meta.environment_fingerprint.is_empty()
+    });
     let reuse = if remote_environment_unknown {
         CheckReuseDecision {
             reusable: false,
@@ -4345,11 +4225,16 @@ fn fresh_observation_write(
     } else {
         reuse
     };
-    let environment_fingerprint = if remote_environment_unknown {
-        String::new()
-    } else {
-        plan_environment_fingerprint(plan)
-    };
+    let environment_fingerprint = provenance
+        .filter(|meta| !meta.environment_fingerprint.is_empty())
+        .map(|meta| meta.environment_fingerprint.clone())
+        .unwrap_or_else(|| {
+            if remote_environment_unknown {
+                String::new()
+            } else {
+                plan_environment_fingerprint(plan)
+            }
+        });
     FreshCheckObservationWrite {
         id: uuid::Uuid::new_v4().to_string(),
         project_id: project_id.to_string(),
@@ -4417,7 +4302,9 @@ fn check_command_identity(
             executor_id: None,
             device_id: None,
             capabilities: vec![toolchain.to_string()],
-            runner_build_id: cairn_common::build_identity::current_executable_build_id().ok(),
+            runner_build_id: Some(
+                cairn_common::check_environment::implementation_identity().to_string(),
+            ),
             variable_names: crate::execution::check_identity::verdict_environment_names(check),
         },
         |name| std::env::var(name).ok(),
@@ -4515,9 +4402,8 @@ where
     // is self-healing (latest snapshot wins). A std Mutex keeps the transition
     // helper a plain `Fn`; it is only ever locked to mutate + clone and released
     // before the (synchronous) emit, so no guard is held across an await.
-    let board = status_board.unwrap_or_else(|| {
-        CheckStatusBoard::new(plans, Arc::new(move |checks, _, _| notify(checks)))
-    });
+    let board = status_board
+        .unwrap_or_else(|| CheckStatusBoard::new(plans, Arc::new(move |checks, _| notify(checks))));
     board.emit_initial();
 
     // Phase 1: resolve cache HITS sequentially, and collect the MISS indices to
@@ -4760,9 +4646,9 @@ where
             // Parse before classifying: positive assertion failures outrank any
             // incidental infrastructure warning in the combined output.
             let parsed = parse_check_output(&plan.command, &output);
-            let classification = if substrate_failure.is_some() {
+            let classification = if let Some(substrate) = substrate_failure.as_ref() {
                 Some(FailureClassification {
-                    kind: CheckFailureKind::Infrastructure,
+                    kind: substrate_failure_kind(substrate),
                     reason: "Cairn: this check produced no verdict because Cairn's own \
                              infrastructure failed"
                         .to_string(),
@@ -4789,7 +4675,7 @@ where
                 classified_output_excerpt(&output, classification.as_ref())
             };
 
-            if failure_kind == Some(CheckFailureKind::Infrastructure) {
+            if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
                 let resources = crate::pressure::platform::read_process_resources();
                 let host = crate::pressure::platform::read_host_resources();
                 let process_tree = crate::pressure::process_tree::sample_ps_rows()
@@ -5786,6 +5672,7 @@ pub(crate) async fn verify_review_tree(
                     executor,
                     pinned_executor_id: None,
                     placement_mobility: Default::default(),
+                    verdict_platforms: Vec::new(),
                     command_resource_identity: Some(command_resource_identity),
                     resource_reservation,
                     learned_estimate: None,
@@ -6364,10 +6251,53 @@ mod tests {
 
     // --- keying by the derived closure --------------------------------------
 
-    /// The repository's real manifests plus the source files a case needs, as a
-    /// sealed tree. `version` distinguishes two trees whose source differs.
+    /// A pinned workspace graph plus the source files a case needs. These tests
+    /// assert closure keying, so their graph must not change with the checkout
+    /// while the parallel suite is running.
     fn workspace_tree(sources: &[(&str, &str)]) -> crate::execution::inputs::fixtures::TreeFixture {
-        let mut fixture = crate::execution::inputs::fixtures::real_workspace();
+        use crate::execution::inputs::fixtures::TreeFixture;
+
+        let mut fixture = TreeFixture::new()
+            .file(
+                "src-tauri/Cargo.toml",
+                r#"[workspace]
+members = ["os/cairn-cmd", "os/cairn-common", "os/cairn-core", "os/cairn-db", "os/cairn-vcs"]
+"#,
+            )
+            .file(
+                "src-tauri/os/cairn-common/Cargo.toml",
+                "[package]\nname = \"cairn-common\"\n",
+            )
+            .file(
+                "src-tauri/os/cairn-vcs/Cargo.toml",
+                "[package]\nname = \"cairn-vcs\"\n",
+            )
+            .file(
+                "src-tauri/os/cairn-db/Cargo.toml",
+                r#"[package]
+name = "cairn-db"
+[dependencies]
+cairn-common = { path = "../cairn-common" }
+"#,
+            )
+            .file(
+                "src-tauri/os/cairn-core/Cargo.toml",
+                r#"[package]
+name = "cairn-core"
+[dependencies]
+cairn-common = { path = "../cairn-common" }
+cairn-db = { path = "../cairn-db" }
+cairn-vcs = { path = "../cairn-vcs" }
+"#,
+            )
+            .file(
+                "src-tauri/os/cairn-cmd/Cargo.toml",
+                r#"[package]
+name = "cairn-cmd"
+[dependencies]
+cairn-common = { path = "../cairn-common" }
+"#,
+            );
         for (path, version) in sources {
             fixture = fixture.source(path, version);
         }
@@ -6682,6 +6612,7 @@ mod tests {
             timeout: None,
             executor: None,
             verdict_environment: Vec::new(),
+            verdict_platforms: None,
             fixes: false,
         }
     }
@@ -8095,6 +8026,7 @@ mod tests {
             output: String::new(),
             timed_out: false,
             metadata: cairn_common::executor_protocol::CellExecutionMeta {
+                warmth: None,
                 executor_id: "executor".to_string(),
                 executor_device_id: "device".to_string(),
                 executor_connection_generation: 1,
@@ -8107,6 +8039,7 @@ mod tests {
                 peak_physical_footprint_bytes: None,
                 disk_delta_bytes: None,
                 measurement_quality: None,
+                environment_fingerprint: String::new(),
             },
             mutation_delta: Some(Box::new(cairn_common::executor_protocol::MutationDelta {
                 base_commit: "base".to_string(),
@@ -8398,26 +8331,17 @@ mod tests {
         )
     }
 
-    /// The attempt bound, which is what keeps re-presentation from becoming a
-    /// loop. The other bound — the declared patience budget — is exercised in
-    /// the patience tests below; either one alone ends the policy.
     #[test]
-    fn a_capacity_retry_is_bounded_by_its_attempt_count() {
-        let refused = capacity_outcome([0, 1]);
-        for attempt in 0..CAPACITY_RETRY_ATTEMPTS {
-            assert!(
-                matches!(
-                    capacity_retry_decision(attempt, &refused),
-                    CapacityRetry::Again { .. }
-                ),
-                "attempt {attempt} is within the bound"
-            );
-        }
-        assert_eq!(
-            capacity_retry_decision(CAPACITY_RETRY_ATTEMPTS, &refused),
-            CapacityRetry::Surface,
-            "the bound is what makes this a policy rather than a loop"
+    fn capacity_is_represented_but_structural_failure_surfaces() {
+        assert!(matches!(
+            capacity_retry_decision(&capacity_outcome([0, 1])),
+            CapacityRetry::Again { .. }
+        ));
+        let structural = PlannedCheckBatchOutcome::failed(
+            vec![0],
+            SubstrateFailure::new(SubstrateFailureShape::NoMachine, "no machine"),
         );
+        assert_eq!(capacity_retry_decision(&structural), CapacityRetry::Surface);
     }
 
     fn predicted(
@@ -8433,115 +8357,19 @@ mod tests {
         )
     }
 
-    /// The ceiling bounds the whole wait on load Cairn cannot account for, not
-    /// one presentation of it, so a batch that has spent it has nothing left to
-    /// offer a retry however many attempts its count would still allow.
     #[test]
-    fn foreign_patience_bounds_the_whole_wait_rather_than_one_presentation() {
-        let live = CheckPatience {
-            started: std::time::Instant::now(),
-            foreign_ceiling: std::time::Duration::from_millis(REVIEW_CADENCE_FOREIGN_CEILING_MS),
-            mobility: PlacementMobility::SpillEligible,
-        };
-        assert!(!live.foreign_patience_spent());
-        assert!(live.remaining_foreign_ceiling_ms() > REVIEW_CADENCE_FOREIGN_CEILING_MS - 10_000);
-
-        let exhausted = CheckPatience {
-            started: std::time::Instant::now(),
-            foreign_ceiling: std::time::Duration::ZERO,
-            mobility: PlacementMobility::SpillEligible,
-        };
-        assert!(
-            exhausted.foreign_patience_spent(),
-            "a spent ceiling ends the wait on load nothing can account for"
-        );
-        assert_eq!(
-            exhausted.remaining_foreign_ceiling_ms(),
-            CAPACITY_RETRY_BACKOFF_MS[0],
-            "a presentation is never given a zero horizon, which would be evicted on arrival"
-        );
-    }
-
-    /// The operator's rule, which is the whole point of the policy: several
-    /// agents working at once is REGULAR operation, so the contention that
-    /// creates must never be able to produce a red row about someone's change.
-    ///
-    /// A wait on Cairn's own measured work carries no ceiling at all — not a
-    /// generous one. Whatever the cadence would allow, and however long the
-    /// occupant is predicted to take, the horizon is sized to outlast it and the
-    /// check keeps its place.
-    #[test]
-    fn a_wait_on_cairns_own_work_is_never_cut_short_by_a_cadence_ceiling() {
-        // Longer than either cadence ceiling, and longer than the whole wait a
-        // pre-CAIRN-3429 batch could ever have declared.
-        let long_suite = GroupWait::from_occupancy(predicted(30 * 60_000, 1), 1_000);
-        assert!(long_suite.self_inflicted);
-        assert_eq!(
-            long_suite.horizon_ms,
-            30 * 60_000 + PREDICTION_MARGIN_MS,
-            "the horizon outlasts the occupant, whatever the cadence would otherwise allow"
-        );
-        assert!(
-            long_suite.horizon_ms > REVIEW_CADENCE_FOREIGN_CEILING_MS,
-            "a ceiling meant for unaccountable load must not clip an accounted-for wait"
-        );
-
-        // Even with the foreign ceiling fully spent, self-inflicted contention
-        // is queued rather than abandoned.
-        let spent = GroupWait::from_occupancy(predicted(240_000, 1), 0);
-        assert!(spent.self_inflicted);
-        assert_eq!(spent.horizon_ms, 240_000 + PREDICTION_MARGIN_MS);
-
-        // And it says it is holding a place, not counting down to a refusal.
-        assert!(
-            spent
-                .description
-                .contains("holding this check's place until it frees"),
-            "{}",
-            spent.description
-        );
-    }
-
-    /// What the operator and the agent actually read. A wait Cairn can attribute
-    /// names the work it is queued behind and when that work should end; a wait
-    /// it cannot attribute says so rather than inventing an occupant, and only
-    /// that second kind is on a clock.
-    #[test]
-    fn a_wait_is_described_by_what_it_is_actually_on() {
-        let known =
-            GroupWait::from_occupancy(predicted(240_000, 3), REVIEW_CADENCE_FOREIGN_CEILING_MS);
-        assert_eq!(known.horizon_ms, 270_000, "relief plus the settling margin");
+    fn measured_and_unmeasured_holders_both_park() {
+        let known = GroupWait::from_occupancy(predicted(240_000, 3));
         assert_eq!(
             known.description,
-            "queued behind CAIRN-3414's rust-tests, predicted to finish in 4m, behind 2 other cells; holding this check's place until it frees"
+            "parked behind CAIRN-3414's rust-tests, predicted to finish in 4m, behind 2 other cells; holding this check's queue entry until capacity is released"
         );
-
-        for blind in [
-            crate::fleet::occupancy::MachineOccupancy::Unforecastable,
-            crate::fleet::occupancy::MachineOccupancy::Idle,
-        ] {
-            let wait = GroupWait::from_occupancy(blind, WRITE_CADENCE_FOREIGN_CEILING_MS);
-            assert!(!wait.self_inflicted, "nothing accounts for this wait");
-            assert_eq!(
-                wait.horizon_ms, WRITE_CADENCE_FOREIGN_CEILING_MS,
-                "with nothing to predict, the cadence ceiling is the whole answer"
-            );
-            assert!(
-                wait.description.contains("no measured duration")
-                    && wait.description.contains("waiting up to"),
-                "an unattributable wait states the absence, and that it is on a clock: {}",
-                wait.description
-            );
-        }
-    }
-
-    /// The floor still applies to an accounted-for wait: no forecast is precise
-    /// enough to justify a horizon so short the queue cannot act on it.
-    #[test]
-    fn even_a_momentary_occupant_buys_the_floor() {
-        let brief =
-            GroupWait::from_occupancy(predicted(1_000, 1), REVIEW_CADENCE_FOREIGN_CEILING_MS);
-        assert_eq!(brief.horizon_ms, CHECK_PATIENCE_FLOOR_MS);
+        let unmeasured =
+            GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Unforecastable);
+        assert!(unmeasured.description.contains("no measured duration"));
+        assert!(unmeasured
+            .description
+            .contains("holding this check's queue entry"));
     }
 
     /// The named wait reaches the agent. A capacity row that says only "there
@@ -8559,7 +8387,7 @@ mod tests {
         );
         attribute_capacity_wait(
             &mut outcome,
-            &GroupWait::from_occupancy(predicted(240_000, 3), REVIEW_CADENCE_FOREIGN_CEILING_MS),
+            &GroupWait::from_occupancy(predicted(240_000, 3)),
         );
 
         for index in [0, 1] {
@@ -8604,16 +8432,13 @@ mod tests {
         let mut linux_group = capacity_outcome([0, 1]);
         attribute_capacity_wait(
             &mut linux_group,
-            &GroupWait::from_occupancy(
-                crate::fleet::occupancy::MachineOccupancy::Predicted(
-                    crate::fleet::occupancy::OccupancyForecast {
-                        relief_ms: 300_000,
-                        blocking: "CAIRN-3414's rust-tests".into(),
-                        occupant_count: 1,
-                    },
-                ),
-                REVIEW_CADENCE_FOREIGN_CEILING_MS,
-            ),
+            &GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Predicted(
+                crate::fleet::occupancy::OccupancyForecast {
+                    relief_ms: 300_000,
+                    blocking: "CAIRN-3414's rust-tests".into(),
+                    occupant_count: 1,
+                },
+            )),
         );
 
         let mut local_group = PlannedCheckBatchOutcome::failed(
@@ -8622,16 +8447,13 @@ mod tests {
         );
         attribute_capacity_wait(
             &mut local_group,
-            &GroupWait::from_occupancy(
-                crate::fleet::occupancy::MachineOccupancy::Predicted(
-                    crate::fleet::occupancy::OccupancyForecast {
-                        relief_ms: 4_000,
-                        blocking: "CAIRN-3421's frontend-tests".into(),
-                        occupant_count: 1,
-                    },
-                ),
-                REVIEW_CADENCE_FOREIGN_CEILING_MS,
-            ),
+            &GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Predicted(
+                crate::fleet::occupancy::OccupancyForecast {
+                    relief_ms: 4_000,
+                    blocking: "CAIRN-3421's frontend-tests".into(),
+                    occupant_count: 1,
+                },
+            )),
         );
 
         let mut combined = linux_group;
@@ -8655,7 +8477,7 @@ mod tests {
         // group that covered two checks.
         let logged = describe_capacity_waits(&combined);
         assert_eq!(
-            logged.matches("queued behind").count(),
+            logged.matches("parked behind").count(),
             2,
             "two distinct waits, deduplicated within each group: {logged}"
         );
@@ -8680,7 +8502,7 @@ mod tests {
                 SubstrateFailure::new(shape, "diagnostic"),
             );
             assert_eq!(
-                capacity_retry_decision(0, &outcome),
+                capacity_retry_decision(&outcome),
                 CapacityRetry::Surface,
                 "{shape:?} must not be asked again"
             );
@@ -8699,21 +8521,18 @@ mod tests {
             }),
         );
         assert_eq!(
-            capacity_retry_decision(0, &partial),
+            capacity_retry_decision(&partial),
             CapacityRetry::Surface,
             "a batch that partly ran is not the same ask any more"
         );
 
         assert_eq!(
-            capacity_retry_decision(
-                0,
-                &PlannedCheckBatchOutcome {
-                    results: HashMap::new(),
-                    request: None,
-                    delta: None,
-                    store_dir: None,
-                }
-            ),
+            capacity_retry_decision(&PlannedCheckBatchOutcome {
+                results: HashMap::new(),
+                request: None,
+                delta: None,
+                store_dir: None,
+            }),
             CapacityRetry::Surface,
             "an empty outcome states no condition to retry"
         );
@@ -8900,6 +8719,7 @@ mod tests {
     async fn remote_executor_without_environment_identity_is_not_reusable() {
         let db = cache_db().await;
         let provenance = cairn_common::executor_protocol::CellExecutionMeta {
+            warmth: None,
             executor_id: "executor-a".to_string(),
             executor_device_id: "device-a".to_string(),
             executor_connection_generation: 3,
@@ -8912,6 +8732,7 @@ mod tests {
             peak_physical_footprint_bytes: None,
             disk_delta_bytes: None,
             measurement_quality: None,
+            environment_fingerprint: String::new(),
         };
         let results = run_planned_checks(
             db.clone(),
@@ -9001,10 +8822,27 @@ mod tests {
             CheckFailureKind::TimedOut,
             CheckFailureKind::SpawnError,
             CheckFailureKind::Killed,
+            CheckFailureKind::Infrastructure,
+            CheckFailureKind::Capacity,
+            CheckFailureKind::RunnerError,
         ] {
             assert_eq!(CheckFailureKind::from_stored(kind.as_str()), Some(kind));
         }
         assert_eq!(CheckFailureKind::from_stored("nonsense"), None);
+    }
+
+    #[test]
+    fn only_capacity_shaped_substrate_failures_gain_the_rearmable_kind() {
+        let capacity = SubstrateFailure::new(SubstrateFailureShape::Capacity, "busy");
+        let dispatch = SubstrateFailure::new(SubstrateFailureShape::Dispatch, "broken");
+        assert_eq!(
+            substrate_failure_kind(&capacity),
+            CheckFailureKind::Capacity
+        );
+        assert_eq!(
+            substrate_failure_kind(&dispatch),
+            CheckFailureKind::Infrastructure
+        );
     }
 
     /// String-level guard on the acceptance requirement: a timed-out check must
@@ -9070,8 +8908,10 @@ mod tests {
             command: command.into(),
             stream_id: "stream".into(),
             env: Vec::new(),
+            verdict_environment_names: Vec::new(),
             timeout_ms: 1,
             executor: None,
+            verdict_platforms: Vec::new(),
             resource_class,
         }
     }
@@ -9086,10 +8926,10 @@ mod tests {
     /// checks queued until their deadlines and surfaced as verdictless red
     /// infrastructure failures. Opportunistic parallelism is not a requirement.
     #[test]
-    fn a_shared_check_declares_one_unit_however_its_tool_parallelizes() {
+    fn check_resource_classes_never_charge_cpu_admission() {
         assert_eq!(
             declared_check_reservation(CheckResourceClass::Shared).concurrency_units,
-            1
+            0
         );
         assert_eq!(
             declared_check_reservation(CheckResourceClass::Shared).source,
@@ -9104,19 +8944,18 @@ mod tests {
             let items = [batch_item(command, CheckResourceClass::Shared)];
             assert_eq!(
                 declared_batch_reservation(&items).concurrency_units,
-                1,
-                "{command} is co-runnable unless the project says otherwise"
+                0,
+                "{command} carries no CPU admission charge"
             );
         }
     }
 
-    /// An `exclusive` resource class is the project asserting whole-machine
-    /// demand directly, and it remains the ONLY route to that charge.
+    /// The legacy `exclusive` value remains parseable but cannot gate CPU.
     #[test]
-    fn an_exclusive_check_declares_the_whole_machine() {
+    fn an_exclusive_check_is_cpu_admission_inert() {
         assert_eq!(
             declared_check_reservation(CheckResourceClass::Exclusive).concurrency_units,
-            ResourceReservation::WHOLE_MACHINE_CONCURRENCY
+            0
         );
     }
 
@@ -9140,16 +8979,16 @@ mod tests {
         let exclusive = batch_item("./run-the-suite", CheckResourceClass::Exclusive);
         assert_eq!(
             declared_batch_reservation(std::slice::from_ref(&light)).concurrency_units,
-            1
+            0
         );
         assert_eq!(
             declared_batch_reservation(&[light.clone(), parallel]).concurrency_units,
-            1,
-            "a shared batch stays one unit no matter what its tools do internally"
+            0,
+            "a shared batch carries no CPU admission charge"
         );
         assert_eq!(
             declared_batch_reservation(&[light, exclusive]).concurrency_units,
-            ResourceReservation::WHOLE_MACHINE_CONCURRENCY
+            0
         );
     }
 
@@ -9240,6 +9079,7 @@ mod tests {
         exit_code: Option<i32>,
         output: impl Into<String>,
         executor_id: &str,
+        environment_fingerprint: impl Into<String>,
     ) -> Result<CheckExecResult, String> {
         Ok(CheckExecResult {
             exit_code,
@@ -9247,6 +9087,7 @@ mod tests {
             timed_out: false,
             duration_ms: Some(1),
             provenance: Some(cairn_common::executor_protocol::CellExecutionMeta {
+                warmth: None,
                 executor_id: executor_id.to_string(),
                 executor_device_id: "device-remote".to_string(),
                 executor_connection_generation: 1,
@@ -9259,6 +9100,7 @@ mod tests {
                 peak_physical_footprint_bytes: None,
                 disk_delta_bytes: None,
                 measurement_quality: None,
+                environment_fingerprint: environment_fingerprint.into(),
             }),
             publication: None,
         })
@@ -9294,7 +9136,7 @@ mod tests {
             CheckExecMode::Shared,
             None,
             |_index, _command, _stream_id| async {
-                exec_on_executor(Some(0), "remote green", "bglab-ub")
+                exec_on_executor(Some(0), "remote green", "bglab-ub", "")
             },
             |_| {},
         )
@@ -9365,6 +9207,96 @@ mod tests {
         assert!(!reply.reusable);
         assert!(reply.environment_fingerprint.is_empty());
         assert!(reply.no_verdict.is_none());
+    }
+
+    #[tokio::test]
+    async fn matching_remote_environment_is_reused_without_running_again() {
+        let db = cache_db().await;
+        let local_environment = current_check_environment_fingerprint();
+        let executor_environment = cairn_common::check_environment::fingerprint(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            [cairn_common::check_environment::toolchain_identity().to_string()],
+            Some(cairn_common::check_environment::implementation_identity()),
+            Vec::<String>::new(),
+            |_| None,
+        );
+        assert_eq!(
+            executor_environment, local_environment,
+            "runner and executor composition must agree without sharing executable byte identity"
+        );
+        let plans = vec![(
+            plan("frontend", "bunx tsc --noEmit"),
+            "ih-matching-remote".to_string(),
+        )];
+        let first = run_planned_checks_at_commit(
+            db.clone(),
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "manual-check:run-a:frontend",
+            CheckExecMode::Shared,
+            None,
+            {
+                let environment = executor_environment.clone();
+                move |_, _, _| {
+                    let environment = environment.clone();
+                    async move {
+                        exec_on_executor(
+                            Some(0),
+                            "remote green",
+                            "bglab-ub",
+                            environment,
+                        )
+                    }
+                }
+            },
+            |_| {},
+        )
+        .await;
+        let source = first[0]
+            .recorded
+            .as_ref()
+            .expect("remote green must record its observation");
+        assert_eq!(source.environment_fingerprint, executor_environment);
+        assert!(source.reusable);
+
+        let second = run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-next",
+                defined_by: "commit-next",
+            },
+            "tree-next",
+            "job-b",
+            &plans,
+            "manual-check:run-b:frontend",
+            CheckExecMode::Shared,
+            None,
+            |_, _, _| async {
+                panic!("a matching remote observation must answer from cache");
+                #[allow(unreachable_code)]
+                exec_on_executor(Some(1), "should not run", "local", "")
+            },
+            |_| {},
+        )
+        .await;
+        assert!(second[0].cached);
+        assert!(second[0].passed);
+        assert_eq!(
+            second[0]
+                .recorded
+                .as_ref()
+                .map(|recorded| recorded.id.as_str()),
+            Some(source.id.as_str()),
+            "the cache hit must preserve the source observation identity"
+        );
     }
 
     /// A local run is unchanged: the recorded identity carries this machine's
@@ -9818,7 +9750,9 @@ mod tests {
                 env: Vec::new(),
                 timeout_ms: 1_000,
                 executor: None,
+                verdict_platforms: Vec::new(),
                 resource_class: CheckResourceClass::Shared,
+                verdict_environment_names: Vec::new(),
             })
             .collect();
         let (admitted, mut results) = reserve_batch_items(db.clone(), "project-a", items);
@@ -9964,8 +9898,10 @@ mod tests {
             command: "cargo test".to_string(),
             stream_id: String::new(),
             env: Vec::new(),
+            verdict_environment_names: Vec::new(),
             timeout_ms: 1_000,
             executor: None,
+            verdict_platforms: Vec::new(),
             resource_class: CheckResourceClass::Shared,
         };
         let racers: Vec<_> = (0..2)
@@ -10292,6 +10228,7 @@ mod tests {
     /// unchanged, so the verdict is a cache HIT — rust does not re-run — and the
     /// commit receives a cached alias rather than mutating its source evidence.
     #[tokio::test]
+    #[serial_test::serial]
     async fn doc_only_commit_reuses_impact_scoped_verdict() {
         let db = cache_db().await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -11088,7 +11025,9 @@ mod tests {
             env: Vec::new(),
             timeout_ms: 1,
             executor: Some(executor),
+            verdict_platforms: Vec::new(),
             resource_class: CheckResourceClass::Shared,
+            verdict_environment_names: Vec::new(),
         };
         let merged = merge_batch_executor(&[
             item(
@@ -11166,9 +11105,11 @@ mod tests {
             env: Vec::new(),
             timeout_ms: 1,
             executor,
+            verdict_platforms: Vec::new(),
             resource_class: CheckResourceClass::Shared,
+            verdict_environment_names: Vec::new(),
         };
-        let groups = partition_check_items_by_executor(vec![
+        let groups = partition_check_items_by_placement(vec![
             item(0, None),
             item(
                 1,

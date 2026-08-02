@@ -37,6 +37,35 @@ pub struct Project {
     pub is_workspace: bool,
 }
 
+fn deserialize_verdict_platforms<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let Some(declared) = Option::<Vec<String>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let mut platforms = Vec::with_capacity(declared.len());
+    for value in declared {
+        let platform = value.trim().to_ascii_lowercase();
+        if platform.is_empty() {
+            return Err(D::Error::custom(
+                "verdictPlatforms entries must not be blank",
+            ));
+        }
+        if !matches!(platform.as_str(), "macos" | "linux" | "windows") {
+            return Err(D::Error::custom(format!(
+                "unsupported verdict platform {value:?}; expected macos, linux, or windows"
+            )));
+        }
+        platforms.push(platform);
+    }
+    platforms.sort();
+    platforms.dedup();
+    Ok(Some(platforms))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectRemoteStatus {
@@ -163,6 +192,28 @@ pub struct CheckCommand {
     /// Values are hashed into environment identity and are never persisted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verdict_environment: Vec<String>,
+
+    /// The platform families whose result for this check the project gates on,
+    /// as lowercase OS names (`macos`, `linux`, `windows`). Absent means the
+    /// runner's own platform, which is what a project's gate has always meant:
+    /// checks ran on the machine holding the checkout, so that machine's
+    /// platform is the one the green was ever observed on.
+    ///
+    /// This is not "where this check CAN run" — that is `executor` — it is
+    /// "whose answer counts as this check's verdict". Placement may only choose
+    /// a machine on one of these platforms, so a suite can never turn a PR lane
+    /// red because idleness sent it to a platform the project does not gate on.
+    /// A genuinely cross-platform lane opts in by naming its platforms here.
+    ///
+    /// This intersects with `executor`: a selector can narrow where work is
+    /// capable of running, but it cannot make an untrusted platform's answer
+    /// count as the verdict.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_verdict_platforms"
+    )]
+    pub verdict_platforms: Option<Vec<String>>,
 
     /// Whether this check REWRITES the tree as its job — a formatter, not a
     /// verifier. Declared fixers run FIRST inside the write cadence's shared

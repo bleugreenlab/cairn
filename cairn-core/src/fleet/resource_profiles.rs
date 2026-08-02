@@ -1,9 +1,10 @@
 use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
-    CellCommandClass, CellExecutionMeta, CommandResourceIdentity, ExecutorCapabilities,
-    MeasurementQuality, ReservationFallback, ReservationRationale,
-    MIN_CONFIDENT_RESERVATION_SAMPLES,
+    CellCommandClass, CellExecutionMeta, CommandResourceIdentity, DurationEstimate,
+    DurationEvidence, DurationFallback, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality,
+    ReservationFallback, ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS,
+    DURATION_SAMPLE_WINDOW, MIN_CONFIDENT_DURATION_SAMPLES, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ const HEADROOM_NUMERATOR: u64 = 5;
 const HEADROOM_DENOMINATOR: u64 = 4;
 const HEADROOM_PERCENT: u32 = 25;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct ProfileContext {
     pub executor_class: String,
     pub os: String,
@@ -40,6 +41,11 @@ pub(super) struct ResolvedResourceProfile {
     pub learned_estimate: Option<cairn_common::executor_protocol::LearnedResourceEstimate>,
     /// How this number came to be this number.
     pub rationale: ReservationRationale,
+    /// How long this work is predicted to run on this machine at the warmth it
+    /// was resolved for. Read-only with respect to admission: nothing reserves
+    /// against a duration, and it exists so placement can rank machines by when
+    /// they would answer rather than by how unloaded they look.
+    pub duration: DurationEstimate,
 }
 
 /// The conservative safety prior for a work class that has never been measured
@@ -91,6 +97,114 @@ pub(super) fn cold_start_prior(
     }
 }
 
+/// The conservative duration a work class is assumed to take on a machine that
+/// has never run it.
+///
+/// A class prior, never a machine-speed constant. Every machine gets the same
+/// number for the same class, which is precisely what makes it useless for
+/// deciding between two unmeasured machines — and that is the point. Absent
+/// evidence, placement must not manufacture a reason to prefer one host over
+/// another; the queue forecast and the deterministic tiebreaks decide instead,
+/// and the record says the run leg was [`DurationEvidence::Unmeasured`].
+///
+/// The values are ordered by what these classes actually are: a Rust
+/// compilation front is minutes, a bundler or a type-check is under a minute, an
+/// unclassified command is assumed short because nothing is known about it and
+/// over-predicting would keep work off machines that have never been tried.
+pub(super) fn duration_prior(class: CellCommandClass) -> u64 {
+    const SECOND: u64 = 1_000;
+    match class {
+        CellCommandClass::CargoTest
+        | CellCommandClass::CargoClippy
+        | CellCommandClass::CargoCheck => 300 * SECOND,
+        CellCommandClass::Build => 60 * SECOND,
+        CellCommandClass::Typecheck | CellCommandClass::Vitest => 30 * SECOND,
+        CellCommandClass::Other => 10 * SECOND,
+    }
+}
+
+/// The labeled class prior, dressed as the estimate every caller reads.
+pub(super) fn unmeasured_duration(
+    class: CellCommandClass,
+    context: &ProfileContext,
+    identity: Option<&CommandResourceIdentity>,
+    warmth: ExecutionWarmth,
+    fallback: DurationFallback,
+) -> DurationEstimate {
+    DurationEstimate {
+        predicted_ms: duration_prior(class),
+        source: DurationEvidence::Unmeasured,
+        sample_count: 0,
+        profile_key: identity.map(|identity| identity.key.clone()),
+        profile_context: context.describe(),
+        warmth,
+        updated_at_unix_ms: None,
+        fallback: Some(fallback),
+    }
+}
+
+/// How long this command is predicted to run on this machine at this warmth.
+///
+/// Predicts from the median of a bounded recent window rather than from a
+/// high-water mark, because ranking and reserving want opposite things from the
+/// same observations. A reservation must cover the worst case it has seen or it
+/// stops being a safety margin; a prediction must describe the typical case or
+/// one bad afternoon — a machine that swapped, a network mount that stalled —
+/// becomes that machine's permanent answer and quietly removes it from the
+/// fleet. The median gives the outlier one vote out of the window's size, and
+/// the window's bound is what eventually retires it altogether.
+pub(super) async fn resolve_duration(
+    db: Arc<LocalDb>,
+    identity: Option<&CommandResourceIdentity>,
+    context: &ProfileContext,
+    warmth: ExecutionWarmth,
+    class: CellCommandClass,
+    now_unix_ms: u64,
+) -> DurationEstimate {
+    let Some(identity) = identity else {
+        return unmeasured_duration(
+            class,
+            context,
+            None,
+            warmth,
+            DurationFallback::NoCommandIdentity,
+        );
+    };
+    let prior = |fallback| unmeasured_duration(class, context, Some(identity), warmth, fallback);
+    let profile = match load_duration_profile(db, identity, context, warmth).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return prior(DurationFallback::NoProfileRecorded),
+        Err(_) => return prior(DurationFallback::ProfileLookupFailed),
+    };
+    if profile.recent_ms.len() < MIN_CONFIDENT_DURATION_SAMPLES as usize {
+        return prior(DurationFallback::BelowConfidenceFloor);
+    }
+    // Silence is not evidence of continuity. A profile whose newest observation
+    // predates the age limit describes a machine that may have been reinstalled,
+    // re-toolchained, or filled up since, so it stops speaking and says why.
+    if now_unix_ms.saturating_sub(profile.updated_at_unix_ms) > DURATION_PROFILE_STALE_AFTER_MS {
+        return prior(DurationFallback::ProfileTooOld);
+    }
+    DurationEstimate {
+        predicted_ms: median_ms(&profile.recent_ms),
+        source: DurationEvidence::Learned,
+        sample_count: profile.sample_count,
+        profile_key: Some(identity.key.clone()),
+        profile_context: context.describe(),
+        warmth,
+        updated_at_unix_ms: Some(profile.updated_at_unix_ms),
+        fallback: None,
+    }
+}
+
+/// The upper median of a non-empty window. Integer throughout: a prediction in
+/// whole milliseconds is already finer than anything downstream compares on.
+fn median_ms(samples: &[u64]) -> u64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
 /// The rationale for a reservation the caller stated itself.
 pub(super) fn declared_rationale(
     context: &ProfileContext,
@@ -118,12 +232,42 @@ struct ResourceProfile {
     upper_duration_ms: Option<u64>,
 }
 
+/// The retained window a duration prediction is computed from, plus how much
+/// history stands behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurationProfile {
+    sample_count: u64,
+    updated_at_unix_ms: u64,
+    /// Oldest first, bounded by [`DURATION_SAMPLE_WINDOW`].
+    recent_ms: Vec<u64>,
+}
+
+/// What a duration lookup needs beyond the profile key: which class stands in
+/// when nothing is learned, what state the machine is in, and the instant
+/// staleness is judged against.
+#[derive(Clone, Copy)]
+pub(super) struct DurationContext {
+    pub class: CellCommandClass,
+    pub warmth: ExecutionWarmth,
+    pub now_unix_ms: u64,
+}
+
 pub(super) async fn resolve_reservation(
     db: Arc<LocalDb>,
     identity: Option<&CommandResourceIdentity>,
     context: &ProfileContext,
     prior: ResourceReservation,
+    duration_context: DurationContext,
 ) -> ResolvedResourceProfile {
+    let duration = resolve_duration(
+        db.clone(),
+        identity,
+        context,
+        duration_context.warmth,
+        duration_context.class,
+        duration_context.now_unix_ms,
+    )
+    .await;
     let rationale = |fallback: Option<ReservationFallback>, profile: Option<&ResourceProfile>| {
         ReservationRationale {
             // A learned profile speaks for memory, disk, and duration only. Any
@@ -146,6 +290,7 @@ pub(super) async fn resolve_reservation(
             reservation: prior.clone(),
             learned_estimate: None,
             rationale: rationale(Some(ReservationFallback::NoCommandIdentity), None),
+            duration,
         };
     };
     // A store that could not be read and a work class that has never run are
@@ -158,6 +303,7 @@ pub(super) async fn resolve_reservation(
                 reservation: prior.clone(),
                 learned_estimate: None,
                 rationale: rationale(Some(ReservationFallback::NoProfileRecorded), None),
+                duration,
             }
         }
         Err(_) => {
@@ -165,6 +311,7 @@ pub(super) async fn resolve_reservation(
                 reservation: prior.clone(),
                 learned_estimate: None,
                 rationale: rationale(Some(ReservationFallback::ProfileLookupFailed), None),
+                duration,
             }
         }
     };
@@ -181,9 +328,17 @@ pub(super) async fn resolve_reservation(
             below_floor.then_some(ReservationFallback::BelowConfidenceFloor),
             Some(&profile),
         ),
+        duration,
     }
 }
 
+/// Fold one real completion into what this machine has learned.
+///
+/// The only writer. Nothing else may put a number into these profiles — in
+/// particular a reused check-result observation must not, because its duration
+/// belongs to the execution that originally produced it, on whatever machine
+/// that was, and recording it here would teach the fleet that a cache hit is how
+/// fast that machine runs the suite.
 pub(super) async fn observe_completed(
     db: Arc<LocalDb>,
     identity: Option<&CommandResourceIdentity>,
@@ -205,6 +360,23 @@ pub(super) async fn observe_completed(
         .flatten();
     if duration.is_none() && memory.is_none() && disk.is_none() {
         return;
+    }
+    // A duration only becomes evidence about speed once the executor says what
+    // state the machine was in when it ran. An execution that makes no warmth
+    // claim is still charged against the reservation profile — memory demand does
+    // not depend on knowing why — but it teaches the predictor nothing, because
+    // filing it under a guessed warmth is how warm and cold runs contaminate each
+    // other.
+    if let (Some(duration), Some(warmth)) = (duration, metadata.warmth) {
+        let _ = record_duration(
+            db.clone(),
+            identity,
+            context,
+            warmth,
+            metadata.finished_at_unix_ms,
+            duration,
+        )
+        .await;
     }
     let _ = update_profile(
         db,
@@ -291,6 +463,118 @@ async fn load_profile(
     }).await.map_err(|error| error.to_string())
 }
 
+async fn load_duration_profile(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    warmth: ExecutionWarmth,
+) -> Result<Option<DurationProfile>, String> {
+    let identity = identity.clone();
+    let context = context.clone();
+    db.read(|conn| {
+        let identity = identity.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT sample_count, updated_at_unix_ms, recent_duration_ms
+                 FROM command_duration_profiles
+                 WHERE identity_version=?1 AND command_identity=?2 AND executor_class=?3
+                   AND os=?4 AND arch=?5 AND toolchain_fingerprint=?6 AND warmth=?7",
+                    params![
+                        identity.version as i64,
+                        identity.key,
+                        context.executor_class,
+                        context.os,
+                        context.arch,
+                        context.toolchain_fingerprint,
+                        warmth.as_str()
+                    ],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(DurationProfile {
+                    sample_count: row.get::<i64>(0)? as u64,
+                    updated_at_unix_ms: row.get::<i64>(1)? as u64,
+                    recent_ms: decode_window(&row.get::<String>(2)?),
+                })),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// A window that cannot be decoded is an empty window, not a zero-length run.
+/// The caller reads too few samples and falls back to the labeled prior, which
+/// is the honest response to a store that has stopped making sense.
+fn decode_window(encoded: &str) -> Vec<u64> {
+    serde_json::from_str::<Vec<u64>>(encoded).unwrap_or_default()
+}
+
+/// Append one observation to the retained window, evicting the oldest.
+///
+/// Read-modify-write inside the transaction rather than in SQL: the window is a
+/// bounded ordered list, and expressing "append, then drop the head if it grew
+/// past the bound" in portable SQL costs more than it buys. `LocalDb::write`
+/// re-runs this closure when a concurrent writer conflicts, so the read and the
+/// write it derives always describe the same snapshot.
+async fn record_duration(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    warmth: ExecutionWarmth,
+    finished: u64,
+    duration_ms: u64,
+) -> Result<(), String> {
+    let identity = identity.clone();
+    let context = context.clone();
+    db.write(move |conn| {
+        let identity = identity.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let key = params![identity.version as i64, identity.key.clone(), context.executor_class.clone(),
+                context.os.clone(), context.arch.clone(), context.toolchain_fingerprint.clone(), warmth.as_str()];
+            let mut rows = conn.query(
+                "SELECT sample_count, updated_at_unix_ms, recent_duration_ms
+                 FROM command_duration_profiles
+                 WHERE identity_version=?1 AND command_identity=?2 AND executor_class=?3
+                   AND os=?4 AND arch=?5 AND toolchain_fingerprint=?6 AND warmth=?7",
+                key,
+            ).await?;
+            let existing = rows.next().await?;
+            let (sample_count, newest, mut window) = match existing {
+                Some(row) => (
+                    row.get::<i64>(0)? as u64,
+                    row.get::<i64>(1)? as u64,
+                    decode_window(&row.get::<String>(2)?),
+                ),
+                None => (0, 0, Vec::new()),
+            };
+            window.push(duration_ms);
+            while window.len() > DURATION_SAMPLE_WINDOW {
+                window.remove(0);
+            }
+            let encoded = serde_json::to_string(&window).unwrap_or_else(|_| "[]".into());
+            conn.execute(
+                "INSERT INTO command_duration_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, warmth, sample_count, updated_at_unix_ms, recent_duration_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                 ON CONFLICT(identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, warmth) DO UPDATE SET
+                   sample_count=excluded.sample_count,
+                   updated_at_unix_ms=excluded.updated_at_unix_ms,
+                   recent_duration_ms=excluded.recent_duration_ms",
+                params![identity.version as i64, identity.key.clone(), context.executor_class.clone(),
+                    context.os.clone(), context.arch.clone(), context.toolchain_fingerprint.clone(), warmth.as_str(),
+                    sample_count.saturating_add(1).min(10_000) as i64,
+                    newest.max(finished) as i64,
+                    encoded],
+            ).await?;
+            Ok(())
+        })
+    }).await.map_err(|error| error.to_string())
+}
+
 async fn update_profile(
     db: Arc<LocalDb>,
     identity: &CommandResourceIdentity,
@@ -327,6 +611,15 @@ async fn update_profile(
 mod tests {
     use super::*;
     use cairn_common::executor_protocol::ExecutionMeasurementQuality;
+
+    /// A duration lookup the reservation tests do not care about the answer to.
+    fn test_duration_context() -> DurationContext {
+        DurationContext {
+            class: CellCommandClass::Other,
+            warmth: ExecutionWarmth::Cold,
+            now_unix_ms: 0,
+        }
+    }
 
     fn capabilities() -> ExecutorCapabilities {
         ExecutorCapabilities {
@@ -388,7 +681,14 @@ mod tests {
         };
         let prior = cold_start_prior(CellCommandClass::CargoClippy, &capabilities());
 
-        let anonymous = resolve_reservation(db.clone(), None, &context, prior.clone()).await;
+        let anonymous = resolve_reservation(
+            db.clone(),
+            None,
+            &context,
+            prior.clone(),
+            test_duration_context(),
+        )
+        .await;
         assert_eq!(
             anonymous.rationale.fallback,
             Some(ReservationFallback::NoCommandIdentity)
@@ -399,8 +699,14 @@ mod tests {
             version: 1,
             key: "check:rust".into(),
         };
-        let unseen =
-            resolve_reservation(db.clone(), Some(&identity), &context, prior.clone()).await;
+        let unseen = resolve_reservation(
+            db.clone(),
+            Some(&identity),
+            &context,
+            prior.clone(),
+            test_duration_context(),
+        )
+        .await;
         assert_eq!(
             unseen.rationale.fallback,
             Some(ReservationFallback::NoProfileRecorded)
@@ -422,7 +728,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let thin = resolve_reservation(db, Some(&identity), &context, prior.clone()).await;
+        let thin = resolve_reservation(
+            db,
+            Some(&identity),
+            &context,
+            prior.clone(),
+            test_duration_context(),
+        )
+        .await;
         assert_eq!(
             thin.rationale.fallback,
             Some(ReservationFallback::BelowConfidenceFloor),
@@ -606,6 +919,7 @@ mod tests {
             toolchain_fingerprint: "toolchain".into(),
         };
         let metadata = CellExecutionMeta {
+            warmth: None,
             executor_id: "executor".into(),
             executor_device_id: "device".into(),
             executor_connection_generation: 1,
@@ -618,6 +932,7 @@ mod tests {
             peak_physical_footprint_bytes: None,
             disk_delta_bytes: Some(20),
             measurement_quality: None,
+            environment_fingerprint: String::new(),
         };
         let (left, right) = tokio::join!(
             update_profile(
@@ -665,6 +980,7 @@ mod tests {
             toolchain_fingerprint: "toolchain".into(),
         };
         let metadata = CellExecutionMeta {
+            warmth: None,
             executor_id: "executor".into(),
             executor_device_id: "device".into(),
             executor_connection_generation: 1,
@@ -683,6 +999,7 @@ mod tests {
                 memory_platform: Some("test".into()),
                 disk_boundary: "unavailable".into(),
             }),
+            environment_fingerprint: String::new(),
         };
 
         observe_completed(db.clone(), Some(&identity), &context, &metadata).await;
@@ -706,11 +1023,408 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
             },
+            test_duration_context(),
         )
         .await;
         assert_eq!(resolved.reservation.disk_growth_bytes, 2_000);
         let estimate = resolved.learned_estimate.unwrap();
         assert_eq!(estimate.upper_duration_ms, Some(10));
         assert_eq!(estimate.upper_disk_growth_bytes, None);
+    }
+
+    fn duration_context() -> ProfileContext {
+        ProfileContext {
+            executor_class: "device:executor".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            toolchain_fingerprint: "rust".into(),
+        }
+    }
+
+    fn duration_identity() -> CommandResourceIdentity {
+        CommandResourceIdentity {
+            version: 1,
+            key: "check:rust".into(),
+        }
+    }
+
+    /// A completion the executor measured, at a stated warmth.
+    fn completion(
+        warmth: Option<ExecutionWarmth>,
+        finished: u64,
+        duration_ms: u64,
+    ) -> CellExecutionMeta {
+        CellExecutionMeta {
+            warmth,
+            environment_fingerprint: String::new(),
+            executor_id: "executor".into(),
+            executor_device_id: "device".into(),
+            executor_connection_generation: 1,
+            cell_id: "slot".into(),
+            cell_epoch: 1,
+            started_at_unix_ms: finished.saturating_sub(duration_ms),
+            finished_at_unix_ms: finished,
+            duration_ms: Some(duration_ms),
+            peak_rss_bytes: Some(100),
+            peak_physical_footprint_bytes: None,
+            disk_delta_bytes: Some(20),
+            measurement_quality: Some(ExecutionMeasurementQuality {
+                duration: MeasurementQuality::Authoritative,
+                memory: MeasurementQuality::Sampled,
+                disk: MeasurementQuality::Sampled,
+                memory_platform: Some("test".into()),
+                disk_boundary: "cell".into(),
+            }),
+        }
+    }
+
+    /// The failure this whole stratification exists to prevent: an incremental
+    /// compile against a populated target directory and a full one against an
+    /// empty one are different work, and a single averaged number describes
+    /// neither. A machine that has just built this tree must not be predicted at
+    /// its cold-start speed, nor an empty one at its warm speed.
+    #[tokio::test]
+    async fn warm_and_cold_observations_of_one_command_never_mix() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-warmth.db").await);
+        let identity = duration_identity();
+        let context = duration_context();
+
+        for finished in 1..=3 {
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &completion(Some(ExecutionWarmth::Cold), finished, 300_000),
+            )
+            .await;
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &completion(Some(ExecutionWarmth::PreparedWarmSlot), finished, 20_000),
+            )
+            .await;
+        }
+
+        let cold = resolve_duration(
+            db.clone(),
+            Some(&identity),
+            &context,
+            ExecutionWarmth::Cold,
+            CellCommandClass::CargoTest,
+            10,
+        )
+        .await;
+        let warm = resolve_duration(
+            db.clone(),
+            Some(&identity),
+            &context,
+            ExecutionWarmth::PreparedWarmSlot,
+            CellCommandClass::CargoTest,
+            10,
+        )
+        .await;
+        assert_eq!(cold.predicted_ms, 300_000);
+        assert_eq!(warm.predicted_ms, 20_000);
+        assert!(cold.is_learned() && warm.is_learned());
+        assert_eq!(cold.warmth, ExecutionWarmth::Cold);
+        assert_eq!(warm.warmth, ExecutionWarmth::PreparedWarmSlot);
+
+        // The reservation half saw every one of those six executions: memory
+        // demand does not depend on what was already on disk, so splitting it by
+        // warmth would only make the high-water mark cover less.
+        let profile = load_profile(db, &identity, &context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.sample_count, 6);
+    }
+
+    /// A duration profile describes one machine on one platform. Reading a
+    /// Linux observation as evidence about a macOS host is how a fleet predicts
+    /// speeds nobody ever measured.
+    #[tokio::test]
+    async fn a_duration_learned_in_one_context_does_not_answer_for_another() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-context.db").await);
+        let identity = duration_identity();
+        let here = duration_context();
+        for finished in 1..=3 {
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &here,
+                &completion(Some(ExecutionWarmth::Cold), finished, 50_000),
+            )
+            .await;
+        }
+
+        for elsewhere in [
+            ProfileContext {
+                os: "macos".into(),
+                ..here.clone()
+            },
+            ProfileContext {
+                arch: "aarch64".into(),
+                ..here.clone()
+            },
+            ProfileContext {
+                toolchain_fingerprint: "rust,node".into(),
+                ..here.clone()
+            },
+            ProfileContext {
+                executor_class: "other-device:executor".into(),
+                ..here.clone()
+            },
+        ] {
+            let estimate = resolve_duration(
+                db.clone(),
+                Some(&identity),
+                &elsewhere,
+                ExecutionWarmth::Cold,
+                CellCommandClass::CargoTest,
+                10,
+            )
+            .await;
+            assert_eq!(
+                estimate.source,
+                DurationEvidence::Unmeasured,
+                "{elsewhere:?} inherited a prediction it never earned"
+            );
+            assert_eq!(estimate.fallback, Some(DurationFallback::NoProfileRecorded));
+        }
+    }
+
+    /// The specimen: one forty-minute run on a machine that was swapping must
+    /// not become that machine's answer for the next hour. A median over a
+    /// bounded window rejects it, and later observations push it out entirely.
+    #[tokio::test]
+    async fn one_extreme_observation_never_becomes_the_prediction() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-outlier.db").await);
+        let identity = duration_identity();
+        let context = duration_context();
+        let predict = |db: Arc<LocalDb>,
+                       identity: CommandResourceIdentity,
+                       context: ProfileContext| async move {
+            resolve_duration(
+                db,
+                Some(&identity),
+                &context,
+                ExecutionWarmth::Cold,
+                CellCommandClass::CargoTest,
+                100,
+            )
+            .await
+        };
+
+        for finished in 1..=2 {
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &completion(Some(ExecutionWarmth::Cold), finished, 60_000),
+            )
+            .await;
+        }
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &completion(Some(ExecutionWarmth::Cold), 3, 2_400_000),
+        )
+        .await;
+        let with_outlier = predict(db.clone(), identity.clone(), context.clone()).await;
+        assert_eq!(
+            with_outlier.predicted_ms, 60_000,
+            "the median holds the line at the two representative runs"
+        );
+
+        // Enough later observations to advance the window past the outlier. The
+        // sample count keeps rising, so the profile does not forget that it has
+        // history -- only that the outlier is no longer part of it.
+        for finished in 4..=(4 + DURATION_SAMPLE_WINDOW as u64) {
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &completion(Some(ExecutionWarmth::Cold), finished, 55_000),
+            )
+            .await;
+        }
+        let displaced = predict(db.clone(), identity.clone(), context.clone()).await;
+        assert_eq!(displaced.predicted_ms, 55_000);
+        assert!(
+            displaced.sample_count > DURATION_SAMPLE_WINDOW as u64,
+            "the window is bounded; the history behind it is not"
+        );
+        let stored = load_duration_profile(db, &identity, &context, ExecutionWarmth::Cold)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.recent_ms.len(), DURATION_SAMPLE_WINDOW);
+        assert!(
+            !stored.recent_ms.contains(&2_400_000),
+            "the outlier aged out by sample count, not by clock"
+        );
+    }
+
+    /// Every way a lookup can come back with nothing is a labeled prior that
+    /// names which nothing it found. None of them is silence, and none of them
+    /// is a number presented as a measurement.
+    #[tokio::test]
+    async fn every_absent_duration_is_a_named_prior() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-absences.db").await);
+        let identity = duration_identity();
+        let context = duration_context();
+
+        let anonymous = resolve_duration(
+            db.clone(),
+            None,
+            &context,
+            ExecutionWarmth::Cold,
+            CellCommandClass::CargoTest,
+            10,
+        )
+        .await;
+        assert_eq!(
+            anonymous.fallback,
+            Some(DurationFallback::NoCommandIdentity)
+        );
+        assert_eq!(
+            anonymous.predicted_ms,
+            duration_prior(CellCommandClass::CargoTest)
+        );
+        assert_eq!(anonymous.sample_count, 0);
+
+        let unseen = resolve_duration(
+            db.clone(),
+            Some(&identity),
+            &context,
+            ExecutionWarmth::Cold,
+            CellCommandClass::Typecheck,
+            10,
+        )
+        .await;
+        assert_eq!(unseen.fallback, Some(DurationFallback::NoProfileRecorded));
+        assert_eq!(
+            unseen.predicted_ms,
+            duration_prior(CellCommandClass::Typecheck),
+            "the prior is a class prior, so it differs by class and not by machine"
+        );
+
+        for finished in 1..=(MIN_CONFIDENT_DURATION_SAMPLES - 1) {
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &completion(Some(ExecutionWarmth::Cold), finished, 1_000),
+            )
+            .await;
+        }
+        let thin = resolve_duration(
+            db.clone(),
+            Some(&identity),
+            &context,
+            ExecutionWarmth::Cold,
+            CellCommandClass::CargoTest,
+            10,
+        )
+        .await;
+        assert_eq!(thin.fallback, Some(DurationFallback::BelowConfidenceFloor));
+        assert_eq!(thin.source, DurationEvidence::Unmeasured);
+        assert_ne!(
+            thin.predicted_ms, 1_000,
+            "under the floor a median cannot reject an outlier, so it is not consulted"
+        );
+
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &completion(
+                Some(ExecutionWarmth::Cold),
+                MIN_CONFIDENT_DURATION_SAMPLES,
+                1_000,
+            ),
+        )
+        .await;
+        let learned = resolve_duration(
+            db.clone(),
+            Some(&identity),
+            &context,
+            ExecutionWarmth::Cold,
+            CellCommandClass::CargoTest,
+            10,
+        )
+        .await;
+        assert_eq!(learned.source, DurationEvidence::Learned);
+        assert_eq!(learned.predicted_ms, 1_000);
+
+        // Silence is not evidence of continuity: a machine's toolchain, caches,
+        // and disk all move, and a prediction older than the age limit is
+        // describing a machine that no longer exists.
+        let stale = resolve_duration(
+            db,
+            Some(&identity),
+            &context,
+            ExecutionWarmth::Cold,
+            CellCommandClass::CargoTest,
+            MIN_CONFIDENT_DURATION_SAMPLES + DURATION_PROFILE_STALE_AFTER_MS + 1,
+        )
+        .await;
+        assert_eq!(stale.fallback, Some(DurationFallback::ProfileTooOld));
+        assert_eq!(stale.source, DurationEvidence::Unmeasured);
+    }
+
+    /// An execution that makes no warmth claim is charged against the
+    /// reservation profile -- memory demand does not depend on knowing why --
+    /// but teaches the predictor nothing. Filing it under a guessed warmth is
+    /// exactly how warm and cold profiles contaminate each other.
+    #[tokio::test]
+    async fn an_execution_without_a_warmth_claim_teaches_the_predictor_nothing() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-unclaimed.db").await);
+        let identity = duration_identity();
+        let context = duration_context();
+        for finished in 1..=5 {
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &completion(None, finished, 42_000),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            load_profile(db.clone(), &identity, &context)
+                .await
+                .unwrap()
+                .unwrap()
+                .sample_count,
+            5
+        );
+        for warmth in [
+            ExecutionWarmth::Cold,
+            ExecutionWarmth::RepositoryOnly,
+            ExecutionWarmth::PreparedWarmSlot,
+        ] {
+            assert!(
+                load_duration_profile(db.clone(), &identity, &context, warmth)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "an unattributable duration must not land in any warmth's profile"
+            );
+        }
+    }
+
+    /// A window the store can no longer parse is an empty window, not a
+    /// zero-length run. The caller then reads too few samples and falls back to
+    /// the labeled prior, which is the honest answer to a store that has stopped
+    /// making sense.
+    #[test]
+    fn an_undecodable_window_is_empty_rather_than_instantaneous() {
+        assert!(decode_window("not json").is_empty());
+        assert!(decode_window("").is_empty());
+        assert_eq!(decode_window("[10,20,30]"), vec![10, 20, 30]);
     }
 }

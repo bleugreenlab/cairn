@@ -58,7 +58,11 @@ pub(crate) async fn handle_read_batch(
     // Per-target flail dedup: re-applied here because `read_batch` is kept out of
     // the outer `is_read_family` so the batch granularity does not collapse the
     // per-target `[duplicate call]` stub.
-    if let Some(run_id) = request.run_id.as_deref() {
+    if let Some(run_id) = request
+        .run_id
+        .as_deref()
+        .filter(|_| !crate::dispatch::is_standalone_cli(request))
+    {
         for segment in &mut segments {
             // Browser reads are snapshots of an interactive surface; repeating the
             // same URI is an intentional poll/visual re-check, not flailing over
@@ -1270,12 +1274,25 @@ mod tests {
         paths: serde_json::Value,
         run_id: Option<&str>,
     ) -> ReadBatchEnvelope {
+        read_batch_envelope_for_origin(orch, paths, run_id, false).await
+    }
+
+    async fn read_batch_envelope_for_origin(
+        orch: &Orchestrator,
+        paths: serde_json::Value,
+        run_id: Option<&str>,
+        standalone_cli: bool,
+    ) -> ReadBatchEnvelope {
+        let mut payload = serde_json::json!({ "paths": paths });
+        if standalone_cli {
+            payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
+        }
         let request = McpCallbackRequest {
             thread_id: None,
             cwd: tempfile::tempdir().unwrap().keep().display().to_string(),
             run_id: run_id.map(str::to_string),
             tool: "read_batch".to_string(),
-            payload: serde_json::json!({ "paths": paths }),
+            payload,
             tool_use_id: None,
         };
         let cursors = Mutex::new(HashMap::new());
@@ -1322,6 +1339,37 @@ mod tests {
         )
         .await;
         assert!(second.text.contains("[duplicate call]"), "{}", second.text);
+    }
+
+    #[tokio::test]
+    async fn read_batch_does_not_dedupe_cli_poll_after_agent_read() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-cli-poll', 'proj-rb', 1, 'Polled issue', 'active', 1, 1)",
+        )
+        .await;
+        register_turn(&orch, "run-cli-poll", "turn-cli-poll");
+
+        let paths = serde_json::json!(["cairn://p/RB/1"]);
+        let agent_read =
+            read_batch_envelope_for_run(&orch, paths.clone(), Some("run-cli-poll")).await;
+        let cli_poll =
+            read_batch_envelope_for_origin(&orch, paths, Some("run-cli-poll"), true).await;
+
+        assert!(
+            agent_read.text.contains("Polled issue"),
+            "{}",
+            agent_read.text
+        );
+        assert!(cli_poll.text.contains("Polled issue"), "{}", cli_poll.text);
+        assert!(
+            !cli_poll.text.contains("[duplicate call]"),
+            "{}",
+            cli_poll.text
+        );
     }
 
     #[tokio::test]

@@ -2171,6 +2171,7 @@ buildSlots:
             default_timeout_seconds: 900,
             executor_policies: Default::default(),
             remote_executors: Default::default(),
+            remote_host_identities: Default::default(),
         };
 
         super::set_fleet(dir, &config).unwrap();

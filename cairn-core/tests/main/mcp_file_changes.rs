@@ -204,6 +204,7 @@ struct ChangeTestRepo {
     project: tempfile::TempDir,
     _origin: tempfile::TempDir,
     config: tempfile::TempDir,
+    jj_bin: String,
     orch: Orchestrator,
     project_id: String,
 }
@@ -213,7 +214,7 @@ impl ChangeTestRepo {
     /// jj is unavailable. The cwd (`dir`) is a real `.jj` workspace over a shared
     /// store backed by a throwaway project git repo.
     async fn try_new() -> Option<Self> {
-        common::jj_bin()?;
+        let jj_bin = common::jj_bin()?;
         let dir = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         init_git_repo(project.path());
@@ -253,6 +254,7 @@ impl ChangeTestRepo {
             project,
             _origin: origin,
             config,
+            jj_bin,
             orch,
             project_id,
         })
@@ -292,9 +294,9 @@ impl ChangeTestRepo {
     /// Seal the current working copy into a base commit, so a later delete or
     /// edit operates against committed content rather than un-sealed `@` dirt.
     fn seal_base(&self, msg: &str) {
-        let jj = JjEnv::resolve("jj", self.config.path());
+        let jj = JjEnv::with_binary(&self.jj_bin, self.config.path());
         jj::seal(&jj, self.dir.path(), msg, None).unwrap();
-        let output = std::process::Command::new("jj")
+        let output = std::process::Command::new(&self.jj_bin)
             .args(["bookmark", "set", "agent/CHG-1-builder-0", "-r", "@"])
             .current_dir(self.dir.path())
             .output()
@@ -319,7 +321,7 @@ impl ChangeTestRepo {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
-        let output = std::process::Command::new("jj")
+        let output = std::process::Command::new(&self.jj_bin)
             .args(["bookmark", "set", "agent/CHG-1-builder-0", "-r", "@"])
             .current_dir(self.dir.path())
             .output()
@@ -331,7 +333,7 @@ impl ChangeTestRepo {
     }
 
     fn read(&self, path: &str) -> String {
-        let output = std::process::Command::new("jj")
+        let output = std::process::Command::new(&self.jj_bin)
             .args(["file", "show", "-r", "agent/CHG-1-builder-0", path])
             .current_dir(self.dir.path())
             .output()
@@ -341,7 +343,7 @@ impl ChangeTestRepo {
     }
 
     fn logical_exists(&self, path: &str) -> bool {
-        std::process::Command::new("jj")
+        std::process::Command::new(&self.jj_bin)
             .args(["file", "show", "-r", "agent/CHG-1-builder-0", path])
             .current_dir(self.dir.path())
             .output()

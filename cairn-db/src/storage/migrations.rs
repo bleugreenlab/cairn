@@ -565,6 +565,20 @@ macro_rules! private_channel_persistence {
 /// work queue, and the generations and entries are derivable again from the
 /// append-only transcript that stays in the shared tables. None of it is
 /// collaboration data a teammate's replica needs.
+/// Warmth-stratified execution durations learned from this runner's own
+/// executors. Machine-local observation aggregates, safely rebuildable, and
+/// never team-replicated -- the same reasoning that keeps
+/// `command_resource_profiles` private.
+macro_rules! private_command_duration_profiles {
+    () => {
+        Migration::new(
+            "0143",
+            "command_duration_profiles",
+            include_str!("../../../../turso_migrations/0143_command_duration_profiles.sql"),
+        )
+    };
+}
+
 macro_rules! private_thread_compaction {
     () => {
         Migration::new(
@@ -825,6 +839,7 @@ macro_rules! private_lineage {
             // tables of its own, so its position among the unrelated tail
             // entries around it carries no dependency.
             private_thread_compaction!(),
+            private_command_duration_profiles!(),
             private_channel_persistence!(),
             private_channel_outbound_expired!(),
             shared_tail_issue_kind!(),
@@ -1547,6 +1562,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "command_resource_profiles",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
+    // Learned execution durations, keyed by machine context and cache warmth.
+    // Machine-local observations of how long work takes HERE; nothing a
+    // teammate's replica could use, and rebuildable by running the work again.
+    (
+        "command_duration_profiles",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
     // ── Private: identity & credentials ──────────────────────────────────────
     (
         "account",
@@ -2185,6 +2207,7 @@ mod tests {
                 "0138_issue_kind".to_string(),
                 "0140_thread_compaction_seed_bytes".to_string(),
                 "0141_thread_compaction_capacity_trigger".to_string(),
+                "0143_command_duration_profiles".to_string(),
             ]
         );
         Ok(db)

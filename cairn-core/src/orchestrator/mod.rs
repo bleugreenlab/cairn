@@ -574,13 +574,6 @@ fn executor_health_reasons(
             skipped: accounting.skipped.clone(),
         });
     }
-    if executor
-        .admission
-        .concurrency_capacity
-        .is_some_and(|capacity| executor.admission.active_reservation.concurrency_units >= capacity)
-    {
-        reasons.push(SubstrateHealthReason::AdmissionSaturated { executor_id: id });
-    }
     reasons
 }
 

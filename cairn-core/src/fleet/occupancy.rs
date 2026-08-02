@@ -184,6 +184,7 @@ mod tests {
             priority: None,
             subscriber_count: 1,
             resource_reservation: Default::default(),
+            command_resource_identity: None,
             learned_estimate: upper_ms.map(|upper_duration_ms| LearnedResourceEstimate {
                 sample_count: 12,
                 upper_duration_ms: Some(upper_duration_ms),

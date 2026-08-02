@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use super::{
     render_text_floor, ChannelCapabilities, ChannelHealth, ChannelProvider, InboundEvent,
-    OutboundAsk, OutboundMessage, SentIds,
+    OperatorPresence, OutboundAsk, OutboundMessage, SentIds,
 };
 use crate::fleet::service_placement::ServiceLease;
 use crate::services::{ProcessSpawner, SpawnConfig};
@@ -37,6 +37,48 @@ const MAX_PROPAGATING_EDITS: u8 = 5;
 pub struct PollOption {
     pub id: String,
     pub text: String,
+}
+
+const ACTIVE_INPUT_IDLE_SECONDS: u64 = 60;
+const OPERATOR_PRESENCE_SCRIPT: &str = r#"
+idle=$(/usr/sbin/ioreg -c IOHIDSystem -d 4 | /usr/bin/awk '/HIDIdleTime/ { print int($NF / 1000000000); exit }')
+locked=$(/usr/sbin/ioreg -n Root -d 1 | /usr/bin/awk '/"IOConsoleLocked"/ { print ($NF == "Yes") ? 1 : 0; exit }')
+[ -n "$idle" ] && [ -n "$locked" ] || exit 1
+/usr/bin/printf '%s %s\n' "$idle" "$locked"
+"#;
+
+async fn probe_operator_presence_local(
+    process: Arc<dyn ProcessSpawner>,
+) -> Result<OperatorPresence, String> {
+    tokio::task::spawn_blocking(move || {
+        let output =
+            process.run(SpawnConfig::new("/bin/sh").args(["-c", OPERATOR_PRESENCE_SCRIPT]))?;
+        if !output.success {
+            return Err(output.stderr);
+        }
+        parse_operator_presence(&output.stdout)
+    })
+    .await
+    .map_err(|error| format!("operator presence task failed: {error}"))?
+}
+
+fn parse_operator_presence(stdout: &str) -> Result<OperatorPresence, String> {
+    let mut fields = stdout.split_whitespace();
+    let idle_seconds = fields
+        .next()
+        .ok_or_else(|| "operator presence omitted input idle time".to_string())?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid input idle time: {error}"))?;
+    let locked = match fields.next() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => return Err("operator presence omitted screen lock state".into()),
+    };
+    Ok(if !locked && idle_seconds < ACTIVE_INPUT_IDLE_SECONDS {
+        OperatorPresence::Present
+    } else {
+        OperatorPresence::Away
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -61,6 +103,10 @@ pub trait IMessageExecutor: Send + Sync {
 
     async fn shutdown(&self) {}
 
+    async fn operator_presence(&self) -> Result<OperatorPresence, String> {
+        Ok(OperatorPresence::Away)
+    }
+
     async fn run(&self, args: Vec<String>) -> Result<CommandResult, String>;
     async fn watch(
         &self,
@@ -81,6 +127,9 @@ impl LocalProcessExecutor {
 
 #[async_trait]
 impl IMessageExecutor for LocalProcessExecutor {
+    async fn operator_presence(&self) -> Result<OperatorPresence, String> {
+        probe_operator_presence_local(self.process.clone()).await
+    }
     async fn run(&self, args: Vec<String>) -> Result<CommandResult, String> {
         let process = self.process.clone();
         tokio::task::spawn_blocking(move || {
@@ -157,6 +206,22 @@ impl PlacedProcessExecutor {
 
 #[async_trait]
 impl IMessageExecutor for PlacedProcessExecutor {
+    async fn operator_presence(&self) -> Result<OperatorPresence, String> {
+        let output = self
+            .lease
+            .run_one_shot(
+                "/bin/sh",
+                vec!["-c".into(), OPERATOR_PRESENCE_SCRIPT.into()],
+                PLACED_COMMAND_TIMEOUT,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if output.exit_code != Some(0) {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        parse_operator_presence(&String::from_utf8_lossy(&output.stdout))
+    }
+
     async fn shutdown(&self) {
         let _ = self.lease.stop_resident(PLACED_WATCH_KEY).await;
         let _ = self.lease.release().await;
@@ -647,6 +712,16 @@ impl ChannelProvider for IMessageProvider {
             .expect("iMessage health lock poisoned")
             .clone()
     }
+
+    async fn operator_presence(&self) -> OperatorPresence {
+        match self.executor.operator_presence().await {
+            Ok(presence) => presence,
+            Err(error) => {
+                log::warn!("could not read operator presence; delivering immediately: {error}");
+                OperatorPresence::Away
+            }
+        }
+    }
 }
 
 /// Classifies `imsg status --json`. Ready is the gate that lets a question go out as a
@@ -957,6 +1032,33 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn presence_requires_recent_input_and_an_unlocked_screen() {
+        assert_eq!(
+            parse_operator_presence("0 0").unwrap(),
+            OperatorPresence::Present
+        );
+        assert_eq!(
+            parse_operator_presence("59 0").unwrap(),
+            OperatorPresence::Present
+        );
+        assert_eq!(
+            parse_operator_presence("60 0").unwrap(),
+            OperatorPresence::Away
+        );
+        assert_eq!(
+            parse_operator_presence("0 1").unwrap(),
+            OperatorPresence::Away
+        );
+    }
+
+    #[test]
+    fn incomplete_presence_output_fails_closed_to_immediate_delivery() {
+        assert!(parse_operator_presence("").is_err());
+        assert!(parse_operator_presence("0").is_err());
+        assert!(parse_operator_presence("0 maybe").is_err());
     }
 
     fn message() -> OutboundMessage {

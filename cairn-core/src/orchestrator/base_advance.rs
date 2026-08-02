@@ -273,7 +273,7 @@ async fn mark_reconcile_delivered(db: &LocalDb, intent_id: &str) -> Result<(), S
     .map_err(|error| format!("persist reconcile delivery: {error}"))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SiblingJob {
     id: String,
     branch: Option<String>,
@@ -291,6 +291,7 @@ struct IssueInfo {
     number: i64,
 }
 
+#[derive(Clone)]
 struct BaseAdvanceNotes {
     conflict: String,
     clean: String,
@@ -367,6 +368,7 @@ struct BranchAdvanceOutcome {
     rebased_clean: usize,
     conflicted: usize,
     failed: usize,
+    coalesced_destination: Option<String>,
 }
 
 /// Project conflict markers into every live checkout holding this branch, and
@@ -1541,6 +1543,39 @@ async fn finish_reconcile_intent(
     .map_err(|error| format!("complete reconcile intent: {error}"))
 }
 
+async fn wait_for_reconcile_slot(
+    db: &LocalDb,
+    store: &Path,
+    target_branch: &str,
+    destination: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let store = store.to_string_lossy().into_owned();
+    loop {
+        let running = db
+            .query_text(
+                "SELECT status FROM jj_reconcile_intents
+                 WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3",
+                params![store.as_str(), target_branch, destination],
+            )
+            .await
+            .map_err(|error| format!("inspect reconcile intent: {error}"))?
+            .as_deref()
+            == Some("running");
+        if !running {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "The reconcile already running for `{target_branch}` at `{destination}` did not \
+                 yield a follow-on slot before its lease deadline. No replay was silently accepted; \
+                 request it again after the running reconcile is recovered."
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_base_advance(
     orch: &Orchestrator,
@@ -1593,7 +1628,10 @@ async fn reconcile_base_advance(
         log::debug!(
             "jj base advance ({label}): coalesced with an existing intent for {pinned_dest}"
         );
-        return Ok(BranchAdvanceOutcome::default());
+        return Ok(BranchAdvanceOutcome {
+            coalesced_destination: Some(pinned_dest),
+            ..BranchAdvanceOutcome::default()
+        });
     };
     let eligible = siblings.len();
     let worker_orch = orch.clone();
@@ -1707,29 +1745,50 @@ pub(crate) async fn request_branch_replay(
         crate::jj::revset_commit(&jj, &store, &base_branch)
             .ok_or_else(|| format!("Base `{base_branch}` did not resolve to a commit."))?
     };
-    reopen_reconcile_intent(db, &store, &base_branch, &destination, branch).await?;
-
     let notes = BaseAdvanceNotes {
         conflict: build_jj_conflict_note(&base_branch, session.incoming.pr_number, None),
         clean: build_jj_clean_note(&base_branch, session.incoming.pr_number, None),
         incoming: session.incoming.clone(),
     };
-    reconcile_base_advance(
-        orch,
-        db,
-        &project.id,
-        &if take_committed_tip {
-            format!("resolved replay requested for {branch}")
-        } else {
-            format!("replay requested for {branch}")
-        },
-        &project.repo_path,
-        &base_branch,
-        &base_branch,
-        siblings,
-        notes,
-    )
-    .await?;
+    let label = if take_committed_tip {
+        format!("resolved replay requested for {branch}")
+    } else {
+        format!("replay requested for {branch}")
+    };
+
+    // Candidate resolution happens before the destination intent is claimed, so
+    // an already-running intent has a frozen work list and cannot absorb this
+    // request. Wait for that pass, reopen the completed coordinate, and retry as
+    // a follow-on pass. Returning success is reserved for a pass that actually
+    // accepted this branch; timeout and database failures remain observable to
+    // the requester. One deadline spans every attempt, including attempts made
+    // after the base moves to a new destination.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs((RECONCILE_LEASE_SECONDS + 30) as u64);
+    let mut reopen_destination = destination.clone();
+    loop {
+        reopen_reconcile_intent(db, &store, &base_branch, &reopen_destination, branch).await?;
+        let outcome = reconcile_base_advance(
+            orch,
+            db,
+            &project.id,
+            &label,
+            &project.repo_path,
+            &base_branch,
+            &base_branch,
+            siblings.clone(),
+            notes.clone(),
+        )
+        .await?;
+        if outcome.eligible > 0 {
+            break;
+        }
+        reopen_destination = outcome.coalesced_destination.ok_or_else(|| {
+            "Replay reconciliation returned no accepted branch and no coalesced destination."
+                .to_string()
+        })?;
+        wait_for_reconcile_slot(db, &store, &base_branch, &reopen_destination, deadline).await?;
+    }
 
     Ok(format!(
         "Queued a store-side replay of `{branch}` onto `{base_branch}` at `{destination}`. The \
@@ -2352,6 +2411,7 @@ async fn execute_reconcile_claim(
         rebased_clean: clean_rewritten.len(),
         conflicted: report.conflicted.len(),
         failed: report.failed.len() + terminal_failed,
+        coalesced_destination: None,
     })
 }
 
@@ -3761,6 +3821,130 @@ mod tests {
                 .is_none(),
             "absorbing the base closes the session"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_waits_for_resolved_intent_then_claims_follow_on_pass() {
+        let db = Arc::new(migrated_db().await);
+        seed_base_advance_fixture(&db).await;
+        let store = Path::new("/store");
+        let first = claim_reconcile_intent(
+            &db,
+            "/repo",
+            store,
+            "main",
+            "dest-a",
+            "resolved replay requested for agent/first",
+        )
+        .await
+        .unwrap()
+        .expect("the first resolved candidate list owns the intent");
+
+        assert!(
+            claim_reconcile_intent(
+                &db,
+                "/repo",
+                store,
+                "main",
+                "dest-a",
+                "resolved replay requested for agent/second",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the second request initially encounters the live frozen intent"
+        );
+
+        let waiting_db = db.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_reconcile_slot(
+                &waiting_db,
+                Path::new("/store"),
+                "main",
+                "dest-a",
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the second request waits for the first pass"
+        );
+
+        finish_reconcile_intent(&db, &first.id, &first.owner, false)
+            .await
+            .unwrap();
+        waiter.await.unwrap().unwrap();
+        reopen_reconcile_intent(&db, store, "main", "dest-a", "agent/second")
+            .await
+            .unwrap();
+        let second = claim_reconcile_intent(
+            &db,
+            "/repo",
+            store,
+            "main",
+            "dest-a",
+            "resolved replay requested for agent/second",
+        )
+        .await
+        .unwrap()
+        .expect("the second request claims a follow-on pass instead of disappearing");
+        assert_ne!(second.owner, first.owner);
+
+        // If the base advances between attempts, the failed claim reports the
+        // newly pinned destination. Waiting on that coordinate must not be
+        // satisfied by the older pass releasing its different destination.
+        let moved = claim_reconcile_intent(
+            &db,
+            "/repo",
+            store,
+            "main",
+            "dest-b",
+            "resolved replay requested for agent/other",
+        )
+        .await
+        .unwrap()
+        .expect("the moved base owns a distinct intent");
+        let moved_waiting_db = Arc::clone(&db);
+        let moved_waiter = tokio::spawn(async move {
+            wait_for_reconcile_slot(
+                &moved_waiting_db,
+                Path::new("/store"),
+                "main",
+                "dest-b",
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        finish_reconcile_intent(&db, &second.id, &second.owner, false)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            !moved_waiter.is_finished(),
+            "releasing the stale destination does not satisfy the moved-base waiter"
+        );
+        finish_reconcile_intent(&db, &moved.id, &moved.owner, false)
+            .await
+            .unwrap();
+        moved_waiter.await.unwrap().unwrap();
+        reopen_reconcile_intent(&db, store, "main", "dest-b", "agent/second")
+            .await
+            .unwrap();
+        let moved_follow_on = claim_reconcile_intent(
+            &db,
+            "/repo",
+            store,
+            "main",
+            "dest-b",
+            "resolved replay requested for agent/second",
+        )
+        .await
+        .unwrap()
+        .expect("the moved destination is reopened and claimed after its owner finishes");
+        assert_ne!(moved_follow_on.owner, moved.owner);
     }
 
     #[tokio::test]

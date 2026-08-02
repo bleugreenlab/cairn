@@ -147,12 +147,11 @@ fn jj() -> Capability {
         detail: match (bin, version) {
             (Some(bin), Some(version)) => format!("{version} at {bin}"),
             (Some(bin), None) => format!("resolved {bin} but could not read its version"),
-            (None, _) => "no jj resolvable (CAIRN_JJ_BIN unset or broken)".to_string(),
+            (None, _) => "no build-slot, explicit, or PATH jj resolvable".to_string(),
         },
-        // Deliberately no remedy: jj reaches a lane as a bundled sidecar or via
-        // CAIRN_JJ_BIN, so there is no one command that installs it here, and
-        // naming `ensure-jj` would be a lie — that script populates
-        // src-tauri/binaries/ for packaging, which is not what `jj_bin` reads.
+        // Deliberately no remedy: the suite bootstrap already attempted to
+        // provision the exact host artifact that `jj_bin` prefers, and the two
+        // remaining answers (an explicit path or PATH install) are host-specific.
         remedy: None,
     }
 }

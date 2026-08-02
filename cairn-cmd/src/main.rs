@@ -47,32 +47,40 @@ mod cli_parse_tests {
     use super::*;
 
     #[test]
-    fn check_run_accepts_suite_and_optional_branch() {
+    fn check_run_accepts_one_or_more_suites_and_optional_branch() {
         let current = Args::try_parse_from(["cairn", "check", "run", "rust-tests"]).unwrap();
         let Some(Command::Check {
-            command: CheckCommand::Run { suite, branch },
+            command: CheckCommand::Run { suites, branch },
         }) = current.command
         else {
             panic!("expected check run")
         };
-        assert_eq!(suite, "rust-tests");
+        assert_eq!(suites, ["rust-tests"]);
         assert_eq!(branch, None);
 
-        let explicit =
-            Args::try_parse_from(["cairn", "check", "run", "rust-tests", "main"]).unwrap();
+        let explicit = Args::try_parse_from([
+            "cairn",
+            "check",
+            "run",
+            "rust-tests",
+            "lint",
+            "--branch",
+            "main",
+        ])
+        .unwrap();
         let Some(Command::Check {
-            command: CheckCommand::Run { branch, .. },
+            command: CheckCommand::Run { suites, branch },
         }) = explicit.command
         else {
             panic!("expected check run")
         };
+        assert_eq!(suites, ["rust-tests", "lint"]);
         assert_eq!(branch.as_deref(), Some("main"));
     }
 
     #[test]
-    fn check_run_rejects_missing_suite_and_extra_positionals() {
+    fn check_run_rejects_missing_suite() {
         assert!(Args::try_parse_from(["cairn", "check", "run"]).is_err());
-        assert!(Args::try_parse_from(["cairn", "check", "run", "suite", "main", "extra"]).is_err());
     }
 
     #[test]
@@ -171,11 +179,13 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum CheckCommand {
-    /// Run one named configured suite, reusing an exact immutable observation when possible.
+    /// Run one or more named configured suites, reusing exact immutable observations when possible.
     Run {
-        /// Suite name from the project's `.cairn/config.yaml` `checks` contract.
-        suite: String,
+        /// Suite names from the project's `.cairn/config.yaml` `checks` contract.
+        #[arg(required = true, num_args = 1..)]
+        suites: Vec<String>,
         /// Optional branch or revision. Defaults to the current logical head.
+        #[arg(long)]
         branch: Option<String>,
     },
 }
@@ -224,9 +234,9 @@ async fn async_main() -> Result<()> {
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Check {
-            command: CheckCommand::Run { suite, branch },
+            command: CheckCommand::Run { suites, branch },
         }) => {
-            let ok = run_cli_check(suite.clone(), branch.clone()).await;
+            let ok = run_cli_check(suites.clone(), branch.clone()).await;
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Executor { command }) => {

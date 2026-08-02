@@ -29,6 +29,23 @@ fn register_run(orch: &Orchestrator, run_id: &str) {
     processes.register(run_id.to_string(), handle);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_does_not_dedup_cli_read_after_agent_read() {
+    let (_temp, orch, cursors) = active_turn_fixture().await;
+    let agent_request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent-xyz");
+    let mut cli_request = agent_request.clone();
+    cli_request.payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
+
+    let first = dispatch_tool(&orch, &agent_request, &cursors).await.content;
+    let cli_poll = dispatch_tool(&orch, &cli_request, &cursors).await.content;
+
+    assert!(!first.starts_with("[duplicate call]"));
+    assert_eq!(
+        cli_poll, first,
+        "standalone CLI reads must return the resource body, not agent-facing dedupe guidance"
+    );
+}
+
 fn register_run_with_turn(orch: &Orchestrator, run_id: &str, turn_id: &str) {
     register_run(orch, run_id);
     orch.process_state.begin_turn(run_id, turn_id);

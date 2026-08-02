@@ -188,7 +188,23 @@ Partial failures never abort: a target that errors shows its message inline as t
         params: Parameters<ReadFileInput>,
         meta: rmcp::model::RequestMetaObject,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let input = params.0;
+        self.read_with_origin(params.0, meta, false).await
+    }
+
+    pub(crate) async fn read_cli(
+        &self,
+        input: ReadFileInput,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.read_with_origin(input, rmcp::model::RequestMetaObject::default(), true)
+            .await
+    }
+
+    async fn read_with_origin(
+        &self,
+        input: ReadFileInput,
+        meta: rmcp::model::RequestMetaObject,
+        standalone_cli: bool,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let thread_id = Self::thread_id_from_meta(&meta);
         let pooled = thread_id.is_some();
         if input.paths.is_empty() {
@@ -215,11 +231,15 @@ Partial failures never abort: a target that errors shows its message inline as t
             })
             .collect();
 
+        let mut payload = serde_json::json!({ "paths": resolved });
+        if standalone_cli {
+            payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
+        }
         let request = CallbackRequest {
             cwd: self.cwd.to_string(),
             run_id: self.run_id.as_ref().map(|r| r.to_string()),
             tool: "read_batch".to_string(),
-            payload: serde_json::json!({ "paths": resolved }),
+            payload,
             tool_use_id: None,
             thread_id,
         };

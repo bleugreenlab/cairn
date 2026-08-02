@@ -1,16 +1,17 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use cairn_common::uri::{build_node_permission_uri, build_node_question_uri, parse_uri};
 use cairn_db::turso::params;
 use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{
-    ledger, render_text_floor, AskOption, ChannelProvider, InboundEvent, OutboundAsk,
-    OutboundMessage,
+    ledger, render_text_floor, AskOption, ChannelProvider, InboundEvent, OperatorPresence,
+    OutboundAsk, OutboundMessage,
 };
 use crate::{
     mcp::handlers::{
@@ -34,12 +35,64 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// second with a newly raised ask could fill the window on every sweep and the
 /// live ask would never be offered at all. Admission is by identity instead.
 const SWEEP_LIMIT: usize = 100;
+const ATTENTION_GRACE: Duration = Duration::from_secs(3 * 60);
 
 #[derive(Debug, Deserialize)]
 struct StoredQuestion {
     question: String,
     #[serde(default)]
     options: Vec<StoredOption>,
+}
+
+fn review_notice(project: &str, number: i32, title: &str, content_ref: &str) -> String {
+    format!("{project}-{number} review ready — {title}\n{content_ref}")
+}
+
+impl Gate {
+    fn is_presence_aware(&self) -> bool {
+        matches!(self.kind, "question" | "review")
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttentionTiming {
+    Defer,
+    Send,
+}
+
+fn attention_timing(
+    presence: OperatorPresence,
+    now: Instant,
+    deadline: Instant,
+) -> AttentionTiming {
+    if presence == OperatorPresence::Present && now < deadline {
+        AttentionTiming::Defer
+    } else {
+        AttentionTiming::Send
+    }
+}
+
+struct DeferredAttention {
+    id: String,
+    gate: Gate,
+    deadline: Instant,
+}
+
+fn cancel_resolved_attention(
+    deferred: &mut HashMap<String, DeferredAttention>,
+    live: &HashSet<String>,
+    snapshot_complete: bool,
+) -> Vec<String> {
+    if !snapshot_complete {
+        return Vec::new();
+    }
+    let cancelled = deferred
+        .iter()
+        .filter(|(binding, _)| !live.contains(*binding))
+        .map(|(_, attention)| attention.id.clone())
+        .collect::<Vec<_>>();
+    deferred.retain(|binding, _| live.contains(binding));
+    cancelled
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,7 +127,7 @@ impl ClaimSet {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Gate {
     kind: &'static str,
     binding_ref: String,
@@ -88,6 +141,7 @@ pub struct ChannelRouter {
     provider: Arc<dyn ChannelProvider>,
     config: IMessageChannelConfig,
     claims: ClaimSet,
+    deferred_attention: Mutex<HashMap<String, DeferredAttention>>,
 }
 
 impl ChannelRouter {
@@ -101,6 +155,7 @@ impl ChannelRouter {
             provider,
             config,
             claims: ClaimSet::default(),
+            deferred_attention: Mutex::new(HashMap::new()),
         }
     }
 
@@ -193,14 +248,54 @@ impl ChannelRouter {
         if !self.config.enabled || self.config.to.trim().is_empty() {
             return;
         }
-        for db in self.orch.db.all_dbs().await {
-            if let Err(error) = self.sweep_db(&db).await {
-                log::warn!("channel gate sweep failed: {error}");
-            }
+        if let Err(error) = self.sweep_live_gates().await {
+            log::warn!("channel gate sweep failed: {error}");
         }
     }
 
-    async fn sweep_db(&self, db: &LocalDb) -> Result<(), String> {
+    async fn sweep_live_gates(&self) -> Result<(), String> {
+        let mut gates = Vec::new();
+        let mut snapshot_complete = true;
+        for db in self.orch.db.all_dbs().await {
+            match self.load_routed_gates(&db).await {
+                Ok(mut db_gates) => gates.append(&mut db_gates),
+                Err(error) => {
+                    snapshot_complete = false;
+                    log::warn!("channel skipped one project database during gate sweep: {error}");
+                }
+            }
+        }
+        let live: HashSet<_> = gates.iter().map(|gate| gate.binding_ref.clone()).collect();
+        let presence = if gates.iter().any(Gate::is_presence_aware) {
+            self.provider.operator_presence().await
+        } else {
+            OperatorPresence::Away
+        };
+        let now = Instant::now();
+        let mut delivered = 0;
+        for gate in gates {
+            if delivered == SWEEP_LIMIT {
+                break;
+            }
+            if self.deliver_or_defer(gate, presence, now).await? {
+                delivered += 1;
+            }
+        }
+        let cancelled = cancel_resolved_attention(
+            &mut self
+                .deferred_attention
+                .lock()
+                .expect("deferred attention set poisoned"),
+            &live,
+            snapshot_complete,
+        );
+        for id in cancelled {
+            ledger::mark_expired(self.ledger(), &id, chrono::Utc::now().timestamp()).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_routed_gates(&self, db: &LocalDb) -> Result<Vec<Gate>, String> {
         let mut gates = Vec::new();
         if self.config.route.question {
             gates.extend(load_questions(db).await?);
@@ -211,27 +306,53 @@ impl ChannelRouter {
         if self.config.route.review {
             gates.extend(load_reviews(db).await?);
         }
-        let mut delivered = 0;
-        for gate in gates {
-            if delivered == SWEEP_LIMIT {
-                break;
-            }
-            if self.deliver(gate).await? {
-                delivered += 1;
-            }
-        }
-        Ok(())
+        Ok(gates)
     }
 
-    /// Reports whether this call actually put something on the wire, so a sweep's
-    /// batch bounds deliveries rather than gates examined.
-    async fn deliver(&self, gate: Gate) -> Result<bool, String> {
-        // The claim is what makes a gate live: one the channel has already seen --
-        // in this session, or in the backlog it sealed off at startup -- is
-        // already claimed, and that is how a sweep says "not mine".
+    async fn deliver_or_defer(
+        &self,
+        gate: Gate,
+        presence: OperatorPresence,
+        now: Instant,
+    ) -> Result<bool, String> {
+        let deferred = self
+            .deferred_attention
+            .lock()
+            .expect("deferred attention set poisoned")
+            .remove(&gate.binding_ref);
+        if let Some(deferred) = deferred {
+            if attention_timing(presence, now, deferred.deadline) == AttentionTiming::Defer {
+                self.deferred_attention
+                    .lock()
+                    .expect("deferred attention set poisoned")
+                    .insert(gate.binding_ref.clone(), deferred);
+                return Ok(false);
+            }
+            return self.send_claimed(deferred.id, deferred.gate).await;
+        }
         let Some(id) = self.claim(&gate).await? else {
             return Ok(false);
         };
+        if gate.is_presence_aware() && presence == OperatorPresence::Present {
+            self.deferred_attention
+                .lock()
+                .expect("deferred attention set poisoned")
+                .insert(
+                    gate.binding_ref.clone(),
+                    DeferredAttention {
+                        id,
+                        gate,
+                        deadline: now + ATTENTION_GRACE,
+                    },
+                );
+            return Ok(false);
+        }
+        self.send_claimed(id, gate).await
+    }
+
+    /// Reports whether this call put something on the wire, so a sweep's batch
+    /// bounds sends rather than gates examined.
+    async fn send_claimed(&self, id: String, gate: Gate) -> Result<bool, String> {
         let options_json = match &gate.ask {
             OutboundAsk::Question { options, .. } => Some(
                 serde_json::to_string(
@@ -471,13 +592,18 @@ pub fn spawn(
 /// separate gates raised within the same second. The router bounds DELIVERIES.
 async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
     db.read(|conn| Box::pin(async move {
-        let mut rows = conn.query("SELECT p.id, p.questions, COALESCE(p.job_id, r.job_id), COALESCE(j.node_name, j.uri_segment, 'agent') FROM prompts p JOIN runs r ON r.id=p.run_id LEFT JOIN jobs j ON j.id=COALESCE(p.job_id,r.job_id) LEFT JOIN issues i ON i.id=r.issue_id WHERE p.response IS NULL AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY p.created_at DESC", ()).await?;
+        let mut rows = conn.query("SELECT p.id, p.questions, COALESCE(p.job_id, r.job_id), COALESCE(j.node_name, j.uri_segment, 'agent'), pr.key, i.number, e.seq, j.uri_segment, p.uri_segment FROM prompts p JOIN runs r ON r.id=p.run_id LEFT JOIN jobs j ON j.id=COALESCE(p.job_id,r.job_id) LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,r.issue_id) LEFT JOIN projects pr ON pr.id=i.project_id LEFT JOIN executions e ON e.id=j.execution_id WHERE p.response IS NULL AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY p.created_at DESC", ()).await?;
         let mut gates = Vec::new();
         while let Some(row) = rows.next().await? {
             let prompt_id = row.text(0)?; let questions_json = row.text(1)?; let job_id = row.opt_text(2)?; let context = format!("[Cairn · {}]", row.text(3)?);
+            let question_uri = match (row.opt_text(4)?, row.opt_i64(5)?, row.opt_i64(6)?, row.opt_text(7)?, row.opt_text(8)?) {
+                (Some(project), Some(number), Some(exec_seq), Some(node), Some(segment)) => Some(build_node_question_uri(&project, number as i32, exec_seq as i32, &node, &segment)),
+                _ => None,
+            };
             let questions: Vec<StoredQuestion> = serde_json::from_str(&questions_json).map_err(|e| crate::storage::DbError::Row(e.to_string()))?;
             for (index, question) in questions.into_iter().enumerate() {
-                gates.push(Gate { kind: "question", binding_ref: format!("{prompt_id}:{index}"), job_id: job_id.clone(), context: context.clone(), ask: OutboundAsk::Question { prompt_id: prompt_id.clone(), question_index: index, text: question.question, options: question.options.into_iter().map(|o| AskOption { label:o.label, description:o.description }).collect() } });
+                let text = match &question_uri { Some(uri) => format!("{}\n\n{}", question.question, uri), None => question.question };
+                gates.push(Gate { kind: "question", binding_ref: format!("{prompt_id}:{index}"), job_id: job_id.clone(), context: context.clone(), ask: OutboundAsk::Question { prompt_id: prompt_id.clone(), question_index: index, text, options: question.options.into_iter().map(|o| AskOption { label:o.label, description:o.description }).collect() } });
             }
         }
         Ok(gates)
@@ -486,8 +612,8 @@ async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
 
 async fn load_permissions(db: &LocalDb) -> Result<Vec<Gate>, String> {
     db.read(|conn| Box::pin(async move {
-        let mut rows = conn.query("SELECT pr.id, pr.tool_name, pr.tool_input, COALESCE(pr.job_id,r.job_id), COALESCE(j.node_name,j.uri_segment,'agent') FROM permission_requests pr JOIN runs r ON r.id=pr.run_id LEFT JOIN jobs j ON j.id=COALESCE(pr.job_id,r.job_id) LEFT JOIN issues i ON i.id=r.issue_id WHERE pr.status='pending' AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY pr.created_at DESC", ()).await?;
-        let mut gates=Vec::new(); while let Some(row)=rows.next().await? { let id=row.text(0)?; let tool=row.text(1)?; let input=row.text(2)?; gates.push(Gate { kind:"permission", binding_ref:id.clone(), job_id:row.opt_text(3)?, context:format!("[Cairn · {}]",row.text(4)?), ask:OutboundAsk::Permission { request_id:id, summary:format!("Allow {tool}?\n{input}") } }); } Ok(gates)
+        let mut rows = conn.query("SELECT req.id, req.tool_name, req.tool_input, COALESCE(req.job_id,r.job_id), COALESCE(j.node_name,j.uri_segment,'agent'), p.key, i.number, e.seq, j.uri_segment, req.uri_segment FROM permission_requests req JOIN runs r ON r.id=req.run_id LEFT JOIN jobs j ON j.id=COALESCE(req.job_id,r.job_id) LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,r.issue_id) LEFT JOIN projects p ON p.id=i.project_id LEFT JOIN executions e ON e.id=j.execution_id WHERE req.status='pending' AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY req.created_at DESC", ()).await?;
+        let mut gates=Vec::new(); while let Some(row)=rows.next().await? { let id=row.text(0)?; let tool=row.text(1)?; let input=row.text(2)?; let uri=match(row.opt_text(5)?,row.opt_i64(6)?,row.opt_i64(7)?,row.opt_text(8)?,row.opt_text(9)?){(Some(project),Some(number),Some(exec_seq),Some(node),Some(segment))=>Some(build_node_permission_uri(&project,number as i32,exec_seq as i32,&node,&segment)),_=>None}; let summary=match uri{Some(uri)=>format!("Allow {tool}?\n{input}\n\n{uri}"),None=>format!("Allow {tool}?\n{input}")}; gates.push(Gate { kind:"permission", binding_ref:id.clone(), job_id:row.opt_text(3)?, context:format!("[Cairn · {}]",row.text(4)?), ask:OutboundAsk::Permission { request_id:id, summary } }); } Ok(gates)
     })).await.map_err(|e| e.to_string())
 }
 
@@ -501,16 +627,29 @@ async fn load_reviews(db: &LocalDb) -> Result<Vec<Gate>, String> {
             .await
             .map_err(|e| e.to_string())?
         {
+            let parsed = parse_uri(&push.content_ref)
+                .ok_or_else(|| format!("review has invalid content ref: {}", push.content_ref))?;
+            let project = parsed
+                .project()
+                .ok_or_else(|| format!("review ref has no project: {}", push.content_ref))?;
+            let number = parsed
+                .issue_number()
+                .ok_or_else(|| format!("review ref has no issue: {}", push.content_ref))?;
+            let title = db
+                .query_opt_text(
+                    "SELECT i.title FROM issues i JOIN projects p ON p.id=i.project_id WHERE upper(p.key)=upper(?1) AND i.number=?2",
+                    (project.to_string(), number),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("review issue not found: {project}-{number}"))?;
             gates.push(Gate {
                 kind: "review",
                 binding_ref: push.id.clone(),
                 job_id: Some(push.recipient),
-                context: "[Cairn · review]".into(),
+                context: String::new(),
                 ask: OutboundAsk::Notify {
-                    text: format!(
-                        "Work product ready for review: {}\nReply to send feedback to the agent.",
-                        push.content_ref
-                    ),
+                    text: review_notice(project, number, &title, &push.content_ref),
                 },
             });
         }
@@ -817,5 +956,83 @@ mod tests {
         );
         record.options_json = None;
         assert_eq!(question_answer(&record, "1"), "1");
+    }
+
+    #[test]
+    fn present_attention_defers_until_the_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            attention_timing(OperatorPresence::Present, now, now + Duration::from_secs(1)),
+            AttentionTiming::Defer
+        );
+        assert_eq!(
+            attention_timing(OperatorPresence::Present, now, now),
+            AttentionTiming::Send
+        );
+        let review = Gate {
+            kind: "review",
+            binding_ref: "review".into(),
+            job_id: None,
+            context: String::new(),
+            ask: OutboundAsk::Notify {
+                text: String::new(),
+            },
+        };
+        assert!(review.is_presence_aware());
+    }
+
+    #[test]
+    fn losing_presence_escalates_before_the_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            attention_timing(OperatorPresence::Away, now, now + ATTENTION_GRACE),
+            AttentionTiming::Send
+        );
+    }
+
+    #[test]
+    fn one_failed_database_cannot_cancel_a_healthy_deferred_question() {
+        let gate = Gate {
+            kind: "question",
+            binding_ref: "healthy:0".into(),
+            job_id: None,
+            context: String::new(),
+            ask: OutboundAsk::Question {
+                prompt_id: "healthy".into(),
+                question_index: 0,
+                text: "Which path?".into(),
+                options: Vec::new(),
+            },
+        };
+        let mut deferred = HashMap::from([(
+            gate.binding_ref.clone(),
+            DeferredAttention {
+                id: "intent".into(),
+                gate,
+                deadline: Instant::now() + ATTENTION_GRACE,
+            },
+        )]);
+
+        assert!(cancel_resolved_attention(&mut deferred, &HashSet::new(), false).is_empty());
+        assert!(deferred.contains_key("healthy:0"));
+        assert_eq!(
+            cancel_resolved_attention(&mut deferred, &HashSet::new(), true),
+            vec!["intent"]
+        );
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn review_notice_leads_with_issue_title_and_event_without_boilerplate() {
+        let content_ref = "cairn://p/CAIRN/3445/1/builder/artifact";
+        assert_eq!(
+            review_notice(
+                "CAIRN",
+                3445,
+                "Reap nested Linux process groups when checks stop",
+                content_ref,
+            ),
+            "CAIRN-3445 review ready — Reap nested Linux process groups when checks stop\ncairn://p/CAIRN/3445/1/builder/artifact"
+        );
     }
 }

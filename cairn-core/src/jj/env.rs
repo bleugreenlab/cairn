@@ -133,8 +133,12 @@ fn jj_subprocess_lock() -> &'static Mutex<()> {
 }
 
 impl JjEnv {
-    #[cfg(test)]
-    pub(crate) fn with_binary(bin: impl Into<String>, config_dir: &Path) -> Self {
+    /// Build an environment around an already-resolved binary.
+    ///
+    /// Callers that snapshot an executable must not consult `CAIRN_JJ_BIN` or
+    /// PATH again: doing so would discard the snapshot and reopen the race this
+    /// constructor is meant to close.
+    pub fn with_binary(bin: impl Into<String>, config_dir: &Path) -> Self {
         Self {
             bin: bin.into(),
             config_path: config_dir.join("jj").join("config.toml"),

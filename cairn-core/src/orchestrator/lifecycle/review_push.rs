@@ -507,6 +507,160 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) -> usize {
     candidates.len()
 }
 
+/// Re-arm at most one dormant review wave whose latest attempt ended because
+/// fleet capacity was unavailable. The one-row limit is deliberate pacing: a
+/// capacity transition can free many stranded waves at once, and releasing all
+/// of them would recreate the contention that stranded them.
+///
+/// The durable per-check infrastructure streak remains the retry authority. A
+/// candidate at the bound is excluded here, and the execution claim checks the
+/// same bound atomically before a command can run, so this cadence cannot open a
+/// path around the circuit breaker.
+pub async fn rearm_one_capacity_failed_review(orch: &Orchestrator) -> bool {
+    let Some(job_id) = (match capacity_rearm_candidate_job(orch).await {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            log::warn!("review-checks capacity re-arm: candidate lookup failed: {error}");
+            return false;
+        }
+    }) else {
+        return false;
+    };
+
+    log::info!(
+        "review-checks capacity re-arm: re-spawning one dormant wave for job {}",
+        &job_id[..job_id.len().min(8)]
+    );
+    spawn_turn_end_checks(orch, &job_id);
+    true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CapacityRearmCandidate {
+    pub(super) job_id: String,
+    tree_hash: String,
+    ran_at: i64,
+}
+
+pub(super) async fn capacity_rearm_candidate_job(
+    orch: &Orchestrator,
+) -> Result<Option<String>, String> {
+    for candidate in capacity_rearm_candidates(&orch.db).await? {
+        if capacity_candidate_matches_current_tree(orch, &candidate).await? {
+            return Ok(Some(candidate.job_id));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) async fn capacity_rearm_candidates(
+    dbs: &crate::db::DbState,
+) -> Result<Vec<CapacityRearmCandidate>, String> {
+    let mut candidates = Vec::new();
+    for db in dbs.all_dbs().await {
+        candidates.extend(capacity_rearm_candidates_in_db(&db).await?);
+    }
+    candidates.sort_by(|left, right| {
+        left.ran_at
+            .cmp(&right.ran_at)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    });
+    Ok(candidates)
+}
+
+async fn capacity_rearm_candidates_in_db(
+    db: &crate::storage::LocalDb,
+) -> Result<Vec<CapacityRearmCandidate>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT j.id, c.tree_hash, c.ran_at
+                       FROM check_result_cache c
+                       JOIN jobs j ON j.id = c.job_id
+                       JOIN issues i ON i.id = j.issue_id
+                      WHERE c.failure_kind = 'capacity'
+                        AND c.infra_failure_streak < ?1
+                        AND i.status NOT IN ('merged', 'closed')
+                        AND j.status IN ('idle', 'complete', 'failed', 'blocked')
+                        AND NOT EXISTS (
+                          SELECT 1 FROM check_result_cache newer
+                           WHERE newer.job_id = c.job_id
+                             AND newer.check_name = c.check_name
+                             AND (newer.ran_at > c.ran_at
+                                  OR (newer.ran_at = c.ran_at AND newer.rowid > c.rowid))
+                        )
+                        AND (
+                          EXISTS (
+                            SELECT 1 FROM artifacts a
+                             WHERE a.job_id = j.id AND a.artifact_type = 'create-pr'
+                          )
+                          OR EXISTS (
+                            SELECT 1 FROM merge_requests mr
+                             WHERE mr.issue_id = j.issue_id
+                               AND mr.source_branch = j.branch
+                               AND mr.status = 'open'
+                          )
+                        )
+                      ORDER BY c.ran_at, j.id",
+                    (crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,),
+                )
+                .await?;
+            let mut candidates = Vec::new();
+            while let Some(row) = rows.next().await? {
+                candidates.push(CapacityRearmCandidate {
+                    job_id: row.text(0)?,
+                    tree_hash: row.text(1)?,
+                    ran_at: row.i64(2)?,
+                });
+            }
+            Ok::<_, DbError>(candidates)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn capacity_candidate_matches_current_tree(
+    orch: &Orchestrator,
+    candidate: &CapacityRearmCandidate,
+) -> Result<bool, String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &candidate.job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(coords) =
+        crate::execution::checks_turn_end::resolve_job_coords(&db, &candidate.job_id).await?
+    else {
+        return Ok(false);
+    };
+    let repo_root = std::path::PathBuf::from(&coords.repository_path);
+    let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repo_root);
+    let logical_repository = if crate::jj::is_jj_dir(&store_dir) {
+        store_dir
+    } else {
+        repo_root
+    };
+    let sealed_commit =
+        match cairn_vcs::resolve_coordinate(&logical_repository, &coords.branch).await {
+            Ok(commit) => commit,
+            Err(error) => {
+                log::warn!(
+                    "review-checks capacity re-arm: branch for job {} is unresolved ({error})",
+                    &candidate.job_id[..candidate.job_id.len().min(8)]
+                );
+                return Ok(false);
+            }
+        };
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let current_tree = tokio::task::spawn_blocking(move || {
+        crate::jj::logical_tree_hash(&jj, &logical_repository, &sealed_commit)
+    })
+    .await
+    .map_err(|error| format!("capacity re-arm tree-hash task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+    Ok(current_tree == candidate.tree_hash)
+}
+
 /// Jobs eligible for the startup review-checks re-arm, as `(job_id, issue_id)`:
 /// settled jobs on a non-terminal issue that still own reviewable output.
 ///

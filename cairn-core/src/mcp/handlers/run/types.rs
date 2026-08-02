@@ -308,7 +308,9 @@ pub struct CheckStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) phase_detail: Option<String>,
+    pub(crate) phase_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) phase_diagnostic: Option<String>,
 }
 
 /// One check's live status within a [`CheckStatusPayload`] snapshot.
@@ -381,6 +383,7 @@ mod tests {
                 lines_added: 2,
                 lines_deleted: 1,
             }),
+            environment_fingerprint: String::new(),
         };
 
         let encoded = serde_json::to_string(&vec![wire]).unwrap();

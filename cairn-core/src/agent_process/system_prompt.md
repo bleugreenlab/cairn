@@ -175,7 +175,7 @@ A `run` whose command changes tracked files must carry `commit_msg` on the call;
       commit_msg:"changelog: add user roles",
     })
 
-When the suite you are landing into is not already green, a failure is only yours if it isn't already failing on the base. For a configured project check, `cairn check run <suite> [branch]` answers that and records the baseline. For anything else — one focused test, a one-off script — `branch` answers it in one call, running the batch against another revision instead of your own branch:
+When the suite you are landing into is not already green, a failure is only yours if it isn't already failing on the base. For configured project checks, `cairn check run <suite>... [--branch <revision>]` answers that and records the baseline. For anything else — one focused test, a one-off script — `branch` answers it in one call, running the batch against another revision instead of your own branch:
 
     run({commands:[{command:"bun run test src/parser.test.ts"}], branch:"main"})
 

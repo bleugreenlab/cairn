@@ -125,6 +125,67 @@ impl CellCommandClass {
             Self::Other
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CargoCheck => "cargoCheck",
+            Self::CargoTest => "cargoTest",
+            Self::CargoClippy => "cargoClippy",
+            Self::Vitest => "vitest",
+            Self::Typecheck => "typecheck",
+            Self::Build => "build",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// How much of the work a command would otherwise redo was already on the
+/// machine when it started.
+///
+/// This is a fact the executor states about an execution that happened, not a
+/// score and not a discount. It exists so that warm and cold runs of the same
+/// command on the same machine are learned as two profiles rather than averaged
+/// into one number that describes neither: a Rust compilation front against a
+/// populated target directory and the same front against an empty one are
+/// different work, and a prediction that cannot tell them apart is a prediction
+/// about nothing.
+///
+/// Nothing here is a percentage applied to a duration. Warmth reaches a
+/// prediction only by selecting which observations speak for it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionWarmth {
+    /// A retained cell for this project and repository had already completed
+    /// this work class, so whatever that class writes into the tree — a target
+    /// directory, a build cache, installed modules — was on disk before this
+    /// command began.
+    PreparedWarmSlot,
+    /// The repository objects for the requested commit were already verified
+    /// present, but no retained cell had completed this work class. Object
+    /// warmth is not compile warmth, and conflating them is how a machine that
+    /// merely holds the commit came to look as fast as one that has built it.
+    RepositoryOnly,
+    /// Neither claim holds.
+    #[default]
+    Cold,
+}
+
+impl ExecutionWarmth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreparedWarmSlot => "preparedWarmSlot",
+            Self::RepositoryOnly => "repositoryOnly",
+            Self::Cold => "cold",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::PreparedWarmSlot => "a retained cell had already run this work class",
+            Self::RepositoryOnly => "the repository objects were present, no prepared cell was",
+            Self::Cold => "neither the objects nor a prepared cell were present",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,7 +298,19 @@ pub struct LearnedResourceEstimate {
 /// asymmetry is deliberate: a live peer can renegotiate at the handshake and a
 /// persisted cell cannot, so state written by an older executor decodes with
 /// absent words rather than being skipped and orphaning its processes.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 33;
+///
+/// Bumped to 34 for CAIRN-3462: check batch items declare the environment
+/// variables that affect their verdict and outcomes carry the executor-composed
+/// fingerprint. Older peers cannot preserve safe cache reuse across this wire.
+///
+/// Bumped to 35 for CAIRN-3412: placement ranks on predicted time to a verdict
+/// rather than on idleness, and the facts that prediction is built from are new
+/// wire shape in both directions. `PersistentCellState` carries
+/// `warmCommandClasses` and `CellExecutionMeta` carries `warmth`, so an executor
+/// that does not report them leaves every candidate looking cold and every
+/// observation unattributable. `PlacementReason::measuredIdle` is gone rather
+/// than aliased because the two policies do not coexist.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 35;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -931,6 +1004,33 @@ pub enum CellPriority {
     AgentInteractive,
 }
 
+/// How long a queued request waits before priority aging promotes it one tier.
+///
+/// Lives here rather than inside the executor because two parties now depend on
+/// the same ordering: the executor's admission, which is the only authority
+/// that may actually dequeue anything, and the runner's read-only forecast of
+/// how much work sits ahead of a request it is considering placing. A forecast
+/// computed under a different aging rule than the queue it describes would
+/// predict a wait that machine was never going to have.
+pub const PRIORITY_AGING_INTERVAL_MS: u64 = 5_000;
+
+/// The tier a queued request currently ranks in, after aging.
+///
+/// Aging saturates at the top tier, so a request that has waited long enough
+/// competes with interactive work however it was submitted. Higher is earlier.
+pub fn aged_priority(priority: CellPriority, queued_at_unix_ms: u64, now_unix_ms: u64) -> u64 {
+    let base = match priority {
+        CellPriority::ReviewCheck => 0_u64,
+        CellPriority::WriteCheck => 1,
+        CellPriority::AgentInteractive => 2,
+    };
+    let promotions = now_unix_ms
+        .saturating_sub(queued_at_unix_ms)
+        .checked_div(PRIORITY_AGING_INTERVAL_MS)
+        .unwrap_or(0);
+    base.saturating_add(promotions).min(2)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MutationPolicy {
@@ -1059,6 +1159,32 @@ pub struct CellRequest {
     /// of a selector is not permission to move. See [`PlacementMobility`].
     #[serde(default)]
     pub placement_mobility: PlacementMobility,
+    /// The platform families whose answer to this request the requester counts,
+    /// as lowercase OS names (`macos`, `linux`, `windows`). Empty means the
+    /// requester counts an answer from anywhere.
+    ///
+    /// Placement policy may only CHOOSE a machine on one of these platforms.
+    /// This is not a capability question — a windows machine can run `eslint`
+    /// and `clippy` perfectly well — it is a question about whose result the
+    /// requester is willing to publish as the answer. A check suite whose gate
+    /// has only ever meant "green on macOS" gets a windows-only finding
+    /// (`#[cfg(windows)]` dead code, a backslash in a lint path) recorded as ITS
+    /// verdict the moment idleness sends it there, and one placement decision
+    /// becomes an operator reading "all checks are failing" about a tree that is
+    /// green everywhere the project actually gates.
+    ///
+    /// Deliberately separate from `executor`: a selector states where the work
+    /// must go, and this states which answers count. The two are set by
+    /// different parties for different reasons, and collapsing them would make a
+    /// project's gate policy indistinguishable from a caller's routing request
+    /// in every diagnostic that mentions either.
+    ///
+    /// Nothing on the executor side reads this. It is a runner-side placement
+    /// input, resolved before dispatch, and it travels on the request only
+    /// because the request is where everything else the requester asked for
+    /// lives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verdict_platforms: Vec<String>,
     /// Where this batch must run because its working tree already lives there.
     ///
     /// Not a selector and never settable by a requester: a job's execution home
@@ -1197,6 +1323,17 @@ pub struct CellExecutionMeta {
     pub disk_delta_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measurement_quality: Option<ExecutionMeasurementQuality>,
+    /// What the cell already held when this command started, as the executor
+    /// observed it rather than as the runner predicted it.
+    ///
+    /// The learner keys a duration observation on this, so a warm run can never
+    /// be recorded as evidence about a cold one. `None` from an executor that
+    /// does not state it, which is read as "no claim" and keeps the observation
+    /// out of every warmth-keyed profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmth: Option<ExecutionWarmth>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub environment_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1964,6 +2101,16 @@ pub struct PersistentCellState {
     pub last_affinity_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preparation_fingerprint: Option<String>,
+    /// Work classes that have completed at least once in this checkout since it
+    /// was created.
+    ///
+    /// The one fact that separates a cell which has compiled this project from
+    /// one that merely exists. It accumulates over the cell's life because build
+    /// products do: re-preparing onto a different base leaves the target
+    /// directory in place, and only recreating the checkout clears it. Bounded
+    /// by the number of [`CellCommandClass`] variants, so it never grows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm_command_classes: Vec<CellCommandClass>,
     /// Who holds this cell. Absent for a free cell and for a transient batch
     /// that took a cell of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1974,6 +2121,20 @@ pub struct PersistentCellState {
 }
 
 impl PersistentCellState {
+    /// Whether this checkout has already completed the given work class, and so
+    /// holds whatever that class writes into the tree.
+    pub fn is_warm_for(&self, class: CellCommandClass) -> bool {
+        self.warm_command_classes.contains(&class)
+    }
+
+    /// Record that a work class completed here. Idempotent, and bounded by the
+    /// number of classes that exist.
+    pub fn mark_warm_for(&mut self, class: CellCommandClass) {
+        if !self.warm_command_classes.contains(&class) {
+            self.warm_command_classes.push(class);
+        }
+    }
+
     /// A cell nobody holds and nothing runs in — the only cell that may be
     /// reused, retired, or swept.
     pub fn is_free(&self) -> bool {
@@ -2016,6 +2177,13 @@ pub struct QueuedCellRequest {
     pub requesting_job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity_key: Option<String>,
+    /// The profile identity this work was submitted under, echoed back so the
+    /// runner can price what sits ahead of a request it is considering placing.
+    /// Without it a queue forecast could only ever use class priors, which
+    /// over-predicts the wait on exactly the machines that have run this work
+    /// often enough to be fast at it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_resource_identity: Option<CommandResourceIdentity>,
     pub queued_at_unix_ms: u64,
     #[serde(default)]
     pub resource_reservation: ResourceReservation,
@@ -2090,6 +2258,11 @@ pub struct ExecutingCellRequest {
     pub resource_reservation: ResourceReservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_estimate: Option<LearnedResourceEstimate>,
+    /// The profile identity this execution was submitted under. Lets the runner
+    /// price the remaining time of work already running when it forecasts what a
+    /// new request would wait behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_resource_identity: Option<CommandResourceIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3155,6 +3328,11 @@ pub struct PlacementSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_transfer: Option<ObjectTransferCoordinate>,
     pub observation_reuse: ObservationReuse,
+    /// What this machine was predicted to cost, and on what evidence. Absent
+    /// only where nothing was ranked — a pin, or a caller that settled
+    /// placement itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<PlacementPrediction>,
 }
 
 /// Why this machine, in words that distinguish a measured win from the absence
@@ -3169,8 +3347,15 @@ pub enum PlacementReason {
     ColocatedHome,
     /// The only machine that survived the caller's selector and the filters.
     OnlyCandidate,
-    /// Won a measured ranking against other usable machines.
-    MeasuredIdle,
+    /// Predicted to reach a verdict soonest among the usable machines — queue
+    /// wait plus run duration, at this machine's learned speed and warmth.
+    ///
+    /// This replaced a ranking on whole-percent CPU idleness, which measured how
+    /// unloaded a machine was and called it fast. An idle eight-core host with
+    /// an empty target directory beat a busy sixteen-core one that had just
+    /// built the same tree, which is precisely backwards for a caller waiting on
+    /// the answer.
+    PredictedEarliestVerdict,
     /// Nothing in the fleet had complete, fresh placement readings, so no
     /// measured comparison was possible and the work stayed on its home
     /// executor. Named explicitly because it is exactly the state that must not
@@ -3184,7 +3369,7 @@ impl PlacementReason {
             Self::Pinned => "pinned",
             Self::ColocatedHome => "colocatedHome",
             Self::OnlyCandidate => "onlyCandidate",
-            Self::MeasuredIdle => "measuredIdle",
+            Self::PredictedEarliestVerdict => "predictedEarliestVerdict",
             Self::MeasuredBlindFleet => "measuredBlindFleet",
         }
     }
@@ -3332,12 +3517,426 @@ impl ReservationFallback {
     }
 }
 
+/// Observations of one command identity, on one machine context, at one warmth
+/// below which a learned duration is not yet a prediction.
+///
+/// Three, because three is the smallest window in which a median can reject a
+/// single outlier — which is the whole failure this floor exists to prevent. One
+/// forty-minute run on a machine that was swapping must not become that
+/// machine's answer for the next hour. It is deliberately lower than
+/// [`MIN_CONFIDENT_RESERVATION_SAMPLES`]: a reservation that is wrong overcommits
+/// a host, while a ranking that is wrong sends work to the second-best machine,
+/// and the second failure is cheap enough to learn from.
+pub const MIN_CONFIDENT_DURATION_SAMPLES: u64 = 3;
+
+/// How many recent observations a duration profile predicts from.
+///
+/// Bounded so that a machine which got slower — a new toolchain, a filling
+/// disk, a heavier suite — is described by what it does now rather than by an
+/// average over its whole history. Old samples age out by count, not by clock,
+/// so a machine that is rarely used keeps the evidence it has.
+pub const DURATION_SAMPLE_WINDOW: usize = 16;
+
+/// Past this age the newest observation in a profile stops speaking for the
+/// machine, and the labeled class prior takes over.
+///
+/// A week, because a duration profile describes a machine's current shape — its
+/// toolchain, its caches, its disk — and none of those are stable across much
+/// more than that. Silence is not evidence of continuity.
+pub const DURATION_PROFILE_STALE_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// How long this work is predicted to take on one machine, and on what basis.
+///
+/// The prediction and its provenance travel together on purpose. A number
+/// without its evidence is indistinguishable from a constant, and a fleet that
+/// ranks machines on constants is the fiction this replaced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DurationEstimate {
+    /// Milliseconds of execution predicted for this command on this machine at
+    /// this warmth.
+    pub predicted_ms: u64,
+    pub source: DurationEvidence,
+    /// Observations behind the prediction. Zero whenever `source` is
+    /// [`DurationEvidence::Unmeasured`].
+    pub sample_count: u64,
+    /// The profile identity consulted, absent when the work declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_key: Option<String>,
+    /// The executor context the profile was keyed by. A profile learned on one
+    /// platform never speaks for another.
+    pub profile_context: String,
+    /// Which warmth's observations this prediction came from.
+    pub warmth: ExecutionWarmth,
+    /// When the newest observation behind this prediction was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix_ms: Option<u64>,
+    /// Why no learned value was used, when none was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<DurationFallback>,
+}
+
+impl DurationEstimate {
+    pub fn is_learned(&self) -> bool {
+        matches!(self.source, DurationEvidence::Learned)
+    }
+
+    /// One line an operator can read without a second lookup.
+    pub fn describe(&self) -> String {
+        match self.source {
+            DurationEvidence::Learned => format!(
+                "{}ms predicted from {} {} observation(s) of {}",
+                self.predicted_ms,
+                self.sample_count,
+                self.warmth.as_str(),
+                self.profile_key.as_deref().unwrap_or("this command")
+            ),
+            DurationEvidence::Unmeasured => format!(
+                "{}ms from the labeled class prior ({})",
+                self.predicted_ms,
+                self.fallback
+                    .map(DurationFallback::describe)
+                    .unwrap_or("nothing learned")
+            ),
+        }
+    }
+}
+
+/// Whether a duration prediction came from this machine's own history or from a
+/// labeled prior standing in for history it does not have.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DurationEvidence {
+    Learned,
+    /// A class prior. Never a claim about this machine's speed, and marked so
+    /// that no surface can present it as one.
+    Unmeasured,
+}
+
+/// Why a duration prediction fell back to the labeled class prior.
+///
+/// Deliberately its own vocabulary rather than [`ReservationFallback`]'s. A
+/// reservation high-water mark does not rot with age, so it has no notion of a
+/// profile that got too old to speak; a duration does, and that difference is
+/// the whole reason a prediction can be stale while a reservation is not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DurationFallback {
+    /// The work declares no command resource identity, so nothing can be
+    /// learned about it or looked up for it.
+    NoCommandIdentity,
+    /// This identity has never completed on this machine at this warmth.
+    NoProfileRecorded,
+    /// The profile store could not be read. A fault, not a cold start.
+    ProfileLookupFailed,
+    /// Fewer observations than [`MIN_CONFIDENT_DURATION_SAMPLES`], so a median
+    /// could not reject an outlier yet.
+    BelowConfidenceFloor,
+    /// The newest observation aged past [`DURATION_PROFILE_STALE_AFTER_MS`].
+    ProfileTooOld,
+    /// This placement had no profile store to consult at all. Distinct from
+    /// having consulted one and found nothing: a residency placement carries no
+    /// resource plan, and reporting that as "never observed" would blame the
+    /// machine for a lookup that was never attempted.
+    NoProfileStore,
+}
+
+impl DurationFallback {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCommandIdentity => "noCommandIdentity",
+            Self::NoProfileRecorded => "noProfileRecorded",
+            Self::ProfileLookupFailed => "profileLookupFailed",
+            Self::BelowConfidenceFloor => "belowConfidenceFloor",
+            Self::ProfileTooOld => "profileTooOld",
+            Self::NoProfileStore => "noProfileStore",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::NoCommandIdentity => "the work declares no command identity",
+            Self::NoProfileRecorded => "nothing has been observed here at this warmth",
+            Self::ProfileLookupFailed => "the profile store could not be read",
+            Self::BelowConfidenceFloor => "too few observations to reject an outlier",
+            Self::ProfileTooOld => "every observation is older than the profile age limit",
+            Self::NoProfileStore => "this placement consulted no profile store",
+        }
+    }
+}
+
+/// What the runner could establish about a machine's warmth for this request.
+///
+/// Warmth is derived from facts the executor reported about its own retained
+/// cells and verified objects. When those facts are absent or aged, this says so
+/// rather than reporting [`ExecutionWarmth::Cold`] — "we could not tell" and
+/// "we checked and it is cold" rank differently and read differently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum CacheWarmthEvidence {
+    Observed {
+        warmth: ExecutionWarmth,
+        /// When the facts this classification was read from were collected.
+        observed_at_unix_ms: u64,
+    },
+    Unknown {
+        reason: WarmthUnknownReason,
+    },
+}
+
+impl CacheWarmthEvidence {
+    /// The warmth a prediction should be keyed on. An unknown warmth resolves to
+    /// [`ExecutionWarmth::Cold`] for lookup — the conservative reading, which
+    /// predicts the slower profile rather than the faster one — while the record
+    /// keeps saying it was unknown.
+    pub fn for_lookup(&self) -> ExecutionWarmth {
+        match self {
+            Self::Observed { warmth, .. } => *warmth,
+            Self::Unknown { .. } => ExecutionWarmth::Cold,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Observed { warmth, .. } => warmth.describe().to_string(),
+            Self::Unknown { reason } => format!("warmth unknown: {}", reason.describe()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WarmthUnknownReason {
+    /// The machine's advertised facts aged past the liveness bound, so what it
+    /// last said about its cells is history.
+    FactsStale,
+    /// The executor does not claim authority over its own cell inventory, so
+    /// the absence of a matching cell is not evidence that none exists.
+    InventoryNotAuthoritative,
+}
+
+impl WarmthUnknownReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FactsStale => "factsStale",
+            Self::InventoryNotAuthoritative => "inventoryNotAuthoritative",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::FactsStale => "the machine's cell facts are past the liveness bound",
+            Self::InventoryNotAuthoritative => "the machine does not claim inventory authority",
+        }
+    }
+}
+
+/// How long this request is predicted to wait before a machine starts it.
+///
+/// Advisory, and computed by the runner from facts the executor published. It
+/// reserves nothing, enqueues nothing, and binds nobody: the executor's waiting
+/// room remains the only authority over what actually runs when.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum QueueForecast {
+    Forecast {
+        predicted_ms: u64,
+        /// Queued requests that would rank ahead of this one under the
+        /// executor's own aging rule.
+        requests_ahead: usize,
+        /// Executions already running, whose remaining time this request waits
+        /// on when the machine has no free lane.
+        running_ahead: usize,
+        /// False when any leg of the sum came from a labeled prior rather than
+        /// from learned history.
+        fully_measured: bool,
+        observed_at_unix_ms: u64,
+    },
+    Unknown {
+        reason: QueueUnknownReason,
+    },
+}
+
+impl QueueForecast {
+    /// Milliseconds this leg contributes to a total, or `None` when the leg is
+    /// unknown. An unknown wait is never summed as zero.
+    pub fn predicted_ms(&self) -> Option<u64> {
+        match self {
+            Self::Forecast { predicted_ms, .. } => Some(*predicted_ms),
+            Self::Unknown { .. } => None,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Forecast {
+                predicted_ms,
+                requests_ahead,
+                running_ahead,
+                fully_measured,
+                ..
+            } => format!(
+                "{predicted_ms}ms behind {requests_ahead} queued and {running_ahead} running{}",
+                if *fully_measured {
+                    ""
+                } else {
+                    ", partly from class priors"
+                }
+            ),
+            Self::Unknown { reason } => format!("queue wait unknown: {}", reason.describe()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QueueUnknownReason {
+    /// The machine's advertised facts aged past the liveness bound.
+    FactsStale,
+    /// The executor advertises no concurrency capacity, so what sits ahead of a
+    /// request cannot be turned into a wait.
+    NoAdmissionCapacity,
+}
+
+impl QueueUnknownReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FactsStale => "factsStale",
+            Self::NoAdmissionCapacity => "noAdmissionCapacity",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::FactsStale => "the machine's queue facts are past the liveness bound",
+            Self::NoAdmissionCapacity => "the machine advertises no concurrency capacity",
+        }
+    }
+}
+
+/// What this machine would have to fetch or build before the command could
+/// start, and why that costs no predicted milliseconds yet.
+///
+/// This leg deliberately contributes nothing to a total. Turning missing object
+/// bytes into milliseconds requires transfer history nothing has recorded, and
+/// inventing a bytes-per-second constant would put back exactly the kind of
+/// fiction predicted-verdict ranking exists to remove. The byte count rides here
+/// as what it honestly is: a deterministic tiebreak between machines whose
+/// predicted times are otherwise equal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PreparationForecast {
+    /// This machine already holds every object the request names.
+    ObjectsPresent,
+    /// Objects must travel first, and no transfer history exists to price them.
+    TransferPending { bytes: u64 },
+    /// The runner could not estimate what this machine is missing.
+    Unknown,
+}
+
+impl PreparationForecast {
+    /// Bytes for the ranking tiebreak. A machine whose transfer cost is unknown
+    /// sorts behind every machine whose cost is known, including large ones,
+    /// because an unknown is not evidence of being small.
+    pub fn tiebreak_bytes(self) -> u64 {
+        match self {
+            Self::ObjectsPresent => 0,
+            Self::TransferPending { bytes } => bytes,
+            Self::Unknown => u64::MAX,
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self {
+            Self::ObjectsPresent => "every object is already here".into(),
+            Self::TransferPending { bytes } => {
+                format!("{bytes} bytes of objects to send, not yet priced in time")
+            }
+            Self::Unknown => "what this machine is missing could not be estimated".into(),
+        }
+    }
+}
+
+/// One machine's predicted time to a verdict, with every component's evidence.
+///
+/// This is what placement now ranks on, and it is attached to the winner and to
+/// every machine that was passed over with something to compare. An operator
+/// asking "why did this run there" reads the totals side by side off one record
+/// rather than reconstructing them from a second log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementPrediction {
+    pub executor_name: String,
+    pub executor_id: String,
+    /// Predicted wait before this machine would start the work.
+    pub queue: QueueForecast,
+    /// What this machine would have to fetch first. Carries no milliseconds by
+    /// construction; see [`PreparationForecast`].
+    pub preparation: PreparationForecast,
+    /// Predicted execution time once started.
+    pub run: DurationEstimate,
+    /// Queue wait plus run duration — the two legs that carry honest time.
+    pub predicted_verdict_ms: u64,
+    /// What the runner established about this machine's warmth for this work.
+    pub warmth: CacheWarmthEvidence,
+}
+
+impl PlacementPrediction {
+    /// How much of this prediction is this machine's own history rather than a
+    /// labeled prior. Lower is better evidence, and it breaks ties between
+    /// machines whose predicted totals are equal — never ahead of the totals
+    /// themselves, because a confidently predicted slow machine is still slow.
+    pub fn evidence_rank(&self) -> u8 {
+        let run = u8::from(!self.run.is_learned());
+        let queue = match &self.queue {
+            QueueForecast::Forecast {
+                fully_measured: true,
+                ..
+            } => 0,
+            QueueForecast::Forecast { .. } => 1,
+            QueueForecast::Unknown { .. } => 2,
+        };
+        run * 3 + queue
+    }
+
+    /// The one line every readable surface renders for a candidate.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}: {}ms predicted ({}; {}; {}; {})",
+            self.executor_name,
+            self.predicted_verdict_ms,
+            self.queue.describe(),
+            self.run.describe(),
+            self.warmth.describe(),
+            self.preparation.describe()
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlacementRejection {
     pub executor_name: String,
     pub executor_id: String,
     pub reason: PlacementRejectionReason,
+    /// What this machine was predicted to cost, when it was comparable at all.
+    /// A structural rejection — wrong project, closed link, pinned elsewhere —
+    /// carries none, because no honest prediction exists for a machine that was
+    /// never in the running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<PlacementPrediction>,
 }
 
 /// Why a machine could not take this work. Every variant is actionable: it names
@@ -3387,6 +3986,10 @@ pub enum PlacementRejectionReason {
     },
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
+    /// Capable of running the work, but not a platform whose answer the
+    /// requester counts as the verdict. Placement will not turn a lane red on a
+    /// platform the project does not gate on.
+    UntrustedVerdictPlatform { os: String, trusted: Vec<String> },
 }
 
 impl PlacementRejectionReason {
@@ -3429,6 +4032,10 @@ impl PlacementRejectionReason {
                 free_bytes,
             } => format!("needs {required_bytes} bytes of volume, has {free_bytes}"),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
+            Self::UntrustedVerdictPlatform { os, trusted } => format!(
+                "runs {os}, and this verdict counts only from {}",
+                trusted.join(", ")
+            ),
         }
     }
 }
@@ -3995,6 +4602,8 @@ pub struct ProcessBatchItem {
     pub timeout_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_resource_identity: Option<CommandResourceIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verdict_environment_names: Vec<String>,
 }
 
 /// Typed result for one command in a build-cell process batch.
@@ -4025,6 +4634,8 @@ pub struct ProcessBatchItemOutcome {
     pub sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracked_modifications: Option<TrackedModificationEvidence>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub environment_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4886,10 +5497,11 @@ mod tests {
             selector: None,
             pinned_executor_id: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
+                prediction: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,
-                reason: PlacementReason::MeasuredIdle,
+                reason: PlacementReason::PredictedEarliestVerdict,
                 readings: PlacementReadings {
                     cpu: Measurement::measured(
                         10,
@@ -4932,6 +5544,7 @@ mod tests {
                 observation_reuse: ObservationReuse::UntrustedRemoteEnvironment,
             })),
             rejected: vec![PlacementRejection {
+                prediction: None,
                 executor_name: "local".into(),
                 executor_id: "colocated".into(),
                 reason: PlacementRejectionReason::TelemetryStale {
@@ -4982,6 +5595,7 @@ mod tests {
                 ..ExecutorSelector::default()
             }),
             placement_mobility: PlacementMobility::SpillEligible,
+            verdict_platforms: Vec::new(),
             pinned_executor_id: None,
             command_resource_identity: Some(CommandResourceIdentity {
                 version: COMMAND_RESOURCE_IDENTITY_VERSION,
@@ -5677,6 +6291,7 @@ mod tests {
             }),
         );
         let cell = PersistentCellState {
+            warm_command_classes: Vec::new(),
             executor_id: "executor-a".into(),
             executor_display_name: Some("Executor A".into()),
             project_id: "project".into(),
@@ -5851,6 +6466,7 @@ mod tests {
             fleet: FleetSnapshot {
                 cells: vec![cell, branched, detached, service],
                 queued_requests: vec![QueuedCellRequest {
+                    command_resource_identity: None,
                     admission_kind: CellAdmissionKind::Residency,
                     executor_id: "executor-a".into(),
                     request_id: "queued".into(),
@@ -5870,6 +6486,7 @@ mod tests {
                     substrate_hold: Some(substrate_state.clone()),
                 }],
                 executing_requests: vec![ExecutingCellRequest {
+                    command_resource_identity: None,
                     executor_id: "executor-a".into(),
                     cell_id: "slot-1".into(),
                     request_id: "request".into(),
@@ -5900,6 +6517,7 @@ mod tests {
                     resource_reservation: Some(reservation.clone()),
                     learned_estimate: Some(learned_estimate),
                     actuals: Some(CellExecutionMeta {
+                        warmth: None,
                         executor_id: "executor-a".into(),
                         executor_device_id: "device".into(),
                         executor_connection_generation: 2,
@@ -5918,6 +6536,7 @@ mod tests {
                             memory_platform: Some("macos".into()),
                             disk_boundary: "cell".into(),
                         }),
+                        environment_fingerprint: String::new(),
                     }),
                     cached: false,
                     subscriber_count: 1,
@@ -6854,6 +7473,7 @@ mod tests {
             output: "failed".into(),
             timed_out: false,
             metadata: CellExecutionMeta {
+                warmth: None,
                 executor_id: "e".into(),
                 executor_device_id: "d".into(),
                 executor_connection_generation: 1,
@@ -6866,6 +7486,7 @@ mod tests {
                 peak_physical_footprint_bytes: None,
                 disk_delta_bytes: None,
                 measurement_quality: None,
+                environment_fingerprint: String::new(),
             },
             mutation_delta: Some(Box::new(MutationDelta {
                 base_commit: "b".into(),

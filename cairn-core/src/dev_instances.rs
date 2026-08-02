@@ -1092,6 +1092,7 @@ mod tests {
             PersistentCellState, ResidencyPhase,
         };
         PersistentCellState {
+            warm_command_classes: Vec::new(),
             executor_id: "executor-a".into(),
             executor_display_name: None,
             project_id: project_id.into(),

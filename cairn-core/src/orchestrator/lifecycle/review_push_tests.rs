@@ -1,4 +1,4 @@
-use super::review_push::spawn_turn_end_checks;
+use super::review_push::{capacity_rearm_candidates, spawn_turn_end_checks};
 use super::{create_review_push_for_pr_open, evaluate_review_readiness};
 use crate::db::DbState;
 use crate::orchestrator::attention_push::{
@@ -15,6 +15,97 @@ const REVIEW_KEY: &str = "review:cairn://p/PRJ/7";
 
 async fn test_db() -> LocalDb {
     crate::storage::migrated_test_db("review-push.db").await
+}
+
+#[tokio::test]
+async fn capacity_rearm_selects_only_retryable_review_work() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_artifact(&db, "create-pr", 1).await;
+    insert_failed_check(&db, "infrastructure", 1).await;
+
+    let orch = test_orchestrator(db);
+    assert!(capacity_rearm_candidates(&orch.db)
+        .await
+        .unwrap()
+        .is_empty());
+
+    orch.db
+        .local
+        .execute("UPDATE check_result_cache SET failure_kind='capacity'", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        capacity_rearm_candidates(&orch.db).await.unwrap()[0].job_id,
+        "j-prod",
+        "time-relieved capacity is eligible while structural infrastructure is not"
+    );
+
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET infra_failure_streak=?1",
+            (crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        capacity_rearm_candidates(&orch.db).await.unwrap(),
+        Vec::new(),
+        "the scheduler must not route around the persisted retry bound"
+    );
+}
+
+#[tokio::test]
+async fn stale_capacity_input_is_not_a_rearm_candidate_after_a_newer_result() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_artifact(&db, "create-pr", 1).await;
+    insert_failed_check(&db, "capacity", 1).await;
+    db.execute_script(
+        "UPDATE check_result_cache SET ran_at=1;
+         INSERT INTO check_result_cache
+           (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+            output_tail, duration_ms, ran_at, job_id, failure_kind, infra_failure_streak)
+         VALUES('p-rev','tree','new-input','review',0,1,'passed',1,1,'j-prod',NULL,0);",
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+
+    assert_eq!(
+        capacity_rearm_candidates(&orch.db).await.unwrap(),
+        Vec::new(),
+        "rowid breaks equal-second ties, so an older capacity input on the same tree cannot remain latest"
+    );
+}
+
+#[tokio::test]
+async fn capacity_rearm_enumerates_open_team_databases() {
+    let local = test_db().await;
+    let team = test_db().await;
+    seed(&team, "initial").await;
+    insert_artifact(&team, "create-pr", 1).await;
+    insert_failed_check(&team, "capacity", 1).await;
+    let orch = test_orchestrator(local);
+    orch.db
+        .register_team_db_for_test("team-a".to_string(), Arc::new(team))
+        .await;
+
+    let candidates = capacity_rearm_candidates(&orch.db).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].job_id, "j-prod");
+}
+
+async fn insert_failed_check(db: &LocalDb, kind: &str, streak: i64) {
+    db.execute_script(&format!(
+        "INSERT INTO check_result_cache
+           (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+            output_tail, duration_ms, ran_at, job_id, failure_kind, infra_failure_streak)
+         VALUES('p-rev','tree','input','review',-1,0,'failed',0,1,'j-prod','{kind}',{streak});"
+    ))
+    .await
+    .unwrap();
 }
 
 fn test_orchestrator(db: LocalDb) -> Orchestrator {

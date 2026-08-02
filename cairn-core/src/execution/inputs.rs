@@ -1299,6 +1299,7 @@ mod tests {
             timeout: None,
             executor: None,
             verdict_environment: Vec::new(),
+            verdict_platforms: None,
             fixes: false,
         }
     }

@@ -4133,6 +4133,7 @@ mod terminal_finalize_tests {
             events: Vec::new(),
         };
         PersistentCellState {
+            warm_command_classes: Vec::new(),
             executor_id: String::new(),
             executor_display_name: None,
             project_id: "p".into(),

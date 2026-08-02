@@ -3,13 +3,80 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 static IMESSAGE_RUNTIME: OnceLock<Mutex<Option<Arc<imessage::IMessageProvider>>>> = OnceLock::new();
+const ADMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const ADMISSION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct AdmissionFailureReporter {
+    last_error: Option<String>,
+    last_reported_at: Option<Instant>,
+    suppressed: u64,
+}
+
+impl AdmissionFailureReporter {
+    fn record(&mut self, now: Instant, error: &str) -> Option<String> {
+        let changed = self.last_error.as_deref() != Some(error);
+        let report_due = self
+            .last_reported_at
+            .is_none_or(|last| now.duration_since(last) >= ADMISSION_REPORT_INTERVAL);
+        if changed || report_due {
+            let suffix = if changed || self.suppressed == 0 {
+                String::new()
+            } else {
+                format!(" ({} identical attempts suppressed)", self.suppressed)
+            };
+            self.last_error = Some(error.to_string());
+            self.last_reported_at = Some(now);
+            self.suppressed = 0;
+            Some(format!("{error}{suffix}"))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
+
+async fn supervise_admission<L, C, F, Fut, R>(
+    mut load: L,
+    mut run: F,
+    mut report: R,
+    retry_interval: Duration,
+) where
+    L: FnMut() -> Option<C>,
+    F: FnMut(C) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+    R: FnMut(String),
+{
+    let mut failures = AdmissionFailureReporter::default();
+    loop {
+        let Some(config) = load() else {
+            tokio::time::sleep(retry_interval).await;
+            return;
+        };
+        match run(config).await {
+            Ok(()) => return,
+            Err(error) => {
+                if let Some(message) = failures.record(Instant::now(), &error) {
+                    report(message);
+                }
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
+}
 
 fn runtime_slot() -> &'static Mutex<Option<Arc<imessage::IMessageProvider>>> {
     IMESSAGE_RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorPresence {
+    Present,
+    Away,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,7 +143,18 @@ pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
                 .channels
                 .imessage;
             if config.enabled && !config.to.trim().is_empty() {
-                spawn_imessage(orch.clone(), config).await;
+                supervise_admission(
+                    || {
+                        let config = crate::config::settings::load_settings(&orch.config_dir)
+                            .channels
+                            .imessage;
+                        (config.enabled && !config.to.trim().is_empty()).then_some(config)
+                    },
+                    |config| spawn_imessage(orch.clone(), config),
+                    |report| log::error!("{report}"),
+                    ADMISSION_RETRY_INTERVAL,
+                )
+                .await;
             } else {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -87,14 +165,14 @@ pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
 async fn spawn_imessage(
     orch: crate::orchestrator::Orchestrator,
     config: crate::models::IMessageChannelConfig,
-) {
+) -> Result<(), String> {
     use cairn_common::executor_protocol::{OwnerDeathPolicy, ResidencyFootprint};
 
     let Some(name) = config.executor.as_deref() else {
-        log::error!(
+        return Err(
             "iMessage channel requires a named executor so Messages account and TCC identity are explicit; channel remains stopped"
+                .into(),
         );
-        return;
     };
     let executor: Arc<dyn imessage::IMessageExecutor> =
         match crate::fleet::service_placement::acquire_service_lease(
@@ -121,10 +199,9 @@ async fn spawn_imessage(
                 Arc::new(imessage::PlacedProcessExecutor::new(lease))
             }
             Err(error) => {
-                log::error!(
+                return Err(format!(
                     "iMessage channel executor `{name}` is unavailable; channel remains stopped: {error}"
-                );
-                return;
+                ));
             }
         };
     let provider = Arc::new(imessage::IMessageProvider::new(
@@ -202,7 +279,7 @@ async fn spawn_imessage(
             {
                 *runtime = None;
             }
-            return;
+            return Ok(());
         }
     }
 }
@@ -290,6 +367,12 @@ pub trait ChannelProvider: Send + Sync {
     async fn send(&self, message: &OutboundMessage) -> Result<SentIds, String>;
     fn subscribe(&self) -> mpsc::Receiver<InboundEvent>;
     fn health(&self) -> ChannelHealth;
+    /// Presence on the machine that owns this provider account. An unreadable
+    /// signal is away: deferral may remove a redundant alert, but uncertainty
+    /// must never suppress one.
+    async fn operator_presence(&self) -> OperatorPresence {
+        OperatorPresence::Away
+    }
 }
 
 /// Renders the provider-independent plain-text floor for an outbound ask.
@@ -325,6 +408,99 @@ pub fn render_text_floor(ask: &OutboundAsk) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn admission_failures_are_paced_collapsed_and_recover_promptly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let configs = Arc::new(Mutex::new(["offline", "offline", "attached"].into_iter()));
+        let started = Instant::now();
+        supervise_admission(
+            {
+                let configs = configs.clone();
+                move || configs.lock().unwrap().next()
+            },
+            {
+                let attempts = attempts.clone();
+                move |config| {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if config == "offline" {
+                            Err("executor disconnected".to_string())
+                        } else {
+                            assert_eq!(attempt, 2);
+                            Ok(())
+                        }
+                    }
+                }
+            },
+            {
+                let reports = reports.clone();
+                move |report| reports.lock().unwrap().push(report)
+            },
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert_eq!(
+            reports.lock().unwrap().as_slice(),
+            ["executor disconnected"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_channel_stops_retrying_stale_admission_config() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let configs = Arc::new(Mutex::new([Some("offline"), None].into_iter()));
+        supervise_admission(
+            {
+                let configs = configs.clone();
+                move || configs.lock().unwrap().next().flatten()
+            },
+            {
+                let attempts = attempts.clone();
+                move |_config| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async { Err("executor disconnected".to_string()) }
+                }
+            },
+            |_| {},
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admission_failure_report_summarizes_suppressed_attempts_periodically() {
+        let start = Instant::now();
+        let mut reporter = AdmissionFailureReporter::default();
+        assert_eq!(
+            reporter.record(start, "executor disconnected").as_deref(),
+            Some("executor disconnected")
+        );
+        assert_eq!(
+            reporter.record(start + Duration::from_secs(2), "executor disconnected"),
+            None
+        );
+        assert_eq!(
+            reporter.record(start + Duration::from_secs(4), "executor disconnected"),
+            None
+        );
+        assert_eq!(
+            reporter
+                .record(start + ADMISSION_REPORT_INTERVAL, "executor disconnected")
+                .as_deref(),
+            Some("executor disconnected (2 identical attempts suppressed)")
+        );
+    }
 
     #[test]
     fn renders_numbered_question_options() {

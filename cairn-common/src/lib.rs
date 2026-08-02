@@ -2,6 +2,7 @@ pub mod abnormal_exit;
 pub mod auth;
 pub mod build_identity;
 pub mod change_validation;
+pub mod check_environment;
 pub mod conflict_scaffolding;
 pub mod contract;
 pub mod dev_instance_protocol;

@@ -14,22 +14,26 @@ pub(crate) mod service_placement;
 use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
-    executor_names_match, normalize_executor_name, EXECUTOR_NAME_RULE,
-};
-use cairn_common::executor_protocol::{
-    CellResidency, EnrolledRemote, ExecutorAdvertisement, ExecutorCapabilities, ExecutorConfig,
-    ExecutorHealthSnapshot, ExecutorHealthStatus, ExecutorIdentity, ExecutorInspection,
-    ExecutorMessage, ExecutorSelector, ExecutorSubstrateEvidence, ExecutorSubstrateReport,
-    ExecutorSubstrateState, MachineMeasurement, MaterializationReadFailureKind,
+    aged_priority, CacheWarmthEvidence, CellCheckoutKind, CellCommandClass, CellResidency,
+    DurationEstimate, DurationFallback, EnrolledRemote, ExecutionWarmth, ExecutorAdvertisement,
+    ExecutorCapabilities, ExecutorConfig, ExecutorHealthSnapshot, ExecutorHealthStatus,
+    ExecutorIdentity, ExecutorInspection, ExecutorMessage, ExecutorSelector,
+    ExecutorSubstrateEvidence, ExecutorSubstrateReport, ExecutorSubstrateState,
+    InventoryAuthorityState, MachineMeasurement, MaterializationReadFailureKind,
     MaterializationReadRequest, MaterializationReadResult, ObjectTransferCoordinate,
-    ObservationReuse, PlacementDecision, PlacementMobility, PlacementOutcome, PlacementReadings,
-    PlacementReason, PlacementRejection, PlacementRejectionReason, PlacementSelection,
-    PlacementSyncCost, ProcessBatch, ProcessBatchExecution, ProcessBatchItem, ProcessSandboxMode,
+    ObservationReuse, PlacementDecision, PlacementMobility, PlacementOutcome, PlacementPrediction,
+    PlacementReadings, PlacementReason, PlacementRejection, PlacementRejectionReason,
+    PlacementSelection, PlacementSyncCost, PreparationForecast, ProcessBatch,
+    ProcessBatchExecution, ProcessBatchItem, ProcessSandboxMode, QueueForecast, QueueUnknownReason,
     RemoteAttachAttempt, RemoteLinkState, RepositoryLocator, ReservationFallback,
     ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence,
     ResidencyHolder, ResidencyOperation, ResidencyResult, ResidentProcessEvent,
-    ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult, EXECUTOR_PROGRESS_FRESHNESS_MS,
-    LOCAL_EXECUTOR_NAME, MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult, WarmthUnknownReason,
+    EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME, MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS,
+    RESIDENCY_ACQUIRE_ATTEMPT_ID,
+};
+use cairn_common::executor_protocol::{
+    executor_names_match, normalize_executor_name, EXECUTOR_NAME_RULE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -82,6 +86,11 @@ pub struct FleetConfig {
     /// Runner-owned SSH executor declarations, keyed by stable executor ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_executors: BTreeMap<String, RemoteExecutorConfig>,
+    /// Stable operating-system identities learned during SSH enrollment, keyed
+    /// by executor ID. Kept outside the public declaration because callers name
+    /// a host; only the host itself can authoritatively identify it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote_host_identities: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +139,14 @@ impl RemotePlatform {
             }
         }
     }
+}
+
+fn missing_wait_reason_is_new(previous: &FleetSnapshot, queued: &QueuedCellRequest) -> bool {
+    !previous.queued_requests.iter().any(|prior| {
+        prior.request_id == queued.request_id
+            && prior.attempt_id == queued.attempt_id
+            && prior.substrate_hold.is_none()
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -489,6 +506,7 @@ impl Default for FleetConfig {
             default_timeout_seconds: default_timeout_seconds(),
             executor_policies: HashMap::new(),
             remote_executors: BTreeMap::new(),
+            remote_host_identities: BTreeMap::new(),
         }
     }
 }
@@ -2141,6 +2159,15 @@ impl Fleet {
         }
         for queued in &mut snapshot.queued_requests {
             queued.executor_id = executor_id.to_string();
+            if queued.substrate_hold.is_none()
+                && missing_wait_reason_is_new(&entry.snapshot, queued)
+            {
+                log::warn!(
+                    "executor {executor_id} reported queued request {} attempt {} without a wait reason",
+                    queued.request_id,
+                    queued.attempt_id,
+                );
+            }
         }
         for execution in &mut snapshot.executing_requests {
             execution.executor_id = executor_id.to_string();
@@ -4100,6 +4127,7 @@ impl Fleet {
                                 item_meta.duration_ms = Some(result.duration_ms);
                                 item_meta.peak_rss_bytes = result.peak_rss_bytes;
                                 item_meta.disk_delta_bytes = result.disk_delta_bytes;
+                                item_meta.environment_fingerprint = result.environment_fingerprint;
                                 pool.complete_coalesced_for_leader(
                                     key,
                                     &leader,
@@ -4863,6 +4891,17 @@ impl Fleet {
                                 .unwrap_or_else(|| "this job's execution home".to_string()),
                             known_executor_inventory(&connections)
                         )
+                    } else if !request.verdict_platforms.is_empty() {
+                        // Trust is why nothing here was usable, so trust is what
+                        // the diagnostic has to name. An operator reading "no
+                        // executor became usable" beside a fleet of idle
+                        // machines would have no way to tell that they were
+                        // passed over deliberately.
+                        format!(
+                            "no executor on {} — the platform(s) this verdict counts from — became usable before this request's wait horizon. Known executors: {}. Read cairn://executors for live state.",
+                            request.verdict_platforms.join(", "),
+                            known_executor_inventory(&connections)
+                        )
                     } else {
                         "no executor became usable before this request's wait horizon".to_string()
                     },
@@ -4904,22 +4943,69 @@ impl Fleet {
         // attach asks nothing at all. Pure with respect to placement: nothing
         // here reserves anything.
         let mut reservations = HashMap::new();
-        if let Some(plan) = plan {
-            for entry in &survey.usable {
-                reservations.insert(
-                    entry.identity.executor_id.clone(),
-                    plan.resolve_for(
-                        request,
-                        &entry.identity.device_id,
-                        &entry.identity.executor_id,
-                        &entry.advertisement.capabilities,
-                    )
-                    .await,
-                );
-            }
+        let mut predictions = HashMap::new();
+        let mut sync_costs = HashMap::new();
+        let oracle = DurationOracle {
+            db: plan.map(|plan| plan.db.clone()),
+        };
+        for entry in &survey.usable {
+            let context = ReservationPlan::context_for(
+                &entry.identity.device_id,
+                &entry.identity.executor_id,
+                &entry.advertisement.capabilities,
+            );
+            let warmth = candidate_warmth(entry, request, now);
+            let duration_context = resource_profiles::DurationContext {
+                class: request.command_class,
+                warmth: warmth.for_lookup(),
+                now_unix_ms: now,
+            };
+            let run = match plan {
+                Some(plan) => {
+                    let resolved = plan
+                        .resolve_for(
+                            request,
+                            &entry.identity.device_id,
+                            &entry.identity.executor_id,
+                            &entry.advertisement.capabilities,
+                            duration_context,
+                        )
+                        .await;
+                    let run = resolved.duration.clone();
+                    reservations.insert(entry.identity.executor_id.clone(), resolved);
+                    run
+                }
+                None => {
+                    oracle
+                        .predict(
+                            request.command_resource_identity.as_ref(),
+                            &context,
+                            warmth.for_lookup(),
+                            request.command_class,
+                            now,
+                        )
+                        .await
+                }
+            };
+            let prices = QueuePrices::resolve(&oracle, entry, &context, now).await;
+            let queue = forecast_queue_wait(entry, &prices, request, now);
+            let sync_cost = estimate(request, entry);
+            sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
+            predictions.insert(
+                entry.identity.executor_id.clone(),
+                placement_prediction(entry, warmth, queue, run, sync_cost),
+            );
         }
-        // Stage three: rank on those estimates and the machines' own readings.
-        let draft = rank_survey(request, survey, &reservations, estimate, now).map_err(refuse)?;
+        // Stage three: rank on when each machine is predicted to answer.
+        let draft = rank_survey(
+            request,
+            survey,
+            &reservations,
+            &predictions,
+            &sync_costs,
+            now,
+        )
+        .map_err(refuse)?;
         let Some((selected, selection)) = draft.selected else {
             return Ok(None);
         };
@@ -4984,6 +5070,7 @@ impl Fleet {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -5117,6 +5204,7 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         // A residency is an environment that outlives any one batch. Where it is
         // acquired is where it stays, so policy never gets to choose for it.
         placement_mobility: PlacementMobility::PinnedOrColocated,
+        verdict_platforms: Vec::new(),
         command_resource_identity: None,
         resource_reservation: acquisition.footprint.reservation(),
         learned_estimate: None,
@@ -5279,6 +5367,51 @@ fn choose_executor(
     .map(|(selected, _)| selected))
 }
 
+/// Predict every usable candidate with no profile store behind it.
+///
+/// This is exactly what production does for a placement that carries no resource
+/// plan: labeled class priors for every duration, and a real queue forecast
+/// built from the facts each machine published. It is the sync path, so tests
+/// exercise the same ordering, capacity model, and honesty rules production
+/// does rather than a second implementation of them.
+#[cfg(test)]
+fn prior_predictions(
+    usable: &[&ExecutorConnectionState],
+    request: &CellRequest,
+    estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
+    now_unix_ms: u64,
+) -> (
+    HashMap<String, PlacementPrediction>,
+    HashMap<String, SyncCost>,
+) {
+    let mut predictions = HashMap::new();
+    let mut sync_costs = HashMap::new();
+    for entry in usable {
+        let context = ReservationPlan::context_for(
+            &entry.identity.device_id,
+            &entry.identity.executor_id,
+            &entry.advertisement.capabilities,
+        );
+        let warmth = candidate_warmth(entry, request, now_unix_ms);
+        let prices = QueuePrices::from_priors(entry, &context);
+        let queue = forecast_queue_wait(entry, &prices, request, now_unix_ms);
+        let run = resource_profiles::unmeasured_duration(
+            request.command_class,
+            &context,
+            request.command_resource_identity.as_ref(),
+            warmth.for_lookup(),
+            DurationFallback::NoProfileStore,
+        );
+        let sync_cost = estimate(request, entry);
+        sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
+        predictions.insert(
+            entry.identity.executor_id.clone(),
+            placement_prediction(entry, warmth, queue, run, sync_cost),
+        );
+    }
+    (predictions, sync_costs)
+}
+
 /// What one pass of placement concluded: the machine it chose, and every machine
 /// it passed over with the reason.
 ///
@@ -5307,7 +5440,16 @@ fn choose_executor_with(
     now_unix_ms: u64,
 ) -> Result<PlacementDraft, String> {
     let survey = survey_candidates(connections, request)?;
-    rank_survey(request, survey, reservations, estimate, now_unix_ms)
+    let (predictions, sync_costs) =
+        prior_predictions(&survey.usable, request, &estimate, now_unix_ms);
+    rank_survey(
+        request,
+        survey,
+        reservations,
+        &predictions,
+        &sync_costs,
+        now_unix_ms,
+    )
 }
 
 /// Whether the caller settled placement itself, leaving policy nothing to
@@ -5348,6 +5490,7 @@ pub(crate) struct PlacementScope<'a> {
     pub(crate) selector: Option<&'a ExecutorSelector>,
     pub(crate) pinned_executor_id: Option<&'a str>,
     pub(crate) mobility: PlacementMobility,
+    pub(crate) verdict_platforms: &'a [String],
 }
 
 impl<'a> PlacementScope<'a> {
@@ -5361,6 +5504,7 @@ impl<'a> PlacementScope<'a> {
                 .filter(|selector| !selector.is_empty()),
             pinned_executor_id: request.pinned_executor_id.as_deref(),
             mobility: request.placement_mobility,
+            verdict_platforms: &request.verdict_platforms,
         }
     }
 
@@ -5376,9 +5520,14 @@ impl<'a> PlacementScope<'a> {
 ///
 /// The filters that are facts rather than judgement: a closed link, a pin that
 /// points elsewhere, a project this machine does not serve, a selector it does
-/// not satisfy, conservative work on a machine that is not the home, a
-/// repository that cannot be recreated from objects. Ranking never reaches a
-/// machine this rejects.
+/// not satisfy, a platform whose answer this request does not count,
+/// conservative work on a machine that is not the home, or a repository that
+/// cannot be recreated from objects. Ranking never reaches a machine this
+/// rejects.
+///
+/// Verdict-platform trust is a filter here rather than a ranking key, and that
+/// is the point: it decides eligibility, so no amount of idleness, cache warmth,
+/// or predicted time-to-verdict can outweigh it downstream.
 ///
 /// This is THE eligibility relation. Anything that needs to know where work
 /// could go asks here rather than approximating with a subset of these clauses
@@ -5410,6 +5559,16 @@ fn candidate_rejection(
                 .selector
                 .map(|selector| selector.describe())
                 .unwrap_or_default(),
+        })
+    } else if !scope.verdict_platforms.is_empty()
+        && !scope
+            .verdict_platforms
+            .iter()
+            .any(|platform| platform.eq_ignore_ascii_case(&entry.advertisement.capabilities.os))
+    {
+        Some(PlacementRejectionReason::UntrustedVerdictPlatform {
+            os: entry.advertisement.capabilities.os.clone(),
+            trusted: scope.verdict_platforms.to_vec(),
         })
     } else if !scope.targeted() && !entry.colocated && !scope.mobility.may_spill() {
         // Untargeted work that has not been declared mobile stays on the
@@ -5450,6 +5609,7 @@ fn survey_candidates<'a>(
     for entry in ordered {
         match candidate_rejection(entry, scope) {
             Some(reason) => rejected.push(PlacementRejection {
+                prediction: None,
                 executor_name: executor_public_name(entry),
                 executor_id: entry.identity.executor_id.clone(),
                 reason,
@@ -5464,7 +5624,40 @@ fn survey_candidates<'a>(
     if usable.is_empty() && targeted {
         return Err(no_matching_executor_diagnostic(connections, request));
     }
+    // Waiting is the right answer for a mobile request that trust left with
+    // nothing: a machine on a platform this verdict counts from may still
+    // attach, and the horizon bounds how long that hope lasts. It is the wrong
+    // answer for a request that cannot move at all, because its one possible
+    // machine is attached right now and its platform will not change while the
+    // horizon runs down. That combination is a contradiction between what the
+    // check declared and the cadence it runs at, and saying so immediately is
+    // the difference between a legible config error and a suite that silently
+    // stalls out its horizon on every commit.
+    if usable.is_empty() && !request.placement_mobility.may_spill() {
+        if let Some(rejection) = rejected.iter().find(|rejection| {
+            matches!(
+                rejection.reason,
+                PlacementRejectionReason::UntrustedVerdictPlatform { .. }
+            )
+        }) {
+            return Err(untrusted_verdict_platform_diagnostic(request, rejection));
+        }
+    }
     Ok(CandidateSurvey { usable, rejected })
+}
+
+/// The refusal for work that can only run on the machine holding the runner's
+/// checkout, whose platform is not one this verdict counts from.
+fn untrusted_verdict_platform_diagnostic(
+    request: &CellRequest,
+    rejection: &PlacementRejection,
+) -> String {
+    format!(
+        "this request cannot leave {} ({}), and its verdict counts only from {}. Nothing was run. Either widen the platforms this verdict counts from or move the work to a cadence that can be placed elsewhere.",
+        rejection.executor_name,
+        rejection.reason.describe(),
+        request.verdict_platforms.join(", ")
+    )
 }
 
 /// Rank what survived the survey, on the estimates and readings each machine
@@ -5473,7 +5666,8 @@ fn rank_survey(
     request: &CellRequest,
     survey: CandidateSurvey<'_>,
     reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
-    estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
+    predictions: &HashMap<String, PlacementPrediction>,
+    sync_costs: &HashMap<String, SyncCost>,
     now_unix_ms: u64,
 ) -> Result<PlacementDraft, String> {
     let CandidateSurvey {
@@ -5499,10 +5693,24 @@ fn rank_survey(
     let scored: Vec<_> = usable
         .into_iter()
         .map(|entry| {
+            let sync_cost = sync_costs
+                .get(&entry.identity.executor_id)
+                .copied()
+                .unwrap_or(SyncCost::Unknown);
             ScoredCandidate::new(
                 entry,
-                estimate(request, entry),
+                sync_cost,
                 reservations.get(&entry.identity.executor_id),
+                &request.resource_reservation,
+                predictions
+                    .get(&entry.identity.executor_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        // Every usable candidate is predicted for above; this is
+                        // the shape of an entry that was surveyed and somehow not
+                        // predicted, and it says so rather than scoring zero.
+                        unpredicted_candidate(entry, request, sync_cost)
+                    }),
                 now_unix_ms,
             )
         })
@@ -5531,7 +5739,7 @@ fn rank_survey(
     } else if !targeted && !request.placement_mobility.may_spill() {
         PlacementReason::ColocatedHome
     } else {
-        PlacementReason::MeasuredIdle
+        PlacementReason::PredictedEarliestVerdict
     };
     let winner_name = executor_public_name(winner.entry);
     rejected.extend(
@@ -5567,6 +5775,7 @@ fn rank_survey(
         } else {
             ObservationReuse::UntrustedRemoteEnvironment
         },
+        prediction: Some(winner.prediction.clone()),
     };
     Ok(PlacementDraft {
         selected: Some((selected_executor(winner.entry), selection)),
@@ -5583,10 +5792,11 @@ struct ScoredCandidate<'a> {
     blindness: Option<PlacementRejectionReason>,
     /// Set when the machine is measured and the resolved demand does not fit.
     misfit: Option<PlacementRejectionReason>,
-    /// Non-idle share of processor time in whole percent.
-    cpu_percent: u64,
-    available_memory_bytes: u64,
-    free_volume_bytes: u64,
+    /// Whether executor admission can retain and fit this request right now.
+    admission_accepts: bool,
+    /// When this machine is predicted to answer, and on what evidence. The
+    /// ranking key, and the explanation, are the same object.
+    prediction: PlacementPrediction,
 }
 
 impl<'a> ScoredCandidate<'a> {
@@ -5594,22 +5804,21 @@ impl<'a> ScoredCandidate<'a> {
         entry: &'a ExecutorConnectionState,
         sync_cost: SyncCost,
         reservation: Option<&'a resource_profiles::ResolvedResourceProfile>,
+        declared_reservation: &ResourceReservation,
+        prediction: PlacementPrediction,
         now_unix_ms: u64,
     ) -> Self {
         let machine = &entry.health.machine;
         let blindness = placement_blindness(machine, now_unix_ms);
+        // Memory and volume remain eligibility evidence: a machine that cannot
+        // hold the work cannot be the fastest at it. They are no longer ranking
+        // keys, because how much a machine has left says nothing about how long
+        // it takes.
         let available_memory_bytes = machine
             .memory
             .value()
             .map_or(0, |memory| memory.available_bytes);
         let free_volume_bytes = machine.volume.value().map_or(0, |volume| volume.free_bytes);
-        // Whole percent, not the raw fraction. Ranking on an unrounded double
-        // makes CPU the only key that ever decides anything, because two
-        // machines never tie on it — and the keys behind it exist precisely to
-        // separate machines that are equally busy.
-        let cpu_percent = machine.cpu.value().map_or(0, |cpu| {
-            (cpu.utilization.clamp(0.0, 1.0) * 100.0).round() as u64
-        });
         let misfit = blindness
             .is_none()
             .then_some(reservation)
@@ -5633,20 +5842,41 @@ impl<'a> ScoredCandidate<'a> {
                     None
                 }
             });
+        let demand = reservation
+            .map(|resolved| &resolved.reservation)
+            .unwrap_or(declared_reservation);
+        let admission = &entry.health.admission;
+        let active = &admission.active_reservation;
+        let queue_depth = entry
+            .health
+            .queues
+            .iter()
+            .map(|queue| queue.depth)
+            .sum::<usize>();
+        let admission_accepts = queue_depth < entry.health.applied_policy.maximum_queue_depth
+            && admission.memory_capacity_bytes.is_none_or(|capacity| {
+                active.memory_bytes.saturating_add(demand.memory_bytes) <= capacity
+            })
+            && admission.disk_growth_capacity_bytes.is_none_or(|capacity| {
+                active
+                    .disk_growth_bytes
+                    .saturating_add(demand.disk_growth_bytes)
+                    <= capacity
+            });
         Self {
             entry,
             sync_cost,
             reservation,
             blindness,
             misfit,
-            cpu_percent,
-            available_memory_bytes,
-            free_volume_bytes,
+            admission_accepts,
+            prediction,
         }
     }
 
     fn rejection(&self) -> PlacementRejection {
         PlacementRejection {
+            prediction: Some(self.prediction.clone()),
             executor_name: executor_public_name(self.entry),
             executor_id: self.entry.identity.executor_id.clone(),
             reason: self
@@ -5668,6 +5898,9 @@ impl<'a> ScoredCandidate<'a> {
                 executor_name: winner_name.to_string(),
             });
         PlacementRejection {
+            // A machine that was ranked and lost owes the operator its numbers,
+            // not just the name of whoever beat it.
+            prediction: Some(self.prediction.clone()),
             executor_name: executor_public_name(self.entry),
             executor_id: self.entry.identity.executor_id.clone(),
             reason,
@@ -5695,6 +5928,14 @@ impl<'a> ScoredCandidate<'a> {
 /// narrows the candidate set and leaves policy to pick among what is left, so
 /// absent placement evidence is exactly as disqualifying there as it is for an
 /// unconstrained request. A gap is never read as no load.
+///
+/// Among the machines that survive those gates, a known queue forecast always
+/// precedes an unknown one: there is no numeric total to compare when one summand
+/// is absent. Within that comparable set, the order is predicted time to a
+/// verdict, ascending. Evidence quality breaks ties but never leads: a machine
+/// confidently predicted to be slow is still slow, and preferring it because the
+/// prediction was well-evidenced would rank on the measurement rather than on
+/// what was measured.
 fn rank_candidates<'a, 'b>(
     scored: &'b [ScoredCandidate<'a>],
     settled_by_caller: bool,
@@ -5709,9 +5950,26 @@ fn rank_candidates<'a, 'b>(
             .is_some()
             .cmp(&b.blindness.is_some())
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
-            .then_with(|| a.cpu_percent.cmp(&b.cpu_percent))
-            .then_with(|| b.available_memory_bytes.cmp(&a.available_memory_bytes))
-            .then_with(|| b.free_volume_bytes.cmp(&a.free_volume_bytes))
+            // A prediction cannot promise a verdict on a machine that cannot
+            // retain this request's queue entry or fit its current reservation.
+            .then_with(|| b.admission_accepts.cmp(&a.admission_accepts))
+            .then_with(|| {
+                a.prediction
+                    .queue
+                    .predicted_ms()
+                    .is_none()
+                    .cmp(&b.prediction.queue.predicted_ms().is_none())
+            })
+            .then_with(|| {
+                a.prediction
+                    .predicted_verdict_ms
+                    .cmp(&b.prediction.predicted_verdict_ms)
+            })
+            .then_with(|| {
+                a.prediction
+                    .evidence_rank()
+                    .cmp(&b.prediction.evidence_rank())
+            })
             .then_with(|| sync_cost_key(a.sync_cost).cmp(&sync_cost_key(b.sync_cost)))
             .then_with(|| {
                 a.entry
@@ -5727,6 +5985,408 @@ fn rank_candidates<'a, 'b>(
             || !exercising_spill
     });
     (winner, ranked)
+}
+
+/// What this machine already holds for this request, read off the facts it
+/// published about its own cells and verified objects.
+///
+/// The runner classifies; the executor states facts. Nothing here is a score and
+/// nothing here is a path: where a cell lives is that machine's business, and
+/// comparing paths across machines would be meaningless anyway. What is
+/// comparable is the project a cell serves and the work classes that have
+/// completed in it.
+///
+/// An externally owned checkout never counts as warm. The executor supplies
+/// process authority over such a tree and does not prepare, fingerprint, or
+/// normalize it, so it cannot honestly claim anything about what it contains.
+fn candidate_warmth(
+    entry: &ExecutorConnectionState,
+    request: &CellRequest,
+    now_unix_ms: u64,
+) -> CacheWarmthEvidence {
+    let observed_at = entry
+        .advertisement
+        .liveness_observed_at_unix_ms
+        .unwrap_or(entry.advertisement.observed_at_unix_ms);
+    if now_unix_ms.saturating_sub(observed_at) > EXECUTOR_TELEMETRY_STALE_AFTER_MS {
+        return CacheWarmthEvidence::Unknown {
+            reason: WarmthUnknownReason::FactsStale,
+        };
+    }
+    // A machine that does not claim authority over its own inventory cannot have
+    // the absence of a matching cell read as evidence that none exists. Cold and
+    // "we cannot tell" are different answers and must not collapse into one.
+    if entry.health.inventory.authority != InventoryAuthorityState::Authoritative {
+        return CacheWarmthEvidence::Unknown {
+            reason: WarmthUnknownReason::InventoryNotAuthoritative,
+        };
+    }
+    let prepared = entry.snapshot.cells.iter().any(|cell| {
+        cell.project_id == request.project_id
+            && cell.checkout_kind != CellCheckoutKind::ExistingCheckout
+            && cell.is_warm_for(request.command_class)
+    });
+    let warmth = if prepared {
+        ExecutionWarmth::PreparedWarmSlot
+    } else if warm_root_holds_commit(entry, request) {
+        // Objects present is not a build cache. A machine that merely holds the
+        // commit still compiles from scratch, and saying otherwise is how a cold
+        // remote came to look as ready as one that had just built the tree.
+        ExecutionWarmth::RepositoryOnly
+    } else {
+        ExecutionWarmth::Cold
+    };
+    CacheWarmthEvidence::Observed {
+        warmth,
+        observed_at_unix_ms: observed_at,
+    }
+}
+
+/// Resolves "how long would this take" for any command identity, on any
+/// machine, with or without a profile store behind it.
+///
+/// A residency placement carries no resource plan and therefore no store. That
+/// is a different fact from having looked and found nothing, and this is what
+/// keeps the two apart on the record instead of blaming a machine for a lookup
+/// nobody attempted.
+struct DurationOracle {
+    db: Option<Arc<cairn_db::storage::LocalDb>>,
+}
+
+impl DurationOracle {
+    async fn predict(
+        &self,
+        identity: Option<&CommandResourceIdentity>,
+        context: &resource_profiles::ProfileContext,
+        warmth: ExecutionWarmth,
+        class: cairn_common::executor_protocol::CellCommandClass,
+        now_unix_ms: u64,
+    ) -> DurationEstimate {
+        match &self.db {
+            Some(db) => {
+                resource_profiles::resolve_duration(
+                    db.clone(),
+                    identity,
+                    context,
+                    warmth,
+                    class,
+                    now_unix_ms,
+                )
+                .await
+            }
+            None => resource_profiles::unmeasured_duration(
+                class,
+                context,
+                identity,
+                warmth,
+                DurationFallback::NoProfileStore,
+            ),
+        }
+    }
+}
+
+/// How long this request would wait before a machine could start it.
+///
+/// Advisory and read-only, in the strongest sense: it enqueues nothing, reserves
+/// nothing, refuses nothing, and binds nobody. The executor's waiting room stays
+/// the only authority over what actually runs when, and after placement picks a
+/// machine that machine may still queue or refuse the request on its own live
+/// state. This exists so a caller waiting on a verdict is not sent to a host that
+/// will start its work in ten minutes just because that host looked idle.
+///
+/// The wait is a fluid approximation: the work ahead is summed as unit
+/// milliseconds — each item's predicted duration times the concurrency it holds
+/// — and the machine is assumed to drain it at its advertised capacity. It does
+/// not simulate a scheduler, because the fidelity of such a simulation could not
+/// be verified against a queue the runner does not own.
+/// Every distinct thing a forecast must price on one machine, so each is
+/// resolved once however much work shares an identity.
+fn queue_price_keys(
+    entry: &ExecutorConnectionState,
+) -> Vec<(Option<CommandResourceIdentity>, CellCommandClass)> {
+    let mut keys: Vec<(Option<CommandResourceIdentity>, CellCommandClass)> = Vec::new();
+    let mut push = |identity: Option<CommandResourceIdentity>, class| {
+        if !keys
+            .iter()
+            .any(|(known, known_class)| *known == identity && *known_class == class)
+        {
+            keys.push((identity, class));
+        }
+    };
+    for queued in &entry.snapshot.queued_requests {
+        push(
+            queued.command_resource_identity.clone(),
+            queued.command_class,
+        );
+    }
+    for running in &entry.snapshot.executing_requests {
+        push(
+            running.command_resource_identity.clone(),
+            running.command_class,
+        );
+    }
+    keys
+}
+
+/// What each piece of work on a machine is predicted to take.
+///
+/// Resolving these is the only asynchronous part of a forecast, which is why it
+/// is separated from the arithmetic: the ordering, the capacity model, and the
+/// honesty rules are then a pure function that can be reasoned about and tested
+/// without a database behind it.
+#[derive(Default)]
+struct QueuePrices {
+    by_key: Vec<(
+        (Option<CommandResourceIdentity>, CellCommandClass),
+        DurationEstimate,
+    )>,
+}
+
+impl QueuePrices {
+    /// Queued work has not run, so nothing is known about the state it will
+    /// find. Everything ahead is priced cold, which predicts the longer wait and
+    /// therefore biases placement away from busy machines rather than toward
+    /// them.
+    async fn resolve(
+        oracle: &DurationOracle,
+        entry: &ExecutorConnectionState,
+        context: &resource_profiles::ProfileContext,
+        now_unix_ms: u64,
+    ) -> Self {
+        let mut by_key = Vec::new();
+        for (identity, class) in queue_price_keys(entry) {
+            let estimate = oracle
+                .predict(
+                    identity.as_ref(),
+                    context,
+                    ExecutionWarmth::Cold,
+                    class,
+                    now_unix_ms,
+                )
+                .await;
+            by_key.push(((identity, class), estimate));
+        }
+        Self { by_key }
+    }
+
+    /// The labeled class priors alone, synchronously.
+    ///
+    /// Production reaches the same answer through [`Self::resolve`] against a
+    /// [`DurationOracle`] with no store behind it; this exists only so the
+    /// synchronous test entry points exercise the real forecast arithmetic
+    /// rather than a stand-in for it.
+    #[cfg(test)]
+    fn from_priors(
+        entry: &ExecutorConnectionState,
+        context: &resource_profiles::ProfileContext,
+    ) -> Self {
+        Self {
+            by_key: queue_price_keys(entry)
+                .into_iter()
+                .map(|(identity, class)| {
+                    let estimate = resource_profiles::unmeasured_duration(
+                        class,
+                        context,
+                        identity.as_ref(),
+                        ExecutionWarmth::Cold,
+                        DurationFallback::NoProfileStore,
+                    );
+                    ((identity, class), estimate)
+                })
+                .collect(),
+        }
+    }
+
+    fn get(
+        &self,
+        identity: Option<&CommandResourceIdentity>,
+        class: CellCommandClass,
+    ) -> Option<&DurationEstimate> {
+        self.by_key
+            .iter()
+            .find(|((known, known_class), _)| known.as_ref() == identity && *known_class == class)
+            .map(|(_, estimate)| estimate)
+    }
+}
+
+fn forecast_queue_wait(
+    entry: &ExecutorConnectionState,
+    prices: &QueuePrices,
+    request: &CellRequest,
+    now_unix_ms: u64,
+) -> QueueForecast {
+    let observed_at = entry
+        .advertisement
+        .liveness_observed_at_unix_ms
+        .unwrap_or(entry.advertisement.observed_at_unix_ms);
+    if now_unix_ms.saturating_sub(observed_at) > EXECUTOR_TELEMETRY_STALE_AFTER_MS {
+        return QueueForecast::Unknown {
+            reason: QueueUnknownReason::FactsStale,
+        };
+    }
+    let capacity = entry
+        .health
+        .admission
+        .concurrency_capacity
+        .filter(|capacity| *capacity > 0);
+    let Some(_capacity) = capacity else {
+        return QueueForecast::Unknown {
+            reason: QueueUnknownReason::NoAdmissionCapacity,
+        };
+    };
+
+    // Seniority is a property of the wait, not of the enqueue, so the
+    // hypothetical request ranks by when its requester began waiting -- exactly
+    // the key the executor's own admission uses.
+    let waiting_since = if request.waiting_since_unix_ms == 0 {
+        now_unix_ms
+    } else {
+        request.waiting_since_unix_ms
+    };
+    let ours = (
+        aged_priority(request.priority, waiting_since, now_unix_ms),
+        std::cmp::Reverse(waiting_since),
+    );
+
+    let mut queued_ms_ahead = 0_u64;
+    let mut fully_measured = true;
+    let mut requests_ahead = 0_usize;
+    for queued in &entry.snapshot.queued_requests {
+        let theirs = (
+            aged_priority(queued.priority, queued.queued_at_unix_ms, now_unix_ms),
+            std::cmp::Reverse(queued.queued_at_unix_ms),
+        );
+        if theirs <= ours {
+            continue;
+        }
+        requests_ahead += 1;
+        let Some(estimate) = prices.get(
+            queued.command_resource_identity.as_ref(),
+            queued.command_class,
+        ) else {
+            // Something ahead could not be priced at all. Summing it as zero
+            // would report an empty queue, so the whole forecast declines
+            // instead.
+            return QueueForecast::Unknown {
+                reason: QueueUnknownReason::FactsStale,
+            };
+        };
+        fully_measured &= estimate.is_learned();
+        queued_ms_ahead = queued_ms_ahead.saturating_add(estimate.predicted_ms);
+    }
+
+    let mut running_ahead = 0_usize;
+    for running in &entry.snapshot.executing_requests {
+        running_ahead += 1;
+        let Some(estimate) = prices.get(
+            running.command_resource_identity.as_ref(),
+            running.command_class,
+        ) else {
+            return QueueForecast::Unknown {
+                reason: QueueUnknownReason::FactsStale,
+            };
+        };
+        let elapsed = now_unix_ms.saturating_sub(running.started_at_unix_ms);
+        let remaining = estimate.predicted_ms.saturating_sub(elapsed);
+        // An execution past its estimate has demonstrably outrun the prediction.
+        // Its remaining time floors at zero because negative time is not a thing,
+        // but the forecast stops calling itself measured: the one number it had
+        // for this item has already been proven wrong.
+        if remaining == 0 {
+            fully_measured = false;
+        }
+        fully_measured &= estimate.is_learned();
+        queued_ms_ahead = queued_ms_ahead.saturating_add(remaining);
+    }
+
+    QueueForecast::Forecast {
+        // CPU demand never gates admission. Memory pressure can still serialize
+        // these occupants, so summing their durations is the conservative bound.
+        predicted_ms: queued_ms_ahead,
+        requests_ahead,
+        running_ahead,
+        fully_measured,
+        observed_at_unix_ms: observed_at,
+    }
+}
+
+/// Assemble one machine's predicted time to a verdict from its legs.
+///
+/// The total is queue wait plus run duration and nothing else. Preparation rides
+/// along as evidence because no transfer history exists to turn missing object
+/// bytes into milliseconds, and a fabricated bytes-per-second constant would be
+/// exactly the kind of fiction this ranking replaced. An unknown queue wait is
+/// not summed as zero either: it contributes nothing to the number and says so
+/// on the record, so a machine whose queue could not be read never wins by
+/// looking empty.
+fn placement_prediction(
+    entry: &ExecutorConnectionState,
+    warmth: CacheWarmthEvidence,
+    queue: QueueForecast,
+    run: DurationEstimate,
+    sync_cost: SyncCost,
+) -> PlacementPrediction {
+    let preparation = match sync_cost {
+        SyncCost::Known(0) => PreparationForecast::ObjectsPresent,
+        SyncCost::Known(bytes) => PreparationForecast::TransferPending { bytes },
+        SyncCost::Unknown => PreparationForecast::Unknown,
+    };
+    PlacementPrediction {
+        executor_name: executor_public_name(entry),
+        executor_id: entry.identity.executor_id.clone(),
+        predicted_verdict_ms: queue
+            .predicted_ms()
+            .unwrap_or(0)
+            .saturating_add(run.predicted_ms),
+        queue,
+        preparation,
+        run,
+        warmth,
+    }
+}
+
+/// The prediction for a candidate that reached ranking without one.
+///
+/// Structurally unreachable today, and shaped so that if it ever does happen the
+/// machine sorts last on an explicitly unknown queue and a labeled prior rather
+/// than winning on an accidental zero.
+fn unpredicted_candidate(
+    entry: &ExecutorConnectionState,
+    request: &CellRequest,
+    sync_cost: SyncCost,
+) -> PlacementPrediction {
+    let context = ReservationPlan::context_for(
+        &entry.identity.device_id,
+        &entry.identity.executor_id,
+        &entry.advertisement.capabilities,
+    );
+    placement_prediction(
+        entry,
+        CacheWarmthEvidence::Unknown {
+            reason: WarmthUnknownReason::FactsStale,
+        },
+        QueueForecast::Unknown {
+            reason: QueueUnknownReason::FactsStale,
+        },
+        resource_profiles::unmeasured_duration(
+            request.command_class,
+            &context,
+            request.command_resource_identity.as_ref(),
+            ExecutionWarmth::Cold,
+            DurationFallback::NoProfileStore,
+        ),
+        sync_cost,
+    )
+}
+
+/// Whether this machine has already verified the exact commit the request names.
+fn warm_root_holds_commit(entry: &ExecutorConnectionState, request: &CellRequest) -> bool {
+    let repository = request.repository.identity();
+    entry
+        .advertisement
+        .warm_roots
+        .iter()
+        .any(|root| root.repository == repository && root.commit == request.base_commit)
 }
 
 /// The three readings placement decides on, as this machine last reported them.
@@ -6072,20 +6732,32 @@ impl ReservationPlan {
         }
     }
 
-    /// What this work would be charged on one machine.
+    /// What this work would be charged on one machine, and how long it would
+    /// take there.
+    ///
+    /// Warmth is a per-candidate fact, so the duration half of this answer can
+    /// differ between machines even where the reservation half does not: the
+    /// same suite against a populated target directory and against an empty one
+    /// is exactly the difference this ranking turns on.
     async fn resolve_for(
         &self,
         request: &CellRequest,
         device_id: &str,
         executor_id: &str,
         capabilities: &ExecutorCapabilities,
+        duration_context: resource_profiles::DurationContext,
     ) -> resource_profiles::ResolvedResourceProfile {
         let context = Self::context_for(device_id, executor_id, capabilities);
         if !self.resolves {
+            // A caller-stated reservation is not a caller-stated duration. The
+            // prediction still comes from this machine's own history, because a
+            // submitter that knows its own memory demand still knows nothing
+            // about how fast any particular host is.
             return resource_profiles::ResolvedResourceProfile {
                 reservation: self.stated.clone(),
                 learned_estimate: request.learned_estimate.clone(),
                 rationale: resource_profiles::declared_rationale(&context, self.stated.clone()),
+                duration: self.predict_duration(&context, duration_context).await,
             };
         }
         // Whether the caller declared concurrency is decided here, before the
@@ -6101,10 +6773,11 @@ impl ReservationPlan {
                 self.request_identity.as_ref(),
                 &context,
                 prior,
+                duration_context,
             )
             .await
         } else {
-            self.resolve_batch(&context, prior).await
+            self.resolve_batch(&context, prior, duration_context).await
         };
         // Whole-machine demand is declared as saturation because the submitter
         // cannot know which executor would be chosen. Clamp it to this executor's
@@ -6120,10 +6793,86 @@ impl ReservationPlan {
         resolved
     }
 
+    /// The duration half alone, for the paths that do not resolve a reservation.
+    async fn predict_duration(
+        &self,
+        context: &resource_profiles::ProfileContext,
+        duration_context: resource_profiles::DurationContext,
+    ) -> cairn_common::executor_protocol::DurationEstimate {
+        if self.batch_identities.is_empty() {
+            return resource_profiles::resolve_duration(
+                self.db.clone(),
+                self.request_identity.as_ref(),
+                context,
+                duration_context.warmth,
+                duration_context.class,
+                duration_context.now_unix_ms,
+            )
+            .await;
+        }
+        self.predict_batch_duration(context, duration_context).await
+    }
+
+    /// A batch's predicted run time is the SUM of its items, not the maximum.
+    ///
+    /// The items run one after another in the same cell, so the caller waits for
+    /// all of them. This is the one place where duration and reservation compose
+    /// in opposite directions: a batch is CHARGED for its heaviest item, because
+    /// that is the peak it must fit under, and TAKES as long as all of them.
+    async fn predict_batch_duration(
+        &self,
+        context: &resource_profiles::ProfileContext,
+        duration_context: resource_profiles::DurationContext,
+    ) -> cairn_common::executor_protocol::DurationEstimate {
+        let mut total: Option<cairn_common::executor_protocol::DurationEstimate> = None;
+        for identity in &self.batch_identities {
+            let item = resource_profiles::resolve_duration(
+                self.db.clone(),
+                Some(identity),
+                context,
+                duration_context.warmth,
+                duration_context.class,
+                duration_context.now_unix_ms,
+            )
+            .await;
+            total = Some(match total {
+                None => item,
+                Some(mut running) => {
+                    running.predicted_ms = running.predicted_ms.saturating_add(item.predicted_ms);
+                    // A sum is only as measured as its least-measured leg, and
+                    // only as confident as its thinnest one. Anything else would
+                    // let one well-observed item dress up a batch nothing else
+                    // in it has been seen doing.
+                    if !item.is_learned() {
+                        running.source = item.source;
+                        running.fallback = item.fallback;
+                    }
+                    running.sample_count = running.sample_count.min(item.sample_count);
+                    running.updated_at_unix_ms =
+                        match (running.updated_at_unix_ms, item.updated_at_unix_ms) {
+                            (Some(left), Some(right)) => Some(left.min(right)),
+                            _ => None,
+                        };
+                    running
+                }
+            });
+        }
+        total.unwrap_or_else(|| {
+            resource_profiles::unmeasured_duration(
+                duration_context.class,
+                context,
+                None,
+                duration_context.warmth,
+                cairn_common::executor_protocol::DurationFallback::NoCommandIdentity,
+            )
+        })
+    }
+
     async fn resolve_batch(
         &self,
         context: &resource_profiles::ProfileContext,
         prior: ResourceReservation,
+        duration_context: resource_profiles::DurationContext,
     ) -> resource_profiles::ResolvedResourceProfile {
         let mut reservation = ResourceReservation::default();
         let mut learned_estimates = Vec::with_capacity(self.batch_identities.len());
@@ -6136,6 +6885,7 @@ impl ReservationPlan {
                 Some(identity),
                 context,
                 prior.clone(),
+                duration_context,
             )
             .await;
             reservation.memory_bytes = reservation.memory_bytes.max(item.reservation.memory_bytes);
@@ -6162,6 +6912,7 @@ impl ReservationPlan {
             learned_estimate: aggregate_batch_learned_estimates(&learned_estimates),
             rationale: rationale
                 .unwrap_or_else(|| resource_profiles::declared_rationale(context, prior)),
+            duration: self.predict_batch_duration(context, duration_context).await,
         }
     }
 }
@@ -6357,6 +7108,17 @@ fn no_matching_executor_diagnostic(
         (None, Some(asked)) => asked,
         (None, None) => "any executor".to_string(),
     };
+    // Trust narrows the same fleet the selector does, and a refusal that reports
+    // only half of what was applied sends the reader looking for a machine that
+    // was passed over for the other half.
+    let wanted = if request.verdict_platforms.is_empty() {
+        wanted
+    } else {
+        format!(
+            "{wanted} on {} (the platform(s) this verdict counts from)",
+            request.verdict_platforms.join(", ")
+        )
+    };
     format!(
         "no live enrolled executor satisfies {wanted} for project {}. Known executors: {}. Read cairn://executors for live state.",
         request.project_id,
@@ -6407,6 +7169,7 @@ fn serialize_process_batch(
             // smaller one, which is how a suite's output was lost.
             timeout_ms: crate::mcp::handlers::run::clamp_run_item_timeout_ms(timeout),
             command_resource_identity: None,
+            verdict_environment_names: Vec::new(),
         });
     }
     Ok(ProcessBatch {
@@ -6715,6 +7478,7 @@ mod tests {
             stdin: None,
             timeout_ms: 1_000,
             command_resource_identity: None,
+            verdict_environment_names: Vec::new(),
         }
     }
 
@@ -7194,7 +7958,17 @@ mod tests {
             source: ResourceReservationSource::Declared,
         };
         let resolved = ReservationPlan::new(db.clone(), &request, None)
-            .resolve_for(&request, "device", "executor", &capabilities)
+            .resolve_for(
+                &request,
+                "device",
+                "executor",
+                &capabilities,
+                resource_profiles::DurationContext {
+                    class: request.command_class,
+                    warmth: ExecutionWarmth::Cold,
+                    now_unix_ms: NOW,
+                },
+            )
             .await;
         assert_eq!(
             resolved.rationale.declared_concurrency_units,
@@ -7213,7 +7987,17 @@ mod tests {
         request.resource_reservation.concurrency_units =
             ResourceReservation::WHOLE_MACHINE_CONCURRENCY;
         let exclusive = ReservationPlan::new(db, &request, None)
-            .resolve_for(&request, "device", "executor", &capabilities)
+            .resolve_for(
+                &request,
+                "device",
+                "executor",
+                &capabilities,
+                resource_profiles::DurationContext {
+                    class: request.command_class,
+                    warmth: ExecutionWarmth::Cold,
+                    now_unix_ms: NOW,
+                },
+            )
             .await;
         assert_eq!(
             exclusive.reservation.concurrency_units,
@@ -7251,6 +8035,7 @@ mod tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: Some(CommandResourceIdentity {
                 version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
                 key: "check:rust".into(),
@@ -7473,6 +8258,7 @@ mod tests {
             generation,
             FleetSnapshot {
                 executing_requests: vec![ExecutingCellRequest {
+                    command_resource_identity: None,
                     executor_id: COLOCATED_EXECUTOR_ID.into(),
                     cell_id: "cell-1".into(),
                     request_id: leader.0.clone(),
@@ -7805,6 +8591,7 @@ mod tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -7864,6 +8651,7 @@ mod tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -8202,6 +8990,7 @@ mod tests {
             generation,
             FleetSnapshot {
                 executing_requests: vec![ExecutingCellRequest {
+                    command_resource_identity: None,
                     executor_id: COLOCATED_EXECUTOR_ID.into(),
                     cell_id: "slot-1".into(),
                     request_id: leader.0.clone(),
@@ -8409,6 +9198,7 @@ mod tests {
                     stdin: None,
                     timeout_ms: 600,
                     command_resource_identity: None,
+                    verdict_environment_names: Vec::new(),
                 },
                 ProcessBatchItem {
                     header: "two".into(),
@@ -8420,6 +9210,7 @@ mod tests {
                     stdin: None,
                     timeout_ms: 700,
                     command_resource_identity: None,
+                    verdict_environment_names: Vec::new(),
                 },
             ],
             runner_context_id: None,
@@ -8461,6 +9252,7 @@ mod tests {
             stdin: None,
             timeout_ms: cairn_common::run_contract::RUN_BATCH_CEILING_MS,
             command_resource_identity: None,
+            verdict_environment_names: Vec::new(),
         };
         let batch = |sequential: bool| ProcessBatch {
             sequential,
@@ -8515,6 +9307,7 @@ mod tests {
             executor: None,
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -8583,7 +9376,13 @@ mod tests {
                 sender,
                 snapshot: FleetSnapshot::default(),
                 last_progress_unix_ms: 1,
-                health: ExecutorSubstrateReport::default(),
+                health: ExecutorSubstrateReport {
+                    applied_policy: cairn_common::executor_protocol::ExecutorRuntimePolicy {
+                        maximum_queue_depth: 64,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
                 executor_build_id: None,
                 colocated: id == COLOCATED_EXECUTOR_ID,
                 pump_tick: Arc::new(AtomicU64::new(1)),
@@ -8646,6 +9445,102 @@ mod tests {
         )
     }
 
+    /// The labeled class prior, for a fixture whose reservation is the point and
+    /// whose duration is not.
+    fn test_prior_duration() -> DurationEstimate {
+        resource_profiles::unmeasured_duration(
+            CellCommandClass::Other,
+            &ReservationPlan::context_for(
+                "device",
+                "executor",
+                &ExecutorCapabilities {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    logical_cores: 8,
+                    toolchains: Vec::new(),
+                    projects_served: Vec::new(),
+                    disk_budget_bytes: None,
+                    memory_budget_bytes: None,
+                    toolchain_detection: None,
+                },
+            ),
+            None,
+            ExecutionWarmth::Cold,
+            DurationFallback::NoProfileStore,
+        )
+    }
+
+    /// A missing queue reading is not a fast queue. Even when that machine's run
+    /// prior is numerically lower, it cannot outrank a candidate whose complete
+    /// queue-plus-run prediction is known.
+    #[test]
+    fn an_unknown_queue_never_wins_by_looking_empty() {
+        let (unknown_id, mut unknown) = fleet_entry("unknown-queue", "linux", 0, &[]);
+        let (known_id, mut known) = fleet_entry("known-queue", "linux", 0, &[]);
+        measured(&mut unknown, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut known, 0.1, 8_000_000_000, 8_000_000_000);
+
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let mut short_run = test_prior_duration();
+        short_run.predicted_ms = 10_000;
+        let mut longer_run = test_prior_duration();
+        longer_run.predicted_ms = 15_000;
+        let unknown_prediction = placement_prediction(
+            &unknown,
+            warmth.clone(),
+            QueueForecast::Unknown {
+                reason: QueueUnknownReason::NoAdmissionCapacity,
+            },
+            short_run,
+            SyncCost::Known(0),
+        );
+        let known_prediction = placement_prediction(
+            &known,
+            warmth,
+            QueueForecast::Forecast {
+                predicted_ms: 5_000,
+                requests_ahead: 1,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+            },
+            longer_run,
+            SyncCost::Known(0),
+        );
+        let scored = vec![
+            ScoredCandidate::new(
+                &unknown,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                unknown_prediction,
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &known,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                known_prediction,
+                NOW,
+            ),
+        ];
+
+        let (winner, _) = rank_candidates(&scored, false, true);
+        assert_eq!(
+            winner
+                .expect("one measurable candidate wins")
+                .entry
+                .identity
+                .executor_id,
+            known_id
+        );
+        assert_ne!(unknown_id, known_id);
+    }
+
     fn chosen(draft: &PlacementDraft) -> &PlacementSelection {
         &draft.selected.as_ref().expect("a machine was chosen").1
     }
@@ -8687,7 +9582,7 @@ mod tests {
         let draft = place(&connections, &spillable_request()).unwrap();
         let selection = chosen(&draft);
         assert_eq!(selection.executor_id, "bglab-ub");
-        assert_eq!(selection.reason, PlacementReason::MeasuredIdle);
+        assert_eq!(selection.reason, PlacementReason::PredictedEarliestVerdict);
         assert_eq!(
             selection.observation_reuse,
             ObservationReuse::UntrustedRemoteEnvironment,
@@ -8701,11 +9596,78 @@ mod tests {
         );
     }
 
-    /// Local is not privileged for being local, and it is not penalized for it
-    /// either. When it is the idle one it wins on the same evidence, and the
-    /// record says so rather than leaving "it stayed home" to be inferred.
     #[test]
-    fn an_idle_local_wins_the_same_measured_comparison() {
+    fn spill_eligible_work_uses_remote_when_local_admission_is_full() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(
+            &mut local,
+            0.01,
+            48 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        local.health.admission.concurrency_capacity = Some(16);
+        local.health.admission.active_reservation.concurrency_units = 16;
+        local.health.applied_policy.maximum_queue_depth = 16;
+
+        let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured(
+            &mut remote,
+            0.50,
+            16 * 1024 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
+        );
+        remote.health.admission.concurrency_capacity = Some(16);
+        remote.health.applied_policy.maximum_queue_depth = 16;
+
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        assert_eq!(
+            chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
+            "bglab-ub",
+            "resident capacity absent from command forecasts still participates in placement"
+        );
+    }
+
+    #[test]
+    fn spill_eligible_work_avoids_a_full_preferred_queue() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(
+            &mut local,
+            0.01,
+            48 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        local.health.admission.concurrency_capacity = Some(16);
+        local.health.applied_policy.maximum_queue_depth = 1;
+        local.health.queues = vec![cairn_common::executor_protocol::QueueClassHealth {
+            priority: CellPriority::ReviewCheck,
+            depth: 1,
+            oldest_age_ms: Some(1_000),
+            waits: Default::default(),
+        }];
+
+        let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured(
+            &mut remote,
+            0.50,
+            16 * 1024 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
+        );
+        remote.health.admission.concurrency_capacity = Some(16);
+        remote.health.applied_policy.maximum_queue_depth = 1;
+
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        assert_eq!(
+            chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
+            "bglab-ub",
+            "a preferred executor that cannot retain a queue entry must not win re-placement"
+        );
+    }
+
+    /// CPU is evidence about current utilization, not time to a verdict. When
+    /// two candidates have equal duration predictions, a lower CPU reading must
+    /// not silently restore the retired load-based ranking.
+    #[test]
+    fn cpu_readings_do_not_outrank_equal_verdict_predictions() {
         let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
         measured(
             &mut local,
@@ -8724,13 +9686,15 @@ mod tests {
 
         let selection = place(&connections, &spillable_request()).unwrap();
         let selection = chosen(&selection);
-        assert_eq!(selection.executor_id, COLOCATED_EXECUTOR_ID);
         assert_eq!(
-            selection.reason,
-            PlacementReason::MeasuredIdle,
-            "local won on measurements, and the record has to say that rather than 'fallback'"
+            selection.executor_id, "bglab-ub",
+            "equal verdict predictions fall through to deterministic identity ordering, not CPU"
         );
-        assert_eq!(selection.observation_reuse, ObservationReuse::Colocated);
+        assert_eq!(selection.reason, PlacementReason::PredictedEarliestVerdict);
+        assert_eq!(
+            selection.observation_reuse,
+            ObservationReuse::UntrustedRemoteEnvironment
+        );
     }
 
     /// Untargeted is not the same property as free to move. An agent's own batch
@@ -8935,6 +9899,134 @@ mod tests {
         );
     }
 
+    /// The CAIRN-3452 specimen, as placement sees it.
+    ///
+    /// A review wave with nowhere idle to go locally found one measured, idle
+    /// Windows machine and took it, and the target-gated dead-code findings
+    /// clippy only emits there were recorded as the PR's rust-lint verdict.
+    /// Every input placement ranks on said bglab-win was the better machine.
+    /// The one thing that makes it the wrong machine is not a reading at all:
+    /// this project's gate has only ever meant green on macOS, so a Windows
+    /// answer is not this check's answer however fast it arrives.
+    #[test]
+    fn a_verdict_never_travels_to_a_platform_the_project_does_not_gate_on() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+        measured(
+            &mut local,
+            0.97,
+            2 * 1024 * 1024 * 1024,
+            100 * 1024 * 1024 * 1024,
+        );
+        let (windows_id, mut windows) = fleet_entry("bglab-win", "windows", 0, &[]);
+        measured(
+            &mut windows,
+            0.01,
+            64 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        let connections = HashMap::from([(local_id, local), (windows_id, windows)]);
+
+        let mut request = spillable_request();
+        request.verdict_platforms = vec!["macos".into()];
+        let draft = place(&connections, &request).unwrap();
+        assert_eq!(
+            chosen(&draft).executor_id,
+            COLOCATED_EXECUTOR_ID,
+            "a busy machine the project gates on beats an idle one it does not"
+        );
+        let rejection = rejection_for(&draft, "bglab-win");
+        assert!(
+            matches!(
+                rejection,
+                PlacementRejectionReason::UntrustedVerdictPlatform { .. }
+            ),
+            "the reason must be the trust, not a reading: {rejection:?}"
+        );
+        assert!(rejection.describe().contains("windows"), "{rejection:?}");
+    }
+
+    /// Trust decides eligibility, so a same-platform machine still competes on
+    /// its readings. The rule narrows WHERE a verdict may come from; it does not
+    /// pin every check back to the runner's own machine, which would trade one
+    /// wrong answer for a fleet that never spills at all.
+    #[test]
+    fn a_gated_platform_still_spills_to_the_idle_machine_on_it() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+        measured(
+            &mut local,
+            0.95,
+            2 * 1024 * 1024 * 1024,
+            100 * 1024 * 1024 * 1024,
+        );
+        let (mac_id, mut mac) = fleet_entry("bglab-mac", "macos", 0, &[]);
+        measured(
+            &mut mac,
+            0.02,
+            64 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        let (windows_id, mut windows) = fleet_entry("bglab-win", "windows", 0, &[]);
+        measured(
+            &mut windows,
+            0.00,
+            96 * 1024 * 1024 * 1024,
+            999 * 1024 * 1024 * 1024,
+        );
+        let connections = HashMap::from([(local_id, local), (mac_id, mac), (windows_id, windows)]);
+
+        let mut request = spillable_request();
+        request.verdict_platforms = vec!["macos".into()];
+        let draft = place(&connections, &request).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "bglab-mac");
+        assert_eq!(
+            chosen(&draft).reason,
+            PlacementReason::PredictedEarliestVerdict
+        );
+    }
+
+    /// A batch that cannot move has one possible machine, and waiting cannot
+    /// change its platform. That is a contradiction between what a check
+    /// declared and the cadence it runs at, and it is answered immediately
+    /// rather than by stalling out the horizon on every commit.
+    #[test]
+    fn work_that_cannot_move_refuses_at_once_when_its_home_is_not_gated_on() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+        measured(
+            &mut local,
+            0.10,
+            8 * 1024 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
+        );
+        let connections = HashMap::from([(local_id, local)]);
+
+        let mut request = spillable_request();
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.verdict_platforms = vec!["linux".into()];
+        let refusal = place(&connections, &request).unwrap_err();
+        assert!(refusal.contains("linux"), "{refusal}");
+        assert!(refusal.contains("Nothing was run"), "{refusal}");
+    }
+
+    /// A mobile batch waits instead: a machine on a platform this verdict counts
+    /// from may still attach, and the requester's horizon already bounds how
+    /// long that hope lasts.
+    #[test]
+    fn mobile_work_waits_when_only_ungated_platforms_are_attached() {
+        let (windows_id, mut windows) = fleet_entry("bglab-win", "windows", 0, &[]);
+        measured(
+            &mut windows,
+            0.01,
+            64 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        let connections = HashMap::from([(windows_id, windows)]);
+
+        let mut request = spillable_request();
+        request.verdict_platforms = vec!["macos".into()];
+        let draft = place(&connections, &request).unwrap();
+        assert!(draft.selected.is_none(), "{draft:?}");
+    }
+
     /// And when the constraint leaves only blind machines, the answer is the
     /// typed telemetry refusal. Narrowing the fleet cannot make absent evidence
     /// safe to act on.
@@ -9026,6 +10118,7 @@ mod tests {
         let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
 
         let demand = resource_profiles::ResolvedResourceProfile {
+            duration: test_prior_duration(),
             reservation: ResourceReservation {
                 memory_bytes: 2 * 1024 * 1024 * 1024,
                 disk_growth_bytes: 1024 * 1024 * 1024,
@@ -9057,41 +10150,23 @@ mod tests {
         );
     }
 
-    /// Every key behind CPU has to be able to decide something, or it is
-    /// decoration. Equally busy machines separate on memory, then volume, then
-    /// transfer cost, then identity — and the same fleet always ranks the same.
+    /// Equal verdict predictions fall through to transfer cost and then stable
+    /// executor identity. Memory and volume are eligibility facts, not ranking
+    /// preferences once both machines can fit the work.
     #[test]
-    fn the_ranking_keys_behind_cpu_are_deterministic() {
-        let entry = |id: &str, memory: u64, volume: u64| {
+    fn equal_verdict_predictions_are_ranked_deterministically() {
+        let entry = |id: &str| {
             let (key, mut state) = fleet_entry(id, "linux", 0, &[]);
-            measured(&mut state, 0.10, memory, volume);
+            measured(
+                &mut state,
+                0.10,
+                40 * 1024 * 1024 * 1024,
+                100 * 1024 * 1024 * 1024,
+            );
             (key, state)
         };
-        let gib = 1024 * 1024 * 1024;
-        let by_memory = HashMap::from([
-            entry(COLOCATED_EXECUTOR_ID, 4 * gib, 100 * gib),
-            entry("roomy", 40 * gib, 100 * gib),
-        ]);
-        assert_eq!(
-            chosen(&place(&by_memory, &spillable_request()).unwrap()).executor_id,
-            "roomy",
-            "equal CPU separates on available memory"
-        );
 
-        let by_volume = HashMap::from([
-            entry(COLOCATED_EXECUTOR_ID, 40 * gib, 10 * gib),
-            entry("spacious", 40 * gib, 900 * gib),
-        ]);
-        assert_eq!(
-            chosen(&place(&by_volume, &spillable_request()).unwrap()).executor_id,
-            "spacious",
-            "equal CPU and memory separate on free volume"
-        );
-
-        let by_sync = HashMap::from([
-            entry(COLOCATED_EXECUTOR_ID, 40 * gib, 100 * gib),
-            entry("far", 40 * gib, 100 * gib),
-        ]);
+        let by_sync = HashMap::from([entry(COLOCATED_EXECUTOR_ID), entry("far")]);
         let draft = choose_executor_with(
             &by_sync,
             &spillable_request(),
@@ -9112,10 +10187,7 @@ mod tests {
             "otherwise equal machines separate on what has to be transferred"
         );
 
-        let tied = HashMap::from([
-            entry("aaa", 40 * gib, 100 * gib),
-            entry("zzz", 40 * gib, 100 * gib),
-        ]);
+        let tied = HashMap::from([entry("aaa"), entry("zzz")]);
         for _ in 0..8 {
             assert_eq!(
                 chosen(&place(&tied, &spillable_request()).unwrap()).executor_id,
@@ -9410,6 +10482,7 @@ mod tests {
         let pool = Fleet::default();
         let mut colocated = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]).1;
         colocated.snapshot.executing_requests = vec![ExecutingCellRequest {
+            command_resource_identity: None,
             executor_id: COLOCATED_EXECUTOR_ID.into(),
             cell_id: "cell".into(),
             request_id: "r".into(),
@@ -9918,6 +10991,7 @@ mod tests {
             priority: None,
             subscriber_count: 1,
             resource_reservation: ResourceReservation::default(),
+            command_resource_identity: None,
             learned_estimate: Some(cairn_common::executor_protocol::LearnedResourceEstimate {
                 sample_count: 20,
                 upper_duration_ms: Some(upper_duration_ms),
@@ -9961,6 +11035,7 @@ mod tests {
             selector,
             pinned_executor_id: None,
             mobility,
+            verdict_platforms: &[],
         }
     }
 
@@ -10261,6 +11336,7 @@ mod tests {
             }),
         );
         cairn_common::executor_protocol::PersistentCellState {
+            warm_command_classes: Vec::new(),
             executor_id: String::new(),
             executor_display_name: None,
             project_id: "p".into(),
@@ -10545,6 +11621,7 @@ mod tests {
             }),
             pinned_executor_id: None,
             placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -11102,6 +12179,7 @@ mod tests {
             generation,
             FleetSnapshot {
                 queued_requests: vec![QueuedCellRequest {
+                    command_resource_identity: None,
                     executor_id: COLOCATED_EXECUTOR_ID.into(),
                     request_id: identity.0,
                     attempt_id: identity.1,
@@ -11405,6 +12483,7 @@ mod tests {
         status: cairn_common::executor_protocol::ResidentProcessStatus,
     ) -> PersistentCellState {
         PersistentCellState {
+            warm_command_classes: Vec::new(),
             executor_id: String::new(),
             executor_display_name: None,
             project_id: "p".into(),
