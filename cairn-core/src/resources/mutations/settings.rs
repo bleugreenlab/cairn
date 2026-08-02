@@ -34,6 +34,7 @@ const PREF_KEYS: &[&str] = &[
     "memoryTriageEnabled",
     "maxOpenTriageIssuesPerScope",
     "pendingMemoryThreshold",
+    "threadCompactThreshold",
     "externalReplies",
     "subscriptionFees",
     "activeBackend",

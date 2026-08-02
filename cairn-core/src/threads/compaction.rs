@@ -26,12 +26,12 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 /// What made a compaction fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionTrigger {
-    /// The session went stale, so the next turn pays a prompt-cache write
-    /// regardless and compacting is marginally free.
+    /// The prompt cache expired, so the next turn pays a write regardless and
+    /// the session is being rebuilt either way.
     Expiry,
-    /// The live compactable prefix outgrew three times its table-of-contents
-    /// representation while the session was still warm.
-    Ratio,
+    /// The live session filled enough of the model's context window, while the
+    /// cache was still warm, that it has to give something up.
+    Capacity,
     /// An operator forced a digest resume.
     Manual,
 }
@@ -40,7 +40,7 @@ impl CompactionTrigger {
     pub fn as_db(self) -> &'static str {
         match self {
             CompactionTrigger::Expiry => "expiry",
-            CompactionTrigger::Ratio => "ratio",
+            CompactionTrigger::Capacity => "capacity",
             CompactionTrigger::Manual => "manual",
         }
     }
@@ -117,6 +117,10 @@ pub struct AppliedCompaction {
     /// pending until the job leaves it.
     pub source_session_id: String,
     pub entries: Vec<TocEntry>,
+    /// What the rebuilt prompt weighs. The rotation's cache write is paid on
+    /// this, so it is the number a later calibration prices against; the two
+    /// below both describe the dropped range and cannot answer that alone.
+    pub seed_bytes: i64,
     pub source_bytes: i64,
     pub candidate_bytes: i64,
     pub compacted_through_block: Option<i64>,
@@ -296,14 +300,16 @@ pub async fn persist_generation(
             conn.execute(
                 "INSERT INTO thread_compactions (
                      job_id, generation, source_session_id, compacted_through_block,
-                     recency_start_block, source_bytes, candidate_bytes, trigger, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     recency_start_block, seed_bytes, source_bytes, candidate_bytes,
+                     trigger, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     job_id.as_str(),
                     generation,
                     applied.source_session_id.as_str(),
                     applied.compacted_through_block,
                     applied.recency_start_block,
+                    applied.seed_bytes,
                     applied.source_bytes,
                     applied.candidate_bytes,
                     applied.trigger.as_db(),
@@ -400,6 +406,7 @@ mod tests {
             trigger: CompactionTrigger::Expiry,
             source_session_id: BEFORE.to_string(),
             entries,
+            seed_bytes: 60_000,
             source_bytes: 9_000,
             candidate_bytes: 300,
             compacted_through_block: Some(4),

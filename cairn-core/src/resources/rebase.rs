@@ -253,17 +253,23 @@ fn render_summary(
         )
     };
 
-    let condition = if session.is_base_drift() {
-        "**Condition: base drift.** Every conflicting file is already byte-identical between your \
-         branch and the new base, so there is nothing to merge — what is stale is your branch's \
-         ANCESTRY. Editing files will not clear this, and you cannot repair it from your checkout: \
-         slot refs are downstream exports of the runner's private jj store. Request the replay \
-         below."
+    let (condition, replay_payload) = if session.is_base_drift() {
+        (
+            "**Condition: base drift.** Every conflicting file is already byte-identical between your \
+             branch and the new base, so there is nothing to merge — what is stale is your branch's \
+             ANCESTRY. Editing files will not clear this, and you cannot repair it from your checkout: \
+             slot refs are downstream exports of the runner's private jj store. Request the replay \
+             below.",
+            "action:\"replay\"",
+        )
     } else {
-        "**Condition: content conflict.** The two sides genuinely disagree. Read both versions of \
-         each conflicting file, write the merged result with ordinary edits, and commit it on your \
-         branch. Then request the replay below so the branch actually moves onto the base — \
-         resolving the content does not by itself change your branch's ancestry."
+        (
+            "**Condition: content conflict.** The two sides genuinely disagree. Read both versions of \
+             each conflicting file, write the merged result with ordinary edits, and commit it on your \
+             branch. Then request the replay below so the branch actually moves onto the base — \
+             resolving the content does not by itself change your branch's ancestry.",
+            "action:\"replay\",resolution:\"take-committed-tip\"",
+        )
     };
 
     format!(
@@ -274,7 +280,7 @@ fn render_summary(
          with `?branch=<commit>`, or read the whole side as a patch:\n\n- `{base}?view=base-ours` \
          — what your branch did\n- `{base}?view=base-theirs` — what arrived\n\nBoth accept \
          `file=PATH`, `offset=N`, and `limit=N`.\n{conflicting_table}{clean_table}\n## Next \
-         action\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"replay\"}}}}]}})\n```\n\nThis \
+         action\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{{replay_payload}}}}}]}})\n```\n\nThis \
          asks the store to replay your branch onto `{dest}`. It is the only way the branch's \
          ancestry moves — never rebase, reset, or force-push by hand. A clean replay publishes the \
          branch and closes this session; a conflicting one refreshes this page.\n\nSession \
@@ -290,9 +296,9 @@ fn render_summary(
         ),
         dest = session.destination_commit,
         fingerprint = session.fingerprint(),
-        recorded = chrono::DateTime::from_timestamp(session.updated_at, 0)
-            .map(|when| when.format("%Y-%m-%d %H:%M UTC").to_string())
+        recorded = crate::clock::stamp(session.updated_at)
             .unwrap_or_else(|| "at an unrecorded time".to_string()),
+        replay_payload = replay_payload,
     )
 }
 

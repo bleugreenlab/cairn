@@ -310,6 +310,36 @@ pub async fn list_terminal_output_watchers_for_job_terminal(
     .map_err(|error| format!("Failed to list terminal output watchers: {error}"))
 }
 
+/// Whether any job holds an active subscription on this exact source.
+///
+/// A gate, not a router: it exists so an edge that must BUILD an expensive
+/// payload before it can route (the checks-settlement snapshot reads the
+/// repository) can find out first that nobody is listening. Every node's every
+/// turn end passes through that edge, and almost none of them are watched.
+pub(crate) async fn any_active_subscriber(
+    db: &LocalDb,
+    source_kind: &str,
+    source_ref: &str,
+) -> Result<bool, String> {
+    let (source_kind, source_ref) = (source_kind.to_string(), source_ref.to_string());
+    db.read(|conn| {
+        let (source_kind, source_ref) = (source_kind.clone(), source_ref.clone());
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM wake_subscriptions
+                     WHERE source_kind = ?1 AND source_ref = ?2 AND state = 'active'
+                     LIMIT 1",
+                    params![source_kind.as_str(), source_ref.as_str()],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn seed_default_job_subscriptions(
     db: &LocalDb,
     job_id: &str,

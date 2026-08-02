@@ -44,6 +44,14 @@ pub(super) async fn dispatch(
                 ));
             }
             let fingerprint = payload_non_empty_str(payload, "fingerprint", &[]);
+            let resolution = payload_non_empty_str(payload, "resolution", &[]);
+            if resolution.is_some_and(|value| value != "take-committed-tip") {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload.resolution must be 'take-committed-tip' when provided",
+                ));
+            }
 
             let db = orch.db.for_project(project).await;
             let (conn, job) = crate::resources::connect_and_find_node_job(
@@ -71,6 +79,7 @@ pub(super) async fn dispatch(
                     &job.id,
                     &branch,
                     fingerprint,
+                    resolution.is_some(),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?

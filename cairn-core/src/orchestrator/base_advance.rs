@@ -1661,6 +1661,7 @@ pub(crate) async fn request_branch_replay(
     job_id: &str,
     branch: &str,
     expected_fingerprint: Option<&str>,
+    take_committed_tip: bool,
 ) -> Result<String, String> {
     let session = crate::orchestrator::conflict_session::load_active_session(db, branch)
         .await?
@@ -1717,7 +1718,11 @@ pub(crate) async fn request_branch_replay(
         orch,
         db,
         &project.id,
-        &format!("replay requested for {branch}"),
+        &if take_committed_tip {
+            format!("resolved replay requested for {branch}")
+        } else {
+            format!("replay requested for {branch}")
+        },
         &project.repo_path,
         &base_branch,
         &base_branch,
@@ -1918,6 +1923,18 @@ async fn execute_reconcile_claim(
             }
         }
 
+        // A requested replay is the explicit resolution operation: take the
+        // branch's committed tip bytes for this session's conflicting paths.
+        // Automatic base-advance reconciliation never receives this authority
+        // and therefore retains the fail-closed rollback. A previous failed retry
+        // may already name the resolved tip as `ours`, so tip inequality cannot
+        // identify resolution intent reliably (the live CAIRN-3412 shape).
+        let resolution_session = if label.starts_with("resolved replay requested for ") {
+            crate::orchestrator::conflict_session::load_active_session(db, branch).await?
+        } else {
+            None
+        };
+
         let mut ambiguous_item = None;
         let mut divergence_resolved = false;
         let mut item_report = if let Some(progress) =
@@ -1984,8 +2001,26 @@ async fn execute_reconcile_claim(
                     before.insert(branch.clone(), commit);
                 }
             }
+            let resolution_paths = resolution_session
+                .as_ref()
+                .map(|session| {
+                    session
+                        .conflicting()
+                        .map(|file| file.path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|paths| !paths.is_empty());
             let item_report = if ambiguous_item.is_some() {
                 crate::jj::ReconcileReport::default()
+            } else if let Some(paths) = resolution_paths.as_deref() {
+                crate::jj::reconcile_resolved_sibling_without_publication(
+                    &jj,
+                    &store,
+                    &pinned_dest,
+                    branch,
+                    paths,
+                )
+                .map_err(|error| format!("jj resolved sibling replay ({label}) failed: {error}"))?
             } else {
                 let item = vec![branch.clone()];
                 crate::jj::reconcile_siblings_without_publication(&jj, &store, &pinned_dest, &item)

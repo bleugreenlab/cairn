@@ -23,7 +23,10 @@ fn gate_accepts_the_rebase_replay_action() {
     let it = item(
         "cairn://p/CAIRN/1/1/builder/rebase",
         ChangeMode::Patch,
-        Some(serde_json::json!({"action": "replay"})),
+        Some(serde_json::json!({
+            "action": "replay",
+            "resolution": "take-committed-tip"
+        })),
     );
     let spec = gate(&it).expect("the replay mutation is gated in");
     assert_eq!(

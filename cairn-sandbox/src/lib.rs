@@ -445,6 +445,8 @@ pub fn default_writable_extra() -> Vec<PathBuf> {
     // first spawn of a fresh install writes there, and an absent path is inert
     // in the generated rules.
     dirs.push(cairn_common::scratch::scratch_root());
+    // Cairn's own log directory is deliberately absent; see
+    // `the_cairn_log_dir_is_never_writable`.
     dirs
 }
 
@@ -827,6 +829,42 @@ mod tests {
         let policy = SandboxPolicy::for_run(Path::new("/project/wt"), &[], vec![]);
         assert!(policy.writable_paths().contains(&scratch));
         assert!(policy.readable_paths().contains(&scratch));
+    }
+
+    /// Cairn's own log directory must never join the writable set, however
+    /// tempting the nested `cairn` CLI makes it.
+    ///
+    /// A fenced spawn confines an agent's whole process tree, not the one Cairn
+    /// binary inside it, so a grant meant to let the CLI keep its log would hand
+    /// arbitrary branch code the ability to truncate, delete, or fabricate the
+    /// durable logs of the desktop app, the runner, and every concurrent job.
+    /// `default_writable_extra` is also what the `write` verb classifies
+    /// absolute targets against, and that check is ancestor-based, so every file
+    /// beneath the directory would become writable with no prompt on that
+    /// surface too. Logs are the evidence trail bug reports are built from;
+    /// shared durable state stays protected even from a well-motivated grant.
+    ///
+    /// Nothing is lost by denying it. A CLI whose log destination is unwritable
+    /// still runs — `cairn_common::logging::init` degrades to a fileless logger
+    /// — and the CLI is a thin client that forwards to the app, so the
+    /// substantive record of what a call did is written by that unfenced process
+    /// regardless.
+    #[test]
+    fn the_cairn_log_dir_is_never_writable() {
+        // Derived from the home rather than through `cairn_log_dir`, whose
+        // `CAIRN_LOG_DIR` override could name a temp dir the fence grants for
+        // unrelated reasons. This is the canonical host location being pinned.
+        let logs = cairn_common::paths::cairn_home().join("logs");
+        assert!(
+            !default_writable_extra().contains(&logs),
+            "the Cairn log directory must not be writable: {}",
+            logs.display()
+        );
+        let policy = SandboxPolicy::for_run(Path::new("/project/wt"), &[], vec![]);
+        assert!(
+            !policy.writable_paths().contains(&logs),
+            "no run policy may carry the log directory into its writable set"
+        );
     }
 
     #[test]

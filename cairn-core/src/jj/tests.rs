@@ -28,6 +28,80 @@ pub(crate) fn jj_bin() -> Option<String> {
         .then_some(bin)
 }
 
+/// A sanctioned replay must distinguish the original same-hunk conflict from a
+/// later tip commit that deliberately resolves it. The replay reapplies the
+/// lineage, restores the committed resolution only for the session's conflicting
+/// paths, and flattens away the conflict-flagged intermediates.
+#[test]
+#[serial_test::serial(jj)]
+fn committed_tip_resolution_lands_same_hunk_replay() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping committed_tip_resolution_lands_same_hunk_replay: jj not resolvable");
+        return;
+    };
+    let fx = setup_conflicting_advance(&bin);
+
+    let RebaseOutcome::Conflicted { diagnostic } =
+        rebase_branch_onto(&fx.jj, &fx.store, fx.branch, "main").unwrap()
+    else {
+        panic!("precondition: the first replay must conflict");
+    };
+    let paths = diagnostic.conflicting_paths();
+
+    update_stale(&fx.jj, &fx.workspace).unwrap();
+    std::fs::write(fx.workspace.join("shared.rs"), "RESOLVED-34\n").unwrap();
+    seal(
+        &fx.jj,
+        &fx.workspace,
+        "resolve same-hunk base conflict",
+        None,
+    )
+    .unwrap();
+
+    // The base may advance again while the agent is resolving. Replay onto the
+    // live destination and preserve that newer, non-conflicting content rather
+    // than requiring the resolution session's old `theirs` coordinate.
+    fx.jj
+        .run(&fx.store, &["new", "main"], "advance main after resolution")
+        .unwrap();
+    std::fs::write(fx.store.join("after-resolution.rs"), "newer base\n").unwrap();
+    fx.jj
+        .run(
+            &fx.store,
+            &["describe", "-m", "newer base while resolution is pending"],
+            "describe newer base",
+        )
+        .unwrap();
+    fx.jj
+        .run(
+            &fx.store,
+            &["bookmark", "set", "main", "-r", "@"],
+            "advance main bookmark again",
+        )
+        .unwrap();
+
+    let report = reconcile_resolved_sibling_without_publication(
+        &fx.jj, &fx.store, "main", fx.branch, &paths,
+    )
+    .unwrap();
+    assert_eq!(report.rebased_clean, vec![fx.branch.to_string()]);
+    assert!(report.conflicted.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&file_show(&fx.jj, &fx.store, fx.branch, "shared.rs").unwrap()),
+        "RESOLVED-34\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(
+            &file_show(&fx.jj, &fx.store, fx.branch, "after-resolution.rs").unwrap()
+        ),
+        "newer base\n"
+    );
+    let dest = bookmark_commit(&fx.jj, &fx.store, "main").unwrap();
+    let range = format!("{dest}..bookmarks(exact:{:?})", fx.branch);
+    assert_eq!(count_commits(&fx.jj, &fx.store, &range), 1);
+    assert!(conflicted_commits(&fx.jj, &fx.store, &range).is_empty());
+}
+
 /// Tree identity sees through a stale base coordinate; the changed-file diff
 /// does not. This is the VCS-level fact the turn-end zero-delta gate rests on
 /// (CAIRN-3108), reproduced against real jj rather than asserted in prose.
@@ -6190,6 +6264,7 @@ struct ConflictingAdvance {
     _wts: TempDir,
     jj: JjEnv,
     store: PathBuf,
+    workspace: PathBuf,
     branch: &'static str,
     pre_tip: String,
 }
@@ -6238,6 +6313,7 @@ fn setup_conflicting_advance(bin: &str) -> ConflictingAdvance {
         _wts: wts,
         jj,
         store,
+        workspace: ws,
         branch,
         pre_tip,
     }

@@ -21,6 +21,7 @@ pub mod check_parsers;
 pub mod checkpoint_runs;
 pub mod checkpoints;
 pub mod checks;
+pub mod checks_settlement;
 pub mod checks_status;
 pub mod checks_turn_end;
 pub mod conditions;

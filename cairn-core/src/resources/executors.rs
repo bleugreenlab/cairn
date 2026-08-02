@@ -28,9 +28,43 @@ use cairn_common::executor_protocol::{
 // list is edited by whoever touches the reservation rendering; keeping the
 // fleet-visibility types on a separate line means two branches working on this
 // file do not collide on one line neither of them cares about.
-use cairn_common::executor_protocol::{EnrolledRemote, RemoteLinkState};
+use cairn_common::executor_protocol::{EnrolledRemote, ExecutorCapabilities, RemoteLinkState};
+
+use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
 
 use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
+
+/// The runner's own abnormal restart, when it had one.
+///
+/// Every machine in this resource attaches to one runner, so a runner that
+/// killed itself is a fleet-level fact: it is why links reset, why work was
+/// interrupted, and why an executor's heartbeat age reads younger than the work
+/// it was doing. Rendering it first is the same rule the machines already follow
+/// -- a reading or a named gap, never silence. A runner that came up cleanly has
+/// nothing to say here and says nothing.
+fn runner_restart_section(exit: Option<&AbnormalExit>, captured_at_unix_ms: u64) -> String {
+    let Some(exit) = exit else {
+        return String::new();
+    };
+    let restarted_at = crate::clock::stamp_millis_with_seconds(exit.at_unix_ms as i64)
+        .unwrap_or_else(|| "an unknown time".to_string());
+    let mut out = String::from("## Runner restarted\n\nThis runner replaced one that exited abnormally. Work in flight at that moment was interrupted.\n\n");
+    out.push_str(&format!(
+        "- Restarted: {restarted_at} ({})\n",
+        age(exit.elapsed_ms(captured_at_unix_ms))
+    ));
+    out.push_str(&format!("- Cause: {}\n", exit.reason));
+    out.push_str(&format!("- Predecessor pid: {}\n", exit.pid));
+    // The report is resolved now rather than stored, because the OS writes it
+    // seconds after the abort -- after the successor has already booted.
+    match crash_report_for(exit) {
+        Some(path) => out.push_str(&format!("- Crash report: {}\n\n", path.display())),
+        None => out.push_str(
+            "- Crash report: none found for this exit (the platform may not write one)\n\n",
+        ),
+    }
+    out
+}
 
 /// Render the fleet collection: one line per machine, plus the toolchains and
 /// load an agent weighs before targeting one.
@@ -44,12 +78,25 @@ pub(crate) fn render_executors(
     executors: &[ExecutorInspection],
     enrolled: &[EnrolledRemote],
     enrolling: &[EnrollmentOperation],
+    replaced_abnormal_exit: Option<&AbnormalExit>,
     captured_at_unix_ms: u64,
 ) -> String {
     if executors.is_empty() && enrolled.is_empty() && enrolling.is_empty() {
-        return "# Executors\n\nNo executor is attached to this runner.\n\nThe runner supervises a colocated executor named `local`; if nothing is listed here it is not currently attached. Enrolled machines are added with `cairn executor add <user@host>`.".to_string();
+        let mut empty = String::from("# Executors\n\nNo executor is attached to this runner.\n\nThe runner supervises a colocated executor named `local`; if nothing is listed here it is not currently attached. Enrolled machines are added with `cairn executor add <user@host>`.\n");
+        // Deliberately rendered even here. An empty fleet right after a runner
+        // abort is not a quiet fleet; it is the aftermath, and that is precisely
+        // the moment the restart explains what is being read.
+        empty.push_str(&runner_restart_section(
+            replaced_abnormal_exit,
+            captured_at_unix_ms,
+        ));
+        return empty;
     }
     let mut out = String::from("# Executors\n\n");
+    out.push_str(&runner_restart_section(
+        replaced_abnormal_exit,
+        captured_at_unix_ms,
+    ));
     if executors.is_empty() {
         out.push_str(
             "No executor is attached to this runner, but it is enrolled with machines that are not reporting. Nothing can be placed until one attaches.\n\n",
@@ -69,7 +116,7 @@ pub(crate) fn render_executors(
         ));
         out.push_str(&format!(
             "- Toolchains: {}\n",
-            list_or(&capabilities.toolchains, "none advertised")
+            toolchain_summary(capabilities)
         ));
         out.push_str(&format!("- Link: {}\n", link_summary(executor)));
         out.push_str(&format!(
@@ -251,6 +298,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         "- Toolchains: {}\n",
         list_or(&capabilities.toolchains, "none advertised")
     ));
+    out.push_str(&render_toolchain_probes(capabilities));
     out.push_str(&format!(
         "- Projects served: {}\n\n",
         list_or(&capabilities.projects_served, "every project")
@@ -731,6 +779,77 @@ fn bytes(value: u64) -> String {
     }
 }
 
+/// The toolchain line for the fleet listing: the advertised set, and when that
+/// is empty, the reason the machine itself gave.
+///
+/// A bare "none advertised" is the fleet fact an operator can act on least,
+/// because it reads the same whether the machine has no toolchain or its probe
+/// never worked. Those are opposite facts, exactly as a gap and a zero are
+/// elsewhere in this file, so the emptiness is reported with the account it was
+/// probed as and the failure that produced it.
+fn toolchain_summary(capabilities: &ExecutorCapabilities) -> String {
+    if !capabilities.toolchains.is_empty() {
+        return capabilities.toolchains.join(", ");
+    }
+    let Some(detection) = &capabilities.toolchain_detection else {
+        return "none advertised".to_string();
+    };
+    let failures = detection
+        .probes
+        .iter()
+        .filter(|probe| !probe.detected)
+        .map(|probe| format!("{}: `{}` {}", probe.toolchain, probe.command, probe.detail))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return format!(
+            "none advertised (probed for none, as account {})",
+            detection.account
+        );
+    }
+    format!(
+        "none advertised (as account {} — {})",
+        detection.account,
+        failures.join("; ")
+    )
+}
+
+/// The full probe record for one machine: what ran, as whom, where the program
+/// resolved, and what came back — for toolchains that were found as well as
+/// those that were not.
+///
+/// The account is printed even on success because it is what makes a later
+/// absence intelligible: a per-user toolchain install belongs to one account, so
+/// the account a probe ran as is frequently the whole explanation for what it
+/// could and could not see.
+fn render_toolchain_probes(capabilities: &ExecutorCapabilities) -> String {
+    let Some(detection) = &capabilities.toolchain_detection else {
+        return "- Toolchain probes: not reported by this executor\n".to_string();
+    };
+    let mut out = format!(
+        "- Toolchain probes: run as account {} (home {})\n",
+        detection.account, detection.home
+    );
+    if detection.probes.is_empty() {
+        out.push_str("  - this executor probed for no toolchains\n");
+        return out;
+    }
+    for probe in &detection.probes {
+        out.push_str(&format!(
+            "  - {}: {} — `{}` at {} — {}\n",
+            probe.toolchain,
+            if probe.detected {
+                "detected"
+            } else {
+                "not detected"
+            },
+            probe.command,
+            probe.resolved_path.as_deref().unwrap_or("not on PATH"),
+            probe.detail
+        ));
+    }
+    out
+}
+
 fn list_or(values: &[String], empty: &str) -> String {
     if values.is_empty() {
         empty.to_string()
@@ -755,7 +874,8 @@ mod tests {
     use cairn_common::executor_protocol::{
         CpuPressure, ExecutorAdvertisement, ExecutorCapabilities, ExecutorHealthSnapshot,
         ExecutorIdentity, ExecutorSubstrateReport, FleetSnapshot, MachineMemory, MachineVolume,
-        RemoteAttachAttempt, ResidentOccupancyEvidence, ResourceReservation,
+        RemoteAttachAttempt, ResidentOccupancyEvidence, ResourceReservation, ToolchainDetection,
+        ToolchainProbe,
     };
 
     const CAPTURED_AT: u64 = 1_000_000;
@@ -788,6 +908,7 @@ mod tests {
                         projects_served: Vec::new(),
                         disk_budget_bytes: None,
                         memory_budget_bytes: None,
+                        toolchain_detection: None,
                     },
                     current_load: 0,
                     warm_roots: Vec::new(),
@@ -809,6 +930,168 @@ mod tests {
             occupancy: FleetSnapshot::default(),
             captured_at_unix_ms: CAPTURED_AT,
         }
+    }
+
+    /// Stages the state bglab-win was actually in: a machine whose probe ran
+    /// and truthfully found nothing, because the toolchain belongs to a
+    /// different OS account.
+    fn probed_and_absent() -> ToolchainDetection {
+        ToolchainDetection {
+            account: "mitch".into(),
+            home: "C:\\Users\\mitch".into(),
+            probes: vec![ToolchainProbe {
+                toolchain: "rust".into(),
+                command: "cargo --version".into(),
+                detected: false,
+                resolved_path: None,
+                detail: "could not run: program not found".into(),
+            }],
+        }
+    }
+
+    fn probed_and_present() -> ToolchainDetection {
+        ToolchainDetection {
+            account: "mitch".into(),
+            home: "C:\\Users\\mitch".into(),
+            probes: vec![ToolchainProbe {
+                toolchain: "rust".into(),
+                command: "cargo --version".into(),
+                detected: true,
+                resolved_path: Some("C:\\Users\\mitch\\.cargo\\bin\\cargo.exe".into()),
+                detail: "cargo 1.97.1 (c980f4866 2026-06-30)".into(),
+            }],
+        }
+    }
+
+    fn with_toolchains(
+        name: &str,
+        toolchains: Vec<String>,
+        detection: Option<ToolchainDetection>,
+    ) -> ExecutorInspection {
+        let mut executor = inspection(name, false);
+        let capabilities = &mut executor.health.advertisement.capabilities;
+        capabilities.toolchains = toolchains;
+        capabilities.toolchain_detection = detection;
+        executor
+    }
+
+    /// The listing is where an empty toolchain set is first seen, so it is where
+    /// the emptiness has to be explainable. A bare "none advertised" reads the
+    /// same for a machine without Rust and for a broken probe; naming the
+    /// account and the failure is what separates them.
+    #[test]
+    fn a_machine_advertising_nothing_names_the_account_and_the_failure() {
+        let rendered = render_executors(
+            &[with_toolchains(
+                "bglab-win",
+                Vec::new(),
+                Some(probed_and_absent()),
+            )],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+        );
+        assert!(
+            rendered.contains(
+                "- Toolchains: none advertised (as account mitch — rust: `cargo --version` could not run: program not found)"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// An executor too old to report probes must say that, not present its
+    /// silence as a finding. "Cannot explain itself" and "probed and found
+    /// nothing" are opposite facts about a machine.
+    #[test]
+    fn an_executor_that_reports_no_probes_is_not_read_as_having_probed() {
+        let listed = render_executors(
+            &[with_toolchains("bglab-win", Vec::new(), None)],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+        );
+        assert!(
+            listed.contains("- Toolchains: none advertised\n"),
+            "{listed}"
+        );
+        assert!(!listed.contains("as account"), "{listed}");
+
+        let detailed = render_executor(&with_toolchains("bglab-win", Vec::new(), None));
+        assert!(
+            detailed.contains("- Toolchain probes: not reported by this executor"),
+            "{detailed}"
+        );
+    }
+
+    /// The machine's own page carries the whole record, including for a probe
+    /// that succeeded: which command proved it, where the program resolved, and
+    /// the account that could see it.
+    #[test]
+    fn the_machine_page_records_the_probe_behind_a_detected_toolchain() {
+        let rendered = render_executor(&with_toolchains(
+            "bglab-win",
+            vec!["rust".into()],
+            Some(probed_and_present()),
+        ));
+        assert!(rendered.contains("- Toolchains: rust\n"), "{rendered}");
+        assert!(
+            rendered.contains("- Toolchain probes: run as account mitch (home C:\\Users\\mitch)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  - rust: detected — `cargo --version` at C:\\Users\\mitch\\.cargo\\bin\\cargo.exe — cargo 1.97.1 (c980f4866 2026-06-30)"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// A probe that resolved a program and still failed is the interesting case:
+    /// the path is reported alongside the failure rather than suppressed,
+    /// because "found it and it does not work" is a different problem from
+    /// "could not find it".
+    #[test]
+    fn a_program_that_resolves_and_then_fails_reports_both_facts() {
+        let detection = ToolchainDetection {
+            account: "mitch".into(),
+            home: "C:\\Users\\mitch".into(),
+            probes: vec![ToolchainProbe {
+                toolchain: "rust".into(),
+                command: "cargo --version".into(),
+                detected: false,
+                resolved_path: Some("C:\\Users\\other\\.cargo\\bin\\cargo.exe".into()),
+                detail: "exited 1: error: rustup could not choose a version of cargo to run".into(),
+            }],
+        };
+        let rendered = render_executor(&with_toolchains("bglab-win", Vec::new(), Some(detection)));
+        assert!(
+            rendered.contains("C:\\Users\\other\\.cargo\\bin\\cargo.exe"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("rustup could not choose a version of cargo to run"),
+            "{rendered}"
+        );
+    }
+
+    /// A machine that can build still reads as one line. The evidence belongs on
+    /// the machine's page, not in the scan an agent does before placing work.
+    #[test]
+    fn an_advertised_toolchain_still_lists_as_a_plain_set() {
+        let rendered = render_executors(
+            &[with_toolchains(
+                "bglab-win",
+                vec!["rust".into(), "bun".into()],
+                Some(probed_and_present()),
+            )],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+        );
+        assert!(rendered.contains("- Toolchains: rust, bun\n"), "{rendered}");
     }
 
     fn measured(executor: &mut ExecutorInspection) {
@@ -846,6 +1129,7 @@ mod tests {
             &[inspection("bglab-ub", false), inspection("local", true)],
             &[],
             &[],
+            None,
             CAPTURED_AT,
         );
         assert!(rendered.contains("## bglab-ub"), "{rendered}");
@@ -862,9 +1146,65 @@ mod tests {
     /// rendering an empty list an agent has to interpret.
     #[test]
     fn an_empty_fleet_renders_an_explanation_not_an_empty_list() {
-        let rendered = render_executors(&[], &[], &[], CAPTURED_AT);
+        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT);
         assert!(rendered.contains("No executor is attached"), "{rendered}");
         assert!(rendered.contains("local"), "{rendered}");
+    }
+
+    /// A runner that came up cleanly says nothing about restarts. The section
+    /// has to stay silent in the ordinary case, or the one time it matters it
+    /// reads as boilerplate.
+    #[test]
+    fn a_clean_runner_says_nothing_about_a_restart() {
+        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT);
+        assert!(!rendered.contains("Runner restarted"), "{rendered}");
+    }
+
+    /// The CAIRN-3419 requirement: a deliberate self-abort must still be legible
+    /// after the successor is up and healthy. Time, cause, and the pid that died
+    /// all have to survive the restart that erased everything else.
+    #[test]
+    fn a_runner_that_aborted_itself_reports_it_after_the_restart() {
+        let exit = AbnormalExit {
+            at_unix_ms: CAPTURED_AT - 90_000,
+            pid: 74402,
+            reason: "the transport liveness watchdog aborted the runner after 16 consecutive failed loopback probes over 62s (the listener was bound but its accept queue never drained)".to_string(),
+        };
+        let rendered = render_executors(&[], &[], &[], Some(&exit), CAPTURED_AT);
+        assert!(rendered.contains("Runner restarted"), "{rendered}");
+        assert!(
+            rendered.contains("transport liveness watchdog"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("74402"), "{rendered}");
+        // An age, so the reader knows whether this is now or last week.
+        assert!(rendered.contains("1m ago"), "{rendered}");
+        // A crash report is a reading or a NAMED gap, never an empty field.
+        assert!(rendered.contains("Crash report:"), "{rendered}");
+        // Interrupted work is the consequence an operator is actually chasing.
+        assert!(rendered.contains("interrupted"), "{rendered}");
+    }
+
+    /// The restart is fleet context, so it belongs above the machines it
+    /// explains rather than buried under them.
+    #[test]
+    fn a_restart_is_reported_above_the_machines_it_explains() {
+        let exit = AbnormalExit {
+            at_unix_ms: CAPTURED_AT - 1_000,
+            pid: 1,
+            reason: "aborted".to_string(),
+        };
+        let executor = inspection("local", true);
+        let rendered = render_executors(
+            std::slice::from_ref(&executor),
+            &[],
+            &[],
+            Some(&exit),
+            CAPTURED_AT,
+        );
+        let restart = rendered.find("Runner restarted").expect("restart section");
+        let machine = rendered.find("## local").expect("machine section");
+        assert!(restart < machine, "{rendered}");
     }
 
     /// Far enough from the epoch that a machine can have been gone for hours,
@@ -894,6 +1234,7 @@ mod tests {
             &[inspection("local", true)],
             &[enrolled("bglab-ub", RemoteLinkState::Unreachable)],
             &[],
+            None,
             REMOTE_CAPTURED_AT,
         );
         assert!(rendered.contains("### bglab-ub"), "{rendered}");
@@ -917,6 +1258,7 @@ mod tests {
                 enrolled("bglab-ub", RemoteLinkState::Unreachable),
             ],
             &[],
+            None,
             REMOTE_CAPTURED_AT,
         );
         assert!(rendered.contains("### bglab-mac"), "{rendered}");
@@ -1076,7 +1418,7 @@ mod tests {
         });
         for rendered in [
             render_executor(&executor),
-            render_executors(std::slice::from_ref(&executor), &[], &[], CAPTURED_AT),
+            render_executors(std::slice::from_ref(&executor), &[], &[], None, CAPTURED_AT),
         ] {
             assert!(!rendered.contains("executor-7b21ce"), "{rendered}");
             assert!(!rendered.contains("device-9f3c1a"), "{rendered}");

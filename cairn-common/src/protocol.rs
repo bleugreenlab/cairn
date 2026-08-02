@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Derives `Default` so adding an optional field never ripples across the ~70
 /// struct-literal construction sites: existing literals keep compiling, and new
 /// optional fields can be filled in only where they matter via `..Default::default()`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CallbackRequest {
     /// Process residence reported for diagnostics and non-project host operations.
     /// Repository identity and relative logical paths never resolve from this value.
@@ -45,7 +45,7 @@ pub struct CallbackRequest {
 /// stays parseable end-to-end. The CLI assembles the model-visible text at the
 /// transport edge: `result` first, then each reminder wrapped in a
 /// `<system-reminder>` block, in delivery order.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CallbackResponse {
     pub result: String,
     /// Cairn artifact URI for this task's output, if available.

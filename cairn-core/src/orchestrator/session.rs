@@ -771,7 +771,7 @@ fn build_messaging_context(
     }
 
     if !recent.is_empty() {
-        let clock = crate::clock::HostClock::local();
+        let clock = crate::clock::host();
         out.push_str(&format!(
             "### Recent Messages ({})\n\n",
             clock.timezone_name()
@@ -819,12 +819,7 @@ fn compose_user_message_at(
 }
 
 fn compose_user_message(prompt: &str, messaging: &str) -> String {
-    compose_user_message_at(
-        prompt,
-        messaging,
-        &crate::clock::HostClock::local(),
-        chrono::Utc::now(),
-    )
+    compose_user_message_at(prompt, messaging, crate::clock::host(), chrono::Utc::now())
 }
 
 async fn issue_key(
@@ -2745,11 +2740,11 @@ mod tests {
         let compose = |prompt, messaging| compose_user_message_at(prompt, messaging, &clock, now);
         assert_eq!(
             compose("do the thing", "## Agent Messaging\n\nhi"),
-            "[Sat 2025-07-12 21:40 America/Los_Angeles (UTC-7)]\n\ndo the thing\n\n## Agent Messaging\n\nhi"
+            "[Sat 2025-07-12 21:40 PDT (America/Los_Angeles, UTC-7)]\n\ndo the thing\n\n## Agent Messaging\n\nhi"
         );
         assert_eq!(
             compose("", "## Agent Messaging\n\nhi"),
-            "[Sat 2025-07-12 21:40 America/Los_Angeles (UTC-7)]\n\n## Agent Messaging\n\nhi"
+            "[Sat 2025-07-12 21:40 PDT (America/Los_Angeles, UTC-7)]\n\n## Agent Messaging\n\nhi"
         );
         assert_eq!(compose("", ""), "");
     }
@@ -2760,12 +2755,12 @@ mod tests {
         let now = chrono::DateTime::from_timestamp(1_752_381_600, 0).unwrap();
         assert_eq!(
             compose_user_message_at(
-                "[Sat 21:40 — resumed after 3h 12m]\n\ncontinue",
+                "[Sat 21:40 PDT — resumed after 3h 12m]\n\ncontinue",
                 "## Agent Messaging\n\nhi",
                 &clock,
                 now,
             ),
-            "[Sat 21:40 — resumed after 3h 12m]\n\ncontinue\n\n## Agent Messaging\n\nhi"
+            "[Sat 21:40 PDT — resumed after 3h 12m]\n\ncontinue\n\n## Agent Messaging\n\nhi"
         );
     }
 

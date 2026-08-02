@@ -83,6 +83,7 @@ pub use snapshots::store_tool_result_event_with_turn;
 // every user-attributed surface (CAIRN-3175).
 #[cfg(any(test, feature = "test-utils"))]
 pub use snapshots::store_continuation_event_with_turn;
+pub use snapshots::store_launch_event_with_turn;
 pub(crate) use workflow::{
     delete_workflow_run_row, prepare_workflow_run, redispatch_crashed_workflows,
     start_workflow_run, CreateWorkflowRunInput,

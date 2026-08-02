@@ -47,7 +47,7 @@ pub(super) async fn dispatch(
                 // the owning project's database and resolve the workflow node's
                 // job the same way.
                 let db = orch.db.for_project(project).await;
-                let job_id = crate::resources::resolve_todos_job_id(
+                let job_id = crate::resources::resolve_node_or_task_job_id(
                     &db, project, *number, *exec_seq, node_id, None,
                 )
                 .await

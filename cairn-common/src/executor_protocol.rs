@@ -4,6 +4,7 @@
 //! as a separate control message so dropping a runner-side waiter cannot mutate
 //! or ambiguously replay an admitted request.
 
+use crate::protocol::{CallbackRequest, CallbackResponse};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
@@ -206,13 +207,37 @@ pub struct LearnedResourceEstimate {
 /// its work silently treated as immobile in one direction and mobile in the
 /// other, which is the disagreement a version number exists to prevent.
 ///
+/// Bumped to 31 for CAIRN-3385: enrolled executors can relay MCP callback
+/// requests over their authenticated protocol connection. The request and typed
+/// response frames are not understood by older peers, so this is a hard wire
+/// compatibility boundary.
+///
 /// Bumped to 29 for CAIRN-3352: [`ResidencyOperation::MaterializeConflict`] and
 /// its [`ResidencyResult::ConflictMaterialized`] reply. An executor that does not
 /// know the operation would decode it as an unknown variant and fail the whole
 /// message, and — worse — a runner that could not decode the reply would have no
 /// way to distinguish "markers were written" from "nothing happened", which is
 /// precisely the claim the wake is forbidden to make without confirmation.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 30;
+///
+/// Bumped to 32 for CAIRN-3430: [`CellUnavailableReason::SlotUnhealthy`], the
+/// reason an executor gives when it retired the slot that could not take a
+/// batch. A runner that does not know the variant fails to decode the whole
+/// [`CellOutcome`], turning a batch that should be placed again into a decode
+/// error — and the two builds disagree in the way that matters most, since the
+/// entire point of the variant is that it is waited on rather than refused.
+///
+/// Bumped to 33 for CAIRN-3435: [`ResidentProcessKind::Service`] names the
+/// subsystem that placed a process in words, under `name`, where it previously
+/// carried the lease id under `service`. [`ResidencyOperation::StartProcess`]
+/// carries this enum, so a v32 executor requires the retired key and fails to
+/// decode the operation outright — a hard wire boundary, and exactly the
+/// disagreement the handshake exists to refuse before any work is placed.
+///
+/// The same rename is *tolerated* rather than refused on disk, and the
+/// asymmetry is deliberate: a live peer can renegotiate at the handshake and a
+/// persisted cell cannot, so state written by an older executor decodes with
+/// absent words rather than being skipped and orphaning its processes.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 33;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -267,11 +292,45 @@ pub struct ExecutorArtifact {
     pub distribution_id: String,
 }
 
+/// One prebuilt workspace sidecar published alongside the executor.
+///
+/// [`ExecutorArtifact`] is the runner's own dependency — the executor it installs
+/// on a remote machine. These are a different thing that rides the same release:
+/// the `externalBin` binaries (`cairn-cmd`, `cairn-executor`, `cairn-runner`) that
+/// tauri-build demands before `cargo build` of the app crate will run at all. A
+/// checkout without them compiles them from source, which is a full release build
+/// — half an hour on a fresh remote build cell, paid before a single test runs.
+///
+/// They ride the executor's channel rather than one of their own because a second
+/// publication of the same binaries from the same commit is a second thing to keep
+/// in step. `version` is the workspace version stamped into the bytes
+/// (`cairn_common::sidecar_version_stamp!`), so a consumer can name what it got
+/// instead of trusting a file name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarArtifact {
+    /// Workspace crate this binary was built from, e.g. `cairn-runner`.
+    #[serde(rename = "crate")]
+    pub crate_name: String,
+    pub target: String,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorDistributionManifest {
     pub protocol_version: u32,
     pub artifacts: Vec<ExecutorArtifact>,
+    /// Prebuilt source sidecars for this publication.
+    ///
+    /// Defaulted rather than required: manifests published before sidecars rode
+    /// this channel carry no such key, and a runner meeting one must still
+    /// resolve its executor rather than failing to parse the document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<SidecarArtifact>,
 }
 pub const MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 pub const EXECUTOR_PROGRESS_FRESHNESS_MS: u64 = 75_000;
@@ -319,6 +378,54 @@ pub const REQUESTER_LIVENESS_WINDOW_MS: u64 = 3 * EXECUTOR_HEARTBEAT_INTERVAL_MS
 
 const _: () = assert!(REQUESTER_LIVENESS_WINDOW_MS > EXECUTOR_HEARTBEAT_INTERVAL_MS);
 const _: () = assert!(REQUESTER_LIVENESS_WINDOW_MS < EXECUTOR_LINK_STALL_REMEDIATION_MS);
+
+/// How long a stopping `cairn-executor` waits for its own in-flight blocking
+/// work before it exits.
+///
+/// A build cell's authority is a kernel file lock held by the executor process,
+/// and the kernel releases it only when that process is gone. So this is not a
+/// courtesy extended to background maintenance — it is the length of the outage
+/// the successor inherits, because until the outgoing process exits no
+/// replacement can adopt a single held cell. A storage sweep walks the whole
+/// executor home and routinely runs for minutes; waiting for one to finish once
+/// cost the fleet 75 seconds of "no machines are enrolled" (CAIRN-3420).
+/// Reclaim is best effort and its staging protocol already tolerates being
+/// interrupted, so the exit is bounded and a sweep in flight is abandoned
+/// rather than awaited.
+pub const EXECUTOR_SHUTDOWN_BUDGET_MS: u64 = 3_000;
+
+/// The total time a starting `cairn-executor` spends waiting for build cell
+/// authorities its predecessor has not finished releasing.
+///
+/// Contention here is the ordinary shape of a generational handoff rather than
+/// a fault. A kernel lock is never left behind by a dead process, so a contended
+/// authority always means a live holder — and after a runner restart that holder
+/// is the outgoing executor on its way out. Waiting is therefore the correct
+/// response, and it is spent inside one process: a supervisor's restart cadence
+/// is not a retry policy.
+///
+/// One budget for the whole tree rather than one per authority. Forty
+/// authorities each worth a few seconds is how a bounded handoff becomes an
+/// unbounded outage.
+pub const EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS: u64 = 8_000;
+
+/// How long the runner's supervisor waits for a spawned `cairn-executor` to
+/// reach readiness before it declares the startup failed.
+///
+/// Readiness is announced after adoption, so this has to contain a worst-case
+/// handoff wait with room to spare. Sized below it, the supervisor would kill a
+/// successor for patiently doing the right thing.
+pub const EXECUTOR_STARTUP_READY_BUDGET_MS: u64 = 12_000;
+
+// The three budgets above are one chain, and each link must clear the next: an
+// outgoing executor has to be gone before its successor stops waiting for the
+// locks it holds, and that wait has to finish before the supervisor stops
+// waiting for the successor. Ordered any other way the chain manufactures
+// exactly the crash-loop it exists to prevent, which is why the ordering is
+// asserted here rather than trusted to three files that never mention each
+// other.
+const _: () = assert!(EXECUTOR_SHUTDOWN_BUDGET_MS < EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS);
+const _: () = assert!(EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS < EXECUTOR_STARTUP_READY_BUDGET_MS);
 
 /// The attempt id an execution-environment acquisition carries.
 ///
@@ -510,6 +617,63 @@ pub struct ExecutorIdentity {
     pub display_name: String,
 }
 
+/// What one toolchain probe ran, and what came back.
+///
+/// An advertised toolchain set is a claim about a machine, and a claim with no
+/// evidence behind it cannot be checked. This carries the evidence so that
+/// "this machine has no Rust" is distinguishable from "the probe never worked",
+/// which are the same empty list without it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolchainProbe {
+    /// The toolchain this probe decides, spelled as a placement selector's
+    /// `requiredToolchains` spells it.
+    pub toolchain: String,
+    /// The command that was run, verbatim.
+    pub command: String,
+    /// Whether the toolchain ended up advertised.
+    pub detected: bool,
+    /// Where the program resolved on the executor's own PATH. Absent means it
+    /// was not on PATH, which on Windows does not by itself mean unspawnable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
+    /// The verdict in the machine's own words: the version line that proved the
+    /// toolchain works, or the failure the OS or the tool reported.
+    pub detail: String,
+}
+
+/// The evidence behind an executor's advertised toolchain set.
+///
+/// The account is here because it is frequently the entire answer. A per-user
+/// toolchain install belongs to one account, so a machine can hold a working
+/// toolchain that the account the executor runs as cannot reach — a state that
+/// is invisible to anyone reading only the resulting empty list, and which cost
+/// CAIRN-3407 a live investigation to establish.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolchainDetection {
+    /// The OS account the executor runs as, whose PATH and per-user installs
+    /// the probes actually see.
+    pub account: String,
+    /// The home directory the executor's PATH composition was built around.
+    pub home: String,
+    pub probes: Vec<ToolchainProbe>,
+}
+
+impl ToolchainDetection {
+    /// The toolchain names to advertise: exactly those a probe confirmed.
+    ///
+    /// Deriving the advertised set from the probes rather than assembling it
+    /// separately is what keeps the claim and its evidence from disagreeing.
+    pub fn advertised(&self) -> Vec<String> {
+        self.probes
+            .iter()
+            .filter(|probe| probe.detected)
+            .map(|probe| probe.toolchain.clone())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorCapabilities {
@@ -524,6 +688,17 @@ pub struct ExecutorCapabilities {
     pub disk_budget_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_budget_bytes: Option<u64>,
+    /// The evidence behind `toolchains`, absent from an executor built before
+    /// probes were reported.
+    ///
+    /// Additive and defaulted on purpose, so this is not a wire compatibility
+    /// boundary and does not bump [`EXECUTOR_PROTOCOL_VERSION`]: an older peer
+    /// omits the key, a newer runner renders that omission honestly, and
+    /// nothing about placement changes either way. `None` (this peer cannot
+    /// explain itself) and `Some` with no probes (this peer probed nothing) are
+    /// deliberately different facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_detection: Option<ToolchainDetection>,
 }
 
 impl ExecutorCapabilities {
@@ -1176,6 +1351,14 @@ pub enum CellUnavailableReason {
     Checkout,
     Spawn,
     Preparation,
+    /// The slot could not be made fit for this batch, so the executor retired
+    /// it. Distinct from `Preparation` because of what it licenses rather than
+    /// what failed: nothing of the batch ran, and the slot that could not take
+    /// it is out of the pool, so presenting the work again places it on a
+    /// different slot — and, for a batch free to move, possibly a different
+    /// machine. `Preparation` names a fault that the next attempt would meet
+    /// again; this one names a fault the next attempt cannot meet.
+    SlotUnhealthy,
     ExecutorUnavailable,
     NoMatchingExecutor,
     AdmissionRejected {
@@ -1506,6 +1689,11 @@ pub enum ResidentProcessStatus {
 /// This is the typed discriminator a running list needs to label a row without
 /// string-matching prose. It replaces the free-text name and purpose a lease
 /// carried, which described the substrate rather than the work.
+///
+/// Every payload here is something a person can read: a slug someone chose, or
+/// words a subsystem declares about itself. A storage id, a lease key, or a
+/// filesystem path names nobody, and a panel handed one can only fall back to
+/// calling the work anonymous (CAIRN-3435).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "kind",
@@ -1513,11 +1701,41 @@ pub enum ResidentProcessStatus {
     rename_all_fields = "camelCase"
 )]
 pub enum ResidentProcessKind {
-    Service { service: String },
-    Terminal { slug: String },
-    Repl { slug: String },
+    /// A process placed by one of Cairn's own long-lived subsystems.
+    ///
+    /// Both fields default because a `cairn-build-slot-state.json` written
+    /// before services declared an identity carries neither, and a service cell
+    /// that fails to decode is skipped by adoption entirely — its running watch
+    /// left alive but invisible and unaddressable, which is a worse outcome
+    /// than a row that cannot name it. The old shape's `service` key held the
+    /// lease id rather than words, so this deliberately no longer reads it:
+    /// decoding a storage key into `name` would put `channel-imessage` in the
+    /// identity column, which is the thing CAIRN-3435 exists to stop. An empty
+    /// `name` therefore means "recorded before this contract", and the surface
+    /// says so rather than painting the key.
+    Service {
+        /// What a person calls the subsystem that placed this process — the
+        /// words its lease declares, not the id its residency is keyed by
+        /// (that id is on the cell's `ResidencyHolder::Service`).
+        #[serde(default)]
+        name: String,
+        /// What this process does within that service, as a word rather than
+        /// its lease-internal process key.
+        #[serde(default)]
+        role: String,
+    },
+    Terminal {
+        slug: String,
+    },
+    Repl {
+        slug: String,
+    },
     DevInstance,
-    WorkflowRuntime { workflow: String },
+    WorkflowRuntime {
+        /// The workflow's own name — what it is invoked as, not where its
+        /// package happens to live on disk.
+        workflow: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3809,6 +4027,13 @@ pub struct ProcessBatchItemOutcome {
     pub tracked_modifications: Option<TrackedModificationEvidence>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum McpRelayResult {
+    Success { response: CallbackResponse },
+    Rejected { diagnostic: String },
+}
+
 // The protocol keeps request payloads inline so serde preserves the established
 // wire shape; boxing would be an in-memory optimization with a broad API cost.
 #[allow(clippy::large_enum_variant)]
@@ -3955,6 +4180,15 @@ pub enum ExecutorMessage {
         correlation_id: String,
         result: RunnerCallbackResult,
     },
+    McpRelayRequest {
+        correlation_id: String,
+        runner_context_id: String,
+        request: CallbackRequest,
+    },
+    McpRelayResponse {
+        correlation_id: String,
+        result: McpRelayResult,
+    },
     InfrastructureDiagnostic {
         diagnostic: String,
     },
@@ -4045,6 +4279,22 @@ mod tests {
     /// one constant. This pins the reason: the margin has to be short next to
     /// the silence thresholds, because it is spent on an operation whose caller
     /// is still holding a response slot open, not on detecting a dead link.
+    /// The executor handoff is three budgets living in two processes, and it
+    /// only works read in order. Pinning the comparisons here states why each
+    /// one exists rather than leaving the const assertions to speak alone.
+    #[test]
+    fn the_handoff_budgets_nest_from_the_exit_outward() {
+        // An outgoing executor has to be gone -- and the kernel-held cell locks
+        // gone with it -- before its successor stops waiting for them. Sized the
+        // other way, every restart hands the successor a lock it will never see
+        // released (CAIRN-3420).
+        const { assert!(EXECUTOR_SHUTDOWN_BUDGET_MS < EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS) };
+        // And the successor has to finish that wait before the supervisor gives
+        // up on it, or patience during an ordinary handoff reads as a failed
+        // startup and is answered with a kill.
+        const { assert!(EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS < EXECUTOR_STARTUP_READY_BUDGET_MS) };
+    }
+
     #[test]
     fn the_liveness_window_sits_between_a_beat_and_link_remediation() {
         // Long enough that one lost report cannot reap live work, short enough
@@ -4258,6 +4508,32 @@ mod tests {
             ExecutorMessage::CallbackResponse {
                 correlation_id: "c".into(),
                 result: RunnerCallbackResult::Completed,
+            },
+            ExecutorMessage::McpRelayRequest {
+                correlation_id: "mcp-request".into(),
+                runner_context_id: "ctx".into(),
+                request: CallbackRequest {
+                    cwd: "/tmp/worktree".into(),
+                    run_id: Some("run".into()),
+                    tool: "read".into(),
+                    payload: serde_json::json!({"paths": ["cairn:~/todos"]}),
+                    ..CallbackRequest::default()
+                },
+            },
+            ExecutorMessage::McpRelayResponse {
+                correlation_id: "mcp-success".into(),
+                result: McpRelayResult::Success {
+                    response: CallbackResponse {
+                        result: "ok".into(),
+                        ..CallbackResponse::default()
+                    },
+                },
+            },
+            ExecutorMessage::McpRelayResponse {
+                correlation_id: "mcp-rejected".into(),
+                result: McpRelayResult::Rejected {
+                    diagnostic: "context expired".into(),
+                },
             },
             ExecutorMessage::InfrastructureDiagnostic {
                 diagnostic: "lost".into(),
@@ -4774,6 +5050,7 @@ mod tests {
                 projects_served: vec!["p".into()],
                 disk_budget_bytes: Some(10),
                 memory_budget_bytes: None,
+                toolchain_detection: None,
             },
             current_load: 1,
             warm_roots: vec![VerifiedWarmRoot {
@@ -4937,6 +5214,38 @@ mod tests {
         );
     }
 
+    /// Probe evidence is additive, not a wire boundary. An executor built before
+    /// it existed omits the key, and that has to decode as "this peer cannot
+    /// explain itself" rather than failing the whole advertisement — the entire
+    /// reason this field does not bump [`EXECUTOR_PROTOCOL_VERSION`].
+    #[test]
+    fn capabilities_without_probe_evidence_still_decode() {
+        let older = serde_json::json!({
+            "os": "windows",
+            "arch": "x86_64",
+            "logicalCores": 4,
+            "toolchains": [],
+            "projectsServed": [],
+        });
+        let decoded: ExecutorCapabilities = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.toolchain_detection, None);
+
+        // And an executor that probed and found nothing is a different fact,
+        // which survives the same round trip.
+        let probed = ExecutorCapabilities {
+            toolchain_detection: Some(ToolchainDetection {
+                account: "mitch".into(),
+                home: "C:\\Users\\mitch".into(),
+                probes: Vec::new(),
+            }),
+            ..decoded
+        };
+        let round_tripped: ExecutorCapabilities =
+            serde_json::from_str(&serde_json::to_string(&probed).unwrap()).unwrap();
+        assert_eq!(round_tripped, probed);
+        assert!(round_tripped.toolchain_detection.is_some());
+    }
+
     /// The public selector carries no opaque identity, and a caller reaching for
     /// the retired keys is refused rather than silently placed anywhere.
     #[test]
@@ -5071,6 +5380,46 @@ mod tests {
                 },
                 owner_ref,
                 selector: Some(selector.into()),
+                events: Vec::new(),
+                ..template
+                    .residency
+                    .clone()
+                    .expect("template holds a residency")
+            }),
+            occupancy: CellOccupancy {
+                command: None,
+                processes,
+            },
+            ..template.clone()
+        }
+    }
+
+    /// A cell held by a placed service, with the service's watch running in it.
+    ///
+    /// This is the CAIRN-3435 specimen: a service residency carries no owner
+    /// ref, because a channel watch belongs to no issue, so the panel has only
+    /// what the process itself declares to attribute it by. The desktop fixture
+    /// needs it to prove Cairn-placed work never renders as anonymous.
+    fn service_cell(cell_id: &str, template: &PersistentCellState) -> PersistentCellState {
+        let mut processes = std::collections::BTreeMap::new();
+        processes.insert(
+            "imsg-watch".to_string(),
+            sample_resident_process(ResidentProcessKind::Service {
+                name: "iMessage channel".into(),
+                role: "watch".into(),
+            }),
+        );
+        PersistentCellState {
+            cell_id: cell_id.into(),
+            residency: Some(CellResidency {
+                holder: ResidencyHolder::Service {
+                    service_id: "channel-imessage".into(),
+                },
+                repository: RepositoryLocator::ScratchOnly {
+                    owner_id: "channel-imessage".into(),
+                },
+                owner_ref: None,
+                selector: None,
                 events: Vec::new(),
                 ..template
                     .residency
@@ -5365,6 +5714,7 @@ mod tests {
             &cell,
         );
         let detached = dev_instance_cell("slot-3", DEV_INSTANCE_COMMIT, None, &cell);
+        let service = service_cell("slot-4", &cell);
         SubstrateHealthSnapshot {
             schema_version: SUBSTRATE_HEALTH_SCHEMA_VERSION,
             captured_at_unix_ms: 42,
@@ -5499,7 +5849,7 @@ mod tests {
             },
             inventory,
             fleet: FleetSnapshot {
-                cells: vec![cell, branched, detached],
+                cells: vec![cell, branched, detached, service],
                 queued_requests: vec![QueuedCellRequest {
                     admission_kind: CellAdmissionKind::Residency,
                     executor_id: "executor-a".into(),
@@ -5708,6 +6058,71 @@ mod tests {
              rerun the desktop tests that read it.",
             path.display()
         );
+    }
+
+    /// The retired key is not an alias, for the same reason the placement
+    /// selector's is not: a v31 executor requires `service` and would fail to
+    /// decode a `StartProcess` naming `name`, so the version number moved with
+    /// the field and the handshake refuses that peer before it is asked to
+    /// place anything.
+    ///
+    /// On disk the same shape is tolerated instead — see the adoption test
+    /// below. A live peer can renegotiate and a persisted cell cannot, so the
+    /// old key is ignored there rather than refused, and never becomes the
+    /// words a person reads.
+    #[test]
+    fn the_retired_service_key_is_not_decoded_as_an_identity() {
+        const { assert!(EXECUTOR_PROTOCOL_VERSION >= 33) };
+        let kind = ResidentProcessKind::Service {
+            name: "iMessage channel".into(),
+            role: "watch".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::json!({"kind": "service", "name": "iMessage channel", "role": "watch"}),
+            "the wire carries the words, and carries them under the new key alone"
+        );
+        assert_eq!(
+            serde_json::from_value::<ResidentProcessKind>(
+                serde_json::json!({"kind": "service", "service": "channel-imessage"})
+            )
+            .unwrap(),
+            ResidentProcessKind::Service {
+                name: String::new(),
+                role: String::new(),
+            },
+            "a lease id must never be adopted as somebody's identity"
+        );
+    }
+
+    /// A service process recorded before services declared an identity must
+    /// still decode, for the same reason the camelCase case must: adoption
+    /// skips a cell it cannot decode, and the operator whose iMessage watch
+    /// prompted CAIRN-3435 has exactly this shape on disk right now. Skipping
+    /// it would leave that watch running, invisible, and unaddressable.
+    ///
+    /// The old `service` key held the lease id, not words. It is deliberately
+    /// not read into `name`: a row saying `channel-imessage` would be this
+    /// issue's own bug wearing a different string. Absent words decode as
+    /// absent, and the surface degrades honestly.
+    #[test]
+    fn a_service_process_predating_the_identity_contract_still_decodes() {
+        let persisted = serde_json::json!({
+            "generation": 1,
+            "kind": { "kind": "service", "service": "channel-imessage" },
+            "status": { "status": "running", "startedAtUnixMs": 1_785_124_970_255_u64 }
+        });
+        let decoded = serde_json::from_value::<ResidentProcess>(persisted)
+            .expect("a service cell that cannot decode is a service cell adoption orphans");
+        assert_eq!(
+            decoded.kind,
+            ResidentProcessKind::Service {
+                name: String::new(),
+                role: String::new(),
+            },
+            "the lease id must not arrive as the words a person reads"
+        );
+        assert!(decoded.is_live());
     }
 
     /// The three keys `useBuildFabric` reads off a resident process to decide

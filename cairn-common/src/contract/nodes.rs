@@ -252,9 +252,9 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
     mutations: &[MutationSpec {
         mode: ChangeMode::Patch,
         required: &[REBASE_ACTION],
-        optional: &[REBASE_FINGERPRINT],
+        optional: &[REBASE_FINGERPRINT, REBASE_RESOLUTION],
         label: "ask the store to replay this branch onto its base",
-        example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\"}}]})",
+        example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]})",
     }],
 };
 

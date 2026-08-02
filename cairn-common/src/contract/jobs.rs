@@ -76,7 +76,7 @@ pub(crate) const NODE_WAKES_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Append,
                 required: &[],
-                optional: &[KeySpec::new("subscribe", KeyType::Object, "source filter; kind:\"terminal\" resumes the node when a terminal exits"), KeySpec::new("mute", KeyType::Object, "source filter"), KeySpec::new("until", KeyType::Object, "source filter that lifts the mute")],
+                optional: &[KeySpec::new("subscribe", KeyType::Object, "source filter; kind:\"terminal\" resumes the node when a terminal exits, kind:\"checks\" when a node's project check lanes settle (ref defaults to your own node)"), KeySpec::new("mute", KeyType::Object, "source filter"), KeySpec::new("until", KeyType::Object, "source filter that lifts the mute")],
                 label: "subscribe or mute wakes",
                 example: "write({changes:[{target:\"cairn:~/wakes\",mode:\"append\",payload:{subscribe:{kind:\"terminal\",ref:\"cairn:~/terminal/<slug>\",on:\"exit\"}}}]})",
             },

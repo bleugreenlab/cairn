@@ -5,6 +5,7 @@
 //! mutation sealing exist only in the executor process.
 
 pub mod management;
+pub(crate) mod occupancy;
 pub(crate) mod placement;
 pub(crate) mod residency;
 mod resource_profiles;
@@ -59,14 +60,20 @@ pub struct FleetConfig {
     /// a request waits: it is the requester's answer to "when does this result
     /// stop being wanted", carried onto the queue entry and honoured there.
     ///
-    /// The old spelling is accepted so an existing settings file still loads,
-    /// but the number it named meant something else — twenty seconds of queue
-    /// budget that a ten-minute executor-side pause then quietly compensated for.
-    /// The default here is the wait that arrangement actually produced.
-    #[serde(
-        default = "default_capacity_wait_horizon_seconds",
-        alias = "acquisitionDeadlineSeconds"
-    )]
+    /// Read it through [`FleetConfig::capacity_wait_horizon_ms`], never
+    /// directly: a value below [`MIN_CAPACITY_WAIT_HORIZON_SECONDS`] is not a
+    /// policy anyone chose, and that accessor is where it is refused.
+    ///
+    /// The retired spelling `acquisitionDeadlineSeconds` is deliberately NOT
+    /// aliased. It named a different quantity — twenty seconds of per-attempt
+    /// queue budget that a ten-minute executor-side pause then quietly
+    /// compensated for — and CAIRN-3268 changed the meaning by a factor of
+    /// thirty. An alias migrates a spelling; it cannot migrate a semantics. So
+    /// the retired key is ignored and the default applies, because inheriting
+    /// the old number under the new name is how a fleet came to abandon every
+    /// check after twenty seconds while its settings file looked deliberate
+    /// (CAIRN-3429).
+    #[serde(default = "default_capacity_wait_horizon_seconds")]
     pub(crate) capacity_wait_horizon_seconds: u64,
     #[serde(default = "default_timeout_seconds")]
     pub(crate) default_timeout_seconds: u64,
@@ -290,7 +297,48 @@ fn is_safe_executor_id(value: &str) -> bool {
 }
 
 impl FleetConfig {
+    /// Replace a wait horizon that is a leftover rather than a policy, at the
+    /// one moment the config is read from disk.
+    ///
+    /// Healing on load rather than at each use, so that every consumer — the
+    /// scheduler, the settings API, the Fleet editor the operator is looking at
+    /// — sees one effective number. A value corrected only where it is spent
+    /// would leave the operator reading 20 in a form whose save button then
+    /// refuses it.
+    ///
+    /// Raising rather than refusing, because this is state that already exists
+    /// on disk: refusing would take the fleet down over a number nobody chose,
+    /// and honouring it would keep the fleet abandoning work in twenty seconds.
+    /// The log line is how the operator learns their file says something they
+    /// did not mean; [`Self::validate`] is what keeps a new one from being
+    /// written, and the file itself heals on the next fleet-settings save.
+    pub(crate) fn healed(mut self) -> Self {
+        if self.capacity_wait_horizon_seconds < MIN_CAPACITY_WAIT_HORIZON_SECONDS {
+            log::warn!(
+                "settings.yaml buildSlots.capacityWaitHorizonSeconds is {}, below the {MIN_CAPACITY_WAIT_HORIZON_SECONDS}s floor; \
+                 using {}s instead. A value this small is usually a pre-CAIRN-3268 acquisitionDeadlineSeconds \
+                 carried across the rename, where it meant a per-attempt queue budget rather than a total wait.",
+                self.capacity_wait_horizon_seconds,
+                default_capacity_wait_horizon_seconds(),
+            );
+            self.capacity_wait_horizon_seconds = default_capacity_wait_horizon_seconds();
+        }
+        self
+    }
+
+    /// The horizon a caller with no tighter answer of its own waits on.
+    pub(crate) fn capacity_wait_horizon_ms(&self) -> u64 {
+        self.capacity_wait_horizon_seconds.saturating_mul(1_000)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        if self.capacity_wait_horizon_seconds < MIN_CAPACITY_WAIT_HORIZON_SECONDS {
+            return Err(format!(
+                "capacityWaitHorizonSeconds must be at least {MIN_CAPACITY_WAIT_HORIZON_SECONDS}: \
+                 a shorter horizon cannot outlast one ordinary unit of work finishing, so it refuses \
+                 every request the machine is merely busy for"
+            ));
+        }
         let mut device_ids = HashSet::new();
         let mut names: HashMap<String, String> = HashMap::new();
         for (executor_id, remote) in &self.remote_executors {
@@ -448,6 +496,22 @@ impl Default for FleetConfig {
 fn default_capacity_wait_horizon_seconds() -> u64 {
     10 * 60
 }
+
+/// The shortest wait horizon that can be a policy rather than a leftover.
+///
+/// Below this the number stops describing patience and starts guaranteeing
+/// refusal: the fleet's own placement, provisioning, and admission round trip
+/// takes seconds on an idle machine, so a horizon under a minute cannot outlast
+/// even one ordinary unit of work finishing. Every caller that reaches this
+/// default is one with no tighter answer of its own — a terminal, a REPL, a dev
+/// instance — and none of them means "give up before anything could plausibly
+/// free".
+///
+/// It exists because a persisted twenty, carried across CAIRN-3268's rename
+/// from a field that meant something else, is indistinguishable afterwards from
+/// a number an operator typed. This floor is what tells them apart, and
+/// [`FleetConfig::validate`] is what stops a new one being written.
+pub(crate) const MIN_CAPACITY_WAIT_HORIZON_SECONDS: u64 = 60;
 fn default_timeout_seconds() -> u64 {
     30 * 60
 }
@@ -464,7 +528,7 @@ fn default_timeout_seconds() -> u64 {
 /// from the item timeouts the agent declared, because a batch that bounded all of
 /// its work said what that work is worth.
 pub(crate) fn default_wait_horizon_unix_ms(config: &FleetConfig) -> u64 {
-    unix_time_ms().saturating_add(config.capacity_wait_horizon_seconds.saturating_mul(1_000))
+    unix_time_ms().saturating_add(config.capacity_wait_horizon_ms())
 }
 
 type RequestIdentity = (String, String);
@@ -543,6 +607,10 @@ pub(crate) struct PublicationCoordination {
 struct PublicationState {
     claimed: AtomicBool,
     published: AtomicBool,
+    /// What the publisher recorded, so every coalesced sibling can name the same
+    /// observation. Written before `published` is set and read after it is
+    /// observed, so the release/acquire pair also publishes this value.
+    observation: std::sync::Mutex<Option<crate::execution::cache::RecordedCheckObservation>>,
     notify: Notify,
 }
 
@@ -553,7 +621,10 @@ pub(crate) struct PublicationGuard {
 
 pub(crate) enum PublicationRole {
     Publisher(PublicationGuard),
-    Published,
+    /// A sibling already recorded this verdict, and named the observation it
+    /// wrote. `None` means it recorded nothing — the write failed, and the
+    /// verdict stands without a durable row behind it.
+    Published(Option<crate::execution::cache::RecordedCheckObservation>),
 }
 
 pub(crate) struct CoalescedCellOutcome {
@@ -572,6 +643,7 @@ impl PublicationCoordination {
             state: Arc::new(PublicationState {
                 claimed: AtomicBool::new(false),
                 published: AtomicBool::new(false),
+                observation: std::sync::Mutex::new(None),
                 notify: Notify::new(),
             }),
         }
@@ -580,7 +652,7 @@ impl PublicationCoordination {
     pub(crate) async fn acquire(&self) -> PublicationRole {
         loop {
             if self.state.published.load(Ordering::Acquire) {
-                return PublicationRole::Published;
+                return PublicationRole::Published(self.state.observation.lock().unwrap().clone());
             }
             if self
                 .state
@@ -599,7 +671,13 @@ impl PublicationCoordination {
 }
 
 impl PublicationGuard {
-    pub(crate) fn published(mut self) {
+    /// Declare this verdict recorded, naming the observation written for it so a
+    /// coalesced sibling reports the same row rather than none.
+    pub(crate) fn published(
+        mut self,
+        observation: Option<crate::execution::cache::RecordedCheckObservation>,
+    ) {
+        *self.coordination.state.observation.lock().unwrap() = observation;
         self.coordination
             .state
             .published
@@ -743,6 +821,17 @@ struct RunnerCallbackContext {
     /// answers a cell's sandbox denial with a read-only-checkout explanation
     /// instead of the fence prompt the agent's dial asked for.
     live_checkout: bool,
+    /// The only executor session allowed to exercise this short-lived capability.
+    /// Populated after placement and before the process batch is submitted.
+    executor_binding: Option<RunnerContextExecutorBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunnerContextExecutorBinding {
+    executor_id: String,
+    generation: u64,
+    request_id: String,
+    attempt_id: String,
 }
 
 /// Whether a submitted batch runs in the project's externally owned live
@@ -827,6 +916,158 @@ struct PersistentResidencyRoutes {
 }
 
 impl Fleet {
+    /// Authorize one MCP request relayed by an executor-local callback endpoint.
+    ///
+    /// The context token is a capability, but possession is not sufficient: it
+    /// is bound to the executor session selected for the originating process
+    /// batch, and the independently carried run identity must still match.
+    pub fn authorize_mcp_relay(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        runner_context_id: &str,
+        request: &cairn_common::protocol::CallbackRequest,
+    ) -> Result<(), String> {
+        if request.thread_id.is_some() {
+            return Err("relayed MCP requests cannot select a thread identity".into());
+        }
+        let contexts = self.runner_contexts.lock().unwrap();
+        let context = contexts
+            .get(runner_context_id)
+            .ok_or_else(|| "unknown or expired runner callback context".to_string())?;
+        let binding = context.executor_binding.as_ref().ok_or_else(|| {
+            "runner callback context is not bound to an active process batch".to_string()
+        })?;
+        if binding.executor_id != executor_id || binding.generation != generation {
+            return Err("runner callback context belongs to a different executor session".into());
+        }
+        let expected_run_id = context
+            .request
+            .as_ref()
+            .and_then(|request| request.run_id.as_deref())
+            .or_else(|| {
+                context
+                    .run_context
+                    .as_ref()
+                    .map(|context| context.run_id.as_str())
+            });
+        if request.run_id.as_deref() != expected_run_id || expected_run_id.is_none() {
+            return Err("relayed MCP request run identity does not match its process batch".into());
+        }
+        Ok(())
+    }
+
+    fn bind_runner_context(
+        &self,
+        batch: Option<&ProcessBatch>,
+        request: &CellRequest,
+        executor_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        let Some(context_id) = batch.and_then(|batch| batch.runner_context_id.as_deref()) else {
+            return Ok(());
+        };
+        let mut contexts = self.runner_contexts.lock().unwrap();
+        let context = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| "process batch names an unknown runner callback context".to_string())?;
+        context.executor_binding = Some(RunnerContextExecutorBinding {
+            executor_id: executor_id.to_string(),
+            generation,
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+        });
+        Ok(())
+    }
+
+    pub fn revoke_runner_contexts_for_request(
+        &self,
+        request_id: &str,
+        attempt_id: &str,
+    ) -> Vec<String> {
+        let mut revoked = Vec::new();
+        self.runner_contexts.lock().unwrap().retain(|id, context| {
+            let matches = context.executor_binding.as_ref().is_some_and(|binding| {
+                binding.request_id == request_id && binding.attempt_id == attempt_id
+            });
+            if matches {
+                revoked.push(id.clone());
+            }
+            !matches
+        });
+        revoked
+    }
+
+    pub fn revoke_mcp_relay_contexts_for_executor(
+        &self,
+        executor_id: &str,
+        generation: u64,
+    ) -> Vec<String> {
+        let mut revoked = Vec::new();
+        self.runner_contexts.lock().unwrap().retain(|id, context| {
+            let matches = context.executor_binding.as_ref().is_some_and(|binding| {
+                binding.executor_id == executor_id && binding.generation == generation
+            });
+            if matches {
+                revoked.push(id.clone());
+            }
+            !matches
+        });
+        revoked
+    }
+
+    /// Whether a resident-process event still describes live work.
+    ///
+    /// The cached cell snapshot cannot answer that question by existence. A
+    /// snapshot and a process event are two streams out of one executor with no
+    /// ordering between them — the executor's protocol writer selects over its
+    /// control channel and its event channel — so an event routinely reaches
+    /// the runner before the snapshot that would vouch for it. Requiring the
+    /// snapshot to already name the process at that generation made delivery a
+    /// coin flip for processes whose whole life is shorter than that skew, and
+    /// the event most often lost is the exit, which is the one a caller is
+    /// parked on (CAIRN-3444).
+    ///
+    /// So the snapshot is consulted for what it can answer: contradiction, not
+    /// existence. An event is refused when the runner knows something strictly
+    /// newer at the same address — a later cell epoch for that holder, or a
+    /// later generation at that process key — and admitted otherwise. Every
+    /// subscriber matches the exact fence and generation it holds, so precision
+    /// lives there; this gate exists to keep a superseded or foreign link's
+    /// events from reaching any of them.
+    fn resident_event_is_current(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        event: &ResidentProcessEvent,
+    ) -> bool {
+        let connections = self.connections.lock().unwrap();
+        let Some(connection) = connections
+            .get(executor_id)
+            .filter(|connection| connection.generation == generation)
+        else {
+            return false;
+        };
+        !connection.snapshot.cells.iter().any(|cell| {
+            let holds_event = cell
+                .residency
+                .as_ref()
+                .is_some_and(|residency| residency.holder == event.holder);
+            if !holds_event {
+                return false;
+            }
+            if cell.cell_epoch > event.cell_epoch {
+                return true;
+            }
+            cell.cell_epoch == event.cell_epoch
+                && cell
+                    .occupancy
+                    .processes
+                    .get(&event.process_key)
+                    .is_some_and(|process| process.generation > event.process_generation)
+        })
+    }
+
     pub(crate) fn subscribe_resident_process_events(
         &self,
         subscriber: impl Fn(ResidentProcessEvent) + Send + Sync + 'static,
@@ -1137,6 +1378,7 @@ impl Fleet {
                 projects_served: Vec::new(),
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
+                toolchain_detection: None,
             },
             current_load: 0,
             warm_roots: Vec::new(),
@@ -1734,6 +1976,7 @@ impl Fleet {
                         self.pending.lock().unwrap().insert(key, pending);
                         return false;
                     }
+                    let _ = self.revoke_runner_contexts_for_request(&key.0, &key.1);
                     if let CellOutcome::Completed { metadata, .. } = &mut outcome {
                         let canonical = self
                             .connections
@@ -1804,29 +2047,7 @@ impl Fleet {
                 false
             }
             ExecutorMessage::ResidentProcessEvent { event } => {
-                let valid = self
-                    .connections
-                    .lock()
-                    .unwrap()
-                    .get(executor_id)
-                    .filter(|connection| connection.generation == generation)
-                    .is_some_and(|connection| {
-                        connection.snapshot.cells.iter().any(|cell| {
-                            cell.cell_epoch == event.cell_epoch
-                                && cell.residency.as_ref().is_some_and(|residency| {
-                                    residency.holder == event.holder
-                                        && residency.incarnation_id == event.incarnation_id
-                                })
-                                && cell
-                                    .occupancy
-                                    .processes
-                                    .get(&event.process_key)
-                                    .is_some_and(|process| {
-                                        process.generation == event.process_generation
-                                    })
-                        })
-                    });
-                if valid {
+                if self.resident_event_is_current(executor_id, generation, &event) {
                     for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
                         subscriber(event.clone());
                     }
@@ -2456,6 +2677,42 @@ impl Fleet {
                 cell_epoch: selected.7,
             },
         })
+    }
+
+    /// What Cairn's own running work says about when the machines a batch could
+    /// use will have room.
+    ///
+    /// Read per machine and then combined, rather than from the aggregate
+    /// snapshot, because the aggregate deliberately loses executor attribution:
+    /// "something somewhere finishes in ninety seconds" is not an answer to
+    /// "when will THIS batch's machine have room".
+    ///
+    /// Eligibility is [`candidate_rejection`], the same relation placement
+    /// itself applies — never a subset of it. A machine that matches the
+    /// selector but does not serve the project, or whose link has closed, is one
+    /// the work will never reach, and a forecast that read it would hand the
+    /// batch a shorter wait than its real blocker needs, surface a refusal while
+    /// that blocker was still finite, and print the wrong occupant's name on the
+    /// row that went red. That is the failure this policy exists to end, so it
+    /// must not be reintroduced by approximating where work can go.
+    ///
+    /// This reads placement state and takes no reservation. Which request is
+    /// admitted, and when, remains the executor's try_admit alone (CAIRN-3268);
+    /// a forecast only tells a caller how long its own patience is worth.
+    pub(crate) fn occupancy_for(&self, scope: PlacementScope<'_>) -> occupancy::MachineOccupancy {
+        let now_unix_ms = unix_time_ms();
+        let connections = self.connections.lock().unwrap();
+        connections
+            .values()
+            .filter(|connection| candidate_rejection(connection, scope).is_none())
+            .map(|connection| {
+                occupancy::MachineOccupancy::read(
+                    &connection.snapshot.executing_requests,
+                    now_unix_ms,
+                )
+            })
+            .reduce(occupancy::MachineOccupancy::or_earlier)
+            .unwrap_or(occupancy::MachineOccupancy::Unforecastable)
     }
 
     pub fn snapshot(&self) -> FleetSnapshot {
@@ -3788,6 +4045,7 @@ impl Fleet {
                         run_context: Some(run_context),
                         check_status_board: None,
                         live_checkout: false,
+                        executor_binding: None,
                     },
                 );
                 id
@@ -3954,6 +4212,7 @@ impl Fleet {
                 run_context: batch.run_context.clone(),
                 check_status_board: None,
                 live_checkout: runs_in_live_checkout(&request.repository),
+                executor_binding: None,
             },
         );
         let sandbox_mode = Self::batch_sandbox_mode(
@@ -4010,6 +4269,7 @@ impl Fleet {
                 run_context,
                 check_status_board,
                 live_checkout: false,
+                executor_binding: None,
             },
         );
         let batch = Self::check_process_batch(items, Some(runner_context_id.clone()));
@@ -4393,6 +4653,16 @@ impl Fleet {
             &executor_config,
             selected.colocated,
         );
+        if let Err(diagnostic) = self.bind_runner_context(
+            batch.as_ref(),
+            &request,
+            &selected.executor_id,
+            selected.generation,
+        ) {
+            self.pending.lock().unwrap().remove(&key);
+            guard.disarm();
+            return executor_unavailable(diagnostic);
+        }
         let configured = selected
             .sender
             .send(ExecutorMessage::Configure {
@@ -5062,10 +5332,103 @@ struct CandidateSurvey<'a> {
     rejected: Vec<PlacementRejection>,
 }
 
-/// Apply the filters that are facts rather than judgement: a closed link, a pin
-/// that points elsewhere, a project this machine does not serve, a selector it
-/// does not satisfy, conservative work on a machine that is not the home, a
-/// repository that cannot be recreated from objects.
+/// The facts about a piece of work that decide which machines could
+/// structurally take it.
+///
+/// Borrowed from a [`CellRequest`] at placement, and stated directly by a caller
+/// that asks the same question before a request exists. An occupancy forecast is
+/// exactly that caller: it must read only the machines the work could land on,
+/// and "could land on" has to be the one relation placement uses or the two
+/// answers drift — a forecast scoped more loosely than placement predicts relief
+/// from a machine the work will never reach (CAIRN-3429).
+#[derive(Clone, Copy)]
+pub(crate) struct PlacementScope<'a> {
+    pub(crate) project_id: &'a str,
+    pub(crate) repository: &'a RepositoryLocator,
+    pub(crate) selector: Option<&'a ExecutorSelector>,
+    pub(crate) pinned_executor_id: Option<&'a str>,
+    pub(crate) mobility: PlacementMobility,
+}
+
+impl<'a> PlacementScope<'a> {
+    fn of(request: &'a CellRequest) -> Self {
+        Self {
+            project_id: &request.project_id,
+            repository: &request.repository,
+            selector: request
+                .executor
+                .as_ref()
+                .filter(|selector| !selector.is_empty()),
+            pinned_executor_id: request.pinned_executor_id.as_deref(),
+            mobility: request.placement_mobility,
+        }
+    }
+
+    /// Whether the work named where it must run, by machine or by platform.
+    /// Targeted work is not held to the colocated default, because naming a
+    /// machine IS the permission to leave home.
+    fn targeted(&self) -> bool {
+        self.selector.is_some() || self.pinned_executor_id.is_some()
+    }
+}
+
+/// Why one machine cannot structurally take this work, or `None` if it could.
+///
+/// The filters that are facts rather than judgement: a closed link, a pin that
+/// points elsewhere, a project this machine does not serve, a selector it does
+/// not satisfy, conservative work on a machine that is not the home, a
+/// repository that cannot be recreated from objects. Ranking never reaches a
+/// machine this rejects.
+///
+/// This is THE eligibility relation. Anything that needs to know where work
+/// could go asks here rather than approximating with a subset of these clauses
+/// — a forecast that checked only the selector would happily read a machine that
+/// does not serve the project.
+fn candidate_rejection(
+    entry: &ExecutorConnectionState,
+    scope: PlacementScope<'_>,
+) -> Option<PlacementRejectionReason> {
+    if entry.sender.is_closed() {
+        Some(PlacementRejectionReason::ConnectionClosed)
+    } else if scope
+        .pinned_executor_id
+        .is_some_and(|id| id != entry.identity.executor_id)
+    {
+        Some(PlacementRejectionReason::PinMismatch {
+            pinned_executor_id: scope.pinned_executor_id.unwrap_or_default().to_string(),
+        })
+    } else if !serves_project(entry, scope.project_id) {
+        Some(PlacementRejectionReason::ProjectUnavailable {
+            project_id: scope.project_id.to_string(),
+        })
+    } else if scope
+        .selector
+        .is_some_and(|selector| !matches_selector(entry, selector))
+    {
+        Some(PlacementRejectionReason::SelectorMismatch {
+            requested: scope
+                .selector
+                .map(|selector| selector.describe())
+                .unwrap_or_default(),
+        })
+    } else if !scope.targeted() && !entry.colocated && !scope.mobility.may_spill() {
+        // Untargeted work that has not been declared mobile stays on the
+        // machine holding the runner's own checkout. Absence of a selector is
+        // not permission to move.
+        Some(PlacementRejectionReason::NotColocated)
+    } else if !entry.colocated && !repository_is_transferable(scope.repository) {
+        // A checkout that already exists on one machine cannot be recreated
+        // from managed objects on another.
+        Some(PlacementRejectionReason::RepositoryNotTransferable {
+            locator: repository_locator_name(scope.repository).into(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Every machine that could structurally take this work, and every one that
+/// could not with the reason.
 ///
 /// Separate from ranking so that estimating what the work costs only ever
 /// happens for machines that could actually take it. A request waiting for an
@@ -5074,12 +5437,8 @@ fn survey_candidates<'a>(
     connections: &'a HashMap<String, ExecutorConnectionState>,
     request: &CellRequest,
 ) -> Result<CandidateSurvey<'a>, String> {
-    let selector = request
-        .executor
-        .as_ref()
-        .filter(|selector| !selector.is_empty());
-    let pinned = request.pinned_executor_id.as_deref();
-    let targeted = selector.is_some() || pinned.is_some();
+    let scope = PlacementScope::of(request);
+    let targeted = scope.targeted();
 
     // Deterministic order in, deterministic rejections out: an operator reading
     // two decisions about the same fleet must not see the machines reshuffle.
@@ -5089,37 +5448,7 @@ fn survey_candidates<'a>(
     let mut usable = Vec::new();
     let mut rejected = Vec::new();
     for entry in ordered {
-        let reason = if entry.sender.is_closed() {
-            Some(PlacementRejectionReason::ConnectionClosed)
-        } else if pinned.is_some_and(|id| id != entry.identity.executor_id) {
-            Some(PlacementRejectionReason::PinMismatch {
-                pinned_executor_id: pinned.unwrap_or_default().to_string(),
-            })
-        } else if !serves_project(entry, &request.project_id) {
-            Some(PlacementRejectionReason::ProjectUnavailable {
-                project_id: request.project_id.clone(),
-            })
-        } else if selector.is_some_and(|selector| !matches_selector(entry, selector)) {
-            Some(PlacementRejectionReason::SelectorMismatch {
-                requested: selector
-                    .map(|selector| selector.describe())
-                    .unwrap_or_default(),
-            })
-        } else if !targeted && !entry.colocated && !request.placement_mobility.may_spill() {
-            // Untargeted work that has not been declared mobile stays on the
-            // machine holding the runner's own checkout. Absence of a selector is
-            // not permission to move.
-            Some(PlacementRejectionReason::NotColocated)
-        } else if !entry.colocated && !repository_is_transferable(&request.repository) {
-            // A checkout that already exists on one machine cannot be recreated
-            // from managed objects on another.
-            Some(PlacementRejectionReason::RepositoryNotTransferable {
-                locator: repository_locator_name(&request.repository).into(),
-            })
-        } else {
-            None
-        };
-        match reason {
+        match candidate_rejection(entry, scope) {
             Some(reason) => rejected.push(PlacementRejection {
                 executor_name: executor_public_name(entry),
                 executor_id: entry.identity.executor_id.clone(),
@@ -6207,6 +6536,73 @@ mod tests {
         EXECUTOR_LINK_STALL_REMEDIATION_MS,
     };
 
+    fn relay_request(run_id: Option<&str>) -> cairn_common::protocol::CallbackRequest {
+        cairn_common::protocol::CallbackRequest {
+            cwd: "/tmp/worktree".into(),
+            run_id: run_id.map(str::to_string),
+            tool: "read".into(),
+            payload: serde_json::json!({"paths": ["cairn:~/todos"]}),
+            ..Default::default()
+        }
+    }
+
+    fn insert_bound_relay_context(pool: &Fleet) {
+        pool.runner_contexts.lock().unwrap().insert(
+            "context".into(),
+            RunnerCallbackContext {
+                request: Some(relay_request(Some("run-1"))),
+                run_context: None,
+                check_status_board: None,
+                live_checkout: false,
+                executor_binding: Some(RunnerContextExecutorBinding {
+                    executor_id: "executor-1".into(),
+                    generation: 7,
+                    request_id: "request-1".into(),
+                    attempt_id: "attempt-1".into(),
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn mcp_relay_authorization_binds_context_executor_generation_and_run() {
+        let pool = Fleet::default();
+        insert_bound_relay_context(&pool);
+
+        assert!(pool
+            .authorize_mcp_relay("executor-1", 7, "context", &relay_request(Some("run-1")))
+            .is_ok());
+        for (executor, generation, context, run_id) in [
+            ("executor-2", 7, "context", Some("run-1")),
+            ("executor-1", 8, "context", Some("run-1")),
+            ("executor-1", 7, "unknown", Some("run-1")),
+            ("executor-1", 7, "context", Some("run-2")),
+            ("executor-1", 7, "context", None),
+        ] {
+            assert!(pool
+                .authorize_mcp_relay(executor, generation, context, &relay_request(run_id))
+                .is_err());
+        }
+
+        let mut foreign_thread = relay_request(Some("run-1"));
+        foreign_thread.thread_id = Some("thread-owned-by-another-run".into());
+        assert!(pool
+            .authorize_mcp_relay("executor-1", 7, "context", &foreign_thread)
+            .unwrap_err()
+            .contains("thread identity"));
+    }
+
+    #[test]
+    fn terminal_result_revocation_prevents_replay() {
+        let pool = Fleet::default();
+        insert_bound_relay_context(&pool);
+        pool.revoke_runner_contexts_for_request("request-1", "attempt-1");
+
+        assert!(pool
+            .authorize_mcp_relay("executor-1", 7, "context", &relay_request(Some("run-1")))
+            .is_err());
+    }
+
     #[test]
     fn object_size_exchange_drains_output_while_feeding_clone_sized_input() {
         let repo = tempfile::tempdir().unwrap();
@@ -6747,6 +7143,7 @@ mod tests {
             projects_served: Vec::new(),
             disk_budget_bytes: None,
             memory_budget_bytes: None,
+            toolchain_detection: None,
         }
     }
 
@@ -8164,6 +8561,7 @@ mod tests {
                         projects_served: vec!["p".into()],
                         disk_budget_bytes: None,
                         memory_budget_bytes: None,
+                        toolchain_detection: None,
                     },
                     current_load: load,
                     warm_roots: warm
@@ -9506,6 +9904,281 @@ mod tests {
             .is_empty());
     }
 
+    fn executing(command: &str, upper_duration_ms: u64) -> ExecutingCellRequest {
+        ExecutingCellRequest {
+            executor_id: String::new(),
+            cell_id: "cell".into(),
+            request_id: command.into(),
+            attempt_id: "attempt".into(),
+            owner: None,
+            command_class: cairn_common::executor_protocol::CellCommandClass::CargoTest,
+            command: command.into(),
+            started_at_unix_ms: unix_time_ms(),
+            process_ids: Vec::new(),
+            priority: None,
+            subscriber_count: 1,
+            resource_reservation: ResourceReservation::default(),
+            learned_estimate: Some(cairn_common::executor_protocol::LearnedResourceEstimate {
+                sample_count: 20,
+                upper_duration_ms: Some(upper_duration_ms),
+                upper_peak_rss_bytes: None,
+                upper_disk_growth_bytes: None,
+            }),
+        }
+    }
+
+    const FORECAST_PROJECT: &str = "p";
+
+    /// A colocated macOS machine that frees in four seconds, beside a remote
+    /// Linux one that does not free for five minutes.
+    fn occupied_fleet() -> Fleet {
+        let pool = Fleet::default();
+        for (id, os, colocated, occupant) in [
+            ("local", "macos", true, executing("rust-fmt", 4_000)),
+            ("bglab-ub", "linux", false, executing("rust-tests", 300_000)),
+        ] {
+            let (executor_id, mut connection) = fleet_entry(id, os, 0, &[]);
+            connection.colocated = colocated;
+            connection.snapshot.executing_requests = vec![occupant];
+            pool.connections
+                .lock()
+                .unwrap()
+                .insert(executor_id, connection);
+        }
+        pool
+    }
+
+    /// A colocated check batch's scope: mobile, unpinned, over a colocated
+    /// checkout that can be recreated from managed objects elsewhere.
+    fn forecast_scope<'a>(
+        repository: &'a RepositoryLocator,
+        selector: Option<&'a ExecutorSelector>,
+        mobility: PlacementMobility,
+    ) -> PlacementScope<'a> {
+        PlacementScope {
+            project_id: FORECAST_PROJECT,
+            repository,
+            selector,
+            pinned_executor_id: None,
+            mobility,
+        }
+    }
+
+    fn forecast_repository() -> RepositoryLocator {
+        RepositoryLocator::ColocatedPath {
+            project_id: FORECAST_PROJECT.into(),
+            repository_id: FORECAST_PROJECT.into(),
+            absolute_path: "/repo".into(),
+        }
+    }
+
+    /// A forecast is taken against the wall clock, so the milliseconds between
+    /// placing a fixture's occupant and reading it are real elapsed time and
+    /// come off the prediction. The assertion is about WHICH machine spoke, and
+    /// the two candidates here are two orders of magnitude apart, so a second of
+    /// tolerance distinguishes them without pinning a clock.
+    #[track_caller]
+    fn assert_relief_near(
+        occupancy: &occupancy::MachineOccupancy,
+        expected_ms: u64,
+        because: &str,
+    ) {
+        let occupancy::MachineOccupancy::Predicted(forecast) = occupancy else {
+            panic!("{because}: expected a prediction, got {occupancy:?}");
+        };
+        assert!(
+            expected_ms.abs_diff(forecast.relief_ms) <= 1_000,
+            "{because}: expected relief near {expected_ms}ms, got {}ms",
+            forecast.relief_ms
+        );
+    }
+
+    /// A machine the work cannot land on says nothing about when the work can
+    /// start.
+    ///
+    /// The specimen: a Linux-targeted check whose only eligible machine is busy
+    /// for five minutes, beside a colocated macOS machine that frees in four
+    /// seconds. Scoping the forecast by mobility alone would hand that check a
+    /// four-second reading, clamp its wait to the floor, surface it as
+    /// unavailable while its real blocker was still finite, and name the macOS
+    /// work on the row — which is the whole failure this policy exists to end.
+    #[test]
+    fn a_forecast_ignores_machines_the_work_could_never_land_on() {
+        let pool = occupied_fleet();
+        let repository = forecast_repository();
+        let scope =
+            |selector| forecast_scope(&repository, selector, PlacementMobility::SpillEligible);
+        let linux = ExecutorSelector {
+            os: Some("linux".into()),
+            ..ExecutorSelector::default()
+        };
+        assert_relief_near(
+            &pool.occupancy_for(scope(Some(&linux))),
+            300_000,
+            "only the machine that can run it speaks for it",
+        );
+        assert_relief_near(
+            &pool.occupancy_for(scope(None)),
+            4_000,
+            "an unconstrained batch is genuinely relieved by whichever frees first",
+        );
+
+        let named = ExecutorSelector {
+            name: Some("bglab-ub".into()),
+            ..ExecutorSelector::default()
+        };
+        assert_relief_near(
+            &pool.occupancy_for(scope(Some(&named))),
+            300_000,
+            "naming a machine is asking about that machine",
+        );
+
+        let unsatisfiable = ExecutorSelector {
+            required_toolchains: vec!["matlab".into()],
+            ..ExecutorSelector::default()
+        };
+        assert_eq!(
+            pool.occupancy_for(scope(Some(&unsatisfiable))),
+            occupancy::MachineOccupancy::Unforecastable,
+            "no eligible machine is no knowledge, never an accidental prediction"
+        );
+    }
+
+    /// Selector matching is not eligibility, and reading it as though it were is
+    /// the same bug in a costume.
+    ///
+    /// Here the four-second machine satisfies every selector the work could
+    /// state and is still ineligible: it does not serve this project, or its
+    /// link has closed. Both are facts `candidate_rejection` knows and a
+    /// selector check cannot see, and either one alone would have the forecast
+    /// predict relief from a machine the work will never reach — clamping the
+    /// wait to the floor and printing that machine's occupant on the row.
+    /// Two remote machines that satisfy every selector this work could state:
+    /// `fast` frees in four seconds, `slow` in five minutes.
+    fn two_remotes() -> Fleet {
+        let pool = Fleet::default();
+        for (id, occupant) in [
+            ("fast", executing("rust-fmt", 4_000)),
+            ("slow", executing("rust-tests", 300_000)),
+        ] {
+            let (executor_id, mut connection) = fleet_entry(id, "linux", 0, &[]);
+            connection.colocated = false;
+            connection.snapshot.executing_requests = vec![occupant];
+            pool.connections
+                .lock()
+                .unwrap()
+                .insert(executor_id, connection);
+        }
+        pool
+    }
+
+    /// Selector matching is not eligibility, and reading it as though it were is
+    /// the same bug in a costume.
+    ///
+    /// Here the four-second machine satisfies every selector the work could
+    /// state and is still ineligible: it does not serve this project, or its
+    /// link has closed. Both are facts `candidate_rejection` knows and a
+    /// selector check cannot see, and either one alone would have the forecast
+    /// predict relief from a machine the work will never reach — clamping the
+    /// wait to the floor and printing that machine's occupant on the row.
+    #[test]
+    fn a_forecast_reads_only_machines_placement_itself_would_keep() {
+        let repository = forecast_repository();
+        let scope = forecast_scope(&repository, None, PlacementMobility::SpillEligible);
+
+        assert_relief_near(
+            &two_remotes().occupancy_for(scope),
+            4_000,
+            "with both eligible, the sooner relief is the honest answer",
+        );
+
+        let unserved = two_remotes();
+        unserved
+            .connections
+            .lock()
+            .unwrap()
+            .get_mut("fast")
+            .unwrap()
+            .advertisement
+            .capabilities
+            .projects_served = vec!["another-project".into()];
+        assert_relief_near(
+            &unserved.occupancy_for(scope),
+            300_000,
+            "a machine that does not serve this project cannot relieve it",
+        );
+
+        let disconnected = two_remotes();
+        {
+            let mut connections = disconnected.connections.lock().unwrap();
+            let (sender, receiver) = mpsc::unbounded_channel();
+            drop(receiver);
+            connections.get_mut("fast").unwrap().sender = sender;
+        }
+        assert_relief_near(
+            &disconnected.occupancy_for(scope),
+            300_000,
+            "a machine whose link has closed cannot relieve anything",
+        );
+    }
+
+    /// Mobility follows placement's own rule, which is about being UNtargeted.
+    ///
+    /// A pinned-or-colocated batch that named nothing stays home, so only the
+    /// colocated machine speaks for it. The same batch that named a machine has
+    /// said where it goes, and placement lets it leave home — so the forecast
+    /// must follow it there rather than answering about a machine it is no
+    /// longer headed for.
+    #[test]
+    fn a_colocated_default_binds_untargeted_work_and_releases_targeted_work() {
+        let pool = occupied_fleet();
+        let repository = forecast_repository();
+        assert_relief_near(
+            &pool.occupancy_for(forecast_scope(
+                &repository,
+                None,
+                PlacementMobility::PinnedOrColocated,
+            )),
+            4_000,
+            "untargeted conservative work stays on the machine holding the checkout",
+        );
+
+        let named = ExecutorSelector {
+            name: Some("bglab-ub".into()),
+            ..ExecutorSelector::default()
+        };
+        assert_relief_near(
+            &pool.occupancy_for(forecast_scope(
+                &repository,
+                Some(&named),
+                PlacementMobility::PinnedOrColocated,
+            )),
+            300_000,
+            "naming a machine is the permission to leave home, for placement and forecast alike",
+        );
+    }
+
+    /// A checkout that exists on exactly one machine cannot be recreated
+    /// elsewhere, so no remote machine's occupancy speaks for work that carries
+    /// one — however mobile the batch declared itself.
+    #[test]
+    fn a_forecast_ignores_remotes_for_work_whose_checkout_cannot_travel() {
+        let repository = RepositoryLocator::ExistingCheckout {
+            project_id: FORECAST_PROJECT.into(),
+            repository_id: FORECAST_PROJECT.into(),
+            absolute_path: "/repo".into(),
+        };
+        assert_relief_near(
+            &occupied_fleet().occupancy_for(forecast_scope(
+                &repository,
+                None,
+                PlacementMobility::SpillEligible,
+            )),
+            4_000,
+            "a checkout that cannot travel keeps the forecast at home",
+        );
+    }
+
     #[test]
     fn disconnect_is_generation_fenced_for_health_invalidation() {
         let pool = Fleet::default();
@@ -10643,11 +11316,20 @@ mod tests {
         let PublicationRole::Publisher(second) = coordination.acquire().await else {
             panic!("publication ownership should transfer");
         };
-        second.published();
-        assert!(matches!(
-            coordination.acquire().await,
-            PublicationRole::Published
-        ));
+        let recorded = crate::execution::cache::RecordedCheckObservation {
+            id: "obs-published".to_string(),
+            environment_fingerprint: "env".to_string(),
+            reusable: true,
+        };
+        second.published(Some(recorded.clone()));
+        let PublicationRole::Published(carried) = coordination.acquire().await else {
+            panic!("a published verdict must be reported as published");
+        };
+        assert_eq!(
+            carried,
+            Some(recorded),
+            "a coalesced sibling must learn which observation the publisher wrote"
+        );
     }
 
     #[test]
@@ -10680,45 +11362,17 @@ mod tests {
             restartable: true,
             executor_lost: true,
         };
-        let cell = PersistentCellState {
-            executor_id: String::new(),
-            executor_display_name: None,
-            project_id: "p".into(),
-            cell_id: "slot".into(),
-            path: "/slot".into(),
-            workspace_name: "slot".into(),
-            repository: "/repo".into(),
-            checkout_kind: Default::default(),
-            git_common_dir: None,
-            authority_path: "/slot/.authority".into(),
-            lifecycle: PersistentCellLifecycle::Running,
-            cell_epoch: 7,
-            last_sealed_commit: Some("base".into()),
-            last_used_unix_ms: 42,
-            last_affinity_key: None,
-            preparation_fingerprint: None,
-            residency: Some(CellResidency {
+        let cell = resident_process_cell(
+            CellResidency {
                 phase: cairn_common::executor_protocol::ResidencyPhase::AwaitingReclaim,
                 reclaim_deadline_unix_ms: 100,
                 state_revision: 2,
                 ..residency.clone()
-            }),
-            occupancy: CellOccupancy {
-                command: None,
-                processes: std::collections::BTreeMap::from([(
-                    "main".into(),
-                    cairn_common::executor_protocol::ResidentProcess {
-                        generation: 3,
-                        kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
-                            slug: "watch".into(),
-                        },
-                        spec: None,
-                        status: status.clone(),
-                        reservation: None,
-                    },
-                )]),
             },
-        };
+            7,
+            3,
+            status.clone(),
+        );
 
         assert!(pool.set_executor_snapshot(
             COLOCATED_EXECUTOR_ID,
@@ -10740,6 +11394,147 @@ mod tests {
                 event: ResidentProcessEventKind::State { status },
             }]
         );
+    }
+
+    /// A cell holding one resident process, at a stated cell epoch and process
+    /// generation.
+    fn resident_process_cell(
+        residency: CellResidency,
+        cell_epoch: u64,
+        process_generation: u64,
+        status: cairn_common::executor_protocol::ResidentProcessStatus,
+    ) -> PersistentCellState {
+        PersistentCellState {
+            executor_id: String::new(),
+            executor_display_name: None,
+            project_id: "p".into(),
+            cell_id: "slot".into(),
+            path: "/slot".into(),
+            workspace_name: "slot".into(),
+            repository: "/repo".into(),
+            checkout_kind: Default::default(),
+            git_common_dir: None,
+            authority_path: "/slot/.authority".into(),
+            lifecycle: PersistentCellLifecycle::Running,
+            cell_epoch,
+            last_sealed_commit: Some("base".into()),
+            last_used_unix_ms: 42,
+            last_affinity_key: None,
+            preparation_fingerprint: None,
+            residency: Some(residency),
+            occupancy: CellOccupancy {
+                command: None,
+                processes: std::collections::BTreeMap::from([(
+                    "main".into(),
+                    cairn_common::executor_protocol::ResidentProcess {
+                        generation: process_generation,
+                        kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
+                            slug: "watch".into(),
+                        },
+                        spec: None,
+                        status,
+                        reservation: None,
+                    },
+                )]),
+            },
+        }
+    }
+
+    /// An executor's snapshot of what it is running and its events about that
+    /// work travel as separate streams, so the event can land first. It has to
+    /// reach subscribers anyway: a process that lives a second cannot be made
+    /// to wait for the runner's cache to agree about it (CAIRN-3444).
+    #[test]
+    fn resident_events_survive_a_snapshot_that_has_not_caught_up() {
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let captured = received.clone();
+        pool.subscribe_resident_process_events(move |event| {
+            captured.lock().unwrap().push(event);
+        });
+        let residency = fleet_residency(
+            ResidencyHolder::Service {
+                service_id: "channel-imessage".into(),
+            },
+            None,
+        );
+        let event = |cell_epoch: u64, process_generation: u64| ResidentProcessEvent {
+            holder: residency.holder.clone(),
+            incarnation_id: residency.incarnation_id.clone(),
+            cell_epoch,
+            process_key: "main".into(),
+            process_generation,
+            event: ResidentProcessEventKind::Output {
+                sequence: 1,
+                stream: cairn_common::executor_protocol::ResidentProcessStream::Stdout,
+                data: b"guid".to_vec(),
+            },
+        };
+
+        // Nothing is known about this cell yet: the residency was acquired and
+        // the process started since the last beat.
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::ResidentProcessEvent { event: event(7, 2) },
+        );
+        assert_eq!(received.lock().unwrap().len(), 1);
+
+        // A snapshot that agrees changes nothing, and one that knows a later
+        // generation at the same key refuses the process before it.
+        pool.set_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            FleetSnapshot {
+                cells: vec![resident_process_cell(
+                    residency.clone(),
+                    7,
+                    2,
+                    cairn_common::executor_protocol::ResidentProcessStatus::Running {
+                        started_at_unix_ms: 42,
+                        process_group_id: None,
+                    },
+                )],
+                ..Default::default()
+            },
+            ExecutorSubstrateReport::default(),
+        );
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::ResidentProcessEvent { event: event(7, 2) },
+        );
+        assert_eq!(received.lock().unwrap().len(), 2);
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::ResidentProcessEvent { event: event(7, 1) },
+        );
+        assert_eq!(
+            received.lock().unwrap().len(),
+            2,
+            "a generation the runner has already seen superseded is stale"
+        );
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::ResidentProcessEvent { event: event(6, 9) },
+        );
+        assert_eq!(
+            received.lock().unwrap().len(),
+            2,
+            "an epoch the cell has moved past is stale whatever its generation"
+        );
+
+        // A link that has since bounced speaks for nobody.
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation + 1,
+            ExecutorMessage::ResidentProcessEvent { event: event(7, 2) },
+        );
+        assert_eq!(received.lock().unwrap().len(), 2);
     }
 
     fn darwin_remote_config() -> RemoteExecutorConfig {

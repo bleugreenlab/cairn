@@ -7,7 +7,9 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, RowExt};
 
 use super::common::*;
-use super::review_push::{detach_onto_runtime, emit_for_turn_end, spawn_turn_end_checks};
+use super::review_push::{
+    detach_onto_runtime, emit_for_turn_end, spawn_checks_settled_edge, spawn_turn_end_checks,
+};
 
 /// Transition a run to warm state after successful turn completion.
 ///
@@ -62,6 +64,10 @@ pub fn transition_to_warm_state(
             // child feedback and do not gate the parent review wake; semantic
             // liveness remains owned by `issue_settled` in the recompute hook.
             spawn_turn_end_checks(orch, &job_id);
+            // Immediately after, so a turn end that arms NO wave still settles
+            // this node's watchers instead of leaving them asleep on lanes
+            // nothing will ever run (CAIRN-3437).
+            spawn_checks_settled_edge(orch, &job_id);
             if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
                 log::error!(
                     "Failed to recompute job {} after warm transition: {}",
@@ -614,6 +620,7 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
             // pushing a premature parent review (CAIRN-2483). Mirrors the
             // warm-transition turn-end caller above.
             spawn_turn_end_checks(orch, &job_id);
+            spawn_checks_settled_edge(orch, &job_id);
             if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
                 log::error!(
                     "Failed to recompute job {} after run finalize: {}",
@@ -1060,6 +1067,36 @@ mod ordering_tests {
     fn turn_end_callers_claim_checks_slot_before_recompute() {
         assert_spawn_before_recompute("pub fn transition_to_warm_state");
         assert_spawn_before_recompute("pub fn finalize_run");
+    }
+
+    /// CAIRN-3437: the settled-checks edge must be evaluated AFTER
+    /// `spawn_turn_end_checks`, for the mirror-image reason. A turn's completion
+    /// and the arming of its wave are two steps of one hook, and asking whether
+    /// the lanes have settled between them sees an idle node with no wave in
+    /// flight — which reads exactly like a node whose wave died. Reordering
+    /// these two lines would report every lane about to run as one that never
+    /// will, and wake a watching orchestrator to act on it.
+    fn assert_settled_edge_after_spawn(func_signature: &str) {
+        let start = SOURCE
+            .find(func_signature)
+            .unwrap_or_else(|| panic!("caller {func_signature} present in source"));
+        let body = &SOURCE[start..];
+        let spawn = body
+            .find("spawn_turn_end_checks(orch")
+            .expect("spawn_turn_end_checks call present");
+        let settled = body
+            .find("spawn_checks_settled_edge(orch")
+            .expect("spawn_checks_settled_edge call present");
+        assert!(
+            spawn < settled,
+            "{func_signature}: spawn_checks_settled_edge must follow spawn_turn_end_checks (CAIRN-3437)"
+        );
+    }
+
+    #[test]
+    fn turn_end_callers_evaluate_settlement_after_arming_the_wave() {
+        assert_settled_edge_after_spawn("pub fn transition_to_warm_state");
+        assert_settled_edge_after_spawn("pub fn finalize_run");
     }
 
     /// CAIRN-3104: the digest-reseed fallback opens a NEW turn on the job, so it

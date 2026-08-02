@@ -399,11 +399,14 @@ pub(crate) struct RunItemInput {
     /// from inside the session).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repl: Option<String>,
-    /// Suspend this turn without polling until a duration elapses or a terminal
-    /// exits/prints a phrase. This must be the sole item in the batch. Examples:
+    /// Suspend this turn without polling until a duration elapses, a terminal
+    /// exits/prints a phrase, or a node's project check lanes settle. This must
+    /// be the sole item in the batch. Examples:
     /// `{waitFor:{duration:"3m"}}`,
     /// `{waitFor:{kind:"terminal",ref:"cairn:~/terminal/tests",on:"exit"}}`,
-    /// `{waitFor:{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}}`.
+    /// `{waitFor:{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}}`,
+    /// `{waitFor:{kind:"checks",ref:"cairn://p/CAIRN/3427/1/builder/checks",on:"settled"}}`,
+    /// `{waitFor:{kind:"checks",ref:"cairn://p/CAIRN/3427/1/builder/checks",on:"verdict",suite:"rust-tests"}}`.
     #[serde(default, rename = "waitFor", skip_serializing_if = "Option::is_none")]
     pub(crate) wait_for: Option<WaitForInput>,
 }
@@ -421,6 +424,14 @@ pub(crate) enum WaitForInput {
         on: TerminalWaitEventInput,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phrase: Option<String>,
+    },
+    Checks {
+        kind: ChecksWaitKindInput,
+        #[serde(rename = "ref")]
+        reference: String,
+        on: ChecksWaitEventInput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suite: Option<String>,
     },
 }
 
@@ -442,6 +453,19 @@ pub(crate) enum TerminalWaitKindInput {
 pub(crate) enum TerminalWaitEventInput {
     Exit,
     Output,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ChecksWaitKindInput {
+    Checks,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ChecksWaitEventInput {
+    Settled,
+    Verdict,
 }
 
 /// Structured args for a `target`: positional `args` for a skill script, or a

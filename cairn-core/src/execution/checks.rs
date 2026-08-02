@@ -327,7 +327,6 @@ struct ManualCheckContractSnapshot {
     plan: CheckPlan,
     timeout_ms: u32,
     resource_identity_key: String,
-    environment_fingerprint: String,
 }
 
 /// Resolve every mutable input to a manual check exactly once. The returned owned
@@ -430,7 +429,6 @@ async fn resolve_manual_check_contract_snapshot(
     let timeout_ms =
         resolve_check_timeout_ms(Some(&configured_check), DEFAULT_REVIEW_CHECK_TIMEOUT_MS);
     let resource_identity_key = check_resource_identity(check_name, &configured_check).key;
-    let environment_fingerprint = plan_environment_fingerprint(&plan);
     let entry =
         crate::execution::cache::get_check_result(db, &project_id, check_name, &input_hash)?;
     Ok(ManualCheckContractSnapshot {
@@ -449,7 +447,6 @@ async fn resolve_manual_check_contract_snapshot(
         plan,
         timeout_ms,
         resource_identity_key,
-        environment_fingerprint,
     })
 }
 
@@ -474,6 +471,12 @@ pub async fn manual_check_cache_context(
 /// Every identity in this response was derived by the runner from the authenticated
 /// run coordinate and the project's live checks contract. Callers never supply a
 /// command, content hash, environment fingerprint, or verdict.
+///
+/// The observation fields report what the run RECORDED, carried out of the
+/// recorder itself. They are never re-derived from a second lookup: the key a
+/// requesting machine computes does not describe a verdict another machine
+/// produced, so a lookup-derived reply calls a spilled check unrecorded while its
+/// row sits in the database.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualConfiguredCheckResult {
@@ -481,14 +484,101 @@ pub struct ManualConfiguredCheckResult {
     pub commit_sha: String,
     pub tree_hash: String,
     pub input_hash: String,
+    /// The environment identity the recorded observation is keyed by. EMPTY when
+    /// a remote executor produced the verdict — Cairn cannot yet identify that
+    /// machine's verdict environment, so the row is addressable by id and
+    /// readable as diagnosis while nothing reuses it — and empty when this run
+    /// recorded nothing at all.
     pub environment_fingerprint: String,
-    pub observation_id: String,
-    pub source_observation_id: String,
+    /// The observation this run recorded, or `None` when it recorded none: a
+    /// suppressed check never ran, and a failed write leaves a real verdict
+    /// standing without a durable row behind it.
+    pub observation_id: Option<String>,
+    /// Whether the recorded observation may answer a later run of this check on
+    /// these inputs without executing it.
+    pub reusable: bool,
+    /// `fresh` when this run produced the verdict, `cached` when a stored
+    /// observation answered it without running anything.
     pub disposition: String,
     pub passed: bool,
     pub exit_code: Option<i32>,
-    pub cached: bool,
+    /// Set when the run produced NO VERDICT about the tree.
+    pub no_verdict: Option<ManualCheckNoVerdict>,
     pub output_tail: String,
+}
+
+/// Why a manual run has no verdict to report.
+///
+/// An infrastructure failure and a suppression are facts about Cairn, not results
+/// about the caller's change. Each has to render as itself: reporting either as a
+/// red — or as a complaint about recording — hides the only thing the reader can
+/// act on.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualCheckNoVerdict {
+    /// `infrastructure` when Cairn's own machinery failed around the check,
+    /// `suppressed` when Cairn declined to run it after repeated failures.
+    pub kind: String,
+    /// The consecutive infrastructure failures behind a `suppressed` decision.
+    pub after_failures: Option<i64>,
+    /// The named cause, composed for the reader where the failure happened.
+    pub cause: String,
+}
+
+/// Build the manual reply from the outcome the run returned.
+///
+/// Everything here comes from the evaluation itself — its verdict, and the
+/// observation its recorder wrote. A second lookup could only re-derive a key the
+/// recorder may not have used, which is exactly how a verdict that ran on another
+/// machine came back as "not recorded".
+fn manual_configured_check_result(
+    check_name: &str,
+    commit_sha: String,
+    tree_hash: String,
+    input_hash: String,
+    outcome: CheckOutcome,
+) -> ManualConfiguredCheckResult {
+    let no_verdict = manual_check_no_verdict(&outcome);
+    let disposition = if outcome.cached { "cached" } else { "fresh" }.to_string();
+    let (observation_id, environment_fingerprint, reusable) = match outcome.recorded {
+        Some(recorded) => (
+            Some(recorded.id),
+            recorded.environment_fingerprint,
+            recorded.reusable,
+        ),
+        None => (None, String::new(), false),
+    };
+    ManualConfiguredCheckResult {
+        check_name: check_name.to_string(),
+        commit_sha,
+        tree_hash,
+        input_hash,
+        environment_fingerprint,
+        observation_id,
+        reusable,
+        disposition,
+        passed: outcome.passed,
+        exit_code: outcome.exit_code,
+        no_verdict,
+        output_tail: outcome.output_tail,
+    }
+}
+
+/// Name a run that produced no verdict, using the same predicate the wake path
+/// uses to decide whether a red is the agent's business.
+fn manual_check_no_verdict(outcome: &CheckOutcome) -> Option<ManualCheckNoVerdict> {
+    if outcome.passed || outcome.is_genuine_failure() {
+        return None;
+    }
+    Some(ManualCheckNoVerdict {
+        kind: match outcome.suppressed_after {
+            Some(_) => "suppressed",
+            None => "infrastructure",
+        }
+        .to_string(),
+        after_failures: outcome.suppressed_after,
+        cause: outcome.output_tail.clone(),
+    })
 }
 
 /// Execute one named configured suite at an authenticated agent run's sealed head.
@@ -521,7 +611,6 @@ pub async fn run_manual_configured_check(
     let commit_sha = context.commit_sha.clone();
     let command_check = contract.configured_check;
     let resource_identity_key = contract.resource_identity_key;
-    let environment_fingerprint = contract.environment_fingerprint;
     let submission_orch = orch.clone();
     let submission_repo = repository_path.clone();
     let submission_store = store_dir.clone();
@@ -611,37 +700,16 @@ pub async fn run_manual_configured_check(
         move |_| {},
     )
     .await;
-    let outcome = outcomes
-        .into_iter()
-        .next()
-        .ok_or_else(|| "manual configured check produced no outcome".to_string())?;
-    let projection = crate::execution::cache::get_check_result_observation(
-        db,
-        &project_id,
-        &commit_sha,
+    let outcome = outcomes.into_iter().next().ok_or_else(|| {
+        format!("Cairn lost the result of {check_name}. Run the same command again.")
+    })?;
+    Ok(manual_configured_check_result(
         check_name,
-        &environment_fingerprint,
-        crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
-        None,
-        None,
-        0,
-        0,
-    )?
-    .ok_or_else(|| "manual configured check outcome was not recorded".to_string())?;
-    Ok(ManualConfiguredCheckResult {
-        check_name: check_name.to_string(),
         commit_sha,
-        tree_hash: context.tree_hash,
-        input_hash: context.input_hash,
-        environment_fingerprint,
-        observation_id: projection.observation_id.clone(),
-        source_observation_id: projection.observation_id,
-        disposition: projection.disposition,
-        passed: outcome.passed,
-        exit_code: outcome.exit_code,
-        cached: outcome.cached,
-        output_tail: outcome.output_tail,
-    })
+        context.tree_hash,
+        context.input_hash,
+        outcome,
+    ))
 }
 
 fn format_fixed_batch_summary(summary: &str, commit: &str, paths: &[String]) -> String {
@@ -1395,14 +1463,228 @@ const CAPACITY_RETRY_ATTEMPTS: usize = 2;
 /// Pause before each retry, so a retry does not simply re-ask a host that is
 /// still finishing whatever displaced it.
 const CAPACITY_RETRY_BACKOFF_MS: [u64; CAPACITY_RETRY_ATTEMPTS] = [2_000, 5_000];
-/// How long a RETRY waits for capacity, regardless of the configured horizon.
+
+/// The least patience any check batch declares, whatever else it knows.
 ///
-/// The first attempt already waited out the fleet's full horizon, so a retry
-/// that waited another one would turn a bounded retry policy into an unbounded
-/// stall on a genuinely saturated machine. A minute answers the question the
-/// retry is actually asking — did the thing blocking us just clear? — and keeps
-/// the whole policy's added latency bounded by construction.
-const CAPACITY_RETRY_HORIZON_MS: u64 = 60_000;
+/// Below a minute a lane cannot outlast even a short contention spike, which is
+/// the one thing every retry policy here exists to absorb.
+const CHECK_PATIENCE_FLOOR_MS: u64 = 60_000;
+
+/// The most a write-cadence batch waits on load Cairn cannot account for.
+///
+/// A write-cadence verdict is appended to the tool result of the commit that
+/// triggered it, so an agent's turn is stopped for the whole of this wait. That
+/// makes the ceiling a statement about an agent's time: past it, a red
+/// infrastructure row that re-runs next cadence costs the session less than
+/// continuing to hold its turn open for a machine nothing here can reason about.
+const WRITE_CADENCE_FOREIGN_CEILING_MS: u64 = 3 * 60_000;
+
+/// The most a review-cadence batch waits on load Cairn cannot account for.
+///
+/// Nothing is blocked on a turn-end wave: it runs after the turn, it is
+/// cancelled outright when its issue resolves, and a verdict that lands late is
+/// still the verdict. So its ceiling is set by how long a result stays worth
+/// having rather than by who is waiting, and on a fleet where a whole-workspace
+/// suite runs for minutes, ten of them is one suite's worth of queueing.
+const REVIEW_CADENCE_FOREIGN_CEILING_MS: u64 = 10 * 60_000;
+
+/// Margin added to a predicted relief time before it becomes a bound.
+///
+/// The prediction says when the occupant finishes; it does not cover the
+/// executor noticing, this request winning the next admission pass, and the
+/// cell being handed the command. Without the margin a correct prediction would
+/// still surface a refusal moments before the room it predicted opened.
+const PREDICTION_MARGIN_MS: u64 = 30_000;
+
+/// The two relations the clamp in [`CheckPatience::declare`] depends on, held
+/// where they can be broken rather than where they would be noticed. A floor
+/// above a ceiling inverts `clamp` (which panics), and a write ceiling above the
+/// review one would mean the cadence that holds an agent's turn open is the
+/// patient one — both are facts about these constants, so they are checked when
+/// the constants are compiled.
+const _: () = assert!(
+    CHECK_PATIENCE_FLOOR_MS <= WRITE_CADENCE_FOREIGN_CEILING_MS,
+    "the floor must fit inside every ceiling or a wait is over before it begins"
+);
+const _: () = assert!(
+    WRITE_CADENCE_FOREIGN_CEILING_MS < REVIEW_CADENCE_FOREIGN_CEILING_MS,
+    "holding an agent's turn open is the more expensive wait"
+);
+
+fn foreign_ceiling_ms(priority: &CellPriority) -> u64 {
+    match priority {
+        // Both of these hold something open while they wait. Interactive work
+        // has an agent inside it by definition, and no check batch submits at
+        // this priority today -- naming it here keeps a future one from
+        // inheriting the ceiling meant for work nobody is sitting on.
+        CellPriority::WriteCheck | CellPriority::AgentInteractive => {
+            WRITE_CADENCE_FOREIGN_CEILING_MS
+        }
+        CellPriority::ReviewCheck => REVIEW_CADENCE_FOREIGN_CEILING_MS,
+    }
+}
+
+/// How long this batch will wait for capacity in total, and why that long.
+///
+/// One budget, declared once and spent across every presentation of the same
+/// request, so the added latency an agent can meet is the budget rather than
+/// the budget times the attempt count. Where it comes from is the point:
+///
+/// - When Cairn's own placed work is what holds the machine, the budget is that
+///   work's predicted remaining time. A bound taken from measurement is the
+///   only kind that can say "this should have been enough" when it is not, and
+///   it is why a lane no longer abandons a machine it could have named the
+///   occupant of (CAIRN-3429).
+/// - Otherwise the budget is the cadence's ceiling. A machine held by an
+///   operator's own build, a dev harness, or work with no measured duration is
+///   one nothing here can predict, and the honest answer is to wait a bounded
+///   while and then say so — which is the CAIRN-3345 floor, unchanged.
+///
+/// The fleet-wide default horizon is deliberately not consulted. It documents
+/// itself as the answer for a caller with no tighter answer of its own, and a
+/// check has one: a four-second formatter and an interactive REPL should not
+/// share a number, and the day they did, one stale value took the whole check
+/// fabric down at once.
+struct CheckPatience {
+    started: std::time::Instant,
+    foreign_ceiling: std::time::Duration,
+    mobility: PlacementMobility,
+}
+
+/// The wait ONE selector group declares, against the machines that group can
+/// actually land on.
+///
+/// A batch is not one wait. Pure-verdict items partition by executor selector
+/// and each group is presented separately, so a Linux-targeted group and an
+/// unconstrained one are queued behind different work and are relieved at
+/// different moments. Deriving one basis for the whole batch would hand a
+/// targeted group a horizon sized by a machine it can never land on — and then
+/// print the wrong occupant's name on the row that went red.
+struct GroupWait {
+    horizon_ms: u64,
+    /// Whether the capacity this group is waiting on is held by Cairn's own
+    /// measured work. A wait on Cairn does not expire; only a wait on load Cairn
+    /// cannot account for does.
+    self_inflicted: bool,
+    description: String,
+}
+
+impl CheckPatience {
+    fn declare(batch: &PlannedCheckBatchRequest) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            foreign_ceiling: std::time::Duration::from_millis(foreign_ceiling_ms(&batch.priority)),
+            mobility: batch_placement_mobility(&batch.mutation_policy),
+        }
+    }
+
+    /// What remains of the ceiling that governs waiting on load Cairn cannot
+    /// account for.
+    ///
+    /// Never zero. A presentation with no horizon is evicted from the queue the
+    /// instant it arrives, which would spend an admission to learn nothing; the
+    /// bound that ends that wait is [`Self::foreign_patience_spent`], checked
+    /// before a retry.
+    fn remaining_foreign_ceiling_ms(&self) -> u64 {
+        let elapsed_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        (self.foreign_ceiling.as_millis() as u64)
+            .saturating_sub(elapsed_ms)
+            .max(CAPACITY_RETRY_BACKOFF_MS[0])
+    }
+
+    fn foreign_patience_spent(&self) -> bool {
+        self.started.elapsed() >= self.foreign_ceiling
+    }
+
+    /// Read what holds this group's eligible machines, and turn it into a
+    /// horizon and a sentence.
+    ///
+    /// Taken fresh at each presentation rather than once at declaration: a retry
+    /// exists precisely because the world may have changed, and a forecast from
+    /// before the last wait would answer a question about a machine that no
+    /// longer looks like that.
+    fn for_group(
+        &self,
+        orch: &Orchestrator,
+        batch: &PlannedCheckBatchRequest,
+        selector: Option<&ExecutorSelector>,
+    ) -> GroupWait {
+        // The same repository locator the submission below states. Eligibility
+        // turns on it -- a checkout that exists on only one machine cannot be
+        // recreated elsewhere -- so a forecast that omitted it would be scoped
+        // differently from the placement it is trying to predict.
+        let repository = RepositoryLocator::ColocatedPath {
+            project_id: batch.project_id.clone(),
+            repository_id: batch.project_id.clone(),
+            absolute_path: batch.repository.clone(),
+        };
+        GroupWait::from_occupancy(
+            orch.fleet.occupancy_for(crate::fleet::PlacementScope {
+                project_id: &batch.project_id,
+                repository: &repository,
+                selector,
+                // Checks never pin: `require_colocated_population` may pin a
+                // request later, and does so only for a batch that needs the
+                // runner's ignored content -- which is already pinned here by
+                // its mutation policy's mobility.
+                pinned_executor_id: None,
+                mobility: self.mobility,
+            }),
+            self.remaining_foreign_ceiling_ms(),
+        )
+    }
+}
+
+impl GroupWait {
+    /// The wait a reading implies, separated from the fleet so the policy can be
+    /// exercised against a stated occupancy rather than a live machine.
+    fn from_occupancy(
+        occupancy: crate::fleet::occupancy::MachineOccupancy,
+        remaining_foreign_ceiling_ms: u64,
+    ) -> Self {
+        let crate::fleet::occupancy::MachineOccupancy::Predicted(forecast) = occupancy else {
+            return Self {
+                horizon_ms: remaining_foreign_ceiling_ms,
+                self_inflicted: false,
+                description: format!(
+                    "the machines this check can use are held by work with no measured duration, so there is nothing to queue behind knowingly; waiting up to {}",
+                    describe_ms(remaining_foreign_ceiling_ms)
+                ),
+            };
+        };
+        let others = match forecast.occupant_count.saturating_sub(1) {
+            0 => String::new(),
+            1 => ", behind 1 other cell".to_string(),
+            more => format!(", behind {more} other cells"),
+        };
+        Self {
+            // No ceiling. This presentation is sized to outlast the occupant it
+            // is queued behind, and if that occupant is replaced by another the
+            // next presentation is sized to outlast THAT one. The floor still
+            // applies, because a horizon shorter than a minute is evicted before
+            // the queue can do anything with it.
+            horizon_ms: forecast
+                .relief_ms
+                .saturating_add(PREDICTION_MARGIN_MS)
+                .max(CHECK_PATIENCE_FLOOR_MS),
+            self_inflicted: true,
+            description: format!(
+                "queued behind {}, predicted to finish in {}{others}; holding this check's place until it frees",
+                forecast.blocking,
+                describe_ms(forecast.relief_ms),
+            ),
+        }
+    }
+}
+
+fn describe_ms(value_ms: u64) -> String {
+    let seconds = value_ms / 1_000;
+    match (seconds / 60, seconds % 60) {
+        (0, seconds) => format!("{seconds}s"),
+        (minutes, 0) => format!("{minutes}m"),
+        (minutes, seconds) => format!("{minutes}m{seconds}s"),
+    }
+}
 
 pub(crate) async fn submit_planned_check_batch(
     orch: &Orchestrator,
@@ -1428,21 +1710,57 @@ pub(crate) async fn submit_planned_check_batch(
     // so an immediate retry cannot spend the persisted per-check
     // infrastructure-failure budget. That budget remains the outer circuit
     // breaker across cadences; this loop is the inner one within a single ask.
+    let patience = CheckPatience::declare(&batch);
+    let names = batch
+        .items
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut attempt = 0;
     let mut outcome = loop {
-        let outcome =
-            submit_reserved_check_batch(orch, batch.clone(), attempt_horizon_ms(attempt)).await?;
-        let CapacityRetry::Again { backoff } = capacity_retry_decision(attempt, &outcome) else {
-            break outcome;
+        let presented = submit_reserved_check_batch(orch, batch.clone(), &patience).await?;
+        let CapacityRetry::Again { backoff } = capacity_retry_decision(attempt, &presented.outcome)
+        else {
+            break presented.outcome;
         };
+        // The room was taken by Cairn's own finite work, so this check is queued
+        // rather than failing. It keeps its place: no attempt is spent, no
+        // ceiling is consulted, and the next presentation is sized against
+        // whatever holds the machine then.
+        //
+        // Several agents working at once is what this fabric is FOR, so the
+        // contention it creates in normal operation must not be able to produce
+        // a red row about someone's change. A check that reports failure because
+        // it grew tired of waiting for Cairn is stating something false about
+        // the diff under test, and the cost lands on a merge.
+        //
+        // This does not wait forever on a wedged machine, and the reason is in
+        // `fleet::occupancy` rather than here: an occupant that outlives its own
+        // learned duration stops being explainable, the reading becomes
+        // unforecastable, and the next presentation is bounded by the ceiling
+        // below. Patience is extended only while the wait keeps being accounted
+        // for.
+        if presented.self_inflicted {
+            log::info!(
+                "check batch [{names}] is queued behind Cairn's own work; holding its place — {}",
+                describe_capacity_waits(&presented.outcome)
+            );
+            tokio::time::sleep(backoff).await;
+            continue;
+        }
+        // Nothing here can account for what holds the machine, so the wait is
+        // bounded and the refusal is honest when it comes (CAIRN-3345).
+        if patience.foreign_patience_spent() {
+            log::info!(
+                "check batch [{names}] found no capacity within its declared patience — {}",
+                describe_capacity_waits(&presented.outcome)
+            );
+            break presented.outcome;
+        }
         log::info!(
-            "check batch [{}] found no capacity; retrying ({} of {CAPACITY_RETRY_ATTEMPTS})",
-            batch
-                .items
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
+            "check batch [{names}] found no capacity; {}; retrying ({} of {CAPACITY_RETRY_ATTEMPTS})",
+            describe_capacity_waits(&presented.outcome),
             attempt + 1,
         );
         // Cancellation stops this immediately: the caller holds this future, and
@@ -1455,10 +1773,46 @@ pub(crate) async fn submit_planned_check_batch(
     Ok(outcome)
 }
 
-/// The horizon an attempt waits on: the fleet's configured one first (`None`),
-/// a short bounded one for every retry.
-fn attempt_horizon_ms(attempt: usize) -> Option<u64> {
-    (attempt > 0).then_some(CAPACITY_RETRY_HORIZON_MS)
+/// Fold what the batch waited on into the capacity refusals it is about to
+/// return.
+///
+/// A verdictless red row that says only "there was no room" leaves its reader
+/// with no next step, and the reader who most needs one is an operator watching
+/// their own fleet refuse their own work. Naming the occupant is not substrate
+/// detail: an agent cannot act on a cell id or a queue position, but "queued
+/// behind CAIRN-3414's rust-tests" is a fact about the world that explains the
+/// row and predicts its own recovery.
+///
+/// Only capacity-shaped failures are touched. Every other shape describes
+/// something that was never about waiting.
+fn attribute_capacity_wait(outcome: &mut PlannedCheckBatchOutcome, wait: &GroupWait) {
+    for result in outcome.results.values_mut() {
+        if let Err(CheckExecutionFailure::Substrate(failure)) = result {
+            if failure.shape() == SubstrateFailureShape::Capacity {
+                failure.name_the_wait(&wait.description);
+            }
+        }
+    }
+}
+
+/// The distinct waits a batch's capacity refusals were attributed to, for one
+/// operator log line.
+///
+/// Read back off the refusals rather than recomputed, so the log and the rows
+/// cannot disagree, and distinct because a batch split across selectors was
+/// genuinely queued behind different work in each group.
+fn describe_capacity_waits(outcome: &PlannedCheckBatchOutcome) -> String {
+    let mut waits: Vec<&str> = outcome
+        .results
+        .values()
+        .filter_map(|result| match result {
+            Err(CheckExecutionFailure::Substrate(failure)) => failure.waited_on(),
+            _ => None,
+        })
+        .collect();
+    waits.sort_unstable();
+    waits.dedup();
+    waits.join("; also ")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1496,11 +1850,37 @@ fn capacity_retry_decision(attempt: usize, outcome: &PlannedCheckBatchOutcome) -
     }
 }
 
+/// One presentation of a batch, and whether what refused it was Cairn's own
+/// work.
+///
+/// The second fact decides whether the batch queues or gives up, and it is a
+/// property of THIS presentation rather than of the batch: a group refused by a
+/// named sibling suite is queued, while the same batch refused by an operator's
+/// own build is on a clock. A batch split across selectors is treated as queued
+/// only if every group that was refused for capacity was refused by Cairn — one
+/// group waiting on something nobody can account for puts the whole batch back
+/// on the bounded path, because it is the batch that has to end somewhere.
+struct PresentedBatch {
+    outcome: PlannedCheckBatchOutcome,
+    self_inflicted: bool,
+}
+
+/// Whether this group's outcome is a capacity refusal at all.
+fn refused_for_capacity(outcome: &PlannedCheckBatchOutcome) -> bool {
+    outcome.results.values().any(|result| {
+        matches!(
+            result,
+            Err(CheckExecutionFailure::Substrate(failure))
+                if failure.shape() == SubstrateFailureShape::Capacity
+        )
+    })
+}
+
 async fn submit_reserved_check_batch(
     orch: &Orchestrator,
     mut batch: PlannedCheckBatchRequest,
-    wait_horizon_ms: Option<u64>,
-) -> Result<PlannedCheckBatchOutcome, String> {
+    patience: &CheckPatience,
+) -> Result<PresentedBatch, String> {
     if batch.mutation_policy == MutationPolicy::PureVerdict {
         let mut groups = partition_check_items_by_executor(std::mem::take(&mut batch.items));
         if groups.len() > 1 {
@@ -1510,23 +1890,53 @@ async fn submit_reserved_check_batch(
                 delta: None,
                 store_dir: Some(batch.store_dir.clone()),
             };
-            for (_, items) in groups {
-                let outcome = submit_single_planned_check_batch(
+            let mut refused_groups = 0_usize;
+            let mut queued_groups = 0_usize;
+            for (selector, items) in groups {
+                // Each group derives its own wait, from its own eligible
+                // machines, at the moment it is presented. Groups also run one
+                // after another, so each re-reads what is LEFT of the shared
+                // ceiling -- otherwise a batch naming two executors could wait
+                // twice as long as it declared, and a ten-machine one, ten
+                // times.
+                let wait = patience.for_group(orch, &batch, selector.as_ref());
+                let mut outcome = submit_single_planned_check_batch(
                     orch,
                     PlannedCheckBatchRequest {
                         items,
                         ..batch.clone()
                     },
-                    wait_horizon_ms,
+                    &wait,
                 )
                 .await?;
+                attribute_capacity_wait(&mut outcome, &wait);
+                if refused_for_capacity(&outcome) {
+                    refused_groups += 1;
+                    queued_groups += usize::from(wait.self_inflicted);
+                }
                 combined.results.extend(outcome.results);
             }
-            return Ok(combined);
+            return Ok(PresentedBatch {
+                outcome: combined,
+                self_inflicted: refused_groups > 0 && refused_groups == queued_groups,
+            });
         }
         batch.items = groups.pop().map(|(_, items)| items).unwrap_or_default();
     }
-    submit_single_planned_check_batch(orch, batch, wait_horizon_ms).await
+    // One group, whose selector is whatever its items agree on. A conflict is a
+    // configuration error the submission below reports; there is no forecast to
+    // scope by a selector that cannot exist, so it reads as unconstrained here.
+    let wait = patience.for_group(
+        orch,
+        &batch,
+        merge_batch_executor(&batch.items).ok().flatten().as_ref(),
+    );
+    let mut outcome = submit_single_planned_check_batch(orch, batch, &wait).await?;
+    attribute_capacity_wait(&mut outcome, &wait);
+    Ok(PresentedBatch {
+        self_inflicted: wait.self_inflicted && refused_for_capacity(&outcome),
+        outcome,
+    })
 }
 
 /// Whether a planned check batch is free for placement policy to move.
@@ -1575,8 +1985,9 @@ fn partition_check_items_by_executor(
 async fn submit_single_planned_check_batch(
     orch: &Orchestrator,
     batch: PlannedCheckBatchRequest,
-    wait_horizon_ms: Option<u64>,
+    wait: &GroupWait,
 ) -> Result<PlannedCheckBatchOutcome, String> {
+    let wait_horizon_ms = wait.horizon_ms;
     // Configuration conflicts are deterministic caller errors and must surface
     // before any transient infrastructure preflight can obscure them.
     let executor = merge_batch_executor(&batch.items)?;
@@ -1593,7 +2004,6 @@ async fn submit_single_planned_check_batch(
         .items
         .iter()
         .fold(0_u32, |sum, item| sum.saturating_add(item.timeout_ms));
-    let fleet_config = crate::config::settings::load_fleet(&orch.config_dir);
     let request_id = uuid::Uuid::new_v4().to_string();
     let attempt_id = uuid::Uuid::new_v4().to_string();
     let mut temporary_ref = match publish_check_commit_ref(
@@ -1636,15 +2046,14 @@ async fn submit_single_planned_check_batch(
         env: batch.env,
         priority: batch.priority,
         // A check yields to interactive work by priority and then waits its
-        // turn. Past the machine-wide horizon the machine is genuinely saturated
-        // and "no room for a check right now" is honest, and the cadence that
-        // planned this check will plan it again. Every attempt gets a horizon
-        // derived from NOW, so a retry re-enters admission with a live wait
+        // turn. The horizon is the batch's OWN, stated by [`CheckPatience`] from
+        // what holds the machine, rather than the fleet-wide default meant for
+        // callers with no answer of their own. Past it the machine is genuinely
+        // saturated, "no room for a check right now" is honest, and the cadence
+        // that planned this check will plan it again. It is derived from NOW on
+        // every presentation, so a retry re-enters admission with a live wait
         // rather than one that already expired.
-        wait_horizon_unix_ms: wait_horizon_ms.map_or_else(
-            || crate::fleet::default_wait_horizon_unix_ms(&fleet_config),
-            |window| unix_time_ms_for_checks().saturating_add(window),
-        ),
+        wait_horizon_unix_ms: unix_time_ms_for_checks().saturating_add(wait_horizon_ms),
         waiting_since_unix_ms: unix_time_ms_for_checks(),
         timeout_ms,
         mutation_policy: batch.mutation_policy.clone(),
@@ -1690,8 +2099,11 @@ async fn submit_single_planned_check_batch(
             .await
     } else {
         let processes = items.into_iter().map(|item| item.process).collect();
+        // The queued row says what it is queued BEHIND. "Waiting for build
+        // slot" told an operator watching their own fleet only that Cairn was
+        // waiting on Cairn, which is the one thing they could already see.
         if let Some(board) = &batch.status_board {
-            board.set_phase(Some("queued"), Some("waiting for build slot".into()));
+            board.set_phase(Some("queued"), Some(wait.description.clone()));
         }
         let outcome = orch
             .fleet
@@ -1914,6 +2326,11 @@ pub(crate) enum SubstrateFailureShape {
     NoMachine,
     /// A working environment for the check could not be prepared.
     Preparation,
+    /// The working environment the check was given could not be made fit for
+    /// it, and was taken out of service for that. Distinct from `Preparation`
+    /// because the next attempt gets a different environment rather than the
+    /// same broken one.
+    EnvironmentRetired,
     /// The command ran, but Cairn could not obtain or record its result.
     Result,
     /// Cairn's own storage for the check failed.
@@ -1941,6 +2358,9 @@ impl SubstrateFailureShape {
             Self::Preparation => {
                 "Cairn could not prepare a working environment for this check."
             }
+            Self::EnvironmentRetired => {
+                "The working environment this check was given could not be made ready, so Cairn took it out of service."
+            }
             Self::Result => "This check ran, but Cairn could not record its result.",
             Self::Storage => "Cairn's own storage for this check failed.",
             Self::Cancelled => "Cairn cancelled this check before it produced a verdict.",
@@ -1949,13 +2369,16 @@ impl SubstrateFailureShape {
 
     /// Whether presenting this work again could plausibly change the answer.
     ///
-    /// Exactly one condition qualifies: capacity is relieved by time passing and
-    /// nothing else here is. A structural refusal (no matching machine, a
-    /// toolchain fault, a draining host), a cancellation, and anything that
-    /// happened after the command ran are all re-presented unchanged, so
-    /// retrying them would only spend the machine twice for the same answer.
+    /// Two conditions qualify, and both because something outside the check
+    /// changes between attempts. Capacity is relieved by time passing. A retired
+    /// environment is relieved by the retirement itself: the environment that
+    /// could not take the check is gone, so the next attempt is handed a
+    /// different one. A structural refusal (no matching machine, a toolchain
+    /// fault, a draining host), a cancellation, and anything that happened after
+    /// the command ran are all re-presented unchanged, so retrying them would
+    /// only spend the machine twice for the same answer.
     fn is_transient(self) -> bool {
-        matches!(self, Self::Capacity)
+        matches!(self, Self::Capacity | Self::EnvironmentRetired)
     }
 }
 
@@ -1990,6 +2413,7 @@ fn no_start_shape(
         CellUnavailableReason::Provisioning
         | CellUnavailableReason::Checkout
         | CellUnavailableReason::Preparation => SubstrateFailureShape::Preparation,
+        CellUnavailableReason::SlotUnhealthy => SubstrateFailureShape::EnvironmentRetired,
         // The environment was ready and the command still could not be launched,
         // which is Cairn's own machinery failing rather than the machine's state.
         CellUnavailableReason::Spawn | CellUnavailableReason::ObjectInfrastructure(_) => {
@@ -2092,6 +2516,11 @@ pub(crate) struct SubstrateFailure {
     shape: SubstrateFailureShape,
     diagnostic: String,
     build_service_implicated: bool,
+    /// What the batch was waiting ON, when Cairn's own placement records say.
+    /// Agent-facing on purpose: unlike a cell id or a queue position, the
+    /// identity of the work holding the machine is a fact about the world that
+    /// explains the row and predicts its recovery.
+    waited_on: Option<String>,
 }
 
 impl SubstrateFailure {
@@ -2100,7 +2529,17 @@ impl SubstrateFailure {
             shape,
             diagnostic: diagnostic.into(),
             build_service_implicated: false,
+            waited_on: None,
         }
+    }
+
+    /// Record what this failure spent its patience waiting on.
+    pub(crate) fn name_the_wait(&mut self, waited_on: &str) {
+        self.waited_on = Some(waited_on.to_string());
+    }
+
+    pub(crate) fn waited_on(&self) -> Option<&str> {
+        self.waited_on.as_deref()
     }
 
     /// Mark this failure as one the shared build-cache service caused, so its
@@ -2118,7 +2557,13 @@ impl SubstrateFailure {
 
     /// The authored text an agent reads in place of the substrate diagnostic.
     pub(crate) fn agent_message(&self) -> String {
-        format!("{} {SUBSTRATE_FAILURE_CONSEQUENCE}", self.shape.lead())
+        match &self.waited_on {
+            Some(waited_on) => format!(
+                "{} It was {waited_on}. {SUBSTRATE_FAILURE_CONSEQUENCE}",
+                self.shape.lead()
+            ),
+            None => format!("{} {SUBSTRATE_FAILURE_CONSEQUENCE}", self.shape.lead()),
+        }
     }
 
     /// The substrate diagnostic. Operator log only.
@@ -3687,6 +4132,14 @@ pub(crate) struct CheckOutcome {
     /// nor a reused one — it is the honest absence of both — so it must never
     /// wake anyone or read as a red the agent's change caused.
     pub(crate) suppressed_after: Option<i64>,
+    /// The immutable observation this evaluation recorded, as the recorder wrote
+    /// it. A caller that must name the row reads it from here rather than
+    /// re-deriving a key: a remote verdict is keyed by an empty environment
+    /// fingerprint that no coordinator-side key can match, and a coalesced
+    /// sibling's row was never this caller's to compute. `None` is the honest
+    /// answer when nothing was recorded — a suppressed triple never ran, and a
+    /// failed write leaves the verdict standing without a durable row.
+    pub(crate) recorded: Option<crate::execution::cache::RecordedCheckObservation>,
 }
 
 impl CheckOutcome {
@@ -4116,6 +4569,12 @@ where
             misses.push(index);
             continue;
         };
+        let recorded = crate::execution::cache::RecordedCheckObservation {
+            id: source_observation.clone(),
+            environment_fingerprint: environment_fingerprint.clone(),
+            // Only a reusable observation is ever admitted as a hit.
+            reusable: true,
+        };
         let _ = record_cached_check_observation(
             db.clone(),
             CachedCheckObservationWrite {
@@ -4171,6 +4630,7 @@ where
             cached: true,
             duration_ms: entry.duration_ms,
             suppressed_after: None,
+            recorded: Some(recorded),
         };
         // A cache hit jumps straight from pending to its final state.
         board.transition(
@@ -4238,6 +4698,7 @@ where
                         suppressed_after: Some(
                             crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
                         ),
+                        recorded: None,
                     },
                 };
                 board.transition(index, "failed", summary_annotation(&outcome));
@@ -4389,76 +4850,91 @@ where
                 Some(publication) => Some(publication.acquire().await),
                 None => None,
             };
-            let should_publish = !matches!(
-                publication_role,
-                Some(crate::fleet::PublicationRole::Published)
-            );
-            if should_publish {
-                let legacy_write = CheckResultCacheWrite {
-                    project_id: project_id.to_string(),
-                    defined_by_commit_sha: Some(commit.defined_by.to_string()),
-                    tree_hash: tree_hash.to_string(),
-                    input_hash: input_hash.clone(),
-                    check_name: plan.name.clone(),
-                    exit_code: exit_code.unwrap_or(-1),
-                    passed,
-                    output_tail: output_tail.clone(),
-                    duration_ms,
-                    target_results_json,
-                    job_id: Some(job_id.to_string()),
-                    cached: Some(false),
-                    failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
-                    executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
-                    executor_device_id: provenance
-                        .as_ref()
-                        .map(|meta| meta.executor_device_id.clone()),
-                    executor_connection_generation: provenance
-                        .as_ref()
-                        .map(|meta| meta.executor_connection_generation as i64),
-                    executor_cell_id: provenance.as_ref().map(|meta| meta.cell_id.clone()),
-                    executor_lease_epoch: provenance.as_ref().map(|meta| meta.cell_epoch as i64),
-                    executor_started_at_unix_ms: provenance
-                        .as_ref()
-                        .map(|meta| meta.started_at_unix_ms as i64),
-                    executor_finished_at_unix_ms: provenance
-                        .as_ref()
-                        .map(|meta| meta.finished_at_unix_ms as i64),
-                    toolchain_fingerprint: Some(check_toolchain_identity().to_string()),
-                };
-                let reuse =
-                    check_reuse_decision(&plan.command, passed, failure_kind, parsed.as_ref());
-                let observation = fresh_observation_write(
-                    project_id,
-                    commit,
-                    tree_hash,
-                    input_hash,
-                    plan,
-                    job_id,
-                    tool_use_id,
-                    exit_code.unwrap_or(-1),
-                    failure_kind,
-                    duration_ms,
-                    &output_tail,
-                    provenance.as_ref(),
-                    parsed.as_ref(),
-                    reuse,
-                );
-                if let Err(error) = record_fresh_check_observation(db.clone(), observation) {
-                    log::warn!("failed to record immutable check observation: {error}");
+            // Either a sibling already recorded this verdict and named the row it
+            // wrote, or this evaluation records it and names that row for every
+            // sibling. Both arms end holding the same answer to "what is this
+            // verdict's durable identity", which is what the caller reports.
+            let (recorded, published_here) = match publication_role {
+                Some(crate::fleet::PublicationRole::Published(recorded)) => (recorded, false),
+                role => {
+                    let legacy_write = CheckResultCacheWrite {
+                        project_id: project_id.to_string(),
+                        defined_by_commit_sha: Some(commit.defined_by.to_string()),
+                        tree_hash: tree_hash.to_string(),
+                        input_hash: input_hash.clone(),
+                        check_name: plan.name.clone(),
+                        exit_code: exit_code.unwrap_or(-1),
+                        passed,
+                        output_tail: output_tail.clone(),
+                        duration_ms,
+                        target_results_json,
+                        job_id: Some(job_id.to_string()),
+                        cached: Some(false),
+                        failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
+                        executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
+                        executor_device_id: provenance
+                            .as_ref()
+                            .map(|meta| meta.executor_device_id.clone()),
+                        executor_connection_generation: provenance
+                            .as_ref()
+                            .map(|meta| meta.executor_connection_generation as i64),
+                        executor_cell_id: provenance.as_ref().map(|meta| meta.cell_id.clone()),
+                        executor_lease_epoch: provenance
+                            .as_ref()
+                            .map(|meta| meta.cell_epoch as i64),
+                        executor_started_at_unix_ms: provenance
+                            .as_ref()
+                            .map(|meta| meta.started_at_unix_ms as i64),
+                        executor_finished_at_unix_ms: provenance
+                            .as_ref()
+                            .map(|meta| meta.finished_at_unix_ms as i64),
+                        toolchain_fingerprint: Some(check_toolchain_identity().to_string()),
+                    };
+                    let reuse =
+                        check_reuse_decision(&plan.command, passed, failure_kind, parsed.as_ref());
+                    let observation = fresh_observation_write(
+                        project_id,
+                        commit,
+                        tree_hash,
+                        input_hash,
+                        plan,
+                        job_id,
+                        tool_use_id,
+                        exit_code.unwrap_or(-1),
+                        failure_kind,
+                        duration_ms,
+                        &output_tail,
+                        provenance.as_ref(),
+                        parsed.as_ref(),
+                        reuse,
+                    );
+                    let identity = crate::execution::cache::RecordedCheckObservation {
+                        id: observation.id.clone(),
+                        environment_fingerprint: observation.environment_fingerprint.clone(),
+                        reusable: observation.reusable,
+                    };
+                    let recorded = match record_fresh_check_observation(db.clone(), observation) {
+                        Ok(()) => Some(identity),
+                        Err(error) => {
+                            log::warn!("failed to record immutable check observation: {error}");
+                            None
+                        }
+                    };
+                    // The legacy row is retained only for infrastructure retry/suppression diagnosis.
+                    if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
+                        let _ = store_check_result(db.clone(), legacy_write);
+                    }
+                    if let Some(crate::fleet::PublicationRole::Publisher(guard)) = role {
+                        guard.published(recorded.clone());
+                    }
+                    (recorded, true)
                 }
-                // The legacy row is retained only for infrastructure retry/suppression diagnosis.
-                if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
-                    let _ = store_check_result(db.clone(), legacy_write);
-                }
-                if let Some(crate::fleet::PublicationRole::Publisher(guard)) = publication_role {
-                    guard.published();
-                }
-            }
+            };
 
             // The bound may have just been reached by the store above. Claim the
             // ONE escalation this triple is allowed and, if we won it, put the
             // operator's half of the story where the rest of it already lives.
-            if should_publish && failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
+            if published_here && failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
                 escalate_suppressed_check(
                     db,
                     project_id,
@@ -4480,6 +4956,7 @@ where
                 cached: false,
                 duration_ms,
                 suppressed_after: None,
+                recorded,
             };
             board.transition(
                 index,
@@ -4607,6 +5084,10 @@ pub(crate) fn record_suppressed_check(
         cached: false,
         duration_ms: 0,
         suppressed_after: Some(streak),
+        // Nothing ran, so there is no observation of this evaluation. The
+        // re-stamped legacy row is the last real failure's record, not this
+        // evaluation's verdict.
+        recorded: None,
     }
 }
 
@@ -6948,6 +7429,7 @@ mod tests {
             parsed: None,
             output_tail: String::new(),
             cached: false,
+            recorded: None,
             duration_ms: 0,
             suppressed_after: None,
         }
@@ -7006,6 +7488,7 @@ mod tests {
             parsed,
             output_tail: "raw output tail".to_string(),
             cached: false,
+            recorded: None,
             duration_ms: 0,
             suppressed_after: None,
         }];
@@ -7034,6 +7517,7 @@ mod tests {
             parsed: Some(parsed),
             output_tail: String::new(),
             cached,
+            recorded: None,
             duration_ms: 0,
             suppressed_after: None,
         }
@@ -7701,6 +8185,7 @@ mod tests {
             | CellUnavailableReason::Checkout
             | CellUnavailableReason::Spawn
             | CellUnavailableReason::Preparation
+            | CellUnavailableReason::SlotUnhealthy
             | CellUnavailableReason::ExecutorUnavailable
             | CellUnavailableReason::NoMatchingExecutor
             | CellUnavailableReason::AdmissionRejected { .. }
@@ -7794,6 +8279,13 @@ mod tests {
             (
                 CellUnavailableReason::Preparation,
                 SubstrateFailureShape::Preparation,
+            ),
+            // The pair that must not collapse: an environment that could not be
+            // prepared is re-presented unchanged, and one that was retired for
+            // being unfit is tried again somewhere else.
+            (
+                CellUnavailableReason::SlotUnhealthy,
+                SubstrateFailureShape::EnvironmentRetired,
             ),
             (
                 CellUnavailableReason::Spawn,
@@ -7906,11 +8398,11 @@ mod tests {
         )
     }
 
-    /// The retry policy, stated as the two bounds that keep it from becoming a
-    /// loop: it stops at the attempt bound, and every retry waits on a fresh,
-    /// short horizon rather than another full one.
+    /// The attempt bound, which is what keeps re-presentation from becoming a
+    /// loop. The other bound — the declared patience budget — is exercised in
+    /// the patience tests below; either one alone ends the policy.
     #[test]
-    fn a_capacity_retry_is_bounded_and_waits_on_a_fresh_short_horizon() {
+    fn a_capacity_retry_is_bounded_by_its_attempt_count() {
         let refused = capacity_outcome([0, 1]);
         for attempt in 0..CAPACITY_RETRY_ATTEMPTS {
             assert!(
@@ -7926,19 +8418,247 @@ mod tests {
             CapacityRetry::Surface,
             "the bound is what makes this a policy rather than a loop"
         );
+    }
 
-        assert_eq!(
-            attempt_horizon_ms(0),
-            None,
-            "the first ask waits on the fleet's own horizon"
+    fn predicted(
+        relief_ms: u64,
+        occupant_count: usize,
+    ) -> crate::fleet::occupancy::MachineOccupancy {
+        crate::fleet::occupancy::MachineOccupancy::Predicted(
+            crate::fleet::occupancy::OccupancyForecast {
+                relief_ms,
+                blocking: "CAIRN-3414's rust-tests".into(),
+                occupant_count,
+            },
+        )
+    }
+
+    /// The ceiling bounds the whole wait on load Cairn cannot account for, not
+    /// one presentation of it, so a batch that has spent it has nothing left to
+    /// offer a retry however many attempts its count would still allow.
+    #[test]
+    fn foreign_patience_bounds_the_whole_wait_rather_than_one_presentation() {
+        let live = CheckPatience {
+            started: std::time::Instant::now(),
+            foreign_ceiling: std::time::Duration::from_millis(REVIEW_CADENCE_FOREIGN_CEILING_MS),
+            mobility: PlacementMobility::SpillEligible,
+        };
+        assert!(!live.foreign_patience_spent());
+        assert!(live.remaining_foreign_ceiling_ms() > REVIEW_CADENCE_FOREIGN_CEILING_MS - 10_000);
+
+        let exhausted = CheckPatience {
+            started: std::time::Instant::now(),
+            foreign_ceiling: std::time::Duration::ZERO,
+            mobility: PlacementMobility::SpillEligible,
+        };
+        assert!(
+            exhausted.foreign_patience_spent(),
+            "a spent ceiling ends the wait on load nothing can account for"
         );
-        for attempt in 1..=CAPACITY_RETRY_ATTEMPTS {
+        assert_eq!(
+            exhausted.remaining_foreign_ceiling_ms(),
+            CAPACITY_RETRY_BACKOFF_MS[0],
+            "a presentation is never given a zero horizon, which would be evicted on arrival"
+        );
+    }
+
+    /// The operator's rule, which is the whole point of the policy: several
+    /// agents working at once is REGULAR operation, so the contention that
+    /// creates must never be able to produce a red row about someone's change.
+    ///
+    /// A wait on Cairn's own measured work carries no ceiling at all — not a
+    /// generous one. Whatever the cadence would allow, and however long the
+    /// occupant is predicted to take, the horizon is sized to outlast it and the
+    /// check keeps its place.
+    #[test]
+    fn a_wait_on_cairns_own_work_is_never_cut_short_by_a_cadence_ceiling() {
+        // Longer than either cadence ceiling, and longer than the whole wait a
+        // pre-CAIRN-3429 batch could ever have declared.
+        let long_suite = GroupWait::from_occupancy(predicted(30 * 60_000, 1), 1_000);
+        assert!(long_suite.self_inflicted);
+        assert_eq!(
+            long_suite.horizon_ms,
+            30 * 60_000 + PREDICTION_MARGIN_MS,
+            "the horizon outlasts the occupant, whatever the cadence would otherwise allow"
+        );
+        assert!(
+            long_suite.horizon_ms > REVIEW_CADENCE_FOREIGN_CEILING_MS,
+            "a ceiling meant for unaccountable load must not clip an accounted-for wait"
+        );
+
+        // Even with the foreign ceiling fully spent, self-inflicted contention
+        // is queued rather than abandoned.
+        let spent = GroupWait::from_occupancy(predicted(240_000, 1), 0);
+        assert!(spent.self_inflicted);
+        assert_eq!(spent.horizon_ms, 240_000 + PREDICTION_MARGIN_MS);
+
+        // And it says it is holding a place, not counting down to a refusal.
+        assert!(
+            spent
+                .description
+                .contains("holding this check's place until it frees"),
+            "{}",
+            spent.description
+        );
+    }
+
+    /// What the operator and the agent actually read. A wait Cairn can attribute
+    /// names the work it is queued behind and when that work should end; a wait
+    /// it cannot attribute says so rather than inventing an occupant, and only
+    /// that second kind is on a clock.
+    #[test]
+    fn a_wait_is_described_by_what_it_is_actually_on() {
+        let known =
+            GroupWait::from_occupancy(predicted(240_000, 3), REVIEW_CADENCE_FOREIGN_CEILING_MS);
+        assert_eq!(known.horizon_ms, 270_000, "relief plus the settling margin");
+        assert_eq!(
+            known.description,
+            "queued behind CAIRN-3414's rust-tests, predicted to finish in 4m, behind 2 other cells; holding this check's place until it frees"
+        );
+
+        for blind in [
+            crate::fleet::occupancy::MachineOccupancy::Unforecastable,
+            crate::fleet::occupancy::MachineOccupancy::Idle,
+        ] {
+            let wait = GroupWait::from_occupancy(blind, WRITE_CADENCE_FOREIGN_CEILING_MS);
+            assert!(!wait.self_inflicted, "nothing accounts for this wait");
             assert_eq!(
-                attempt_horizon_ms(attempt),
-                Some(CAPACITY_RETRY_HORIZON_MS),
-                "a retry gets a live horizon, bounded so the policy cannot stall"
+                wait.horizon_ms, WRITE_CADENCE_FOREIGN_CEILING_MS,
+                "with nothing to predict, the cadence ceiling is the whole answer"
+            );
+            assert!(
+                wait.description.contains("no measured duration")
+                    && wait.description.contains("waiting up to"),
+                "an unattributable wait states the absence, and that it is on a clock: {}",
+                wait.description
             );
         }
+    }
+
+    /// The floor still applies to an accounted-for wait: no forecast is precise
+    /// enough to justify a horizon so short the queue cannot act on it.
+    #[test]
+    fn even_a_momentary_occupant_buys_the_floor() {
+        let brief =
+            GroupWait::from_occupancy(predicted(1_000, 1), REVIEW_CADENCE_FOREIGN_CEILING_MS);
+        assert_eq!(brief.horizon_ms, CHECK_PATIENCE_FLOOR_MS);
+    }
+
+    /// The named wait reaches the agent. A capacity row that says only "there
+    /// was no room" is the row CAIRN-3429 was filed about; every other shape is
+    /// left alone because none of them was about waiting.
+    #[test]
+    fn only_a_capacity_refusal_is_told_what_it_waited_on() {
+        let mut outcome = capacity_outcome([0, 1]);
+        outcome.results.insert(
+            2,
+            Err(CheckExecutionFailure::substrate(
+                SubstrateFailureShape::NoMachine,
+                "no executor advertises matlab",
+            )),
+        );
+        attribute_capacity_wait(
+            &mut outcome,
+            &GroupWait::from_occupancy(predicted(240_000, 3), REVIEW_CADENCE_FOREIGN_CEILING_MS),
+        );
+
+        for index in [0, 1] {
+            let Some(Err(CheckExecutionFailure::Substrate(failure))) = outcome.results.get(&index)
+            else {
+                panic!("index {index} is a substrate failure");
+            };
+            let message = failure.agent_message();
+            assert!(
+                message.contains("CAIRN-3414's rust-tests"),
+                "a capacity row names what held the machine: {message}"
+            );
+            assert!(
+                message.contains(SUBSTRATE_FAILURE_CONSEQUENCE),
+                "the consequence still closes the message: {message}"
+            );
+        }
+
+        let Some(Err(CheckExecutionFailure::Substrate(structural))) = outcome.results.get(&2)
+        else {
+            panic!("index 2 is a substrate failure");
+        };
+        assert_eq!(
+            structural.agent_message(),
+            format!(
+                "{} {SUBSTRATE_FAILURE_CONSEQUENCE}",
+                SubstrateFailureShape::NoMachine.lead()
+            ),
+            "a refusal that was never about waiting gains no wait story"
+        );
+    }
+
+    /// Two selector groups are two different waits.
+    ///
+    /// A batch whose items name different executors is presented as separate
+    /// requests against separate machines, so each group is blocked by its own
+    /// occupant and is attributed before the results merge. One basis stamped
+    /// across the whole batch would tell half its rows the name of work they
+    /// were never queued behind.
+    #[test]
+    fn each_selector_group_is_attributed_to_its_own_blocker() {
+        let mut linux_group = capacity_outcome([0, 1]);
+        attribute_capacity_wait(
+            &mut linux_group,
+            &GroupWait::from_occupancy(
+                crate::fleet::occupancy::MachineOccupancy::Predicted(
+                    crate::fleet::occupancy::OccupancyForecast {
+                        relief_ms: 300_000,
+                        blocking: "CAIRN-3414's rust-tests".into(),
+                        occupant_count: 1,
+                    },
+                ),
+                REVIEW_CADENCE_FOREIGN_CEILING_MS,
+            ),
+        );
+
+        let mut local_group = PlannedCheckBatchOutcome::failed(
+            vec![2],
+            SubstrateFailure::new(SubstrateFailureShape::Capacity, "no room"),
+        );
+        attribute_capacity_wait(
+            &mut local_group,
+            &GroupWait::from_occupancy(
+                crate::fleet::occupancy::MachineOccupancy::Predicted(
+                    crate::fleet::occupancy::OccupancyForecast {
+                        relief_ms: 4_000,
+                        blocking: "CAIRN-3421's frontend-tests".into(),
+                        occupant_count: 1,
+                    },
+                ),
+                REVIEW_CADENCE_FOREIGN_CEILING_MS,
+            ),
+        );
+
+        let mut combined = linux_group;
+        combined.results.extend(local_group.results);
+
+        let waited_on = |index: usize| match combined.results.get(&index) {
+            Some(Err(CheckExecutionFailure::Substrate(failure))) => {
+                failure.waited_on().unwrap().to_string()
+            }
+            _ => panic!("index {index} is a capacity failure"),
+        };
+        assert!(waited_on(0).contains("CAIRN-3414's rust-tests"));
+        assert!(waited_on(1).contains("CAIRN-3414's rust-tests"));
+        assert!(
+            waited_on(2).contains("CAIRN-3421's frontend-tests"),
+            "the second group kept its own blocker: {}",
+            waited_on(2)
+        );
+
+        // And the operator's one log line reports both, without repeating the
+        // group that covered two checks.
+        let logged = describe_capacity_waits(&combined);
+        assert_eq!(
+            logged.matches("queued behind").count(),
+            2,
+            "two distinct waits, deduplicated within each group: {logged}"
+        );
     }
 
     /// What must NOT retry. A structural refusal has the same answer next time,
@@ -8061,6 +8781,13 @@ mod tests {
                 reason: Preparation,
                 diagnostic: "could not load canonical project execution policy".to_string(),
             },
+            // The specimen from the transcript that opened CAIRN-3430, now on
+            // the reason that says the environment was given up rather than the
+            // one that says preparation failed.
+            CellOutcome::Unavailable {
+                reason: SlotUnhealthy,
+                diagnostic: scratch_path.to_string(),
+            },
             CellOutcome::Unavailable {
                 reason: ExecutorUnavailable,
                 diagnostic: "connection closed while the request was queued".to_string(),
@@ -8098,11 +8825,11 @@ mod tests {
                     .to_string(),
             );
         }
-        // Nine outcome classes, nine distinct openings: composition informs, it
+        // Ten outcome classes, ten distinct openings: composition informs, it
         // does not flatten every infrastructure failure into one sentence. The
         // count is the assertion — a new class that reuses an existing lead is
         // exactly the collapse this guards against.
-        assert_eq!(leads.len(), 9, "each outcome class needs its own lead");
+        assert_eq!(leads.len(), 10, "each outcome class needs its own lead");
     }
 
     /// Composition happens at the executor seam, so it must survive the whole
@@ -8238,6 +8965,7 @@ mod tests {
             parsed: None,
             output_tail: "timed out after 30m".to_string(),
             cached: false,
+            recorded: None,
             duration_ms: 1_800_000,
             suppressed_after: None,
         }]);
@@ -8506,6 +9234,323 @@ mod tests {
         reusable_observation_for("frontend", "ih-frontend", environment_fingerprint)
     }
 
+    /// A check run reported by a REMOTE executor — what an enrolled machine
+    /// returns when a spill-eligible suite lands on it.
+    fn exec_on_executor(
+        exit_code: Option<i32>,
+        output: impl Into<String>,
+        executor_id: &str,
+    ) -> Result<CheckExecResult, String> {
+        Ok(CheckExecResult {
+            exit_code,
+            output: output.into(),
+            timed_out: false,
+            duration_ms: Some(1),
+            provenance: Some(cairn_common::executor_protocol::CellExecutionMeta {
+                executor_id: executor_id.to_string(),
+                executor_device_id: "device-remote".to_string(),
+                executor_connection_generation: 1,
+                cell_id: "slot-1".to_string(),
+                cell_epoch: 1,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                duration_ms: Some(1),
+                peak_rss_bytes: None,
+                peak_physical_footprint_bytes: None,
+                disk_delta_bytes: None,
+                measurement_quality: None,
+            }),
+            publication: None,
+        })
+    }
+
+    /// The specimen behind CAIRN-3413: a manual check that spilled to another
+    /// machine.
+    ///
+    /// Its observation is recorded under an EMPTY environment fingerprint,
+    /// because Cairn cannot identify a remote machine's verdict environment and
+    /// must not publish its row under a coordinator-derived key. Both halves are
+    /// pinned here: the coordinator's key still resolves nothing (reuse stays
+    /// exactly as closed as CAIRN-3328 left it), and the caller still gets its
+    /// verdict and the id of the row that was written.
+    #[tokio::test]
+    async fn a_remotely_executed_check_returns_the_observation_it_recorded() {
+        let db = cache_db().await;
+        let plans = vec![(
+            plan("rust-tests", "bunx tsc --noEmit"),
+            "ih-remote".to_string(),
+        )];
+        let results = run_planned_checks_at_commit(
+            db.clone(),
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "manual-check:run-a:rust-tests",
+            CheckExecMode::Shared,
+            None,
+            |_index, _command, _stream_id| async {
+                exec_on_executor(Some(0), "remote green", "bglab-ub")
+            },
+            |_| {},
+        )
+        .await;
+
+        let recorded = results[0]
+            .recorded
+            .clone()
+            .expect("a remote run records the observation it wrote");
+        assert!(
+            recorded.environment_fingerprint.is_empty(),
+            "a remote machine's verdict environment is unidentified"
+        );
+        assert!(
+            !recorded.reusable,
+            "a remote verdict must never suppress a later execution"
+        );
+
+        let schema = crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64;
+        assert!(
+            crate::execution::cache::get_check_result_observation(
+                db.clone(),
+                "project-a",
+                "commit-target",
+                "rust-tests",
+                &plan_environment_fingerprint(&plans[0].0),
+                schema,
+                None,
+                None,
+                0,
+                0,
+            )
+            .unwrap()
+            .is_none(),
+            "the requesting side's key must not resolve a remote row — which is why \
+             the reply cannot be derived from a second lookup"
+        );
+        assert_eq!(
+            crate::execution::cache::get_check_result_observation(
+                db,
+                "project-a",
+                "commit-target",
+                "rust-tests",
+                "",
+                schema,
+                None,
+                None,
+                0,
+                0,
+            )
+            .unwrap()
+            .expect("the row exists under the identity it was recorded with")
+            .observation_id,
+            recorded.id,
+            "the run recorded exactly the observation it reported"
+        );
+
+        let reply = manual_configured_check_result(
+            "rust-tests",
+            "commit-target".to_string(),
+            "tree-target".to_string(),
+            "ih-remote".to_string(),
+            results.into_iter().next().unwrap(),
+        );
+        assert!(reply.passed, "a remote green reaches the caller as a green");
+        assert_eq!(reply.observation_id.as_deref(), Some(recorded.id.as_str()));
+        assert_eq!(reply.disposition, "fresh");
+        assert!(!reply.reusable);
+        assert!(reply.environment_fingerprint.is_empty());
+        assert!(reply.no_verdict.is_none());
+    }
+
+    /// A local run is unchanged: the recorded identity carries this machine's
+    /// fingerprint, the coordinator's own key resolves it, and it stays reusable.
+    #[tokio::test]
+    async fn a_local_verdict_reports_a_reusable_observation_under_this_machine() {
+        let db = cache_db().await;
+        let plans = vec![(
+            plan("frontend", "bunx tsc --noEmit"),
+            "ih-local".to_string(),
+        )];
+        let results = run_planned_checks_at_commit(
+            db.clone(),
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "manual-check:run-a:frontend",
+            CheckExecMode::Shared,
+            None,
+            |_index, _command, _stream_id| async { exec_ok(Some(0), "ok") },
+            |_| {},
+        )
+        .await;
+
+        let recorded = results[0].recorded.clone().expect("a local run records");
+        assert_eq!(
+            recorded.environment_fingerprint,
+            plan_environment_fingerprint(&plans[0].0)
+        );
+        assert!(recorded.reusable);
+        assert_eq!(
+            crate::execution::cache::get_check_result_observation(
+                db,
+                "project-a",
+                "commit-target",
+                "frontend",
+                &recorded.environment_fingerprint,
+                crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+                None,
+                None,
+                0,
+                0,
+            )
+            .unwrap()
+            .expect("a local row is addressable by this machine's key")
+            .observation_id,
+            recorded.id
+        );
+
+        let reply = manual_configured_check_result(
+            "frontend",
+            "commit-target".to_string(),
+            "tree-target".to_string(),
+            "ih-local".to_string(),
+            results.into_iter().next().unwrap(),
+        );
+        assert!(reply.passed && reply.reusable);
+        assert_eq!(reply.disposition, "fresh");
+        assert!(reply.no_verdict.is_none());
+    }
+
+    /// Cairn's own machinery failing is not a result about the tree. It renders
+    /// as the named substrate cause, never as a red and never as a complaint
+    /// about recording.
+    #[tokio::test]
+    async fn an_infrastructure_failure_reports_its_substrate_cause() {
+        let db = cache_db().await;
+        let plans = vec![(
+            plan("rust-tests", "bunx tsc --noEmit"),
+            "ih-infra".to_string(),
+        )];
+        let results = run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "manual-check:run-a:rust-tests",
+            CheckExecMode::Shared,
+            None,
+            |_index, _command, _stream_id| async {
+                Err::<CheckExecResult, CheckExecutionFailure>(CheckExecutionFailure::substrate(
+                    SubstrateFailureShape::MachineUnreachable,
+                    "cell link dropped mid-execution",
+                ))
+            },
+            |_| {},
+        )
+        .await;
+
+        let outcome = results.into_iter().next().unwrap();
+        assert_eq!(outcome.failure_kind, Some(CheckFailureKind::Infrastructure));
+        let reply = manual_configured_check_result(
+            "rust-tests",
+            "commit-target".to_string(),
+            "tree-target".to_string(),
+            "ih-infra".to_string(),
+            outcome,
+        );
+        let no_verdict = reply
+            .no_verdict
+            .expect("an infrastructure failure produced no verdict");
+        assert_eq!(no_verdict.kind, "infrastructure");
+        assert_eq!(no_verdict.after_failures, None);
+        assert!(
+            no_verdict.cause.contains("lost contact with the machine"),
+            "the reader gets the named cause: {}",
+            no_verdict.cause
+        );
+        assert!(
+            !no_verdict.cause.contains("cell link dropped"),
+            "the substrate diagnostic stays in the operator log: {}",
+            no_verdict.cause
+        );
+    }
+
+    /// A check Cairn declined to run says so, and an ordinary red stays an
+    /// ordinary red rather than being laundered into a no-verdict.
+    #[test]
+    fn a_suppressed_check_reports_that_cairn_declined_to_run_it() {
+        let suppressed = CheckOutcome {
+            name: "rust-tests".to_string(),
+            passed: false,
+            exit_code: None,
+            failure_kind: Some(CheckFailureKind::Infrastructure),
+            parsed: None,
+            output_tail: "the last failure was a spawn error".to_string(),
+            cached: false,
+            duration_ms: 0,
+            suppressed_after: Some(3),
+            recorded: None,
+        };
+        let reply = manual_configured_check_result(
+            "rust-tests",
+            "commit-target".to_string(),
+            "tree-target".to_string(),
+            "ih-suppressed".to_string(),
+            suppressed,
+        );
+        let no_verdict = reply.no_verdict.expect("a suppressed check has no verdict");
+        assert_eq!(no_verdict.kind, "suppressed");
+        assert_eq!(no_verdict.after_failures, Some(3));
+        assert!(
+            reply.observation_id.is_none(),
+            "nothing ran, so nothing was observed"
+        );
+
+        let red = CheckOutcome {
+            name: "rust-tests".to_string(),
+            passed: false,
+            exit_code: Some(1),
+            failure_kind: None,
+            parsed: None,
+            output_tail: "2 tests failed".to_string(),
+            cached: false,
+            duration_ms: 10,
+            suppressed_after: None,
+            recorded: Some(crate::execution::cache::RecordedCheckObservation {
+                id: "obs-red".to_string(),
+                environment_fingerprint: "env-local".to_string(),
+                reusable: false,
+            }),
+        };
+        let reply = manual_configured_check_result(
+            "rust-tests",
+            "commit-target".to_string(),
+            "tree-target".to_string(),
+            "ih-red".to_string(),
+            red,
+        );
+        assert!(
+            reply.no_verdict.is_none(),
+            "a failing check IS a verdict about the tree"
+        );
+        assert_eq!(reply.observation_id.as_deref(), Some("obs-red"));
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn configured_verdict_environment_requires_an_exact_cache_hit() {
@@ -8594,6 +9639,13 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "a hit must spawn nothing");
         assert!(results[0].cached);
         assert_eq!(results[0].output_tail, "cached");
+        let reused = results[0]
+            .recorded
+            .clone()
+            .expect("a hit reports the observation it reused");
+        assert_eq!(reused.id, "obs-frontend");
+        assert_eq!(reused.environment_fingerprint, environment);
+        assert!(reused.reusable);
         let alias = crate::execution::cache::get_check_result_observation(
             db.clone(),
             "project-a",

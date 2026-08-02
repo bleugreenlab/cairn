@@ -575,6 +575,18 @@ macro_rules! private_thread_compaction {
     };
 }
 
+/// The abandoned-intent state the live-tap channel needs. Channel delivery state
+/// never replicates into a team database, so this rebuild stays private.
+macro_rules! private_channel_outbound_expired {
+    () => {
+        Migration::new(
+            "0142",
+            "channel_outbound_expired",
+            include_str!("../../../../turso_migrations/0142_channel_outbound_expired.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -814,7 +826,23 @@ macro_rules! private_lineage {
             // entries around it carries no dependency.
             private_thread_compaction!(),
             private_channel_persistence!(),
+            private_channel_outbound_expired!(),
             shared_tail_issue_kind!(),
+            // Must follow `private_thread_compaction!()`: they alter that table.
+            Migration::new(
+                "0140",
+                "thread_compaction_seed_bytes",
+                include_str!(
+                    "../../../../turso_migrations/0140_thread_compaction_seed_bytes.sql"
+                ),
+            ),
+            Migration::new(
+                "0141",
+                "thread_compaction_capacity_trigger",
+                include_str!(
+                    "../../../../turso_migrations/0141_thread_compaction_capacity_trigger.sql"
+                ),
+            ),
         ]
     };
 }
@@ -2153,7 +2181,10 @@ mod tests {
                 "0136_conflict_resolution_sessions".to_string(),
                 "0139_thread_compaction".to_string(),
                 "0137_channel_persistence".to_string(),
+                "0142_channel_outbound_expired".to_string(),
                 "0138_issue_kind".to_string(),
+                "0140_thread_compaction_seed_bytes".to_string(),
+                "0141_thread_compaction_capacity_trigger".to_string(),
             ]
         );
         Ok(db)
@@ -2203,7 +2234,11 @@ mod tests {
             .run(&db)
             .await
             .unwrap();
-        assert_eq!(applied, vec!["0138_issue_kind".to_string()]);
+        // The migration under test is what this run reaches first. Whatever is
+        // composed after it also applies and will keep growing, so pinning the
+        // whole pending tail here would only make every later migration edit an
+        // unrelated test.
+        assert_eq!(applied.first().map(String::as_str), Some("0138_issue_kind"));
 
         assert_eq!(
             query_i64(
@@ -2767,6 +2802,75 @@ mod tests {
             .await
             .unwrap(),
             0
+        );
+    }
+
+    /// CAIRN-3434: widening a CHECK-constrained enum is a full table rebuild, so
+    /// an ask already on the operator's phone has to survive it with the GUID a
+    /// reply binds to -- and the new terminal state has to actually be accepted
+    /// once the rebuild lands.
+    #[tokio::test]
+    async fn channel_outbound_rebuild_preserves_intents_and_admits_expired() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("channel-expired.turso.db"))
+            .await
+            .unwrap();
+
+        // Stop at the migration under test in COMPOSITION order; the private tail
+        // interleaves, so a version comparison would apply the wrong neighbors.
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0140")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+
+        db.execute_batch(
+            "INSERT INTO channel_outbound
+                 (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, provider_guid, created_at, sent_at)
+                 VALUES ('sent-1', 'imessage', 'question', 'prompt-1:0', '+15551234567', 'Which path?', 'text', 'sent', 'guid-1', 10, 11);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT provider_guid FROM channel_outbound WHERE id = 'sent-1'"
+            )
+            .await
+            .unwrap(),
+            "guid-1"
+        );
+        // The rebuild recreates every index the dropped table carried.
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_channel_outbound%'"
+            )
+            .await
+            .unwrap(),
+            3
+        );
+        db.execute(
+            "UPDATE channel_outbound SET status = 'expired' WHERE id = 'sent-1'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.execute(
+                "UPDATE channel_outbound SET status = 'abandoned' WHERE id = 'sent-1'",
+                (),
+            )
+            .await
+            .is_err(),
+            "the widened CHECK still fences off statuses the ledger does not define"
         );
     }
 

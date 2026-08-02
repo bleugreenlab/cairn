@@ -10,12 +10,18 @@
 //!    and copied, never summarized and never generated. An unprovenanced ruling
 //!    gets relitigated, and a generated summary of one's own decisions is
 //!    strictly worse than the version the thread wrote.
-//! 2. **A generated table of contents** — mechanical. A chapter is usually a
+//! 2. **A generated census of the children** — where every child issue stands
+//!    *right now*, read from live state at composition time. Same split as the
+//!    arc, applied to the other half of a thread's memory: the arc is inherited
+//!    verbatim, so any census authored into it is stale by construction, and a
+//!    resumed thread that cannot trust it spends its first turn re-reading every
+//!    child to rebuild what Cairn already knows.
+//! 3. **A generated table of contents** — mechanical. A chapter is usually a
 //!    child issue: it has a beginning, an end, a subject, and a URI. Everything
 //!    else is bounded at user-turn boundaries. Every line carries a one-line
 //!    overview *and* an address, because a bare address invites a defensive
 //!    re-fetch, which costs more than never having dropped the range.
-//! 3. **The recency window** — the last [`RECENCY_TURNS`] turns verbatim, plus
+//! 4. **The recency window** — the last [`RECENCY_TURNS`] turns verbatim, plus
 //!    any older turn that still touches an unresolved child.
 //!
 //! Nothing here decides *when* to compact; that is the trigger's job in
@@ -29,7 +35,7 @@ use cairn_db::turso::params;
 use crate::storage::{LocalDb, RowExt};
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
 
-use super::common::connect_for_read;
+use super::common::{connect_for_read, job_status_icon};
 use super::transcript::{
     format_transcript_digest_with, group_turn_blocks, load_job_events_ordered, DigestMeta,
     DigestOptions, EventRow, TurnBlock,
@@ -48,6 +54,10 @@ const ARC_MISSING_NOTICE: &str = "_No arc has been authored for this thread yet.
 
 const NO_HISTORY_NOTICE: &str =
     "_Nothing has been compacted yet; the whole session so far is below._";
+
+/// Framing for the children census. It says where the lines came from, because
+/// a resumed thread that reads them as prose it once wrote will re-verify them.
+const CHILDREN_NOTICE: &str = "_Read from live state as this seed was composed — not authored, not inherited. Trust it over anything the arc says about where a child stands, and re-read a child only when you need detail this line does not carry._";
 
 /// A composed thread seed, and the two measurements that price it.
 pub(crate) struct ThreadSeed {
@@ -75,7 +85,11 @@ pub(crate) struct ThreadSeed {
 ///
 /// Fails rather than returning a partial seed: the caller preserves the existing
 /// session on any error, exactly as the ordinary reseed path does.
-pub(crate) async fn compose_thread_seed(db: &LocalDb, job_id: &str) -> Result<ThreadSeed, String> {
+pub(crate) async fn compose_thread_seed(
+    db: &LocalDb,
+    job_id: &str,
+    now: i64,
+) -> Result<ThreadSeed, String> {
     let conn = connect_for_read(db).await?;
     let events = load_job_events_ordered(
         &conn,
@@ -104,9 +118,14 @@ pub(crate) async fn compose_thread_seed(db: &LocalDb, job_id: &str) -> Result<Th
     let prior_entries = compaction::applied_entries(db, job_id, &source_session_id)
         .await
         .map_err(|error| format!("Failed to load the prior thread table of contents: {error}"))?;
-    let open_children = open_child_issue_uris(&conn, job_id)
+    let children = load_children(&conn, job_id)
         .await
-        .map_err(|error| format!("Failed to resolve this thread's open children: {error}"))?;
+        .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
+    let open_children: Vec<String> = children
+        .iter()
+        .filter(|child| child.is_open())
+        .map(|child| child.uri.clone())
+        .collect();
 
     let blocks = group_turn_blocks(&events);
     let plan = plan_chapters(&blocks, &marks, &open_children, &prior_entries);
@@ -151,7 +170,9 @@ pub(crate) async fn compose_thread_seed(db: &LocalDb, job_id: &str) -> Result<Th
     let mut content = String::new();
     content.push_str("## Arc\n\n");
     content.push_str(arc.trim());
-    content.push_str("\n\n## History\n\n");
+    content.push_str("\n\n");
+    content.push_str(&render_children(&children, now));
+    content.push_str("## History\n\n");
     content.push_str(&history);
     content.push_str("\n## Recent\n\n");
     if carried_older {
@@ -620,7 +641,7 @@ fn interstitial_overview(block: &TurnBlock<'_>) -> String {
     }
 }
 
-/// Strip the machinery that leads a resumed turn — the `[Fri 09:12 — resumed]`
+/// Strip the machinery that leads a resumed turn — the `[Fri 09:12 PDT — resumed]`
 /// clock stamp and any system-reminder block — then take the first sentence.
 fn first_sentence(content: &str) -> String {
     let mut body = content.trim();
@@ -705,29 +726,305 @@ async fn node_coordinates(
     })
 }
 
-/// The canonical URIs of this thread's children that have not resolved.
-async fn open_child_issue_uris(
+/// Where one child issue stands at composition time.
+///
+/// Every field is read live. None of it is new state: it is the same data an
+/// issue read returns, assembled into one line so a resumed thread does not have
+/// to fetch five issues to learn what Cairn already knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildStatus {
+    uri: String,
+    title: String,
+    status: String,
+    /// The newest execution's top-level nodes, in creation order.
+    nodes: Vec<(String, String)>,
+    pr: Option<(i64, String)>,
+    /// The newest verdict per check name across this child's jobs.
+    checks: Vec<(String, String)>,
+    unanswered_questions: i64,
+    last_activity_at: Option<i64>,
+}
+
+/// Statuses that end an issue. A child in one of these is history: its turns may
+/// be compacted into a chapter, and its census line carries no live detail.
+const TERMINAL_ISSUE_STATUSES: [&str; 3] = ["merged", "closed", "failed"];
+
+impl ChildStatus {
+    fn is_open(&self) -> bool {
+        !TERMINAL_ISSUE_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// The facets of a live child, in the order a thread asks about them: who is
+    /// working it, whether a PR is out, whether the checks are green, whether it
+    /// is blocked on the user, and when it last moved. An absent facet is
+    /// omitted rather than rendered empty — "no PR" is not news.
+    fn detail_line(&self, now: i64) -> String {
+        let mut facets: Vec<String> = Vec::new();
+        if !self.nodes.is_empty() {
+            facets.push(
+                self.nodes
+                    .iter()
+                    .map(|(name, status)| format!("{name} {}", job_status_icon(status)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        if let Some((number, status)) = &self.pr {
+            facets.push(format!("PR #{number} {status}"));
+        }
+        if let Some(checks) = self.check_summary() {
+            facets.push(checks);
+        }
+        match self.unanswered_questions {
+            0 => {}
+            1 => facets.push("1 unanswered question".to_string()),
+            count => facets.push(format!("{count} unanswered questions")),
+        }
+        if let Some(at) = self.last_activity_at {
+            let elapsed = now.saturating_sub(at);
+            facets.push(match elapsed >= 60 {
+                true => format!("active {} ago", crate::clock::format_elapsed(elapsed)),
+                // Sub-minute precision is noise here for the same reason it is at
+                // a turn boundary: it implies accuracy nothing acts on.
+                false => "active just now".to_string(),
+            });
+        }
+        facets.join(" · ")
+    }
+
+    /// Check state as a count plus the names that are red, because the count
+    /// alone tells a thread something is wrong without telling it what.
+    fn check_summary(&self) -> Option<String> {
+        if self.checks.is_empty() {
+            return None;
+        }
+        let failing: Vec<&str> = self
+            .checks
+            .iter()
+            .filter(|(_, verdict)| verdict != "passed")
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if failing.is_empty() {
+            return Some(format!("checks {}✓", self.checks.len()));
+        }
+        Some(format!(
+            "checks {}✓ {}✗ ({})",
+            self.checks.len() - failing.len(),
+            failing.len(),
+            failing.join(", ")
+        ))
+    }
+}
+
+/// Render the census. Open children carry their full detail line; a terminal
+/// child collapses to one line, because its detail is history and the table of
+/// contents below already addresses it. Without that asymmetry a thread with
+/// forty merged children would pay two lines each, forever, for state nothing
+/// acts on.
+fn render_children(children: &[ChildStatus], now: i64) -> String {
+    if children.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Children\n\n");
+    out.push_str(CHILDREN_NOTICE);
+    out.push_str("\n\n");
+    for child in children {
+        out.push_str(&format!(
+            "- `{}` **{}** · {}\n",
+            child.uri,
+            child.status,
+            one_line(&child.title)
+        ));
+        if !child.is_open() {
+            continue;
+        }
+        let detail = child.detail_line(now);
+        if !detail.is_empty() {
+            out.push_str(&format!("  {detail}\n"));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Assemble every child issue's live status.
+///
+/// Six queries, each keyed on the parent issue rather than run per child, so
+/// composition costs the same whether a thread has three children or forty.
+///
+/// Enumerating the children is strict: a census that silently omits one is the
+/// staleness this block exists to remove. Enriching them is best-effort — a
+/// facet that cannot be read is left off the line, which is what the renderer
+/// does for a facet that simply does not exist.
+async fn load_children(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ChildStatus>, String> {
+    let mut children: Vec<ChildStatus> = Vec::new();
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
     let mut rows = conn
         .query(
-            "SELECT p.key, child.number
+            "SELECT child.id, p.key, child.number, child.title, child.status
              FROM issues child
              JOIN projects p ON p.id = child.project_id
              WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
-               AND child.status NOT IN ('merged', 'closed', 'failed')",
+             ORDER BY child.number ASC",
             params![job_id],
         )
         .await
         .map_err(|error| error.to_string())?;
-    let mut uris = Vec::new();
     while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let key = row.text(0).map_err(|error| error.to_string())?;
-        let number = row.i64(1).map_err(|error| error.to_string())? as i32;
-        uris.push(cairn_common::uri::build_issue_uri(&key, number));
+        let id = row.text(0).map_err(|error| error.to_string())?;
+        let key = row.text(1).map_err(|error| error.to_string())?;
+        let number = row.i64(2).map_err(|error| error.to_string())? as i32;
+        at.insert(id, children.len());
+        children.push(ChildStatus {
+            uri: cairn_common::uri::build_issue_uri(&key, number),
+            title: row.text(3).map_err(|error| error.to_string())?,
+            status: row.text(4).map_err(|error| error.to_string())?,
+            nodes: Vec::new(),
+            pr: None,
+            checks: Vec::new(),
+            unanswered_questions: 0,
+            last_activity_at: None,
+        });
     }
-    Ok(uris)
+    if children.is_empty() {
+        return Ok(children);
+    }
+
+    // The newest execution's top-level nodes. An older execution's nodes describe
+    // an attempt that has been superseded, which would read as live work.
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT j.issue_id, COALESCE(j.node_name, j.uri_segment), j.status
+             FROM jobs j
+             JOIN executions e ON e.id = j.execution_id
+             JOIN issues child ON child.id = j.issue_id
+             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+               AND j.parent_job_id IS NULL
+               AND e.seq = (SELECT MAX(latest.seq) FROM executions latest WHERE latest.issue_id = j.issue_id)
+             ORDER BY j.created_at ASC",
+            params![job_id],
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(issue_id), Ok(Some(name)), Ok(status)) =
+                (row.text(0), row.opt_text(1), row.text(2))
+            else {
+                continue;
+            };
+            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+                child.nodes.push((name, status));
+            }
+        }
+    }
+
+    // Oldest first, so the last write per child is its newest pull request. A
+    // non-positive number is a phantom binding, not a pull request.
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT m.issue_id, m.github_pr_number, m.status
+             FROM merge_requests m
+             JOIN issues child ON child.id = m.issue_id
+             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+               AND m.github_pr_number > 0
+             ORDER BY m.opened_at ASC",
+            params![job_id],
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(issue_id), Ok(Some(number)), Ok(status)) =
+                (row.text(0), row.opt_i64(1), row.text(2))
+            else {
+                continue;
+            };
+            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+                child.pr = Some((number, status));
+            }
+        }
+    }
+
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT r.issue_id, COUNT(*)
+             FROM prompts p
+             JOIN runs r ON r.id = p.run_id
+             JOIN issues child ON child.id = r.issue_id
+             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+               AND p.answered_at IS NULL
+             GROUP BY r.issue_id",
+            params![job_id],
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(issue_id), Ok(count)) = (row.text(0), row.i64(1)) else {
+                continue;
+            };
+            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+                child.unanswered_questions = count;
+            }
+        }
+    }
+
+    // Oldest first again: the newest observation of a check name replaces the
+    // one before it, so each child ends with one current verdict per check.
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT j.issue_id, o.check_name, o.verdict
+             FROM check_result_observations o
+             JOIN jobs j ON j.id = o.job_id
+             JOIN issues child ON child.id = j.issue_id
+             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             ORDER BY o.ran_at ASC",
+            params![job_id],
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(issue_id), Ok(name), Ok(verdict)) = (row.text(0), row.text(1), row.text(2))
+            else {
+                continue;
+            };
+            let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) else {
+                continue;
+            };
+            match child.checks.iter_mut().find(|(known, _)| *known == name) {
+                Some(entry) => entry.1 = verdict,
+                None => child.checks.push((name, verdict)),
+            }
+        }
+    }
+
+    // Last activity is the newest event under the child, not `issues.updated_at`:
+    // patching an issue's labels is not the work moving.
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT r.issue_id, MAX(e.timestamp)
+             FROM events e
+             JOIN runs r ON r.id = e.run_id
+             JOIN issues child ON child.id = r.issue_id
+             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             GROUP BY r.issue_id",
+            params![job_id],
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(issue_id), Ok(Some(timestamp))) = (row.text(0), row.opt_i64(1)) else {
+                continue;
+            };
+            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+                child.last_activity_at = Some(timestamp);
+            }
+        }
+    }
+
+    Ok(children)
 }
 
 #[cfg(test)]
@@ -738,6 +1035,10 @@ mod tests {
     const THREAD_JOB: &str = "job-thread";
     const DONE_CHILD: &str = "cairn://p/PRJ/20";
     const OPEN_CHILD: &str = "cairn://p/PRJ/21";
+
+    /// Composition time for every test. The fixture's newest event is at 141, so
+    /// a child's last activity reads as a couple of hours old.
+    const NOW: i64 = 10_000;
 
     /// A thread with fourteen turns: four old ones behind the recency window,
     /// then ten recent. Of the four old turns, one is plain conversation, two
@@ -912,7 +1213,7 @@ mod tests {
         mark_done_child(&db).await;
         write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
 
-        let seed = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         // The arc is copied, not summarized: every authored string survives.
         assert!(seed
@@ -977,13 +1278,164 @@ mod tests {
         );
     }
 
+    /// Give the open child everything a live child accumulates: a running
+    /// execution, a pull request, a red check beside green ones, an unanswered
+    /// question, and recent activity.
+    async fn make_open_child_live(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-open-old','build','i-open','p','complete',1,1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-open','build','i-open','p','running',2,2);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES ('job-open-stale','e-open-old','i-open','p','failed','builder','builder',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES ('job-open-build','e-open','i-open','p','complete','builder','builder',2,2);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES ('job-open-review','e-open','i-open','p','running','review','review',3,3);
+             INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-open','job-open-build','i-open','running',1,1);
+             INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, github_pr_number)
+               VALUES ('mr-open','job-open-build','p','i-open','Lease renewal backoff','feat/lease','main','open',10,10,892);
+             INSERT INTO prompts(id, run_id, questions, created_at)
+               VALUES ('q-open','run-open','[{\"question\":\"which backoff curve?\"}]',20);
+             INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+               VALUES ('ev-open','run-open',1,9_100,'assistant','{}',9_100);",
+        )
+        .await
+        .unwrap();
+        for (name, verdict) in [
+            ("rust-tests", "passed"),
+            ("lint", "passed"),
+            ("lint", "failed"),
+        ] {
+            observe_check(db, name, verdict).await;
+        }
+    }
+
+    /// One check observation against the open child's build node. Written with an
+    /// id derived from an incrementing clock so the newest verdict per check name
+    /// is unambiguous.
+    async fn observe_check(db: &LocalDb, check_name: &str, verdict: &str) {
+        static RAN_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
+        let ran_at = RAN_AT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        db.execute(
+            "INSERT INTO check_result_observations(
+                 id, project_id, commit_sha, tree_hash, check_name, input_hash,
+                 environment_fingerprint, exit_code, verdict, complete, reusable,
+                 parser_version, result_schema_version, ran_at, duration_ms, job_id,
+                 cadence, output_tail
+             ) VALUES (?1,'p','sha','tree',?2,'input','env',0,?3,1,1,1,1,?4,1,'job-open-build','write','')",
+            params![format!("obs-{ran_at}"), check_name, verdict, ran_at],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_census_reports_a_live_child_and_collapses_a_finished_one() {
+        let db = thread_fixture("thread-seed-children.db").await;
+        mark_done_child(&db).await;
+        make_open_child_live(&db).await;
+        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+
+        // The live child carries every facet a thread would otherwise re-read it
+        // to learn, and reads its nodes from the NEWEST execution: the failed
+        // builder of the superseded attempt is not where this work stands.
+        assert!(
+            seed.content.contains(
+                "- `cairn://p/PRJ/21` **active** · Lease renewal backoff\n  \
+                 builder ✓ review ◐ · PR #892 open · checks 1✓ 1✗ (lint) · \
+                 1 unanswered question · active 15m ago\n"
+            ),
+            "the live child's census line is wrong: {}",
+            seed.content
+        );
+
+        // A finished child collapses to one line. Its detail is history, and the
+        // table of contents below already addresses it.
+        assert!(
+            seed.content.contains(
+                "- `cairn://p/PRJ/20` **merged** · Running panel for the executor fleet\n"
+            ),
+            "the merged child's census line is wrong: {}",
+            seed.content
+        );
+
+        // The census sits between authored intent and generated history.
+        let arc = seed.content.find("## Arc").expect("an arc section");
+        let children = seed
+            .content
+            .find("## Children")
+            .expect("a children section");
+        let history = seed.content.find("## History").expect("a history section");
+        assert!(arc < children && children < history);
+    }
+
+    #[tokio::test]
+    async fn the_census_contradicts_a_stale_arc_rather_than_echoing_it() {
+        // The defect this block exists for: a thread inherits its arc verbatim,
+        // so a census authored into `current_intent` is stale by construction.
+        // The generated lines must state live status regardless of what the arc
+        // claims, and both must survive — a thread that only saw the arc's
+        // version would act on it.
+        let db = thread_fixture("thread-seed-children-vs-arc.db").await;
+        make_open_child_live(&db).await;
+        write_arc(
+            &db,
+            1,
+            "21 is still unstarted and has no PR; nothing is waiting on me.",
+        )
+        .await;
+
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+
+        assert!(seed.content.contains("21 is still unstarted and has no PR"));
+        assert!(
+            seed.content.contains("PR #892 open"),
+            "the census deferred to the arc's stale claim: {}",
+            seed.content
+        );
+        assert!(seed.content.contains("1 unanswered question"));
+    }
+
+    #[tokio::test]
+    async fn a_thread_with_no_children_carries_no_census() {
+        // An empty heading is not information, and this seed is composed on every
+        // continuation of every thread.
+        let db = migrated_test_db("thread-seed-childless.db").await;
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','default','P','PRJ','/tmp/p',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
+               VALUES ('i-thread','p',1,'Platform thread','active','none',1,1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e','recipe','i-thread','p','running',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, current_session_id, created_at, updated_at)
+               VALUES ('job-thread','e','i-thread','p','running','thread','thread','sess-1',1,1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('sess-1','job-thread','claude','open',1,1,1);
+             INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-1','job-thread','i-thread','running',1,1);",
+        )
+        .await
+        .unwrap();
+        turn(&db, 1, "just a conversation", Some("fine")).await;
+
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+
+        assert!(!seed.content.contains("## Children"));
+    }
+
     #[tokio::test]
     async fn an_unmarked_child_is_never_folded_into_a_chapter() {
         // Without the terminal mark, the same turns are conversation. They may be
         // compacted as interstitial chapters, but never attributed to the child.
         let db = thread_fixture("thread-seed-unmarked.db").await;
 
-        let seed = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(seed
             .entries
@@ -997,7 +1449,7 @@ mod tests {
         let db = thread_fixture("thread-seed-no-arc.db").await;
         mark_done_child(&db).await;
 
-        let seed = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(
             seed.content
@@ -1015,10 +1467,10 @@ mod tests {
         let db = thread_fixture("thread-seed-arc-independence.db").await;
         mark_done_child(&db).await;
         write_arc(&db, 1, "FIRST INTENT").await;
-        let first = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let first = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         write_arc(&db, 2, "SECOND INTENT").await;
-        let second = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let second = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(first.content.contains("FIRST INTENT"));
         assert!(second.content.contains("SECOND INTENT"));
@@ -1030,7 +1482,7 @@ mod tests {
     async fn a_prior_table_of_contents_is_carried_forward_not_regenerated() {
         let db = thread_fixture("thread-seed-carry-forward.db").await;
         mark_done_child(&db).await;
-        let first = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let first = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
         compaction::persist_generation(
             &db,
             THREAD_JOB,
@@ -1038,6 +1490,7 @@ mod tests {
                 trigger: compaction::CompactionTrigger::Expiry,
                 source_session_id: first.source_session_id.clone(),
                 entries: first.entries.clone(),
+                seed_bytes: first.content.len() as i64,
                 source_bytes: first.source_bytes,
                 candidate_bytes: first.candidate_bytes,
                 compacted_through_block: first.compacted_through_block,
@@ -1050,7 +1503,7 @@ mod tests {
         .unwrap();
         rotate_session(&db, "sess-2").await;
 
-        let second = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let second = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert_eq!(
             second.entries, first.entries,
@@ -1076,14 +1529,15 @@ mod tests {
         // live prefix until the one-hour expiry.
         let db = thread_fixture("thread-seed-retry-while-warm.db").await;
         mark_done_child(&db).await;
-        let first = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let first = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
         compaction::persist_generation(
             &db,
             THREAD_JOB,
             &compaction::AppliedCompaction {
-                trigger: compaction::CompactionTrigger::Ratio,
+                trigger: compaction::CompactionTrigger::Capacity,
                 source_session_id: first.source_session_id.clone(),
                 entries: first.entries.clone(),
+                seed_bytes: first.content.len() as i64,
                 source_bytes: first.source_bytes,
                 candidate_bytes: first.candidate_bytes,
                 compacted_through_block: first.compacted_through_block,
@@ -1096,7 +1550,7 @@ mod tests {
         .unwrap();
         // No rotation: the job stays on the session the seed was composed from.
 
-        let retry = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let retry = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert_eq!(retry.entries, first.entries);
         assert_eq!(retry.new_entries, first.new_entries);
@@ -1127,7 +1581,7 @@ mod tests {
         )
         .await;
 
-        let seed = compose_thread_seed(&db, THREAD_JOB).await.unwrap();
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(!seed.content.contains("EMBEDDED_PRIOR_SEED_BODY"));
         assert!(seed.content.contains("[prior context compacted]"));
@@ -1147,7 +1601,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(compose_thread_seed(&db, THREAD_JOB).await.is_err());
+        assert!(compose_thread_seed(&db, THREAD_JOB, NOW).await.is_err());
     }
 
     /// The compactor reads one named artifact, and the thread recipe is what
@@ -1222,7 +1676,7 @@ mod tests {
 
     #[test]
     fn an_overview_skips_the_clock_stamp_and_the_system_reminder() {
-        let content = "[Fri 23:19 — resumed after 1m]\n\n<system-reminder>noise</system-reminder>\nLand the residency lease change. Then look at the panel.";
+        let content = "[Fri 23:19 PST — resumed after 1m]\n\n<system-reminder>noise</system-reminder>\nLand the residency lease change. Then look at the panel.";
         assert_eq!(first_sentence(content), "Land the residency lease change");
     }
 

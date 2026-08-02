@@ -1405,6 +1405,10 @@ async fn render_resource_body(
                     &orch.fleet.inspect_executors(captured_at),
                     &orch.fleet.unattached_enrolled_remotes(),
                     &orch.fleet.management().operations().in_flight(),
+                    // A process-wide fact established once at boot, read here
+                    // rather than threaded through the fleet: the runner's own
+                    // restart is not a machine's property.
+                    cairn_common::abnormal_exit::predecessor(),
                     captured_at,
                 )
             }

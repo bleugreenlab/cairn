@@ -356,8 +356,15 @@ async fn stop_session_fails_pending_run_tool_result() {
 /// an actual process being stopped instead of a mock recording that it was asked
 /// to be. The whole defect this covers is that dropping a handle does NOT stop
 /// the process, which only a real one can demonstrate.
+///
+/// Unix-only, and not because of a porting gap: the stand-in process is `sleep`
+/// and liveness is signal 0, neither of which Windows has. Compiling it there
+/// anyway failed the whole `main` test target on `nix::sys`, which took every
+/// Rust check placed on a Windows executor down with it (CAIRN-3448).
+#[cfg(unix)]
 struct RealChild(std::process::Child);
 
+#[cfg(unix)]
 impl cairn_core::internal::services::ChildProcess for RealChild {
     fn id(&self) -> u32 {
         self.0.id()
@@ -387,6 +394,7 @@ impl cairn_core::internal::services::ChildProcess for RealChild {
 /// Whether `pid` still exists, via signal 0. A stopped-and-reaped child is gone;
 /// the process this asks about was spawned by this test, so there is no window in
 /// which another process could claim its id.
+#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
@@ -394,6 +402,7 @@ fn process_alive(pid: u32) -> bool {
 /// CAIRN-3287: a runner must not exit while its agents keep running. The teardown
 /// stops the real process, empties the registry, and records that WE stopped it
 /// rather than leaving `crash` for a later startup sweep to invent.
+#[cfg(unix)]
 #[tokio::test]
 async fn host_shutdown_stops_the_agent_process_it_spawned() {
     let (_temp, orch) = common::test_orchestrator().await;

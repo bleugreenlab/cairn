@@ -26,12 +26,13 @@ use cairn_common::uri::{
     build_task_checks_uri, build_task_permission_uri,
 };
 
-/// Resolve the job_id that owns the todos addressed by a `JobTodos` URI.
+/// Resolve the job id a node- or task-scoped URI addresses.
 ///
 /// `task_name: None` resolves a node job; `Some` resolves a sub-agent task job.
-/// Shared by the todos read resolver and the `write` dispatch so both address
-/// the same job from the same URI.
-pub(crate) async fn resolve_todos_job_id(
+/// The one resolver every node-scoped surface shares -- todos, progress,
+/// artifacts, memories, messages, wakes, checks -- so a URI names the same job
+/// whichever collection hangs off it.
+pub(crate) async fn resolve_node_or_task_job_id(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -65,9 +66,7 @@ fn job_status_icon(status: &str) -> &'static str {
 }
 
 fn format_node_timestamp(timestamp: i64) -> String {
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "Unknown".to_string())
+    crate::clock::stamp(timestamp).unwrap_or_else(|| "Unknown".to_string())
 }
 
 fn append_optional_timestamp(output: &mut String, label: &str, timestamp: Option<i64>) {
@@ -265,7 +264,9 @@ pub(super) async fn read_job_todos(
     task_name: Option<&str>,
 ) -> String {
     let job_id =
-        match resolve_todos_job_id(db, project_key, number, exec_seq, node_name, task_name).await {
+        match resolve_node_or_task_job_id(db, project_key, number, exec_seq, node_name, task_name)
+            .await
+        {
             Ok(job_id) => job_id,
             Err(error) => return error,
         };
@@ -286,7 +287,8 @@ pub(super) async fn read_node_wakes(
     node_name: &str,
 ) -> String {
     let job_id =
-        match resolve_todos_job_id(db, project_key, number, exec_seq, node_name, None).await {
+        match resolve_node_or_task_job_id(db, project_key, number, exec_seq, node_name, None).await
+        {
             Ok(job_id) => job_id,
             Err(error) => return error,
         };
@@ -1295,17 +1297,18 @@ async fn render_action_node(
         output.push_str("Awaiting merge/close.\n\n");
     }
 
-    let fmt_ts = |ts: i64| {
-        chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "Unknown".to_string())
-    };
-    output.push_str(&format!("Created: {}\n", fmt_ts(action_run.created_at)));
+    output.push_str(&format!(
+        "Created: {}\n",
+        format_node_timestamp(action_run.created_at)
+    ));
     if let Some(started) = action_run.started_at {
-        output.push_str(&format!("Started: {}\n", fmt_ts(started)));
+        output.push_str(&format!("Started: {}\n", format_node_timestamp(started)));
     }
     if let Some(completed) = action_run.completed_at {
-        output.push_str(&format!("Completed: {}\n", fmt_ts(completed)));
+        output.push_str(&format!(
+            "Completed: {}\n",
+            format_node_timestamp(completed)
+        ));
     }
     output.push('\n');
 
@@ -1827,9 +1830,10 @@ pub(super) async fn artifact_affordance_block(
     kind: cairn_common::contract::ResourceKind,
 ) -> Option<String> {
     let db = orch.db.for_project(project_key).await;
-    let job_id = resolve_todos_job_id(&db, project_key, number, exec_seq, node_name, task_name)
-        .await
-        .ok()?;
+    let job_id =
+        resolve_node_or_task_job_id(&db, project_key, number, exec_seq, node_name, task_name)
+            .await
+            .ok()?;
     let contract = crate::mcp::handlers::comments_artifacts::resolve_artifact_contract(
         orch,
         &job_id,

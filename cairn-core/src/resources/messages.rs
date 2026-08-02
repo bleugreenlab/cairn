@@ -62,8 +62,7 @@ fn format_messages(messages: &[crate::models::Message]) -> String {
 
     let mut out = String::new();
     for msg in messages {
-        let ts = chrono::DateTime::from_timestamp(msg.created_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        let ts = crate::clock::stamp_with_seconds(msg.created_at)
             .unwrap_or_else(|| msg.created_at.to_string());
         out.push_str(&format!("[{}] {}: {}\n", ts, msg.sender_name, msg.content));
     }
@@ -128,7 +127,7 @@ pub(super) async fn read_node_messages(
         Err(error) => return error,
     };
 
-    let job_id = match super::node::resolve_todos_job_id(
+    let job_id = match super::node::resolve_node_or_task_job_id(
         db,
         project_key,
         number,

@@ -74,6 +74,9 @@ struct MutationResult {
     os: Option<String>,
     arch: Option<String>,
     attach_state: String,
+    /// Present when a removal completed without reaching the host. Absent means
+    /// nothing was left behind.
+    unverified_remote_cleanup: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,8 +333,14 @@ fn format_mutation(action: &str, result: &MutationResult) -> String {
         (Some(os), Some(arch)) => format!(" ({os}/{arch})"),
         _ => String::new(),
     };
+    let unreached = match &result.unverified_remote_cleanup {
+        Some(reason) => format!(
+            "\nIts host could not be reached ({reason}), so no remote cleanup ran there. The enrollment is revoked, so anything still running on it cannot reattach."
+        ),
+        None => String::new(),
+    };
     format!(
-        "{action} {}: {}{platform}",
+        "{action} {}: {}{platform}{unreached}",
         result.config.display_name, result.attach_state
     )
 }
@@ -446,12 +455,39 @@ mod tests {
             os: Some("windows".into()),
             arch: Some("x86_64".into()),
             attach_state: "ready".into(),
+            unverified_remote_cleanup: None,
         };
 
         assert_eq!(
             format_mutation("Added", &result),
             "Added bglab-win: ready (windows/x86_64)"
         );
+    }
+
+    /// A removal that never reached the host has to say so. The operator's next
+    /// move depends on it: the enrollment is revoked either way, but only in
+    /// this case is there possibly something still running on a machine Cairn
+    /// can no longer talk to.
+    #[test]
+    fn a_removal_that_never_reached_the_host_says_what_was_left_behind() {
+        let result = MutationResult {
+            config: RemoteConfig {
+                display_name: "bglab-win".into(),
+            },
+            os: None,
+            arch: None,
+            attach_state: "removed".into(),
+            unverified_remote_cleanup: Some("ssh timed out".into()),
+        };
+
+        let confirmation = format_mutation("Removed", &result);
+
+        assert!(
+            confirmation.starts_with("Removed bglab-win: removed"),
+            "{confirmation}"
+        );
+        assert!(confirmation.contains("ssh timed out"), "{confirmation}");
+        assert!(confirmation.contains("cannot reattach"), "{confirmation}");
     }
 
     #[test]

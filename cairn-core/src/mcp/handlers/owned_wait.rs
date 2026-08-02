@@ -1,11 +1,14 @@
 //! The `waitFor` condition vocabulary: duration, terminal exit, terminal output
-//! phrase. Suspension itself -- the `agent_waits` row, the park, the single
+//! phrase, node check lanes settling. Suspension itself -- the `agent_waits` row, the park, the single
 //! synthetic result and single continuation -- belongs to
 //! [`super::durable_suspend`], which this shares with long-running `run` batches.
 
 use super::durable_suspend::{self, Condition, Record};
-use super::run::{TerminalWaitEvent, WaitDuration, WaitFor};
+use super::run::{ChecksWaitEvent, TerminalWaitEvent, WaitDuration, WaitFor};
 use super::tool_use_correlation::{claim_tool_use_id, Claim};
+use crate::execution::checks_settlement::{
+    node_checks_settlement, resolve_checks_target, ChecksSnapshot, Settlement, VERDICTLESS_DWELL_MS,
+};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -99,7 +102,7 @@ pub(crate) async fn handle_owned_wait(
     // see [`bind_call`].
     let tool_use_id = request.tool_use_id.clone().unwrap_or_default();
     let created = chrono::Utc::now().timestamp_millis();
-    let (condition, deadline) = match normalize(orch, request, wait, created).await {
+    let (condition, deadline) = match normalize(orch, request, &ctx.job_id, wait, created).await {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -211,6 +214,7 @@ async fn bind_call(db: &LocalDb, record: Record, wait: &WaitFor) -> Result<Recor
 async fn normalize(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
+    caller_job_id: &str,
     wait: &WaitFor,
     now: i64,
 ) -> Result<(Condition, Option<i64>), String> {
@@ -258,8 +262,64 @@ async fn normalize(
                 None,
             ))
         }
+        WaitFor::Checks {
+            reference,
+            on,
+            suite,
+            ..
+        } => {
+            let suite = checks_suite(on, suite.as_deref())?;
+            let home = super::run_context::lookup_home_uri_routed(&orch.db, request)
+                .await
+                .ok();
+            let target = resolve_checks_target(orch, reference, home.as_deref()).await?;
+            // Your own lanes are the one thing this cannot answer. Turn-end
+            // checks are armed by the END of a turn, so a node waiting on its
+            // own would be waiting for a wave its own live turn is what
+            // prevents — a guaranteed hang, and the wake surface is the shape
+            // that actually serves the intent.
+            if target.job_id == caller_job_id {
+                return Err(format!(
+                    "a node cannot wait on its own check lanes: the turn-end wave is armed by this turn ENDING, so the wait would never fire. \
+                     End your turn with a wake instead: write({{changes:[{{target:\"cairn:~/wakes\",mode:\"append\",payload:{{subscribe:{{kind:\"checks\",ref:\"{}\"}}}}}}]}})",
+                    target.uri
+                ));
+            }
+            // Arm-time validation, so a target that can never settle is refused
+            // now rather than parking a turn on it. Past this point the poller
+            // treats the same errors as transients, because a momentarily
+            // unreadable repository says nothing about the lanes.
+            node_checks_settlement(orch, &target.job_id, suite.as_deref()).await?;
+            Ok((
+                Condition::Checks {
+                    uri: target.uri,
+                    job_id: target.job_id,
+                    suite,
+                },
+                None,
+            ))
+        }
     }
 }
+/// The lane set a checks wait watches, from the `on`/`suite` pair.
+///
+/// The two keys are one decision, so a mismatched pair is refused rather than
+/// silently resolved: watching the whole node when a suite was named, or one
+/// suite when none was, is a different wait than the one that was asked for.
+fn checks_suite(on: &ChecksWaitEvent, suite: Option<&str>) -> Result<Option<String>, String> {
+    match (on, suite.map(str::trim).filter(|s| !s.is_empty())) {
+        (ChecksWaitEvent::Settled, Some(_)) => Err(
+            "checks settled wait watches the whole node and does not accept suite; \
+             use on:\"verdict\" to watch one suite"
+                .into(),
+        ),
+        (ChecksWaitEvent::Verdict, None) => Err("checks verdict wait requires suite, e.g. \
+             {kind:\"checks\",ref:\"…/checks\",on:\"verdict\",suite:\"rust-tests\"}"
+            .into()),
+        (_, suite) => Ok(suite.map(ToString::to_string)),
+    }
+}
+
 fn parse_duration(v: &WaitDuration) -> Result<u64, String> {
     let ms = match v {
         WaitDuration::Milliseconds(v) => *v,
@@ -314,12 +374,132 @@ pub(super) async fn trigger(
             }
             tokio::time::sleep(Duration::from_millis(100)).await
         },
+        Condition::Checks { uri, job_id, suite } => {
+            checks(&orch, uri, job_id, suite.as_deref(), r.created).await
+        }
         // A run batch has no pollable condition: its trigger is the awaited
         // executor result, which only the suspending host holds.
         Condition::RunBatch { .. } | Condition::McpContinuation { .. } => {
             Err("this durable suspension has no waitFor condition to await".into())
         }
     }
+}
+
+/// Poll a node's check lanes until they stop moving.
+///
+/// Two poll rates rather than one, because the snapshot's cost is not uniform. A
+/// wave in flight publishes an immutable sealed-tree snapshot that the status
+/// read reuses; with no wave, the same read re-resolves tree hashes and the
+/// cumulative diff through jj, which under repository load is orders of
+/// magnitude more expensive. A node still working can be waited on for a long
+/// time, and hammering its repository to learn that it is still working is the
+/// wrong trade.
+async fn checks(
+    orch: &Orchestrator,
+    uri: &str,
+    job_id: &str,
+    suite: Option<&str>,
+    created: i64,
+) -> Result<String, String> {
+    const IN_FLIGHT_POLL: Duration = Duration::from_secs(2);
+    const QUIET_POLL: Duration = Duration::from_secs(10);
+    /// How long the target may stay unreadable before the wait gives up on it.
+    ///
+    /// A momentarily unreadable repository says nothing about the lanes, so a
+    /// snapshot error is a transient. A node that has been ARCHIVED or deleted
+    /// out from under an armed wait produces the same error forever, though, and
+    /// tolerating it forever is the one thing this condition must not do.
+    const UNAVAILABLE_GRACE_MS: i64 = 10 * 60 * 1000;
+
+    // When the verdictless reading first appeared. `None` whenever the node is
+    // moving or settled on real verdicts, so the dwell restarts from scratch
+    // every time the reading is contradicted.
+    let mut verdictless_since: Option<i64> = None;
+    let mut unavailable_since: Option<i64> = None;
+    loop {
+        let snapshot = match node_checks_settlement(orch, job_id, suite).await {
+            Ok(snapshot) => {
+                unavailable_since = None;
+                snapshot
+            }
+            // Armed against a target that resolved, so a read that fails now is
+            // a transient (a busy repository, a replica reopening) -- until it
+            // has been failing long enough to be the target's permanent state.
+            Err(error) => {
+                let now = chrono::Utc::now().timestamp_millis();
+                let since = *unavailable_since.get_or_insert(now);
+                if now - since >= UNAVAILABLE_GRACE_MS {
+                    return Err(format!(
+                        "{uri} has been unreadable for {} minutes, so its lanes cannot be observed \
+                         and this wait would never fire: {error}",
+                        UNAVAILABLE_GRACE_MS / 60_000
+                    ));
+                }
+                log::debug!("checks wait on {uri}: snapshot unavailable ({error}); retrying");
+                tokio::time::sleep(QUIET_POLL).await;
+                continue;
+            }
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        match &snapshot.settlement {
+            Settlement::Settled { verdictless } if verdictless.is_empty() => {
+                return Ok(settled_result(uri, suite, &snapshot, now - created))
+            }
+            Settlement::Settled { .. } => {
+                let since = *verdictless_since.get_or_insert(now);
+                if now - since >= VERDICTLESS_DWELL_MS {
+                    return Ok(settled_result(uri, suite, &snapshot, now - created));
+                }
+            }
+            Settlement::Moving(_) => verdictless_since = None,
+        }
+        let in_flight =
+            orch.turn_end_checks_in_flight(job_id) || orch.write_checks_in_flight(job_id);
+        // A dwell in progress polls at the fast rate regardless: it is a claim
+        // about a specific instant, and confirming it slowly would stretch the
+        // window it exists to close.
+        let interval = if in_flight || verdictless_since.is_some() {
+            IN_FLIGHT_POLL
+        } else {
+            QUIET_POLL
+        };
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// The settled answer, shaped so an orchestrator can branch on one field and
+/// still read what happened without a follow-up call.
+fn settled_result(
+    uri: &str,
+    suite: Option<&str>,
+    snapshot: &ChecksSnapshot,
+    elapsed_ms: i64,
+) -> String {
+    let verdictless = match &snapshot.settlement {
+        Settlement::Settled { verdictless } => verdictless.clone(),
+        Settlement::Moving(_) => Vec::new(),
+    };
+    let mut value = serde_json::json!({
+        "outcome": "settled",
+        "checks": uri,
+        "verdict": snapshot.verdict(),
+        "summary": snapshot.tally(),
+        "lanes": snapshot.lane_lines(),
+        "elapsedMs": elapsed_ms,
+    });
+    if let Some(suite) = suite {
+        value["suite"] = serde_json::json!(suite);
+    }
+    if !verdictless.is_empty() {
+        value["verdictless"] = serde_json::json!(verdictless);
+        value["note"] = serde_json::json!(format!(
+            "These lanes stopped without producing a verdict for this tree \
+             (a withdrawn or interrupted wave, a suppressed check, or a tree \
+             identical to its base). Nothing is going to run them; read {uri} \
+             for the node's own account."
+        ));
+    }
+    value.to_string()
 }
 async fn terminal(
     orch: &Orchestrator,
@@ -458,6 +638,18 @@ mod tests {
             (
                 "duration wait",
                 serde_json::json!({"waitFor":{"duration":"3m"}}),
+            ),
+            (
+                "checks settled wait, suite omitted",
+                serde_json::json!({
+                    "waitFor":{"kind":"checks","ref":"cairn://p/CAIRN/3427/1/builder/checks","on":"settled"}
+                }),
+            ),
+            (
+                "checks verdict wait carrying a suite",
+                serde_json::json!({
+                    "waitFor":{"kind":"checks","ref":"cairn:~/checks","on":"verdict","suite":"rust-tests"}
+                }),
             ),
             (
                 "wait item that also carries a description",
@@ -664,6 +856,96 @@ mod tests {
             value["outcome"], "terminal_exited",
             "an output/phrase wait must resolve when the terminal exits before the phrase"
         );
+    }
+
+    #[test]
+    fn a_checks_wait_refuses_a_mismatched_on_and_suite_pair() {
+        assert_eq!(
+            checks_suite(&ChecksWaitEvent::Settled, None).unwrap(),
+            None,
+            "a settled wait watches every lane"
+        );
+        assert_eq!(
+            checks_suite(&ChecksWaitEvent::Verdict, Some("rust-tests")).unwrap(),
+            Some("rust-tests".to_string())
+        );
+        assert!(checks_suite(&ChecksWaitEvent::Settled, Some("rust-tests"))
+            .unwrap_err()
+            .contains("does not accept suite"));
+        for empty in [None, Some(""), Some("   ")] {
+            assert!(
+                checks_suite(&ChecksWaitEvent::Verdict, empty)
+                    .unwrap_err()
+                    .contains("requires suite"),
+                "a verdict wait naming no suite watches nothing in particular: {empty:?}"
+            );
+        }
+    }
+
+    /// The resume is the whole agent-visible surface of a settled wait, so it
+    /// has to carry the branchable answer AND enough of the lanes that reading
+    /// the resource is a choice rather than a second required call.
+    #[test]
+    fn a_settled_resume_carries_the_verdict_the_lanes_and_the_gaps() {
+        use crate::execution::checks_settlement::{classify, ChecksSnapshot};
+        use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
+        use crate::messages::delivery::HeadTurn;
+
+        let lane = |name: &str, state: NodeCheckState| NodeCheckStatus {
+            name: name.to_string(),
+            state,
+            policy: "advisory".to_string(),
+            when: "review".to_string(),
+            cached: None,
+            duration_ms: None,
+            ran_at: None,
+            passed: None,
+            failed: None,
+            skipped: None,
+            suite_failures: None,
+            failure_names: Vec::new(),
+            output_tail: None,
+            failure_kind: None,
+            suppressed_after: None,
+        };
+        let statuses = vec![
+            lane("rust-lint", NodeCheckState::Pending),
+            lane("rust-tests", NodeCheckState::Passed),
+        ];
+        let snapshot = ChecksSnapshot {
+            settlement: classify(&statuses, HeadTurn::Idle, false),
+            statuses,
+        };
+        let uri = "cairn://p/CAIRN/3427/1/builder/checks";
+        let value: serde_json::Value =
+            serde_json::from_str(&settled_result(uri, None, &snapshot, 1234)).unwrap();
+
+        assert_eq!(value["outcome"], "settled");
+        assert_eq!(value["checks"], uri);
+        assert_eq!(value["verdict"], "incomplete");
+        assert_eq!(value["elapsedMs"], 1234);
+        assert_eq!(value["verdictless"][0], "rust-lint");
+        assert!(value["note"]
+            .as_str()
+            .unwrap()
+            .contains("without producing a verdict"));
+        let lanes = value["lanes"].as_array().unwrap();
+        assert_eq!(lanes.len(), 2);
+        assert!(lanes[0].as_str().unwrap().contains("[no verdict]"));
+
+        // A clean settle says nothing about gaps it does not have -- an empty
+        // `verdictless` key would still read as a caveat worth chasing.
+        let statuses = vec![lane("rust-tests", NodeCheckState::Passed)];
+        let clean = ChecksSnapshot {
+            settlement: classify(&statuses, HeadTurn::Idle, false),
+            statuses,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&settled_result(uri, Some("rust-tests"), &clean, 5)).unwrap();
+        assert_eq!(value["verdict"], "passed");
+        assert_eq!(value["suite"], "rust-tests");
+        assert!(value.get("verdictless").is_none());
+        assert!(value.get("note").is_none());
     }
 
     /// The wait's half of CAIRN-3153. An exit wait reads its answer off the

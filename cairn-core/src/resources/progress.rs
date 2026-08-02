@@ -46,13 +46,19 @@ pub(super) async fn read_node_progress(
         }
     }
 
-    let job_id =
-        match super::node::resolve_todos_job_id(db, project_key, number, exec_seq, node_name, None)
-            .await
-        {
-            Ok(job_id) => job_id,
-            Err(error) => return error,
-        };
+    let job_id = match super::node::resolve_node_or_task_job_id(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        None,
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => return error,
+    };
 
     let entries = match workflow_progress::list_entries(db, &job_id).await {
         Ok(entries) => entries,
@@ -80,8 +86,7 @@ pub(super) async fn read_node_progress(
         if shown.len() == 1 { "y" } else { "ies" }
     );
     for entry in shown {
-        let ts = chrono::DateTime::from_timestamp(entry.created_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        let ts = crate::clock::stamp_with_seconds(entry.created_at)
             .unwrap_or_else(|| entry.created_at.to_string());
         match entry.kind.as_str() {
             "phase" => out.push_str(&format!("[{ts}] \u{25b8} phase: {}\n", entry.text)),

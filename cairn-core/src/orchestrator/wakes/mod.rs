@@ -5,6 +5,7 @@
 //! surface is re-exported here so every `crate::orchestrator::wakes::X` path
 //! resolves unchanged.
 
+mod checks;
 mod child;
 mod matching;
 mod routing;
@@ -16,6 +17,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use checks::*;
 pub use child::*;
 pub use matching::*;
 pub use routing::*;

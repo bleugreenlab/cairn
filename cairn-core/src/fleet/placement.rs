@@ -187,6 +187,16 @@ pub(crate) fn classify_unavailable(
             // behind a shutdown.
             AdmissionRejectionReason::Draining => PlacementVerdict::Structural,
         },
+        // A slot that could not be made fit for the batch, and was retired for
+        // it. Nothing about the batch is wrong and nothing of it ran, so this is
+        // capacity in the most literal sense the word has here: the machine had
+        // no usable room at this moment. What makes the retry meaningful rather
+        // than a loop is the retirement — the slot that refused the work is out
+        // of the pool, so re-presenting it takes a fresh slot, and a batch free
+        // to move can take a different machine entirely. A machine that cannot
+        // produce a healthy slot at all fails the next attempt in provisioning,
+        // which is structural and refuses there.
+        CellUnavailableReason::SlotUnhealthy => PlacementVerdict::Capacity,
         // Everything below is a fault in provisioning, in the request, or in the
         // fleet's ability to serve it. None of them are relieved by time.
         CellUnavailableReason::Provisioning
@@ -329,12 +339,21 @@ mod tests {
             | CellUnavailableReason::Checkout
             | CellUnavailableReason::Spawn
             | CellUnavailableReason::Preparation
+            | CellUnavailableReason::SlotUnhealthy
             | CellUnavailableReason::ExecutorUnavailable
             | CellUnavailableReason::NoMatchingExecutor
             | CellUnavailableReason::AdmissionRejected { .. }
             | CellUnavailableReason::ObjectInfrastructure(_) => {}
         }
-        let waits = [deadline(Some(ExecutorSubstrateState::CapacityBusy))];
+        let waits = [
+            deadline(Some(ExecutorSubstrateState::CapacityBusy)),
+            // A retired slot is the one non-deadline wait: the thing that
+            // refused the work is gone, so the next attempt meets a different
+            // one. Sitting next to `Preparation` in the refusals below is the
+            // whole point — the two describe the same moment in a batch's life
+            // and call for opposite answers.
+            CellUnavailableReason::SlotUnhealthy,
+        ];
         let refusals = [
             deadline(Some(ExecutorSubstrateState::ConnectedStalled)),
             CellUnavailableReason::Provisioning,

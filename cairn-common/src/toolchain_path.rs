@@ -35,8 +35,98 @@ const PATH_SEP: char = ';';
 #[cfg(not(windows))]
 const PATH_SEP: char = ':';
 
+/// The suffix a bare program name takes before it names a file on this
+/// platform.
+///
+/// Windows resolves a bare `cargo` to `cargo.exe` and never to a file literally
+/// named `cargo`; Unix resolves it literally. A PATH lookup is therefore not one
+/// algorithm with a different separator, and treating it as one is how a
+/// diagnostic reports "not found" for a toolchain that is sitting right there.
+#[cfg(windows)]
+const EXECUTABLE_SUFFIX: &str = ".exe";
+#[cfg(not(windows))]
+const EXECUTABLE_SUFFIX: &str = "";
+
+/// The OS account this process runs as — the identity whose home directory and
+/// per-user tool installs [`user_path`] composes around.
+///
+/// This is load-bearing for toolchain detection rather than decoration. A
+/// per-user install belongs to exactly one account, so a machine can carry a
+/// perfectly good toolchain that the account Cairn logs in as cannot reach.
+/// Naming the account is what lets "this machine has no Rust" and "this machine
+/// has Rust, installed for somebody else" be told apart at the fleet surface,
+/// instead of both arriving as an unexplained empty list.
+pub fn account_name() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("USERNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+}
+
+/// Where a spawn of `program` would find it, searching this process's own PATH
+/// the way the platform's spawner does.
+///
+/// A diagnostic, not the spawn's own lookup: Windows also consults the
+/// application directory and the system directories ahead of PATH, so `None`
+/// here means "not on PATH", never "unspawnable". A caller that also ran the
+/// command should believe the exit status over this answer and report both.
+pub fn locate_program(program: &str) -> Option<PathBuf> {
+    resolve_on_path(
+        &std::env::var("PATH").unwrap_or_default(),
+        PATH_SEP,
+        EXECUTABLE_SUFFIX,
+        program,
+    )
+}
+
+/// PATH resolution as a pure function, taking the platform's separator and
+/// executable suffix as arguments rather than reading them from `cfg`.
+///
+/// The parameters let the Windows algorithm be exercised on every host, so a
+/// regression in it surfaces in the ordinary inner loop and on every platform's
+/// lane rather than only where Windows is. That matters because the native
+/// Windows lane in `publish-executor-protocol.yml` is gated on `main`: a
+/// `#[cfg(windows)]`-only test would give its first verdict after a merge had
+/// already landed. That lane does run these tests, which is what separately
+/// confirms the platform's own answer for a bare program name is the one
+/// modelled here.
+fn resolve_on_path(
+    path: &str,
+    separator: char,
+    executable_suffix: &str,
+    program: &str,
+) -> Option<PathBuf> {
+    // A name carrying a path component is never searched for: the spawner uses
+    // it as written, so reporting a PATH entry instead would name a directory
+    // that had nothing to do with what ran.
+    let given = Path::new(program);
+    if given
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        return given.is_file().then(|| given.to_path_buf());
+    }
+    // Mirrors `CreateProcessW`: the suffix is appended only when the name
+    // carries no extension of its own.
+    let file_name = if executable_suffix.is_empty() || program.contains('.') {
+        program.to_string()
+    } else {
+        format!("{program}{executable_suffix}")
+    };
+    path.split(separator)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| Path::new(entry).join(&file_name))
+        .find(|candidate| candidate.is_file())
+}
+
 /// The user's home directory, as the platform names it.
-fn home_dir() -> String {
+pub fn user_home() -> String {
     #[cfg(windows)]
     {
         std::env::var("USERPROFILE")
@@ -102,7 +192,7 @@ fn compose_unix_path(home: &str, shell_path: Option<&str>, inherited_path: &str)
 /// first call, which is the only one that pays for the login-shell probe.
 pub fn user_path() -> &'static str {
     USER_PATH.get_or_init(|| {
-        let home = home_dir();
+        let home = user_home();
 
         #[cfg(windows)]
         {
@@ -282,6 +372,115 @@ mod tests {
         ] {
             assert!(path.contains(expected), "composed PATH lacks {expected}");
         }
+    }
+
+    /// The Windows lookup a bare `cargo` actually gets: the spawner appends
+    /// `.exe`, so a PATH entry holding `cargo.exe` is a hit even though nothing
+    /// on that PATH is named `cargo`. Getting this wrong reports a toolchain as
+    /// absent on the one platform Cairn cannot compile a test for.
+    #[test]
+    fn windows_resolution_appends_the_executable_suffix_to_a_bare_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let cargo_bin = temp.path().join("cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::write(cargo_bin.join("cargo.exe"), b"").unwrap();
+
+        let path = format!("C:\\windows\\system32;{}", cargo_bin.display());
+        assert_eq!(
+            resolve_on_path(&path, ';', ".exe", "cargo"),
+            Some(cargo_bin.join("cargo.exe"))
+        );
+    }
+
+    /// The Unix lookup is literal: a `cargo.exe` sitting on a Unix PATH is not
+    /// the `cargo` a spawn would find, and claiming otherwise would advertise a
+    /// toolchain that cannot run.
+    #[test]
+    fn unix_resolution_never_invents_an_executable_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cargo.exe"), b"").unwrap();
+
+        let path = format!("/usr/bin:{}", temp.path().display());
+        assert_eq!(resolve_on_path(&path, ':', "", "cargo"), None);
+    }
+
+    /// A name that already carries an extension is used as written, matching
+    /// `CreateProcessW`, which appends its suffix only to an extensionless name.
+    #[test]
+    fn windows_resolution_leaves_an_explicit_extension_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("where.exe"), b"").unwrap();
+
+        let path = temp.path().display().to_string();
+        assert_eq!(
+            resolve_on_path(&path, ';', ".exe", "where.exe"),
+            Some(temp.path().join("where.exe"))
+        );
+    }
+
+    /// PATH order decides, because it decides for the spawner. A diagnostic that
+    /// named a later entry would point an operator at the wrong install.
+    #[test]
+    fn resolution_returns_the_first_path_entry_that_holds_the_program() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("cargo.exe"), b"").unwrap();
+        std::fs::write(second.join("cargo.exe"), b"").unwrap();
+
+        let path = format!("{};{}", first.display(), second.display());
+        assert_eq!(
+            resolve_on_path(&path, ';', ".exe", "cargo"),
+            Some(first.join("cargo.exe"))
+        );
+    }
+
+    /// The composed Windows PATH names install locations that need not exist;
+    /// an absent directory is skipped, not treated as a resolution failure.
+    #[test]
+    fn resolution_skips_empty_and_absent_path_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("cargo.exe"), b"").unwrap();
+
+        let path = format!(";C:\\Users\\absent\\.cargo\\bin;;{}", temp.path().display());
+        assert_eq!(
+            resolve_on_path(&path, ';', ".exe", "cargo"),
+            Some(temp.path().join("cargo.exe"))
+        );
+    }
+
+    /// A directory named like the program is not the program. `is_file` is what
+    /// keeps `.../cargo/` from being reported as a resolved `cargo`.
+    #[test]
+    fn resolution_ignores_a_directory_sharing_the_program_name() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("cargo")).unwrap();
+
+        let path = temp.path().display().to_string();
+        assert_eq!(resolve_on_path(&path, ':', "", "cargo"), None);
+    }
+
+    /// A program named by path is used as given. Searching PATH for it would
+    /// report a directory that had no part in running it.
+    #[test]
+    fn a_program_named_by_path_is_not_searched_for_on_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let program = elsewhere.join("cargo");
+        std::fs::write(&program, b"").unwrap();
+
+        let program = program.display().to_string();
+        assert_eq!(
+            resolve_on_path("/usr/bin", ':', "", &program),
+            Some(PathBuf::from(&program))
+        );
+        assert_eq!(
+            resolve_on_path("", ':', "", &format!("{program}-absent")),
+            None
+        );
     }
 
     #[cfg(not(windows))]

@@ -113,6 +113,11 @@ pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, canc
     if let Some(issue_id) = issue_id_for_job(&orch.db.local, &job_id).await {
         crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, &issue_id).await;
     }
+    // Every exit path lands here too, which is the point: a wave that died
+    // verdictless settles its node just as truly as one that produced a full
+    // green, and a subscriber waiting on the latter must not be stranded by the
+    // former (CAIRN-3437).
+    crate::orchestrator::wakes::route_checks_settled_edge(&orch, &job_id).await;
 }
 
 /// Signal every in-flight turn-end (`when:review`) check suite belonging to
@@ -1200,7 +1205,7 @@ fn base_tree_coordinate(coords: &JobCoords) -> Option<&str> {
     coords.base_branch.as_deref()
 }
 
-fn checks_uri_for_job(coords: &JobCoords) -> String {
+pub(crate) fn checks_uri_for_job(coords: &JobCoords) -> String {
     match (coords.is_workflow, coords.parent_segment.as_deref()) {
         (true, _) => build_node_checks_uri(
             &coords.project_key,
@@ -1504,6 +1509,7 @@ mod tests {
             parsed: None,
             output_tail: output.to_string(),
             cached: false,
+            recorded: None,
             duration_ms: 1,
             suppressed_after: None,
         }

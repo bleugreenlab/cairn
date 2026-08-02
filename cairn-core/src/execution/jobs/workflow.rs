@@ -229,7 +229,7 @@ pub(crate) fn prepare_workflow_run(
         "Workflow `{}` invoked.\n\nArgs:\n{}",
         input.workflow_id, input.args_json
     );
-    store_user_event(orch, &run_id, &session_id, &seed, now)?;
+    store_launch_event(orch, &run_id, &session_id, &seed, now)?;
 
     // Create the initial turn (pending) and point the job at it; the backend
     // moves it to running once the process spawns.
@@ -568,6 +568,7 @@ async fn respawn_workflow_run(
         orch,
         crate::backends::workflow::WorkflowSpawnParams {
             run_id: row.run_id.clone(),
+            workflow_id: row.workflow_id.clone(),
             project_id: row.project_id.clone(),
             repository_path: PathBuf::from(
                 repository_path.ok_or("Workflow project has no local repository path")?,
@@ -781,6 +782,7 @@ pub(crate) async fn start_workflow_run(
         orch,
         crate::backends::workflow::WorkflowSpawnParams {
             run_id: prepared.run_id.clone(),
+            workflow_id: prepared.workflow_id.clone(),
             project_id: prepared.project_id.clone(),
             repository_path: prepared.repository_path.clone(),
             anchor_branch: prepared.anchor_branch.clone(),

@@ -1487,6 +1487,7 @@ mod tests {
                 projects_served: Vec::new(),
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
+                toolchain_detection: None,
             },
             current_load: 0,
             warm_roots: Vec::new(),

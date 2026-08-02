@@ -231,7 +231,9 @@ pub(crate) fn prepare_call_run(
     }
 
     // ---- Seed the transcript --------------------------------------------
-    store_user_event(orch, &run_id, &session_id, &input.prompt, now)?;
+    // The call's prompt was written by whoever invoked the call, not typed at
+    // this job by an operator (CAIRN-3408).
+    store_launch_event(orch, &run_id, &session_id, &input.prompt, now)?;
 
     // The prompt's output-artifact instruction is built from the SAME contract
     // that resolve_artifact_contract validates against, so they cannot drift.
@@ -677,7 +679,9 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
             Some(&job.project_id),
         ),
     );
-    store_user_event(orch, &run_id, &session_id, &prompt, now)?;
+    // A restart replays the original call prompt into a fresh session, so it
+    // seeds the same launch event the first attempt did (CAIRN-3408).
+    store_launch_event(orch, &run_id, &session_id, &prompt, now)?;
 
     // 2. Move the journal link to the new run BEFORE killing the old run, so the
     //    old run's finalize finds no link and journals nothing.
@@ -795,17 +799,26 @@ async fn latest_run_row(
     .map_err(|e| e.to_string())
 }
 
-/// The seed user prompt of a call run (its earliest `user` transcript event).
+/// The prompt a call run was launched on (its earliest user-slot event).
+///
+/// `restart_call` reconstructs its spawn inputs from this and refuses the
+/// restart outright when it comes back empty, so the type set here is
+/// load-bearing rather than cosmetic. A call seeded since CAIRN-3408 stores
+/// `user:launch`; the plain `user` type stays in the set because runs recorded
+/// before that keep it, and a restart must not become impossible for them.
 async fn seed_user_prompt(db: Arc<LocalDb>, run_id: String) -> Result<Option<String>, String> {
     db.read(|conn| {
         let run_id = run_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
+                    // A bound parameter inside an `IN (...)` list does not
+                    // reliably match here, so the launch type is compared with
+                    // its own equality term.
                     "SELECT data FROM events \
-                     WHERE run_id = ?1 AND event_type = 'user' \
+                     WHERE run_id = ?1 AND (event_type = 'user' OR event_type = ?2) \
                      ORDER BY sequence ASC, rowid ASC LIMIT 1",
-                    (run_id.as_str(),),
+                    (run_id.as_str(), crate::transcripts::LAUNCH_EVENT_TYPE),
                 )
                 .await?;
             let Some(row) = rows.next().await? else {
@@ -1156,6 +1169,59 @@ mod restart_call_tests {
             "INSERT INTO runs (id, job_id, issue_id, project_id, status, created_at, updated_at) VALUES ('call-run','j-call','i','p','live',1,1)".to_string(),
         ] {
             db.execute(&sql, ()).await.unwrap();
+        }
+    }
+
+    /// Store a call run's opening prompt under `event_type`.
+    async fn seed_launch_event(db: &LocalDb, event_type: &str, content: &str) {
+        let data = serde_json::to_string(&crate::agent_process::stream::TranscriptEvent {
+            event_type: event_type.to_string(),
+            session_id: Some("sess".to_string()),
+            parent_tool_use_id: None,
+            content: Some(content.to_string()),
+            thinking: None,
+            tool_name: None,
+            tool_input: None,
+            tool_uses: None,
+            tool_use_id: None,
+            tool_result: None,
+            is_error: false,
+            thinking_ms: None,
+            raw: None,
+        })
+        .unwrap();
+        db.execute(
+            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+             VALUES('ev-launch','call-run','sess',0,1,?1,?2,1)",
+            (event_type, data.as_str()),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `restart_call` reconstructs its spawn inputs from the run's opening
+    /// prompt and refuses the restart when it finds none, so namespacing that
+    /// event (CAIRN-3408) without widening this lookup would have turned every
+    /// call restart into a hard "has no seed prompt to restart" failure.
+    ///
+    /// Both types are asserted: new calls store `user:launch`, and runs recorded
+    /// before the change keep `user` and must stay restartable.
+    #[tokio::test]
+    async fn a_call_restart_recovers_its_launch_prompt_under_either_type() {
+        for event_type in ["user", crate::transcripts::LAUNCH_EVENT_TYPE] {
+            let (_orch, db) = orch_with_db().await;
+            seed_call(&db, "workflow").await;
+            seed_launch_event(&db, event_type, "Explore the parser and report back").await;
+
+            let recovered = seed_user_prompt(db.clone(), "call-run".to_string())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                recovered.as_deref(),
+                Some("Explore the parser and report back"),
+                "a call stored as `{event_type}` must stay restartable"
+            );
         }
     }
 

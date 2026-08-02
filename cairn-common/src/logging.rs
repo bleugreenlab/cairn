@@ -6,11 +6,15 @@
 //!   from prod (`~/.cairn/logs`) and honors the `CAIRN_LOG_DIR` override.
 //! - Pretty stderr layer (ANSI when TTY, respects RUST_LOG)
 //!
+//! Logging is diagnostics, never a precondition for running. A log destination
+//! the process cannot write degrades the subscriber to its remaining layers
+//! rather than failing [`init`] — see that function for why.
+//!
 //! All `log::` crate calls are bridged into tracing via `tracing-log`.
 //! Call `init()` once at startup in each binary.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -120,7 +124,29 @@ impl std::str::FromStr for LogLevel {
 
 /// Holds the async writer guard. **Must be kept alive** for the duration of the
 /// process — dropping it flushes and stops the background writer thread.
-pub struct LogGuard(#[allow(dead_code)] WorkerGuard);
+///
+/// Also carries whether the file layer is live at all: [`init`] degrades to a
+/// fileless logger when the log destination cannot be written, and a caller that
+/// reports log state (the app's log viewer) needs to say so rather than claim
+/// files exist.
+pub struct LogGuard {
+    /// `None` when the file layer degraded away and there is no writer to flush.
+    _worker: Option<WorkerGuard>,
+    /// Why the file layer is absent; `None` when it is live.
+    file_error: Option<String>,
+}
+
+impl LogGuard {
+    /// Whether the JSONL file layer is live.
+    pub fn file_logging_enabled(&self) -> bool {
+        self.file_error.is_none()
+    }
+
+    /// Why the JSONL file layer is absent, when it is.
+    pub fn file_error(&self) -> Option<&str> {
+        self.file_error.as_deref()
+    }
+}
 
 /// Default log directory, resolved by the shared paths resolver (dev/prod
 /// separated; `CAIRN_LOG_DIR` override honored).
@@ -319,37 +345,65 @@ fn profiler_span_filter(directives: &str) -> Targets {
     }
 }
 
+/// Build the rotating JSONL appender for `log_dir`, creating the directory if it
+/// is missing.
+///
+/// A missing directory and an unopenable file are the same fact to a caller — no
+/// writable log destination — so both collapse into one message naming the path,
+/// which is the part a person needs to act on.
+fn build_file_appender(
+    log_dir: &Path,
+    process: ProcessTag,
+) -> Result<tracing_appender::rolling::RollingFileAppender, String> {
+    std::fs::create_dir_all(log_dir)
+        .map_err(|error| format!("create log directory {}: {error}", log_dir.display()))?;
+
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(process.prefix())
+        .filename_suffix("jsonl")
+        .max_log_files(14)
+        .build(log_dir)
+        .map_err(|error| format!("open a log file in {}: {error}", log_dir.display()))
+}
+
 /// Initialize the unified logging subscriber.
 ///
 /// Returns a `LogGuard` that must be stored (not dropped) for the lifetime of the
 /// process. Dropping it flushes pending log writes.
 ///
+/// A log destination the process cannot write is **not** a failure: the file
+/// layer is dropped, the remaining layers are installed, and the reason is
+/// recorded on the returned [`LogGuard`]. A Cairn binary has to run wherever it
+/// is launched, and the `run` verb's OS fence proved the point — it confines
+/// writes to the worktree and the sanctioned scratch dirs, so the home log
+/// directory is unwritable there and every `cairn` CLI invocation from an agent
+/// batch shell died at this call before it parsed its command. A read-only home,
+/// a container, or any fence yet to be written would do the same.
+///
 /// # Errors
-/// Returns an error if the subscriber cannot be initialized (e.g. a global subscriber
-/// was already set).
+/// Only if a global subscriber was already installed — a double-init bug in the
+/// calling binary, which is worth failing on because it means two subscribers
+/// disagree about where this process logs.
 pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
     let log_dir = config.log_dir.unwrap_or_else(default_log_dir);
 
-    // Ensure log directory exists
-    std::fs::create_dir_all(&log_dir)?;
-
-    // File layer: JSON Lines with daily rotation, 14 file max
-    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix(config.process.prefix())
-        .filename_suffix("jsonl")
-        .max_log_files(14)
-        .build(&log_dir)?;
-
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    let file_layer = fmt::layer()
-        .json()
-        .with_writer(non_blocking)
-        .with_target(true)
-        .with_level(true)
-        .with_thread_ids(false)
-        .with_thread_names(false);
+    // File layer: JSON Lines with daily rotation, 14 file max — or nothing at
+    // all, when this process cannot write there.
+    let (file_layer, worker, file_error) = match build_file_appender(&log_dir, config.process) {
+        Ok(appender) => {
+            let (non_blocking, worker) = tracing_appender::non_blocking(appender);
+            let layer = fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_target(true)
+                .with_level(true)
+                .with_thread_ids(false)
+                .with_thread_names(false);
+            (Some(layer), Some(worker), None)
+        }
+        Err(error) => (None, None, Some(error)),
+    };
 
     // File layer filter: resolved from CAIRN_FILE_LOG / CAIRN_LOG_LEVEL / the
     // configured level, defaulting to the light `Standard` filter (no crate
@@ -359,13 +413,17 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
 
     // Span-duration profiler layer: emits one profiler-schema duration event per
     // closed `profiler`-target span (see `SpanDurationLayer`). Its filter is
-    // derived from the same resolved directives, so it is active exactly when the
-    // file layer will record its events — and inert (zero overhead) otherwise.
+    // derived from the same resolved directives that gate the file layer, so the
+    // profiler is on for exactly the configurations that asked for it — and inert
+    // (zero overhead) otherwise. It tracks the configured level rather than
+    // whether a file layer survived, so a degraded logger still profiles into
+    // whatever layers remain.
     let span_layer = SpanDurationLayer.with_filter(profiler_span_filter(&file_directives));
 
-    // Build the subscriber
+    // Build the subscriber. `Option<Layer>` is itself a `Layer`, so a degraded
+    // file layer simply contributes nothing.
     let registry = tracing_subscriber::registry()
-        .with(file_layer.with_filter(file_filter))
+        .with(file_layer.map(|layer| layer.with_filter(file_filter)))
         .with(span_layer);
 
     if config.stderr {
@@ -388,7 +446,21 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
     // Bridge log:: crate into tracing (ignore if already set)
     let _ = tracing_log::LogTracer::init();
 
-    Ok(LogGuard(guard))
+    // Announce a degrade through the subscriber that was just installed, so a
+    // binary with a stderr layer says why its files stopped appearing. A CLI
+    // subcommand runs with `stderr: false` to keep its output pipeable, and this
+    // is deliberately dropped there rather than special-cased into a print.
+    if let Some(error) = &file_error {
+        tracing::warn!(
+            %error,
+            "file logging disabled; continuing without a log file"
+        );
+    }
+
+    Ok(LogGuard {
+        _worker: worker,
+        file_error,
+    })
 }
 
 /// Check if stderr is a TTY (for ANSI color support).
@@ -461,6 +533,75 @@ mod tests {
 
         std::env::remove_var("CAIRN_FILE_LOG");
         std::env::remove_var("CAIRN_LOG_LEVEL");
+    }
+
+    /// A path whose parent is a regular file: `create_dir_all` refuses it for
+    /// every user, root included, so the "no writable log destination" case is
+    /// reproducible without depending on permissions or on a fence being active.
+    fn unwritable_log_dir(dir: &tempfile::TempDir) -> PathBuf {
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"").expect("seed the blocking file");
+        blocker.join("logs")
+    }
+
+    #[test]
+    fn file_appender_creates_a_missing_log_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("deeply/nested/logs");
+
+        build_file_appender(&nested, ProcessTag::Cmd).expect("a writable path must open");
+
+        assert!(nested.is_dir(), "the log directory is created on demand");
+    }
+
+    #[test]
+    fn file_appender_reports_an_unwritable_log_dir_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = unwritable_log_dir(&dir);
+
+        let error = build_file_appender(&target, ProcessTag::Cmd)
+            .expect_err("a log dir that cannot be created must report, not panic");
+
+        assert!(
+            error.contains(&target.display().to_string()),
+            "the failure must name the path a person has to fix: {error}"
+        );
+    }
+
+    /// The regression this pins: a `cairn` CLI invocation inside the `run`
+    /// fence cannot write the home log directory, and it used to die at
+    /// `logging::init` before parsing its command. Init must hand back a working
+    /// (fileless) logger instead of an error every caller has to `expect`-crash
+    /// on.
+    ///
+    /// Sole `init` caller in this crate's test binary — it installs the global
+    /// subscriber, which only one test can do.
+    #[test]
+    fn init_degrades_to_a_fileless_logger_when_the_log_dir_is_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = unwritable_log_dir(&dir);
+
+        let guard = init(LogConfig {
+            process: ProcessTag::Cmd,
+            log_dir: Some(target.clone()),
+            // The CLI's own configuration: stderr stays clean for piping, so the
+            // degraded subscriber carries no layers at all.
+            stderr: false,
+            level: None,
+            stderr_level: None,
+        })
+        .expect("an unwritable log destination must not fail logging init");
+
+        assert!(
+            !guard.file_logging_enabled(),
+            "the file layer must be reported as absent"
+        );
+        assert!(guard
+            .file_error()
+            .is_some_and(|error| error.contains(&target.display().to_string())));
+        // The installed subscriber accepts events rather than panicking on them.
+        tracing::info!("degraded logger still accepts events");
+        tracing::warn!(target: PROFILER_TARGET, "and filtered targets too");
     }
 
     // The profiler gate derives from the same directive resolution: on at

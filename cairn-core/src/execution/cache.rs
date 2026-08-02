@@ -25,6 +25,30 @@ impl CheckResultIdentity {
     }
 }
 
+/// The immutable observation a run actually recorded, carried back from the write
+/// so a caller reports the row it produced instead of re-deriving a key and
+/// hoping a second lookup finds it.
+///
+/// Re-deriving is not a theoretical hazard. A verdict produced on another machine
+/// is recorded under an EMPTY environment fingerprint, because Cairn cannot yet
+/// identify a remote machine's verdict environment and must not publish its row
+/// under a coordinator-derived key. No key the requesting side computes can match
+/// that row, so a lookup-derived reply calls every remotely executed check
+/// unrecorded. The recorder is the only thing that knows what it wrote; this is
+/// how it says so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedCheckObservation {
+    pub id: String,
+    /// The environment identity this observation and its commit alias are keyed
+    /// by. EMPTY when a remote executor produced the verdict: the row is
+    /// addressable by id and readable as diagnosis, but nothing may reuse it.
+    pub environment_fingerprint: String,
+    /// Whether this observation may suppress a later execution of the same
+    /// triple. False keeps a red, incomplete, or remotely produced verdict out of
+    /// the reuse path while still returning it to whoever asked for it.
+    pub reusable: bool,
+}
+
 fn row_to_check_result(
     row: &cairn_db::turso::Row,
 ) -> Result<CheckResultCacheEntry, crate::storage::DbError> {

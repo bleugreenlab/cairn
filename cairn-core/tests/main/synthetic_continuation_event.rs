@@ -1,12 +1,14 @@
-//! A resume Cairn synthesizes for itself must not reach the transcript as a
-//! user message (CAIRN-3175). This pins the storage seam: the stored row's
-//! `event_type` is what every downstream projection dispatches on, so it is the
-//! representation that carries "synthetic" end to end.
+//! Substrate text that occupies the user slot must not reach the transcript as a
+//! user message: a resume Cairn synthesizes for itself (CAIRN-3175), and the
+//! prompt a job is launched on (CAIRN-3408). These pin the storage seam — the
+//! stored row's `event_type` is what every downstream projection dispatches on,
+//! so it is the representation that carries authorship end to end.
 
 use crate::common;
 
 use cairn_core::internal::execution::jobs::{
-    store_continuation_event_with_turn, store_tool_result_event_with_turn,
+    store_continuation_event_with_turn, store_launch_event_with_turn,
+    store_tool_result_event_with_turn,
 };
 use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
@@ -86,6 +88,45 @@ async fn synthesized_continuation_is_not_stored_as_a_user_event() {
     assert!(
         data.contains("Automatic resume"),
         "the prompt the agent actually received must stay recoverable: {data}"
+    );
+}
+
+/// A job's launch prompt lands under its own namespaced type too (CAIRN-3408).
+///
+/// Nobody types a launch prompt — Cairn composes it from the issue's resolved
+/// inputs, so under delegation its author is the coordinator or thread that
+/// filed the child. Stored as a plain `user` event it came back to that parent
+/// as `**User:** <its own issue description>` in the child's catch-up digest.
+#[tokio::test]
+async fn a_launch_prompt_is_not_stored_as_a_user_event() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local).await;
+
+    let task =
+        "# Fix the panic in the CLI logger\n\nEvery fenced batch shell dies at logging init.";
+    store_launch_event_with_turn(&orch, "run-1", "session-1", task, 7, Some("turn-1")).unwrap();
+
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT event_type FROM events WHERE run_id = ?1",
+            "run-1",
+        )
+        .await,
+        Some("user:launch".to_string()),
+        "a launch prompt must never be stored as a plain `user` event"
+    );
+
+    let data = common::scalar_text_by_id(
+        &orch.db.local,
+        "SELECT data FROM events WHERE run_id = ?1",
+        "run-1",
+    )
+    .await
+    .unwrap();
+    assert!(
+        data.contains("Fix the panic in the CLI logger"),
+        "the task the agent was given must stay recoverable: {data}"
     );
 }
 

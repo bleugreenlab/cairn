@@ -20,7 +20,7 @@ pub(crate) async fn read_node_memories_collection(
     node_id: &str,
 ) -> String {
     let db = orch.db.for_project(project).await;
-    let job_id = match crate::resources::node::resolve_todos_job_id(
+    let job_id = match crate::resources::node::resolve_node_or_task_job_id(
         &db, project, number, exec_seq, node_id, None,
     )
     .await

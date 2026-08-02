@@ -1,3 +1,4 @@
+pub mod abnormal_exit;
 pub mod auth;
 pub mod build_identity;
 pub mod change_validation;

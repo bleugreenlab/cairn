@@ -43,6 +43,10 @@ const WORKFLOW_BACKEND_NAME: &str = "Workflow";
 /// Parameters required to dispatch a workflow into an executor lease.
 pub(crate) struct WorkflowSpawnParams {
     pub run_id: String,
+    /// What this workflow is invoked as. It is what a surface showing the
+    /// running runtime calls it, so the row names the workflow rather than the
+    /// directory its package happens to sit in.
+    pub workflow_id: String,
     pub project_id: String,
     pub repository_path: PathBuf,
     pub anchor_branch: String,
@@ -219,7 +223,7 @@ pub(crate) async fn spawn_workflow_process(
                 fence: fence.clone(),
                 process_key: params.run_id.clone(),
                 kind: ResidentProcessKind::WorkflowRuntime {
-                    workflow: params.package_path.to_string_lossy().into_owned(),
+                    workflow: params.workflow_id.clone(),
                 },
                 // The runtime is the thing that works, so it is the thing that
                 // is charged.

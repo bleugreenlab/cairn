@@ -230,6 +230,19 @@ fn head_turn_sync(db: &LocalDb, job_id: &str) -> HeadTurn {
     run_db_blocking(move || async move { head_turn(db, &job_id).await }).unwrap_or(HeadTurn::Idle)
 }
 
+/// [`head_turn`] for a job id, routed to the job's owning database, from an
+/// async caller. Fails open to [`HeadTurn::Idle`] for the same reason as
+/// [`head_turn_sync`]: a read error must not invent work that is not happening.
+///
+/// Used by the checks-settlement predicate, which asks whether a node is still
+/// working before it will believe that node's lanes have stopped.
+pub(crate) async fn head_turn_for_job_async(orch: &Orchestrator, job_id: &str) -> HeadTurn {
+    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
+        return HeadTurn::Idle;
+    };
+    head_turn(&db, job_id).await.unwrap_or(HeadTurn::Idle)
+}
+
 /// [`head_turn`] for a job id, routed to the job's owning database, for the
 /// synchronous turn-end hooks in `orchestrator::lifecycle`. Fails open to
 /// [`HeadTurn::Idle`] for the same reason as [`head_turn_sync`].

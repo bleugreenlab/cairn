@@ -159,6 +159,12 @@ pub struct Settings {
     pub max_open_triage_issues_per_scope: i32,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: i32,
+    /// Fraction of the model's context window at which a WARM thread session
+    /// rebuilds itself. A rebuild costs the thread its own reasoning and its
+    /// sense of continuity, which no byte saving offsets, so while the cache is
+    /// live it is done only because the window is running out — never because it
+    /// would be cheaper.
+    pub thread_compact_threshold: f64,
     /// Behavior for replies to the documented `to: "external"` target.
     pub external_replies: ExternalReplyMode,
     /// File-log verbosity level (default `standard`; `verbose` opts into full
@@ -229,6 +235,8 @@ pub struct UpdateSettings {
     pub max_open_triage_issues_per_scope: Option<i32>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: Option<i32>,
+    /// Fraction of the model's context window at which a warm thread session rebuilds.
+    pub thread_compact_threshold: Option<f64>,
     /// Behavior for replies to the documented `to: "external"` target.
     pub external_replies: Option<ExternalReplyMode>,
     /// File-log verbosity level.

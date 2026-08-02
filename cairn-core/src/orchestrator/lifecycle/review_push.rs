@@ -268,6 +268,26 @@ fn withdrawn_turn_end_wave(orch: &Orchestrator, job_id: &str) -> Option<String> 
     }
 }
 
+/// The turn-end half of the checks-settled edge (CAIRN-3437).
+///
+/// Must be called immediately AFTER [`spawn_turn_end_checks`], never before: a
+/// wave that is going to run claims its single-flight slot inside that call, and
+/// asking settlement first would see an idle node with no wave in flight and
+/// report every lane about to run as one that never will. Detached for the same
+/// reason the wave itself is -- this hook runs on an agent backend's plain
+/// stdout thread with no ambient runtime, and the settlement snapshot reads the
+/// repository.
+pub(super) fn spawn_checks_settled_edge(orch: &Orchestrator, job_id: &str) {
+    let orch = orch.clone();
+    let job_id = job_id.to_string();
+    detach_onto_runtime(
+        async move {
+            crate::orchestrator::wakes::route_checks_settled_edge(&orch, &job_id).await;
+        },
+        || {},
+    );
+}
+
 /// Detach `fut` onto a runtime that is guaranteed to run it, without ever
 /// blocking the caller — which at turn-end is an agent backend's plain
 /// `std::thread` stdout loop, not a Tokio worker.

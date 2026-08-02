@@ -569,6 +569,153 @@ fn extract_user_content(
     }
 }
 
+/// Why the agent runtime refused a tool call's input JSON.
+///
+/// With native tool use the runtime accumulates the streamed `tool_use` input
+/// and parses it itself. When that parse fails the call is never dispatched —
+/// Cairn's MCP server never sees it — and the runtime hands the block back with
+/// `input` replaced by a `__unparsedToolInput` marker carrying the byte length
+/// and a clipped prefix of the text it could not read. Classifying that prefix
+/// is the only account anyone gets of why the call was lost, so the variants
+/// here name causes observed in real rejections rather than a generic failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputDefect {
+    /// A backslash escape JSON does not define, such as a regex `\.` or `\|`
+    /// that reached the wire with only one level of escaping.
+    InvalidEscape,
+    /// `\u` not followed by four hex digits — Rust's `\u{2717}` form leaking
+    /// into a JSON string.
+    UnicodeEscape,
+    /// A raw control character inside a string, which JSON requires escaped.
+    /// Most often a literal newline carried in from a shell heredoc.
+    ControlCharacter,
+    /// A complete value followed by more text. The observed shape is a
+    /// duplicated object tail, where a trailing key is emitted twice.
+    TrailingGarbage,
+    /// A string that never closes in a prefix known to be the whole payload.
+    UnterminatedString,
+    /// The retained prefix holds no defect and stops short of the full length,
+    /// so the cause lies in the part the runtime did not keep.
+    BeyondCapture,
+    /// Well-formed JSON by our reading, so the rejection was not a syntax
+    /// problem — a schema mismatch reported through the same error.
+    NotSyntax,
+    /// Invalid some other way, typically a string closed early by an unescaped
+    /// quote, leaving the remainder of the object desynchronized.
+    Structure,
+}
+
+impl InputDefect {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            InputDefect::InvalidEscape => "invalid-escape",
+            InputDefect::UnicodeEscape => "unicode-escape",
+            InputDefect::ControlCharacter => "control-character",
+            InputDefect::TrailingGarbage => "trailing-garbage",
+            InputDefect::UnterminatedString => "unterminated-string",
+            InputDefect::BeyondCapture => "beyond-capture",
+            InputDefect::NotSyntax => "not-syntax",
+            InputDefect::Structure => "structure",
+        }
+    }
+}
+
+/// A tool call the runtime rejected before Cairn could run it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RejectedToolInput {
+    /// Byte length of the input the runtime tried to parse.
+    pub len: usize,
+    /// Bytes actually retained for inspection; the runtime clips its sample.
+    pub captured: usize,
+    pub defect: InputDefect,
+}
+
+impl RejectedToolInput {
+    /// Recognize the marker the runtime substitutes for an unparsable input.
+    pub(crate) fn detect(input: &Value) -> Option<Self> {
+        let marker = input.get("__unparsedToolInput")?;
+        let raw = marker
+            .get("raw")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let captured = raw.len();
+        let len = marker
+            .get("len")
+            .and_then(Value::as_u64)
+            .map_or(captured, |len| len as usize);
+        Some(Self {
+            len,
+            captured,
+            defect: classify_input_defect(raw, captured < len),
+        })
+    }
+}
+
+fn classify_input_defect(raw: &str, clipped: bool) -> InputDefect {
+    match scan_json_strings(raw) {
+        StringScan::Defect(defect) => return defect,
+        StringScan::EndedInString if clipped => return InputDefect::BeyondCapture,
+        StringScan::EndedInString => return InputDefect::UnterminatedString,
+        StringScan::Balanced => {}
+    }
+    if clipped {
+        return InputDefect::BeyondCapture;
+    }
+    // The payload is whole and its strings are sound, so the fault is in the
+    // structure around them. Decoding one value and asking where it stopped
+    // separates a duplicated tail from an object that never made sense.
+    let mut values = serde_json::Deserializer::from_str(raw).into_iter::<Value>();
+    match values.next() {
+        Some(Ok(_)) if values.byte_offset() >= raw.trim_end().len() => InputDefect::NotSyntax,
+        Some(Ok(_)) => InputDefect::TrailingGarbage,
+        _ => InputDefect::Structure,
+    }
+}
+
+enum StringScan {
+    Balanced,
+    EndedInString,
+    Defect(InputDefect),
+}
+
+/// Walk the text as JSON would, reporting the first defect inside a string
+/// literal. Escaping mistakes are the dominant cause of a rejected input, and
+/// they are decidable from a prefix, so this runs before any whole-value parse.
+fn scan_json_strings(raw: &str) -> StringScan {
+    let mut chars = raw.chars();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if !in_string {
+            in_string = c == '"';
+            continue;
+        }
+        match c {
+            '"' => in_string = false,
+            '\\' => match chars.next() {
+                None => return StringScan::EndedInString,
+                Some('u') => {
+                    for _ in 0..4 {
+                        match chars.next() {
+                            Some(hex) if hex.is_ascii_hexdigit() => {}
+                            Some(_) => return StringScan::Defect(InputDefect::UnicodeEscape),
+                            None => return StringScan::EndedInString,
+                        }
+                    }
+                }
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {}
+                Some(_) => return StringScan::Defect(InputDefect::InvalidEscape),
+            },
+            c if (c as u32) < 0x20 => return StringScan::Defect(InputDefect::ControlCharacter),
+            _ => {}
+        }
+    }
+    if in_string {
+        StringScan::EndedInString
+    } else {
+        StringScan::Balanced
+    }
+}
+
 /// Extract content, tool uses, and thinking from assistant messages
 /// Returns: (content, tool_uses, thinking)
 fn extract_assistant_content(
@@ -585,6 +732,21 @@ fn extract_assistant_content(
                 match block {
                     ContentBlock::Text { text } => texts.push(text.clone()),
                     ContentBlock::ToolUse { id, name, input } => {
+                        // A rejected input costs a full re-authoring of the
+                        // payload and is otherwise visible only to whoever
+                        // reads the transcript, so account for it here.
+                        if let Some(rejected) = RejectedToolInput::detect(input) {
+                            log::warn!(
+                                "rejected-tool-input: {} never ran because the agent runtime could not \
+                                 parse its input JSON (tool_use_id={}, bytes={}, inspected={}, defect={}). \
+                                 The call did not reach Cairn; the agent has to re-author the payload.",
+                                name,
+                                id,
+                                rejected.len,
+                                rejected.captured,
+                                rejected.defect.as_str(),
+                            );
+                        }
                         log::trace!(
                             "[DEBUG-TOOLUSE] Extracted tool_use from assistant content: id={} name={}",
                             id,
@@ -669,6 +831,117 @@ fn normalize_control_response(raw: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every payload below is a real rejected tool input, recovered from the
+    // `__unparsedToolInput` markers the runtime handed back on this machine.
+
+    fn defect_of(raw: &str) -> InputDefect {
+        classify_input_defect(raw, false)
+    }
+
+    #[test]
+    fn regex_backslash_in_a_query_reads_as_an_invalid_escape() {
+        // `\.` is a regex escape and not a JSON one, so the payload dies on a
+        // grep pattern that reached the wire singly escaped.
+        let raw =
+            r#"{"paths": ["cairn://p/CAIRN/2802/1/coordinator/chat?grep=\.cairn/logs|jsonl"]}"#;
+        assert_eq!(defect_of(raw), InputDefect::InvalidEscape);
+    }
+
+    #[test]
+    fn a_rust_style_unicode_escape_is_not_a_json_one() {
+        // JSON wants four bare hex digits; Rust's braced form is a defect.
+        let raw = r#"{"content": "assert!(s.starts_with(\u{2717}))"}"#;
+        assert_eq!(defect_of(raw), InputDefect::UnicodeEscape);
+    }
+
+    #[test]
+    fn a_heredoc_newline_survives_into_the_string_unescaped() {
+        let raw = "{\"commands\": [{\"command\": \"cat > m.rs <<EOF\nuse std::io;\"}]}";
+        assert_eq!(defect_of(raw), InputDefect::ControlCharacter);
+    }
+
+    #[test]
+    fn a_duplicated_object_tail_reads_as_trailing_garbage() {
+        // The generation stutters and re-emits a trailing top-level key after
+        // the object has already closed.
+        let raw = r#"{"commands": [{"command": "true"}], "branch": "main"}, "branch": "main"}"#;
+        assert_eq!(defect_of(raw), InputDefect::TrailingGarbage);
+    }
+
+    #[test]
+    fn a_whole_payload_whose_string_never_closes_is_named_as_such() {
+        let raw = r#"{"paths": ["file:src/lib.rs?grep=Command.*git|\"git\"]}"#;
+        assert_eq!(defect_of(raw), InputDefect::UnterminatedString);
+    }
+
+    #[test]
+    fn a_clipped_prefix_is_not_blamed_for_ending_early() {
+        // The runtime retains only a prefix. Ending mid-string says nothing
+        // about the payload, so the verdict points past the capture instead of
+        // inventing an unterminated string.
+        let raw = r#"{"paths": ["file:src-tauri/os/cairn-core/src/backends/cla"#;
+        assert_eq!(classify_input_defect(raw, true), InputDefect::BeyondCapture);
+    }
+
+    #[test]
+    fn a_defect_before_the_clip_still_counts() {
+        // A concrete escaping fault inside the retained prefix is decidable
+        // even though the rest was dropped.
+        let raw = r#"{"paths": ["file:src/lib.rs?grep=a\|b"#;
+        assert_eq!(classify_input_defect(raw, true), InputDefect::InvalidEscape);
+    }
+
+    #[test]
+    fn syntactically_sound_json_is_reported_as_a_non_syntax_rejection() {
+        let raw = r#"{"paths": ["file:src/lib.rs"]}"#;
+        assert_eq!(defect_of(raw), InputDefect::NotSyntax);
+    }
+
+    #[test]
+    fn an_unescaped_quote_desyncs_the_object_around_it() {
+        // The string closes early, so what follows is read as structure.
+        let raw = r#"{"content": "const N: &str = "node_modules";", "msg": "x"}"#;
+        assert_eq!(defect_of(raw), InputDefect::Structure);
+    }
+
+    #[test]
+    fn detect_reports_the_full_length_and_what_was_inspected() {
+        let input = serde_json::json!({
+            "__unparsedToolInput": {
+                "len": 26559,
+                "raw": r#"{"changes": [{"target": "file:a.rs?grep=\.x"}]}"#,
+            }
+        });
+        let rejected = RejectedToolInput::detect(&input).expect("marker recognized");
+        assert_eq!(rejected.len, 26559);
+        assert_eq!(rejected.captured, 47);
+        assert_eq!(rejected.defect, InputDefect::InvalidEscape);
+    }
+
+    #[test]
+    fn a_rejected_call_reaches_the_transcript_carrying_its_marker() {
+        // The runtime still emits the assistant message; only the input is
+        // replaced. The block has to survive parsing with the marker intact,
+        // because that is the whole record of a call that never ran.
+        let line = r#"{"type":"assistant","uuid":"u1","session_id":"s1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"mcp__cairn__read","input":{"__unparsedToolInput":{"len":87,"raw":"{}"}}}]}}"#;
+        let (event, raw) = parse_event(line).expect("assistant event parses");
+        let transcript = TranscriptEvent::from_claude_event(&event, raw);
+
+        let uses = transcript.tool_uses.expect("tool use surfaced");
+        assert_eq!(uses[0].name, "mcp__cairn__read");
+        let rejected = RejectedToolInput::detect(&uses[0].input).expect("marker survives parsing");
+        assert_eq!(rejected.len, 87);
+        // Only two bytes were retained of eighty-seven, so no verdict is
+        // available from the prefix alone.
+        assert_eq!(rejected.defect, InputDefect::BeyondCapture);
+    }
+
+    #[test]
+    fn an_ordinary_tool_input_carries_no_marker() {
+        let input = serde_json::json!({"paths": ["file:src/lib.rs"]});
+        assert!(RejectedToolInput::detect(&input).is_none());
+    }
 
     #[test]
     fn test_parse_system_init_event() {

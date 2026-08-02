@@ -61,12 +61,23 @@ fn load_prior_chat_messages(
         let session_db = crate::projects::crud::owning_db(&orch.db, &project_id).await?;
         let rows = session_db
             .query_all(
+                // `user:launch` carries the task the job was started on. It is
+                // bound as a parameter rather than written into the IN list so
+                // the replay set cannot drift from the constant (CAIRN-3408):
+                // dropping it here would rebuild a conversation whose opening
+                // instruction is missing, and every turn after the first would
+                // continue without ever having been told what to do.
                 "SELECT event_type, data FROM events
                  WHERE session_id = ?1
                    AND run_id != ?2
-                   AND event_type IN ('user', 'assistant', 'tool_result')
+                   AND (event_type IN ('user', 'assistant', 'tool_result')
+                        OR event_type = ?3)
                  ORDER BY created_at ASC, rowid ASC",
-                (session_id.clone(), current_run_id.clone()),
+                (
+                    session_id.clone(),
+                    current_run_id.clone(),
+                    crate::transcripts::LAUNCH_EVENT_TYPE,
+                ),
                 |row| Ok((row.text(0)?, row.text(1)?)),
             )
             .await
@@ -80,23 +91,27 @@ fn load_prior_chat_messages(
             // text block is rejected by the provider, and replaying one turns a
             // single bad turn into a conversation that can never resume
             // (CAIRN-3263).
-            let message = if event_type == "user" {
-                match event.content.filter(|text| !text.trim().is_empty()) {
-                    Some(content) => {
-                        let content = crate::agent_process::stdin::resolve_stable_images(
-                            &orch.db,
-                            &project_id,
-                            &project_key,
-                            content,
-                        )
-                        .await?;
-                        Some(ChatMessage::user_content(&content))
+            // A launch prompt reaches the provider in the same user role it
+            // originally occupied. Namespacing it changed who Cairn says wrote
+            // it, not what the model was told (CAIRN-3408).
+            let message =
+                if event_type == "user" || event_type == crate::transcripts::LAUNCH_EVENT_TYPE {
+                    match event.content.filter(|text| !text.trim().is_empty()) {
+                        Some(content) => {
+                            let content = crate::agent_process::stdin::resolve_stable_images(
+                                &orch.db,
+                                &project_id,
+                                &project_key,
+                                content,
+                            )
+                            .await?;
+                            Some(ChatMessage::user_content(&content))
+                        }
+                        None => None,
                     }
-                    None => None,
-                }
-            } else {
-                transcript_event_to_chat_message(&event_type, event)
-            };
+                } else {
+                    transcript_event_to_chat_message(&event_type, event)
+                };
             if let Some(message) = message {
                 out.push(message);
             }
@@ -227,5 +242,125 @@ pub(crate) fn transcript_event_to_chat_message(
                 ChatMessage::tool(tool_call_id, content)
             }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::Arc;
+
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// One session, one prior run: the launch prompt that opened the job, then
+    /// the assistant's reply.
+    async fn seed_prior_run(db: &LocalDb, launch_type: &str) {
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+            INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+              VALUES('job-1','p','running','sess-1',1,1);
+            INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+              VALUES('sess-1','job-1','active',1,1);
+            INSERT INTO runs(id, project_id, job_id, session_id, status, created_at, updated_at)
+              VALUES('run-1','p','job-1','sess-1','exited',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+        // Serialized from the same struct the storage path builds, so the
+        // fixture cannot drift from what actually lands in `data`.
+        let event_data = |event_type: &str, content: &str| {
+            serde_json::to_string(&TranscriptEvent {
+                event_type: event_type.to_string(),
+                session_id: Some("sess-1".to_string()),
+                parent_tool_use_id: None,
+                content: Some(content.to_string()),
+                thinking: None,
+                tool_name: None,
+                tool_input: None,
+                tool_uses: None,
+                tool_use_id: None,
+                tool_result: None,
+                is_error: false,
+                thinking_ms: None,
+                raw: None,
+            })
+            .unwrap()
+        };
+        let launch = event_data(launch_type, THE_TASK);
+        let reply = event_data("assistant", "on it");
+        let launch_type = launch_type.to_string();
+        db.write(move |conn| {
+            let launch = launch.clone();
+            let reply = reply.clone();
+            let launch_type = launch_type.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES('e1','run-1','sess-1',0,1,?1,?2,1)",
+                    cairn_db::turso::params![launch_type.as_str(), launch.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES('e2','run-1','sess-1',1,2,'assistant',?1,2)",
+                    cairn_db::turso::params![reply.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    const THE_TASK: &str = "Fix the panic in the CLI logger before touching anything else.";
+
+    /// A second run on the same session must rebuild a conversation that still
+    /// states the task (CAIRN-3408).
+    ///
+    /// The first request never exercises this path — it carries its prompt
+    /// directly — so a launch prompt missing from replay stays invisible until
+    /// some later turn continues with no idea what it was asked to do. Asserting
+    /// against the old `user` type in the same test proves the reconstruction is
+    /// equivalent, not merely non-empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_run_replays_the_launch_prompt_it_was_started_on() {
+        for launch_type in ["user", crate::transcripts::LAUNCH_EVENT_TYPE] {
+            let db = crate::storage::migrated_test_db("openai-compat-replay.db").await;
+            seed_prior_run(&db, launch_type).await;
+            let orch = test_orchestrator(db);
+
+            let replayed = load_prior_chat_messages(&orch, "sess-1", "run-2", "p", "PROJ").unwrap();
+
+            assert_eq!(
+                replayed.len(),
+                2,
+                "expected the launch prompt and the reply ({launch_type}): {replayed:?}"
+            );
+            assert_eq!(replayed[0].role, "user", "({launch_type})");
+            assert!(
+                format!("{:?}", replayed[0].content).contains(THE_TASK),
+                "a rebuilt conversation must still state the task ({launch_type}): {replayed:?}"
+            );
+            assert_eq!(replayed[1].role, "assistant", "({launch_type})");
+        }
     }
 }

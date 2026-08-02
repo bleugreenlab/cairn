@@ -26,10 +26,21 @@ pub(crate) fn default_callback_url() -> String {
     format!("http://127.0.0.1:{}/api/mcp", port)
 }
 
-/// Callback URL for CLI use: explicit env var (set by the runner for in-run
-/// invocations), else the runner transport port.
+/// Callback URL for CLI use: explicit env var (set by the runner or a remote
+/// executor relay for in-run invocations), else the local runner transport port.
 fn cli_callback_url() -> String {
-    env::var("CAIRN_CALLBACK_URL").unwrap_or_else(|_| default_callback_url())
+    select_callback_url(env::var("CAIRN_CALLBACK_URL").ok())
+}
+
+fn select_callback_url(explicit: Option<String>) -> String {
+    explicit.unwrap_or_else(default_callback_url)
+}
+
+fn select_mcp_secret(
+    explicit: Option<String>,
+    load_local: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    explicit.or_else(load_local)
 }
 
 /// Build a thin `CairnCmd` client from the environment for CLI forwarding.
@@ -38,9 +49,10 @@ fn build_cli_client(callback_url: String) -> CairnCmd {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let run_id = env::var("CAIRN_RUN_ID").ok();
-    let mcp_secret = env::var("CAIRN_MCP_SECRET")
-        .ok()
-        .or_else(cairn_common::auth::load_local_mcp_token);
+    let mcp_secret = select_mcp_secret(
+        env::var("CAIRN_MCP_SECRET").ok(),
+        cairn_common::auth::load_local_mcp_token,
+    );
     let home_uri = env::var("CAIRN_HOME_URI")
         .ok()
         .filter(|uri| parse_cairn_uri(uri).is_some());
@@ -291,6 +303,17 @@ fn check_run_request(client: &CairnCmd, suite: String, branch: Option<String>) -
     }
 }
 
+/// What the runner left out of a check result, as something the caller can act on.
+fn incomplete_check_result(field: &str) -> String {
+    format!("Cairn's runner left {field} out of its check result. Run the command again.")
+}
+
+/// Render one manual configured-check reply.
+///
+/// Three different things come back here and each has to read as itself: a
+/// verdict about the tree, a run that produced NO verdict because Cairn's own
+/// machinery failed, and a verdict Cairn holds but will not reuse. Returns the
+/// text to print and whether the command succeeded.
 fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     let envelope: serde_json::Value = serde_json::from_str(raw)
         .map_err(|_| format!("invalid response from runner: {}", raw.trim_end()))?;
@@ -307,31 +330,81 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     }
     let result = envelope
         .get("result")
-        .ok_or_else(|| "runner response omitted the configured check result".to_string())?;
+        .ok_or_else(|| incomplete_check_result("the check result"))?;
     let suite = result
         .get("checkName")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "runner response omitted checkName".to_string())?;
-    let disposition = result
-        .get("disposition")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "runner response omitted disposition".to_string())?;
-    let passed = result
-        .get("passed")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| "runner response omitted passed".to_string())?;
+        .ok_or_else(|| incomplete_check_result("the check name"))?;
     let commit = result
         .get("commitSha")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "runner response omitted commitSha".to_string())?;
-    let source = result
-        .get("sourceObservationId")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "runner response omitted sourceObservationId".to_string())?;
+        .ok_or_else(|| incomplete_check_result("the commit"))?;
     let short_commit = commit.get(..12).unwrap_or(commit);
+
+    // A run that produced no verdict is a fact about Cairn, never a red against
+    // the tree, so it renders from its own named cause instead of a ✗ line.
+    if let Some(no_verdict) = result.get("noVerdict").filter(|value| !value.is_null()) {
+        let cause = no_verdict
+            .get("cause")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Cairn recorded no cause for this failure.");
+        let headline = match no_verdict.get("kind").and_then(serde_json::Value::as_str) {
+            Some("suppressed") => {
+                let after = no_verdict
+                    .get("afterFailures")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default();
+                format!(
+                    "⚠ Cairn did not run {suite} at {short_commit}. Cairn stops a check after \
+                     {after} infrastructure failures in a row. Ask an operator to read the cause \
+                     below."
+                )
+            }
+            _ => format!(
+                "⚠ Cairn ran {suite} at {short_commit} and got no verdict. Cairn's own machinery \
+                 failed, so this says nothing about your change. Run the command again."
+            ),
+        };
+        return Ok((format!("{headline}\n{cause}"), false));
+    }
+
+    let disposition = result
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| incomplete_check_result("the disposition"))?;
+    let passed = result
+        .get("passed")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| incomplete_check_result("the verdict"))?;
+    let observation = match result
+        .get("observationId")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(id) => format!("observation {id}"),
+        None => "Cairn recorded no observation for this run".to_string(),
+    };
+    // Only a green is worth annotating: a red is never reusable evidence, and
+    // saying so on every red would bury the one case that surprises a reader — a
+    // pass another machine produced, which Cairn keeps but will not reuse.
+    let reuse = match (
+        passed,
+        result
+            .get("reusable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        result
+            .get("environmentFingerprint")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .is_empty(),
+    ) {
+        (true, false, true) => " · another machine ran this, so Cairn will not reuse the verdict",
+        (true, false, false) => " · Cairn will not reuse this verdict",
+        _ => "",
+    };
     Ok((
         format!(
-            "{} {suite} ({disposition}, {short_commit}) · source observation {source}",
+            "{} {suite} ({disposition}, {short_commit}) · {observation}{reuse}",
             if passed { "✓" } else { "✗" }
         ),
         passed,
@@ -410,6 +483,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_relay_callback_and_capability_win_unchanged() {
+        let callback = "http://127.0.0.1:49152/api/mcp".to_string();
+        let capability = "batch-callback-capability".to_string();
+
+        assert_eq!(select_callback_url(Some(callback.clone())), callback);
+        assert_eq!(
+            select_mcp_secret(Some(capability.clone()), || {
+                panic!("an explicit batch capability must not read the local runner secret")
+            }),
+            Some(capability)
+        );
+    }
+
+    #[test]
+    fn unconfigured_shell_retains_local_runner_fallbacks() {
+        assert_eq!(select_callback_url(None), default_callback_url());
+        assert_eq!(
+            select_mcp_secret(None, || Some("local-runner-secret".into())),
+            Some("local-runner-secret".into())
+        );
+    }
+
+    #[test]
     fn fold_cli_scope_folds_single_target() {
         let paths = fold_cli_scope(&["file:x.rs".to_string()], Some(10), Some(20)).unwrap();
         assert_eq!(paths, vec!["file:x.rs?offset=10&limit=20".to_string()]);
@@ -455,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn check_run_response_renders_hit_and_source_observation() {
+    fn check_run_response_renders_hit_and_its_observation() {
         let rendered = render_check_run_response(
             &serde_json::json!({
                 "ok": true,
@@ -464,7 +560,9 @@ mod tests {
                     "commitSha": "1234567890abcdef",
                     "disposition": "cached",
                     "passed": true,
-                    "sourceObservationId": "obs-source"
+                    "reusable": true,
+                    "environmentFingerprint": "env-local",
+                    "observationId": "obs-source"
                 }
             })
             .to_string(),
@@ -473,7 +571,7 @@ mod tests {
         assert_eq!(
             rendered,
             (
-                "✓ rust-tests (cached, 1234567890ab) · source observation obs-source".to_string(),
+                "✓ rust-tests (cached, 1234567890ab) · observation obs-source".to_string(),
                 true,
             )
         );
@@ -489,16 +587,144 @@ mod tests {
                     "commitSha": "1234567890abcdef",
                     "disposition": "fresh",
                     "passed": false,
-                    "sourceObservationId": "obs-failed"
+                    "reusable": false,
+                    "environmentFingerprint": "env-local",
+                    "observationId": "obs-failed"
                 }
             })
             .to_string(),
         )
         .unwrap();
-        assert!(summary.starts_with("✗ rust-tests"));
+        assert_eq!(
+            summary,
+            "✗ rust-tests (fresh, 1234567890ab) · observation obs-failed"
+        );
         assert!(
             !passed,
             "a rendered red verdict must produce a nonzero CLI exit"
+        );
+    }
+
+    /// The specimen this rendering exists for: a check that ran on another
+    /// machine. Its verdict comes back like any other, keyed by an empty
+    /// environment fingerprint, and the reply says plainly that Cairn will not
+    /// reuse it.
+    #[test]
+    fn check_run_response_returns_a_remotely_executed_verdict() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": true,
+                    "reusable": false,
+                    "environmentFingerprint": "",
+                    "observationId": "obs-remote"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(passed, "a remote green is still a green");
+        assert!(summary.starts_with("✓ rust-tests (fresh, 1234567890ab) · observation obs-remote"));
+        assert!(
+            summary.contains("another machine ran this"),
+            "an unreusable green must say why: {summary}"
+        );
+    }
+
+    #[test]
+    fn check_run_response_names_the_substrate_cause_of_a_no_verdict_run() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": false,
+                    "reusable": false,
+                    "environmentFingerprint": "",
+                    "observationId": "obs-infra",
+                    "noVerdict": {
+                        "kind": "infrastructure",
+                        "afterFailures": null,
+                        "cause": "Cairn could not reach the machine that was running this check."
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!passed);
+        assert!(
+            summary.contains("got no verdict") && summary.contains("Run the command again"),
+            "an infrastructure failure must render as itself: {summary}"
+        );
+        assert!(
+            summary.contains("could not reach the machine"),
+            "the named substrate cause must survive to the reader: {summary}"
+        );
+        assert!(
+            !summary.contains('✗'),
+            "a run with no verdict must not render as a red against the tree: {summary}"
+        );
+    }
+
+    #[test]
+    fn check_run_response_reports_a_suppressed_check_as_not_run() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": false,
+                    "reusable": false,
+                    "environmentFingerprint": "",
+                    "observationId": null,
+                    "noVerdict": {
+                        "kind": "suppressed",
+                        "afterFailures": 3,
+                        "cause": "the last failure was a spawn error"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!passed);
+        assert!(
+            summary.contains("did not run rust-tests") && summary.contains("3 infrastructure"),
+            "a suppressed check must say Cairn declined to run it: {summary}"
+        );
+    }
+
+    #[test]
+    fn check_run_response_states_when_no_observation_was_recorded() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": true,
+                    "reusable": false,
+                    "environmentFingerprint": "",
+                    "observationId": null
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(passed, "an unrecorded verdict is still the verdict");
+        assert!(
+            summary.contains("recorded no observation"),
+            "an unrecorded run must say so instead of failing: {summary}"
         );
     }
 

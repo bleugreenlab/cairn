@@ -27,7 +27,7 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "wakes append requires payload"))?;
-            let job_id = crate::resources::node::resolve_todos_job_id(
+            let job_id = crate::resources::node::resolve_node_or_task_job_id(
                 &orch.db.local,
                 project,
                 *number,
@@ -46,6 +46,12 @@ pub(super) async fn dispatch(
                 let filter = parse_wake_filter(index, item, value, "subscribe")?;
                 if filter.kind == "terminal" {
                     subscribe_terminal_wake(
+                        orch, index, item, &job_id, &filter, created_by, dry_run, project, *number,
+                        *exec_seq, node_id,
+                    )
+                    .await?
+                } else if filter.kind == "checks" {
+                    subscribe_checks_wake(
                         orch, index, item, &job_id, &filter, created_by, dry_run, project, *number,
                         *exec_seq, node_id,
                     )
@@ -124,7 +130,7 @@ pub(super) async fn dispatch(
                 .get("unmute")
                 .ok_or_else(|| build_failure(index, item, "payload.unmute is required"))?;
             let filter = parse_wake_filter(index, item, value, "unmute")?;
-            let job_id = crate::resources::node::resolve_todos_job_id(
+            let job_id = crate::resources::node::resolve_node_or_task_job_id(
                 &orch.db.local,
                 project,
                 *number,
@@ -170,7 +176,7 @@ pub(super) async fn dispatch(
             } else {
                 "user"
             };
-            let job_id = crate::resources::node::resolve_todos_job_id(
+            let job_id = crate::resources::node::resolve_node_or_task_job_id(
                 &orch.db.local,
                 project,
                 *number,
@@ -212,6 +218,10 @@ pub(super) struct WakeFilterPayload {
     pub(super) on: Option<String>,
     /// Terminal `on:"output"` subscriptions only: the literal phrase to watch for.
     pub(super) phrase: Option<String>,
+    /// Only ever set to be REFUSED: a checks wake watches a whole node, and
+    /// accepting a suite silently would subscribe to something other than what
+    /// was asked for.
+    pub(super) suite: Option<String>,
 }
 
 pub(super) fn parse_wake_filter(
@@ -277,12 +287,17 @@ pub(super) fn parse_wake_filter(
         .get("phrase")
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
+    let suite = obj
+        .get("suite")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
     Ok(WakeFilterPayload {
         kind,
         reference,
         fact_kinds,
         on,
         phrase,
+        suite,
     })
 }
 
@@ -293,6 +308,76 @@ pub(super) fn terminal_slug_from_ref(reference: &str) -> &str {
     match trimmed.rfind("terminal/") {
         Some(pos) => &trimmed[pos + "terminal/".len()..],
         None => trimmed,
+    }
+}
+
+/// Subscribe an agent-facing `kind:"checks"` wake: resume this node when the
+/// referenced node's project check lanes stop moving.
+///
+/// The elective, turn-boundary half of `run.waitFor {kind:"checks"}`. It is the
+/// only one of the two that can watch the subscriber's OWN node, and that is the
+/// point: a node's turn-end wave is armed by its turn ENDING, so "wake me when
+/// my own lanes settle" is expressible here and structurally impossible as an
+/// inline wait.
+#[allow(clippy::too_many_arguments)]
+async fn subscribe_checks_wake(
+    orch: &Orchestrator,
+    index: usize,
+    item: &ChangeItem,
+    job_id: &str,
+    filter: &WakeFilterPayload,
+    created_by: &str,
+    dry_run: bool,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+) -> ResourceMutationResult<String> {
+    if filter.suite.is_some() {
+        return Err(build_failure(
+            index,
+            item,
+            "a checks wake watches a whole node and does not accept suite; \
+             for one suite use run({commands:[{waitFor:{kind:\"checks\",ref:\"…/checks\",on:\"verdict\",suite:\"…\"}}]})",
+        ));
+    }
+    // An omitted ref means this node's own lanes, which is the commonest form of
+    // this subscription and reads better than making every caller spell out its
+    // own URI.
+    let home = cairn_common::uri::build_node_uri(project, number, exec_seq, node_id);
+    let reference = filter.reference.as_deref().unwrap_or("cairn:~/checks");
+    let target =
+        crate::execution::checks_settlement::resolve_checks_target(orch, reference, Some(&home))
+            .await
+            .map_err(|error| build_failure(index, item, error))?;
+
+    if dry_run {
+        return Ok(format!("Would subscribe checks wake: {}", target.uri));
+    }
+    use crate::orchestrator::wakes::ChecksSubscribeOutcome;
+    match crate::orchestrator::wakes::subscribe_checks_settled_once(
+        orch,
+        job_id,
+        &target.job_id,
+        &target.label,
+        &target.uri,
+        created_by,
+    )
+    .await
+    .map_err(|error| build_failure(index, item, error))?
+    {
+        ChecksSubscribeOutcome::AlreadySettled => Ok(format!(
+            "Checks on '{}' have already settled; resume queued for turn end ({})",
+            target.label, target.uri
+        )),
+        ChecksSubscribeOutcome::ConfirmingVerdictless => Ok(format!(
+            "Subscribed to '{}' checks settling. Its lanes currently hold no verdicts, which also describes the moment before a wave starts, so that is being confirmed before you are woken — end your turn either way ({})",
+            target.label, target.uri
+        )),
+        ChecksSubscribeOutcome::Subscribed => Ok(format!(
+            "Subscribed to '{}' checks settling; end your turn to resume when its lanes stop moving ({})",
+            target.label, target.uri
+        )),
     }
 }
 

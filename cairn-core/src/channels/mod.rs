@@ -99,7 +99,10 @@ async fn spawn_imessage(
     let executor: Arc<dyn imessage::IMessageExecutor> =
         match crate::fleet::service_placement::acquire_service_lease(
             &orch,
-            "channel-imessage",
+            crate::fleet::service_placement::ServiceIdentity {
+                id: "channel-imessage",
+                label: "iMessage channel",
+            },
             name,
             ResidencyFootprint {
                 memory_bytes: 64 * 1024 * 1024,

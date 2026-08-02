@@ -102,6 +102,7 @@ mod tests {
                 projects_served: vec!["p".into()],
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
+                toolchain_detection: None,
             },
             current_load: 1,
             warm_roots: vec![cairn_common::executor_protocol::VerifiedWarmRoot {

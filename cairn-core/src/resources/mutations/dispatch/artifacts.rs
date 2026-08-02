@@ -58,7 +58,7 @@ pub(super) async fn dispatch(
                         "payload.action must be a string (merge|close|refresh)",
                     )
                 })?;
-                let job_id = crate::resources::resolve_todos_job_id(
+                let job_id = crate::resources::resolve_node_or_task_job_id(
                     &orch.db.local,
                     project,
                     *number,
@@ -152,7 +152,7 @@ pub(super) async fn dispatch(
                 if dry_run {
                     format!("Would confirm artifact {node_id}/{artifact_label}")
                 } else {
-                    let job_id = crate::resources::resolve_todos_job_id(
+                    let job_id = crate::resources::resolve_node_or_task_job_id(
                         &orch.db.local,
                         project,
                         *number,

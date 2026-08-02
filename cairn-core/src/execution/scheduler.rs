@@ -466,11 +466,10 @@ async fn fire_scheduled_recipe(
         Err(e) => return Err(format!("failed to reload recipe '{}': {e}", recipe.id)),
     }
 
-    // Human-readable fire-time label in the OS-local timezone.
-    let stamp = Utc::now()
-        .with_timezone(&get_timezone())
-        .format("%Y-%m-%d %H:%M")
-        .to_string();
+    // Human-readable fire time on the host clock, named so the issue title reads
+    // the same way every other Cairn timestamp does.
+    let now = Utc::now().timestamp();
+    let stamp = crate::clock::stamp(now).unwrap_or_else(|| now.to_string());
     let title = format!("{} — {}", recipe.name, stamp);
     let description = format!(
         "Scheduled run of recipe '{}' ({}).",

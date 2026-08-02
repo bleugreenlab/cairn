@@ -678,9 +678,16 @@ fn rebase_sibling(
     store: &Path,
     branch: &str,
     integration_branch: &str,
+    resolution_paths: &[String],
     report: &mut ReconcileReport,
 ) -> bool {
-    match rebase_branch_onto(jj, store, branch, integration_branch) {
+    match rebase_branch_onto_with_resolution(
+        jj,
+        store,
+        branch,
+        integration_branch,
+        resolution_paths,
+    ) {
         Ok(RebaseOutcome::Rebased) => true,
         Ok(RebaseOutcome::RebasedOverConflictedAncestry { paths }) => {
             log::info!(
@@ -714,7 +721,7 @@ pub fn reconcile_siblings(
     integration_branch: &str,
     siblings: &[String],
 ) -> Result<ReconcileReport, String> {
-    reconcile_siblings_with_publication(jj, store, integration_branch, siblings, true)
+    reconcile_siblings_with_publication(jj, store, integration_branch, siblings, true, None)
 }
 
 pub(crate) fn reconcile_siblings_without_publication(
@@ -723,7 +730,25 @@ pub(crate) fn reconcile_siblings_without_publication(
     integration_branch: &str,
     siblings: &[String],
 ) -> Result<ReconcileReport, String> {
-    reconcile_siblings_with_publication(jj, store, integration_branch, siblings, false)
+    reconcile_siblings_with_publication(jj, store, integration_branch, siblings, false, None)
+}
+
+pub(crate) fn reconcile_resolved_sibling_without_publication(
+    jj: &JjEnv,
+    store: &Path,
+    integration_branch: &str,
+    sibling: &str,
+    resolution_paths: &[String],
+) -> Result<ReconcileReport, String> {
+    let siblings = vec![sibling.to_string()];
+    reconcile_siblings_with_publication(
+        jj,
+        store,
+        integration_branch,
+        &siblings,
+        false,
+        Some((sibling, resolution_paths)),
+    )
 }
 
 fn reconcile_siblings_with_publication(
@@ -732,6 +757,7 @@ fn reconcile_siblings_with_publication(
     integration_branch: &str,
     siblings: &[String],
     publish: bool,
+    resolution: Option<(&str, &[String])>,
 ) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
     // Resolve the rebase dest to a concrete commit id ONCE up front: it may be a
@@ -796,10 +822,30 @@ fn reconcile_siblings_with_publication(
                     }
                     push_clean = false;
                     trivial_fast_forward = true;
-                } else if !rebase_sibling(jj, store, branch, integration_branch, &mut report) {
+                } else if !rebase_sibling(
+                    jj,
+                    store,
+                    branch,
+                    integration_branch,
+                    resolution
+                        .filter(|(resolved, _)| *resolved == branch)
+                        .map(|(_, paths)| paths)
+                        .unwrap_or(&[]),
+                    &mut report,
+                ) {
                     continue;
                 }
-            } else if !rebase_sibling(jj, store, branch, integration_branch, &mut report) {
+            } else if !rebase_sibling(
+                jj,
+                store,
+                branch,
+                integration_branch,
+                resolution
+                    .filter(|(resolved, _)| *resolved == branch)
+                    .map(|(_, paths)| paths)
+                    .unwrap_or(&[]),
+                &mut report,
+            ) {
                 continue;
             }
         }

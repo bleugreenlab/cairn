@@ -425,6 +425,18 @@ fn format_single_event(
             output.push_str(crate::transcripts::CONTINUATION_MARKER_LINE);
             output.push_str("\n\n");
         }
+        crate::transcripts::LAUNCH_EVENT_TYPE => {
+            // Addressing one event by id is a deliberate request for that exact
+            // event, so this projection keeps the body and corrects only the
+            // speaker (CAIRN-3408).
+            if let Some(content) = event_data.get("content").and_then(|c| c.as_str()) {
+                if !content.is_empty() {
+                    output.push_str(crate::transcripts::LAUNCH_LABEL);
+                    output.push_str(content);
+                    output.push_str("\n\n");
+                }
+            }
+        }
         "result" | "tool_result" => {
             if let Some(result) = event_data.get("toolResult") {
                 let tool_name = event_data
@@ -1524,8 +1536,12 @@ pub(super) fn format_transcript_digest_with(
         }
         seen.len()
     };
-    let date = chrono::DateTime::from_timestamp(events[0].created_at, 0)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
+    // The heading's date doubles as the seed for the per-turn rollover below, so
+    // a turn on a different local day than this heading states its own date
+    // rather than silently inheriting one that no longer applies.
+    let heading_date = crate::clock::host().local_date(events[0].created_at);
+    let date = heading_date
+        .map(|date| date.format("%Y-%m-%d").to_string())
         .unwrap_or_default();
 
     let mut out = format!(
@@ -1561,17 +1577,30 @@ pub(super) fn format_transcript_digest_with(
         .map(|limit| (start + limit).min(order.len()))
         .unwrap_or(order.len());
     let order = &order[start..end];
+    // Tracks the local day of the previously RENDERED turn, which is why it is
+    // seeded from the heading and why it works under `latest` ordering too: the
+    // rule is "differs from the stamp before it", not "is later than".
+    let mut previous_local_date = heading_date;
     for &block_index in order {
         let block = &blocks[block_index];
         let (turn_label, linkable) = match block.turn_id.and_then(|id| turn_sequences.get(id)) {
             Some(seq) => (seq.to_string(), true),
             None => ((block_index + 1).to_string(), false),
         };
-        let time = chrono::DateTime::from_timestamp(
+        // A turn header names its clock, because it is the stamp most often
+        // compared against a resume marker or an app log. It carries only the
+        // time while the digest stays on one local day, and states the date on
+        // the first turn after the day turns over — a digest that runs past local
+        // midnight would otherwise leave those turns leaning on a heading date
+        // that no longer applies to them.
+        let time = crate::clock::turn_stamp(
             block.events.first().map(|e| e.created_at).unwrap_or(0),
-            0,
+            previous_local_date,
         )
-        .map(|dt| dt.format("%H:%M").to_string())
+        .map(|(stamp, date)| {
+            previous_local_date = Some(date);
+            stamp
+        })
         .unwrap_or_default();
         out.push_str(&format!("\n## Turn {} · {}\n", turn_label, time));
         let turn_ref = linkable.then_some(turn_label.as_str());
@@ -1684,9 +1713,42 @@ fn render_block(
                 out.push_str(crate::transcripts::CONTINUATION_MARKER_LINE);
                 out.push('\n');
             }
+            crate::transcripts::LAUNCH_EVENT_TYPE => {
+                // The prompt the job was launched on (CAIRN-3408). Unlike a seed,
+                // its body is not recursive, so the fidelity knob decides:
+                //
+                // Default (the skim digest) collapses it. This is the projection
+                // a watching parent receives inlined in its catch-up ride-along,
+                // and turn 1 there is the issue description that same parent
+                // wrote when it filed the child — its own words quoted back at
+                // it, once per turn, forever under a long-lived thread.
+                //
+                // `messages=full` expands it verbatim, which is what a session
+                // rebuilt from a reseed or thread-compaction digest reads to
+                // recover the task it was given.
+                match content_of(&data) {
+                    content if opts.unabridged && !content.is_empty() => {
+                        push_verbatim(out, crate::transcripts::LAUNCH_LABEL, content)
+                    }
+                    // The launch turn happened either way, so the marker stands
+                    // even for an empty prompt — a silently absent turn would
+                    // misreport the transcript's shape.
+                    _ => {
+                        out.push_str(crate::transcripts::LAUNCH_MARKER_LINE);
+                        out.push('\n');
+                    }
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// The `content` string of a user-slot event payload, or empty when absent.
+fn content_of(data: &serde_json::Value) -> &str {
+    data.get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
 }
 
 /// Render a message verbatim (opt-in `messages=full`): on reseed, misremembering
@@ -2218,6 +2280,178 @@ mod tests {
         assert!(out.contains("· read jobs.rs ?grep=foo -C=30 [2 matches]"));
     }
 
+    /// CAIRN-3428: a turn header used to render a bare UTC `HH:MM` while resume
+    /// markers a few lines away rendered host-local, neither saying which — so an
+    /// agent read the wrong hour off its own transcript. The header now carries
+    /// the clock it was rendered on, and the digest's date is that same clock's
+    /// calendar day rather than UTC's.
+    #[test]
+    fn digest_header_and_turn_headers_name_their_clock() {
+        let events = vec![digest_ev(
+            0,
+            "t1",
+            "assistant",
+            serde_json::json!({ "content": "working" }),
+        )];
+        let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
+        let out = format_transcript_digest(
+            &events,
+            "cairn://p/CAIRN/1666/1/builder/chat",
+            &digest_meta(),
+            &turns,
+            false,
+            None,
+            None,
+        );
+
+        let header = out
+            .lines()
+            .find(|line| line.starts_with("## Turn 1 · "))
+            .expect("the digest renders a turn header");
+        let rendered = header.trim_start_matches("## Turn 1 · ");
+        let (hhmm, zone) = rendered
+            .split_once(' ')
+            .expect("a turn header time is followed by the clock it is on");
+        assert_eq!(
+            hhmm.len(),
+            5,
+            "turn header time reads HH:MM, got {rendered}"
+        );
+        assert!(hhmm.contains(':'));
+        assert!(!zone.is_empty(), "the zone label is never blank");
+
+        let expected_date = crate::clock::date(events[0].created_at).unwrap();
+        assert!(
+            out.lines().next().unwrap().ends_with(&expected_date),
+            "the digest dates itself on the same clock its turn headers use"
+        );
+    }
+
+    fn digest_ev_at(seq: i32, turn: &str, created_at: i64) -> EventRow {
+        let mut event = digest_ev(
+            seq,
+            turn,
+            "assistant",
+            serde_json::json!({ "content": "working" }),
+        );
+        event.created_at = created_at;
+        event
+    }
+
+    /// A digest can span local midnight. When it does, a bare `HH:MM` on a turn
+    /// past the boundary is not an absolute time: the reader attaches it to the
+    /// date in the heading, which by then is the wrong day. The first turn on
+    /// each new local day states that day.
+    ///
+    /// The events are placed relative to a real local midnight on whatever host
+    /// runs this, so the assertion holds in any zone rather than only in the one
+    /// the author happened to be sitting in.
+    #[test]
+    fn digest_turn_headers_state_the_date_when_the_local_day_turns_over() {
+        let clock = crate::clock::host();
+        let anchor = 1_700_000_000;
+        let day = clock.local_date(anchor).unwrap();
+        let midnight = (1..=48 * 60)
+            .map(|minutes| anchor + minutes * 60)
+            .find(|at| clock.local_date(*at) != Some(day))
+            .expect("a local day boundary lies within 48h of any instant");
+
+        let events = vec![
+            digest_ev_at(0, "t1", midnight - 20 * 60),
+            digest_ev_at(1, "t2", midnight + 15 * 60),
+            digest_ev_at(2, "t3", midnight + 30 * 60),
+        ];
+        let turns = std::collections::HashMap::from([
+            ("t1".to_string(), 1i32),
+            ("t2".to_string(), 2i32),
+            ("t3".to_string(), 3i32),
+        ]);
+        let out = format_transcript_digest(
+            &events,
+            "cairn://p/CAIRN/1666/1/builder/chat",
+            &digest_meta(),
+            &turns,
+            false,
+            None,
+            None,
+        );
+
+        let stamp = |turn: &str| {
+            out.lines()
+                .find(|line| line.starts_with(&format!("## Turn {turn} · ")))
+                .unwrap_or_else(|| panic!("the digest renders turn {turn}"))
+                .trim_start_matches(&format!("## Turn {turn} · "))
+                .to_string()
+        };
+
+        let first_day = clock.date(midnight - 20 * 60).unwrap();
+        let second_day = clock.date(midnight + 15 * 60).unwrap();
+        assert_ne!(
+            first_day, second_day,
+            "the fixture straddles local midnight"
+        );
+
+        assert!(
+            out.lines().next().unwrap().ends_with(&first_day),
+            "the heading dates itself on the first event's local day"
+        );
+        assert!(
+            !stamp("1").starts_with(&first_day),
+            "a turn on the heading's own day does not repeat it, got {}",
+            stamp("1")
+        );
+        assert!(
+            stamp("2").starts_with(&second_day),
+            "the first turn past local midnight states its own day, got {}",
+            stamp("2")
+        );
+        assert!(
+            !stamp("3").starts_with(&second_day),
+            "only the turn that crosses restates the day, got {}",
+            stamp("3")
+        );
+    }
+
+    /// Latest-first reverses the rendered order, so the boundary falls on a
+    /// different turn — the one that steps back into the earlier day.
+    #[test]
+    fn a_latest_first_digest_marks_the_boundary_where_it_renders_it() {
+        let clock = crate::clock::host();
+        let anchor = 1_700_000_000;
+        let day = clock.local_date(anchor).unwrap();
+        let midnight = (1..=48 * 60)
+            .map(|minutes| anchor + minutes * 60)
+            .find(|at| clock.local_date(*at) != Some(day))
+            .expect("a local day boundary lies within 48h of any instant");
+
+        let events = vec![
+            digest_ev_at(0, "t1", midnight - 20 * 60),
+            digest_ev_at(1, "t2", midnight + 15 * 60),
+        ];
+        let turns =
+            std::collections::HashMap::from([("t1".to_string(), 1i32), ("t2".to_string(), 2i32)]);
+        let out = format_transcript_digest(
+            &events,
+            "cairn://p/CAIRN/1666/1/builder/chat",
+            &digest_meta(),
+            &turns,
+            true,
+            None,
+            None,
+        );
+
+        let earlier_day = clock.date(midnight - 20 * 60).unwrap();
+        let turn_one = out
+            .lines()
+            .find(|line| line.starts_with("## Turn 1 · "))
+            .unwrap()
+            .trim_start_matches("## Turn 1 · ");
+        assert!(
+            turn_one.starts_with(&earlier_day),
+            "rendered after the newer turn, turn 1 steps back a day and says so, got {turn_one}"
+        );
+    }
+
     #[test]
     fn digest_write_rows_show_diffstat_and_commit() {
         let events = vec![
@@ -2383,6 +2617,94 @@ mod tests {
                 "Cairn's own wake text is not conversation (unabridged={unabridged}): {out}"
             );
         }
+    }
+
+    #[test]
+    fn digest_collapses_the_launch_prompt_but_keeps_the_operator_message() {
+        // The CAIRN-3408 specimen, in the shape the live DB holds it: turn 1 is
+        // the child's launch prompt (the issue description the PARENT wrote when
+        // it filed the child) and a later turn carries the one message an
+        // operator actually typed. The default digest is what a watching parent
+        // receives inlined in its catch-up ride-along, so the launch body must
+        // collapse — quoting a parent's own words back at it, once per turn, is
+        // the whole defect — while the operator's message survives untouched.
+        let authored_by_the_parent =
+            "# Catch-up ride-along echoes the recipient's own authored launch prompt";
+        let typed_by_the_operator = "u dont need to cd prefix";
+        let events = vec![
+            digest_ev(
+                0,
+                "t1",
+                crate::transcripts::LAUNCH_EVENT_TYPE,
+                serde_json::json!({ "content": authored_by_the_parent }),
+            ),
+            digest_ev(
+                1,
+                "t2",
+                "user",
+                serde_json::json!({ "content": typed_by_the_operator }),
+            ),
+        ];
+        let turns =
+            std::collections::HashMap::from([("t1".to_string(), 1i32), ("t2".to_string(), 2i32)]);
+
+        let ride_along = format_transcript_digest_with(
+            &events,
+            "cairn://p/CAIRN/3405/1/builder/chat",
+            &digest_meta(),
+            &turns,
+            &DigestOptions {
+                latest: false,
+                turn_offset: Some(0),
+                turn_limit: None,
+                unabridged: false,
+                inline_diffs: false,
+            },
+        );
+        assert!(
+            ride_along.contains(crate::transcripts::LAUNCH_MARKER_LINE),
+            "launch marker missing: {ride_along}"
+        );
+        assert!(
+            !ride_along.contains(authored_by_the_parent),
+            "the recipient's own launch prompt must not ride along: {ride_along}"
+        );
+        assert!(
+            ride_along.contains(typed_by_the_operator),
+            "the genuine operator message must survive: {ride_along}"
+        );
+        assert!(
+            !ride_along.contains(&format!("**User:** {authored_by_the_parent}")),
+            "a launch prompt must never wear the user label: {ride_along}"
+        );
+
+        // `messages=full` is what a reseed or thread-compaction digest reads, and
+        // a session rebuilt from one needs the task it was given. There the body
+        // returns — under an honest speaker, never as **User:**.
+        let reseed = format_transcript_digest_with(
+            &events,
+            "cairn://p/CAIRN/3405/1/builder/chat",
+            &digest_meta(),
+            &turns,
+            &DigestOptions {
+                latest: false,
+                turn_offset: None,
+                turn_limit: None,
+                unabridged: true,
+                inline_diffs: false,
+            },
+        );
+        assert!(
+            reseed.contains(&format!(
+                "{}{authored_by_the_parent}",
+                crate::transcripts::LAUNCH_LABEL
+            )),
+            "a rebuilt session must keep its task statement: {reseed}"
+        );
+        assert!(
+            !reseed.contains(&format!("**User:** {authored_by_the_parent}")),
+            "a launch prompt must never wear the user label: {reseed}"
+        );
     }
 
     #[test]

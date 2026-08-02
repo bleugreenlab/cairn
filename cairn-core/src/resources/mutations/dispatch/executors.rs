@@ -194,12 +194,20 @@ pub(super) async fn dispatch(
                     )
                 }
             } else {
-                management::remove(orch, name)
+                let result = management::remove(orch, name)
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
-                format!(
-                    "Removed {name}: supervision stopped, remote cleaned up, enrollment revoked, configuration removed"
-                )
+                match result.unverified_remote_cleanup {
+                    None => format!(
+                        "Removed {name}: supervision stopped, remote cleaned up, enrollment revoked, configuration removed"
+                    ),
+                    // Removal completed without the machine, so the summary says
+                    // which half happened rather than claiming a teardown that
+                    // never reached the host.
+                    Some(reason) => format!(
+                        "Removed {name}: supervision stopped, enrollment revoked, configuration removed. Its host could not be reached ({reason}), so no remote cleanup ran there; the revoked enrollment means anything still running on it cannot reattach."
+                    ),
+                }
             }
         }
         (CairnResource::Executors, _) | (CairnResource::Executor { .. }, _) => return Ok(None),

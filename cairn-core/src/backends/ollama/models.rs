@@ -3,6 +3,7 @@ use crate::identity::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::time::Duration;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Deserialize)]
@@ -90,20 +91,30 @@ fn discover_hosts_with_errors(
     let error = (!errors.is_empty()).then(|| errors.join("; "));
     (merge_hosts(ok), error)
 }
+fn error_with_causes(context: &str, error: &dyn Error) -> String {
+    let mut message = format!("{context}: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    message
+}
+
 fn discover_host(account_id: &str, label: &str, base_url: &str) -> Result<HostModels, String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(DISCOVERY_TIMEOUT)
         .timeout(DISCOVERY_TIMEOUT)
         .build()
-        .map_err(|e| format!("client failed: {e}"))?;
+        .map_err(|e| error_with_causes("client failed", &e))?;
     let response = client
         .get(format!("{}/api/tags", base_url.trim_end_matches('/')))
         .send()
-        .map_err(|e| format!("tags request failed: {e}"))?;
+        .map_err(|e| error_with_causes("tags request failed", &e))?;
     let status = response.status();
     let body = response
         .text()
-        .map_err(|e| format!("tags body failed: {e}"))?;
+        .map_err(|e| error_with_causes("tags body failed", &e))?;
     if !status.is_success() {
         return Err(format!("tags returned HTTP {}: {}", status.as_u16(), body));
     }
@@ -115,11 +126,11 @@ fn discover_host(account_id: &str, label: &str, base_url: &str) -> Result<HostMo
             .post(format!("{}/api/show", base_url.trim_end_matches('/')))
             .json(&serde_json::json!({"model":tag.name}))
             .send()
-            .map_err(|e| format!("show {} failed: {e}", tag.name))?;
+            .map_err(|e| error_with_causes(&format!("show {} failed", tag.name), &e))?;
         let status = response.status();
         let body = response
             .text()
-            .map_err(|e| format!("show {} body failed: {e}", tag.name))?;
+            .map_err(|e| error_with_causes(&format!("show {} body failed", tag.name), &e))?;
         if !status.is_success() {
             return Err(format!(
                 "show {} returned HTTP {}: {}",
@@ -216,6 +227,43 @@ mod tests {
         assert_eq!(q.canonical_slug.as_deref(), Some("a,b"));
         assert!(q.supported_parameters.is_empty());
     }
+    #[derive(Debug)]
+    struct TestError {
+        message: &'static str,
+        source: Option<Box<TestError>>,
+    }
+
+    impl std::fmt::Display for TestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl Error for TestError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.source.as_deref().map(|error| error as &dyn Error)
+        }
+    }
+
+    #[test]
+    fn network_errors_include_the_underlying_cause() {
+        let error = TestError {
+            message: "error sending request",
+            source: Some(Box::new(TestError {
+                message: "tcp connect error",
+                source: Some(Box::new(TestError {
+                    message: "Connection refused",
+                    source: None,
+                })),
+            })),
+        };
+
+        assert_eq!(
+            error_with_causes("tags request failed", &error),
+            "tags request failed: error sending request: tcp connect error: Connection refused"
+        );
+    }
+
     #[test]
     fn reports_empty_host_configuration() {
         assert!(discover_hosts(vec![])

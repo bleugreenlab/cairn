@@ -181,8 +181,10 @@ pub fn create_child_task(
         ),
     );
 
-    // ---- Store user event -----------------------------------------------
-    store_user_event(orch, &run_id, &session_id, &input.prompt, now)?;
+    // ---- Store the launch prompt ----------------------------------------
+    // A sub-task's prompt is written by the agent that spawned it, which is the
+    // clearest case of all for keeping it out of the `user` role (CAIRN-3408).
+    store_launch_event(orch, &run_id, &session_id, &input.prompt, now)?;
 
     // ---- Output schema --------------------------------------------------
     let output_schema = OutputSchemaInfo {

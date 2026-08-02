@@ -60,7 +60,7 @@ pub(super) async fn dispatch(
                 // Route todos writes to the owning project's database (CAIRN-2132);
                 // resolution and all three mutations share the routed handle.
                 let db = orch.db.for_project(project).await;
-                let job_id = crate::resources::resolve_todos_job_id(
+                let job_id = crate::resources::resolve_node_or_task_job_id(
                     &db,
                     project,
                     *number,

@@ -8,12 +8,15 @@ pub(super) const SOURCE_KIND_PEER: &str = "peer";
 const SOURCE_KIND_USER: &str = "user";
 pub(super) const SOURCE_KIND_PROCESS: &str = "process";
 const SOURCE_KIND_RESOURCE: &str = "resource";
-const SOURCE_KIND_CONDITION: &str = "condition";
+pub(super) const SOURCE_KIND_CONDITION: &str = "condition";
 pub(super) const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 pub(super) const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
 pub(super) const FACT_KIND_MESSAGE: &str = "message";
 pub(crate) const FACT_KIND_TERMINAL_EXIT: &str = "terminal_exit";
 pub(crate) const FACT_KIND_TERMINAL_OUTPUT: &str = "terminal_output";
+/// A node's project check lanes reaching a state nothing will move further.
+/// Carried on a `condition` source keyed by the node's canonical `/checks` URI.
+pub(crate) const FACT_KIND_CHECKS_SETTLED: &str = "checks_settled";
 
 // CAIRN-1647: the attention ledger collapses the old `agent_idle_with_work` +
 // `pr_state_change` fan-out into a single `review` item kind. Default child

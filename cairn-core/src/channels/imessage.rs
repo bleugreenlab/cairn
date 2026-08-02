@@ -27,6 +27,9 @@ use cairn_common::executor_protocol::{
 const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 const PLACED_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PLACED_WATCH_KEY: &str = "imsg-watch";
+/// What the watch calls itself on a surface that shows running work. The key
+/// above addresses it; this names it.
+const PLACED_WATCH_ROLE: &str = "watch";
 /// Receiving clients silently ignore edits after the fifth edit to one message.
 const MAX_PROPAGATING_EDITS: u8 = 5;
 
@@ -200,7 +203,7 @@ impl IMessageExecutor for PlacedProcessExecutor {
         let _ = self.lease.stop_resident(PLACED_WATCH_KEY).await;
         let mut subscription = self
             .lease
-            .start_resident(PLACED_WATCH_KEY, "imsg", args)
+            .start_resident(PLACED_WATCH_KEY, PLACED_WATCH_ROLE, "imsg", args)
             .await
             .map_err(|error| error.to_string())?;
         let mut stdout = Vec::new();
@@ -391,6 +394,20 @@ impl IMessageProvider {
                 .expect("iMessage watch lock poisoned");
             merge_poll_options(&mut state.options, &options);
             if let Some(votes) = poll.get("votes").and_then(Value::as_array) {
+                // A vote event carries no option set of its own - it names the chosen
+                // option inline. Cairn never sees the creation event that would have
+                // populated the option map (its own poll is from_me), so the label on
+                // the vote is the only thing standing between an answer and a raw UUID.
+                let labelled = votes
+                    .iter()
+                    .filter_map(|vote| {
+                        Some(PollOption {
+                            id: string_at(vote, &["option_id", "optionId", "id"])?,
+                            text: string_at(vote, &["option_text", "optionText"])?,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                merge_poll_options(&mut state.options, &labelled);
                 let votes = votes.iter().filter_map(|vote| {
                     Some(PollVote {
                         participant: string_at(vote, &["participant", "sender", "handle"])?,
@@ -456,7 +473,10 @@ impl IMessageProvider {
         .map(|_| ())
     }
 
-    pub async fn edit(&self, guid: &str, text: &str) -> Result<(), String> {
+    /// Edits a message in place. `imsg edit` addresses both the chat and the message,
+    /// so the conversation travels with the guid; a chat imsg cannot resolve has no
+    /// message to edit.
+    pub async fn edit(&self, conversation: &str, guid: &str, text: &str) -> Result<(), String> {
         {
             let mut counts = self
                 .edit_counts
@@ -471,17 +491,22 @@ impl IMessageProvider {
             *count += 1;
         }
 
-        let result = self
-            .executor
-            .run(vec![
-                "edit".into(),
-                "--guid".into(),
-                guid.into(),
-                "--text".into(),
-                text.into(),
-            ])
-            .await
-            .map(|_| ());
+        let result = match self.resolve_chat(conversation).await {
+            Some(chat) => self
+                .executor
+                .run(vec![
+                    "edit".into(),
+                    "--chat".into(),
+                    chat.guid,
+                    "--message".into(),
+                    guid.into(),
+                    "--new-text".into(),
+                    text.into(),
+                ])
+                .await
+                .map(|_| ()),
+            None => Err(format!("imsg reports no chat for {conversation}")),
+        };
         if result.is_err() {
             let mut counts = self
                 .edit_counts
@@ -494,11 +519,31 @@ impl IMessageProvider {
         result
     }
 
+    /// Only `imsg send` addresses a conversation by bare handle; `poll send` wants a
+    /// chat guid and `history` a chat rowid. The configured recipient is a handle, so
+    /// both are resolved against the chats imsg reports rather than synthesized. A
+    /// handle with no chat yet resolves to nothing, which keeps the ask on the text
+    /// floor - and that send creates the chat, making the next ask pollable.
+    async fn resolve_chat(&self, conversation: &str) -> Option<Chat> {
+        let output = self
+            .executor
+            .run(vec![
+                "chats".into(),
+                "--json".into(),
+                "--limit".into(),
+                "50".into(),
+            ])
+            .await
+            .ok()?;
+        find_chat(&output.stdout, conversation)
+    }
+
     async fn send_text(&self, conversation: &str, text: &str) -> Result<SentIds, String> {
         let output = self
             .executor
             .run(vec![
                 "send".into(),
+                "--json".into(),
                 "--to".into(),
                 conversation.into(),
                 "--text".into(),
@@ -518,13 +563,17 @@ impl IMessageProvider {
         if let Some(ids) = parse_sent_ids(send_stdout) {
             return Ok(ids);
         }
+        let chat = self
+            .resolve_chat(conversation)
+            .await
+            .ok_or_else(|| format!("imsg reports no chat for {conversation}"))?;
         let history = self
             .executor
             .run(vec![
                 "history".into(),
                 "--json".into(),
-                "--chat".into(),
-                conversation.into(),
+                "--chat-id".into(),
+                chat.id.to_string(),
                 "--limit".into(),
                 "20".into(),
             ])
@@ -556,22 +605,28 @@ impl ChannelProvider for IMessageProvider {
         };
         if self.capabilities().structured_asks {
             if let OutboundAsk::Question { text, options, .. } = &message.ask {
-                if !options.is_empty() {
-                    let mut args = vec![
-                        "poll".into(),
-                        "send".into(),
-                        "--chat".into(),
-                        message.conversation.clone(),
-                        "--question".into(),
-                        format!("{}\n\n{text}", message.context_header),
-                    ];
-                    for option in options {
-                        args.extend(["--option".into(), option.label.clone()]);
+                // A Messages poll balloon needs at least two options; imsg rejects a
+                // single `--option`. A one-option ask takes the numbered-text floor
+                // rather than failing the delivery outright.
+                if options.len() >= 2 {
+                    if let Some(chat) = self.resolve_chat(&message.conversation).await {
+                        let mut args = vec![
+                            "poll".into(),
+                            "send".into(),
+                            "--json".into(),
+                            "--chat".into(),
+                            chat.guid,
+                            "--question".into(),
+                            format!("{}\n\n{text}", message.context_header),
+                        ];
+                        for option in options {
+                            args.extend(["--option".into(), option.label.clone()]);
+                        }
+                        let output = self.executor.run(args).await?;
+                        return self
+                            .sent_ids_or_history(&message.conversation, text, &output.stdout)
+                            .await;
                     }
-                    let output = self.executor.run(args).await?;
-                    return self
-                        .sent_ids_or_history(&message.conversation, text, &output.stdout)
-                        .await;
                 }
             }
         }
@@ -594,27 +649,113 @@ impl ChannelProvider for IMessageProvider {
     }
 }
 
+/// Classifies `imsg status --json`. Ready is the gate that lets a question go out as a
+/// native poll, so it asserts poll capability specifically: a bridge that is connected
+/// but cannot carry polls is Degraded, because the numbered-text floor is what it can
+/// actually deliver. Absent IMCore advanced features - SIP re-enabled, or Messages
+/// started without the bridge - are the silent-failure mode this classification names.
+///
+/// The schema is imsg's own; `cairn-core/tests/fixtures/imsg-status-0.13.4.json` holds a
+/// payload captured from the real binary and is what the tests parse. An imsg upgrade
+/// may move these keys, so recapture that fixture rather than guessing at key names.
 fn parse_status(stdout: &str) -> ChannelHealth {
     let Ok(value) = serde_json::from_str::<Value>(stdout) else {
         return ChannelHealth::Unavailable {
             reason: "imsg status returned invalid JSON".into(),
         };
     };
-    let bridge = bool_at(&value, &["bridge", "bridge_ready", "bridgeReady", "polls"])
-        .or_else(|| {
-            value
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|s| matches!(s, "ready" | "ok" | "running"))
-        })
-        .unwrap_or(false);
-    if bridge {
-        ChannelHealth::Ready
-    } else {
-        let reason = string_at(&value, &["reason", "error", "message"])
-            .unwrap_or_else(|| "IMCore bridge unavailable; plain text remains available".into());
-        ChannelHealth::Degraded { reason }
+    let advanced = bool_at(&value, &["advanced_features"]).unwrap_or(false)
+        || bool_at(&value, &["v2_ready"]).unwrap_or(false);
+    if advanced && reports_poll_support(&value) {
+        return ChannelHealth::Ready;
     }
+    ChannelHealth::Degraded {
+        reason: degraded_reason(&value, advanced),
+    }
+}
+
+/// True when the bridge advertises polls on either surface it reports them on: the
+/// IMCore selectors it resolved, or the RPC methods it accepts.
+fn reports_poll_support(value: &Value) -> bool {
+    let selector = value
+        .get("selectors")
+        .and_then(|selectors| selectors.get("pollPayloadMessage"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let rpc = value
+        .get("rpc_methods")
+        .and_then(Value::as_array)
+        .is_some_and(|methods| {
+            methods
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|method| method == "poll.send" || method == "messages.poll.send")
+        });
+    selector || rpc
+}
+
+/// Names which capability is missing in our own words. imsg's `message` field is quoted
+/// as attributed context, never used as the reason itself: it describes the connection,
+/// not the capability, so on its own it produced health strings that asserted
+/// availability while the provider was refusing to send polls.
+fn degraded_reason(value: &Value, advanced: bool) -> String {
+    let version = string_at(value, &["version"]).unwrap_or_else(|| "unknown version".into());
+    let sip = string_at(value, &["sip"]).unwrap_or_else(|| "unknown".into());
+    let cause = if advanced {
+        "bridge is connected but advertises no poll support"
+    } else {
+        "IMCore advanced features are unavailable"
+    };
+    let mut reason =
+        format!("imsg {version} (SIP {sip}): {cause}; asks fall back to numbered text");
+    if let Some(message) = string_at(value, &["message"]) {
+        reason.push_str(&format!(" - imsg reports: {message}"));
+    }
+    reason
+}
+
+/// The identity of a conversation as imsg reports it: `guid` addresses `poll send`,
+/// `id` addresses `history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chat {
+    pub guid: String,
+    pub id: i64,
+}
+
+/// Finds the one-to-one chat for a handle in `imsg chats --json`, which emits one chat
+/// object per line. Handles are normalized on both sides so a formatted number and its
+/// canonical form address the same chat. A group that merely contains the handle is not
+/// that conversation and is never matched.
+fn find_chat(stdout: &str, conversation: &str) -> Option<Chat> {
+    let wanted = normalize_handle(conversation);
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|chat| {
+            if bool_at(chat, &["is_group", "isGroup"]).unwrap_or(false) {
+                return false;
+            }
+            let identified = string_at(chat, &["identifier", "guid"])
+                .is_some_and(|handle| normalize_handle(&handle) == wanted)
+                || string_at(chat, &["guid"]).is_some_and(|guid| guid == conversation);
+            let sole_participant = chat
+                .get("participants")
+                .and_then(Value::as_array)
+                .is_some_and(|participants| {
+                    participants.len() == 1
+                        && participants
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|handle| normalize_handle(handle) == wanted)
+                });
+            identified || sole_participant
+        })
+        .and_then(|chat| {
+            Some(Chat {
+                guid: string_at(&chat, &["guid"])?,
+                id: i64_at(&chat, &["id", "chat_id", "rowid"])?,
+            })
+        })
 }
 
 fn parse_sent_ids(stdout: &str) -> Option<SentIds> {
@@ -636,11 +777,14 @@ fn parse_sent_ids(stdout: &str) -> Option<SentIds> {
     })
 }
 
+/// Recovers the guid of a message imsg sent but did not report, by matching its text in
+/// `imsg history --json` - which, like `watch` and `chats`, emits one message object per
+/// line rather than a single document.
 fn reconcile_history(stdout: &str, rendered: &str) -> Option<SentIds> {
-    let value: Value = serde_json::from_str(stdout).ok()?;
-    let rows = value
-        .as_array()
-        .or_else(|| value.get("messages")?.as_array())?;
+    let rows: Vec<Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
     let mut primary = None;
     let mut caption = None;
     for row in rows.iter().rev() {
@@ -648,9 +792,20 @@ fn reconcile_history(stdout: &str, rendered: &str) -> Option<SentIds> {
             continue;
         }
         let text = string_at(row, &["text", "body"]).unwrap_or_default();
-        let guid = string_at(row, &["guid", "message_guid", "messageGuid"])?;
+        let Some(guid) = string_at(row, &["guid", "message_guid", "messageGuid"]) else {
+            continue;
+        };
         if text == rendered || rendered.ends_with(&text) || text.ends_with(rendered) {
-            if string_at(row, &["thread_originator_guid", "threadOriginatorGuid"]).is_some() {
+            if string_at(
+                row,
+                &[
+                    "thread_originator_guid",
+                    "threadOriginatorGuid",
+                    "reply_to_guid",
+                ],
+            )
+            .is_some()
+            {
                 caption.get_or_insert(guid);
             } else {
                 primary.get_or_insert(guid);
@@ -731,6 +886,30 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    /// Captured from `imsg status --json` on a bglab-mac bridge that was connected and
+    /// sending polls (imsg 0.13.4, bridge_version 2). Health classification is parsed
+    /// from this rather than from hand-written JSON: the imagined schema this parser
+    /// used to look for was how a fully-ready bridge shipped as permanently Degraded.
+    const REAL_STATUS: &str = include_str!("../../tests/fixtures/imsg-status-0.13.4.json");
+
+    /// Shapes captured from the same bridge: `imsg chats --json` emits one chat per
+    /// line, and `imsg poll send --json` answers with the balloon's `messageGuid` and
+    /// no guid for the caption it sends afterward. Handles here are examples; the keys
+    /// and framing are the binary's.
+    const REAL_CHATS: &str = include_str!("../../tests/fixtures/imsg-chats-0.13.4.jsonl");
+    const REAL_POLL_SEND: &str = include_str!("../../tests/fixtures/imsg-poll-send-0.13.4.json");
+    const REAL_HISTORY: &str = include_str!("../../tests/fixtures/imsg-history-0.13.4.jsonl");
+    const REAL_POLL_VOTE: &str =
+        include_str!("../../tests/fixtures/imsg-watch-poll-vote-0.13.4.jsonl");
+
+    /// The real payload with one field edited, so a not-ready case still differs from
+    /// the real binary's output only in the way the scenario claims it does.
+    fn status_with(mutate: impl FnOnce(&mut serde_json::Map<String, Value>)) -> String {
+        let mut value: Value = serde_json::from_str(REAL_STATUS).expect("fixture is valid JSON");
+        mutate(value.as_object_mut().expect("fixture is a JSON object"));
+        value.to_string()
+    }
+
     struct FakeExecutor {
         results: Mutex<VecDeque<Result<CommandResult, String>>>,
         calls: Mutex<Vec<Vec<String>>>,
@@ -738,7 +917,7 @@ mod tests {
     }
 
     impl FakeExecutor {
-        fn new(outputs: impl IntoIterator<Item = &'static str>) -> Self {
+        fn new(outputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
             Self {
                 results: Mutex::new(
                     outputs
@@ -781,6 +960,10 @@ mod tests {
     }
 
     fn message() -> OutboundMessage {
+        message_with(&["Legacy", "New"])
+    }
+
+    fn message_with(labels: &[&str]) -> OutboundMessage {
         OutboundMessage {
             intent_id: "intent".into(),
             conversation: "+15551234567".into(),
@@ -789,10 +972,13 @@ mod tests {
                 prompt_id: "p".into(),
                 question_index: 0,
                 text: "Which path?".into(),
-                options: vec![super::super::AskOption {
-                    label: "New".into(),
-                    description: None,
-                }],
+                options: labels
+                    .iter()
+                    .map(|label| super::super::AskOption {
+                        label: (*label).into(),
+                        description: None,
+                    })
+                    .collect(),
             },
         }
     }
@@ -818,59 +1004,208 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_health_sends_text_and_reconciles_guid_from_history() {
+        let bridgeless = status_with(|status| {
+            status.insert("advanced_features".into(), Value::Bool(false));
+            status.insert("v2_ready".into(), Value::Bool(false));
+            status.insert("sip".into(), Value::String("enabled".into()));
+        });
         let fake = Arc::new(FakeExecutor::new([
-            r#"{"status":"degraded","reason":"bridge down"}"#,
-            "{}",
-            r#"[{"guid":"m1","text":"[CAIRN-3373 · builder]\n\nWhich path?\n\n1. New\n\nReply to this message with a number or your answer.","is_from_me":true}]"#,
+            bridgeless,
+            "{}".into(),
+            REAL_CHATS.into(),
+            REAL_HISTORY.into(),
         ]));
         let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
         assert!(matches!(
             provider.refresh_health().await,
             ChannelHealth::Degraded { .. }
         ));
-        assert_eq!(provider.send(&message()).await.unwrap().primary_guid, "m1");
+        assert_eq!(
+            provider.send(&message()).await.unwrap().primary_guid,
+            "63E47F81-B45E-49A5-B241-E94926FAEDEC"
+        );
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls[1][0], "send");
-        assert_eq!(calls[2][0], "history");
+        assert_eq!(calls[2][0], "chats");
+        // `history` takes a chat rowid; the handle `send` accepts is rejected here.
+        assert_eq!(&calls[3][..4], &["history", "--json", "--chat-id", "2"]);
     }
 
     #[tokio::test]
     async fn ready_health_sends_poll_with_argument_boundaries() {
-        let fake = Arc::new(FakeExecutor::new([
-            r#"{"bridge_ready":true}"#,
-            r#"{"poll_guid":"poll-1","caption_guid":"caption-1"}"#,
-        ]));
+        let fake = Arc::new(FakeExecutor::new([REAL_STATUS, REAL_CHATS, REAL_POLL_SEND]));
         let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
         assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);
         let ids = provider.send(&message()).await.unwrap();
-        assert_eq!(ids.caption_guid.as_deref(), Some("caption-1"));
+        // imsg sends the caption itself and reports only the balloon's guid, so the ask
+        // binds to the poll a vote actually arrives against.
+        assert_eq!(ids.primary_guid, "3892DF46-42FE-41FB-960B-292F16EF7FB0");
+        assert_eq!(ids.caption_guid, None);
         let calls = fake.calls.lock().unwrap();
-        assert_eq!(&calls[1][..2], &["poll", "send"]);
-        assert!(calls[1].windows(2).any(|pair| pair == ["--option", "New"]));
+        assert_eq!(calls[1][0], "chats");
+        assert_eq!(&calls[2][..2], &["poll", "send"]);
+        assert!(calls[2].contains(&"--json".to_string()));
+        // `poll send` addresses a chat guid; the bare handle `send` takes is rejected.
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--chat", "any;-;+15551234567"]));
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--option", "Legacy"]));
+        assert!(calls[2].windows(2).any(|pair| pair == ["--option", "New"]));
+    }
+
+    /// A handle imsg has no chat for has nothing to hold a balloon, so the first ask to
+    /// a new recipient takes the text floor - and that send is what creates the chat,
+    /// which is why the guid is still recoverable afterward.
+    #[tokio::test]
+    async fn a_chat_that_does_not_exist_yet_takes_the_text_floor() {
+        let fake = Arc::new(FakeExecutor::new([
+            REAL_STATUS,
+            "",
+            "{}",
+            REAL_CHATS,
+            REAL_HISTORY,
+        ]));
+        let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
+        assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);
+
+        let ids = provider.send(&message()).await.unwrap();
+
+        assert_eq!(ids.primary_guid, "63E47F81-B45E-49A5-B241-E94926FAEDEC");
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls[1][0], "chats");
+        assert_eq!(calls[2][0], "send");
+    }
+
+    #[test]
+    fn chat_lookup_normalizes_handles_and_never_matches_a_group() {
+        assert_eq!(
+            find_chat(REAL_CHATS, " +1 (555) 123-4567 "),
+            Some(Chat {
+                guid: "any;-;+15551234567".into(),
+                id: 2,
+            })
+        );
+        assert_eq!(find_chat(REAL_CHATS, "+15557654321"), None);
+    }
+
+    /// A vote event names its own option; the poll that would have populated the option
+    /// map was sent by Cairn and never comes back through the watch stream.
+    #[test]
+    fn a_real_poll_vote_resolves_to_the_option_label_not_its_uuid() {
+        let provider = IMessageProvider::new(
+            Arc::new(FakeExecutor::new(Vec::<String>::new())),
+            vec!["+15551234567".into()],
+        );
+
+        let event = provider.ingest_watch_line(REAL_POLL_VOTE.trim()).unwrap();
+
+        let Some((
+            75,
+            InboundEvent::Selection {
+                bound_guid,
+                option_text,
+                ..
+            },
+        )) = event
+        else {
+            panic!("a real vote must resolve to a selection, got {event:?}");
+        };
+        assert_eq!(bound_guid, "3892DF46-42FE-41FB-960B-292F16EF7FB0");
+        assert_eq!(option_text, "New");
+    }
+
+    /// Messages renders a poll balloon only with at least two options, so a one-option
+    /// ask has to reach the operator as text instead of failing the delivery.
+    #[tokio::test]
+    async fn single_option_ask_takes_the_text_floor_a_poll_cannot_hold() {
+        let floor = r#"{"guid":"m1","chat_id":2,"is_from_me":true,"text":"[CAIRN-3373 · builder]\n\nWhich path?\n\n1. New\n\nReply to this message with a number or your answer."}"#;
+        let fake = Arc::new(FakeExecutor::new([REAL_STATUS, "{}", REAL_CHATS, floor]));
+        let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
+        assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);
+
+        let ids = provider.send(&message_with(&["New"])).await.unwrap();
+
+        assert_eq!(ids.primary_guid, "m1");
+        assert_eq!(fake.calls.lock().unwrap()[1][0], "send");
     }
 
     #[tokio::test]
     async fn edit_budget_stops_before_clients_silently_drop_updates() {
-        let fake = Arc::new(FakeExecutor::new(["{}", "{}", "{}", "{}", "{}"]));
+        let outputs = std::iter::repeat_n([REAL_CHATS, "{}"], MAX_PROPAGATING_EDITS as usize)
+            .flatten()
+            .collect::<Vec<_>>();
+        let fake = Arc::new(FakeExecutor::new(outputs));
         let provider = IMessageProvider::new(fake.clone(), vec![]);
         for version in 1..=MAX_PROPAGATING_EDITS {
             provider
-                .edit("message-guid", &format!("v{version}"))
+                .edit("+15551234567", "message-guid", &format!("v{version}"))
                 .await
                 .unwrap();
         }
-        let error = provider.edit("message-guid", "v6").await.unwrap_err();
+        let error = provider
+            .edit("+15551234567", "message-guid", "v6")
+            .await
+            .unwrap_err();
         assert!(error.contains("send a fresh status message"));
-        assert_eq!(
-            fake.calls.lock().unwrap().len(),
-            MAX_PROPAGATING_EDITS as usize
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), MAX_PROPAGATING_EDITS as usize * 2);
+        assert_eq!(&calls[1][..2], &["edit", "--chat"]);
+        assert!(calls[1].windows(2).any(|pair| pair == ["--new-text", "v1"]));
+    }
+
+    #[test]
+    fn real_connected_bridge_is_ready_on_either_poll_signal() {
+        assert_eq!(parse_status(REAL_STATUS), ChannelHealth::Ready);
+
+        let selectors_only = status_with(|status| {
+            status.remove("rpc_methods");
+        });
+        assert_eq!(parse_status(&selectors_only), ChannelHealth::Ready);
+
+        let rpc_only = status_with(|status| {
+            status.remove("selectors");
+        });
+        assert_eq!(parse_status(&rpc_only), ChannelHealth::Ready);
+    }
+
+    #[test]
+    fn missing_capability_degrades_with_a_reason_that_does_not_assert_availability() {
+        let bridgeless = status_with(|status| {
+            status.insert("advanced_features".into(), Value::Bool(false));
+            status.insert("v2_ready".into(), Value::Bool(false));
+            status.insert("sip".into(), Value::String("enabled".into()));
+        });
+        let ChannelHealth::Degraded { reason } = parse_status(&bridgeless) else {
+            panic!("a bridge without IMCore features cannot send polls");
+        };
+        assert!(reason.starts_with("imsg 0.13.4 (SIP enabled)"), "{reason}");
+        assert!(
+            reason.contains("IMCore advanced features are unavailable"),
+            "{reason}"
         );
+        assert!(
+            reason.contains("imsg reports: Connected to Messages.app"),
+            "{reason}"
+        );
+
+        let pollless = status_with(|status| {
+            status.remove("selectors");
+            status.remove("rpc_methods");
+        });
+        let ChannelHealth::Degraded { reason } = parse_status(&pollless) else {
+            panic!("advanced features alone do not prove polls can be sent");
+        };
+        assert!(reason.contains("advertises no poll support"), "{reason}");
     }
 
     #[test]
     fn parses_allowlisted_reply_vote_mutations_and_echo_guard() {
-        let provider =
-            IMessageProvider::new(Arc::new(FakeExecutor::new([])), vec!["+14155550123".into()]);
+        let provider = IMessageProvider::new(
+            Arc::new(FakeExecutor::new(Vec::<String>::new())),
+            vec!["+14155550123".into()],
+        );
         let mutation = r#"{"rowid":10,"sender":"+14155550123","poll":{"original_guid":"poll","options":[{"id":"a","text":"Alpha"}],"votes":[]}}"#;
         assert_eq!(provider.ingest_watch_line(mutation).unwrap(), None);
         let vote = r#"{"rowid":11,"sender":"+14155550123","poll":{"original_guid":"poll","options":[{"id":"a","text":"Alpha"}],"votes":[{"participant":"+14155550123","option_id":"a"}]}}"#;

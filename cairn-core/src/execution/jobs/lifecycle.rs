@@ -838,8 +838,11 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
     let job_model = job.model.as_ref().map(Model::new);
 
-    // ---- Store initial user event ---------------------------------------
-    store_user_event_with_turn(orch, &run_id, &session_id, &prompt, now, Some(&turn_id))?;
+    // ---- Store the launch prompt ----------------------------------------
+    // Under the namespaced `user:launch` type, not `user`: this prompt is
+    // composed from the issue's resolved inputs, so a watching parent must never
+    // be shown its own issue description as something a person said (CAIRN-3408).
+    store_launch_event_with_turn(orch, &run_id, &session_id, &prompt, now, Some(&turn_id))?;
 
     // ---- Emit system message for job start ------------------------------
     crate::messages::system::emit_job_event(
@@ -1890,7 +1893,7 @@ fn continue_job_launch_locked(
     let previous_turn_end = previous_turn_end_for_resume(owning_db.clone(), &turn_id)?;
     let prompt = prepend_resume_stamp(
         prompt,
-        &crate::clock::HostClock::local(),
+        crate::clock::host(),
         chrono::Utc::now(),
         previous_turn_end,
     );
@@ -2389,24 +2392,68 @@ fn build_reseed_seed_content(digest: &str) -> String {
 /// [`build_reseed_seed_content`] — header then body, trigger appended later —
 /// so a compacted thread seed remains an ordinary `user:seed` everywhere
 /// downstream.
-fn build_thread_seed_content(composed: &str) -> String {
-    format!("{THREAD_SEED_HEADER}\n\n{composed}")
+fn build_thread_seed_content(composed: &str, idle_secs: Option<i64>) -> String {
+    match idle_secs.filter(|seconds| *seconds >= 60) {
+        // A rebuilt session has no felt continuity with the one before it: every
+        // relative reference in the turns below ("just now", "still running")
+        // was written against a clock the resumed agent cannot see. Naming the
+        // gap once, at the top, is what lets it read them correctly.
+        Some(seconds) => format!(
+            "{THREAD_SEED_HEADER}\n\nYour last turn ended {} ago; everything below was written before that.\n\n{composed}",
+            crate::clock::format_elapsed(seconds)
+        ),
+        None => format!("{THREAD_SEED_HEADER}\n\n{composed}"),
+    }
 }
 
 // ── Thread compaction triggers (CAIRN-3388) ───────────────────────────────────
 
 /// What a thread compaction decision is made from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ThreadCompactionInputs {
-    /// The session's last event is older than the staleness threshold.
+    /// The prompt cache has expired, so the next turn pays a write regardless.
     stale: bool,
-    /// Terminal children this composition actually folded into chapters. A mark
-    /// with nothing to compact does not arm the trigger.
-    folded_marks: usize,
-    /// `P` — what the compactable prefix weighs verbatim.
-    source_bytes: i64,
-    /// `p` — what that same prefix weighs as a table of contents.
-    candidate_bytes: i64,
+    /// Whether this composition would actually drop anything. A rotation that
+    /// replaces nothing is pure loss: it costs the thread its reasoning and its
+    /// continuity and reclaims no window at all.
+    drops_anything: bool,
+    /// Live context occupancy as `(used tokens, the model's window)`, from the
+    /// provider's own accounting of the last request. `None` when there is no
+    /// reading — a session that has not inferred yet, an unrecognized model, a
+    /// backend whose catalog carries no window.
+    occupancy: Option<(i64, i64)>,
+    /// The fraction of the window at which a warm session gives something up.
+    threshold: f64,
+}
+
+/// Whether a warm session has filled enough of its window to have to give
+/// something up.
+///
+/// Deliberately not an economic question. Bytes can say what a rebuild costs in
+/// money; they cannot say what it costs the thread, which is its own reasoning
+/// and its sense of continuity — the thinking that produced a conclusion does not
+/// survive into the seed, only the conclusion does. That cost is large, fixed,
+/// and paid in full every time, so no amount of saved prefix earns it back. A
+/// warm session therefore rebuilds only when the window is running out, which is
+/// the one situation where not rebuilding is not an option either.
+///
+/// Occupancy comes from the provider's own accounting of the request just made.
+/// That is the opposite of using a token counter to price a seed never sent: here
+/// the question *is* what the last request weighed.
+fn window_pressure_reached(occupancy: Option<(i64, i64)>, threshold: f64) -> bool {
+    // No reading, no rebuild. The alternative — estimating occupancy from bytes
+    // against an assumed window — is a second, cruder measure standing in for the
+    // real one, which is exactly the substitution that made the previous trigger
+    // fire on everything. When Cairn cannot see the window, the provider's own
+    // limit is the backstop, and it fails loudly rather than silently degrading
+    // the thread.
+    let Some((used, window)) = occupancy else {
+        return false;
+    };
+    if window <= 0 {
+        return false;
+    }
+    used as f64 >= window as f64 * threshold
 }
 
 /// Decide whether a thread session compacts now.
@@ -2415,27 +2462,39 @@ struct ThreadCompactionInputs {
 /// 2× base input and a read 0.1×, so rewriting history mid-conversation is
 /// expensive rather than free:
 ///
-/// - **expiry**: the session is stale, so the next turn pays a cache write
-///   whatever happens and compacting there is marginally free. Thread wakes are
-///   bursty, so expiry also tends to land at a natural narrative boundary.
-/// - **ratio**: the live prefix exceeds three times its table-of-contents form,
-///   which is where the break-even `N > 20p/(P−p)` pays back inside ~10 turns.
+/// - **expiry**: the prompt cache is gone, so the session is being rebuilt
+///   whatever happens and the choice is only what to rebuild it from. Thread
+///   wakes are bursty, so expiry also tends to land at a natural boundary.
+/// - **capacity**: the window is running out while the cache is still warm, by
+///   [`window_pressure_reached`].
 ///
-/// A child reaching terminal status never triggers anything by itself: it marks
-/// what became compactable, and one of these two decides when to apply it.
+/// The two are asked in that order and for different reasons, which is the whole
+/// shape of the policy. Expiry is not a judgement about whether rebuilding is
+/// worth it — by then it has already happened. Capacity is the only thing that
+/// makes a *live* session give up its continuity, and it does so because the
+/// alternative is a request the provider will refuse.
 ///
-/// Sizes are measured in bytes of the exact strings the composer and renderer
-/// would send, not provider token counters. The counters describe requests
-/// already made and cannot price a seed that has never been sent; bytes are
-/// model-independent, deterministic, and testable.
+/// What is deliberately absent is any comparison of what compaction would save
+/// against what it would cost. A rebuild costs the thread its own reasoning: the
+/// thinking that produced a conclusion does not survive into the seed, only the
+/// conclusion does. Nothing measured in bytes buys that back, so "this would be
+/// cheaper" is not a reason to do it, at any size.
+///
+/// A child reaching terminal status still never triggers anything by itself: it
+/// marks what *became* compactable, and one of these two decides when to apply
+/// the accumulated marks.
 fn decide_thread_compaction(inputs: ThreadCompactionInputs) -> Option<CompactionTrigger> {
     if inputs.stale {
         return Some(CompactionTrigger::Expiry);
     }
-    if inputs.folded_marks > 0 && inputs.source_bytes > inputs.candidate_bytes.saturating_mul(3) {
-        return Some(CompactionTrigger::Ratio);
+    // A warm rotation that replaces nothing spends the thread's continuity and
+    // reclaims no window, so it is worse than doing nothing at any occupancy.
+    // Expiry is exempt: there the rebuild is already happening.
+    if !inputs.drops_anything {
+        return None;
     }
-    None
+    window_pressure_reached(inputs.occupancy, inputs.threshold)
+        .then_some(CompactionTrigger::Capacity)
 }
 
 /// Prepend the reseed seed to the trigger prompt when this resume reseeded;
@@ -2483,7 +2542,14 @@ fn attempt_session_reseed(
     // transcript: it compacts. That path also runs while the session is warm,
     // because the size ratio can fire between wakes.
     if thread_compaction_capability(owning_db, &job.id).is_enabled() {
-        return attempt_thread_compaction(orch, owning_db, job, session, stale);
+        return attempt_thread_compaction(
+            orch,
+            owning_db,
+            job,
+            session,
+            stale,
+            Some(now.saturating_sub(last_event_at)),
+        );
     }
 
     if !stale {
@@ -2525,14 +2591,26 @@ fn force_session_reseed(
     // An operator forcing a digest resume on a thread gets the thread's own seed
     // shape; there is only one way to reconstruct a thread's context.
     if thread_compaction_capability(owning_db, &job.id).is_enabled() {
-        let seed = compose_thread_seed_blocking(owning_db, job)?;
+        let seed = compose_thread_seed_blocking(orch, owning_db, job)?;
+        let idle_secs = run_db(load_last_event_time_for_session(
+            owning_db.clone(),
+            session.id.clone(),
+        ))
+        .ok()
+        .flatten()
+        .map(|last_event_at| orch.services.clock.now().saturating_sub(last_event_at));
+        let framed = build_thread_seed_content(&seed.content, idle_secs);
         return apply_thread_compaction(
             orch,
             owning_db,
             job,
             session,
-            seed,
-            CompactionTrigger::Manual,
+            DecidedCompaction {
+                seed,
+                framed,
+                trigger: CompactionTrigger::Manual,
+                occupancy: None,
+            },
         );
     }
 
@@ -2610,13 +2688,30 @@ fn thread_compaction_capability(owning_db: &Arc<LocalDb>, job_id: &str) -> Threa
     .unwrap_or(ThreadCompaction::Disabled)
 }
 
+/// The session's live context occupancy, as the provider last reported it.
+///
+/// `None` — no snapshot yet, an unrecognized model, a backend catalog without a
+/// window — leaves a warm session alone rather than guessing at a number this
+/// lossy a decision turns on.
+fn session_occupancy(orch: &Orchestrator, session_id: &str) -> Option<(i64, i64)> {
+    let orch = orch.clone();
+    let session_id = session_id.to_string();
+    let state =
+        run_db(async move { Ok::<_, String>(orch.get_context_token_state(&session_id).await) })
+            .ok()
+            .flatten()?;
+    Some((state.used_tokens, state.context_window?))
+}
+
 fn compose_thread_seed_blocking(
+    orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
     job: &DbJob,
 ) -> Result<crate::resources::ThreadSeed, String> {
     let db = owning_db.clone();
     let job_id = job.id.clone();
-    run_db(async move { crate::resources::compose_thread_seed(&db, &job_id).await })
+    let now = orch.services.clock.now();
+    run_db(async move { crate::resources::compose_thread_seed(&db, &job_id, now).await })
 }
 
 /// Compose a thread's seed, decide whether this continuation compacts, and apply
@@ -2632,8 +2727,9 @@ fn attempt_thread_compaction(
     job: &DbJob,
     session: &Session,
     stale: bool,
+    idle_secs: Option<i64>,
 ) -> Option<ReseedOutcome> {
-    let seed = match compose_thread_seed_blocking(owning_db, job) {
+    let seed = match compose_thread_seed_blocking(orch, owning_db, job) {
         Ok(seed) => seed,
         Err(error) => {
             // Fail open, exactly as the ordinary reseed attempt does: the old
@@ -2646,14 +2742,29 @@ fn attempt_thread_compaction(
         }
     };
 
+    // Only consulted while warm, so the reading is skipped entirely on the
+    // expiry path rather than blocking a rebuild that is already decided.
+    let occupancy = if stale {
+        None
+    } else {
+        session_occupancy(orch, &session.id)
+    };
     let trigger = decide_thread_compaction(ThreadCompactionInputs {
         stale,
-        folded_marks: seed.consumed_child_issue_ids.len(),
-        source_bytes: seed.source_bytes,
-        candidate_bytes: seed.candidate_bytes,
+        drops_anything: seed.source_bytes > 0,
+        occupancy,
+        threshold: orch.get_settings().thread_compact_threshold,
     })?;
 
-    match apply_thread_compaction(orch, owning_db, job, session, seed, trigger) {
+    let framed = build_thread_seed_content(&seed.content, idle_secs);
+
+    let decided = DecidedCompaction {
+        seed,
+        framed,
+        trigger,
+        occupancy,
+    };
+    match apply_thread_compaction(orch, owning_db, job, session, decided) {
         Ok(outcome) => Some(outcome),
         Err(error) => {
             log::warn!(
@@ -2663,6 +2774,18 @@ fn attempt_thread_compaction(
             None
         }
     }
+}
+
+/// A compaction that has been decided on: what to send, why, and the reading
+/// that caused it. Travelling together is what keeps them consistent — the bytes
+/// the generation records are the bytes rotation delivers, and the occupancy the
+/// log reports is the occupancy the decision turned on.
+struct DecidedCompaction {
+    seed: crate::resources::ThreadSeed,
+    /// The seed exactly as it will be delivered, header and bridge line applied.
+    framed: String,
+    trigger: CompactionTrigger,
+    occupancy: Option<(i64, i64)>,
 }
 
 /// Persist the generation, then rotate.
@@ -2679,13 +2802,20 @@ fn apply_thread_compaction(
     owning_db: &Arc<LocalDb>,
     job: &DbJob,
     session: &Session,
-    seed: crate::resources::ThreadSeed,
-    trigger: CompactionTrigger,
+    decided: DecidedCompaction,
 ) -> Result<ReseedOutcome, String> {
+    let DecidedCompaction {
+        seed,
+        framed,
+        trigger,
+        occupancy,
+    } = decided;
+    let seed_bytes = framed.len() as i64;
     let applied = crate::threads::compaction::AppliedCompaction {
         trigger,
         source_session_id: seed.source_session_id,
         entries: seed.entries,
+        seed_bytes,
         source_bytes: seed.source_bytes,
         candidate_bytes: seed.candidate_bytes,
         compacted_through_block: seed.compacted_through_block,
@@ -2703,21 +2833,26 @@ fn apply_thread_compaction(
         }
     })?;
 
-    let outcome = rotate_with_seed(
-        orch,
-        owning_db,
-        job,
-        session,
-        build_thread_seed_content(&seed.content),
-    )?;
+    let outcome = rotate_with_seed(orch, owning_db, job, session, framed)?;
 
+    // Occupancy rides in the log line because it is what the warm decision turns
+    // on; the byte counts describe what the rebuild did, never why it happened.
+    let occupancy = match occupancy {
+        Some((used, window)) if window > 0 => {
+            format!("{used}/{window} tokens ({}%)", used * 100 / window)
+        }
+        _ => "occupancy unread".to_string(),
+    };
     log::info!(
-        "Thread compaction ({}) for job {}: {} chapters, {} bytes -> {} bytes, session {} -> {}",
+        "Thread compaction ({}) for job {}: {} chapters, {} bytes -> {} bytes, \
+         framed seed {} bytes, {}, session {} -> {}",
         trigger.as_db(),
         &job.id[..job.id.len().min(8)],
         seed.new_entries,
         seed.source_bytes,
         seed.candidate_bytes,
+        seed_bytes,
+        occupancy,
         &session.id[..session.id.len().min(8)],
         &outcome.new_session_id[..outcome.new_session_id.len().min(8)],
     );
@@ -3086,7 +3221,7 @@ mod tests {
             prepend_resume_stamp(reconstructed, &clock, now, Some(now.timestamp() - 192 * 60));
         assert_eq!(
             prompt,
-            "[Sat 21:40 — resumed after 3h 12m]\n\nSEED\n\nTRIGGER"
+            "[Sat 21:40 PDT — resumed after 3h 12m]\n\nSEED\n\nTRIGGER"
         );
     }
 
@@ -3282,77 +3417,101 @@ mod tests {
         assert!(header_at < digest_at && digest_at < trigger_at);
     }
 
+    /// Inputs for a warm session with a readable window, which is the only case
+    /// where the decision is interesting.
+    fn warm(used: i64, window: i64) -> super::ThreadCompactionInputs {
+        super::ThreadCompactionInputs {
+            stale: false,
+            drops_anything: true,
+            occupancy: Some((used, window)),
+            threshold: 0.8,
+        }
+    }
+
     #[test]
-    fn thread_compaction_fires_only_on_expiry_or_a_three_times_prefix() {
-        use super::{decide_thread_compaction, ThreadCompactionInputs};
+    fn a_warm_session_rebuilds_only_when_its_window_is_running_out() {
+        use super::decide_thread_compaction;
         use crate::threads::compaction::CompactionTrigger;
 
-        // (what the case is, stale, folded marks, P, p, expected trigger)
-        let cases = [
-            (
-                "a warm session with nothing marked holds, however big it is",
-                false,
-                0,
-                99_999,
-                10,
-                None,
-            ),
-            (
-                "a stale session compacts even with nothing to fold: the next turn \
-                 pays a cache write regardless",
-                true,
-                0,
-                0,
-                0,
-                Some(CompactionTrigger::Expiry),
-            ),
-            (
-                "a terminal child alone never rotates a warm session",
-                false,
-                2,
-                100,
-                100,
-                None,
-            ),
-            (
-                "exactly three times the table of contents is not yet worth the \
-                 cache write",
-                false,
-                1,
-                300,
-                100,
-                None,
-            ),
-            (
-                "past three times, the rewrite pays back inside ~10 turns",
-                false,
-                1,
-                301,
-                100,
-                Some(CompactionTrigger::Ratio),
-            ),
-            (
-                "cutting hard is what makes compaction worth it",
-                false,
-                3,
-                40_000,
-                400,
-                Some(CompactionTrigger::Ratio),
-            ),
-        ];
+        assert_eq!(decide_thread_compaction(warm(159_000, 200_000)), None);
+        assert_eq!(
+            decide_thread_compaction(warm(160_000, 200_000)),
+            Some(CompactionTrigger::Capacity),
+            "the threshold is inclusive: at four fifths of the window, give something up"
+        );
 
-        for (case, stale, folded_marks, source_bytes, candidate_bytes, expected) in cases {
+        // The threshold is configurable, and it is the only thing that moves the
+        // boundary — nothing about the size of what would be dropped does.
+        let mut eager = warm(120_000, 200_000);
+        assert_eq!(decide_thread_compaction(eager), None);
+        eager.threshold = 0.6;
+        assert_eq!(
+            decide_thread_compaction(eager),
+            Some(CompactionTrigger::Capacity)
+        );
+    }
+
+    #[test]
+    fn a_warm_session_never_rebuilds_because_it_would_be_cheaper() {
+        use super::decide_thread_compaction;
+
+        // CAIRN-3404's six rotations, all warm, all fired by the old byte rule.
+        // Their common feature is that none of them was near the window: the
+        // thread was using a fraction of its context and rebuilding anyway,
+        // losing its own reasoning six times in one afternoon to reclaim between
+        // 1.1 KB and 18 KB. Occupancy is what decides now, so every one holds —
+        // and would hold no matter how lopsided the byte counts were.
+        for used in [8_000, 20_000, 40_000, 80_000, 120_000, 155_000] {
             assert_eq!(
-                decide_thread_compaction(ThreadCompactionInputs {
-                    stale,
-                    folded_marks,
-                    source_bytes,
-                    candidate_bytes,
-                }),
-                expected,
-                "{case}"
+                decide_thread_compaction(warm(used, 200_000)),
+                None,
+                "a warm session at {used} tokens of a 200k window gave up its \
+                 continuity for a size saving"
             );
         }
+    }
+
+    #[test]
+    fn a_warm_session_with_no_reading_is_left_alone() {
+        use super::decide_thread_compaction;
+
+        // Estimating occupancy from bytes against an assumed window would be a
+        // cruder measure standing in for the real one, which is the substitution
+        // that made the previous trigger fire on everything. Without a reading
+        // the provider's own limit is the backstop, and it fails loudly.
+        let mut blind = warm(0, 0);
+        blind.occupancy = None;
+        assert_eq!(decide_thread_compaction(blind), None);
+
+        // A window the backend reports as zero is not a window at 0% full.
+        assert_eq!(decide_thread_compaction(warm(500_000, 0)), None);
+    }
+
+    #[test]
+    fn expiry_rebuilds_whatever_the_window_says_and_capacity_needs_something_to_drop() {
+        use super::decide_thread_compaction;
+        use crate::threads::compaction::CompactionTrigger;
+
+        // The cache is gone, so the session is being rebuilt either way and the
+        // only question is what from. An unreadable window must not block that,
+        // and neither must an empty composition.
+        let expired = super::ThreadCompactionInputs {
+            stale: true,
+            drops_anything: false,
+            occupancy: None,
+            threshold: 0.8,
+        };
+        assert_eq!(
+            decide_thread_compaction(expired),
+            Some(CompactionTrigger::Expiry)
+        );
+
+        // While warm, a rotation that replaces nothing spends the thread's
+        // continuity and reclaims no window at all — worse than doing nothing,
+        // however full the context is.
+        let mut nothing_to_drop = warm(199_000, 200_000);
+        nothing_to_drop.drops_anything = false;
+        assert_eq!(decide_thread_compaction(nothing_to_drop), None);
     }
 
     #[test]
@@ -3360,9 +3519,19 @@ mod tests {
         // The thread seed is framed for a session that never ends, but it is the
         // same header-then-body shape, so it remains an ordinary `user:seed`
         // everywhere downstream.
-        let content = super::build_thread_seed_content("## Arc\n\nCOMPOSED_BODY");
+        let content = super::build_thread_seed_content("## Arc\n\nCOMPOSED_BODY", None);
         assert!(content.starts_with(super::THREAD_SEED_HEADER));
         assert!(content.contains("COMPOSED_BODY"));
+
+        // The bridge line names the gap the rebuilt session cannot feel, so the
+        // relative references in the turns below stay readable. A sub-minute gap
+        // is omitted, as it is at an ordinary turn boundary.
+        let bridged = super::build_thread_seed_content("BODY", Some(3 * 3600 + 12 * 60));
+        assert!(
+            bridged.contains("Your last turn ended 3h 12m ago"),
+            "the rebuild header lost its bridge line: {bridged}"
+        );
+        assert!(!super::build_thread_seed_content("BODY", Some(59)).contains("last turn ended"));
         assert!(
             !content.starts_with(RESEED_SEED_HEADER),
             "a thread must not be told its session was reconstructed after inactivity"

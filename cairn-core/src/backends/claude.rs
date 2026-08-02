@@ -80,6 +80,23 @@ pub(crate) fn claude_call_concurrency_ceiling(total_ram_bytes: u64) -> usize {
     raw.clamp(CLAUDE_CALL_CONCURRENCY_FLOOR, CLAUDE_CALL_CONCURRENCY_CAP)
 }
 
+/// Claude CLI can report a terminal failure as a `Result` whose subtype is still
+/// `success`. `is_error` is authoritative; this helper turns the structured
+/// failure into a named node-visible diagnosis. Only an actual HTTP 429 is called
+/// a rate limit. The generic case stays neutral because a terminal result can
+/// arrive before or after a tool call and this payload does not prove which.
+fn terminal_result_error_message(data: &serde_json::Value) -> &'static str {
+    if data
+        .get("api_error_status")
+        .and_then(serde_json::Value::as_u64)
+        == Some(429)
+    {
+        "The provider refused the request because its rate limit was reached (HTTP 429). The turn is interrupted and resumable once provider capacity is available."
+    } else {
+        "The provider returned a terminal error. The turn is interrupted and resumable."
+    }
+}
+
 /// Ceiling on simultaneous ephemeral (`cairn:~/calls`) `claude` processes,
 /// derived ONCE at startup from total physical RAM (see
 /// [`claude_call_concurrency_ceiling`]). Admission caps fan-out here so width
@@ -135,9 +152,45 @@ struct StreamingState {
 mod tests {
     use super::{
         build_claude_context_snapshot, claude_context_used_tokens, parse_thinking_tokens_estimate,
-        should_confirm_backend_id_after_init, ClaudeBackend,
+        should_confirm_backend_id_after_init, terminal_result_error_message, ClaudeBackend,
     };
-    use crate::agent_process::stream::Usage;
+    use crate::agent_process::stream::{parse_event, ClaudeEvent, Usage};
+
+    #[test]
+    fn terminal_api_refusal_is_named_even_when_cli_calls_it_success() {
+        let (event, _) = parse_event(
+            r#"{"type":"result","subtype":"success","session_id":"session-1","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"You've hit your session limit"}"#,
+        )
+        .unwrap();
+        let ClaudeEvent::Result { is_error, data, .. } = event else {
+            panic!("fixture must parse as a terminal result");
+        };
+        assert!(is_error);
+        assert!(terminal_result_error_message(&data).contains("HTTP 429"));
+    }
+
+    #[test]
+    fn terminal_api_error_without_429_is_not_called_a_rate_limit() {
+        let data = serde_json::json!({
+            "api_error_status": 500,
+            "terminal_reason": "api_error"
+        });
+        let message = terminal_result_error_message(&data);
+        assert!(!message.contains("429"));
+        assert!(!message.contains("rate limit"));
+    }
+
+    #[test]
+    fn terminal_error_without_tool_history_uses_a_neutral_diagnosis() {
+        let message = terminal_result_error_message(&serde_json::json!({}));
+        assert_eq!(
+            message,
+            "The provider returned a terminal error. The turn is interrupted and resumable."
+        );
+        assert!(!message.contains("tool"));
+        assert!(!message.contains("continuation"));
+    }
+
     use crate::backends::{AgentBackend, SessionStart};
 
     fn test_streaming_state() -> super::StreamingState {
@@ -2231,7 +2284,7 @@ impl ClaudeBackend {
                     }
 
                     // Check for turn completion
-                    if let ClaudeEvent::Result { is_error, .. } = &event {
+                    if let ClaudeEvent::Result { is_error, data, .. } = &event {
                         // The terminal-tool boundary interrupt's ack is the next
                         // Result after we sent it. Consume the expectation on any
                         // Result so it can never leak into a later turn's outcome.
@@ -2273,6 +2326,12 @@ impl ClaudeBackend {
                                     }),
                                 );
                             } else {
+                                insert_error_event(
+                                    orch,
+                                    run_id,
+                                    session_id.as_deref(),
+                                    terminal_result_error_message(data),
+                                );
                                 crate::orchestrator::lifecycle::finalize_run(
                                     orch,
                                     run_id,

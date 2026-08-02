@@ -106,6 +106,21 @@ pub enum WaitFor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phrase: Option<String>,
     },
+    /// A node's project check lanes reaching a state nothing will move further.
+    /// The condition an orchestrator waiting to merge a child's PR actually
+    /// holds, which before this was reachable only as a blind duration sleep
+    /// followed by a re-read (CAIRN-3437).
+    Checks {
+        kind: ChecksWaitKind,
+        #[serde(rename = "ref")]
+        reference: String,
+        on: ChecksWaitEvent,
+        /// The single suite an `on:"verdict"` wait watches. Absent for
+        /// `on:"settled"`, and skipped on the way back out for the same reason
+        /// the terminal phrase is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suite: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +141,21 @@ pub enum TerminalWaitKind {
 pub enum TerminalWaitEvent {
     Exit,
     Output,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChecksWaitKind {
+    Checks,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChecksWaitEvent {
+    /// Every applicable lane of the node has stopped moving.
+    Settled,
+    /// One named suite has stopped moving.
+    Verdict,
 }
 
 /// Structured args for a run item's target.
@@ -313,6 +343,8 @@ mod tests {
             serde_json::json!({"duration":25}),
             serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/tests","on":"exit"}),
             serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/dev","on":"output","phrase":"ready"}),
+            serde_json::json!({"kind":"checks","ref":"cairn://p/CAIRN/3427/1/builder/checks","on":"settled"}),
+            serde_json::json!({"kind":"checks","ref":"cairn:~/checks","on":"verdict","suite":"rust-tests"}),
         ] {
             let parsed: WaitFor = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);

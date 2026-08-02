@@ -188,6 +188,18 @@ pub(super) async fn read_project_check_results(
     }
 }
 
+/// A check observation is a forensic record — it gets read next to app logs and
+/// transcript turns — so its instants render on the host clock with the clock
+/// named. A bare epoch integer told the reader nothing; an unlabelled stamp
+/// would have invited them to read it on the wrong clock.
+fn seconds_stamp(timestamp: i64) -> String {
+    crate::clock::stamp_with_seconds(timestamp).unwrap_or_else(|| timestamp.to_string())
+}
+
+fn millis_stamp(millis: i64) -> String {
+    crate::clock::stamp_millis_with_seconds(millis).unwrap_or_else(|| millis.to_string())
+}
+
 fn render_observation(
     project: &str,
     revision: &str,
@@ -242,8 +254,11 @@ fn render_observation(
             "- Parser/schema: {}/{}",
             observation.parser_version, observation.result_schema_version
         ),
-        format!("- Evaluated at: {}", observation.evaluated_at),
-        format!("- Ran at: {}", observation.ran_at),
+        format!(
+            "- Evaluated at: {}",
+            seconds_stamp(observation.evaluated_at)
+        ),
+        format!("- Ran at: {}", seconds_stamp(observation.ran_at)),
         format!("- Duration: {} ms", observation.duration_ms),
         format!("- Cadence: {}", observation.cadence),
     ];
@@ -254,10 +269,13 @@ fn render_observation(
         body.push(format!("- Lease epoch: {epoch}"));
     }
     if let Some(started) = observation.executor_started_at_unix_ms {
-        body.push(format!("- Executor started at: {started}"));
+        body.push(format!("- Executor started at: {}", millis_stamp(started)));
     }
     if let Some(finished) = observation.executor_finished_at_unix_ms {
-        body.push(format!("- Executor finished at: {finished}"));
+        body.push(format!(
+            "- Executor finished at: {}",
+            millis_stamp(finished)
+        ));
     }
     for (label, value) in [
         (

@@ -156,6 +156,21 @@ pub(super) async fn connect_for_read(db: &LocalDb) -> Result<cairn_db::turso::Co
     Ok(conn)
 }
 
+/// The one-glyph rendering of a node's run state, shared by every surface that
+/// draws one. An unrecognized status renders `?` rather than borrowing the glyph
+/// of a state it might not be in: a node whose status Cairn cannot name is not
+/// thereby pending.
+pub(super) fn job_status_icon(status: &str) -> &'static str {
+    match status {
+        "complete" => "✓",
+        "running" => "◐",
+        "failed" => "✗",
+        "blocked" => "◼",
+        "pending" => "○",
+        _ => "?",
+    }
+}
+
 pub(super) fn resource_job_from_row(row: &cairn_db::turso::Row) -> DbResult<ResourceJob> {
     Ok(ResourceJob {
         id: row.text(0)?,

@@ -64,6 +64,10 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         settings.pending_memory_threshold
     ));
     out.push_str(&format!(
+        "- threadCompactThreshold: {}\n",
+        settings.thread_compact_threshold
+    ));
+    out.push_str(&format!(
         "- externalReplies: {:?}\n\n",
         settings.external_replies
     ));

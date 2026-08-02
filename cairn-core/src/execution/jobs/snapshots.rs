@@ -51,25 +51,6 @@ pub(super) async fn load_agent_snapshot_data(
     .map_err(|e| db_error("Failed to load execution snapshot", e))
 }
 
-/// Store a user event in the transcript.
-pub(crate) fn store_user_event(
-    orch: &Orchestrator,
-    run_id: &str,
-    session_id: &str,
-    content: &str,
-    now: i32,
-) -> Result<(), String> {
-    let current_turn = orch.process_state.get_current_turn_id(run_id);
-    store_user_event_with_turn(
-        orch,
-        run_id,
-        session_id,
-        content,
-        now,
-        current_turn.as_deref(),
-    )
-}
-
 fn store_transcript_event_with_turn(
     orch: &Orchestrator,
     run_id: &str,
@@ -162,6 +143,54 @@ pub(crate) fn store_seed_event_with_turn(
     store_user_like_event_with_turn(orch, run_id, session_id, content, now, turn_id, "user:seed")
 }
 
+/// Store a job's opening prompt as a `user:launch` event (CAIRN-3408).
+///
+/// Every path that seeds a fresh run's transcript with the prompt that job was
+/// started on routes here: the node launch, an ephemeral agent call and its
+/// restart, a sub-task, and a workflow invocation. None of that text was typed
+/// by the operator — it is composed from the issue's resolved inputs, or written
+/// by the agent that spawned the child — so it is stored under the namespaced
+/// type rather than plain `user`, and no projection that renders `user` as a
+/// person can reach it.
+pub fn store_launch_event_with_turn(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    content: &str,
+    now: i32,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    store_user_like_event_with_turn(
+        orch,
+        run_id,
+        session_id,
+        content,
+        now,
+        turn_id,
+        crate::transcripts::LAUNCH_EVENT_TYPE,
+    )
+}
+
+/// [`store_launch_event_with_turn`] against the run's current turn, for the
+/// launch paths that create their turn after seeding the transcript.
+pub(crate) fn store_launch_event(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    content: &str,
+    now: i32,
+) -> Result<(), String> {
+    let current_turn = orch.process_state.get_current_turn_id(run_id);
+    store_launch_event_with_turn(
+        orch,
+        run_id,
+        session_id,
+        content,
+        now,
+        current_turn.as_deref(),
+    )
+}
+
 /// Store a Cairn-synthesized resume nudge as a `user:continuation` event.
 ///
 /// A resume that carries no operator content at all — no message, no queued
@@ -191,8 +220,8 @@ pub fn store_continuation_event_with_turn(
 }
 
 /// Shared storage path for a user-slot transcript event (`user` and its
-/// `user:seed` / `user:continuation` siblings): build the `TranscriptEvent` with
-/// the given `event_type` and persist it.
+/// `user:seed` / `user:continuation` / `user:launch` siblings): build the
+/// `TranscriptEvent` with the given `event_type` and persist it.
 #[allow(clippy::too_many_arguments)]
 fn store_user_like_event_with_turn(
     orch: &Orchestrator,

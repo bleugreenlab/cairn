@@ -13,6 +13,11 @@ pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(
     KeyType::Str,
     "phase name (kind=phase) or log message (kind=log)",
 );
+pub(crate) const REBASE_RESOLUTION: KeySpec = KeySpec::new(
+    "resolution",
+    KeyType::Str,
+    "take-committed-tip — explicitly use the branch's committed tip content for the session's conflicting paths",
+);
 pub(crate) const OLD_STRING: KeySpec = KeySpec::new(
     "old_string",
     KeyType::Str,

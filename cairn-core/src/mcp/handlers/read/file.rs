@@ -1861,9 +1861,7 @@ async fn get_file_issue_history(
 
     let mut output = String::from("## Issue History\n\n");
     for row in rows {
-        let date = chrono::DateTime::from_timestamp(row.created_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| row.created_at.to_string());
+        let date = crate::clock::date(row.created_at).unwrap_or_else(|| row.created_at.to_string());
         output.push_str(&format!(
             "- **{}-{}:** {}\n",
             row.project_key, row.issue_number, row.issue_title

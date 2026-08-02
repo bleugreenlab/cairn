@@ -159,7 +159,7 @@ pub(super) async fn apply_node_memory_append(
         .parse::<crate::models::MemoryScope>()
         .map_err(|e| format!("payload.scope: {e}"))?;
 
-    let target_job_id = crate::resources::node::resolve_todos_job_id(
+    let target_job_id = crate::resources::node::resolve_node_or_task_job_id(
         &orch.db.local,
         target.project,
         target.number,

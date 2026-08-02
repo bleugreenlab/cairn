@@ -17,6 +17,25 @@ use crate::models::{
     ThinkingDisplayMode, TranscriptDensity, TranscriptTextSize, UpdateSettings,
 };
 
+/// Where a warm thread rebuilds by default: four fifths of the model's context
+/// window. High enough that an ordinary working session never reaches it, low
+/// enough to leave room for the turn that discovers it — the seed, the reply,
+/// and the tool results it pulls in all land after the reading that triggered.
+pub(crate) const DEFAULT_THREAD_COMPACT_THRESHOLD: f64 = 0.8;
+
+/// Keep the threshold inside the range where it means something.
+///
+/// At or below zero every warm turn would rebuild, which is the failure this
+/// setting exists to prevent; above one it can never fire and the window fills
+/// until the provider refuses the request. A NaN from hand-edited YAML reads as
+/// "unset" rather than poisoning every comparison it touches.
+pub(crate) fn clamp_compact_threshold(value: f64) -> f64 {
+    if !value.is_finite() {
+        return DEFAULT_THREAD_COMPACT_THRESHOLD;
+    }
+    value.clamp(0.1, 1.0)
+}
+
 /// Custom deserializer for max_thinking_tokens to distinguish between:
 /// - Field missing → None (should default to Some(31999))
 /// - Field set to null → Some(None) (explicitly disabled)
@@ -38,6 +57,7 @@ pub fn load_fleet(config_dir: &std::path::Path) -> crate::fleet::FleetConfig {
         .ok()
         .and_then(|file| file.fleet)
         .unwrap_or_default()
+        .healed()
 }
 
 /// Replace the runner-owned fleet capability in `settings.yaml` without
@@ -129,6 +149,9 @@ pub struct SettingsFile {
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     #[serde(default)]
     pending_memory_threshold: Option<i32>,
+    /// Fraction of the model's context window at which a warm thread session rebuilds.
+    #[serde(default)]
+    thread_compact_threshold: Option<f64>,
     /// How replies to the special `to: "external"` target are handled.
     #[serde(default)]
     external_replies: Option<ExternalReplyMode>,
@@ -354,6 +377,10 @@ impl SettingsFile {
                 .unwrap_or(1)
                 .max(1),
             pending_memory_threshold: self.pending_memory_threshold.unwrap_or(5).max(1),
+            thread_compact_threshold: clamp_compact_threshold(
+                self.thread_compact_threshold
+                    .unwrap_or(DEFAULT_THREAD_COMPACT_THRESHOLD),
+            ),
             external_replies: self
                 .external_replies
                 .clone()
@@ -393,6 +420,9 @@ impl SettingsFile {
                 settings.max_open_triage_issues_per_scope.max(1),
             ),
             pending_memory_threshold: Some(settings.pending_memory_threshold.max(1)),
+            thread_compact_threshold: Some(clamp_compact_threshold(
+                settings.thread_compact_threshold,
+            )),
             external_replies: Some(settings.external_replies.clone()),
             subscription_fees: if settings.subscription_fees.is_empty() {
                 None
@@ -853,6 +883,9 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.pending_memory_threshold {
         current.pending_memory_threshold = value.max(1);
+    }
+    if let Some(value) = input.thread_compact_threshold {
+        current.thread_compact_threshold = clamp_compact_threshold(value);
     }
     if let Some(value) = input.external_replies {
         current.external_replies = value;
@@ -2020,18 +2053,68 @@ buildSlots:
         assert!(fleet.remote_executors.is_empty());
     }
 
-    /// A settings file written before the wait horizon replaced the acquisition
-    /// deadline still loads, so an upgrade does not silently reset a machine's
-    /// tuning to the default.
+    /// The retired `acquisitionDeadlineSeconds` is IGNORED rather than adopted,
+    /// and a value below the floor is read as the leftover it is.
+    ///
+    /// This is the inverse of what this test once asserted, and the reversal is
+    /// the fix. The old assertion was that carrying the number forward avoided
+    /// "silently resetting a machine's tuning" — but the two keys never named
+    /// the same quantity. `acquisitionDeadlineSeconds` was a per-attempt queue
+    /// budget that a ten-minute executor-side pause compensated for; CAIRN-3268
+    /// made the field a TOTAL wait with no such compensation. Carrying 20 across
+    /// that rename did not preserve tuning, it cut the fleet's patience to 3% of
+    /// its intended value — and then `set_fleet` re-serialized it under the new
+    /// name, so nothing downstream could tell it from a number an operator had
+    /// chosen. Every check on that fleet abandoned its machine after twenty
+    /// seconds (CAIRN-3429). An alias migrates a spelling; it cannot migrate a
+    /// semantics, and pretending otherwise is worse than resetting to a default
+    /// the operator can see and change.
     #[test]
-    fn a_settings_file_naming_the_old_acquisition_deadline_still_loads() {
+    fn the_retired_acquisition_deadline_does_not_become_a_wait_horizon() {
         let file: SettingsFile = serde_yaml::from_str(
             "buildSlots:\n  acquisitionDeadlineSeconds: 15\n  defaultTimeoutSeconds: 1800\n",
         )
         .unwrap();
+        let fleet = file.fleet.as_ref().unwrap();
         assert_eq!(
-            file.fleet.as_ref().unwrap().capacity_wait_horizon_seconds,
-            15
+            fleet.capacity_wait_horizon_seconds, 600,
+            "the retired key names a quantity this field is not, so it supplies nothing"
+        );
+
+        // The already-laundered case: the number reached the new spelling before
+        // the alias was removed, so only the floor can still catch it.
+        let laundered: SettingsFile =
+            serde_yaml::from_str("buildSlots:\n  capacityWaitHorizonSeconds: 20\n").unwrap();
+        let laundered = laundered.fleet.unwrap();
+        assert!(
+            laundered.validate().is_err(),
+            "no new horizon this short can be written"
+        );
+        assert_eq!(
+            laundered.healed().capacity_wait_horizon_ms(),
+            600_000,
+            "a horizon too short to outlast one unit of work is not a policy anyone chose"
+        );
+    }
+
+    /// The heal happens on load, so the number the scheduler spends and the
+    /// number the operator sees in the Fleet editor are the same one. Reading a
+    /// 20 in a form whose save button then refuses it is its own small lie.
+    #[test]
+    fn a_leftover_horizon_is_healed_where_the_config_is_read() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            super::get_settings_path(temp.path()),
+            "buildSlots:\n  capacityWaitHorizonSeconds: 20\n  defaultTimeoutSeconds: 1800\n",
+        )
+        .unwrap();
+        let loaded = super::load_fleet(temp.path());
+        assert_eq!(loaded.capacity_wait_horizon_seconds, 600);
+        assert!(
+            loaded.validate().is_ok(),
+            "what load hands out must be something save would accept"
         );
     }
 
@@ -2084,7 +2167,7 @@ buildSlots:
         )
         .unwrap();
         let config = FleetConfig {
-            capacity_wait_horizon_seconds: 12,
+            capacity_wait_horizon_seconds: 120,
             default_timeout_seconds: 900,
             executor_policies: Default::default(),
             remote_executors: Default::default(),

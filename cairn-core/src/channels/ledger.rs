@@ -183,6 +183,25 @@ pub async fn mark_resolved(db: &LocalDb, id: &str, resolved_at: i64) -> Result<b
         .await.map(|changed| changed == 1).map_err(|error| error.to_string())
 }
 
+/// Abandons every intent this channel never delivered. The channel is a live tap
+/// on the ask event, so an intent that had not reached the provider by the time
+/// the session ended is dead rather than owed: re-sending it after a restart
+/// texts the operator prompts their agents have long since moved past. `sent`
+/// rows are deliberately left alone, because a reply to an ask that DID go out
+/// still binds to its provider GUID however long the operator takes.
+pub async fn expire_undelivered(
+    db: &LocalDb,
+    channel: &str,
+    expired_at: i64,
+) -> Result<u64, String> {
+    db.execute(
+        "UPDATE channel_outbound SET status = 'expired', resolved_at = ?2 WHERE channel = ?1 AND status IN ('pending', 'failed')",
+        params![channel.to_string(), expired_at],
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub async fn mark_failed(db: &LocalDb, id: &str, error: &str) -> Result<bool, String> {
     db.execute("UPDATE channel_outbound SET status = 'failed', last_error = ?2 WHERE id = ?1 AND status != 'resolved'", params![id.to_string(), error.to_string()])
         .await.map(|changed| changed == 1).map_err(|error| error.to_string())
@@ -311,6 +330,54 @@ mod tests {
         );
         assert!(mark_resolved(&db, "first", 12).await.unwrap());
         assert!(list_unresolved(&db, "imessage").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expiry_abandons_undelivered_intents_and_spares_delivered_ones() {
+        let db = migrated_test_db("channel-ledger-expiry.db").await;
+        for (id, binding) in [
+            ("never-sent", "prompt-1:0"),
+            ("send-errored", "prompt-2:0"),
+            ("on-the-phone", "prompt-3:0"),
+            ("answered", "prompt-4:0"),
+        ] {
+            let mut intent = intent(id);
+            intent.binding_ref = binding;
+            assert!(insert_intent(&db, &intent).await.unwrap());
+        }
+        assert!(mark_failed(&db, "send-errored", "executor offline")
+            .await
+            .unwrap());
+        assert!(mark_sent(&db, "on-the-phone", "guid-a", None, None, 11)
+            .await
+            .unwrap());
+        assert!(mark_sent(&db, "answered", "guid-b", None, None, 11)
+            .await
+            .unwrap());
+        assert!(mark_resolved(&db, "answered", 12).await.unwrap());
+
+        assert_eq!(expire_undelivered(&db, "imessage", 20).await.unwrap(), 2);
+
+        let unresolved = list_unresolved(&db, "imessage").await.unwrap();
+        assert_eq!(
+            unresolved
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["on-the-phone"],
+            "only an ask that actually reached the phone stays live"
+        );
+        // An expired intent keeps its fence, so the sweep can never resurrect it.
+        assert!(!insert_intent(&db, &intent("replay")).await.unwrap());
+        // A reply to an ask that did go out still binds after the session ends.
+        assert_eq!(
+            get_by_provider_guid(&db, "imessage", "guid-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "on-the-phone"
+        );
     }
 
     #[tokio::test]

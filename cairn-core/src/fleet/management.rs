@@ -19,6 +19,16 @@
 //!   machine means; removal is refused while anything is still running, queued,
 //!   or resident on it, and the check is repeated under the runner's own
 //!   mutation gate so an admission cannot slip in behind it.
+//! - **Removal cannot wait on the machine.** What a removal protects is work,
+//!   and a machine that never attached is holding none by construction. Every
+//!   remote call the runner makes is bounded, a supervisor that will not stop is
+//!   aborted rather than joined, and a machine demonstrably not there is named
+//!   in the result instead of blocking the operation. An enrollment must never
+//!   be made permanent by the unreachability of the machine it points at.
+//!   Demonstrably is the load-bearing word: overrunning a bound is not evidence
+//!   of absence — only the transport finishing and reporting that it could not
+//!   reach the host is — so a removal that cannot obtain that verdict refuses
+//!   rather than assuming the machine it cannot see is not there.
 //!
 //! Authorization belongs to each caller's own boundary, not to this module.
 //! `/api/invoke` carries a person, so it requires an owner or admin. The MCP
@@ -58,6 +68,15 @@ pub struct RemoteExecutorMutationResult {
     pub os: Option<String>,
     pub arch: Option<String>,
     pub attach_state: String,
+    /// What a removal could not finish on the remote host, when the host could
+    /// not be reached at all. `None` means nothing was left behind.
+    ///
+    /// A removal is a registry operation and completes whether or not the
+    /// machine cooperates, so this is the honest account of the courtesy that
+    /// did not happen — which is a different thing from the removal failing, and
+    /// every surface renders it rather than claiming a clean teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_remote_cleanup: Option<String>,
 }
 
 /// The runner-owned side of fleet management.
@@ -754,6 +773,10 @@ pub async fn rename(
 }
 
 /// Remove a machine and revoke its enrollment, once it is empty.
+///
+/// Bounded by construction: this returns with an outcome — removed, or refused
+/// with a reason — whether or not the machine is reachable, because both callers
+/// are foreground surfaces with a person behind them.
 pub async fn remove(
     orch: &Orchestrator,
     reference: &str,

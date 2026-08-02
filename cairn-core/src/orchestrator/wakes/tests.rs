@@ -270,6 +270,187 @@ async fn subscribe_one_shot_sets_flag_and_persists() {
         .any(|s| s.one_shot && s.source_ref.as_deref() == Some("run-1")));
 }
 
+/// A settled-checks subscription is keyed on the node's canonical `/checks`
+/// URI, so it wakes for that node and no other. The whole point of the
+/// subscription is to let an orchestrator end its turn while a child's suite
+/// runs; a cross-node match would resume it on a stranger's verdict.
+#[tokio::test(flavor = "current_thread")]
+async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
+    use crate::execution::checks_settlement::{classify, ChecksSnapshot, Settlement};
+    use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
+    use crate::messages::delivery::HeadTurn;
+
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    let orch = test_orchestrator(db);
+    let uri = "cairn://p/P/1/1/builder/checks";
+    subscribe_one_shot(
+        &orch.db.local,
+        "j",
+        "condition",
+        Some(uri),
+        Some(&["checks_settled".to_string()]),
+        "agent",
+    )
+    .await
+    .unwrap();
+
+    let statuses = vec![NodeCheckStatus {
+        name: "rust-tests".to_string(),
+        state: NodeCheckState::Failed,
+        policy: "advisory".to_string(),
+        when: "review".to_string(),
+        cached: None,
+        duration_ms: None,
+        ran_at: None,
+        passed: Some(38),
+        failed: Some(2),
+        skipped: None,
+        suite_failures: None,
+        failure_names: Vec::new(),
+        output_tail: None,
+        failure_kind: None,
+        suppressed_after: None,
+    }];
+    let snapshot = ChecksSnapshot {
+        settlement: classify(&statuses, HeadTurn::Idle, false),
+        statuses,
+    };
+    assert!(matches!(snapshot.settlement, Settlement::Settled { .. }));
+
+    let other = route_checks_settled(
+        &orch,
+        "builder",
+        "cairn://p/P/9/1/builder/checks",
+        &snapshot,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        other,
+        WakeRouteAction::Dropped,
+        "another node's lanes settling must not wake this subscriber"
+    );
+
+    let action = route_checks_settled(&orch, "builder", uri, &snapshot)
+        .await
+        .unwrap();
+    assert_eq!(action, WakeRouteAction::Delivered);
+
+    let subs = list_subscriptions_for_job(&orch.db.local, "j")
+        .await
+        .unwrap();
+    assert!(
+        !subs
+            .iter()
+            .any(|s| s.source_kind == "condition" && s.source_ref.as_deref() == Some(uri)),
+        "settlement is a moment, so its one-shot subscription must be consumed"
+    );
+}
+
+/// The subscribe-time read is the one settlement question asked with neither
+/// the routing edges' ordering nor the polling wait's dwell, so it is the one
+/// place the completion-to-arming window can be observed raw. A subscription
+/// landing inside another node's window sees every lane about to run as
+/// verdictless; firing on that would consume the one-shot row and wake the
+/// orchestrator before the checks ran, with nothing left for the correctly
+/// ordered edge to repair.
+#[test]
+fn a_verdictless_subscribe_time_reading_is_confirmed_rather_than_fired_on() {
+    use super::checks::immediate_fire;
+    use crate::execution::checks_settlement::{classify, Settlement};
+    use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
+    use crate::messages::delivery::HeadTurn;
+
+    let lane = |name: &str, state: NodeCheckState| NodeCheckStatus {
+        name: name.to_string(),
+        state,
+        policy: "advisory".to_string(),
+        when: "review".to_string(),
+        cached: None,
+        duration_ms: None,
+        ran_at: None,
+        passed: None,
+        failed: None,
+        skipped: None,
+        suite_failures: None,
+        failure_names: Vec::new(),
+        output_tail: None,
+        failure_kind: None,
+        suppressed_after: None,
+    };
+
+    // What a node caught between its turn completing and its wave arming looks
+    // like: idle, no wave in flight, every lane still without a verdict. It
+    // classifies as settled, and must NOT be fired on immediately.
+    let mid_arming = [lane("rust-tests", NodeCheckState::Pending)];
+    let settlement = classify(&mid_arming, HeadTurn::Idle, false);
+    assert!(matches!(settlement, Settlement::Settled { .. }));
+    assert!(
+        !immediate_fire(&settlement),
+        "a verdictless reading is indistinguishable from the arming window and must be confirmed first"
+    );
+
+    // Real verdicts are not ambiguous: nothing about that reading could be the
+    // arming window, so the subscriber is woken at once.
+    let settled = [
+        lane("rust-tests", NodeCheckState::Passed),
+        lane("frontend-tests", NodeCheckState::NotApplicable),
+    ];
+    assert!(immediate_fire(&classify(&settled, HeadTurn::Idle, false)));
+
+    // A node still moving was never a candidate either way.
+    let moving = [lane("rust-tests", NodeCheckState::Running)];
+    assert!(!immediate_fire(&classify(&moving, HeadTurn::Idle, true)));
+}
+
+/// The resume is what the orchestrator acts on, so it has to carry the verdict
+/// and the lanes rather than only a URI to go read.
+#[test]
+fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
+    use crate::execution::checks_settlement::{classify, ChecksSnapshot};
+    use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
+    use crate::messages::delivery::HeadTurn;
+
+    let lane = |name: &str, state: NodeCheckState| NodeCheckStatus {
+        name: name.to_string(),
+        state,
+        policy: "advisory".to_string(),
+        when: "review".to_string(),
+        cached: None,
+        duration_ms: None,
+        ran_at: None,
+        passed: None,
+        failed: None,
+        skipped: None,
+        suite_failures: None,
+        failure_names: Vec::new(),
+        output_tail: None,
+        failure_kind: None,
+        suppressed_after: None,
+    };
+    let statuses = vec![
+        lane("rust-lint", NodeCheckState::Pending),
+        lane("rust-tests", NodeCheckState::Passed),
+    ];
+    let snapshot = ChecksSnapshot {
+        settlement: classify(&statuses, HeadTurn::Idle, false),
+        statuses,
+    };
+    let uri = "cairn://p/P/1/1/builder/checks";
+    let message = format_checks_settled_message("builder", uri, &snapshot);
+
+    assert!(message.contains("[Checks settled]"));
+    assert!(message.contains("builder"));
+    assert!(message.contains("incomplete"));
+    assert!(message.contains(uri));
+    assert!(message.contains("- rust-tests [passed]"));
+    assert!(
+        message.contains("No verdict was produced for: rust-lint"),
+        "a lane nothing will run must be named, not silently absent: {message}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn terminal_exit_wake_fires_once_then_is_consumed() {
     let db = migrated_db().await;

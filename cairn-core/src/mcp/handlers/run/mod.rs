@@ -25,8 +25,9 @@ pub(crate) use process::{build_agent_spawn_config, cache_checkpoint_callback, MA
 pub(crate) use redact::redact_command;
 pub(crate) use sandbox_policy::{build_run_sandbox_policy, RunCheckout};
 pub use types::{
-    CheckStatusEntry, CheckStatusPayload, RunCompletePayload, RunItem, RunItemPayload,
-    RunOutputPayload, RunPayload, TerminalWaitEvent, TerminalWaitKind, WaitDuration, WaitFor,
+    CheckStatusEntry, CheckStatusPayload, ChecksWaitEvent, ChecksWaitKind, RunCompletePayload,
+    RunItem, RunItemPayload, RunOutputPayload, RunPayload, TerminalWaitEvent, TerminalWaitKind,
+    WaitDuration, WaitFor,
 };
 
 use crate::mcp::vcs::{acquire_store_lock, STORE_LOCK_TIMEOUT};

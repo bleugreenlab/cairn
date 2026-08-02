@@ -4,8 +4,8 @@ use cairn_db::turso::params;
 
 use super::common::{
     connect_for_read, get_todo_progress, has_artifact_for_job, has_terminal_for_job,
-    lookup_project_by_key, resource_job_from_row, storage_error, visible_job_node_segment,
-    ResourceJob, JOB_COLUMNS,
+    job_status_icon, lookup_project_by_key, resource_job_from_row, storage_error,
+    visible_job_node_segment, ResourceJob, JOB_COLUMNS,
 };
 
 use crate::issues::relations;
@@ -210,9 +210,8 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         .unwrap_or_default();
 
     // Format header
-    let created_date = chrono::DateTime::from_timestamp(created_at as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
+    let created_date =
+        crate::clock::date(created_at as i64).unwrap_or_else(|| "Unknown".to_string());
 
     // The kind is stated only when it is not the default, so an ordinary issue
     // reads exactly as it always did and a thread announces itself. Absence of
@@ -307,8 +306,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     if !comment_rows.is_empty() {
         output.push_str(&format!("## Comments ({})\n\n", comment_rows.len()));
         for (seq, content, source, comment_created_at) in &comment_rows {
-            let comment_date = chrono::DateTime::from_timestamp(*comment_created_at as i64, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            let comment_date = crate::clock::stamp(*comment_created_at as i64)
                 .unwrap_or_else(|| "Unknown".to_string());
             // `[#N]` is the per-issue comment seq: the addressable id for
             // `cairn://p/PROJECT/NUMBER/comments/N` (edit/delete).
@@ -427,14 +425,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
 
             let node_segment = visible_job_node_segment(&conn, job).await;
 
-            // Status icon
-            let status = match job.status.as_str() {
-                "complete" => "✓",
-                "running" => "◐",
-                "failed" => "✗",
-                "pending" => "○",
-                _ => "?",
-            };
+            let status = job_status_icon(&job.status);
 
             // Resource indicators
             let has_artifact = has_artifact_for_job(&conn, &job.id).await;
@@ -474,12 +465,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
                     .uri_segment
                     .clone()
                     .unwrap_or_else(|| "task".to_string());
-                let task_status = match task.status.as_str() {
-                    "complete" => "✓",
-                    "running" => "◐",
-                    "failed" => "✗",
-                    _ => "○",
-                };
+                let task_status = job_status_icon(&task.status);
                 let task_has_artifact = has_artifact_for_job(&conn, &task.id).await;
                 let task_indicator = if task_has_artifact { " 📄" } else { "" };
 
@@ -499,14 +485,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
             } else {
                 "│  ├─"
             };
-            let status_icon = match status.as_str() {
-                "complete" => "✓",
-                "running" => "◐",
-                "failed" => "✗",
-                "blocked" => "◼",
-                "pending" => "○",
-                _ => "?",
-            };
+            let status_icon = job_status_icon(status);
             output.push_str(&format!(
                 "{} `{}`[{}]\n",
                 prefix,
@@ -594,9 +573,7 @@ async fn resolve_issue_id_for_comments(
 }
 
 fn render_comment(comment: &crate::models::Comment, uri: &str) -> String {
-    let date = chrono::DateTime::from_timestamp(comment.created_at, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
+    let date = crate::clock::stamp(comment.created_at).unwrap_or_else(|| "Unknown".to_string());
     let mut out = format!("### comment {}\n", comment.seq);
     // Surface the addressable member URI inline so a reader of the collection
     // can patch (edit content) or delete this specific comment.

@@ -581,8 +581,7 @@ async fn catchup_operator_digest(
         .iter()
         .rev()
         .map(|message| {
-            let when = chrono::DateTime::from_timestamp(message.timestamp, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            let when = crate::clock::stamp(message.timestamp)
                 .unwrap_or_else(|| "unknown time".to_string());
             let state = if message.read_by_node {
                 String::new()
@@ -1978,6 +1977,94 @@ mod tests {
         assert!(
             rendered.contains("scope change: also ship the producer"),
             "{rendered}"
+        );
+    }
+
+    /// Insert the child job's launch event on its opening turn, in the shape
+    /// production stores it now that launch prompts are namespaced.
+    async fn add_launch_event(db: &LocalDb, turn_id: &str, seq: i64, content: &str) {
+        let turn_id = turn_id.to_string();
+        let data = serde_json::json!({
+            "eventType": crate::transcripts::LAUNCH_EVENT_TYPE,
+            "sessionId": "sess2",
+            "content": content,
+        })
+        .to_string();
+        db.write(move |conn| {
+            let turn_id = turn_id.clone();
+            let data = data.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
+                     VALUES(?1,'sess2','run-1',?2,'completed',1,1)",
+                    params![turn_id.as_str(), seq],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES(?1,'run-1',?2,?3,1,?4,?5,1)",
+                    params![
+                        format!("launch-{turn_id}"),
+                        turn_id.as_str(),
+                        seq,
+                        crate::transcripts::LAUNCH_EVENT_TYPE,
+                        data.as_str()
+                    ],
+                )
+                .await?;
+                Ok::<(), crate::storage::DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The CAIRN-3408 specimen, end to end through the surface that produced it.
+    ///
+    /// A thread files a child, so the child's launch prompt IS the thread's own
+    /// issue description. The thread then gets a passive catch-up whose window
+    /// opens at turn 1 (`offset=0`, what a brand-new child's cursor resolves to).
+    /// What must come back is the operator's message and no trace of the body the
+    /// recipient itself wrote — under threads that echo is a per-turn context tax
+    /// paid forever.
+    #[tokio::test]
+    async fn rendered_catchup_never_echoes_the_recipients_own_launch_prompt() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        add_launch_event(&db, "t1", 1, LAUNCH_PROMPT).await;
+        add_chat_turn(&db, "t2", 2).await;
+        record_operator_send(&db, "q-1", 300, "u dont need to cd prefix").await;
+        let content_ref = format!("{}/chat?offset=0", child_node_uri());
+        let orch = test_orchestrator(db);
+        let push = crate::orchestrator::attention_push::Push {
+            id: "push-1".into(),
+            recipient: "watcher".into(),
+            content_ref: content_ref.clone(),
+            wake: Wake::Passive,
+            boundary: Boundary::Event,
+            key: "catchup:child-job".into(),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(
+            rendered.contains("u dont need to cd prefix"),
+            "the one genuinely operator-authored message must arrive: {rendered}"
+        );
+        let launch_head = LAUNCH_PROMPT.lines().next().unwrap();
+        assert!(
+            !rendered.contains(launch_head),
+            "the recipient authored this launch prompt; catch-up must not quote it back: {rendered}"
+        );
+        assert!(
+            !rendered.contains("**User:**"),
+            "nothing in this window was typed by a user: {rendered}"
+        );
+        assert!(
+            rendered.contains(crate::transcripts::LAUNCH_MARKER_LINE),
+            "the launch turn should still be accounted for, just not quoted: {rendered}"
         );
     }
 

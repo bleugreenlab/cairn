@@ -47,6 +47,15 @@ pub(crate) enum Condition {
         on: TerminalWaitEvent,
         phrase: Option<String>,
     },
+    /// A node's project check lanes settling. The job id is resolved once, when
+    /// the wait is armed, so a restart re-arms against the same node rather than
+    /// re-resolving a URI whose node may since have been renamed or archived.
+    Checks {
+        uri: String,
+        job_id: String,
+        /// The single suite watched, or `None` for the whole node.
+        suite: Option<String>,
+    },
     /// A `run` batch that outlived its grace window. Unlike the wait conditions
     /// there is nothing to poll: the trigger is the awaited executor result,
     /// held in memory by the host that suspended. A restart therefore cannot
@@ -91,6 +100,10 @@ impl Condition {
                 };
                 format!("waitFor: terminal {slug} {on}")
             }
+            Condition::Checks { suite: None, .. } => "waitFor: checks settled".to_string(),
+            Condition::Checks {
+                suite: Some(suite), ..
+            } => format!("waitFor: checks verdict {suite}"),
             Condition::McpContinuation { state } => format!("MCP: {}/{}", state.server, state.tool),
             Condition::RunBatch {
                 label: Some(label), ..
@@ -1310,7 +1323,9 @@ async fn resolution_after_restart(
             orch.cancel_cell_request(request_id);
             super::run::run_batch_lost_to_restart_text(*commits)
         }
-        Condition::Duration | Condition::Terminal { .. } => {
+        // Level-triggered conditions re-arm from their own durable state, so a
+        // restart simply asks them again.
+        Condition::Duration | Condition::Terminal { .. } | Condition::Checks { .. } => {
             match super::owned_wait::trigger(orch.clone(), db.clone(), record.clone()).await {
                 Ok(result) => result,
                 Err(error) => serde_json::json!({"outcome":"error","error":error}).to_string(),

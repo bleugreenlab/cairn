@@ -54,7 +54,7 @@ pub async fn dispatch_tool(
     let content = dispatch_with_dedup(orch, request, read_cursors).await;
     let mut reminders = Vec::new();
     augment_with_queued_dms(orch, request, &mut reminders).await;
-    augment_with_terminal_poll_nudge(orch, request, &mut reminders).await;
+    augment_with_poll_nudge(orch, request, &mut reminders).await;
     DispatchOutput { content, reminders }
 }
 
@@ -446,8 +446,8 @@ fn canonical_json(value: &serde_json::Value) -> String {
     out
 }
 
-/// Nudge an agent that is busy-polling a still-running terminal toward setting a
-/// wake and ending its turn.
+/// Nudge an agent that is busy-polling a still-moving resource -- a running
+/// terminal, or a node's unsettled check lanes -- toward waiting on it instead.
 ///
 /// A terminal read can never trip the content-aware flail dedup: its status
 /// banner carries `elapsed`/`last output ... ago` fields that advance on every
@@ -463,7 +463,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
 /// as a `<system-reminder>`, leaving the structured read envelope untouched, and
 /// never blocks the read: the agent always gets the live terminal output plus the
 /// reminder, so a single confirming read is never penalized.
-async fn augment_with_terminal_poll_nudge(
+async fn augment_with_poll_nudge(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
     reminders: &mut Vec<String>,
@@ -471,13 +471,11 @@ async fn augment_with_terminal_poll_nudge(
     let Some(run_id) = request.run_id.as_deref() else {
         return;
     };
-    // Early-out on the hot path: only a read carrying a terminal target is a
-    // candidate. Collect terminal targets from the read-batch (`paths`) and
-    // single-read (`uri`/`path`) payload shapes; non-terminal calls return here.
+    // Collect targets from the read-batch (`paths`) and single-read
+    // (`uri`/`path`) payload shapes; a call naming neither kind costs two
+    // prefix scans and nothing else.
     let targets = collect_terminal_targets(&request.payload);
-    if targets.is_empty() {
-        return;
-    }
+    augment_with_checks_poll_nudge(orch, run_id, &request.payload, reminders).await;
 
     for (identity, slug) in targets {
         // Content-independent: key on the query-stripped identity so `?new=true`
@@ -499,10 +497,110 @@ async fn augment_with_terminal_poll_nudge(
     }
 }
 
-/// Collect distinct terminal read targets from a tool payload as
-/// `(query-stripped identity, slug)` pairs. Reads the read-batch `paths` array
-/// and the single-read `uri`/`path` fields; any non-terminal target is skipped.
-fn collect_terminal_targets(payload: &serde_json::Value) -> Vec<(String, String)> {
+/// Nudge an agent that is busy-polling a node's check lanes toward waiting on
+/// them instead.
+///
+/// The same call-count signal the terminal nudge uses, and for the same reason:
+/// a `/checks` render carries a running lane's live log tail, so its content
+/// changes on every poll and no content-equality dedup can catch the loop. This
+/// is the read the specimen in CAIRN-3437 was stuck in.
+async fn augment_with_checks_poll_nudge(
+    orch: &crate::orchestrator::Orchestrator,
+    run_id: &str,
+    payload: &serde_json::Value,
+    reminders: &mut Vec<String>,
+) {
+    let targets = collect_checks_targets(payload);
+    if targets.is_empty() {
+        return;
+    }
+    let Some(job_id) = crate::messages::side_channel::job_id_for_run(&orch.db.local, run_id).await
+    else {
+        return;
+    };
+    let home = crate::jobs::queries::home_uri_for_job(&orch.db.local, &job_id)
+        .await
+        .ok()
+        .flatten();
+    for identity in targets {
+        let fingerprint = format!("checks_poll\u{1}{identity}");
+        let count = orch.process_state.record_repeat(run_id, &fingerprint);
+        if count < TERMINAL_POLL_NUDGE_COUNT || !count.is_multiple_of(TERMINAL_POLL_NUDGE_COUNT) {
+            continue;
+        }
+        let Ok(coords) =
+            crate::execution::checks_settlement::checks_coords(&identity, home.as_deref())
+        else {
+            continue;
+        };
+        // Already waiting on this node the right way -> a confirming read is
+        // not a poll loop.
+        if checks_wake_active(orch, &job_id, &coords.canonical).await {
+            continue;
+        }
+        // A node reading its OWN lanes cannot wait on them inline: the wave is
+        // armed by its turn ENDING. The wake is the only shape that serves it,
+        // so that is the only one offered.
+        let own = home
+            .as_deref()
+            .is_some_and(|home| coords.canonical == format!("{home}/checks"));
+        log::info!(
+            "checks_poll_nudge: run={run_id} checks={} count={count}",
+            coords.canonical
+        );
+        reminders.push(build_checks_poll_nudge(&coords.canonical, own, count));
+    }
+}
+
+/// Whether the agent's job already holds an active settled-checks subscription
+/// on this node. Fail-open, like [`terminal_wake_active`]: the only failure
+/// direction is a nudge that fires when it need not have.
+async fn checks_wake_active(
+    orch: &crate::orchestrator::Orchestrator,
+    job_id: &str,
+    checks_uri: &str,
+) -> bool {
+    let (job_id, checks_uri) = (job_id.to_string(), checks_uri.to_string());
+    orch.db
+        .local
+        .read(move |conn| {
+            let (job_id, checks_uri) = (job_id.clone(), checks_uri.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM wake_subscriptions
+                         WHERE job_id = ?1 AND state = 'active'
+                           AND source_kind = 'condition' AND source_ref = ?2
+                         LIMIT 1",
+                        cairn_db::turso::params![job_id.as_str(), checks_uri.as_str()],
+                    )
+                    .await?;
+                Ok(rows.next().await?.is_some())
+            })
+        })
+        .await
+        .unwrap_or(false)
+}
+
+/// Build the checks-poll nudge: name the node and the poll count, then give the
+/// copy-pasteable call that actually waits.
+fn build_checks_poll_nudge(checks_uri: &str, own: bool, count: u32) -> String {
+    let head = format!(
+        "You've read `{checks_uri}` {count} times this turn and its lanes haven't settled. Polling spends the current turn waiting, and re-reading the same URI can also be suppressed as a duplicate call."
+    );
+    if own {
+        return format!(
+            "{head}\n\nThese are your OWN lanes, and your turn-end wave is armed by this turn ENDING \u{2014} so no inline wait can ever see it settle. Subscribe and end your turn:\n  write({{changes:[{{target:\"cairn:~/wakes\",mode:\"append\",payload:{{subscribe:{{kind:\"checks\"}}}}}}]}})"
+        );
+    }
+    format!(
+        "{head}\n\nWait for every lane to settle:\n  run({{commands:[{{waitFor:{{kind:\"checks\",ref:\"{checks_uri}\",on:\"settled\"}}}}]}})\n\nWait for one suite:\n  run({{commands:[{{waitFor:{{kind:\"checks\",ref:\"{checks_uri}\",on:\"verdict\",suite:\"<name>\"}}}}]}})\n\nUse `cairn:~/wakes` ({{subscribe:{{kind:\"checks\",ref:\"{checks_uri}\"}}}}) only if your turn is otherwise complete and you want a later notification. Do not keep reading the checks resource."
+    )
+}
+
+/// Every read target named by a tool payload, across the read-batch (`paths`)
+/// and single-read (`uri`/`path`) shapes.
+fn read_targets(payload: &serde_json::Value) -> Vec<String> {
     let mut raw: Vec<String> = Vec::new();
     if let Some(paths) = payload.get("paths").and_then(|value| value.as_array()) {
         raw.extend(
@@ -516,9 +614,37 @@ fn collect_terminal_targets(payload: &serde_json::Value) -> Vec<(String, String)
             raw.push(target.to_string());
         }
     }
+    raw
+}
 
+/// Collect distinct checks read targets from a tool payload, query-stripped.
+///
+/// Deliberately syntactic: the coordinates are only resolved once a target has
+/// actually crossed the poll threshold, so the hot path costs a prefix test.
+fn collect_checks_targets(payload: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for target in read_targets(payload) {
+        let identity = target.split('?').next().unwrap_or(&target).trim();
+        let names_checks = identity == "cairn:~/checks"
+            || matches!(
+                cairn_common::uri::parse_uri(identity),
+                Some(
+                    cairn_common::uri::CairnResource::NodeChecks { .. }
+                        | cairn_common::uri::CairnResource::TaskChecks { .. }
+                )
+            );
+        if names_checks && !out.iter().any(|existing| existing == identity) {
+            out.push(identity.to_string());
+        }
+    }
+    out
+}
+
+/// Collect distinct terminal read targets from a tool payload as
+/// `(query-stripped identity, slug)` pairs. Any non-terminal target is skipped.
+fn collect_terminal_targets(payload: &serde_json::Value) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for target in raw {
+    for target in read_targets(payload) {
         if let Some((identity, slug)) = terminal_identity_and_slug(&target) {
             // The same terminal listed twice in one call is one read of it.
             if !out.iter().any(|(existing, _)| existing == &identity) {
@@ -1074,7 +1200,7 @@ mod tests {
         request: &McpCallbackRequest,
     ) -> Vec<String> {
         let mut reminders = Vec::new();
-        augment_with_terminal_poll_nudge(orch, request, &mut reminders).await;
+        augment_with_poll_nudge(orch, request, &mut reminders).await;
         reminders
     }
 

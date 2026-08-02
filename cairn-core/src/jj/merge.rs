@@ -669,6 +669,21 @@ pub fn rebase_branch_onto(
     branch: &str,
     dest: &str,
 ) -> Result<RebaseOutcome, String> {
+    rebase_branch_onto_with_resolution(jj, store, branch, dest, &[])
+}
+
+/// Rebase a branch while honoring an explicitly identified committed resolution.
+///
+/// `resolution_paths` is supplied only by the explicit durable conflict-session
+/// replay operation. A normal automatic rebase passes no paths and retains the
+/// fail-closed rollback behavior.
+pub(crate) fn rebase_branch_onto_with_resolution(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest: &str,
+    resolution_paths: &[String],
+) -> Result<RebaseOutcome, String> {
     // Captured immediately before the rebase, so the restore window covers
     // exactly this one rebase and no sibling's.
     let pre_op = operation_id(jj, store)?;
@@ -679,6 +694,46 @@ pub fn rebase_branch_onto(
         &["rebase", "-b", branch, "-o", dest, "--ignore-working-copy"],
         "jj rebase",
     )?;
+
+    if branch_has_conflict(jj, store, branch)? && !resolution_paths.is_empty() {
+        let resolution = pre_tip
+            .as_deref()
+            .ok_or_else(|| format!("resolved rebase: branch `{branch}` had no pre-rebase tip"))?;
+        let branch_revset = format!("bookmarks(exact:{branch:?})");
+        let mut args = vec![
+            "restore",
+            "--from",
+            resolution,
+            "--into",
+            &branch_revset,
+            "--ignore-working-copy",
+            "--",
+        ];
+        args.extend(resolution_paths.iter().map(String::as_str));
+        if let Err(error) = jj.run(store, &args, "jj restore (committed conflict resolution)") {
+            restore_operation(jj, store, &pre_op).map_err(|rollback| {
+                format!(
+                    "resolved rebase of `{branch}` failed while applying the committed tip ({error}), and rollback to {pre_op} also failed: {rollback}"
+                )
+            })?;
+            export_bookmark_advance(
+                jj,
+                store,
+                true,
+                branch,
+                "jj git export (failed resolved rebase rolled back)",
+            )?;
+            return Err(format!(
+                "resolved rebase of `{branch}` failed while applying the committed tip and was rolled back: {error}"
+            ));
+        }
+        if !branch_has_conflict(jj, store, branch)? {
+            log::info!(
+                "jj rebase: honored committed tip resolution for `{branch}` on {} path(s)",
+                resolution_paths.len()
+            );
+        }
+    }
 
     if branch_has_conflict(jj, store, branch)? {
         // Everything the rollback is about to erase is read HERE, in the only
