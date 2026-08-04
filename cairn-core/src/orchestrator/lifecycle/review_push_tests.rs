@@ -1,4 +1,4 @@
-use super::review_push::{capacity_rearm_candidates, spawn_turn_end_checks};
+use super::review_push::{bounded_rearm_candidates, spawn_turn_end_checks};
 use super::{create_review_push_for_pr_open, evaluate_review_readiness};
 use crate::db::DbState;
 use crate::orchestrator::attention_push::{
@@ -18,27 +18,17 @@ async fn test_db() -> LocalDb {
 }
 
 #[tokio::test]
-async fn capacity_rearm_selects_only_retryable_review_work() {
+async fn bounded_rearm_selects_retryable_review_work() {
     let db = test_db().await;
     seed(&db, "initial").await;
     insert_artifact(&db, "create-pr", 1).await;
-    insert_failed_check(&db, "infrastructure", 1).await;
+    insert_failed_check(&db, "infrastructure", 0).await;
 
     let orch = test_orchestrator(db);
-    assert!(capacity_rearm_candidates(&orch.db)
-        .await
-        .unwrap()
-        .is_empty());
-
-    orch.db
-        .local
-        .execute("UPDATE check_result_cache SET failure_kind='capacity'", ())
-        .await
-        .unwrap();
     assert_eq!(
-        capacity_rearm_candidates(&orch.db).await.unwrap()[0].job_id,
+        bounded_rearm_candidates(&orch.db).await.unwrap()[0].job_id,
         "j-prod",
-        "time-relieved capacity is eligible while structural infrastructure is not"
+        "transient infrastructure failures are eligible below the retry bound"
     );
 
     orch.db
@@ -50,14 +40,14 @@ async fn capacity_rearm_selects_only_retryable_review_work() {
         .await
         .unwrap();
     assert_eq!(
-        capacity_rearm_candidates(&orch.db).await.unwrap(),
+        bounded_rearm_candidates(&orch.db).await.unwrap(),
         Vec::new(),
         "the scheduler must not route around the persisted retry bound"
     );
 }
 
 #[tokio::test]
-async fn stale_capacity_input_is_not_a_rearm_candidate_after_a_newer_result() {
+async fn stale_bounded_input_is_not_a_rearm_candidate_after_a_newer_result() {
     let db = test_db().await;
     seed(&db, "initial").await;
     insert_artifact(&db, "create-pr", 1).await;
@@ -74,14 +64,14 @@ async fn stale_capacity_input_is_not_a_rearm_candidate_after_a_newer_result() {
     let orch = test_orchestrator(db);
 
     assert_eq!(
-        capacity_rearm_candidates(&orch.db).await.unwrap(),
+        bounded_rearm_candidates(&orch.db).await.unwrap(),
         Vec::new(),
         "rowid breaks equal-second ties, so an older capacity input on the same tree cannot remain latest"
     );
 }
 
 #[tokio::test]
-async fn capacity_rearm_enumerates_open_team_databases() {
+async fn bounded_rearm_enumerates_open_team_databases() {
     let local = test_db().await;
     let team = test_db().await;
     seed(&team, "initial").await;
@@ -92,7 +82,7 @@ async fn capacity_rearm_enumerates_open_team_databases() {
         .register_team_db_for_test("team-a".to_string(), Arc::new(team))
         .await;
 
-    let candidates = capacity_rearm_candidates(&orch.db).await.unwrap();
+    let candidates = bounded_rearm_candidates(&orch.db).await.unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].job_id, "j-prod");
 }

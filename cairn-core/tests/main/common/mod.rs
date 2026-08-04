@@ -170,7 +170,7 @@ pub fn attach_test_executor(orch: &Orchestrator) {
 /// machine and watch what a batch with nowhere to run does about it.
 pub fn attach_capacity_limited_test_executor(
     orch: &Orchestrator,
-    concurrency_units: u32,
+    memory_budget_bytes: u64,
     max_queue_entries: usize,
 ) {
     attach_executor(
@@ -181,7 +181,7 @@ pub fn attach_capacity_limited_test_executor(
         "test-executor",
         Vec::new(),
         AdmissionLimits {
-            concurrency_units,
+            memory_budget_bytes: Some(memory_budget_bytes),
             max_queue_entries,
             ..AdmissionLimits::default()
         },

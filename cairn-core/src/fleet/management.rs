@@ -64,7 +64,9 @@ const RETAINED_TERMINAL_OPERATIONS: usize = 8;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteExecutorMutationResult {
-    pub config: RemoteExecutorConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<RemoteExecutorConfig>,
+    pub display_name: String,
     pub os: Option<String>,
     pub arch: Option<String>,
     pub attach_state: String,
@@ -185,6 +187,8 @@ pub struct EnrollmentOperation {
     pub id: String,
     /// The public name the machine will answer to, and the name its URI uses.
     pub name: String,
+    pub host: String,
+    pub executor_id: String,
     pub uri: String,
     pub phase: EnrollmentPhase,
     pub started_at_unix_ms: u64,
@@ -257,13 +261,15 @@ impl EnrollmentOperations {
     /// two records sharing an id would send both progress handles to the first
     /// one, stranding the second at `validating` forever. A stranded operation
     /// is never terminal, so it is also never evicted.
-    pub fn start(&self, name: &str) -> EnrollmentOperation {
+    pub fn start(&self, name: &str, host: &str, executor_id: &str) -> EnrollmentOperation {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let now = unix_time_ms();
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let operation = EnrollmentOperation {
             id: format!("enroll-{now}-{sequence}-{name}"),
             name: name.to_string(),
+            host: host.to_string(),
+            executor_id: executor_id.to_string(),
             uri: format!("cairn://executors/{name}"),
             phase: EnrollmentPhase::Validating,
             started_at_unix_ms: now,
@@ -346,6 +352,21 @@ impl EnrollmentOperations {
             .iter()
             .rfind(|entry| executor_names_match(&entry.name, name))
             .cloned()
+    }
+
+    fn forget_identity(&self, reference: &str) -> Vec<EnrollmentOperation> {
+        let mut entries = self.entries.lock().unwrap();
+        let mut removed = Vec::new();
+        entries.retain(|entry| {
+            let matches = executor_names_match(&entry.name, reference)
+                || entry.host.eq_ignore_ascii_case(reference)
+                || entry.executor_id == reference;
+            if matches {
+                removed.push(entry.clone());
+            }
+            !matches
+        });
+        removed
     }
 }
 
@@ -487,7 +508,9 @@ pub fn removal_refusal(occupancy: ExecutorOccupancy, name: &str) -> Result<(), S
 pub fn resolve_executor_reference(orch: &Orchestrator, reference: &str) -> Result<String, String> {
     let configured = crate::config::settings::load_fleet(&orch.config_dir);
     if let Some(config) = configured.remote_executors.values().find(|config| {
-        executor_names_match(&config.display_name, reference) || config.executor_id == reference
+        executor_names_match(&config.display_name, reference)
+            || config.host.eq_ignore_ascii_case(reference)
+            || config.executor_id == reference
     }) {
         return Ok(config.executor_id.clone());
     }
@@ -500,11 +523,20 @@ pub fn resolve_executor_reference(orch: &Orchestrator, reference: &str) -> Resul
     }) {
         return Ok(inspection.health.identity.executor_id.clone());
     }
+    let operations = orch.fleet.management().operations.all();
+    if let Some(operation) = operations.iter().rev().find(|operation| {
+        executor_names_match(&operation.name, reference)
+            || operation.host.eq_ignore_ascii_case(reference)
+            || operation.executor_id == reference
+    }) {
+        return Ok(operation.executor_id.clone());
+    }
     let mut known: Vec<_> = configured
         .remote_executors
         .values()
         .filter_map(|config| normalize_executor_name(&config.display_name))
         .chain(attached.iter().map(|inspection| inspection.name.clone()))
+        .chain(operations.iter().map(|operation| operation.name.clone()))
         .collect();
     known.sort();
     known.dedup();
@@ -716,7 +748,9 @@ pub async fn enroll(
     // Fail before an operation exists if there is nothing to run it, so a
     // caller is not handed an id that will never move.
     management.lifecycle()?;
-    let operation = management.operations.start(&name);
+    let operation = management
+        .operations
+        .start(&name, &declaration.host, &declaration.executor_id);
     let progress = management.operations.progress(&operation.id);
     let started = EnrollmentStarted {
         operation_id: operation.id.clone(),
@@ -784,12 +818,65 @@ pub async fn remove(
     let executor_id = resolve_executor_reference(orch, reference)?;
     let name = public_name(orch, &executor_id);
     refuse_removal_while_occupied(orch, &executor_id, &name)?;
+    let configured = crate::config::settings::load_fleet(&orch.config_dir)
+        .remote_executors
+        .contains_key(&executor_id);
+    let attached = orch
+        .fleet
+        .inspect_executors(unix_time_ms())
+        .iter()
+        .any(|inspection| inspection.health.identity.executor_id == executor_id);
+    if !configured && !attached {
+        let operation = orch
+            .fleet
+            .management()
+            .operations
+            .all()
+            .into_iter()
+            .rev()
+            .find(|operation| operation.executor_id == executor_id)
+            .ok_or_else(|| format!("no removable enrollment is named {reference}"))?;
+        if !operation.phase.is_terminal() {
+            return Err(format!(
+                "{} is still enrolling; wait for it to finish before removing it",
+                operation.name
+            ));
+        }
+        if operation.phase != EnrollmentPhase::Failed
+            || operation.cleanup != EnrollmentCleanup::Complete
+        {
+            return Err(format!(
+                "{} has no configured machine to remove, and its enrollment record is not a failed attempt with completed rollback",
+                operation.name
+            ));
+        }
+        orch.fleet
+            .management()
+            .operations
+            .forget_identity(&executor_id);
+        orch.fleet.forget_enrolled_remote(&executor_id);
+        let _ = orch.services.emitter.emit_empty(ENROLLMENT_CHANGED_EVENT);
+        return Ok(RemoteExecutorMutationResult {
+            config: None,
+            display_name: operation.name,
+            os: None,
+            arch: None,
+            attach_state:
+                "removed failed enrollment; no remote cleanup was needed because rollback completed"
+                    .into(),
+            unverified_remote_cleanup: None,
+        });
+    }
     let result = orch
         .fleet
         .management()
         .lifecycle()?
         .remove(&executor_id)
         .await?;
+    orch.fleet
+        .management()
+        .operations
+        .forget_identity(&executor_id);
     let _ = orch.services.emitter.emit_empty(ENROLLMENT_CHANGED_EVENT);
     Ok(result)
 }
@@ -799,6 +886,97 @@ pub async fn remove(
 /// The settings write happens first so a restart keeps the policy, and is rolled
 /// back if the live application is refused — a persisted policy the running
 /// executor never accepted is a lie the next reader would believe.
+/// Activate a placement profile and atomically apply its effective runtime policies.
+///
+/// The profile becomes durable before live application. If any attached executor
+/// refuses its new policy, already-updated executors and the settings document are
+/// restored before the error is returned, so operators never observe a partially
+/// active mode.
+pub async fn activate_placement_profile(
+    orch: &Orchestrator,
+    name: &str,
+) -> Result<crate::fleet::FleetConfig, String> {
+    let mut next = crate::config::settings::load_fleet(&orch.config_dir);
+    next.activate_placement_profile(name)?;
+    apply_placement_profile_config(orch, next, name).await
+}
+
+pub async fn apply_placement_profile_config(
+    orch: &Orchestrator,
+    next: crate::fleet::FleetConfig,
+    name: &str,
+) -> Result<crate::fleet::FleetConfig, String> {
+    let previous = crate::config::settings::load_fleet(&orch.config_dir);
+    let attached = orch.fleet.inspect_executors(unix_time_ms());
+    let mut changes = Vec::new();
+    for executor in attached {
+        let executor_id = executor.health.identity.executor_id;
+        let device_id = executor.health.identity.device_id;
+        let generation = orch
+            .fleet
+            .managed_generation(&executor_id, &device_id)
+            .ok_or_else(|| {
+                format!("executor {executor_id} changed generation during profile activation")
+            })?;
+        let baseline = |config: &crate::fleet::FleetConfig| {
+            config
+                .executor_policies
+                .get(&executor_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let old_policy = previous
+            .active_placement_profile()
+            .executor_policy_overrides
+            .get(&executor_id)
+            .cloned()
+            .unwrap_or_else(|| baseline(&previous));
+        let new_policy = next
+            .active_placement_profile()
+            .executor_policy_overrides
+            .get(&executor_id)
+            .cloned()
+            .unwrap_or_else(|| baseline(&next));
+        if old_policy != new_policy {
+            changes.push((executor_id, generation, old_policy, new_policy));
+        }
+    }
+
+    crate::config::settings::set_fleet(&orch.config_dir, &next)?;
+    let mut applied: Vec<(String, u64, ExecutorRuntimePolicy)> = Vec::new();
+    for (executor_id, generation, old_policy, new_policy) in &changes {
+        if let Err(error) = orch
+            .fleet
+            .set_executor_runtime_policy(executor_id, *generation, new_policy.clone())
+            .await
+        {
+            let mut rollback_errors = Vec::new();
+            for (applied_id, applied_generation, applied_policy) in applied.into_iter().rev() {
+                if let Err(rollback) = orch
+                    .fleet
+                    .set_executor_runtime_policy(&applied_id, applied_generation, applied_policy)
+                    .await
+                {
+                    rollback_errors.push(format!("{applied_id}: {rollback}"));
+                }
+            }
+            if let Err(rollback) = crate::config::settings::set_fleet(&orch.config_dir, &previous) {
+                rollback_errors.push(format!("settings: {rollback}"));
+            }
+            let suffix = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; rollback also failed for {}", rollback_errors.join(", "))
+            };
+            return Err(format!(
+                "failed to apply placement profile {name} to executor {executor_id}: {error}{suffix}"
+            ));
+        }
+        applied.push((executor_id.clone(), *generation, old_policy.clone()));
+    }
+    Ok(next)
+}
+
 pub async fn set_runtime_policy(
     orch: &Orchestrator,
     reference: &str,
@@ -874,6 +1052,27 @@ pub fn ensure_current_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DbState;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+
+    async fn test_orchestrator(config_dir: &std::path::Path) -> Orchestrator {
+        let local = LocalDb::open(config_dir.join("management.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            std::sync::Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        Orchestrator::builder(
+            std::sync::Arc::new(DbState::new(std::sync::Arc::new(local), search)),
+            std::sync::Arc::new(TestServicesBuilder::new().build()),
+            config_dir.to_path_buf(),
+        )
+        .build()
+    }
 
     fn request(host: &str) -> EnrollmentRequest {
         EnrollmentRequest {
@@ -927,9 +1126,11 @@ mod tests {
     #[test]
     fn finished_operations_are_bounded_and_in_flight_ones_are_never_evicted() {
         let operations = EnrollmentOperations::default();
-        let live = operations.start("still-going");
+        let live = operations.start("still-going", "still-going.example", "still-going-id");
         for index in 0..(RETAINED_TERMINAL_OPERATIONS + 4) {
-            let operation = operations.start(&format!("done-{index}"));
+            let name = format!("done-{index}");
+            let operation =
+                operations.start(&name, &format!("{name}.example"), &format!("{name}-id"));
             operations.record(&operation.id, EnrollmentPhase::Ready, None, None);
         }
 
@@ -952,8 +1153,8 @@ mod tests {
     #[test]
     fn same_name_enrollments_started_together_stay_distinguishable() {
         let operations = std::sync::Arc::new(EnrollmentOperations::default());
-        let first = operations.start("bglab-ub");
-        let second = operations.start("bglab-ub");
+        let first = operations.start("bglab-ub", "bglab-ub.local", "bglab-ub-id");
+        let second = operations.start("bglab-ub", "bglab-ub.local", "bglab-ub-id");
         assert_ne!(first.id, second.id);
 
         operations
@@ -974,8 +1175,8 @@ mod tests {
     #[test]
     fn a_failure_that_could_not_roll_back_is_a_different_state_than_one_that_did() {
         let operations = std::sync::Arc::new(EnrollmentOperations::default());
-        let clean = operations.start("clean");
-        let dirty = operations.start("dirty");
+        let clean = operations.start("clean", "clean.invalid", "clean-id");
+        let dirty = operations.start("dirty", "dirty.invalid", "dirty-id");
         let handle = |id: &str| operations.progress(id);
 
         handle(&clean.id).failed("host refused the key", EnrollmentCleanup::Complete);
@@ -991,6 +1192,37 @@ mod tests {
         assert_eq!(clean.cleanup, EnrollmentCleanup::Complete);
         assert_eq!(dirty.phase, EnrollmentPhase::RetryRemoveRequired);
         assert_eq!(dirty.cleanup, EnrollmentCleanup::Incomplete);
+    }
+
+    #[tokio::test]
+    async fn removing_a_displayed_bare_failure_clears_every_fleet_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let operations = &orch.fleet.management().operations;
+        let operation = operations.start("Build host", "178.156.196.213", "build-host-id");
+        operations.record(
+            &operation.id,
+            EnrollmentPhase::Failed,
+            Some("attach failed".into()),
+            Some(EnrollmentCleanup::Complete),
+        );
+        orch.fleet
+            .declare_enrolled_remote("build-host-id", "Build host", "linux", "x86_64");
+
+        for reference in ["Build host", "178.156.196.213", "build-host-id"] {
+            assert_eq!(
+                resolve_executor_reference(&orch, reference).unwrap(),
+                "build-host-id"
+            );
+        }
+
+        let result = remove(&orch, "Build host").await.unwrap();
+
+        assert_eq!(result.display_name, "Build host");
+        assert!(result.config.is_none());
+        assert!(operations.all().is_empty());
+        assert!(orch.fleet.unattached_enrolled_remotes().is_empty());
+        assert!(resolve_executor_reference(&orch, "Build host").is_err());
     }
 
     #[test]

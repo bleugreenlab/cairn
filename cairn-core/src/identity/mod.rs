@@ -523,6 +523,36 @@ impl IdentityStore {
         self.resolve(project_id, Some(&overrides))
     }
 
+    pub(crate) fn resolve_with_provider_account(
+        &self,
+        backend: &str,
+        account_id: &str,
+    ) -> Option<UserIdentity> {
+        let (provider, overrides) = match backend {
+            "claude" => (
+                ApiProvider::Anthropic,
+                AccountOverrides {
+                    anthropic_account_id: Some(account_id.to_string()),
+                    ..Default::default()
+                },
+            ),
+            "codex" => (
+                ApiProvider::OpenAI,
+                AccountOverrides {
+                    openai_account_id: Some(account_id.to_string()),
+                    ..Default::default()
+                },
+            ),
+            _ => return None,
+        };
+        self.accounts_for_provider(provider, None)
+            .into_iter()
+            .find(|account| {
+                account.id == account_id && account.compatible_backends().contains(&backend)
+            })?;
+        Some(self.resolve(None, Some(&overrides)))
+    }
+
     /// Get the default git identity (first by sort order).
     fn default_git_identity(&self) -> Option<&GitIdentity> {
         self.git_identities.iter().min_by_key(|g| g.sort_order)
@@ -697,6 +727,26 @@ impl From<&ProviderAccount> for AccountInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_provider_account_is_exact_and_never_falls_back() {
+        let mut store = test_store();
+        let mut first = test_account(ApiProvider::OpenAI, api_key_auth("first-key"));
+        first.id = "first".into();
+        let mut requested = test_account(ApiProvider::OpenAI, api_key_auth("requested-key"));
+        requested.id = "requested".into();
+        store.accounts = vec![first, requested];
+
+        let identity = store
+            .resolve_with_provider_account("codex", "requested")
+            .unwrap();
+        assert!(
+            matches!(identity.codex_auth, Some(CodexAuth::ApiKey(ref key)) if key == "requested-key")
+        );
+        assert!(store
+            .resolve_with_provider_account("codex", "missing")
+            .is_none());
+    }
 
     #[test]
     fn codex_auth_value_oauth() {

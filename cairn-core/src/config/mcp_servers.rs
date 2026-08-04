@@ -791,14 +791,14 @@ args: ["@playwright/mcp@latest"]
         // re-emit it as `null` (= disabled). The surgical edit must not.
         std::fs::write(
             &path,
-            "# Cairn Workspace Settings\nbranchPrefix: feature\nmergeType: rebase\n",
+            "# Cairn Workspace Settings\nlogLevel: verbose\nmergeType: rebase\n",
         )
         .unwrap();
 
         upsert_workspace_mcp_server(ws.path(), "axon", &axon_config()).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("branchPrefix: feature"));
+        assert!(raw.contains("logLevel: verbose"));
         assert!(raw.contains("mergeType: rebase"));
         assert!(raw.contains("axon"));
         // The bug we are guarding against: no maxThinkingTokens was added.

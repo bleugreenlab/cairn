@@ -27,6 +27,9 @@ pub use context::{
     try_resolve_mr_context_for_job, MergeMrContext, MrContext, PrNodeResolution,
 };
 pub(crate) use create_pr::sync_create_pr_artifact_for_job;
-pub use merge::{merge_pr_for_job, reconcile_after_merge};
+pub use merge::{merge_pr_for_job, reconcile_after_merge, CheckoutReconciliation};
 pub use refresh::{close_pr_for_job, refresh_pr_for_job, render_live_pr_section};
-pub use resolution::{advance_producing_execution_after_pr_resolution, resolve_pr_node};
+pub use resolution::{
+    advance_producing_execution_after_pr_resolution, ensure_unjournaled_merge_observation,
+    latest_resolution_attribution, resolve_pr_node, PrResolutionAttribution,
+};

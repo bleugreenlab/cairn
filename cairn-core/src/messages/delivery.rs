@@ -688,6 +688,7 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
 /// stamps every pending item (notices, queued messages, pushes); this function
 /// only decides whether to resume and carries no prompt of its own.
 pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
+    let timing_started = std::time::Instant::now();
     let db = match run_db_blocking({
         let dbs = orch.db.clone();
         let run_id = run_id.to_string();
@@ -704,10 +705,24 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
         }
     };
     let Some(pending) = collect_pending_for_flush(&db, run_id) else {
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("idle_flush_decision")
+            .elapsed(timing_started);
+        event.run_id = Some(run_id);
+        event.mode = Some("skip");
+        event.emit();
         return;
     };
 
+    let mut event =
+        crate::resume_timing::ResumeTimingEvent::new("idle_flush_decision").elapsed(timing_started);
+    event.run_id = Some(run_id);
+    event.job_id = Some(&pending.job_id);
+    event.mode = Some("resume");
+    event.count = Some(pending.queued_count);
+    event.emit();
+
     let short = &pending.job_id[..pending.job_id.len().min(8)];
+    let handoff_started = std::time::Instant::now();
     match crate::execution::jobs::continue_job_impl(orch, &pending.job_id, None, None, None) {
         Ok(_) => log::info!(
             "flush-on-idle: resumed job {} ({} side-channel notice(s), {} queued user message(s); directs/pushes delivered by the resume)",
@@ -717,6 +732,11 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
         ),
         Err(e) => log::warn!("flush-on-idle: failed to resume job {}: {}", short, e),
     }
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("continue_job_handoff")
+        .elapsed(handoff_started);
+    event.run_id = Some(run_id);
+    event.job_id = Some(&pending.job_id);
+    event.emit();
 }
 
 /// Nudge a job after a pending row has been durably persisted according to the
@@ -730,6 +750,10 @@ pub fn nudge_job_for_urgency(
     job_id: &str,
     urgency: DeliveryUrgency,
 ) -> Result<(), String> {
+    let mut timing_event = crate::resume_timing::ResumeTimingEvent::new("queue_nudge");
+    timing_event.job_id = Some(job_id);
+    timing_event.mode = Some(urgency.as_str());
+    timing_event.emit();
     if !urgency.wakes_idle() {
         return Ok(());
     }

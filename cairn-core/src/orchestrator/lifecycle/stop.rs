@@ -153,6 +153,7 @@ fn fail_pending_run_tool_results(
             tool_result: Some(USER_STOP_TOOL_RESULT.to_string()),
             is_error: true,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(serde_json::json!({ "synthetic": true, "reason": "user_stop" })),
         };
         let data = serde_json::to_string(&event).unwrap_or_default();
@@ -242,7 +243,7 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_
 
     let result = match state.as_str() {
         "running" => interrupt_turn(orch, &turn_id, Some(TurnEndReason::UserStop)),
-        "pending" => apply_turn_outcome(
+        "pending" | "yielded" => apply_turn_outcome(
             orch,
             &turn_id,
             TurnState::Cancelled,

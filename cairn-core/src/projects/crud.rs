@@ -4,7 +4,7 @@ use crate::models::CreateProject;
 use crate::services::Clock;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_common::ids;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// Full project creation: DB insert + filesystem setup.
@@ -63,6 +63,85 @@ pub async fn create(
     }
 
     Ok(db_project)
+}
+
+/// The single repository answer for project-scoped Git and GitHub operations.
+///
+/// Portable project metadata comes from the owning database, while the checkout
+/// path is resolved through this machine's private route overlay for team projects.
+pub struct ProjectRepository {
+    pub db: Arc<LocalDb>,
+    pub project_id: String,
+    pub project_key: String,
+    pub local_repo_path: PathBuf,
+    pub remote_url: Option<String>,
+    pub default_branch: String,
+    pub is_workspace: bool,
+}
+
+pub async fn resolve_project_repository(
+    dbs: &crate::db::DbState,
+    project_id: &str,
+    config_dir: &Path,
+) -> Result<ProjectRepository, CairnError> {
+    let db = owning_db(dbs, project_id).await?;
+    let project = get_db(&db, project_id)
+        .await?
+        .ok_or_else(|| CairnError::NotFound {
+            entity: "project",
+            id: project_id.to_string(),
+        })?;
+    let local_path = resolve_local_repo_path(dbs, &project.id, &project.key, &project.repo_path)
+        .await?
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| {
+            CairnError::Internal(format!(
+                "project {} has no checkout registered on this machine",
+                project.key
+            ))
+        })?;
+    let local_repo_path = PathBuf::from(local_path);
+    validate_project_checkout(&local_repo_path, config_dir)?;
+    let remote_url = remote_url(&db, project_id)
+        .await?
+        .map(|url| crate::projects::remote::normalize_remote_url(&url))
+        .transpose()?;
+
+    Ok(ProjectRepository {
+        db,
+        project_id: project.id,
+        project_key: project.key,
+        local_repo_path,
+        remote_url,
+        default_branch: project.default_branch.unwrap_or_else(|| "main".to_string()),
+        is_workspace: project.is_workspace != 0,
+    })
+}
+
+fn validate_project_checkout(path: &Path, config_dir: &Path) -> Result<(), CairnError> {
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(CairnError::Internal(format!(
+            "registered project checkout is unavailable: {}",
+            path.display()
+        )));
+    }
+    let canonical = path.canonicalize()?;
+    let config = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    if canonical.starts_with(config.join("scratch"))
+        || canonical.starts_with(config.join("build-slots"))
+        || canonical.starts_with(config.join("executions"))
+        || canonical
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if name == "build-slots"))
+    {
+        return Err(CairnError::Internal(format!(
+            "registered project checkout points into disposable execution storage: {}",
+            canonical.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Ensure a local project repository has at least one commit so git worktrees can branch from it.
@@ -897,6 +976,22 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+    }
+
+    #[test]
+    fn project_checkout_validation_rejects_disposable_and_missing_paths() {
+        let home = std::env::var_os("HOME").expect("tests require a home directory");
+        let root = tempfile::tempdir_in(home).unwrap();
+        let config = root.path().join(".cairn");
+        let scratch = config.join("scratch/job/repo");
+        let build_slot = root.path().join("build-slots/slot/repo");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&build_slot).unwrap();
+
+        assert!(validate_project_checkout(&scratch, &config).is_err());
+        assert!(validate_project_checkout(&build_slot, &config).is_err());
+        assert!(validate_project_checkout(&root.path().join("missing"), &config).is_err());
+        assert!(validate_project_checkout(root.path(), &config).is_ok());
     }
 
     #[tokio::test]

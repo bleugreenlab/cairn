@@ -495,6 +495,7 @@ fn codex_tool_result_event(
         tool_result: Some(tool_result),
         is_error,
         thinking_ms: None,
+        queued_message_id: None,
         raw,
     }
 }
@@ -667,6 +668,7 @@ impl CodexBackend {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         };
         store_event(
@@ -935,6 +937,7 @@ impl CodexBackend {
                                     tool_result: None,
                                     is_error: false,
                                     thinking_ms: None,
+                                    queued_message_id: None,
                                     raw: None,
                                 };
                                 store_event(
@@ -991,6 +994,7 @@ impl CodexBackend {
                                     tool_result: None,
                                     is_error: false,
                                     thinking_ms: None,
+                                    queued_message_id: None,
                                     raw: None,
                                 };
                                 store_event(
@@ -1051,6 +1055,7 @@ impl CodexBackend {
                                     tool_result: None,
                                     is_error: false,
                                     thinking_ms: None,
+                                    queued_message_id: None,
                                     raw: None,
                                 };
                                 store_event(
@@ -1256,6 +1261,7 @@ impl CodexBackend {
                                 tool_result: None,
                                 is_error: false,
                                 thinking_ms: None,
+                                queued_message_id: None,
                                 raw: None,
                             };
                             store_event(

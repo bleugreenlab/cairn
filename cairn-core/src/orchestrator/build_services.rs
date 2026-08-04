@@ -158,6 +158,13 @@ fn build_service_spawn_config(
 
     let mut config = SpawnConfig::new(program)
         .args(args.iter().cloned())
+        // A foreground service keeps its cwd for its whole lifetime. Never let
+        // it inherit the runner's cwd: the installed app directory is replaced
+        // during rebuilds and build-slot directories are reclaimed after a
+        // batch, either of which leaves rustc unable to resolve the daemon's
+        // working directory. The persistent state directory already exists
+        // before launch and is writable inside the service sandbox.
+        .cwd(&state_dir.to_string_lossy())
         .sandbox(sandbox);
     // A daemon manages its own lifetime; don't hold its stdio pipes open.
     config.capture_stdout = false;
@@ -760,58 +767,6 @@ fn listener_temp_dir_live(control: &dyn ListenerProcessControl, addr: &str) -> b
     })
 }
 
-/// How many compiles the daemon must have run ITSELF before "not one of them
-/// succeeded" is evidence about the daemon rather than about the code.
-///
-/// The counters cannot say WHY a compile the daemon ran returned non-zero:
-/// sccache scores a denied output write and a genuine type error identically
-/// (measured — a server-side `Operation not permitted` reaches the client as
-/// exit 1, byte-identical to a compiler error; see `scripts/cache-wrapper.sh`).
-/// What separates them is the company they keep. A real cargo build compiles
-/// dozens of registry dependencies before it ever reaches code anyone edited,
-/// so a daemon that is working produces successes long before it accumulates
-/// this many failures, whatever state the tree is in. A floor this low is
-/// crossed within seconds of a real breakage; a floor at all is what keeps two
-/// hand-run broken compiles from accusing a healthy daemon.
-const UNSERVICEABLE_COMPILE_FLOOR: u64 = 8;
-
-/// Whether the daemon's own counters say it cannot do the one thing only it can
-/// do, with the sentence that says so.
-///
-/// A cache miss is not served from disk — the DAEMON runs that compile, in its
-/// own process, under its own sandbox grant and its own temp directory. That is
-/// the only work whose success depends on the daemon's environment rather than
-/// on the build's, and it is therefore the only work whose failure a build can
-/// do nothing about. When every one of those fails, the daemon is not a slow
-/// cache; it is a process that takes compiles and destroys them, and it does it
-/// while answering `--show-stats` in eleven milliseconds.
-///
-/// This is what "healthy" failed to mean for a whole day: a daemon launched by a
-/// runner two days older than the grant fix held the port, failed 228 of the 230
-/// compiles it executed, and reported HEALTHY throughout, because liveness was
-/// the entire predicate (CAIRN-3355). Liveness is a claim about a socket.
-/// Health has to be a claim about work.
-///
-/// Deliberately silent about partial failure. A daemon that serves one Cairn
-/// home and denies another has successes, so it does not raise this and its
-/// counters are left to an operator to read — which is why
-/// [`CompileCacheStats::compile_failures`] is reported on the panel whether or
-/// not this fires.
-///
-/// **This is a question, not a verdict.** The counters cannot tell a denied
-/// output write from a genuine compiler error, and one realistic shape produces
-/// exactly this reading on a perfectly healthy daemon: a warm cache where every
-/// dependency HITS (hits do not increment `compilations`) while the one crate
-/// being edited misses, executes, and fails to compile because its source is
-/// broken. Iterate on that crate eight times and a working daemon looks like the
-/// incident. Cache hits do not rescue the distinction either — measured, a hit's
-/// outputs are written by the CLIENT, so a hit proves nothing about whether the
-/// daemon can write anywhere at all. Only [`prove_daemon_cannot_compile`] can
-/// answer what this asks.
-fn compiles_look_unserviceable(stats: &CompileCacheStats) -> bool {
-    stats.compile_failures >= UNSERVICEABLE_COMPILE_FLOOR && stats.compilations == 0
-}
-
 /// Where the capability probe compiles to.
 ///
 /// Inside a managed build root, because the daemon's grant over those roots is
@@ -858,9 +813,8 @@ const CAPABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 ///
 /// Returns `Some(reason)` only when the daemon is PROVEN unable to compile.
 ///
-/// This exists because the counters raise a question they cannot answer (see
-/// [`compiles_look_unserviceable`]). Rather than sharpen a statistic until it
-/// looks decisive, this performs the experiment: hand the daemon a crate whose
+/// Rather than infer capability from statistics, this performs the experiment:
+/// hand the daemon a crate whose
 /// source is ours and trivially valid, ask it to write the output into a managed
 /// build root, and see what happens. A genuine compiler error is impossible for
 /// that source, so a failure is about the daemon and nothing else.
@@ -1007,23 +961,11 @@ fn assess_service(
             return observation;
         }
     }
-    // The round trip that just proved liveness also carries the counters, so
-    // reading them costs nothing. They only ever raise the question; an
-    // unparseable report raises none, and leaves the daemon alone.
-    let suspect = observation
-        .round_trip
-        .as_ref()
-        .and_then(|round_trip| parse_cache_stats(&round_trip.stdout))
-        .is_some_and(|stats| compiles_look_unserviceable(&stats));
-    if !suspect {
-        return observation;
-    }
     let Some((cfg, templates)) = capability else {
         return observation;
     };
-    // Only an experiment can separate a daemon that cannot write from a crate
-    // that does not compile, so the counters buy exactly one thing: permission
-    // to spend a compile finding out.
+    // Liveness is not fitness. Prove the daemon can write this runner's managed
+    // build root before any client environment is allowed to route work to it.
     if let Some(reason) = prove_daemon_cannot_compile(spawner, cfg, templates, env) {
         observation.health = ServiceHealth::Wedged;
         observation.unfit = Some(reason);
@@ -1444,6 +1386,10 @@ pub struct BuildServiceRuntimeDiagnostic {
     pub(crate) lifecycle: Option<String>,
     pub(crate) supervised_pid: Option<u32>,
     pub(crate) launched_at_unix_ms: Option<u64>,
+    /// Identity of the supervisor that launched the current child.
+    pub(crate) launcher_cairn_home: Option<String>,
+    pub(crate) launcher_pid: Option<u32>,
+    pub(crate) launcher_confined: Option<bool>,
     /// What the last health round trip did, in one bounded line.
     pub(crate) last_probe: Option<String>,
     /// How a supervised child was last observed to end, and when. Learned from
@@ -1801,17 +1747,28 @@ impl Orchestrator {
             // above only stops one runner from racing itself, while the four
             // runners this machine actually runs race each other for the same
             // port. Held for the whole reconcile, released on drop.
-            let _owned =
-                match lock_service_machine_wide(&machine_lock_path(&cfg, &templates, &name)) {
-                    ReconcileOwnership::HeldElsewhere => {
-                        log::debug!("build service '{name}' is being reconciled by another runner");
-                        continue;
-                    }
-                    ReconcileOwnership::Owned(lock) => Some(lock),
-                    // Losing the lock costs coordination, never supervision.
-                    ReconcileOwnership::Unavailable => None,
-                };
-            self.reconcile_build_service(&name, &cfg, &templates, deny_read.clone());
+            let _owned = match lock_service_machine_wide(&machine_lock_path(
+                &cfg, &templates, &name,
+            )) {
+                ReconcileOwnership::HeldElsewhere => {
+                    log::debug!("build service '{name}' is being reconciled by another runner");
+                    continue;
+                }
+                ReconcileOwnership::Owned(lock) => Some(lock),
+                ReconcileOwnership::Unavailable => {
+                    log::warn!(
+                            "build service '{name}' reconcile lock is unavailable; refusing to launch without machine-wide ownership"
+                        );
+                    continue;
+                }
+            };
+            self.reconcile_build_service(
+                &name,
+                &cfg,
+                &templates,
+                deny_read.clone(),
+                !sandbox::current_process_is_confined(),
+            );
         }
     }
 
@@ -1830,6 +1787,7 @@ impl Orchestrator {
         cfg: &BuildServiceConfig,
         templates: &Templates,
         deny_read: Vec<PathBuf>,
+        may_launch: bool,
     ) {
         let now_ms = unix_ms();
         let may_destroy;
@@ -1976,6 +1934,23 @@ impl Orchestrator {
             state.next_attempt_unix_ms = Some(now_ms + wait.as_millis() as u64);
         }
 
+        if !may_launch {
+            log::warn!(
+                "build service '{name}' is {health_name}, but runner pid {} under {} is confined; refusing machine-wide daemon recovery or launch",
+                std::process::id(),
+                templates.cairn_home.display()
+            );
+            let mut diagnostics = self.build_service_runtime.lock().unwrap();
+            let state = diagnostics.entry(name.to_string()).or_default();
+            state.current_failure = Some(
+                "this runner is confined and may not launch the machine-wide build service"
+                    .to_string(),
+            );
+            state.failure_config = Some(service_config_fingerprint(cfg));
+            state.enter("degraded", now_ms);
+            return;
+        }
+
         if observation.health == ServiceHealth::Wedged {
             if !may_destroy {
                 log::warn!(
@@ -2030,10 +2005,14 @@ impl Orchestrator {
                 }
                 state.current_failure = None;
                 state.failure_config = None;
-                // A new incarnation is not the old one's verdict. Its counters
-                // start at zero, so the unfitness finding they produced retires
-                // with them rather than condemning a daemon nothing has judged.
-                state.unfit = None;
+                // A freshly launched daemon is not routable merely because spawn
+                // succeeded. Keep clients on direct rustc until the next tick's
+                // capability compile proves this incarnation can write a managed
+                // build root. An adopted daemon was proved by the reconcile probe.
+                state.unfit = pid.is_some().then(|| {
+                    "the newly launched daemon has not yet proved it can compile into a managed build root"
+                        .to_string()
+                });
                 state.restart_count += 1;
                 // A new incarnation means the daemon's counters restarted at
                 // zero. Retiring the sample with the generation is what keeps a
@@ -2046,6 +2025,9 @@ impl Orchestrator {
                 );
                 state.supervised_pid = pid;
                 state.launched_at_unix_ms = Some(unix_ms());
+                state.launcher_cairn_home = Some(templates.cairn_home.display().to_string());
+                state.launcher_pid = Some(std::process::id());
+                state.launcher_confined = Some(false);
                 // Launched, NOT proven. A spawn that succeeds says nothing about
                 // whether the daemon serves; the next tick's probe decides, and
                 // only that clears the attempt streak. Declaring health here is
@@ -2470,6 +2452,7 @@ mod tests {
         let cfg = default_sccache_service();
         let config = build_service_spawn_config(&cfg, &templates(), vec![]).unwrap();
         assert_eq!(config.program, "sccache");
+        assert_eq!(config.cwd.as_deref(), Some("/home/u/.cache/sccache-cairn"));
         // Bare `sccache`: the foreground server is selected via SCCACHE_START_SERVER
         // (launch env below), not a `--start-server` arg.
         assert!(config.args.is_empty());
@@ -3640,62 +3623,8 @@ Max cache size                       50 GiB
         );
         assert_eq!(observation.health, ServiceHealth::Healthy);
         assert_eq!(observation.unfit, None);
-        // Counters that raise no question spend no compile: the mock spawner
-        // above answers everything with a statistics report, so a probe would
-        // have been read as a successful compile and gone unnoticed. The point
-        // is that it never ran.
-    }
-
-    /// What the counters may and may not be asked.
-    ///
-    /// They raise a question; they never answer one. sccache scores a denied
-    /// output write and a genuine type error identically, so the only shape worth
-    /// spending a probe on is "many run, none finished".
-    #[test]
-    fn the_counters_raise_the_question_only_where_it_is_worth_asking() {
-        let with = |compilations, compile_failures| CompileCacheStats {
-            compile_requests: 500,
-            compiles_executed: compilations + compile_failures,
-            compilations,
-            compile_failures,
-            ..CompileCacheStats::default()
-        };
-
-        assert!(compiles_look_unserviceable(&with(0, 228)));
-
-        // A tree full of genuine compile errors still compiles its dependencies,
-        // so successes accompany the failures and there is nothing to ask.
-        assert!(!compiles_look_unserviceable(&with(140, 228)));
-
-        // Below the floor, "none succeeded" is a sample size, not a question.
-        assert!(!compiles_look_unserviceable(&with(
-            0,
-            UNSERVICEABLE_COMPILE_FLOOR - 1
-        )));
-
-        // A daemon serving purely from cache executes nothing, which is the
-        // healthiest state there is — and the one a naive "zero compilations"
-        // test would condemn.
-        assert!(!compiles_look_unserviceable(&CompileCacheStats {
-            compile_requests: 4_000,
-            cache_hits: 4_000,
-            ..CompileCacheStats::default()
-        }));
-
-        // THE FALSE POSITIVE THIS DESIGN EXISTS TO SURVIVE. A warm cache where
-        // every dependency hits, while the one crate being edited misses and
-        // fails to compile because its source is broken, produces the incident's
-        // exact counters on a perfectly healthy daemon. The counters still raise
-        // the question here — they cannot tell — which is precisely why raising
-        // it may not condemn anything by itself.
-        assert!(compiles_look_unserviceable(&CompileCacheStats {
-            compile_requests: 900,
-            cache_hits: 850,
-            compiles_executed: 8,
-            compilations: 0,
-            compile_failures: 8,
-            ..CompileCacheStats::default()
-        }));
+        // Fitness is proved even when the counters look healthy; statistics are
+        // not permission to route a compile.
     }
 
     /// A build pointed at a daemon Cairn has watched fail is told so, and

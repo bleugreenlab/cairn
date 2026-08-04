@@ -546,7 +546,10 @@ async fn output_wake_fires_when_process_exits_before_phrase() {
         "r-1",
     )
     .await;
-    assert!(out.contains("watching output for"), "{out}");
+    assert!(
+        out.contains("watching output for") || out.contains("already exited before"),
+        "{out}"
+    );
 
     // The process exits (code 3) before ever printing "neverphrase". The exit must
     // consume the output-phrase subscription so the waiting agent is woken.

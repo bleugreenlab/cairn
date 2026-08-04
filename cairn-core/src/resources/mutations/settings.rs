@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use crate::config::build_services::BuildServiceConfig;
-use crate::config::keybinds::Modifier;
+use crate::config::keybinds::KeySequence;
 use crate::config::settings;
 use crate::identity::{ApiProvider, ProviderAuth};
 use crate::mcp::types::{ChangeItem, ChangeMode};
@@ -19,10 +19,8 @@ use cairn_common::uri::{parse_uri, CairnResource};
 
 /// Scalar/app-pref + backend keys that route to `orch.update_settings`.
 const PREF_KEYS: &[&str] = &[
-    "branchPrefix",
     "maxThinkingTokens",
     "mergeType",
-    "pullOnMerge",
     "orphanCleanupDays",
     "repoTargetSweepDays",
     "bugReports",
@@ -249,23 +247,19 @@ pub(super) async fn apply_settings_patch(
     // --- Keybinds ---
     if let Some(section) = obj.get("keybinds") {
         let mut count = 0;
+        let mut candidate = orch.get_keybinds();
         for item in array(section, "set")? {
             let action = require_str(item, "action")?;
-            let key = opt_str(item, "key").unwrap_or_default();
-            let modifiers: Vec<Modifier> = match item.get("modifiers") {
+            let sequence: KeySequence = match item.get("sequence") {
                 None | Some(Value::Null) => Vec::new(),
                 Some(value) => serde_json::from_value(value.clone())
-                    .map_err(|error| format!("invalid modifiers: {error}"))?,
+                    .map_err(|error| format!("invalid key sequence: {error}"))?,
             };
-            if !dry_run {
-                orch.set_keybind(&action, key, modifiers)?;
-            }
+            candidate.set_keybind(&action, sequence)?;
             count += 1;
         }
         for action in string_array(section, "reset")? {
-            if !dry_run {
-                orch.reset_keybind(&action)?;
-            }
+            candidate.remove_keybind(&action)?;
             count += 1;
         }
         if section
@@ -273,10 +267,11 @@ pub(super) async fn apply_settings_patch(
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            if !dry_run {
-                orch.reset_all_keybinds()?;
-            }
+            candidate.reset();
             count += 1;
+        }
+        if !dry_run {
+            orch.save_keybinds(&candidate)?;
         }
         summary.push(format!("keybinds ({count} op(s))"));
     }
@@ -341,7 +336,7 @@ mod tests {
 
     #[test]
     fn accepts_known_pref_and_section_keys() {
-        assert!(validate(&["branchPrefix", "gitIdentities", "keybinds", "buildServices"]).is_ok());
+        assert!(validate(&["mergeType", "gitIdentities", "keybinds", "buildServices"]).is_ok());
         assert!(validate(&["activeBackend", "tiers", "backends", "accounts"]).is_ok());
     }
 
@@ -411,16 +406,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deprecated_keys() {
+    fn rejects_deprecated_and_removed_keys() {
         assert!(validate(&["systemPrompt"]).is_err());
         assert!(validate(&["autoStartJobs"]).is_err());
+        assert!(validate(&["branchPrefix"]).is_err());
+        assert!(validate(&["pullOnMerge"]).is_err());
     }
 
     #[test]
     fn rejects_unknown_keys_with_accepted_list() {
         let error = validate(&["bogusKey"]).unwrap_err();
         assert!(error.contains("unknown settings key 'bogusKey'"), "{error}");
-        assert!(error.contains("branchPrefix"), "{error}");
+        assert!(error.contains("mergeType"), "{error}");
     }
 
     #[test]

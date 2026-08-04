@@ -399,7 +399,7 @@ fn run_git_checked(
 /// hard-reset the working tree to the merged tip the export already wrote to that
 /// ref. A checkout deliberately on a *different* branch is never detached by the
 /// export (jj only rewrites HEAD when it points at the branch being moved), so it
-/// is left untouched. `pull` (remote + `pull_on_merge`) adds a `git pull origin
+/// is left untouched. `pull` for a remote landing adds a `git pull origin
 /// <default>` to also absorb an external advance; it never gates the re-attach,
 /// which must restore the invariant regardless of the pull preference.
 ///
@@ -1157,8 +1157,8 @@ mod tests {
     fn reconcile_reattaches_detached_head_then_pulls_remote_merge() {
         use crate::services::testing::MockGitClient;
 
-        // Remote merge with `pull_on_merge`: re-attach AND pull. The re-attach is
-        // not gated on the pull preference.
+        // A remote landing re-attaches AND pulls because no local fold advanced
+        // the checkout.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
         git.expect_status().returning(|_| Ok(String::new()));

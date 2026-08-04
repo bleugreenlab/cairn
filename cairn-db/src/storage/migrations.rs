@@ -31,6 +31,38 @@ macro_rules! shared_tail {
     };
 }
 
+macro_rules! shared_tail_check_observation_public_handle {
+    () => {
+        Migration::new(
+            "0146",
+            "add_check_observation_public_handle",
+            include_str!(
+                "../../../../turso_migrations/0146_add_check_observation_public_handle.sql"
+            ),
+        )
+    };
+}
+
+macro_rules! shared_tail_pr_resolution_attribution {
+    () => {
+        Migration::new(
+            "0145",
+            "pr_resolution_attribution",
+            include_str!("../../../../turso_migrations/0145_pr_resolution_attribution.sql"),
+        )
+    };
+}
+
+macro_rules! private_channel_thread_state {
+    () => {
+        Migration::new(
+            "0144",
+            "channel_thread_state",
+            include_str!("../../../../turso_migrations/0144_channel_thread_state.sql"),
+        )
+    };
+}
+
 macro_rules! shared_tail_virtual_reconcile_coordinates {
     () => {
         // `jobs` loses two columns in place via ALTER TABLE DROP COLUMN;
@@ -643,6 +675,8 @@ macro_rules! team_lineage {
             shared_tail_check_definition_provenance!(),
             shared_tail_conflict_resolution_sessions!(),
             shared_tail_issue_kind!(),
+            shared_tail_pr_resolution_attribution!(),
+            shared_tail_check_observation_public_handle!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -842,7 +876,10 @@ macro_rules! private_lineage {
             private_command_duration_profiles!(),
             private_channel_persistence!(),
             private_channel_outbound_expired!(),
+            private_channel_thread_state!(),
             shared_tail_issue_kind!(),
+            shared_tail_pr_resolution_attribution!(),
+            shared_tail_check_observation_public_handle!(),
             // Must follow `private_thread_compaction!()`: they alter that table.
             Migration::new(
                 "0140",
@@ -1514,6 +1551,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("memories", TableScope::ProjectScoped),
     ("memory_triage_issue_memories", TableScope::ProjectScoped),
     ("merge_requests", TableScope::ProjectScoped),
+    ("pr_resolution_attributions", TableScope::ProjectScoped),
     ("message_stream_chunks", TableScope::ProjectScoped),
     ("message_streams", TableScope::ProjectScoped),
     ("messages", TableScope::ProjectScoped),
@@ -1660,6 +1698,14 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "channel_inbound",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "channel_thread_follow",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "channel_thread_focus",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // A terminal child makes parent turns compactable; the mark sits in this
@@ -1907,6 +1953,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "merge_requests",
         id_columns: &["id", "job_id", "project_id", "issue_id"],
+    },
+    RekeyTableManifest {
+        table: "pr_resolution_attributions",
+        id_columns: &["id", "merge_request_id"],
     },
     RekeyTableManifest {
         table: "message_stream_chunks",
@@ -2202,12 +2252,15 @@ mod tests {
                 "0135_check_definition_provenance".to_string(),
                 "0136_conflict_resolution_sessions".to_string(),
                 "0139_thread_compaction".to_string(),
+                "0143_command_duration_profiles".to_string(),
                 "0137_channel_persistence".to_string(),
                 "0142_channel_outbound_expired".to_string(),
+                "0144_channel_thread_state".to_string(),
                 "0138_issue_kind".to_string(),
+                "0145_pr_resolution_attribution".to_string(),
+                "0146_add_check_observation_public_handle".to_string(),
                 "0140_thread_compaction_seed_bytes".to_string(),
                 "0141_thread_compaction_capacity_trigger".to_string(),
-                "0143_command_duration_profiles".to_string(),
             ]
         );
         Ok(db)
@@ -4019,6 +4072,8 @@ mod tests {
                 "0135_check_definition_provenance".to_string(),
                 "0136_conflict_resolution_sessions".to_string(),
                 "0138_issue_kind".to_string(),
+                "0145_pr_resolution_attribution".to_string(),
+                "0146_add_check_observation_public_handle".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

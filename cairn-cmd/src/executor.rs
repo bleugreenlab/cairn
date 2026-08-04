@@ -70,19 +70,13 @@ struct AddRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MutationResult {
-    config: RemoteConfig,
+    display_name: String,
     os: Option<String>,
     arch: Option<String>,
     attach_state: String,
     /// Present when a removal completed without reaching the host. Absent means
     /// nothing was left behind.
     unverified_remote_cleanup: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteConfig {
-    display_name: String,
 }
 
 /// What starting an enrollment answers with. The SSH bootstrap behind it takes
@@ -341,7 +335,7 @@ fn format_mutation(action: &str, result: &MutationResult) -> String {
     };
     format!(
         "{action} {}: {}{platform}{unreached}",
-        result.config.display_name, result.attach_state
+        result.display_name, result.attach_state
     )
 }
 
@@ -449,9 +443,7 @@ mod tests {
     #[test]
     fn mutation_confirmation_names_the_machine_by_its_public_name() {
         let result = MutationResult {
-            config: RemoteConfig {
-                display_name: "bglab-win".into(),
-            },
+            display_name: "bglab-win".into(),
             os: Some("windows".into()),
             arch: Some("x86_64".into()),
             attach_state: "ready".into(),
@@ -471,9 +463,7 @@ mod tests {
     #[test]
     fn a_removal_that_never_reached_the_host_says_what_was_left_behind() {
         let result = MutationResult {
-            config: RemoteConfig {
-                display_name: "bglab-win".into(),
-            },
+            display_name: "bglab-win".into(),
             os: None,
             arch: None,
             attach_state: "removed".into(),

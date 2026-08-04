@@ -25,17 +25,23 @@ pub struct GitHubApp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubStatus {
-    pub connected: bool,
-    pub app_name: Option<String>,
-    pub app_slug: Option<String>,
-    pub relay_status: RelayStatus,
+    pub app_authorization: GitHubAppAuthorizationStatus,
+    pub event_delivery: EventDeliveryStatus,
 }
 
-/// Status of the Relay connection.
+/// Locally usable GitHub App authorization. This is independent of installations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RelayStatus {
+pub struct GitHubAppAuthorizationStatus {
+    pub authorized: bool,
+    pub app_name: Option<String>,
+    pub app_slug: Option<String>,
+}
+
+/// Observable facts about the per-device event-delivery channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventDeliveryStatus {
     pub configured: bool,
-    pub connected: bool,
-    pub webhook_url: Option<String>,
+    pub last_event_sync: Option<String>,
 }

@@ -37,11 +37,26 @@ where
 }
 
 /// Workspace-owned delivery policy for external message channels.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelsConfig {
+    #[serde(default = "default_channel_thread")]
+    pub default_thread: String,
     #[serde(default)]
     pub imessage: IMessageChannelConfig,
+}
+
+fn default_channel_thread() -> String {
+    "cairn://p/CAIRN/3404".to_string()
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            default_thread: default_channel_thread(),
+            imessage: IMessageChannelConfig::default(),
+        }
+    }
 }
 
 /// iMessage delivery configuration. Empty addresses keep the provider
@@ -133,11 +148,9 @@ pub struct Settings {
     pub tiers: Vec<String>,
     pub backends: HashMap<String, HashMap<String, Preset>>,
 
-    pub branch_prefix: String,
     pub system_prompt: String,
     pub max_thinking_tokens: Option<i32>,
     pub merge_type: MergeType,
-    pub pull_on_merge: bool,
     /// Always true — setting removed, kept for serialization compat.
     pub auto_start_jobs: bool,
     pub orphan_cleanup_days: i32,
@@ -205,14 +218,12 @@ pub struct UpdateSettings {
     pub tiers: Option<Vec<String>>,
     pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
 
-    pub branch_prefix: Option<String>,
     /// Deprecated - system_prompt is no longer used
     #[allow(dead_code)]
     pub system_prompt: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub max_thinking_tokens: Option<Option<i32>>,
     pub merge_type: Option<MergeType>,
-    pub pull_on_merge: Option<bool>,
     /// Deprecated — auto_start_jobs is always true. Kept for deserialization compat.
     #[allow(dead_code)]
     pub auto_start_jobs: Option<bool>,

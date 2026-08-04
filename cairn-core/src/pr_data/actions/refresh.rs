@@ -634,7 +634,11 @@ async fn refresh_unbound_pr_for_job(
 
 /// Close a PR without merging, mark the `merge_requests` row closed, and tear
 /// down the issue's worktrees.
-pub async fn close_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<String, String> {
+pub async fn close_pr_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+    attribution: Option<super::PrResolutionAttribution>,
+) -> Result<String, String> {
     // Route to the owning database (team replica or private DB); the PR's
     // `merge_requests` row lives there. GitHub credentials stay on the private DB.
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
@@ -652,7 +656,7 @@ pub async fn close_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<Strin
         api::close_pr(http, &creds, &owner, &repo, pr_number).await?;
     }
 
-    resolve_pr_node(orch, job_id, PrNodeResolution::Close).await?;
+    resolve_pr_node(orch, job_id, PrNodeResolution::Close, attribution).await?;
 
     // Release runtime resources and apply the established branch cleanup policy.
     // This runs after the cascade above has stopped the issue's agents: killing
@@ -879,6 +883,49 @@ pub async fn render_live_pr_section(
         pr_details.state,
         if pr_details.is_draft { " (draft)" } else { "" }
     ));
+    let expected_action = match pr_details.state {
+        PrState::Merged => Some("merge"),
+        PrState::Closed => Some("close"),
+        _ => None,
+    };
+    let mut attribution = super::latest_resolution_attribution(&db, &mr_context.mr_id).await;
+    if matches!(pr_details.state, PrState::Merged)
+        && attribution
+            .as_ref()
+            .is_none_or(|event| event.action != "merge")
+    {
+        log::error!(
+            "merge performed by an unjournaled path: merge_request={}",
+            mr_context.mr_id
+        );
+        if let Err(error) =
+            super::ensure_unjournaled_merge_observation(orch, &db, &mr_context.mr_id, job_id).await
+        {
+            log::error!("{error}");
+        }
+        attribution = super::latest_resolution_attribution(&db, &mr_context.mr_id).await;
+    }
+    if let Some(attribution) =
+        attribution.filter(|event| expected_action.is_some_and(|expected| event.action == expected))
+    {
+        let actor = match (
+            attribution.actor_kind.as_str(),
+            attribution.actor_identity.as_deref(),
+        ) {
+            ("operator-ui", _) => "operator (UI)".to_string(),
+            ("operator-cli", _) => "operator (CLI)".to_string(),
+            ("agent", Some(uri)) => uri.to_string(),
+            ("unjournaled", _) => "merge performed by an unjournaled path".to_string(),
+            (_, Some(identity)) => identity.to_string(),
+            _ => attribution.surface.clone(),
+        };
+        let verb = if attribution.action == "close" {
+            "Closed"
+        } else {
+            "Merged"
+        };
+        out.push_str(&format!("{verb} by {actor} at {}\n\n<details><summary>Resolution provenance</summary>\n\nSurface: `{}`\n\nLane snapshot: `{}`\n\n</details>\n", chrono::DateTime::from_timestamp(attribution.created_at, 0).map(|v| v.to_rfc3339()).unwrap_or_else(|| attribution.created_at.to_string()), attribution.surface, attribution.lane_snapshot));
+    }
     if let Some(review) = &pr_details.review_decision {
         out.push_str(&format!("Review: {}\n", review));
     }

@@ -17,6 +17,28 @@ pub enum StreamChunkKind {
     Thinking,
 }
 
+/// Record the first live delta handed to the frontend for a run. This boundary
+/// belongs with stream delivery rather than any one backend, and deliberately
+/// records only aggregate sizes.
+pub(crate) fn trace_first_frontend_delta_emit(
+    run_id: &str,
+    session_id: Option<&str>,
+    stream_id: &str,
+    delta: &EmitDelta,
+) {
+    if crate::resume_timing::mark_first(format!("frontend:{run_id}")) {
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("first_frontend_delta_emit");
+        event.run_id = Some(run_id);
+        event.session_id = session_id;
+        event.stream_id = Some(stream_id);
+        event.bytes = Some(
+            delta.content_delta.as_ref().map_or(0, String::len)
+                + delta.thinking_delta.as_ref().map_or(0, String::len),
+        );
+        event.emit();
+    }
+}
+
 impl StreamChunkKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -260,6 +282,7 @@ impl ActiveMessageStream {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         })
         .unwrap_or_default()
@@ -614,11 +637,12 @@ pub fn open_stream(
     turn_id: Option<&str>,
     backend: &str,
 ) -> Result<ActiveMessageStream, String> {
+    let timing_started = Instant::now();
     let run_id = run_id.to_string();
     let session_id = session_id.map(str::to_string);
     let turn_id = turn_id.map(str::to_string);
     let backend = backend.to_string();
-    block_on_stream_db(async move {
+    let result = block_on_stream_db(async move {
         db.write(|conn| {
             let run_id = run_id.clone();
             let session_id = session_id.clone();
@@ -665,7 +689,17 @@ pub fn open_stream(
         })
         .await
         .map_err(|e| e.to_string())
-    })
+    });
+    if let Ok(stream) = &result {
+        let mut event =
+            crate::resume_timing::ResumeTimingEvent::new("stream_open").elapsed(timing_started);
+        event.run_id = Some(stream.stream.run_id.as_str());
+        event.session_id = stream.stream.session_id.as_deref();
+        event.turn_id = stream.stream.turn_id.as_deref();
+        event.stream_id = Some(stream.stream_id());
+        event.emit();
+    }
+    result
 }
 
 pub fn append_chunks(
@@ -674,9 +708,14 @@ pub fn append_chunks(
     expected_version: i32,
     chunks: &[StreamChunkInput],
 ) -> Result<AppendResult, String> {
+    let timing_started = Instant::now();
+    let first_flush = expected_version == 0;
+    let chunk_count = chunks.len();
+    let chunk_bytes: usize = chunks.iter().map(|chunk| chunk.data.len()).sum();
     let stream_id = stream_id.to_string();
+    let timing_stream_id = stream_id.clone();
     let chunks = chunks.to_vec();
-    block_on_stream_db(async move {
+    let result = block_on_stream_db(async move {
         db.write(|conn| {
             let stream_id = stream_id.clone();
             let chunks = chunks.clone();
@@ -763,7 +802,16 @@ pub fn append_chunks(
         })
         .await
         .map_err(|e| e.to_string())
-    })
+    });
+    if result.is_ok() && first_flush && chunk_count > 0 {
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("first_database_stream_flush")
+            .elapsed(timing_started);
+        event.stream_id = Some(&timing_stream_id);
+        event.count = Some(chunk_count);
+        event.bytes = Some(chunk_bytes);
+        event.emit();
+    }
+    result
 }
 
 pub fn read_active_stream(
@@ -851,6 +899,7 @@ pub fn finalize_stream(
                         tool_result: None,
                         is_error: false,
                         thinking_ms: None,
+                        queued_message_id: None,
                         raw: None,
                     });
                     if final_event.content.is_none() && !active.content.is_empty() {

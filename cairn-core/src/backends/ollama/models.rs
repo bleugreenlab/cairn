@@ -11,6 +11,24 @@ struct TagsResponse {
     #[serde(default)]
     models: Vec<TagModel>,
 }
+
+fn bounded_model_failures(errors: &[String]) -> String {
+    const MAX_NAMES: usize = 5;
+    let shown = errors
+        .iter()
+        .take(MAX_NAMES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if errors.len() > MAX_NAMES {
+        format!(
+            "model details unavailable for {shown}, and {} more",
+            errors.len() - MAX_NAMES
+        )
+    } else {
+        format!("model details unavailable for {shown}")
+    }
+}
 #[derive(Debug, Deserialize)]
 struct TagModel {
     name: String,
@@ -27,6 +45,7 @@ struct HostModels {
     account_id: String,
     label: String,
     models: Vec<(String, ShowResponse)>,
+    errors: Vec<String>,
 }
 
 #[derive(Default)]
@@ -84,7 +103,12 @@ fn discover_hosts_with_errors(
     let mut errors = Vec::new();
     for (id, label, url) in hosts {
         match discover_host(&id, &label, &url) {
-            Ok(v) => ok.push(v),
+            Ok(v) => {
+                if !v.errors.is_empty() {
+                    errors.push(format!("{label}: {}", bounded_model_failures(&v.errors)));
+                }
+                ok.push(v)
+            }
             Err(e) => errors.push(format!("{label}: {e}")),
         }
     }
@@ -121,32 +145,33 @@ fn discover_host(account_id: &str, label: &str, base_url: &str) -> Result<HostMo
     let tags: TagsResponse =
         serde_json::from_str(&body).map_err(|e| format!("tags JSON failed: {e}"))?;
     let mut models = Vec::new();
+    let mut errors = Vec::new();
     for tag in tags.models {
-        let response = client
-            .post(format!("{}/api/show", base_url.trim_end_matches('/')))
-            .json(&serde_json::json!({"model":tag.name}))
-            .send()
-            .map_err(|e| error_with_causes(&format!("show {} failed", tag.name), &e))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .map_err(|e| error_with_causes(&format!("show {} body failed", tag.name), &e))?;
-        if !status.is_success() {
-            return Err(format!(
-                "show {} returned HTTP {}: {}",
-                tag.name,
-                status.as_u16(),
-                body
-            ));
+        let result = (|| -> Result<ShowResponse, String> {
+            let response = client
+                .post(format!("{}/api/show", base_url.trim_end_matches('/')))
+                .json(&serde_json::json!({"model": &tag.name}))
+                .send()
+                .map_err(|e| error_with_causes("request failed", &e))?;
+            let status = response.status();
+            let body = response
+                .text()
+                .map_err(|e| error_with_causes("body failed", &e))?;
+            if !status.is_success() {
+                return Err(format!("HTTP {}", status.as_u16()));
+            }
+            serde_json::from_str(&body).map_err(|e| format!("invalid JSON: {e}"))
+        })();
+        match result {
+            Ok(show) => models.push((tag.name, show)),
+            Err(_) => errors.push(tag.name),
         }
-        let show = serde_json::from_str(&body)
-            .map_err(|e| format!("show {} JSON failed: {e}", tag.name))?;
-        models.push((tag.name, show));
     }
     Ok(HostModels {
         account_id: account_id.into(),
         label: label.into(),
         models,
+        errors,
     })
 }
 fn context_length(info: &serde_json::Map<String, serde_json::Value>) -> Option<i64> {
@@ -197,6 +222,15 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounds_partial_model_failure_notes() {
+        let errors = (0..8).map(|i| format!("model-{i}")).collect::<Vec<_>>();
+        let note = bounded_model_failures(&errors);
+        assert!(note.contains("model-0, model-1, model-2, model-3, model-4"));
+        assert!(note.contains("and 3 more"));
+        assert!(!note.contains("model-5"));
+    }
+
     fn show(w: i64, t: bool) -> ShowResponse {
         ShowResponse {
             capabilities: if t { vec!["tools".into()] } else { vec![] },
@@ -211,6 +245,7 @@ mod tests {
                 account_id: "a".into(),
                 label: "Fast".into(),
                 models: vec![("qwen".into(), show(32768, false))],
+                errors: vec![],
             },
             HostModels {
                 account_id: "b".into(),
@@ -219,6 +254,7 @@ mod tests {
                     ("qwen".into(), show(131072, true)),
                     ("llama".into(), show(8192, false)),
                 ],
+                errors: vec![],
             },
         ]);
         assert_eq!(m.len(), 2);

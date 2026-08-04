@@ -174,7 +174,7 @@ pub(super) async fn dispatch(
                         .map_err(|error| build_failure(index, item, error))?;
                     applied.push(format!(
                         "renamed to {} — placement requests must use the new name; cairn://executors/{} is the address now",
-                        result.config.display_name, new_name
+                        result.display_name, new_name
                     ));
                 }
                 format!("{name}: {}", applied.join("; "))
@@ -197,16 +197,22 @@ pub(super) async fn dispatch(
                 let result = management::remove(orch, name)
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
-                match result.unverified_remote_cleanup {
-                    None => format!(
-                        "Removed {name}: supervision stopped, remote cleaned up, enrollment revoked, configuration removed"
-                    ),
-                    // Removal completed without the machine, so the summary says
-                    // which half happened rather than claiming a teardown that
-                    // never reached the host.
-                    Some(reason) => format!(
-                        "Removed {name}: supervision stopped, enrollment revoked, configuration removed. Its host could not be reached ({reason}), so no remote cleanup ran there; the revoked enrollment means anything still running on it cannot reattach."
-                    ),
+                if result.config.is_none() {
+                    format!(
+                        "Removed {name}: cleared the failed enrollment record. Its rollback had already completed, so there was no configuration, supervision, credential, or remote process left to remove."
+                    )
+                } else {
+                    match result.unverified_remote_cleanup {
+                        None => format!(
+                            "Removed {name}: supervision stopped, remote cleaned up, enrollment revoked, configuration removed"
+                        ),
+                        // Removal completed without the machine, so the summary says
+                        // which half happened rather than claiming a teardown that
+                        // never reached the host.
+                        Some(reason) => format!(
+                            "Removed {name}: supervision stopped, enrollment revoked, configuration removed. Its host could not be reached ({reason}), so no remote cleanup ran there; the revoked enrollment means anything still running on it cannot reattach."
+                        ),
+                    }
                 }
             }
         }

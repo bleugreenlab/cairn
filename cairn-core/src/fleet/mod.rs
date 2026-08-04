@@ -15,22 +15,22 @@ use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
     aged_priority, CacheWarmthEvidence, CellCheckoutKind, CellCommandClass, CellResidency,
-    DurationEstimate, DurationFallback, EnrolledRemote, ExecutionWarmth, ExecutorAdvertisement,
-    ExecutorCapabilities, ExecutorConfig, ExecutorHealthSnapshot, ExecutorHealthStatus,
-    ExecutorIdentity, ExecutorInspection, ExecutorMessage, ExecutorSelector,
+    CpuAdmissionState, DurationEstimate, DurationFallback, EnrolledRemote, ExecutionWarmth,
+    ExecutorAdvertisement, ExecutorCapabilities, ExecutorConfig, ExecutorHealthSnapshot,
+    ExecutorHealthStatus, ExecutorIdentity, ExecutorInspection, ExecutorMessage, ExecutorSelector,
     ExecutorSubstrateEvidence, ExecutorSubstrateReport, ExecutorSubstrateState,
     InventoryAuthorityState, MachineMeasurement, MaterializationReadFailureKind,
     MaterializationReadRequest, MaterializationReadResult, ObjectTransferCoordinate,
-    ObservationReuse, PlacementDecision, PlacementMobility, PlacementOutcome, PlacementPrediction,
-    PlacementReadings, PlacementReason, PlacementRejection, PlacementRejectionReason,
-    PlacementSelection, PlacementSyncCost, PreparationForecast, ProcessBatch,
-    ProcessBatchExecution, ProcessBatchItem, ProcessSandboxMode, QueueForecast, QueueUnknownReason,
-    RemoteAttachAttempt, RemoteLinkState, RepositoryLocator, ReservationFallback,
-    ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence,
-    ResidencyHolder, ResidencyOperation, ResidencyResult, ResidentProcessEvent,
+    ObservationReuse, PlacementDecision, PlacementMobility, PlacementOutcome,
+    PlacementPolicyEvidence, PlacementPrediction, PlacementReadings, PlacementReason,
+    PlacementRejection, PlacementRejectionReason, PlacementSelection, PlacementSyncCost,
+    PreparationForecast, ProcessBatch, ProcessBatchExecution, ProcessBatchItem, ProcessSandboxMode,
+    QueueForecast, QueueUnknownReason, RemoteAttachAttempt, RemoteLinkState, RepositoryLocator,
+    ReservationFallback, ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind,
+    ResidencyFence, ResidencyHolder, ResidencyOperation, ResidencyResult, ResidentProcessEvent,
     ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult, WarmthUnknownReason,
-    EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME, MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS,
-    RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    CPU_ADMISSION_SAMPLE_INTERVAL_MS, EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME,
+    MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, EXECUTOR_NAME_RULE,
@@ -49,13 +49,188 @@ use tokio::time::Instant;
 pub use cairn_common::executor_protocol::{
     ActiveCellRequest, CellExecutionMeta, CellOutcome, CellPriority, CellRequest,
     CellUnavailableReason, CommandResourceIdentity, ExecutingCellRequest, FleetSnapshot,
-    MutationDelta, MutationPolicy, PersistentCellLifecycle, PersistentCellState, QueuedCellRequest,
-    ResourceReservation, ResourceReservationSource,
+    MutationDelta, MutationPolicy, PersistentCellLifecycle, PersistentCellState,
+    PlacementWorkClass, QueuedCellRequest, ResourceReservation, ResourceReservationSource,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub const DEFAULT_PLACEMENT_PROFILE: &str = "default";
+pub const INTERACTIVE_PLACEMENT_PROFILE: &str = "interactive";
+pub const LOW_POWER_PLACEMENT_PROFILE: &str = "low-power";
+pub const MAX_PREFERENCE_DELAY_SECONDS: u64 = 60 * 60;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlacementStance {
+    LocalFirst,
+    RemoteFirst,
+    RemoteOnly,
+    #[default]
+    Any,
+}
+
+fn default_active_placement_profile() -> String {
+    DEFAULT_PLACEMENT_PROFILE.to_string()
+}
+
+fn built_in_profile(name: &str) -> Option<&'static PlacementProfile> {
+    use std::sync::OnceLock;
+    static BUILT_INS: OnceLock<BTreeMap<String, PlacementProfile>> = OnceLock::new();
+    BUILT_INS.get_or_init(built_in_placement_profiles).get(name)
+}
+
+fn is_built_in_profile(name: &str) -> bool {
+    built_in_profile(name).is_some()
+}
+
+fn validate_custom_profile_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() || name.trim() != name {
+        return Err(
+            "placement profile name must be nonblank and have no surrounding whitespace".into(),
+        );
+    }
+    if is_built_in_profile(name) {
+        return Err(format!(
+            "built-in placement profile {name} cannot be shadowed"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_executor_id(
+    executor_id: &str,
+    known_executor_ids: &HashSet<&str>,
+) -> Result<(), String> {
+    if !known_executor_ids.contains(executor_id) {
+        return Err(format!(
+            "placement profile names unknown executor ID {executor_id}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlacementProfile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machine_priority: Vec<String>,
+    pub routes: BTreeMap<PlacementWorkClass, PlacementStance>,
+    #[serde(default)]
+    pub max_preference_delay_seconds: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub executor_policy_overrides:
+        HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>,
+}
+
+impl PlacementProfile {
+    pub fn stance(&self, work_class: PlacementWorkClass) -> PlacementStance {
+        self.routes
+            .get(&work_class)
+            .copied()
+            .unwrap_or(PlacementStance::Any)
+    }
+
+    fn validate(&self, known_executor_ids: &HashSet<&str>) -> Result<(), String> {
+        for class in placement_work_classes() {
+            if !self.routes.contains_key(&class) {
+                return Err(format!("placement profile is missing route {class:?}"));
+            }
+        }
+        if self.routes.len() != placement_work_classes().len() {
+            return Err("placement profile contains an unknown work-class route".into());
+        }
+        if self.max_preference_delay_seconds > MAX_PREFERENCE_DELAY_SECONDS {
+            return Err(format!(
+                "maxPreferenceDelaySeconds must not exceed {MAX_PREFERENCE_DELAY_SECONDS}"
+            ));
+        }
+        let mut priority = HashSet::new();
+        for executor_id in &self.machine_priority {
+            validate_profile_executor_id(executor_id, known_executor_ids)?;
+            if !priority.insert(executor_id) {
+                return Err(format!(
+                    "placement profile repeats machinePriority executor {executor_id}"
+                ));
+            }
+        }
+        for executor_id in self.executor_policy_overrides.keys() {
+            validate_profile_executor_id(executor_id, known_executor_ids)?;
+        }
+        Ok(())
+    }
+}
+
+fn placement_work_classes() -> [PlacementWorkClass; 5] {
+    [
+        PlacementWorkClass::ReviewChecks,
+        PlacementWorkClass::WriteChecks,
+        PlacementWorkClass::AgentSessions,
+        PlacementWorkClass::DevInstances,
+        PlacementWorkClass::Services,
+    ]
+}
+
+fn profile_with_routes(
+    max_preference_delay_seconds: u64,
+    route: impl Fn(PlacementWorkClass) -> PlacementStance,
+) -> PlacementProfile {
+    PlacementProfile {
+        machine_priority: Vec::new(),
+        routes: placement_work_classes()
+            .into_iter()
+            .map(|class| (class, route(class)))
+            .collect(),
+        max_preference_delay_seconds,
+        executor_policy_overrides: HashMap::new(),
+    }
+}
+
+pub fn built_in_placement_profiles() -> BTreeMap<String, PlacementProfile> {
+    [
+        (
+            DEFAULT_PLACEMENT_PROFILE.to_string(),
+            profile_with_routes(0, |_| PlacementStance::Any),
+        ),
+        (INTERACTIVE_PLACEMENT_PROFILE.to_string(), {
+            let mut profile = profile_with_routes(30, |class| match class {
+                PlacementWorkClass::ReviewChecks | PlacementWorkClass::WriteChecks => {
+                    PlacementStance::RemoteFirst
+                }
+                PlacementWorkClass::AgentSessions => PlacementStance::LocalFirst,
+                PlacementWorkClass::DevInstances | PlacementWorkClass::Services => {
+                    PlacementStance::Any
+                }
+            });
+            profile.executor_policy_overrides.insert(
+                LOCAL_EXECUTOR_NAME.to_string(),
+                cairn_common::executor_protocol::ExecutorRuntimePolicy {
+                    cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy {
+                        entry_utilization: 0.75,
+                        clear_utilization: 0.60,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            profile
+        }),
+        (
+            LOW_POWER_PLACEMENT_PROFILE.to_string(),
+            profile_with_routes(120, |_| PlacementStance::RemoteFirst),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FleetConfig {
+    #[serde(default = "default_active_placement_profile")]
+    pub active_placement_profile: String,
+    /// Operator-authored profiles only. Code-owned built-ins are merged through
+    /// [`FleetConfig::resolved_placement_profiles`] and never persisted here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placement_profiles: BTreeMap<String, PlacementProfile>,
     /// How long a caller with no tighter answer of its own is willing to wait
     /// for a machine that is merely busy.
     ///
@@ -81,6 +256,11 @@ pub struct FleetConfig {
     pub(crate) capacity_wait_horizon_seconds: u64,
     #[serde(default = "default_timeout_seconds")]
     pub(crate) default_timeout_seconds: u64,
+    /// Workspace fallback used when a machine has no complete runtime-policy
+    /// override. Profile and machine-specific resolution can layer above this
+    /// single baseline without putting policy into executor inventory.
+    #[serde(default)]
+    pub cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub executor_policies: HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>,
     /// Runner-owned SSH executor declarations, keyed by stable executor ID.
@@ -314,6 +494,85 @@ fn is_safe_executor_id(value: &str) -> bool {
 }
 
 impl FleetConfig {
+    pub fn resolved_placement_profiles(&self) -> BTreeMap<String, PlacementProfile> {
+        let mut profiles = built_in_placement_profiles();
+        profiles.extend(self.placement_profiles.clone());
+        profiles
+    }
+
+    pub fn active_placement_profile(&self) -> &PlacementProfile {
+        self.placement_profiles
+            .get(&self.active_placement_profile)
+            .or_else(|| built_in_profile(&self.active_placement_profile))
+            .expect("FleetConfig is healed at load and validated before save")
+    }
+
+    pub fn effective_executor_policy(
+        &self,
+        executor_id: &str,
+    ) -> cairn_common::executor_protocol::ExecutorRuntimePolicy {
+        self.active_placement_profile()
+            .executor_policy_overrides
+            .get(executor_id)
+            .cloned()
+            .unwrap_or_else(|| self.resolve_executor_policy(executor_id))
+    }
+
+    pub fn save_placement_profile(
+        &mut self,
+        name: String,
+        profile: PlacementProfile,
+    ) -> Result<(), String> {
+        validate_custom_profile_name(&name)?;
+        profile.validate(&self.known_profile_executor_ids())?;
+        self.placement_profiles.insert(name, profile);
+        Ok(())
+    }
+
+    pub fn delete_placement_profile(&mut self, name: &str) -> Result<PlacementProfile, String> {
+        if is_built_in_profile(name) {
+            return Err(format!(
+                "built-in placement profile {name} cannot be deleted"
+            ));
+        }
+        if self.active_placement_profile == name {
+            return Err(format!("active placement profile {name} cannot be deleted"));
+        }
+        self.placement_profiles
+            .remove(name)
+            .ok_or_else(|| format!("placement profile {name} does not exist"))
+    }
+
+    pub fn activate_placement_profile(&mut self, name: &str) -> Result<PlacementProfile, String> {
+        let profile = self
+            .placement_profiles
+            .get(name)
+            .cloned()
+            .or_else(|| built_in_profile(name).cloned())
+            .ok_or_else(|| format!("placement profile {name} does not exist"))?;
+        self.active_placement_profile = name.to_string();
+        Ok(profile)
+    }
+
+    fn known_profile_executor_ids(&self) -> HashSet<&str> {
+        std::iter::once(LOCAL_EXECUTOR_NAME)
+            .chain(self.remote_executors.keys().map(String::as_str))
+            .collect()
+    }
+
+    pub fn resolve_executor_policy(
+        &self,
+        executor_id: &str,
+    ) -> cairn_common::executor_protocol::ExecutorRuntimePolicy {
+        self.executor_policies
+            .get(executor_id)
+            .cloned()
+            .unwrap_or_else(|| cairn_common::executor_protocol::ExecutorRuntimePolicy {
+                cpu_admission: self.cpu_admission,
+                ..Default::default()
+            })
+    }
+
     /// Replace a wait horizon that is a leftover rather than a policy, at the
     /// one moment the config is read from disk.
     ///
@@ -340,6 +599,19 @@ impl FleetConfig {
             );
             self.capacity_wait_horizon_seconds = default_capacity_wait_horizon_seconds();
         }
+        self.placement_profiles
+            .retain(|name, _| !is_built_in_profile(name));
+        if !is_built_in_profile(&self.active_placement_profile)
+            && !self
+                .placement_profiles
+                .contains_key(&self.active_placement_profile)
+        {
+            log::warn!(
+                "settings.yaml names missing placement profile {}; using {DEFAULT_PLACEMENT_PROFILE}",
+                self.active_placement_profile
+            );
+            self.active_placement_profile = DEFAULT_PLACEMENT_PROFILE.to_string();
+        }
         self
     }
 
@@ -349,6 +621,12 @@ impl FleetConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.cpu_admission.validate()?;
+        for (executor_id, policy) in &self.executor_policies {
+            policy
+                .validate()
+                .map_err(|error| format!("executor policy {executor_id}: {error}"))?;
+        }
         if self.capacity_wait_horizon_seconds < MIN_CAPACITY_WAIT_HORIZON_SECONDS {
             return Err(format!(
                 "capacityWaitHorizonSeconds must be at least {MIN_CAPACITY_WAIT_HORIZON_SECONDS}: \
@@ -372,9 +650,6 @@ impl FleetConfig {
                     remote.device_id
                 ));
             }
-            // A public name is an address. Two machines answering to one would
-            // make every placement request that names it ambiguous, and the
-            // ambiguity would be invisible: the fleet would simply pick one.
             let name = normalize_executor_name(&remote.display_name)
                 .expect("validate() rejects a displayName with no public name");
             if let Some(existing) = names.insert(name.clone(), remote.executor_id.clone()) {
@@ -383,6 +658,21 @@ impl FleetConfig {
                     remote.executor_id
                 ));
             }
+        }
+        if !is_built_in_profile(&self.active_placement_profile)
+            && !self
+                .placement_profiles
+                .contains_key(&self.active_placement_profile)
+        {
+            return Err(format!(
+                "active placement profile {} does not exist",
+                self.active_placement_profile
+            ));
+        }
+        let known = self.known_profile_executor_ids();
+        for (name, profile) in &self.placement_profiles {
+            validate_custom_profile_name(name)?;
+            profile.validate(&known)?;
         }
         Ok(())
     }
@@ -502,8 +792,11 @@ impl Drop for CoalescedLeaderCompletionGuard {
 impl Default for FleetConfig {
     fn default() -> Self {
         Self {
+            active_placement_profile: default_active_placement_profile(),
+            placement_profiles: BTreeMap::new(),
             capacity_wait_horizon_seconds: default_capacity_wait_horizon_seconds(),
             default_timeout_seconds: default_timeout_seconds(),
+            cpu_admission: Default::default(),
             executor_policies: HashMap::new(),
             remote_executors: BTreeMap::new(),
             remote_host_identities: BTreeMap::new(),
@@ -531,6 +824,9 @@ fn default_capacity_wait_horizon_seconds() -> u64 {
 /// [`FleetConfig::validate`] is what stops a new one being written.
 pub(crate) const MIN_CAPACITY_WAIT_HORIZON_SECONDS: u64 = 60;
 fn default_timeout_seconds() -> u64 {
+    // Cold Rust builds in managed cells routinely cross ten minutes. Thirty
+    // minutes clears that ordinary floor while keeping setup, residency, and
+    // check infrastructure failures bounded and operator-configurable.
     30 * 60
 }
 
@@ -872,6 +1168,23 @@ struct PreparedExecution {
     /// placement, because the daemon answers on loopback and is named by this
     /// machine's paths. See [`cell_build_service_env`].
     cell_client_env: Vec<(String, String)>,
+    placement_policy: ActivePlacementPolicy,
+}
+
+#[derive(Clone)]
+struct ActivePlacementPolicy {
+    name: String,
+    profile: PlacementProfile,
+}
+
+impl ActivePlacementPolicy {
+    #[cfg(test)]
+    fn default_profile() -> Self {
+        Self {
+            name: DEFAULT_PLACEMENT_PROFILE.to_string(),
+            profile: built_in_profile(DEFAULT_PLACEMENT_PROFILE).unwrap().clone(),
+        }
+    }
 }
 
 /// The build-service client env a cell batch should carry.
@@ -1303,6 +1616,7 @@ struct RefusedPlacement {
 fn placement_decision(
     request: &CellRequest,
     decided_at_unix_ms: u64,
+    policy: Option<PlacementPolicyEvidence>,
     outcome: PlacementOutcome,
     rejected: Vec<PlacementRejection>,
 ) -> PlacementDecision {
@@ -1317,6 +1631,7 @@ fn placement_decision(
             .filter(|selector| !selector.is_empty())
             .cloned(),
         pinned_executor_id: request.pinned_executor_id.clone(),
+        policy,
         outcome,
         rejected,
     }
@@ -1455,18 +1770,21 @@ impl Fleet {
         generation
     }
 
-    pub(crate) async fn wait_for_named_executor(&self, executor_name: &str) {
+    pub async fn wait_for_named_executor(&self, executor_name: &str) {
         loop {
             let notified = self.connection_ready.notified();
-            let connected = self.connections.lock().unwrap().values().any(|entry| {
-                !entry.sender.is_closed()
-                    && executor_names_match(&executor_public_name(entry), executor_name)
-            });
-            if connected {
+            if self.named_executor_is_connected(executor_name) {
                 return;
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn named_executor_is_connected(&self, executor_name: &str) -> bool {
+        self.connections.lock().unwrap().values().any(|entry| {
+            !entry.sender.is_closed()
+                && executor_names_match(&executor_public_name(entry), executor_name)
+        })
     }
 
     pub fn disconnect_advertised_executor(&self, executor_id: &str, generation: u64) -> bool {
@@ -3347,7 +3665,10 @@ impl Fleet {
                     }
                     // A residency carries its own declared footprint, so there
                     // is no per-candidate demand to resolve for it.
-                    let selected = match self.select_executor(&placement, None).await {
+                    let selected = match self
+                        .select_executor(&placement, None, &prepared.placement_policy)
+                        .await
+                    {
                         Ok(placed) => {
                             self.record_placement_decision(placed.decision);
                             placed.selected
@@ -3434,7 +3755,10 @@ impl Fleet {
                     );
                 };
                 if !selected.colocated {
-                    if let ResidencyOperation::RefreshCheckout { fence, base_commit } = &operation {
+                    if let ResidencyOperation::RefreshCheckout {
+                        fence, base_commit, ..
+                    } = &operation
+                    {
                         let request = residency_refresh_request(&residency, fence, base_commit);
                         orch.object_plane.authorize_request(
                             &request,
@@ -3713,6 +4037,37 @@ impl Fleet {
             .values()
             .find(|route| route.holder == *holder)
             .map(|route| route.executor_id.clone())
+    }
+
+    /// The executor a job home occupies, or will occupy before it has been routed.
+    ///
+    /// Job residencies are untargeted and immobile, so an unrouted home can only
+    /// land on the colocated executor.
+    pub(crate) fn job_home_executor(&self, holder: &ResidencyHolder) -> Option<String> {
+        self.residency_route_executor(holder).or_else(|| {
+            self.connections
+                .lock()
+                .unwrap()
+                .values()
+                .find(|entry| entry.colocated && !entry.sender.is_closed())
+                .map(|entry| entry.identity.executor_id.clone())
+        })
+    }
+
+    /// Whether one live executor satisfies the caller's complete selector.
+    ///
+    /// A missing result means the executor is not in the live fleet snapshot;
+    /// callers must not interpret missing knowledge as selector compatibility.
+    pub(crate) fn executor_satisfies_selector(
+        &self,
+        executor_id: &str,
+        selector: &ExecutorSelector,
+    ) -> Option<bool> {
+        self.connections
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .map(|entry| matches_selector(entry, selector))
     }
 
     #[allow(clippy::result_large_err)]
@@ -4521,6 +4876,10 @@ impl Fleet {
         if matches!(request.repository, RepositoryLocator::ScratchOnly { .. }) {
             return Ok(PreparedExecution {
                 cell_client_env: Vec::new(),
+                placement_policy: ActivePlacementPolicy {
+                    name: config.active_placement_profile.clone(),
+                    profile: config.active_placement_profile().clone(),
+                },
                 executor_config: ExecutorConfig {
                     project_id: request.project_id.clone(),
                     project_key: request.project_id.clone(),
@@ -4565,6 +4924,10 @@ impl Fleet {
                 })?;
         Ok(PreparedExecution {
             cell_client_env: cell_build_service_env(orch, &request.repository),
+            placement_policy: ActivePlacementPolicy {
+                name: config.active_placement_profile.clone(),
+                profile: config.active_placement_profile().clone(),
+            },
             executor_config: ExecutorConfig {
                 project_id: request.project_id.clone(),
                 project_key,
@@ -4589,6 +4952,7 @@ impl Fleet {
             object_plane,
             db,
             cell_client_env,
+            placement_policy,
         } = prepared;
         let mut request = request;
         if let Err(diagnostic) = require_colocated_population(&mut request, &executor_config) {
@@ -4602,7 +4966,10 @@ impl Fleet {
             selected,
             reservation,
             mut decision,
-        } = match self.select_executor(&request, Some(&plan)).await {
+        } = match self
+            .select_executor(&request, Some(&plan), &placement_policy)
+            .await
+        {
             Ok(placement) => placement,
             Err(outcome) => return outcome,
         };
@@ -4838,11 +5205,12 @@ impl Fleet {
         &self,
         request: &CellRequest,
         plan: Option<&ReservationPlan>,
+        policy: &ActivePlacementPolicy,
     ) -> Result<Placement, CellOutcome> {
         loop {
             let notified = self.connection_ready.notified();
             let selection = self
-                .select_executor_once_with(request, plan, repository_sync_cost)
+                .select_executor_once_with(request, plan, policy, repository_sync_cost)
                 .await;
             match selection {
                 Ok(Some(placement)) => return Ok(placement),
@@ -4916,6 +5284,7 @@ impl Fleet {
         &self,
         request: &CellRequest,
         plan: Option<&ReservationPlan>,
+        policy: &ActivePlacementPolicy,
         estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
     ) -> Result<Option<Placement>, RefusedPlacement> {
         // Placement can inspect the local repository to estimate transfer cost
@@ -4928,6 +5297,7 @@ impl Fleet {
             decision: placement_decision(
                 request,
                 now,
+                Some(policy_evidence(request, policy, false)),
                 PlacementOutcome::Refused {
                     diagnostic: diagnostic.clone(),
                 },
@@ -5003,6 +5373,7 @@ impl Fleet {
             &reservations,
             &predictions,
             &sync_costs,
+            policy,
             now,
         )
         .map_err(refuse)?;
@@ -5030,6 +5401,7 @@ impl Fleet {
         let decision = placement_decision(
             request,
             now,
+            Some(draft.policy),
             PlacementOutcome::Selected(Box::new(selection)),
             draft.rejected,
         );
@@ -5057,6 +5429,8 @@ impl Fleet {
             base_commit: String::new(),
             command: String::new(),
             command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -5075,7 +5449,7 @@ impl Fleet {
             resource_reservation: Default::default(),
             learned_estimate: None,
         };
-        self.select_executor(&request, None)
+        self.select_executor(&request, None, &ActivePlacementPolicy::default_profile())
             .await
             .map(|placement| placement.selected.sender)
             .map_err(|outcome| match outcome {
@@ -5177,6 +5551,13 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         base_commit: acquisition.initial_base_commit.clone(),
         command: acquisition.holder.storage_key(),
         command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+        placement_work_class: match acquisition.holder {
+            ResidencyHolder::Service { .. } => PlacementWorkClass::Services,
+            ResidencyHolder::DevInstance { .. } => PlacementWorkClass::DevInstances,
+            ResidencyHolder::Job { .. }
+            | ResidencyHolder::ProjectTerminals { .. }
+            | ResidencyHolder::Workflow { .. } => PlacementWorkClass::AgentSessions,
+        },
         owner: acquisition.owner_ref.clone().or_else(|| {
             Some(cairn_common::executor_protocol::CellOwnerRef {
                 project_id: acquisition.repository.project_id().to_string(),
@@ -5340,7 +5721,7 @@ fn require_colocated_population(
         .is_some_and(|name| !executor_names_match(name, LOCAL_EXECUTOR_NAME))
     {
         return Err(
-            "worktree population requires the local executor because ignored project content is available only in the runner's live primary checkout"
+            "worktree population requires the local executor because ignored project content is available only in the runner's live primary checkout; remove the executor selector or run without worktree population"
                 .into(),
         );
     }
@@ -5422,6 +5803,7 @@ fn prior_predictions(
 struct PlacementDraft {
     selected: Option<(SelectedExecutor, PlacementSelection)>,
     rejected: Vec<PlacementRejection>,
+    policy: PlacementPolicyEvidence,
 }
 
 /// Both placement stages back to back, for tests that have no demand to resolve
@@ -5439,6 +5821,25 @@ fn choose_executor_with(
     estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
     now_unix_ms: u64,
 ) -> Result<PlacementDraft, String> {
+    choose_executor_with_policy(
+        connections,
+        request,
+        reservations,
+        &ActivePlacementPolicy::default_profile(),
+        estimate,
+        now_unix_ms,
+    )
+}
+
+#[cfg(test)]
+fn choose_executor_with_policy(
+    connections: &HashMap<String, ExecutorConnectionState>,
+    request: &CellRequest,
+    reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
+    policy: &ActivePlacementPolicy,
+    estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
+    now_unix_ms: u64,
+) -> Result<PlacementDraft, String> {
     let survey = survey_candidates(connections, request)?;
     let (predictions, sync_costs) =
         prior_predictions(&survey.usable, request, &estimate, now_unix_ms);
@@ -5448,6 +5849,7 @@ fn choose_executor_with(
         reservations,
         &predictions,
         &sync_costs,
+        policy,
         now_unix_ms,
     )
 }
@@ -5668,6 +6070,7 @@ fn rank_survey(
     reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
     predictions: &HashMap<String, PlacementPrediction>,
     sync_costs: &HashMap<String, SyncCost>,
+    policy: &ActivePlacementPolicy,
     now_unix_ms: u64,
 ) -> Result<PlacementDraft, String> {
     let CandidateSurvey {
@@ -5678,6 +6081,7 @@ fn rank_survey(
         return Ok(PlacementDraft {
             selected: None,
             rejected,
+            policy: policy_evidence(request, policy, false),
         });
     }
     let targeted = request.pinned_executor_id.is_some()
@@ -5716,7 +6120,8 @@ fn rank_survey(
         })
         .collect();
 
-    let (winner, ranked) = rank_candidates(&scored, settled, exercising_spill);
+    let (winner, ranked, changed_earliest_winner) =
+        rank_candidates(&scored, settled, exercising_spill, request, policy);
     let Some(winner) = winner else {
         // Every usable machine was measured-blind and none of them was a
         // machine policy is allowed to spill onto. Say so with the evidence.
@@ -5780,7 +6185,31 @@ fn rank_survey(
     Ok(PlacementDraft {
         selected: Some((selected_executor(winner.entry), selection)),
         rejected,
+        policy: policy_evidence(request, policy, changed_earliest_winner),
     })
+}
+
+fn policy_evidence(
+    request: &CellRequest,
+    policy: &ActivePlacementPolicy,
+    changed_earliest_winner: bool,
+) -> PlacementPolicyEvidence {
+    let stance = policy.profile.stance(request.placement_work_class);
+    PlacementPolicyEvidence {
+        profile_name: policy.name.clone(),
+        work_class: request.placement_work_class,
+        stance: match stance {
+            PlacementStance::LocalFirst => "localFirst",
+            PlacementStance::RemoteFirst => "remoteFirst",
+            PlacementStance::RemoteOnly => "remoteOnly",
+            PlacementStance::Any => "any",
+        }
+        .to_string(),
+        max_preference_delay_seconds: policy.profile.max_preference_delay_seconds,
+        changed_earliest_winner,
+        constrained_by_mobility: !request.placement_mobility.may_spill()
+            && !matches!(stance, PlacementStance::Any | PlacementStance::LocalFirst),
+    }
 }
 
 /// One usable machine, with everything the ranking decides on.
@@ -5794,6 +6223,9 @@ struct ScoredCandidate<'a> {
     misfit: Option<PlacementRejectionReason>,
     /// Whether executor admission can retain and fit this request right now.
     admission_accepts: bool,
+    /// Normalized proximity to the entry bar, used only after a candidate can
+    /// admit and has an otherwise-comparable verdict prediction.
+    cpu_headroom_risk: Option<f64>,
     /// When this machine is predicted to answer, and on what evidence. The
     /// ranking key, and the explanation, are the same object.
     prediction: PlacementPrediction,
@@ -5805,7 +6237,7 @@ impl<'a> ScoredCandidate<'a> {
         sync_cost: SyncCost,
         reservation: Option<&'a resource_profiles::ResolvedResourceProfile>,
         declared_reservation: &ResourceReservation,
-        prediction: PlacementPrediction,
+        mut prediction: PlacementPrediction,
         now_unix_ms: u64,
     ) -> Self {
         let machine = &entry.health.machine;
@@ -5853,7 +6285,32 @@ impl<'a> ScoredCandidate<'a> {
             .iter()
             .map(|queue| queue.depth)
             .sum::<usize>();
-        let admission_accepts = queue_depth < entry.health.applied_policy.maximum_queue_depth
+        let cpu_admission = &entry.health.host.cpu_admission;
+        let cpu_admission_fresh = cpu_admission
+            .measured_at_unix_ms
+            .is_some_and(|measured_at| {
+                now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_SAMPLE_INTERVAL_MS
+            });
+        let cpu_pressured =
+            cpu_admission_fresh && cpu_admission.state == CpuAdmissionState::Pressured;
+        let cpu_headroom_risk = (cpu_admission_fresh
+            && cpu_admission.state == CpuAdmissionState::Accepting)
+            .then(|| {
+                let utilization = cpu_admission.utilization?;
+                let policy = entry.health.applied_policy.cpu_admission;
+                let span = policy.entry_utilization - policy.clear_utilization;
+                (span > 0.0)
+                    .then(|| ((utilization - policy.clear_utilization) / span).clamp(0.0, 1.0))
+            })
+            .flatten();
+        if cpu_pressured {
+            prediction.queue = QueueForecast::Unknown {
+                reason: QueueUnknownReason::MeasuredCpuPressure,
+            };
+            prediction.predicted_verdict_ms = prediction.run.predicted_ms;
+        }
+        let admission_accepts = !cpu_pressured
+            && queue_depth < entry.health.applied_policy.maximum_queue_depth
             && admission.memory_capacity_bytes.is_none_or(|capacity| {
                 active.memory_bytes.saturating_add(demand.memory_bytes) <= capacity
             })
@@ -5870,6 +6327,7 @@ impl<'a> ScoredCandidate<'a> {
             blindness,
             misfit,
             admission_accepts,
+            cpu_headroom_risk,
             prediction,
         }
     }
@@ -5940,18 +6398,18 @@ fn rank_candidates<'a, 'b>(
     scored: &'b [ScoredCandidate<'a>],
     settled_by_caller: bool,
     exercising_spill: bool,
+    request: &CellRequest,
+    policy: &ActivePlacementPolicy,
 ) -> (
     Option<&'b ScoredCandidate<'a>>,
     Vec<&'b ScoredCandidate<'a>>,
+    bool,
 ) {
-    let mut ranked: Vec<&ScoredCandidate<'a>> = scored.iter().collect();
-    ranked.sort_by(|a, b| {
+    let hard_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
         a.blindness
             .is_some()
             .cmp(&b.blindness.is_some())
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
-            // A prediction cannot promise a verdict on a machine that cannot
-            // retain this request's queue entry or fit its current reservation.
             .then_with(|| b.admission_accepts.cmp(&a.admission_accepts))
             .then_with(|| {
                 a.prediction
@@ -5960,10 +6418,15 @@ fn rank_candidates<'a, 'b>(
                     .is_none()
                     .cmp(&b.prediction.queue.predicted_ms().is_none())
             })
+    };
+    let forecast_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
+        a.prediction
+            .predicted_verdict_ms
+            .cmp(&b.prediction.predicted_verdict_ms)
             .then_with(|| {
-                a.prediction
-                    .predicted_verdict_ms
-                    .cmp(&b.prediction.predicted_verdict_ms)
+                a.cpu_headroom_risk
+                    .partial_cmp(&b.cpu_headroom_risk)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| {
                 a.prediction
@@ -5977,14 +6440,75 @@ fn rank_candidates<'a, 'b>(
                     .executor_id
                     .cmp(&b.entry.identity.executor_id)
             })
-    });
-    let winner = ranked.iter().copied().find(|candidate| {
-        candidate.blindness.is_none()
+    };
+    let selectable = |candidate: &&ScoredCandidate<'a>| {
+        (candidate.blindness.is_none()
             || settled_by_caller
             || candidate.entry.colocated
-            || !exercising_spill
+            || !exercising_spill)
+            && !(exercising_spill
+                && matches!(
+                    policy.profile.stance(request.placement_work_class),
+                    PlacementStance::RemoteOnly
+                )
+                && candidate.entry.colocated)
+    };
+
+    let mut baseline: Vec<&ScoredCandidate<'a>> = scored.iter().collect();
+    baseline.sort_by(|a, b| hard_order(a, b).then_with(|| forecast_order(a, b)));
+    let earliest = baseline.iter().copied().find(selectable);
+    let Some(earliest) = earliest else {
+        return (None, baseline, false);
+    };
+    if settled_by_caller || !exercising_spill {
+        return (Some(earliest), baseline, false);
+    }
+
+    let deadline = earliest.prediction.predicted_verdict_ms.saturating_add(
+        policy
+            .profile
+            .max_preference_delay_seconds
+            .saturating_mul(1_000),
+    );
+    let same_hard_group = |candidate: &&ScoredCandidate<'a>| {
+        hard_order(&earliest, candidate).is_eq()
+            && candidate.prediction.predicted_verdict_ms <= deadline
+            && selectable(candidate)
+    };
+    let stance = policy.profile.stance(request.placement_work_class);
+    let preference = |candidate: &&ScoredCandidate<'a>| match stance {
+        PlacementStance::LocalFirst => !candidate.entry.colocated,
+        PlacementStance::RemoteFirst | PlacementStance::RemoteOnly => candidate.entry.colocated,
+        PlacementStance::Any => false,
+    };
+    let priority = |candidate: &&ScoredCandidate<'a>| {
+        policy
+            .profile
+            .machine_priority
+            .iter()
+            .position(|id| id == &candidate.entry.identity.executor_id)
+            .unwrap_or(usize::MAX)
+    };
+    let mut ranked = baseline;
+    ranked.sort_by(|a, b| {
+        hard_order(a, b)
+            .then_with(|| same_hard_group(b).cmp(&same_hard_group(a)))
+            .then_with(|| {
+                if same_hard_group(a) && same_hard_group(b) {
+                    preference(a)
+                        .cmp(&preference(b))
+                        .then_with(|| priority(a).cmp(&priority(b)))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| forecast_order(a, b))
     });
-    (winner, ranked)
+    let winner = ranked.iter().copied().find(selectable);
+    let changed = winner.is_some_and(|winner| {
+        winner.entry.identity.executor_id != earliest.entry.identity.executor_id
+    });
+    (winner, ranked, changed)
 }
 
 /// What this machine already holds for this request, read off the facts it
@@ -7620,6 +8144,7 @@ mod tests {
                         cell_epoch: 1,
                     },
                     base_commit: "new-head".into(),
+                    require_clean: false,
                 },
             )
             .await;
@@ -7882,7 +8407,10 @@ mod tests {
         request.executor = None;
         request.wait_horizon_unix_ms = unix_time_ms().saturating_sub(1);
 
-        let outcome = pool.select_executor(&request, None).await.unwrap_err();
+        let outcome = pool
+            .select_executor(&request, None, &ActivePlacementPolicy::default_profile())
+            .await
+            .unwrap_err();
 
         let CellOutcome::Unavailable { reason, diagnostic } = outcome else {
             panic!("an elapsed horizon leaves no executor to run on");
@@ -8022,6 +8550,8 @@ mod tests {
             base_commit: "base".into(),
             command: "cargo test --workspace".into(),
             command_class: cairn_common::executor_protocol::CellCommandClass::CargoTest,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -8578,6 +9108,8 @@ mod tests {
             base_commit: "base".into(),
             command: "touch command-ran".into(),
             command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -8635,6 +9167,8 @@ mod tests {
             base_commit: "base".into(),
             command: "true".into(),
             command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -9294,6 +9828,8 @@ mod tests {
             base_commit: "base".into(),
             command: "true".into(),
             command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -9313,7 +9849,10 @@ mod tests {
             learned_estimate: None,
         };
         let started = Instant::now();
-        let outcome = pool.select_executor(&request, None).await.unwrap_err();
+        let outcome = pool
+            .select_executor(&request, None, &ActivePlacementPolicy::default_profile())
+            .await
+            .unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(20));
         assert!(matches!(
             outcome,
@@ -9445,6 +9984,80 @@ mod tests {
         )
     }
 
+    fn place_with_profile(
+        connections: &HashMap<String, ExecutorConnectionState>,
+        request: &CellRequest,
+        name: &str,
+        profile: PlacementProfile,
+    ) -> Result<PlacementDraft, String> {
+        choose_executor_with_policy(
+            connections,
+            request,
+            &HashMap::new(),
+            &ActivePlacementPolicy {
+                name: name.to_string(),
+                profile,
+            },
+            |_, _| SyncCost::Known(0),
+            NOW,
+        )
+    }
+
+    #[test]
+    fn remote_first_prefers_a_comparable_remote_and_records_policy_evidence() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
+        measured(&mut local, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut remote, 0.1, 8_000_000_000, 8_000_000_000);
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        let request = spillable_request();
+        let profile = profile_with_routes(30, |_| PlacementStance::RemoteFirst);
+
+        let draft = place_with_profile(&connections, &request, "interactive", profile).unwrap();
+
+        assert_eq!(chosen(&draft).executor_id, "remote");
+        assert_eq!(draft.policy.profile_name, "interactive");
+        assert!(draft.policy.changed_earliest_winner);
+    }
+
+    #[test]
+    fn explicit_selector_leaves_profile_preference_no_choice() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
+        measured(&mut local, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut remote, 0.1, 8_000_000_000, 8_000_000_000);
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        let mut request = spillable_request();
+        request.placement_work_class = PlacementWorkClass::AgentSessions;
+        request.executor = Some(ExecutorSelector {
+            name: Some("remote".into()),
+            ..ExecutorSelector::default()
+        });
+        let mut profile = profile_with_routes(30, |_| PlacementStance::LocalFirst);
+        profile.machine_priority = vec![LOCAL_EXECUTOR_NAME.into(), "remote".into()];
+
+        let draft = place_with_profile(&connections, &request, "interactive", profile).unwrap();
+
+        assert_eq!(chosen(&draft).executor_id, "remote");
+        assert!(!draft.policy.changed_earliest_winner);
+    }
+
+    #[test]
+    fn machine_priority_breaks_comparable_candidates_without_crossing_hard_gates() {
+        let (a_id, mut a) = fleet_entry("a", "linux", 0, &[]);
+        let (b_id, mut b) = fleet_entry("b", "linux", 0, &[]);
+        measured(&mut a, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut b, 0.1, 8_000_000_000, 8_000_000_000);
+        let connections = HashMap::from([(a_id, a), (b_id, b)]);
+        let mut profile = profile_with_routes(0, |_| PlacementStance::Any);
+        profile.machine_priority = vec!["b".into(), "a".into()];
+
+        let draft =
+            place_with_profile(&connections, &spillable_request(), "custom", profile).unwrap();
+
+        assert_eq!(chosen(&draft).executor_id, "b");
+    }
+
     /// The labeled class prior, for a fixture whose reservation is the point and
     /// whose duration is not.
     fn test_prior_duration() -> DurationEstimate {
@@ -9529,7 +10142,14 @@ mod tests {
             ),
         ];
 
-        let (winner, _) = rank_candidates(&scored, false, true);
+        let request = spillable_request();
+        let (winner, _, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+        );
         assert_eq!(
             winner
                 .expect("one measurable candidate wins")
@@ -9663,11 +10283,10 @@ mod tests {
         );
     }
 
-    /// CPU is evidence about current utilization, not time to a verdict. When
-    /// two candidates have equal duration predictions, a lower CPU reading must
-    /// not silently restore the retired load-based ranking.
+    /// Measured CPU remains observational rather than declared demand, but the
+    /// executor's fresh accepting state breaks an otherwise-comparable tie.
     #[test]
-    fn cpu_readings_do_not_outrank_equal_verdict_predictions() {
+    fn measured_cpu_headroom_breaks_only_equal_verdict_predictions() {
         let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
         measured(
             &mut local,
@@ -9682,18 +10301,59 @@ mod tests {
             4 * 1024 * 1024 * 1024,
             900 * 1024 * 1024 * 1024,
         );
+        local.health.host.cpu_admission = cairn_common::executor_protocol::CpuAdmissionHealth {
+            state: CpuAdmissionState::Accepting,
+            utilization: Some(0.02),
+            state_since_unix_ms: Some(NOW),
+            measured_at_unix_ms: Some(NOW),
+        };
+        remote.health.host.cpu_admission = cairn_common::executor_protocol::CpuAdmissionHealth {
+            state: CpuAdmissionState::Accepting,
+            utilization: Some(0.89),
+            state_since_unix_ms: Some(NOW),
+            measured_at_unix_ms: Some(NOW),
+        };
         let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
 
         let selection = place(&connections, &spillable_request()).unwrap();
         let selection = chosen(&selection);
         assert_eq!(
-            selection.executor_id, "bglab-ub",
-            "equal verdict predictions fall through to deterministic identity ordering, not CPU"
+            selection.executor_id, COLOCATED_EXECUTOR_ID,
+            "fresh measured headroom breaks an otherwise-equal prediction tie"
         );
         assert_eq!(selection.reason, PlacementReason::PredictedEarliestVerdict);
+        assert_eq!(selection.observation_reuse, ObservationReuse::Colocated);
+    }
+
+    #[test]
+    fn continuing_cpu_pressure_remains_authoritative_after_an_entry_window() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(
+            &mut local,
+            0.95,
+            48 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        local.health.host.cpu_admission = cairn_common::executor_protocol::CpuAdmissionHealth {
+            state: CpuAdmissionState::Pressured,
+            utilization: Some(0.95),
+            state_since_unix_ms: Some(NOW - 20_000),
+            measured_at_unix_ms: Some(NOW),
+        };
+
+        let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured(
+            &mut remote,
+            0.20,
+            48 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+
         assert_eq!(
-            selection.observation_reuse,
-            ObservationReuse::UntrustedRemoteEnvironment
+            chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
+            "bglab-ub",
+            "a fresh sample must keep an executor rejected after pressure has remained active beyond one sampling interval"
         );
     }
 
@@ -11605,6 +12265,8 @@ mod tests {
             base_commit: "base".into(),
             command: "true".into(),
             command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -11653,13 +12315,16 @@ mod tests {
             tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap()
-                .block_on(
-                    selecting_pool.select_executor_once_with(&request, None, |_, _| {
+                .block_on(selecting_pool.select_executor_once_with(
+                    &request,
+                    None,
+                    &ActivePlacementPolicy::default_profile(),
+                    |_, _| {
                         estimation_started_tx.send(()).unwrap();
                         release_estimation_rx.recv().unwrap();
                         SyncCost::Unknown
-                    }),
-                )
+                    },
+                ))
                 .unwrap()
         });
         estimation_started_rx
@@ -11702,13 +12367,16 @@ mod tests {
             tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap()
-                .block_on(
-                    selecting_pool.select_executor_once_with(&request, None, |_, _| {
+                .block_on(selecting_pool.select_executor_once_with(
+                    &request,
+                    None,
+                    &ActivePlacementPolicy::default_profile(),
+                    |_, _| {
                         estimation_started_tx.send(()).unwrap();
                         release_estimation_rx.recv().unwrap();
                         SyncCost::Unknown
-                    }),
-                )
+                    },
+                ))
                 .unwrap()
         });
         estimation_started_rx
@@ -11730,11 +12398,12 @@ mod tests {
         let selected = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(
-                pool.select_executor_once_with(&targeted_request("linux"), None, |_, _| {
-                    SyncCost::Unknown
-                }),
-            )
+            .block_on(pool.select_executor_once_with(
+                &targeted_request("linux"),
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                |_, _| SyncCost::Unknown,
+            ))
             .unwrap()
             .unwrap()
             .selected;
@@ -12396,6 +13065,8 @@ mod tests {
         };
         let recorded = crate::execution::cache::RecordedCheckObservation {
             id: "obs-published".to_string(),
+            public_handle: "111111111111111111111111".into(),
+            ran_at: 1,
             environment_fingerprint: "env".to_string(),
             reusable: true,
         };

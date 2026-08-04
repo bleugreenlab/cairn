@@ -14,7 +14,7 @@
 //!   rides along into its next natural run — its work moved underneath it but
 //!   there is nothing to resolve, so it is never mechanically resumed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -72,6 +72,125 @@ pub(crate) async fn publish_managed_branch(
     crate::jj::publish_branch_to_origin(&jj, store, branch)
         .await
         .map_err(|error| format!("stale publication retry failed: {error}"))
+}
+
+async fn release_reminted_claim_after_failure(
+    db: &LocalDb,
+    original_intent_id: &str,
+    effective_claim: &ReconcileClaim,
+) {
+    if effective_claim.id != original_intent_id {
+        release_reconcile_claim(db, effective_claim).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_stale_durable_intent(
+    db: &LocalDb,
+    repo_path: &str,
+    store: &Path,
+    target_branch: &str,
+    stored_destination: &str,
+    current_destination: &str,
+    refresh_source: &str,
+    claim: ReconcileClaim,
+) -> Result<Option<ReconcileClaim>, String> {
+    if stored_destination == current_destination {
+        return Ok(Some(claim));
+    }
+
+    let diagnostic = format!(
+        "superseded stale destination pin {stored_destination} with current destination {current_destination}"
+    );
+    let changed = db
+        .execute(
+            "UPDATE jj_reconcile_intents
+             SET status = 'superseded', lease_owner = NULL, lease_expires_at = NULL,
+                 last_diagnostic = ?3, updated_at = ?4
+             WHERE id = ?1 AND lease_owner = ?2 AND status = 'running'",
+            params![
+                claim.id.as_str(),
+                claim.owner.as_str(),
+                diagnostic.as_str(),
+                chrono::Utc::now().timestamp()
+            ],
+        )
+        .await
+        .map_err(|error| format!("supersede stale reconcile intent: {error}"))?;
+    if changed == 0 {
+        return Err(format!(
+            "durable reconcile intent {} lost its lease while refreshing destination",
+            claim.id
+        ));
+    }
+    log::info!(
+        "jj reconcile worker superseded durable intent {}: {diagnostic}",
+        claim.id
+    );
+
+    let reminted = claim_reconcile_intent(
+        db,
+        repo_path,
+        store,
+        target_branch,
+        current_destination,
+        refresh_source,
+    )
+    .await?;
+    if reminted.is_none() {
+        log::info!(
+            "jj reconcile worker reaped durable intent {}: current destination {} is already owned or completed",
+            claim.id,
+            current_destination
+        );
+    }
+    Ok(reminted)
+}
+
+/// A base advance must not move a job's branch while one of its process batches
+/// is still executing off-turn. The suspension row is the durable execution
+/// bracket: it is created before the provider turn yields and resolved only
+/// after the executor result has been published. Moving the branch inside that
+/// bracket can leave the resolver publishing against a coordinate that no
+/// longer names the running batch.
+async fn jobs_have_inflight_run_batches(
+    db: &LocalDb,
+    siblings: &[SiblingJob],
+) -> Result<bool, String> {
+    for sibling in siblings {
+        let job_id = sibling.id.clone();
+        let active = db
+            .read(|conn| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT condition_json FROM agent_waits
+                             WHERE job_id = ?1 AND state IN ('pending', 'resolving')",
+                            params![job_id.as_str()],
+                        )
+                        .await?;
+                    while let Some(row) = rows.next().await? {
+                        let condition = serde_json::from_str::<
+                            crate::mcp::handlers::durable_suspend::Condition,
+                        >(&row.text(0)?);
+                        if matches!(
+                            condition,
+                            Ok(crate::mcp::handlers::durable_suspend::Condition::RunBatch { .. })
+                        ) {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                })
+            })
+            .await
+            .map_err(|error| format!("inspect in-flight run batches: {error}"))?;
+        if active {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -533,6 +652,7 @@ async fn refresh_residencies_for_branch(
                         cell_epoch,
                     },
                     base_commit: new_tip.to_string(),
+                    require_clean: false,
                 },
             )
             .await;
@@ -595,6 +715,9 @@ async fn refresh_residencies_for_branch(
             }
         }
     }
+    failed += crate::dev_instances::sync_live_branch_instances(orch, project_id, branch, new_tip)
+        .await
+        .len();
     failed
 }
 
@@ -692,6 +815,13 @@ async fn reconcile_jj_downstream(
                 ),
             }
         }
+        crate::execution::checks_main::spawn(
+            orch,
+            merged_job.project_id.clone(),
+            repo_path.to_string(),
+            base_branch.to_string(),
+            Some(merged_job.id.clone()),
+        );
     }
 
     let siblings =
@@ -825,9 +955,9 @@ pub(crate) async fn reconcile_external_default_advance(
 /// non-blocking, and notify the siblings this reconcile actually rewrote — a
 /// waking `Steer` note to a conflicted sibling, a passive ride-along note to a
 /// cleanly-rebased one (the before/after commit-id guard in
-/// `reconcile_base_advance` gates both). Runs regardless of the project's
-/// `pull_on_merge` setting: that gates the user's main-checkout pull, not
-/// agent branch reconciliation. Non-fatal end to end — every failure is logged
+/// `reconcile_base_advance` gates both). This reconciliation is driven by
+/// an observed remote advance, independently of main-checkout lifecycle. Non-fatal
+/// end to end — every failure is logged
 /// and swallowed so the webhook handler does not error on it.
 async fn reconcile_default_advance(
     orch: &Orchestrator,
@@ -846,6 +976,16 @@ async fn reconcile_default_advance(
         log::debug!("Skipping external advance reconcile: no repo_path for project {project_id}");
         return Ok(());
     };
+    // Arm independently of sibling reconciliation. Its own retry refreshes and
+    // reconciles the canonical bookmark, so a transient failure below cannot
+    // erase the observed main advance.
+    crate::execution::checks_main::spawn(
+        orch,
+        project_id.to_string(),
+        repo_path.clone(),
+        default_branch.to_string(),
+        None,
+    );
     // Bring the advanced tip into the shared store and reconcile the default
     // bookmark onto it — BEFORE looking at siblings, because this is owed whether
     // or not anything downstream needs rebasing.
@@ -882,7 +1022,6 @@ async fn reconcile_default_advance(
         &format!("external advance on {default_branch}"),
     )
     .await;
-
     let siblings = load_sibling_jobs(&db, project_id, default_branch, EXCLUDE_NONE).await?;
     if siblings.is_empty() {
         log::debug!("external advance on {default_branch}: no in-flight siblings to reconcile");
@@ -1157,6 +1296,7 @@ async fn execute_durable_reconcile_work(
     work: DurableReconcileWork,
 ) -> Result<(), String> {
     let project_id = work.claim.project_id.clone();
+    let original_intent_id = work.claim.id.clone();
     let repo_path = load_project_repo_path(db, &project_id)
         .await?
         .ok_or_else(|| format!("project {project_id} has no repository path"))?;
@@ -1165,10 +1305,15 @@ async fn execute_durable_reconcile_work(
         .iter()
         .filter_map(sibling_branch)
         .collect::<Vec<_>>();
-    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    let candidate_names = specs.to_vec();
-    let existing_bookmarks =
-        crate::jj::query_local_bookmarks(&jj, &work.store, &candidate_names).ok();
+    if specs.is_empty() {
+        log::info!(
+            "jj reconcile worker reaped durable intent {}: no live sibling bookmarks remain for {}",
+            work.claim.id,
+            work.target_branch
+        );
+        finish_reconcile_intent(db, &work.claim.id, &work.claim.owner, false).await?;
+        return Ok(());
+    }
     let external = work
         .sources
         .iter()
@@ -1177,6 +1322,43 @@ async fn execute_durable_reconcile_work(
         remote_default_revset(&work.target_branch)
     } else {
         work.target_branch.clone()
+    };
+    let refresh_source = if external {
+        "external advance durable destination refresh"
+    } else {
+        "durable destination refresh"
+    };
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let (pinned_dest, claim, existing_bookmarks) = {
+        let _guard = orch
+            .acquire_jj_store_lock(
+                &work.store,
+                format!(
+                    "durable reconcile destination refresh ({})",
+                    work.target_branch
+                ),
+            )
+            .await;
+        let current_dest =
+            crate::jj::revset_commit(&jj, &work.store, &rebase_dest).ok_or_else(|| {
+                format!("durable reconcile destination `{rebase_dest}` did not resolve")
+            })?;
+        let Some(claim) = refresh_stale_durable_intent(
+            db,
+            &repo_path,
+            &work.store,
+            &work.target_branch,
+            &work.destination_commit,
+            &current_dest,
+            refresh_source,
+            work.claim,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let existing_bookmarks = crate::jj::query_local_bookmarks(&jj, &work.store, &specs).ok();
+        (current_dest, claim, existing_bookmarks)
     };
     let notes = BaseAdvanceNotes {
         conflict: build_jj_conflict_note(&work.target_branch, None, None),
@@ -1190,7 +1372,12 @@ async fn execute_durable_reconcile_work(
         },
     };
     let label = format!("durable retry on {}", work.target_branch);
-    execute_reconcile_claim(
+    let effective_claim = ReconcileClaim {
+        id: claim.id.clone(),
+        owner: claim.owner.clone(),
+        project_id: claim.project_id.clone(),
+    };
+    let result = execute_reconcile_claim(
         orch,
         db,
         &project_id,
@@ -1201,15 +1388,24 @@ async fn execute_durable_reconcile_work(
         notes,
         specs,
         existing_bookmarks,
-        work.destination_commit,
-        work.claim,
+        pinned_dest,
+        claim,
     )
     .await
-    .map(|_| ())
+    .map(|_| ());
+    if result.is_err() {
+        release_reminted_claim_after_failure(db, &original_intent_id, &effective_claim).await;
+    }
+    result
+}
+
+fn first_claim_this_sweep(claimed: &mut HashSet<String>, intent_id: &str) -> bool {
+    claimed.insert(intent_id.to_owned())
 }
 
 pub(crate) async fn sweep_reconcile_intents(orch: &Orchestrator) {
     for db in orch.db.all_dbs().await {
+        let mut claimed_this_pass = HashSet::new();
         loop {
             let work = match claim_next_reconcile_intent(&db).await {
                 Ok(Some(work)) => work,
@@ -1219,6 +1415,10 @@ pub(crate) async fn sweep_reconcile_intents(orch: &Orchestrator) {
                     break;
                 }
             };
+            if !first_claim_this_sweep(&mut claimed_this_pass, &work.claim.id) {
+                release_reconcile_claim(&db, &work.claim).await;
+                break;
+            }
             let claim = ReconcileClaim {
                 id: work.claim.id.clone(),
                 owner: work.claim.owner.clone(),
@@ -1870,6 +2070,14 @@ async fn reopen_reconcile_intent(
     Ok(())
 }
 
+fn siblings_for_branch(siblings: &[SiblingJob], branch: &str) -> Vec<SiblingJob> {
+    siblings
+        .iter()
+        .filter(|sibling| sibling.branch.as_deref() == Some(branch))
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_reconcile_claim(
     orch: &Orchestrator,
@@ -1907,6 +2115,7 @@ async fn execute_reconcile_claim(
     let mut before: HashMap<String, String> = HashMap::new();
     let mut after: HashMap<String, String> = HashMap::new();
     let mut report = crate::jj::ReconcileReport::default();
+    let mut any_branch_deferred = false;
 
     for branch in &specs {
         heartbeat_reconcile_intent(db, &claim).await?;
@@ -2022,6 +2231,19 @@ async fn execute_reconcile_claim(
                 .acquire_jj_store_lock(&store, format!("sibling reconcile ({label}): {branch}"))
                 .await;
             let _phase = guard.phase(format!("bookmark transaction branch={branch}"));
+
+            // RunBatch suspension admission takes this same store lock while
+            // inserting its durable row. Revalidating under the guard makes the
+            // row check and bookmark mutation one exclusive bracket.
+            let branch_siblings = siblings_for_branch(&siblings, branch);
+            if jobs_have_inflight_run_batches(db, &branch_siblings).await? {
+                log::info!(
+                    "jj base advance ({label}): deferred {branch} at the mutation boundary for an in-flight run batch"
+                );
+                drop(guard);
+                any_branch_deferred = true;
+                continue;
+            }
 
             // Revalidate that the named destination still identifies the pinned
             // commit before mutating this bookmark.
@@ -2388,7 +2610,7 @@ async fn execute_reconcile_claim(
     // this write resumes graph_moved items without replaying their jj mutation.
     mark_reconcile_delivered(db, intent_id).await?;
 
-    let retry_transient = reconcile_has_transient_failures(&report.failed);
+    let retry_transient = any_branch_deferred || reconcile_has_transient_failures(&report.failed);
     // Fan a lifetime-cell refresh out to every sibling this reconcile actually
     // rewrote. A running cell on a rebased job branch must follow the logical
     // coordinate to the new tip or it keeps serving pre-rebase source. This is the
@@ -3647,6 +3869,228 @@ mod tests {
     use crate::storage::{LocalDb, SearchIndex};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn base_advance_defers_while_a_sibling_run_batch_is_in_flight() {
+        let db = Arc::new(migrated_db().await);
+        seed_base_advance_fixture(&db).await;
+        for sql in [
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-batch','job-overlap','open','backend',1,1)",
+            "UPDATE runs SET session_id='session-batch' WHERE id='run-job-overlap'",
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-batch','session-batch','run-job-overlap','job-overlap',1,'yielded','initial',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        let root = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root,
+        )
+        .build();
+        let sibling = SiblingJob {
+            id: "job-overlap".into(),
+            branch: Some("agent/overlap".into()),
+            base_commit: None,
+        };
+
+        // Reconcile wins the store lock first and reaches its final mutation
+        // boundary. A batch that starts between the initial claim query and this
+        // point cannot insert its bracket row underneath that mutation.
+        let store = PathBuf::from("/store");
+        let mutation_guard = orch
+            .acquire_jj_store_lock(&store, "test reconcile mutation")
+            .await;
+        let admission_orch = orch.clone();
+        let admission_db = db.clone();
+        let admission_store = store.clone();
+        let mut admission = tokio::spawn(async move {
+            let _guard = admission_orch
+                .acquire_jj_store_lock(&admission_store, "test run batch admission")
+                .await;
+            admission_db
+                .execute(
+                    "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-batch','job-overlap','run-job-overlap','session-batch','turn-batch','tool-batch','{\"kind\":\"run_batch\",\"request_id\":\"request-1\",\"commits\":false,\"label\":\"focused test\"}','pending',1)",
+                    (),
+                )
+                .await
+                .unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut admission)
+                .await
+                .is_err(),
+            "run-batch admission must wait while bookmark mutation owns the store lock"
+        );
+        assert!(
+            !jobs_have_inflight_run_batches(&db, std::slice::from_ref(&sibling))
+                .await
+                .unwrap()
+        );
+
+        drop(mutation_guard);
+        admission.await.unwrap();
+        let _revalidation_guard = orch
+            .acquire_jj_store_lock(&store, "test reconcile revalidation")
+            .await;
+        assert!(jobs_have_inflight_run_batches(&db, &[sibling])
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn reconcile_sweep_bounds_requeued_work_to_one_claim_per_pass() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let claim =
+            claim_reconcile_intent(&db, "/repo", Path::new("/store"), "main", "dest-a", "test")
+                .await
+                .unwrap()
+                .unwrap();
+        let mut claimed = HashSet::new();
+
+        assert!(first_claim_this_sweep(&mut claimed, &claim.id));
+        release_reconcile_claim(&db, &claim).await;
+        let retried = claim_next_reconcile_intent(&db)
+            .await
+            .unwrap()
+            .expect("released work remains retryable");
+        assert_eq!(retried.claim.id, claim.id);
+        assert_ne!(retried.claim.owner, claim.owner);
+        assert!(
+            !first_claim_this_sweep(&mut claimed, &retried.claim.id),
+            "the retry is deferred to the next sweep instead of spinning in this one"
+        );
+        release_reconcile_claim(&db, &retried.claim).await;
+        assert!(
+            claim_next_reconcile_intent(&db).await.unwrap().is_some(),
+            "bounding the pass must not consume the retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_retry_supersedes_a_fossilized_pin_and_remints_current_destination() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let store = Path::new("/store");
+        let stale = claim_reconcile_intent(
+            &db,
+            "/repo",
+            store,
+            "main",
+            "destination-a",
+            "pre-sweep trigger",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let current = refresh_stale_durable_intent(
+            &db,
+            "/repo",
+            store,
+            "main",
+            "destination-a",
+            "destination-b",
+            "durable destination refresh",
+            stale,
+        )
+        .await
+        .unwrap()
+        .expect("the stale intent is reminted against the live destination");
+
+        let stale_state: (String, String) = db
+            .query_one(
+                "SELECT status, last_diagnostic FROM jj_reconcile_intents
+                 WHERE destination_commit = 'destination-a'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_state.0, "superseded");
+        assert!(stale_state.1.contains("destination-b"));
+        assert_eq!(
+            db.query_text(
+                "SELECT destination_commit FROM jj_reconcile_intents WHERE id = ?1",
+                (current.id.clone(),),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("destination-b")
+        );
+
+        release_reminted_claim_after_failure(&db, "fossil-intent", &current).await;
+        assert_eq!(
+            db.query_text(
+                "SELECT status FROM jj_reconcile_intents WHERE id = ?1",
+                (current.id.clone(),),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("pending"),
+            "a failed execution releases the reminted destination immediately"
+        );
+        let retried = claim_next_reconcile_intent(&db)
+            .await
+            .unwrap()
+            .expect("the replacement is retryable without waiting for lease expiry");
+        finish_reconcile_intent(&db, &retried.claim.id, &retried.claim.owner, false)
+            .await
+            .unwrap();
+        assert!(
+            claim_next_reconcile_intent(&db).await.unwrap().is_none(),
+            "one sweep can leave both the fossil and its replacement terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_batch_deferral_is_scoped_to_the_owning_branch() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        for sql in [
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-local','job-overlap','open','backend',1,1)",
+            "UPDATE runs SET session_id='session-local' WHERE id='run-job-overlap'",
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-local','session-local','run-job-overlap','job-overlap',1,'yielded','initial',1,1)",
+            "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-local','job-overlap','run-job-overlap','session-local','turn-local','tool-local','{\"kind\":\"run_batch\",\"request_id\":\"request-local\",\"commits\":false,\"label\":\"branch-local test\"}','pending',1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        let siblings = vec![
+            SiblingJob {
+                id: "job-overlap".into(),
+                branch: Some("agent/overlap".into()),
+                base_commit: None,
+            },
+            SiblingJob {
+                id: "job-clean".into(),
+                branch: Some("agent/clean".into()),
+                base_commit: None,
+            },
+        ];
+        let blocked = siblings_for_branch(&siblings, "agent/overlap");
+        let clear = siblings_for_branch(&siblings, "agent/clean");
+
+        assert_eq!(
+            blocked.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["job-overlap"]
+        );
+        assert_eq!(
+            clear.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["job-clean"]
+        );
+        assert!(jobs_have_inflight_run_batches(&db, &blocked).await.unwrap());
+        assert!(
+            !jobs_have_inflight_run_batches(&db, &clear).await.unwrap(),
+            "a run batch on one branch must not defer its clear sibling"
+        );
+    }
+
     /// The diagnostic exists only inside the rebase, between the recorded
     /// conflict and the rollback. If it does not survive that window in storage,
     /// nothing downstream can ever show it: the branch is clean again and a later

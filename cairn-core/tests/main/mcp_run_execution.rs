@@ -41,6 +41,7 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
 /// contract, and passes only for as long as the leak lasts. The refusal is built
 /// in `mcp::handlers::run`.
 const REACHED_PLACEMENT: &str = "environment could not be reached";
+const DURABLE_SUSPEND: &str = "Run handed off to durable suspend";
 
 /// The canon invariant, end to end: a search over tracked content is served
 /// from the job's head coordinate with no executor in the fleet at all. This
@@ -620,7 +621,7 @@ async fn awaited_resolution(db: &LocalDb) -> String {
 /// over, instead of quietly waiting its turn in the executor's queue.
 async fn setup_impatient_machine(
     run_id: &str,
-    concurrency_units: u32,
+    memory_budget_bytes: u64,
     max_queue_entries: usize,
 ) -> (TempDir, Arc<LocalDb>, Orchestrator, String, String) {
     let (temp, db) = common::migrated_db().await;
@@ -633,7 +634,7 @@ async fn setup_impatient_machine(
     let base_commit = common::head_sha(&project_repo);
     seed_run(&db, &project_id, &worktree, branch, &base_commit, run_id).await;
     let orch = orchestrator_without_executor(&temp, db.clone());
-    common::attach_capacity_limited_test_executor(&orch, concurrency_units, max_queue_entries);
+    common::attach_capacity_limited_test_executor(&orch, memory_budget_bytes, max_queue_entries);
     let config = temp.path().join("config");
     common::provision_jj_workspace(&config, &project_repo, &worktree, branch);
     std::fs::write(
@@ -694,6 +695,7 @@ fn occupying_request(
         base_commit: String::new(),
         command: format!("sleep {}", if index == 0 { 8 } else { 1 }),
         command_class: CellCommandClass::Other,
+        placement_work_class: cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
         owner: None,
         cwd: String::new(),
         env: Vec::new(),
@@ -709,7 +711,10 @@ fn occupying_request(
         placement_mobility: Default::default(),
         verdict_platforms: Vec::new(),
         command_resource_identity: None,
-        resource_reservation: Default::default(),
+        resource_reservation: cairn_common::executor_protocol::ResourceReservation {
+            memory_bytes: 512 * 1024 * 1024,
+            ..Default::default()
+        },
         learned_estimate: None,
     }
 }
@@ -735,7 +740,8 @@ async fn a_full_machine_makes_a_batch_slower_not_broken() {
     // not the case under test: a queued request is held while the executor
     // reports itself busy, and it would run without any of this change. Only a
     // refusal proves the batch was re-presented instead of failed.
-    let (_temp, db, orch, cwd, project_id) = setup_impatient_machine("run-capacity", 1, 1).await;
+    let (_temp, db, orch, cwd, project_id) =
+        setup_impatient_machine("run-capacity", 512 * 1024 * 1024, 1).await;
     let payload = json!({ "commands": [{ "command": "echo room-freed" }] });
     seed_suspendable_run(&db, &orch, "run-capacity", &payload).await;
 
@@ -787,7 +793,7 @@ async fn a_full_machine_makes_a_batch_slower_not_broken() {
         marker
     };
     assert!(
-        marker.contains("Run suspended"),
+        marker.contains(DURABLE_SUSPEND),
         "a batch with nowhere to run must suspend, not refuse: {marker}"
     );
     assert!(
@@ -840,7 +846,8 @@ async fn a_waiting_request_holds_one_place_and_reports_the_wait_it_did() {
     }
     // Room for one command and waiting room behind it, so the second request is
     // queued rather than turned away at the door.
-    let (_temp, _db, orch, cwd, project_id) = setup_impatient_machine("run-continuity", 1, 8).await;
+    let (_temp, _db, orch, cwd, project_id) =
+        setup_impatient_machine("run-continuity", 512 * 1024 * 1024, 8).await;
 
     let occupant = {
         let fleet = orch.fleet.clone();
@@ -943,7 +950,7 @@ async fn an_unsatisfiable_executor_selector_still_refuses_instead_of_queueing() 
         return;
     }
     let (_temp, db, orch, cwd, _project_id) =
-        setup_impatient_machine("run-unsatisfiable", u32::MAX, usize::MAX).await;
+        setup_impatient_machine("run-unsatisfiable", u64::MAX, usize::MAX).await;
     let text = run_text(
         &handle_run(
             &orch,
@@ -1190,7 +1197,7 @@ async fn a_batch_publishes_identically_whether_it_settles_fast_or_suspends() {
         marker
     };
     assert!(
-        marker.contains("Run suspended"),
+        marker.contains(DURABLE_SUSPEND),
         "the batch did not suspend: {marker}"
     );
     assert!(
@@ -1259,7 +1266,7 @@ async fn an_explicit_timeout_still_kills_inside_a_suspended_batch() {
         marker
     };
     assert!(
-        marker.contains("Run suspended"),
+        marker.contains(DURABLE_SUSPEND),
         "the batch did not suspend: {marker}"
     );
 
@@ -1340,7 +1347,7 @@ async fn a_batch_outliving_grace_suspends_over_the_transport_agents_actually_use
     };
 
     assert!(
-        marker.contains("Run suspended"),
+        marker.contains(DURABLE_SUSPEND),
         "a batch that outlived grace did not suspend over the MCP transport: {marker}"
     );
     assert!(
@@ -1398,7 +1405,7 @@ async fn a_supplied_tool_use_id_is_used_as_given() {
     };
 
     assert!(
-        marker.contains("Run suspended"),
+        marker.contains(DURABLE_SUSPEND),
         "a supplied tool-use id must still park the batch: {marker}"
     );
     let rows = wait_rows(&db).await;
@@ -1435,7 +1442,7 @@ async fn a_suspension_binds_to_its_own_call_among_siblings() {
     };
 
     assert!(
-        marker.contains("Run suspended"),
+        marker.contains(DURABLE_SUSPEND),
         "the batch did not suspend: {marker}"
     );
     let rows = wait_rows(&db).await;
@@ -1482,7 +1489,7 @@ async fn indistinguishable_concurrent_batches_claim_nothing() {
 
     for (label, text) in [("first", &first), ("second", &second)] {
         assert!(
-            !text.contains("Run suspended"),
+            !text.contains(DURABLE_SUSPEND),
             "the {label} batch claimed a call it could not identify: {text}"
         );
         assert!(
@@ -1591,7 +1598,7 @@ async fn two_concurrent_batches_both_suspend_over_the_real_transport() {
 
     for (label, text) in [("tests", &first), ("checks", &second)] {
         assert!(
-            text.contains("Run suspended"),
+            text.contains(DURABLE_SUSPEND),
             "the concurrent {label} batch did not park: {text}"
         );
     }
@@ -1645,7 +1652,7 @@ async fn the_turn_resumes_only_after_the_last_batch_settles() {
         std::env::remove_var("CAIRN_RUN_GRACE_MS");
         for (label, text) in [("quick", run_text(&first)), ("slow", run_text(&second))] {
             assert!(
-                text.contains("Run suspended"),
+                text.contains(DURABLE_SUSPEND),
                 "the {label} batch did not park: {text}"
             );
         }
@@ -1704,11 +1711,15 @@ async fn suspension_engages_again_after_a_row_outlives_its_turn() {
     };
 
     assert!(
-        first_marker.contains("Run suspended"),
+        first_marker.contains("Run handed off to durable suspend"),
         "the first batch did not suspend: {first_marker}"
     );
     assert!(
-        second_marker.contains("Run suspended"),
+        first_marker.contains(DURABLE_SUSPEND),
+        "the first batch did not suspend: {first_marker}"
+    );
+    assert!(
+        second_marker.contains(DURABLE_SUSPEND),
         "a second suspension in the same job was refused instead of superseding the stale row: {second_marker}"
     );
 

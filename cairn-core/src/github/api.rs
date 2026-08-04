@@ -25,6 +25,79 @@ struct CachedToken {
     expires_at: u64,
 }
 
+fn app_auth_headers(app_id: i64, private_key: &str) -> Result<HeaderMap, String> {
+    let jwt = generate_app_jwt(app_id, private_key)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {jwt}")).map_err(|e| e.to_string())?,
+    );
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("Cairn"));
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static("2022-11-28"),
+    );
+    Ok(headers)
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AppInstallation {
+    pub id: i64,
+    pub account: AppInstallationAccount,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AppInstallationAccount {
+    pub login: String,
+    #[serde(rename = "type")]
+    pub account_type: String,
+}
+
+/// List the installations currently authorized for this GitHub App.
+pub async fn list_app_installations(
+    http: &dyn HttpClient,
+    app_id: i64,
+    private_key: &str,
+) -> Result<Vec<AppInstallation>, String> {
+    let mut installations = Vec::new();
+    for page in 1.. {
+        let resp = http
+            .get(
+                &format!("{GITHUB_API_BASE}/app/installations?per_page=100&page={page}"),
+                app_auth_headers(app_id, private_key)?,
+            )
+            .await?;
+        ensure_github_api_success(&resp)?;
+        let mut page_installations: Vec<AppInstallation> = resp.json()?;
+        let is_last_page = page_installations.len() < 100;
+        installations.append(&mut page_installations);
+        if is_last_page {
+            return Ok(installations);
+        }
+    }
+    unreachable!("installation pagination always returns from a finite page")
+}
+
+/// Revoke exactly one GitHub App installation.
+pub async fn revoke_app_installation(
+    http: &dyn HttpClient,
+    app_id: i64,
+    private_key: &str,
+    installation_id: i64,
+) -> Result<(), String> {
+    let resp = http
+        .delete(
+            &format!("{GITHUB_API_BASE}/app/installations/{installation_id}"),
+            app_auth_headers(app_id, private_key)?,
+        )
+        .await?;
+    ensure_github_api_success(&resp)
+}
+
 /// Global token cache keyed by installation_id.
 static TOKEN_CACHE: LazyLock<RwLock<HashMap<i64, CachedToken>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -573,22 +646,7 @@ pub async fn update_app_webhook_url(
     private_key: &str,
     new_webhook_url: &str,
 ) -> Result<(), String> {
-    let jwt = generate_app_jwt(app_id, private_key)?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", jwt)).map_err(|e| e.to_string())?,
-    );
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/vnd.github+json"),
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static("Cairn"));
-    headers.insert(
-        "X-GitHub-Api-Version",
-        HeaderValue::from_static("2022-11-28"),
-    );
+    let headers = app_auth_headers(app_id, private_key)?;
 
     let url = format!("{}/app/hook/config", GITHUB_API_BASE);
 
@@ -616,6 +674,51 @@ pub async fn update_app_webhook_url(
 mod tests {
     use super::*;
     use crate::services::{testing::MockHttpClient, HttpResponse};
+
+    #[tokio::test]
+    async fn lists_app_installations_with_account_facts() {
+        let body = serde_json::json!([
+            {"id": 42, "account": {"login": "Acme", "type": "Organization"}},
+            {"id": 7, "account": {"login": "mitch", "type": "User"}}
+        ]);
+        let http = MockHttpClient::new().respond_to(
+            "/app/installations?",
+            HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+        );
+        let installations = list_app_installations(
+            &http,
+            12345,
+            include_str!("../../tests/fixtures/test_rsa_key.pem"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(installations[0].id, 42);
+        assert_eq!(installations[0].account.login, "Acme");
+        assert_eq!(installations[0].account.account_type, "Organization");
+    }
+
+    #[tokio::test]
+    async fn scoped_revocation_reports_github_failure() {
+        let http = MockHttpClient::new().respond_to(
+            "/app/installations/42",
+            HttpResponse {
+                status: 403,
+                body: br#"{"message":"forbidden"}"#.to_vec(),
+            },
+        );
+        let error = revoke_app_installation(
+            &http,
+            12345,
+            include_str!("../../tests/fixtures/test_rsa_key.pem"),
+            42,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("403"));
+    }
 
     // ── parse_repo_from_url ──────────────────────────────────────
 

@@ -10,6 +10,35 @@ use crate::services::GitClient;
 use crate::storage::LocalDb;
 use std::path::Path;
 
+pub fn normalize_remote_url(value: &str) -> Result<String, CairnError> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() || value.starts_with("file://") || Path::new(value).is_absolute() {
+        return Err(CairnError::Internal(
+            "Remote must be an HTTPS or SSH Git URL".to_string(),
+        ));
+    }
+    let valid_url = ["https://", "ssh://"].iter().any(|prefix| {
+        value.strip_prefix(prefix).is_some_and(|rest| {
+            let mut parts = rest.split('/');
+            parts.next().is_some_and(|host| !host.is_empty())
+                && parts.next().is_some_and(|segment| !segment.is_empty())
+        })
+    });
+    let valid_scp = value.split_once(':').is_some_and(|(authority, path)| {
+        authority.contains('@')
+            && !authority.contains('/')
+            && path.contains('/')
+            && !path.starts_with('/')
+            && !path.split('/').any(str::is_empty)
+    });
+    if !valid_url && !valid_scp {
+        return Err(CairnError::Internal(
+            "Remote must be an HTTPS or SSH Git URL".to_string(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushRemoteSyncOutcome {
     IgnoredNonDefaultRef,
@@ -178,6 +207,27 @@ mod tests {
     use mockall::predicate::{eq, function};
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn normalizes_supported_git_remotes_and_rejects_unsafe_inputs() {
+        assert_eq!(
+            normalize_remote_url(" https://github.com/cairn/cairn.git/ ").unwrap(),
+            "https://github.com/cairn/cairn.git"
+        );
+        assert_eq!(
+            normalize_remote_url("git@github.com:cairn/cairn.git").unwrap(),
+            "git@github.com:cairn/cairn.git"
+        );
+        for value in [
+            "",
+            "/tmp/repo",
+            "file:///tmp/repo",
+            "../scratch/repo",
+            ".cairn/build-slots/1",
+        ] {
+            assert!(normalize_remote_url(value).is_err(), "accepted {value}");
+        }
+    }
 
     struct FixedClock;
     impl Clock for FixedClock {

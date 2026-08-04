@@ -233,7 +233,7 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
 /// the status and the request size so the failure is diagnosable.
 pub(crate) fn http_status_error_message(status: u16, reason: &str, request_bytes: usize) -> String {
     let mut message = format!(
-        "MCP callback returned HTTP {status} {reason}. Request body was {request_bytes} bytes."
+        "Cairn's MCP callback gateway returned HTTP {status} {reason}. Request body was {request_bytes} bytes."
     );
     if status == 413 {
         message.push_str(

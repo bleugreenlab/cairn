@@ -21,6 +21,10 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeCheckStatus {
+    /// Stable owner used to join this lane to the canonical build-fabric row.
+    pub(crate) job_id: String,
+    /// The live fabric request for this lane, while one has been submitted.
+    pub(crate) request_id: Option<String>,
     pub(crate) name: String,
     pub(crate) state: NodeCheckState,
     pub(crate) policy: String,
@@ -112,6 +116,10 @@ pub async fn node_check_statuses(
     let write_in_flight = orch.write_checks_in_flight(job_id);
     let in_flight = review_in_flight || write_in_flight;
     let runtime_status = orch.turn_end_check_runtime_status(job_id);
+    let request_ids = runtime_status
+        .as_ref()
+        .map(|status| status.request_ids.clone())
+        .unwrap_or_default();
     let status_db = db.clone();
     let status_job_id = job_id.to_string();
     let status_project_id = coords.project_id.clone();
@@ -197,7 +205,7 @@ pub async fn node_check_statuses(
             .map(|name| {
                 let check = checks.get(&name).expect("name came from checks map");
                 if let Some(row) = rows_by_name.get(&name) {
-                    return status_from_row(&name, check.policy, check.when, row);
+                    return status_from_row(job_id, &name, check.policy, check.when, row);
                 }
 
                 // A review check does not apply when the impact gate excluded it
@@ -239,6 +247,8 @@ pub async fn node_check_statuses(
                 };
 
                 NodeCheckStatus {
+                    job_id: job_id.to_string(),
+                    request_id: request_ids.get(&name).cloned(),
                     name,
                     state,
                     policy: check.policy.as_str().to_string(),
@@ -261,6 +271,7 @@ pub async fn node_check_statuses(
 }
 
 fn status_from_row(
+    job_id: &str,
     name: &str,
     policy: CheckPolicy,
     when: CheckWhen,
@@ -294,6 +305,8 @@ fn status_from_row(
         .filter(|s| !s.trim().is_empty())
     };
     NodeCheckStatus {
+        job_id: job_id.to_string(),
+        request_id: None,
         name: name.to_string(),
         state: if row.passed {
             NodeCheckState::Passed
@@ -457,6 +470,8 @@ mod tests {
     #[test]
     fn status_annotation_renders_counts_duration_and_cached() {
         let mut status = NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
             name: "rust".to_string(),
             state: NodeCheckState::Passed,
             policy: "advisory".to_string(),
@@ -491,6 +506,8 @@ mod tests {
     #[test]
     fn status_annotation_separates_a_self_skipped_suite_from_a_zero_selection() {
         let mut status = NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
             name: "rust-full".to_string(),
             state: NodeCheckState::Passed,
             policy: "advisory".to_string(),
@@ -524,6 +541,8 @@ mod tests {
     #[test]
     fn status_annotation_names_a_cached_suite_collection_failure() {
         let mut status = NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
             name: "frontend-partial".to_string(),
             state: NodeCheckState::Failed,
             policy: "advisory".to_string(),
@@ -566,6 +585,8 @@ mod tests {
     #[test]
     fn failed_annotation_renders_timeout_with_still_running_tests() {
         let status = NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
             name: "rust-full".to_string(),
             state: NodeCheckState::Failed,
             policy: "advisory".to_string(),
@@ -595,6 +616,8 @@ mod tests {
     #[test]
     fn suppressed_annotation_says_not_run_rather_than_naming_a_verdict() {
         let mut status = NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
             name: "rust-full".to_string(),
             state: NodeCheckState::Failed,
             policy: "advisory".to_string(),
@@ -654,15 +677,27 @@ mod tests {
             defined_by_commit_sha: Some("commit-a".to_string()),
         };
         assert_eq!(
-            status_from_row("rust", CheckPolicy::Advisory, CheckWhen::Review, &row)
-                .suppressed_after,
+            status_from_row(
+                "job",
+                "rust",
+                CheckPolicy::Advisory,
+                CheckWhen::Review,
+                &row
+            )
+            .suppressed_after,
             None
         );
 
         row.infra_failure_streak = crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND;
         assert_eq!(
-            status_from_row("rust", CheckPolicy::Advisory, CheckWhen::Review, &row)
-                .suppressed_after,
+            status_from_row(
+                "job",
+                "rust",
+                CheckPolicy::Advisory,
+                CheckWhen::Review,
+                &row
+            )
+            .suppressed_after,
             Some(crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND)
         );
     }
@@ -670,6 +705,8 @@ mod tests {
     #[test]
     fn failed_annotation_renders_spawn_error() {
         let status = NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
             name: "rust-lint".to_string(),
             state: NodeCheckState::Failed,
             policy: "advisory".to_string(),

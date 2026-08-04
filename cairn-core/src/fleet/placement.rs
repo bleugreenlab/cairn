@@ -139,7 +139,8 @@ pub(crate) fn pressure_relieves_itself(evidence: &HostPressureEvidence) -> bool 
     !evidence.conditions.is_empty()
         && evidence.conditions.iter().all(|condition| match condition {
             HostPressureCondition::MemoryAvailable { .. }
-            | HostPressureCondition::ResidentOccupancy { .. } => true,
+            | HostPressureCondition::ResidentOccupancy { .. }
+            | HostPressureCondition::CpuUtilization { .. } => true,
             HostPressureCondition::DiskFree { .. } => false,
         })
 }

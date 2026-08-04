@@ -26,6 +26,63 @@ where
     Ok(accepted)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementPolicyEvidence {
+    pub profile_name: String,
+    pub work_class: PlacementWorkClass,
+    pub stance: String,
+    pub max_preference_delay_seconds: u64,
+    /// True when policy selected a different machine from the earliest forecast.
+    pub changed_earliest_winner: bool,
+    /// True when a hard mobility boundary left policy no machine choice.
+    pub constrained_by_mobility: bool,
+}
+
+/// The operator-facing class used to choose placement policy for a unit of work.
+///
+/// This is deliberately separate from [`CellCommandClass`], which describes the
+/// command for duration learning. Placement classes describe why work is being
+/// run and therefore remain stable when its command changes.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum PlacementWorkClass {
+    ReviewChecks,
+    WriteChecks,
+    /// The conservative protocol default. A request from an older peer must not
+    /// become newly spillable merely because it predates placement profiles.
+    #[default]
+    AgentSessions,
+    DevInstances,
+    Services,
+}
+
+/// Cadence and freshness bound for measured CPU admission decisions.
+pub const CPU_ADMISSION_SAMPLE_INTERVAL_MS: u64 = 5_000;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CpuAdmissionState {
+    #[default]
+    Unknown,
+    Accepting,
+    Pressured,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuAdmissionHealth {
+    pub state: CpuAdmissionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_since_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_unix_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ResidentProcessCwdRoot {
@@ -310,7 +367,11 @@ pub struct LearnedResourceEstimate {
 /// that does not report them leaves every candidate looking cold and every
 /// observation unattributable. `PlacementReason::measuredIdle` is gone rather
 /// than aliased because the two policies do not coexist.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 35;
+///
+/// Bumped to 36 for CAIRN-3514: measured CPU admission adds policy in the
+/// runner-to-executor direction and publishes the executor's hysteresis verdict
+/// and numeric pressure evidence in the other direction.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 36;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -1114,6 +1175,10 @@ pub struct CellRequest {
     pub command: String,
     #[serde(default)]
     pub command_class: CellCommandClass,
+    /// Why this work is running, used by the active operator placement profile.
+    /// Older peers omit it and decode conservatively as an agent session.
+    #[serde(default)]
+    pub placement_work_class: PlacementWorkClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<CellOwnerRef>,
     #[serde(default)]
@@ -1398,7 +1463,7 @@ pub enum StorageFailureKind {
     AccountingUnavailable,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum HostPressureCondition {
     MemoryAvailable {
@@ -1413,7 +1478,19 @@ pub enum HostPressureCondition {
         process_count: usize,
         reservation: ResourceReservation,
     },
+    CpuUtilization {
+        utilization: f64,
+        entry_utilization: f64,
+        clear_utilization: f64,
+        state_since_unix_ms: u64,
+        measured_at_unix_ms: u64,
+    },
 }
+
+// This protocol is JSON-only, and JSON cannot represent non-finite numbers.
+// Consequently the numeric CPU variant cannot contain NaN, the sole value that
+// would violate f64's reflexive equality requirement.
+impl Eq for HostPressureCondition {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1867,7 +1944,12 @@ pub enum ResidentProcessKind {
     Repl {
         slug: String,
     },
-    DevInstance,
+    DevInstance {
+        /// Exact tracked terminal process that initiated this runtime. The
+        /// launcher handoff breaks OS ancestry and process-group identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_terminal_session_id: Option<String>,
+    },
     WorkflowRuntime {
         /// The workflow's own name — what it is invoked as, not where its
         /// package happens to live on disk.
@@ -2340,7 +2422,7 @@ pub struct FleetSnapshot {
 /// paths that still exist and went unmeasured — so it alone decides
 /// `DiskAccountingPartial` — while entries that disappeared mid-scan ride along
 /// as the `vanishedEntries` count.
-pub const SUBSTRATE_HEALTH_SCHEMA_VERSION: u32 = 5;
+pub const SUBSTRATE_HEALTH_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -2877,6 +2959,11 @@ impl MachineTelemetry {
 #[serde(rename_all = "camelCase")]
 pub struct HostHealth {
     pub pressure: Option<HostPressureEvidence>,
+    /// The executor's sustained-pressure verdict. This is separate from the
+    /// latest machine reading because admission acts on hysteresis, not a
+    /// single sample.
+    #[serde(default)]
+    pub cpu_admission: CpuAdmissionHealth,
     pub logical_cores: Option<usize>,
     pub tokio_worker_count: Option<usize>,
     pub tokio_alive_tasks: Option<usize>,
@@ -2929,7 +3016,7 @@ impl Default for DiskHealth {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorRuntimePolicy {
     pub memory_budget_bytes: Option<u64>,
@@ -2950,6 +3037,50 @@ pub struct ExecutorRuntimePolicy {
     /// storage sweep reclaims it.
     #[serde(default = "default_quarantine_forensic_window_ms")]
     pub quarantine_forensic_window_ms: u64,
+    #[serde(default)]
+    pub cpu_admission: CpuAdmissionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuAdmissionPolicy {
+    pub entry_utilization: f64,
+    pub clear_utilization: f64,
+    pub entry_window_ms: u64,
+    pub clear_window_ms: u64,
+}
+
+impl Default for CpuAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            entry_utilization: 0.90,
+            clear_utilization: 0.75,
+            entry_window_ms: 15_000,
+            clear_window_ms: 10_000,
+        }
+    }
+}
+
+impl CpuAdmissionPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.entry_utilization.is_finite() || !(0.0..=1.0).contains(&self.entry_utilization) {
+            return Err(
+                "CPU admission entry utilization must be a finite fraction in [0, 1]".into(),
+            );
+        }
+        if !self.clear_utilization.is_finite() || !(0.0..=1.0).contains(&self.clear_utilization) {
+            return Err(
+                "CPU admission clear utilization must be a finite fraction in [0, 1]".into(),
+            );
+        }
+        if self.clear_utilization >= self.entry_utilization {
+            return Err("CPU admission clear utilization must be below entry utilization".into());
+        }
+        if self.entry_window_ms == 0 || self.clear_window_ms == 0 {
+            return Err("CPU admission entry and clear windows must be greater than zero".into());
+        }
+        Ok(())
+    }
 }
 
 /// Idle cells an executor keeps for one project no matter how little disk is
@@ -3032,12 +3163,14 @@ impl Default for ExecutorRuntimePolicy {
             idle_retention_ceiling_per_project: default_idle_retention_ceiling_per_project(),
             idle_retention_pressure_free_bytes: default_idle_retention_pressure_free_bytes(),
             quarantine_forensic_window_ms: default_quarantine_forensic_window_ms(),
+            cpu_admission: CpuAdmissionPolicy::default(),
         }
     }
 }
 
 impl ExecutorRuntimePolicy {
     pub fn validate(&self) -> Result<(), String> {
+        self.cpu_admission.validate()?;
         if self.concurrency_units == 0 {
             return Err("executor concurrency units must be greater than zero".into());
         }
@@ -3271,6 +3404,10 @@ pub struct PlacementDecision {
     /// Where the work already lived, when it already lived somewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_executor_id: Option<String>,
+    /// The operator policy consulted after hard placement gates and forecast
+    /// comparability were established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PlacementPolicyEvidence>,
     pub outcome: PlacementOutcome,
     /// Every machine that was considered and passed over, with the reason.
     #[serde(default)]
@@ -3799,6 +3936,9 @@ impl QueueForecast {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum QueueUnknownReason {
+    /// Sustained measured host CPU pressure has no Cairn-owned completion event
+    /// from which a relief time can be predicted.
+    MeasuredCpuPressure,
     /// The machine's advertised facts aged past the liveness bound.
     FactsStale,
     /// The executor advertises no concurrency capacity, so what sits ahead of a
@@ -3809,6 +3949,7 @@ pub enum QueueUnknownReason {
 impl QueueUnknownReason {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::MeasuredCpuPressure => "measuredCpuPressure",
             Self::FactsStale => "factsStale",
             Self::NoAdmissionCapacity => "noAdmissionCapacity",
         }
@@ -3816,6 +3957,9 @@ impl QueueUnknownReason {
 
     pub fn describe(self) -> &'static str {
         match self {
+            Self::MeasuredCpuPressure => {
+                "sustained measured CPU pressure has no forecastable relief event"
+            }
             Self::FactsStale => "the machine's queue facts are past the liveness bound",
             Self::NoAdmissionCapacity => "the machine advertises no concurrency capacity",
         }
@@ -4240,6 +4384,11 @@ pub struct SubstrateHealthSnapshot {
     pub captured_at_unix_ms: u64,
     pub status: SubstrateHealthStatus,
     pub reasons: Vec<SubstrateHealthReason>,
+    /// The runner has not received an executor reading in this process lifetime
+    /// and is still inside the bounded startup grace period. This is an absence
+    /// of evidence, not a fleet failure.
+    #[serde(default)]
+    pub warming_up: bool,
     pub executors: Vec<ExecutorHealthSnapshot>,
     /// Machines enrolled with this runner that are not attached right now,
     /// sorted by name. Deliberately separate from `executors`: that collection
@@ -4389,6 +4538,11 @@ pub enum ResidencyOperation {
     RefreshCheckout {
         fence: ResidencyFence,
         base_commit: String,
+        /// Refuse before moving `HEAD` when tracked working-tree changes are
+        /// present. Long-lived dev servers use this stricter contract because
+        /// their checkout is a projection, not an authoring surface.
+        #[serde(default)]
+        require_clean: bool,
     },
     MaterializeConflict {
         fence: ResidencyFence,
@@ -5340,7 +5494,9 @@ mod tests {
         };
         let process = |status: ResidentProcessStatus| ResidentProcess {
             generation: 1,
-            kind: ResidentProcessKind::DevInstance,
+            kind: ResidentProcessKind::DevInstance {
+                source_terminal_session_id: None,
+            },
             spec: None,
             status,
             reservation: Some(charged.clone()),
@@ -5483,6 +5639,28 @@ mod tests {
         assert!(!decoded.placement_mobility.may_spill());
     }
 
+    #[test]
+    fn placement_work_class_round_trips_and_defaults_conservatively() {
+        let mut request = sample_request();
+        request.placement_work_class = PlacementWorkClass::ReviewChecks;
+        let mut value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["placementWorkClass"], "reviewChecks");
+        assert_eq!(
+            serde_json::from_value::<CellRequest>(value.clone())
+                .unwrap()
+                .placement_work_class,
+            PlacementWorkClass::ReviewChecks
+        );
+
+        value.as_object_mut().unwrap().remove("placementWorkClass");
+        assert_eq!(
+            serde_json::from_value::<CellRequest>(value)
+                .unwrap()
+                .placement_work_class,
+            PlacementWorkClass::AgentSessions
+        );
+    }
+
     /// The record is what an operator reads instead of guessing, so every part
     /// of it has to survive the wire: the readings with their own timestamps,
     /// the rationale behind the number the work was charged, and the typed
@@ -5496,6 +5674,7 @@ mod tests {
             mobility: PlacementMobility::SpillEligible,
             selector: None,
             pinned_executor_id: None,
+            policy: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 prediction: None,
                 executor_name: "bglab-ub".into(),
@@ -5579,6 +5758,7 @@ mod tests {
             base_commit: "b".into(),
             command: "true".into(),
             command_class: CellCommandClass::Other,
+            placement_work_class: PlacementWorkClass::ReviewChecks,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -5984,7 +6164,9 @@ mod tests {
         let mut processes = std::collections::BTreeMap::new();
         processes.insert(
             "dev-instance".to_string(),
-            sample_resident_process(ResidentProcessKind::DevInstance),
+            sample_resident_process(ResidentProcessKind::DevInstance {
+                source_terminal_session_id: None,
+            }),
         );
         PersistentCellState {
             cell_id: cell_id.into(),
@@ -6119,6 +6301,12 @@ mod tests {
                     },
                 ],
             }),
+            cpu_admission: CpuAdmissionHealth {
+                state: CpuAdmissionState::Pressured,
+                utilization: Some(0.94),
+                state_since_unix_ms: Some(3),
+                measured_at_unix_ms: Some(4),
+            },
             logical_cores: Some(10),
             tokio_worker_count: Some(4),
             tokio_alive_tasks: Some(12),
@@ -6282,7 +6470,9 @@ mod tests {
         );
         processes.insert(
             "dev".to_string(),
-            sample_resident_process(ResidentProcessKind::DevInstance),
+            sample_resident_process(ResidentProcessKind::DevInstance {
+                source_terminal_session_id: Some("session".into()),
+            }),
         );
         processes.insert(
             "workflow".to_string(),
@@ -6396,6 +6586,7 @@ mod tests {
                 condition: None,
             }),
             status: SubstrateHealthStatus::Degraded,
+            warming_up: false,
             reasons: vec![
                 SubstrateHealthReason::NoExecutors,
                 SubstrateHealthReason::DiskAccountingPartial {
@@ -7007,6 +7198,7 @@ mod tests {
                 last_seen_unix_ms: None,
             }],
             status: SubstrateHealthStatus::Degraded,
+            warming_up: false,
             reasons: vec![
                 SubstrateHealthReason::MeasurementUnavailable {
                     executor_id: "executor-1".into(),
@@ -7390,6 +7582,7 @@ mod tests {
                 cell_epoch: 1,
             },
             base_commit: "base".into(),
+            require_clean: false,
         };
         assert_eq!(
             serde_json::to_value(operation).unwrap()["operation"],
@@ -7456,6 +7649,84 @@ mod tests {
     }
 
     #[test]
+    fn cpu_admission_policy_defaults_validate_and_legacy_runtime_policy_decodes() {
+        let expected = CpuAdmissionPolicy::default();
+        assert_eq!(expected.entry_utilization, 0.90);
+        assert_eq!(expected.clear_utilization, 0.75);
+        assert_eq!(expected.entry_window_ms, 15_000);
+        assert_eq!(expected.clear_window_ms, 10_000);
+        assert!(expected.validate().is_ok());
+
+        let mut legacy = serde_json::to_value(ExecutorRuntimePolicy::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("cpuAdmission");
+        let decoded: ExecutorRuntimePolicy = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.cpu_admission, expected);
+    }
+
+    #[test]
+    fn cpu_admission_policy_rejects_invalid_bars_and_windows() {
+        let valid = CpuAdmissionPolicy::default();
+        for invalid in [
+            CpuAdmissionPolicy {
+                entry_utilization: f64::NAN,
+                ..valid
+            },
+            CpuAdmissionPolicy {
+                entry_utilization: 1.01,
+                ..valid
+            },
+            CpuAdmissionPolicy {
+                clear_utilization: -0.01,
+                ..valid
+            },
+            CpuAdmissionPolicy {
+                clear_utilization: valid.entry_utilization,
+                ..valid
+            },
+            CpuAdmissionPolicy {
+                entry_window_ms: 0,
+                ..valid
+            },
+            CpuAdmissionPolicy {
+                clear_window_ms: 0,
+                ..valid
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn cpu_admission_health_and_pressure_evidence_round_trip() {
+        let health = CpuAdmissionHealth {
+            state: CpuAdmissionState::Pressured,
+            utilization: Some(0.94),
+            state_since_unix_ms: Some(1_000),
+            measured_at_unix_ms: Some(2_000),
+        };
+        let condition = HostPressureCondition::CpuUtilization {
+            utilization: 0.94,
+            entry_utilization: 0.90,
+            clear_utilization: 0.75,
+            state_since_unix_ms: 1_000,
+            measured_at_unix_ms: 2_000,
+        };
+
+        let health_value = serde_json::to_value(&health).unwrap();
+        assert_eq!(health_value["state"], "pressured");
+        assert_eq!(
+            serde_json::from_value::<CpuAdmissionHealth>(health_value).unwrap(),
+            health
+        );
+        let condition_value = serde_json::to_value(&condition).unwrap();
+        assert_eq!(condition_value["cpuUtilization"]["utilization"], 0.94);
+        assert_eq!(
+            serde_json::from_value::<HostPressureCondition>(condition_value).unwrap(),
+            condition
+        );
+    }
+
+    #[test]
     fn legacy_health_defaults_new_operator_fields() {
         let mut value = serde_json::to_value(ExecutorSubstrateReport::default()).unwrap();
         value.as_object_mut().unwrap().remove("appliedPolicy");
@@ -7463,6 +7734,11 @@ mod tests {
         let report: ExecutorSubstrateReport = serde_json::from_value(value).unwrap();
         assert_eq!(report.applied_policy, ExecutorRuntimePolicy::default());
         assert!(!report.drain_mode);
+
+        let mut host_value = serde_json::to_value(HostHealth::default()).unwrap();
+        host_value.as_object_mut().unwrap().remove("cpuAdmission");
+        let host: HostHealth = serde_json::from_value(host_value).unwrap();
+        assert_eq!(host.cpu_admission, CpuAdmissionHealth::default());
     }
 
     fn sample_outcome() -> CellOutcome {
@@ -7497,11 +7773,6 @@ mod tests {
             tracked_modifications: None,
         }
     }
-}
-
-#[cfg(test)]
-mod lifetime_pipe_protocol_tests {
-    use super::*;
 
     #[test]
     fn lifetime_pipe_runtime_shape_round_trips_with_stream_tags() {

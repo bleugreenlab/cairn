@@ -1129,6 +1129,12 @@ fn sealed_tree_hash_is_content_addressed() {
         sealed_tree_hash(&jj, &c).unwrap(),
         "different tree content yields a different hash"
     );
+
+    let error = logical_tree_hash(&jj, &store, &"f".repeat(40)).unwrap_err();
+    assert!(
+        error.contains("refusing to record check evidence"),
+        "an unverifiable revision must fail closed instead of substituting its commit id: {error}"
+    );
 }
 
 /// `parse_ls_tree` extracts `(path, blob)` from `-z` records, ignores

@@ -151,6 +151,7 @@ mod tests {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         }
     }
@@ -169,6 +170,7 @@ mod tests {
             tool_result: Some("result".to_string()),
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         }
     }
@@ -192,6 +194,7 @@ mod tests {
             tool_result: None,
             is_error: !success,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         }
     }

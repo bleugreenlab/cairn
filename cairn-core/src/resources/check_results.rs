@@ -3,7 +3,10 @@
 //! Persistence is intentionally accessed through `execution::cache`; resource
 //! code owns only coordinate/query validation and presentation.
 
-use crate::execution::cache::{get_check_result_observation, CheckResultObservationProjection};
+use crate::execution::cache::{
+    get_check_result_observation, get_check_result_observation_by_handle,
+    CheckResultObservationProjection,
+};
 use crate::mcp::handlers::branch::resolve_for_read;
 use crate::mcp::handlers::run_context::project_id_by_key;
 use crate::mcp::types::McpCallbackRequest;
@@ -23,6 +26,50 @@ struct CheckResultsQuery {
     name: Option<String>,
     limit: usize,
     offset: usize,
+}
+
+pub(super) async fn read_project_check_observation(
+    orch: &Orchestrator,
+    project: &str,
+    handle: &str,
+) -> String {
+    if handle.len() != 24 || !handle.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return "Invalid check observation handle".to_string();
+    }
+    let db = orch.db.for_project(project).await;
+    let project_id = match project_id_by_key(&db, project).await {
+        Ok(project_id) => project_id,
+        Err(error) => return error,
+    };
+    match get_check_result_observation_by_handle(db, &project_id, handle) {
+        Ok(Some(observation)) => {
+            let environment = if observation.environment_fingerprint.is_empty() {
+                "unfingerprinted"
+            } else {
+                observation.environment_fingerprint.as_str()
+            };
+            let query = CheckResultsQuery {
+                suite: observation.check_name.clone(),
+                environment: environment.to_string(),
+                environment_fingerprint: observation.environment_fingerprint.clone(),
+                status: None,
+                name: None,
+                limit: observation.test_total.max(1),
+                offset: 0,
+            };
+            let citation = format!("cairn://p/{project}/check-observations/{handle}");
+            render_observation(
+                project,
+                &observation.source_commit_sha,
+                &observation.source_commit_sha,
+                &query,
+                &observation,
+                Some(&citation),
+            )
+        }
+        Ok(None) => "Check observation not found".to_string(),
+        Err(error) => format!("Unable to read check observation: {error}"),
+    }
 }
 
 fn parse_query(params: &[QueryParam]) -> Result<CheckResultsQuery, String> {
@@ -90,6 +137,8 @@ fn parse_query(params: &[QueryParam]) -> Result<CheckResultsQuery, String> {
         }
     }
     let environment_fingerprint = if environment == "current" {
+        String::new()
+    } else if environment == "unfingerprinted" {
         String::new()
     } else {
         environment.clone()
@@ -176,6 +225,7 @@ pub(super) async fn read_project_check_results(
             &resolution.commit_id,
             &query,
             &observation,
+            None,
         ),
         Ok(None) => render_miss(
             project,
@@ -206,7 +256,22 @@ fn render_observation(
     commit: &str,
     query: &CheckResultsQuery,
     observation: &CheckResultObservationProjection,
+    permalink: Option<&str>,
 ) -> String {
+    let short_commit = commit.get(..12).unwrap_or(commit);
+    let handle = format!("{}@{short_commit}", observation.check_name);
+    let params = encode_query_params(&[
+        QueryParam {
+            key: "suite".into(),
+            value: query.suite.clone(),
+        },
+        QueryParam {
+            key: "environment".into(),
+            value: query.environment.clone(),
+        },
+    ]);
+    let coordinate = format!("cairn://p/{project}/check-results/{commit}?{params}");
+    let citation = permalink.unwrap_or(&coordinate);
     let mut body = vec![
         format!("# Check results: {}", observation.check_name),
         String::new(),
@@ -233,7 +298,7 @@ fn render_observation(
             "- Environment fingerprint: {}",
             observation.environment_fingerprint
         ),
-        format!("- Source observation: {}", observation.observation_id),
+        format!("- Citation: [{handle}]({citation})"),
         format!("- Source commit: {}", observation.source_commit_sha),
         format!(
             "- Source defined by commit: {}",
@@ -469,6 +534,15 @@ mod tests {
         ]);
         let query = parse_query(&valid).unwrap();
         assert_eq!(
+            parse_query(&[
+                param("suite", "rust"),
+                param("environment", "unfingerprinted"),
+            ])
+            .unwrap()
+            .environment_fingerprint,
+            ""
+        );
+        assert_eq!(
             (
                 query.status.as_deref(),
                 query.name.as_deref(),
@@ -562,9 +636,10 @@ mod tests {
             param("limit", "2"),
         ])
         .unwrap();
-        let body = render_observation("CAIRN", "main", "target-commit", &query, &observation);
+        let body = render_observation("CAIRN", "main", "target-commit", &query, &observation, None);
         for expected in [
             "cached observation",
+            "Citation: [rust-tests@target-commi](cairn://p/CAIRN/check-results/target-commit?suite=rust-tests&environment=env-1)",
             "Resolved commit: target-commit",
             "Defined by commit: target-commit",
             "Source commit: source-commit",
@@ -580,6 +655,7 @@ mod tests {
         ] {
             assert!(body.contains(expected), "missing {expected:?} from {body}");
         }
+        assert!(!body.contains("obs-1"), "internal UUID/key leaked: {body}");
     }
 
     /// A legacy row has no truthful defining commit. It says so, rather than
@@ -591,7 +667,7 @@ mod tests {
         observation.source_defined_by_commit_sha = None;
         let query =
             parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
-        let body = render_observation("CAIRN", "main", "target-commit", &query, &observation);
+        let body = render_observation("CAIRN", "main", "target-commit", &query, &observation, None);
         assert!(body.contains("Defined by commit: unrecorded (legacy row)"));
         assert!(body.contains("Source defined by commit: unrecorded (legacy row)"));
     }

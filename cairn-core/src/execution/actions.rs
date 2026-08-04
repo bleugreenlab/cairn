@@ -76,34 +76,12 @@ pub async fn complete_action_run(
     // attention exactly as a blocked job does (see `issue_progress_attention`),
     // without being a job. Resolution flips it to Complete. See CAIRN-1220.
     //
-    // Declarative unattended recipes can opt out of that human gate with
-    // `actionParams: { action: "merge", method?: "squash" | "merge" | "rebase" }`.
-    // After opening the PR, route through the same merge implementation used by
-    // patching the node with `action:"merge"`, so GitHub branch protection and
-    // local merge gates still fail closed before Cairn marks anything merged.
+    // PR preparation never implies permission to merge. In particular, a review
+    // completion and green, running, or verdictless check lanes are all only
+    // evidence for the driver deciding whether to merge; none is merge authority.
+    // Resolution therefore always comes from an explicit node/artifact patch by
+    // the parent thread or operator.
     if node.node_type == crate::models::RecipeNodeType::Pr {
-        if let Some(method) = pr_node_auto_merge_method(node)? {
-            update_action_run_status(
-                &db,
-                action_run_id,
-                ActionRunStatus::Running,
-                output_json.as_deref(),
-                now,
-            )
-            .await?;
-            let _ = orch.services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "action_runs", "action": "update"}),
-            );
-            let pr_action_run = get_action_run(&db, action_run_id).await?;
-            let owner_id = pr_action_run
-                .parent_job_id
-                .as_deref()
-                .ok_or("PR action run has no parent_job_id for declarative auto-merge")?;
-            crate::pr_data::actions::merge_pr_for_job(orch, owner_id, method).await?;
-            return Ok(result);
-        }
-
         update_action_run_status(
             &db,
             action_run_id,
@@ -145,37 +123,6 @@ pub async fn complete_action_run(
     );
 
     Ok(result)
-}
-
-fn pr_node_auto_merge_method(node: &RecipeNode) -> Result<Option<Option<String>>, String> {
-    let Some(action_config) = node.action_config.as_ref() else {
-        return Ok(None);
-    };
-    let params = &action_config.action_params;
-    if params.is_null() {
-        return Ok(None);
-    }
-    let Some(action) = params.get("action") else {
-        return Ok(None);
-    };
-    let action = action
-        .as_str()
-        .ok_or("pr node actionParams.action must be a string when present")?;
-    if action != "merge" {
-        return Err(format!(
-            "unsupported pr node actionParams.action '{action}'; expected 'merge'"
-        ));
-    }
-    let method = match params.get("method") {
-        Some(value) => Some(
-            value
-                .as_str()
-                .ok_or("pr node actionParams.method must be a string when present")?
-                .to_string(),
-        ),
-        None => None,
-    };
-    Ok(Some(method))
 }
 
 /// Execute an action node inline during DAG advancement.
@@ -303,9 +250,14 @@ async fn handle_pr_node(
     let branch_name = implementation.branch;
     let base_branch = implementation.base_branch;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
-    let repo_path = project_repo_path(&db, &action_run.project_id)
-        .await?
-        .unwrap_or_default();
+    let repository = crate::projects::crud::resolve_project_repository(
+        &orch.db,
+        &action_run.project_id,
+        &orch.config_dir,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let repo_path = repository.local_repo_path.to_string_lossy().into_owned();
     let vcs = PrVcs::resolve(orch, &repo_path, &branch_name);
     let has_remote = vcs.has_remote();
     let effective_base = resolve_effective_pr_base(
@@ -777,26 +729,6 @@ async fn commit_triage_ledger_if_needed(
         .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))
 }
 
-/// Load a project's repo checkout path (the git-backed checkout that carries
-/// `origin`), used as the gh/git cwd for jj-managed PR creation.
-async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<String>, String> {
-    let project_id = project_id.to_string();
-    db.read(|conn| {
-        let project_id = project_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT repo_path FROM projects WHERE id = ?1",
-                    (project_id.as_str(),),
-                )
-                .await?;
-            crate::storage::next_text(&mut rows, 0).await
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to load project repo_path: {e}"))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectivePrBase {
     branch: String,
@@ -982,9 +914,14 @@ async fn handle_create_pr(
     let base_branch = implementation.base_branch;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
 
-    let repo_path = project_repo_path(&db, &action_run.project_id)
-        .await?
-        .unwrap_or_default();
+    let repository = crate::projects::crud::resolve_project_repository(
+        &orch.db,
+        &action_run.project_id,
+        &orch.config_dir,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let repo_path = repository.local_repo_path.to_string_lossy().into_owned();
     let vcs = PrVcs::resolve(orch, &repo_path, &branch_name);
     let has_remote = vcs.has_remote();
     let effective_base = resolve_effective_pr_base(
@@ -1264,8 +1201,6 @@ async fn handle_merge_pr(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
-    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
-        .await?;
     // Block a premature merge before touching GitHub: if the issue still has
     // active reviewers/jobs, fail the action rather than resolve it out from
     // under them.
@@ -1274,9 +1209,14 @@ async fn handle_merge_pr(
     }
 
     let branch_name = find_implementation_context(orch, action_run).await?.branch;
-    let repo_path = project_repo_path(&db, &action_run.project_id)
-        .await?
-        .unwrap_or_default();
+    let repository = crate::projects::crud::resolve_project_repository(
+        &orch.db,
+        &action_run.project_id,
+        &orch.config_dir,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let repo_path = repository.local_repo_path.to_string_lossy().into_owned();
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
 
     // Merge boundary: refuse a jj-conflicted source bookmark before merging.
@@ -1301,52 +1241,34 @@ async fn handle_merge_pr(
     // wake watchers), so recipe and in-app merges are identical. Passing `None`
     // selects the default `squash` shape, landing one commit per PR on the
     // default branch.
-    crate::pr_data::actions::merge_pr_for_job(orch, &mr_job_id, None).await?;
+    crate::pr_data::actions::merge_pr_for_job(
+        orch,
+        &mr_job_id,
+        None,
+        Some(crate::pr_data::actions::PrResolutionAttribution::internal(
+            "recipe-merge-action",
+            action_run.id.clone(),
+        )),
+    )
+    .await?;
     Ok(Some(serde_json::json!({ "merged": true })))
 }
 
-/// Handle the close_pr action using `gh` CLI.
+/// Handle the close_pr action through the canonical PR boundary.
 async fn handle_close_pr(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
-    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
-        .await?;
-    let branch_name = find_implementation_context(orch, action_run).await?.branch;
-    let repo_path = project_repo_path(&db, &action_run.project_id)
-        .await?
-        .unwrap_or_default();
-    let vcs = PrVcs::resolve(orch, &repo_path, &branch_name);
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
-    let pr_number = load_mr_pr_number(&db, &mr_job_id).await?;
-
-    let gh_cwd = vcs.gh_cwd.clone();
-    let output = tokio::task::spawn_blocking(move || {
-        crate::env::gh()
-            .args(close_pr_args(pr_number))
-            .current_dir(gh_cwd)
-            .output()
-    })
-    .await
-    .map_err(|error| format!("PR close subprocess task failed: {error}"))?
-    .map_err(|e| format!("Failed to run gh pr close: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr close failed: {}", stderr));
-    }
-
-    // Update merge_request status
-    let now = chrono::Utc::now().timestamp() as i32;
-    {
-        update_merge_request_status(&db, &mr_job_id, "closed", now).await?;
-    }
-
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
-    );
-
+    crate::pr_data::actions::close_pr_for_job(
+        orch,
+        &mr_job_id,
+        Some(crate::pr_data::actions::PrResolutionAttribution::internal(
+            "recipe-close-action",
+            action_run.id.clone(),
+        )),
+    )
+    .await?;
     Ok(Some(serde_json::json!({ "closed": true })))
 }
 
@@ -1398,39 +1320,6 @@ async fn find_mr_job_id_for_action(
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
         .await?;
     find_mr_job_id_for_execution(&db, &action_run.execution_id).await
-}
-
-/// The GitHub PR number recorded for a merge_request owner, if any. `None` for a
-/// local (no-remote) PR or before the number is known.
-async fn load_mr_pr_number(db: &LocalDb, mr_job_id: &str) -> Result<Option<i64>, String> {
-    let mr_job_id = mr_job_id.to_string();
-    db.read(|conn| {
-        let mr_job_id = mr_job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT github_pr_number FROM merge_requests WHERE job_id = ?1 LIMIT 1",
-                    (mr_job_id.as_str(),),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => crate::storage::RowExt::opt_i64(&row, 0),
-                None => Ok(None),
-            }
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to load PR number: {e}"))
-}
-
-/// `gh pr close` argv, naming the PR explicitly when known so a cwd that is not
-/// the agent branch (the project checkout) resolves the right PR.
-fn close_pr_args(pr_number: Option<i64>) -> Vec<String> {
-    let mut args = vec!["pr".to_string(), "close".to_string()];
-    if let Some(number) = pr_number {
-        args.push(number.to_string());
-    }
-    args
 }
 
 // ============================================================================
@@ -2179,62 +2068,6 @@ async fn find_mr_job_id_for_execution(db: &LocalDb, execution_id: &str) -> Resul
     .map_err(|e| format!("Failed to query merge request: {}", e))
 }
 
-async fn update_merge_request_status(
-    db: &LocalDb,
-    mr_job_id: &str,
-    status: &str,
-    now: i32,
-) -> Result<(), String> {
-    let mr_job_id = mr_job_id.to_string();
-    let status = status.to_string();
-    let _source_branch = if status == "merged" {
-        db.query_text(
-            "SELECT source_branch FROM merge_requests WHERE job_id = ?1 LIMIT 1",
-            params![mr_job_id.as_str()],
-        )
-        .await
-        .map_err(|e| format!("Failed to query merge_request source branch: {e}"))?
-    } else {
-        None
-    };
-    db.write(|conn| {
-        let mr_job_id = mr_job_id.clone();
-        let status = status.clone();
-        Box::pin(async move {
-            match status.as_str() {
-                "merged" => {
-                    conn.execute(
-                        "UPDATE merge_requests
-                         SET status = 'merged',
-                             merged_at = ?1,
-                             updated_at = ?2
-                         WHERE job_id = ?3",
-                        params![now, now, mr_job_id.as_str()],
-                    )
-                    .await?;
-                }
-                "closed" => {
-                    conn.execute(
-                        "UPDATE merge_requests
-                         SET status = 'closed',
-                             closed_at = ?1,
-                             updated_at = ?2
-                         WHERE job_id = ?3",
-                        params![now, now, mr_job_id.as_str()],
-                    )
-                    .await?;
-                }
-                other => return Err(DbError::internal(format!("unknown MR status {other}"))),
-            }
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to update merge_request: {}", e))?;
-
-    Ok(())
-}
-
 fn action_config_from_row(row: &cairn_db::turso::Row) -> Result<ActionConfig, DbError> {
     let input_schema = parse_json_option(row.opt_text(4)?, "input_schema")?;
     let output_schema = parse_json_option(row.opt_text(5)?, "output_schema")?;
@@ -2913,64 +2746,108 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn pr_node_auto_merge_method_reads_action_params() {
-        let mut node = pr_node_with_action_params(serde_json::json!({}));
-        assert_eq!(pr_node_auto_merge_method(&node).unwrap(), None);
+    #[tokio::test]
+    async fn completing_a_pr_node_never_executes_a_declared_merge() {
+        use crate::db::DbState;
+        use crate::models::{
+            ExecutionSnapshot, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
+        };
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
 
-        node = pr_node_with_action_params(serde_json::json!({ "action": "merge" }));
-        assert_eq!(pr_node_auto_merge_method(&node).unwrap(), Some(None));
+        for (case, action_params) in [
+            ("default", serde_json::json!({})),
+            (
+                "former-auto-merge",
+                serde_json::json!({ "action": "merge" }),
+            ),
+        ] {
+            let node = RecipeNode {
+                id: "pr".to_string(),
+                node_type: crate::models::RecipeNodeType::Pr,
+                name: "PR".to_string(),
+                position: crate::models::NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: None,
+                agent_config: None,
+                action_config: Some(ActionNodeConfig {
+                    action_config_id: None,
+                    action: String::new(),
+                    action_params,
+                    input_schema: None,
+                    output_schema: None,
+                }),
+                checkpoint_config: None,
+                artifact_config: None,
+                condition_config: None,
+                context_config: None,
+            };
+            let snapshot = ExecutionSnapshot::new(
+                RecipeSnapshot {
+                    id: "recipe".to_string(),
+                    name: "Recipe".to_string(),
+                    description: None,
+                    trigger: RecipeTrigger::Manual,
+                    nodes: vec![node.clone()],
+                    edges: vec![],
+                },
+                HashMap::new(),
+                HashMap::new(),
+                TriggerContext {
+                    issue_id: Some("i-pr".to_string()),
+                    project_id: "p-pr".to_string(),
+                    trigger_type: TriggerType::Manual,
+                    event_payload: None,
+                    initiated_via: None,
+                },
+            )
+            .to_json()
+            .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(LocalDb::open(temp.path().join("pr.db")).await.unwrap());
+            MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+                .run(&local)
+                .await
+                .unwrap();
+            local.write(|conn| {
+                let snapshot = snapshot.clone();
+                Box::pin(async move {
+                    conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-pr','default','P','P','/tmp/p',1,1)", ()).await?;
+                    conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-pr','p-pr',1,'PR','active','none',1,1)", ()).await?;
+                    conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-pr','recipe','i-pr','p-pr','running',1,1,?1)", params![snapshot.as_str()]).await?;
+                    conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, node_name, uri_segment, branch, created_at, updated_at) VALUES ('j-pr','e-pr','builder','i-pr','p-pr','complete','Builder','builder','agent/P-1-builder',1,1)", ()).await?;
+                    conn.execute("INSERT INTO action_runs (id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, parent_job_id, created_at) VALUES ('ar-pr','e-pr','pr','builtin:pr','i-pr','p-pr','running','j-pr',1)", ()).await?;
+                    Ok::<_, DbError>(())
+                })
+            }).await.unwrap();
+            let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+            let db = Arc::new(DbState::new(local.clone(), search));
+            // The default mock Git client has no merge expectation: any attempted
+            // merge is therefore a test failure in addition to the persisted-state assertion.
+            let orch = OrchestratorBuilder::new(
+                db,
+                Arc::new(TestServicesBuilder::new().build()),
+                temp.path().join("config"),
+            )
+            .boot_at(0)
+            .build();
 
-        node = pr_node_with_action_params(
-            serde_json::json!({ "action": "merge", "method": "rebase" }),
-        );
-        assert_eq!(
-            pr_node_auto_merge_method(&node).unwrap(),
-            Some(Some("rebase".to_string()))
-        );
-    }
-
-    #[test]
-    fn pr_node_auto_merge_method_rejects_invalid_action_params() {
-        let node = pr_node_with_action_params(serde_json::json!({ "action": "close" }));
-        assert!(pr_node_auto_merge_method(&node)
-            .unwrap_err()
-            .contains("expected 'merge'"));
-
-        let node =
-            pr_node_with_action_params(serde_json::json!({ "action": "merge", "method": 7 }));
-        assert!(pr_node_auto_merge_method(&node)
-            .unwrap_err()
-            .contains("method must be a string"));
-    }
-
-    fn pr_node_with_action_params(action_params: serde_json::Value) -> RecipeNode {
-        RecipeNode {
-            id: "pr".to_string(),
-            node_type: crate::models::RecipeNodeType::Pr,
-            name: "PR".to_string(),
-            position: crate::models::NodePosition { x: 0.0, y: 0.0 },
-            parent_id: None,
-            trigger_config: None,
-            agent_config: None,
-            action_config: Some(ActionNodeConfig {
-                action_config_id: None,
-                action: String::new(),
-                action_params,
-                input_schema: None,
-                output_schema: None,
-            }),
-            checkpoint_config: None,
-            artifact_config: None,
-            condition_config: None,
-            context_config: None,
+            complete_action_run(&orch, "ar-pr", &node, None)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert_eq!(
+                local
+                    .query_text("SELECT status FROM action_runs WHERE id='ar-pr'", ())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("blocked"),
+                "{case} must await an explicit merge"
+            );
         }
-    }
-
-    #[test]
-    fn close_pr_args_names_pr_when_known() {
-        assert_eq!(close_pr_args(Some(7)), vec!["pr", "close", "7"]);
-        assert_eq!(close_pr_args(None), vec!["pr", "close"]);
     }
 
     /// Regression guard for CAIRN-2376: a triage batch with NO promotions (only

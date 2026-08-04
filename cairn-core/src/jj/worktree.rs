@@ -76,10 +76,8 @@ fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
 ///
 /// jj 0.42.0 exposes no tree-id template keyword (`tree_id`, `root_tree`, and
 /// `commit.tree()` all fail to parse), so the git object is the only stable
-/// surface for this. If that resolution fails for any reason we fall back to the
-/// sealed commit id: correctness is preserved (a stable per-commit key) at the
-/// cost of cross-equivalent-tree reuse, and write-checks still run rather than
-/// being skipped on a transient git hiccup.
+/// surface for this. Failure is fatal: a commit id is not a tree id, and recording
+/// it as one would make the observation's content claim false.
 pub fn sealed_tree_hash(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     let commit = head_commit(jj, ws)?;
     logical_tree_hash(jj, ws, &commit)
@@ -91,16 +89,11 @@ pub(crate) fn logical_tree_hash(
     repository: &Path,
     commit: &str,
 ) -> Result<String, String> {
-    match sealed_tree_hash_via_git(jj, repository, commit) {
-        Ok(tree) => Ok(tree),
-        Err(e) => {
-            log::warn!(
-                "sealed_tree_hash: git tree resolution failed ({e}); falling back to \
-                 the sealed commit id (cross-equivalent-tree cache reuse disabled)"
-            );
-            Ok(commit.to_string())
-        }
-    }
+    sealed_tree_hash_via_git(jj, repository, commit).map_err(|error| {
+        format!(
+            "cannot verify the content tree for requested revision {commit}; refusing to record check evidence: {error}"
+        )
+    })
 }
 
 /// Resolve the git tree sha of a sealed commit through the store's git backend.

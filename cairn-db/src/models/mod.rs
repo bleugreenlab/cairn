@@ -175,4 +175,4 @@ pub use webhook::WebhookEvent;
 pub use search::{SearchContentType, SearchFilters, SearchResult};
 
 // GitHub status types
-pub use github::{GitHubStatus, RelayStatus};
+pub use github::{EventDeliveryStatus, GitHubAppAuthorizationStatus, GitHubStatus};

@@ -26,6 +26,20 @@ pub mod macos;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Whether this process is already running under an inherited kernel sandbox.
+///
+/// A child sandbox can narrow an inherited policy but cannot widen it. Long-lived
+/// machine services must therefore refuse to launch from a confined supervisor.
+#[cfg(target_os = "macos")]
+pub fn current_process_is_confined() -> bool {
+    macos::current_process_is_confined()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn current_process_is_confined() -> bool {
+    false
+}
+
 /// A per-spawn filesystem confinement profile.
 ///
 /// Built fresh for each spawn from the current worktree and the session's

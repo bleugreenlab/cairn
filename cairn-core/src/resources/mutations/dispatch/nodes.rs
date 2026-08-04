@@ -5,9 +5,27 @@ use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::CairnResource;
 
+async fn resolution_attribution(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Option<crate::pr_data::actions::PrResolutionAttribution> {
+    if request
+        .payload
+        .get("_cairn_origin")
+        .and_then(|v| v.as_str())
+        == Some("cli")
+    {
+        return Some(crate::pr_data::actions::PrResolutionAttribution::operator_cli());
+    }
+    crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
+        .await
+        .ok()
+        .map(crate::pr_data::actions::PrResolutionAttribution::agent)
+}
+
 pub(super) async fn dispatch(
     orch: &Orchestrator,
-    _request: &McpCallbackRequest,
+    request: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
     dry_run: bool,
@@ -127,18 +145,27 @@ pub(super) async fn dispatch(
                                 .unwrap_or_default();
                             format!("Would merge PR for {node_id}{suffix}")
                         } else {
-                            crate::pr_data::actions::merge_pr_for_job(orch, &owner_id, method)
-                                .await
-                                .map_err(|error| build_failure(index, item, error))?
+                            crate::pr_data::actions::merge_pr_for_job(
+                                orch,
+                                &owner_id,
+                                method,
+                                resolution_attribution(orch, request).await,
+                            )
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?
                         }
                     }
                     "close" => {
                         if dry_run {
                             format!("Would close PR for {node_id}")
                         } else {
-                            crate::pr_data::actions::close_pr_for_job(orch, &owner_id)
-                                .await
-                                .map_err(|error| build_failure(index, item, error))?
+                            crate::pr_data::actions::close_pr_for_job(
+                                orch,
+                                &owner_id,
+                                resolution_attribution(orch, request).await,
+                            )
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?
                         }
                     }
                     "refresh" => {

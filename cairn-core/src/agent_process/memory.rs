@@ -92,59 +92,6 @@ fn process_rss_linux(pid: u32) -> Option<u64> {
     None
 }
 
-#[cfg(target_os = "linux")]
-fn system_memory_linux() -> Option<SystemMemory> {
-    // A memory-capped container reports host RAM in /proc/meminfo but is killed
-    // against its cgroup limit, so prefer the cgroup v2 accounting when present.
-    if let Some(sm) = cgroup_v2_memory() {
-        return Some(sm);
-    }
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = None;
-    let mut available = None;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            total = rest
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|kb| kb * 1024);
-        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            available = rest
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|kb| kb * 1024);
-        }
-    }
-    Some(SystemMemory {
-        total: total?,
-        available: available?,
-    })
-}
-
-/// cgroup v2 memory accounting. `None` when the files are absent (cgroup v1 or
-/// no container) or the limit is unbounded (`max`), so the caller falls back to
-/// host `/proc/meminfo`.
-#[cfg(target_os = "linux")]
-fn cgroup_v2_memory() -> Option<SystemMemory> {
-    let max_raw = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
-    let max_raw = max_raw.trim();
-    if max_raw == "max" {
-        return None;
-    }
-    let total: u64 = max_raw.parse().ok()?;
-    let current: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(SystemMemory {
-        total,
-        available: total.saturating_sub(current),
-    })
-}
-
 // ============================================================================
 // Test stub
 // ============================================================================

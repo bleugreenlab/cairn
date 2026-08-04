@@ -1,6 +1,6 @@
 //! Orchestrator settings and keybinds operations.
 
-use crate::config::keybinds::{self, KeybindsFile, Modifier};
+use crate::config::keybinds::{self, KeySequence, KeybindsFile};
 use crate::config::settings;
 use crate::models::{Settings, UpdateSettings};
 
@@ -37,14 +37,9 @@ impl Orchestrator {
     }
 
     /// Set a single keybind.
-    pub fn set_keybind(
-        &self,
-        action: &str,
-        key: String,
-        modifiers: Vec<Modifier>,
-    ) -> Result<KeybindsFile, String> {
+    pub fn set_keybind(&self, action: &str, sequence: KeySequence) -> Result<KeybindsFile, String> {
         let mut file = keybinds::load_keybinds(&self.config_dir);
-        file.set_keybind(action, key, modifiers);
+        file.set_keybind(action, sequence)?;
         keybinds::save_keybinds(&self.config_dir, &file)?;
 
         let _ = self.services.emitter.emit(
@@ -58,7 +53,7 @@ impl Orchestrator {
     /// Reset a single keybind to default.
     pub fn reset_keybind(&self, action: &str) -> Result<KeybindsFile, String> {
         let mut file = keybinds::load_keybinds(&self.config_dir);
-        file.remove_keybind(action);
+        file.remove_keybind(action)?;
         keybinds::save_keybinds(&self.config_dir, &file)?;
 
         let _ = self.services.emitter.emit(

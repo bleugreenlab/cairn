@@ -20,6 +20,15 @@ impl Orchestrator {
             .and_then(|guard| guard.as_ref().map(|store| store.resolve(None, None)))
     }
 
+    pub fn resolve_provider_account(
+        &self,
+        backend: &str,
+        account_id: &str,
+    ) -> Option<UserIdentity> {
+        self.get_identity_store()?
+            .resolve_with_provider_account(backend, account_id)
+    }
+
     // === New multi-account API ===
 
     /// Get the full identity store.

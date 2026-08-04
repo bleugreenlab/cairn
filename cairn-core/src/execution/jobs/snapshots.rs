@@ -4,6 +4,50 @@ pub(super) struct AgentSnapshotData {
     pub(super) agent: Option<AgentConfig>,
 }
 
+/// Store a queued user message while preserving its durable queue identity.
+pub(crate) fn store_queued_user_event_with_turn(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    queued_message_id: &str,
+    content: &str,
+    now: i32,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    store_transcript_event_with_turn(
+        orch,
+        run_id,
+        session_id,
+        now,
+        turn_id,
+        queued_user_transcript_event(session_id, queued_message_id, content),
+        &[],
+    )
+}
+
+pub(crate) fn queued_user_transcript_event(
+    session_id: &str,
+    queued_message_id: &str,
+    content: &str,
+) -> TranscriptEvent {
+    TranscriptEvent {
+        event_type: "user".to_string(),
+        session_id: Some(session_id.to_string()),
+        parent_tool_use_id: None,
+        content: Some(content.to_string()),
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error: false,
+        thinking_ms: None,
+        queued_message_id: Some(queued_message_id.to_string()),
+        raw: Some(serde_json::json!({ "queued_message_id": queued_message_id })),
+    }
+}
+
 pub(super) async fn load_agent_snapshot_data(
     db: Arc<LocalDb>,
     execution_id: String,
@@ -245,6 +289,7 @@ fn store_user_like_event_with_turn(
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: None,
     };
     store_transcript_event_with_turn(
@@ -289,6 +334,7 @@ pub fn store_tool_result_event_with_turn(
         tool_result: Some(content.to_string()),
         is_error,
         thinking_ms: None,
+        queued_message_id: None,
         raw: None,
     };
     store_transcript_event_with_turn(
@@ -330,6 +376,7 @@ pub(crate) fn store_attention_push_event(
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: None,
     };
     store_transcript_event_with_turn(

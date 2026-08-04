@@ -71,7 +71,12 @@ pub async fn apply_turn_outcome(
     if from == outcome {
         return Ok(());
     }
-    if from.is_terminal() {
+    if from.is_terminal()
+        && !matches!(
+            (&from, &outcome),
+            (TurnState::Yielded, TurnState::Cancelled)
+        )
+    {
         return Err(turn_error(
             turn_id,
             &from,
@@ -82,6 +87,7 @@ pub async fn apply_turn_outcome(
     match (&from, &outcome) {
         (TurnState::Running, _) => {}
         (TurnState::Pending, TurnState::Failed | TurnState::Cancelled) => {}
+        (TurnState::Yielded, TurnState::Cancelled) => {}
         _ => {
             return Err(turn_error(
                 turn_id,

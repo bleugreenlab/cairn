@@ -270,6 +270,7 @@ fn reasoning_details_round_trip_through_conversation() {
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: Some(json!({"reasoning_details": details.clone()})),
     };
     let message = transcript_event_to_chat_message("assistant", event)
@@ -313,6 +314,7 @@ fn tool_call_without_reasoning_details_omits_key_on_resume() {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(raw),
         };
         let message = transcript_event_to_chat_message("assistant", event)
@@ -339,6 +341,7 @@ fn blank_event(event_type: &str) -> TranscriptEvent {
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: None,
     }
 }

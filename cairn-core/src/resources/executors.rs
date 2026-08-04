@@ -64,6 +64,7 @@ fn runner_restart_section(exit: Option<&AbnormalExit>, captured_at_unix_ms: u64)
             "- Crash report: none found for this exit (the platform may not write one)\n\n",
         ),
     }
+
     out
 }
 
@@ -81,9 +82,14 @@ pub(crate) fn render_executors(
     enrolling: &[EnrollmentOperation],
     replaced_abnormal_exit: Option<&AbnormalExit>,
     captured_at_unix_ms: u64,
+    warming_up: bool,
 ) -> String {
     if executors.is_empty() && enrolled.is_empty() && enrolling.is_empty() {
-        let mut empty = String::from("# Executors\n\nNo executor is attached to this runner.\n\nThe runner supervises a colocated executor named `local`; if nothing is listed here it is not currently attached. Enrolled machines are added with `cairn executor add <user@host>`.\n");
+        let mut empty = if warming_up {
+            String::from("# Executors\n\nStatus: warming\n\nWaiting quietly for the first executor heartbeat in this runner session.\n")
+        } else {
+            String::from("# Executors\n\nNo executor is attached to this runner.\n\nThe runner supervises a colocated executor named `local`; if nothing is listed here it is not currently attached. Enrolled machines are added with `cairn executor add <user@host>`.\n")
+        };
         // Deliberately rendered even here. An empty fleet right after a runner
         // abort is not a quiet fleet; it is the aftermath, and that is precisely
         // the moment the restart explains what is being read.
@@ -98,7 +104,9 @@ pub(crate) fn render_executors(
         replaced_abnormal_exit,
         captured_at_unix_ms,
     ));
-    if executors.is_empty() {
+    if executors.is_empty() && warming_up {
+        out.push_str("Status: warming\n\nWaiting quietly for the first executor heartbeat in this runner session.\n\n");
+    } else if executors.is_empty() {
         out.push_str(
             "No executor is attached to this runner, but it is enrolled with machines that are not reporting. Nothing can be placed until one attaches.\n\n",
         );
@@ -244,11 +252,20 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
 }
 
 fn enrolled_link_summary(remote: &EnrolledRemote) -> String {
+    let attempt = remote
+        .last_attempt
+        .as_ref()
+        .map(|attempt| attempt.reason.as_str());
     match remote.link {
-        RemoteLinkState::Unreachable => "unreachable — the host did not answer".to_string(),
-        RemoteLinkState::AttachFailed => {
-            "attach failed — the host answered and the executor could not be started".to_string()
-        }
+        RemoteLinkState::Unreachable => attempt
+            .map(|reason| format!("unreachable — {reason}"))
+            .unwrap_or_else(|| "unreachable — the host did not answer".to_string()),
+        RemoteLinkState::AttachFailed => attempt
+            .map(|reason| format!("attach failed — {reason}"))
+            .unwrap_or_else(|| {
+                "attach failed — the host answered and the executor could not be started"
+                    .to_string()
+            }),
         RemoteLinkState::Pending => "not yet attempted since the runner started".to_string(),
     }
 }
@@ -1057,6 +1074,7 @@ mod tests {
             &[],
             None,
             CAPTURED_AT,
+            false,
         );
         assert!(
             rendered.contains(
@@ -1077,6 +1095,7 @@ mod tests {
             &[],
             None,
             CAPTURED_AT,
+            false,
         );
         assert!(
             listed.contains("- Toolchains: none advertised\n"),
@@ -1156,6 +1175,7 @@ mod tests {
             &[],
             None,
             CAPTURED_AT,
+            false,
         );
         assert!(rendered.contains("- Toolchains: rust, bun\n"), "{rendered}");
     }
@@ -1197,6 +1217,7 @@ mod tests {
             &[],
             None,
             CAPTURED_AT,
+            false,
         );
         assert!(rendered.contains("## bglab-ub"), "{rendered}");
         assert!(rendered.contains("## local"), "{rendered}");
@@ -1212,9 +1233,16 @@ mod tests {
     /// rendering an empty list an agent has to interpret.
     #[test]
     fn an_empty_fleet_renders_an_explanation_not_an_empty_list() {
-        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT);
+        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, false);
         assert!(rendered.contains("No executor is attached"), "{rendered}");
         assert!(rendered.contains("local"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fresh_session_with_no_readings_renders_warming_not_failure() {
+        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, true);
+        assert!(rendered.contains("Status: warming"), "{rendered}");
+        assert!(!rendered.contains("No executor is attached"), "{rendered}");
     }
 
     /// A runner that came up cleanly says nothing about restarts. The section
@@ -1222,7 +1250,7 @@ mod tests {
     /// reads as boilerplate.
     #[test]
     fn a_clean_runner_says_nothing_about_a_restart() {
-        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT);
+        let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, false);
         assert!(!rendered.contains("Runner restarted"), "{rendered}");
     }
 
@@ -1236,7 +1264,7 @@ mod tests {
             pid: 74402,
             reason: "the transport liveness watchdog aborted the runner after 16 consecutive failed loopback probes over 62s (the listener was bound but its accept queue never drained)".to_string(),
         };
-        let rendered = render_executors(&[], &[], &[], Some(&exit), CAPTURED_AT);
+        let rendered = render_executors(&[], &[], &[], Some(&exit), CAPTURED_AT, false);
         assert!(rendered.contains("Runner restarted"), "{rendered}");
         assert!(
             rendered.contains("transport liveness watchdog"),
@@ -1267,6 +1295,7 @@ mod tests {
             &[],
             Some(&exit),
             CAPTURED_AT,
+            false,
         );
         let restart = rendered.find("Runner restarted").expect("restart section");
         let machine = rendered.find("## local").expect("machine section");
@@ -1285,7 +1314,8 @@ mod tests {
             link,
             last_attempt: Some(RemoteAttachAttempt {
                 attempted_at_unix_ms: REMOTE_CAPTURED_AT - 120_000,
-                reason: "ssh: connect to host bglab-ub port 22: No route to host".into(),
+                reason: "ssh unreachable (ssh: connect to host bglab-ub port 22: No route to host)"
+                    .into(),
             }),
             last_seen_unix_ms: Some(REMOTE_CAPTURED_AT - 7_200_000),
         }
@@ -1302,6 +1332,7 @@ mod tests {
             &[],
             None,
             REMOTE_CAPTURED_AT,
+            false,
         );
         assert!(rendered.contains("### bglab-ub"), "{rendered}");
         assert!(
@@ -1326,6 +1357,7 @@ mod tests {
             &[],
             None,
             REMOTE_CAPTURED_AT,
+            false,
         );
         assert!(rendered.contains("### bglab-mac"), "{rendered}");
         assert!(rendered.contains("### bglab-ub"), "{rendered}");
@@ -1348,7 +1380,7 @@ mod tests {
             REMOTE_CAPTURED_AT,
         );
         assert!(
-            unreachable.contains("the host did not answer"),
+            unreachable.contains("unreachable — ssh unreachable ("),
             "{unreachable}"
         );
         assert!(
@@ -1356,13 +1388,16 @@ mod tests {
             "{unreachable}"
         );
 
-        let failed = render_enrolled_remote(
-            &enrolled("bglab-mac", RemoteLinkState::AttachFailed),
-            REMOTE_CAPTURED_AT,
+        let mut refused = enrolled("bglab-mac", RemoteLinkState::AttachFailed);
+        refused.last_attempt.as_mut().unwrap().reason =
+            "ssh authentication refused (root@host: Permission denied (publickey).)".into();
+        let failed = render_enrolled_remote(&refused, REMOTE_CAPTURED_AT);
+        assert!(
+            failed.contains("attach failed — ssh authentication refused ("),
+            "{failed}"
         );
-        assert!(failed.contains("the host answered"), "{failed}");
         assert!(failed.contains("until the cause is fixed"), "{failed}");
-        assert!(failed.contains("No route to host"), "{failed}");
+        assert!(failed.contains("Permission denied (publickey)"), "{failed}");
         assert!(failed.contains("2m ago"), "{failed}");
     }
 
@@ -1484,7 +1519,14 @@ mod tests {
         });
         for rendered in [
             render_executor(&executor),
-            render_executors(std::slice::from_ref(&executor), &[], &[], None, CAPTURED_AT),
+            render_executors(
+                std::slice::from_ref(&executor),
+                &[],
+                &[],
+                None,
+                CAPTURED_AT,
+                false,
+            ),
         ] {
             assert!(!rendered.contains("executor-7b21ce"), "{rendered}");
             assert!(!rendered.contains("device-9f3c1a"), "{rendered}");
@@ -1520,6 +1562,7 @@ mod tests {
             mobility: PlacementMobility::SpillEligible,
             selector: None,
             pinned_executor_id: None,
+            policy: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 prediction: None,
                 executor_name: "bglab-ub".into(),

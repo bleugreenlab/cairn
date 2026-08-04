@@ -7,16 +7,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::{
     render_text_floor, ChannelCapabilities, ChannelHealth, ChannelProvider, InboundEvent,
-    OperatorPresence, OutboundAsk, OutboundMessage, SentIds,
+    OperatorPresence, OutboundAsk, OutboundMessage, PollSelectionChange, ResolvedQuestionMessage,
+    SentIds,
 };
 use crate::fleet::service_placement::ServiceLease;
 use crate::services::{ProcessSpawner, SpawnConfig};
@@ -32,11 +35,153 @@ const PLACED_WATCH_KEY: &str = "imsg-watch";
 const PLACED_WATCH_ROLE: &str = "watch";
 /// Receiving clients silently ignore edits after the fifth edit to one message.
 const MAX_PROPAGATING_EDITS: u8 = 5;
+const UNSEND_WINDOW: Duration = Duration::from_secs(2 * 60);
+const EDIT_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// Keep markdown as Cairn's authoring format while producing both clean channel
+/// text and the native IMCore formatting ranges supported by `imsg send-rich`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct TextFormat {
+    start: usize,
+    length: usize,
+    styles: Vec<&'static str>,
+}
+
+fn reports_rich_send(stdout: &str) -> bool {
+    serde_json::from_str::<Value>(stdout)
+        .ok()
+        .and_then(|value| value.get("rpc_methods").cloned())
+        .and_then(|methods| methods.as_array().cloned())
+        .is_some_and(|methods| {
+            methods
+                .iter()
+                .any(|method| method.as_str() == Some("send.rich"))
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedText {
+    text: String,
+    formats: Vec<TextFormat>,
+}
+
+impl RenderedText {
+    fn append(&mut self, other: Self) {
+        let offset = self.text.encode_utf16().count();
+        self.text.push_str(&other.text);
+        self.formats
+            .extend(other.formats.into_iter().map(|mut format| {
+                format.start += offset;
+                format
+            }));
+    }
+}
+
+fn render_channel_text(markdown: &str) -> RenderedText {
+    let mut rendered = RenderedText {
+        text: String::new(),
+        formats: Vec::new(),
+    };
+    let mut open_styles: Vec<(&'static str, usize)> = Vec::new();
+    let mut link: Option<String> = None;
+    let options = Options::ENABLE_STRIKETHROUGH;
+
+    for event in Parser::new_ext(markdown, options) {
+        let position = rendered.text.encode_utf16().count();
+        match event {
+            Event::Start(Tag::Strong) => open_styles.push(("bold", position)),
+            Event::Start(Tag::Emphasis) => open_styles.push(("italic", position)),
+            Event::Start(Tag::Strikethrough) => open_styles.push(("strikethrough", position)),
+            Event::Start(Tag::Heading { .. }) => open_styles.push(("bold", position)),
+            Event::End(TagEnd::Strong) => close_style(&mut rendered, &mut open_styles, "bold"),
+            Event::End(TagEnd::Emphasis) => close_style(&mut rendered, &mut open_styles, "italic"),
+            Event::End(TagEnd::Strikethrough) => {
+                close_style(&mut rendered, &mut open_styles, "strikethrough")
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                close_style(&mut rendered, &mut open_styles, "bold");
+                ensure_newlines(&mut rendered.text, 2);
+            }
+            Event::Start(Tag::Link { dest_url, .. })
+            | Event::Start(Tag::Image { dest_url, .. }) => {
+                link = Some(dest_url.into_string());
+            }
+            Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {
+                if let Some(destination) = link.take() {
+                    rendered.text.push_str(&destination);
+                }
+            }
+            Event::Start(Tag::Item) => rendered.text.push_str("- "),
+            Event::End(TagEnd::Item) => ensure_newlines(&mut rendered.text, 1),
+            Event::End(TagEnd::List(_)) => ensure_newlines(&mut rendered.text, 2),
+            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::CodeBlock) => {
+                ensure_newlines(&mut rendered.text, 2)
+            }
+            Event::Text(text) | Event::Code(text) if link.is_none() => {
+                rendered.text.push_str(&text)
+            }
+            Event::SoftBreak | Event::HardBreak => ensure_newlines(&mut rendered.text, 1),
+            Event::Rule => rendered.text.push_str("---\n"),
+            _ => {}
+        }
+    }
+    rendered.text = rendered.text.trim().to_string();
+    rendered
+        .formats
+        .retain(|format| format.start + format.length <= rendered.text.encode_utf16().count());
+    rendered
+}
+
+fn close_style(
+    rendered: &mut RenderedText,
+    open: &mut Vec<(&'static str, usize)>,
+    style: &'static str,
+) {
+    if let Some(index) = open.iter().rposition(|(candidate, _)| *candidate == style) {
+        let (_, start) = open.remove(index);
+        rendered.formats.push(TextFormat {
+            start,
+            length: rendered.text.encode_utf16().count() - start,
+            styles: vec![style],
+        });
+    }
+}
+
+fn ensure_newlines(text: &mut String, count: usize) {
+    let present = text.chars().rev().take_while(|ch| *ch == '\n').count();
+    for _ in present..count {
+        text.push('\n');
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollOption {
     pub id: String,
     pub text: String,
+}
+
+fn sender_mismatch_diagnostic(sender: &str, allow_from: &[String]) -> String {
+    let sender = if sender.trim().is_empty() {
+        "<missing>"
+    } else {
+        sender
+    };
+    let configured = if allow_from.is_empty() {
+        "<empty>".to_string()
+    } else {
+        allow_from.join(", ")
+    };
+    format!(
+        "iMessage inbound sender `{sender}` does not match configured operator handle(s) `{configured}`"
+    )
+}
+
+fn log_sender_mismatch(sender: &str, allow_from: &[String]) {
+    log::warn!("{}", sender_mismatch_diagnostic(sender, allow_from));
+}
+
+fn nonzero(value: i64) -> Option<i64> {
+    (value != 0).then_some(value)
 }
 
 const ACTIVE_INPUT_IDLE_SECONDS: u64 = 60;
@@ -112,6 +257,7 @@ pub trait IMessageExecutor: Send + Sync {
         &self,
         args: Vec<String>,
         lines: mpsc::Sender<Result<String, String>>,
+        started: oneshot::Sender<()>,
     ) -> Result<(), String>;
 }
 
@@ -150,6 +296,7 @@ impl IMessageExecutor for LocalProcessExecutor {
         &self,
         args: Vec<String>,
         lines: mpsc::Sender<Result<String, String>>,
+        started: oneshot::Sender<()>,
     ) -> Result<(), String> {
         let process = self.process.clone();
         tokio::task::spawn_blocking(move || {
@@ -157,6 +304,7 @@ impl IMessageExecutor for LocalProcessExecutor {
             let stdout = child
                 .take_stdout()
                 .ok_or_else(|| "imsg watch did not expose stdout".to_string())?;
+            let _ = started.send(());
             for line in std::io::BufReader::new(stdout).lines() {
                 let line = line.map_err(|error| format!("reading imsg watch: {error}"));
                 if lines.blocking_send(line).is_err() {
@@ -262,6 +410,7 @@ impl IMessageExecutor for PlacedProcessExecutor {
         &self,
         args: Vec<String>,
         lines: mpsc::Sender<Result<String, String>>,
+        started: oneshot::Sender<()>,
     ) -> Result<(), String> {
         // A deterministic stop/start converges after a runner restart and ensures
         // the new durable cursor is the only live watch specification.
@@ -271,6 +420,7 @@ impl IMessageExecutor for PlacedProcessExecutor {
             .start_resident(PLACED_WATCH_KEY, PLACED_WATCH_ROLE, "imsg", args)
             .await
             .map_err(|error| error.to_string())?;
+        let _ = started.send(());
         let mut stdout = Vec::new();
         while let Some(event) = subscription.recv().await {
             match event.event {
@@ -329,6 +479,7 @@ impl IMessageExecutor for PlacedProcessExecutor {
 struct WatchState {
     seen_votes: HashSet<PollVote>,
     options: HashMap<String, String>,
+    votes_by_poll: HashMap<String, HashSet<PollVote>>,
 }
 
 pub struct IMessageProvider {
@@ -338,7 +489,20 @@ pub struct IMessageProvider {
     inbound_rx: Mutex<Option<mpsc::Receiver<InboundEvent>>>,
     inbound_tx: mpsc::Sender<InboundEvent>,
     watch_state: Arc<Mutex<WatchState>>,
+    watch_active: AtomicBool,
+    watch_started_at: AtomicI64,
+    last_receipt_at: AtomicI64,
+    last_receipt_rowid: AtomicI64,
     edit_counts: Mutex<HashMap<String, u8>>,
+    rich_text_ready: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchLiveness {
+    pub active: bool,
+    pub started_at: Option<i64>,
+    pub last_receipt_at: Option<i64>,
+    pub last_receipt_rowid: Option<i64>,
 }
 
 impl IMessageProvider {
@@ -353,7 +517,21 @@ impl IMessageProvider {
             inbound_rx: Mutex::new(Some(inbound_rx)),
             inbound_tx,
             watch_state: Arc::new(Mutex::new(WatchState::default())),
+            watch_active: AtomicBool::new(false),
+            watch_started_at: AtomicI64::new(0),
+            last_receipt_at: AtomicI64::new(0),
+            last_receipt_rowid: AtomicI64::new(0),
             edit_counts: Mutex::new(HashMap::new()),
+            rich_text_ready: AtomicBool::new(false),
+        }
+    }
+
+    pub fn watch_liveness(&self) -> WatchLiveness {
+        WatchLiveness {
+            active: self.watch_active.load(Ordering::Acquire),
+            started_at: nonzero(self.watch_started_at.load(Ordering::Acquire)),
+            last_receipt_at: nonzero(self.last_receipt_at.load(Ordering::Acquire)),
+            last_receipt_rowid: nonzero(self.last_receipt_rowid.load(Ordering::Acquire)),
         }
     }
 
@@ -367,7 +545,11 @@ impl IMessageProvider {
             .run(vec!["status".into(), "--json".into()])
             .await
         {
-            Ok(output) => parse_status(&output.stdout),
+            Ok(output) => {
+                self.rich_text_ready
+                    .store(reports_rich_send(&output.stdout), Ordering::Release);
+                parse_status(&output.stdout)
+            }
             Err(error) => ChannelHealth::Unavailable { reason: error },
         };
         *self.health.write().expect("iMessage health lock poisoned") = health.clone();
@@ -393,15 +575,38 @@ impl IMessageProvider {
     ) -> tokio::task::JoinHandle<Result<(), String>> {
         let provider = self.clone();
         tokio::spawn(async move {
+            struct ActiveWatch<'a>(&'a AtomicBool);
+            impl Drop for ActiveWatch<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _active_watch = ActiveWatch(&provider.watch_active);
             let (line_tx, mut line_rx) = mpsc::channel(128);
+            let (started_tx, started_rx) = oneshot::channel();
             let executor = provider.executor.clone();
-            let watch =
-                tokio::spawn(async move { executor.watch(watch_args(since_rowid), line_tx).await });
+            let watch = tokio::spawn(async move {
+                executor
+                    .watch(watch_args(since_rowid), line_tx, started_tx)
+                    .await
+            });
+            if started_rx.await.is_ok() {
+                provider.watch_active.store(true, Ordering::Release);
+                provider
+                    .watch_started_at
+                    .store(chrono::Utc::now().timestamp(), Ordering::Release);
+            }
             while let Some(line) = line_rx.recv().await {
                 let line = line?;
                 let rowid = serde_json::from_str::<Value>(&line)
                     .ok()
                     .and_then(|value| i64_at(&value, &["rowid", "row_id", "id"]));
+                provider
+                    .last_receipt_at
+                    .store(chrono::Utc::now().timestamp(), Ordering::Release);
+                if let Some(rowid) = rowid {
+                    provider.last_receipt_rowid.store(rowid, Ordering::Release);
+                }
                 match provider.ingest_watch_line(&line) {
                     Ok(Some((_rowid, event))) => {
                         if provider.inbound_tx.send(event).await.is_err() {
@@ -427,9 +632,11 @@ impl IMessageProvider {
         let value: Value = serde_json::from_str(line)
             .map_err(|error| format!("invalid imsg watch JSON: {error}"))?;
         let sender = string_at(&value, &["sender", "handle", "participant"]).unwrap_or_default();
-        if bool_at(&value, &["is_from_me", "isFromMe"]).unwrap_or(false)
-            || !is_allowlisted(&sender, &self.allow_from)
-        {
+        if bool_at(&value, &["is_from_me", "isFromMe"]).unwrap_or(false) {
+            return Ok(None);
+        }
+        if !is_allowlisted(&sender, &self.allow_from) {
+            log_sender_mismatch(&sender, &self.allow_from);
             return Ok(None);
         }
         let rowid = i64_at(&value, &["rowid", "row_id", "id"])
@@ -479,23 +686,51 @@ impl IMessageProvider {
                         option_id: string_at(vote, &["option_id", "optionId", "id"])?,
                     })
                 });
-                let new = dedupe_cumulative_votes(&mut state.seen_votes, votes);
-                if let (Some(vote), Some(bound_guid)) = (new.into_iter().next(), original_guid) {
-                    if !is_allowlisted(&vote.participant, &self.allow_from) {
+                let current = votes.collect::<HashSet<_>>();
+                let changes = original_guid.as_ref().map(|guid| {
+                    let previous = state.votes_by_poll.entry(guid.clone()).or_default();
+                    let mut changes = current
+                        .difference(previous)
+                        .cloned()
+                        .map(|vote| (vote, true))
+                        .collect::<Vec<_>>();
+                    changes.extend(
+                        previous
+                            .difference(&current)
+                            .cloned()
+                            .map(|vote| (vote, false)),
+                    );
+                    *previous = current.clone();
+                    changes
+                });
+                state.seen_votes.extend(current);
+                if let (Some(changes), Some(bound_guid)) = (changes, original_guid) {
+                    let Some(participant) =
+                        changes.first().map(|(vote, _)| vote.participant.clone())
+                    else {
+                        return Ok(None);
+                    };
+                    if !is_allowlisted(&participant, &self.allow_from) {
+                        log_sender_mismatch(&participant, &self.allow_from);
                         return Ok(None);
                     }
-                    let option_text = state
-                        .options
-                        .get(&vote.option_id)
-                        .cloned()
-                        .unwrap_or_else(|| vote.option_id.clone());
                     return Ok(Some((
                         rowid,
-                        InboundEvent::Selection {
+                        InboundEvent::Selections {
                             bound_guid,
-                            sender: vote.participant,
-                            option_id: vote.option_id,
-                            option_text,
+                            sender: participant,
+                            changes: changes
+                                .into_iter()
+                                .map(|(vote, selected)| PollSelectionChange {
+                                    option_text: state
+                                        .options
+                                        .get(&vote.option_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| vote.option_id.clone()),
+                                    option_id: vote.option_id,
+                                    selected,
+                                })
+                                .collect(),
                         },
                     )));
                 }
@@ -589,6 +824,101 @@ impl IMessageProvider {
     /// both are resolved against the chats imsg reports rather than synthesized. A
     /// handle with no chat yet resolves to nothing, which keeps the ask on the text
     /// floor - and that send creates the chat, making the next ask pollable.
+    async fn poll_sent_ids(
+        &self,
+        conversation: &str,
+        caption: &str,
+        send_stdout: &str,
+    ) -> Result<SentIds, String> {
+        let mut ids = parse_sent_ids(send_stdout)
+            .ok_or_else(|| "imsg poll send returned no message guid".to_string())?;
+        // The poll is already on the wire. Caption reconciliation enriches its
+        // binding for replies and cleanup, but must never turn that successful
+        // send into a retry that would duplicate the poll.
+        if let Some(chat) = self.resolve_chat(conversation).await {
+            if let Ok(history) = self
+                .executor
+                .run(vec![
+                    "history".into(),
+                    "--json".into(),
+                    "--chat-id".into(),
+                    chat.id.to_string(),
+                    "--limit".into(),
+                    "20".into(),
+                ])
+                .await
+            {
+                ids.caption_guid =
+                    reconcile_history(&history.stdout, caption).map(|caption| caption.primary_guid);
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn cleanup_guid(
+        &self,
+        chat_guid: &str,
+        guid: &str,
+        age: Duration,
+        receipt: &str,
+    ) -> Result<(), String> {
+        if age <= UNSEND_WINDOW
+            && self
+                .executor
+                .run(vec![
+                    "unsend".into(),
+                    "--chat".into(),
+                    chat_guid.into(),
+                    "--message".into(),
+                    guid.into(),
+                ])
+                .await
+                .is_ok()
+        {
+            return Ok(());
+        }
+        if age <= EDIT_WINDOW {
+            return self
+                .executor
+                .run(vec![
+                    "edit".into(),
+                    "--chat".into(),
+                    chat_guid.into(),
+                    "--message".into(),
+                    guid.into(),
+                    "--new-text".into(),
+                    receipt.into(),
+                ])
+                .await
+                .map(|_| ());
+        }
+        Ok(())
+    }
+
+    async fn cleanup_question(&self, message: &ResolvedQuestionMessage) -> Result<(), String> {
+        let Some(chat) = self.resolve_chat(&message.conversation).await else {
+            return Err(format!("imsg reports no chat for {}", message.conversation));
+        };
+        let age_seconds = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(message.sent_at) as u64;
+        let age = Duration::from_secs(age_seconds);
+        let mut failures = Vec::new();
+        for guid in std::iter::once(&message.provider_guid).chain(message.caption_guid.iter()) {
+            if let Err(error) = self
+                .cleanup_guid(&chat.guid, guid, age, &message.receipt)
+                .await
+            {
+                failures.push(format!("{guid}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
     async fn resolve_chat(&self, conversation: &str) -> Option<Chat> {
         let output = self
             .executor
@@ -617,6 +947,35 @@ impl IMessageProvider {
             .await?;
         self.sent_ids_or_history(conversation, text, &output.stdout)
             .await
+    }
+
+    async fn send_rendered(
+        &self,
+        conversation: &str,
+        rendered: &RenderedText,
+    ) -> Result<SentIds, String> {
+        if !rendered.formats.is_empty() && self.rich_text_ready.load(Ordering::Acquire) {
+            if let Some(chat) = self.resolve_chat(conversation).await {
+                let output = self
+                    .executor
+                    .run(vec![
+                        "send-rich".into(),
+                        "--json".into(),
+                        "--chat".into(),
+                        chat.guid,
+                        "--text".into(),
+                        rendered.text.clone(),
+                        "--format".into(),
+                        serde_json::to_string(&rendered.formats)
+                            .map_err(|error| error.to_string())?,
+                    ])
+                    .await?;
+                return self
+                    .sent_ids_or_history(conversation, &rendered.text, &output.stdout)
+                    .await;
+            }
+        }
+        self.send_text(conversation, &rendered.text).await
     }
 
     async fn sent_ids_or_history(
@@ -662,12 +1021,20 @@ impl ChannelProvider for IMessageProvider {
     }
 
     async fn send(&self, message: &OutboundMessage) -> Result<SentIds, String> {
-        let body = render_text_floor(&message.ask);
-        let rendered = if message.context_header.trim().is_empty() {
-            body
+        let body = render_channel_text(&render_text_floor(&message.ask));
+        let context_header = render_channel_text(&message.context_header);
+        let mut rendered = if message.context_header.trim().is_empty() {
+            body.clone()
         } else {
-            format!("{}\n\n{body}", message.context_header)
+            context_header.clone()
         };
+        if !message.context_header.trim().is_empty() {
+            rendered.append(RenderedText {
+                text: "\n\n".into(),
+                formats: Vec::new(),
+            });
+            rendered.append(body);
+        }
         if self.capabilities().structured_asks {
             if let OutboundAsk::Question { text, options, .. } = &message.ask {
                 // A Messages poll balloon needs at least two options; imsg rejects a
@@ -682,20 +1049,32 @@ impl ChannelProvider for IMessageProvider {
                             "--chat".into(),
                             chat.guid,
                             "--question".into(),
-                            format!("{}\n\n{text}", message.context_header),
+                            format!(
+                                "{}\n\n{}",
+                                context_header.text,
+                                render_channel_text(text).text
+                            ),
                         ];
                         for option in options {
-                            args.extend(["--option".into(), option.label.clone()]);
+                            args.extend([
+                                "--option".into(),
+                                render_channel_text(&option.label).text,
+                            ]);
                         }
                         let output = self.executor.run(args).await?;
+                        let caption = format!(
+                            "{}\n\n{}",
+                            context_header.text,
+                            render_channel_text(text).text
+                        );
                         return self
-                            .sent_ids_or_history(&message.conversation, text, &output.stdout)
+                            .poll_sent_ids(&message.conversation, &caption, &output.stdout)
                             .await;
                     }
                 }
             }
         }
-        self.send_text(&message.conversation, &rendered).await
+        self.send_rendered(&message.conversation, &rendered).await
     }
 
     fn subscribe(&self) -> mpsc::Receiver<InboundEvent> {
@@ -721,6 +1100,10 @@ impl ChannelProvider for IMessageProvider {
                 OperatorPresence::Away
             }
         }
+    }
+
+    async fn cleanup_question(&self, message: &ResolvedQuestionMessage) -> Result<(), String> {
+        IMessageProvider::cleanup_question(self, message).await
     }
 }
 
@@ -916,6 +1299,8 @@ pub fn normalize_handle(handle: &str) -> String {
     let digits: String = trimmed.chars().filter(char::is_ascii_digit).collect();
     if digits.is_empty() {
         trimmed.to_lowercase()
+    } else if digits.len() == 11 && digits.starts_with('1') {
+        digits[1..].to_string()
     } else if has_plus {
         format!("+{digits}")
     } else {
@@ -1025,12 +1410,51 @@ mod tests {
             &self,
             args: Vec<String>,
             lines: mpsc::Sender<Result<String, String>>,
+            started: oneshot::Sender<()>,
         ) -> Result<(), String> {
             self.calls.lock().unwrap().push(args);
+            let _ = started.send(());
             for line in &self.watch_lines {
                 lines.send(Ok(line.clone())).await.unwrap();
             }
             Ok(())
+        }
+    }
+
+    struct FailingWatchExecutor;
+
+    #[async_trait]
+    impl IMessageExecutor for FailingWatchExecutor {
+        async fn run(&self, _args: Vec<String>) -> Result<CommandResult, String> {
+            unreachable!("failing watch test does not run commands")
+        }
+
+        async fn watch(
+            &self,
+            _args: Vec<String>,
+            _lines: mpsc::Sender<Result<String, String>>,
+            _started: oneshot::Sender<()>,
+        ) -> Result<(), String> {
+            Err("watch did not start".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_watch_retries_never_claim_an_active_connection() {
+        let provider = Arc::new(IMessageProvider::new(
+            Arc::new(FailingWatchExecutor),
+            vec![],
+        ));
+
+        for _ in 0..2 {
+            let (cursor_tx, _cursor_rx) = mpsc::channel(1);
+            assert_eq!(
+                provider.spawn_watch(41, cursor_tx).await.unwrap(),
+                Err("watch did not start".into())
+            );
+            let liveness = provider.watch_liveness();
+            assert!(!liveness.active);
+            assert_eq!(liveness.started_at, None);
         }
     }
 
@@ -1061,6 +1485,38 @@ mod tests {
         assert!(parse_operator_presence("0 maybe").is_err());
     }
 
+    #[test]
+    fn channel_text_removes_markdown_without_losing_deep_links() {
+        let markdown = "# **CAIRN-3550** stream update\n\nUse `render_channel_text`:\n* first item\n* [Open in Cairn](cairn://p/CAIRN/3550)\n\n_Ready_.";
+        assert_eq!(
+            render_channel_text(markdown).text,
+            "CAIRN-3550 stream update\n\nUse render_channel_text:\n\n- first item\n- cairn://p/CAIRN/3550\n\nReady."
+        );
+    }
+
+    #[test]
+    fn channel_text_preserves_fenced_code_and_literal_underscores() {
+        assert_eq!(
+            render_channel_text("```rust\nlet raw_value = **literal**;\n```\nfoo_bar_baz").text,
+            "let raw_value = **literal**;\n\nfoo_bar_baz"
+        );
+    }
+
+    #[test]
+    fn channel_text_structurally_renders_nested_emphasis() {
+        let rendered = render_channel_text("**bold and *italic***");
+        assert_eq!(rendered.text, "bold and italic");
+        assert_eq!(rendered.formats.len(), 2);
+        assert!(rendered
+            .formats
+            .iter()
+            .any(|format| format.styles == ["bold"]));
+        assert!(rendered
+            .formats
+            .iter()
+            .any(|format| format.styles == ["italic"]));
+    }
+
     fn message() -> OutboundMessage {
         message_with(&["Legacy", "New"])
     }
@@ -1069,6 +1525,7 @@ mod tests {
         OutboundMessage {
             intent_id: "intent".into(),
             conversation: "+15551234567".into(),
+            initiated_by: crate::channels::OutboundInitiator::CairnPush,
             context_header: "[CAIRN-3373 · builder]".into(),
             ask: OutboundAsk::Question {
                 prompt_id: "p".into(),
@@ -1102,6 +1559,10 @@ mod tests {
 
         assert_eq!(cursor_rx.recv().await, Some(42));
         assert_eq!(fake.calls.lock().unwrap()[0], watch_args(41));
+        let liveness = provider.watch_liveness();
+        assert!(liveness.started_at.is_some());
+        assert!(liveness.last_receipt_at.is_some());
+        assert_eq!(liveness.last_receipt_rowid, Some(42));
     }
 
     #[tokio::test]
@@ -1134,15 +1595,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn degraded_bridge_sends_clean_markdown_floor() {
+        let bridgeless = status_with(|status| {
+            status.insert("advanced_features".into(), Value::Bool(false));
+            status.insert("v2_ready".into(), Value::Bool(false));
+            if let Some(Value::Array(methods)) = status.get_mut("rpc_methods") {
+                methods.retain(|method| method.as_str() != Some("send.rich"));
+            }
+        });
+        let fake = Arc::new(FakeExecutor::new([
+            bridgeless,
+            r#"{"guid":"plain-guid"}"#.to_string(),
+        ]));
+        let provider = IMessageProvider::new(fake.clone(), vec![]);
+        provider.refresh_health().await;
+        let mut message = message();
+        message.context_header.clear();
+        message.ask = OutboundAsk::Notify {
+            text: "**Bold** and `inline_code`\n- [Open](cairn://p/CAIRN/3550)".into(),
+        };
+
+        provider.send(&message).await.unwrap();
+
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls[1][0], "send");
+        assert!(calls[1]
+            .windows(2)
+            .any(|pair| { pair == ["--text", "Bold and inline_code\n\n- cairn://p/CAIRN/3550"] }));
+    }
+
+    #[tokio::test]
+    async fn rich_send_does_not_depend_on_poll_support() {
+        let rich_without_polls = status_with(|status| {
+            if let Some(Value::Object(selectors)) = status.get_mut("selectors") {
+                selectors.insert("pollPayloadMessage".into(), Value::Bool(false));
+            }
+            if let Some(Value::Array(methods)) = status.get_mut("rpc_methods") {
+                methods.retain(|method| {
+                    !matches!(method.as_str(), Some("poll.send" | "messages.poll.send"))
+                });
+            }
+        });
+        let fake = Arc::new(FakeExecutor::new([
+            rich_without_polls.as_str(),
+            REAL_CHATS,
+            r#"{"guid":"rich-guid"}"#,
+        ]));
+        let provider = IMessageProvider::new(fake.clone(), vec![]);
+        assert!(matches!(
+            provider.refresh_health().await,
+            ChannelHealth::Degraded { .. }
+        ));
+        let mut message = message();
+        message.context_header.clear();
+        message.ask = OutboundAsk::Notify {
+            text: "**Bold** and *italic*".into(),
+        };
+
+        provider.send(&message).await.unwrap();
+
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls[2][0], "send-rich");
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--text", "Bold and italic"]));
+        let format = calls[2]
+            .windows(2)
+            .find(|pair| pair[0] == "--format")
+            .map(|pair| pair[1].as_str())
+            .unwrap();
+        assert!(format.contains("\"styles\":[\"bold\"]"));
+        assert!(format.contains("\"styles\":[\"italic\"]"));
+    }
+
+    #[tokio::test]
     async fn ready_health_sends_poll_with_argument_boundaries() {
-        let fake = Arc::new(FakeExecutor::new([REAL_STATUS, REAL_CHATS, REAL_POLL_SEND]));
+        let poll_caption = r#"{"guid":"caption-guid","chat_id":2,"is_from_me":true,"text":"[CAIRN-3373 · builder]\n\nWhich path?"}"#;
+        let fake = Arc::new(FakeExecutor::new([
+            REAL_STATUS,
+            REAL_CHATS,
+            REAL_POLL_SEND,
+            REAL_CHATS,
+            poll_caption,
+        ]));
         let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
         assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);
-        let ids = provider.send(&message()).await.unwrap();
+        let mut markdown_message = message_with(&["**Legacy**", "_New_"]);
+        markdown_message.context_header = "**[CAIRN-3373 · builder]**".into();
+        if let OutboundAsk::Question { text, .. } = &mut markdown_message.ask {
+            *text = "Which `path`?".into();
+        }
+        let ids = provider.send(&markdown_message).await.unwrap();
         // imsg sends the caption itself and reports only the balloon's guid, so the ask
         // binds to the poll a vote actually arrives against.
         assert_eq!(ids.primary_guid, "3892DF46-42FE-41FB-960B-292F16EF7FB0");
-        assert_eq!(ids.caption_guid, None);
+        assert_eq!(ids.caption_guid.as_deref(), Some("caption-guid"));
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls[1][0], "chats");
         assert_eq!(&calls[2][..2], &["poll", "send"]);
@@ -1155,6 +1702,9 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--option", "Legacy"]));
         assert!(calls[2].windows(2).any(|pair| pair == ["--option", "New"]));
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| { pair == ["--question", "[CAIRN-3373 · builder]\n\nWhich path?"] }));
     }
 
     /// A handle imsg has no chat for has nothing to hold a balloon, so the first ask to
@@ -1205,17 +1755,19 @@ mod tests {
 
         let Some((
             75,
-            InboundEvent::Selection {
+            InboundEvent::Selections {
                 bound_guid,
-                option_text,
+                changes,
                 ..
             },
         )) = event
         else {
-            panic!("a real vote must resolve to a selection, got {event:?}");
+            panic!("a real vote must resolve to selections, got {event:?}");
         };
         assert_eq!(bound_guid, "3892DF46-42FE-41FB-960B-292F16EF7FB0");
-        assert_eq!(option_text, "New");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].option_text, "New");
+        assert!(changes[0].selected);
     }
 
     /// Messages renders a poll balloon only with at least two options, so a one-option
@@ -1231,6 +1783,79 @@ mod tests {
 
         assert_eq!(ids.primary_guid, "m1");
         assert_eq!(fake.calls.lock().unwrap()[1][0], "send");
+    }
+
+    #[tokio::test]
+    async fn failed_unsend_falls_back_to_a_resolution_receipt_within_edit_window() {
+        let fake = Arc::new(FakeExecutor {
+            results: Mutex::new(VecDeque::from([
+                Ok(CommandResult {
+                    stdout: REAL_CHATS.into(),
+                    stderr: String::new(),
+                }),
+                Err("unsend window rejected by recipient".into()),
+                Ok(CommandResult {
+                    stdout: "{}".into(),
+                    stderr: String::new(),
+                }),
+            ])),
+            calls: Mutex::new(Vec::new()),
+            watch_lines: Vec::new(),
+        });
+        let provider = IMessageProvider::new(fake.clone(), vec![]);
+        provider
+            .cleanup_question(&ResolvedQuestionMessage {
+                conversation: "+15551234567".into(),
+                provider_guid: "message-guid".into(),
+                caption_guid: None,
+                sent_at: chrono::Utc::now().timestamp() - 30,
+                receipt: "✓ answered: Ship it".into(),
+            })
+            .await
+            .unwrap();
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls[1][0], "unsend");
+        assert_eq!(calls[2][0], "edit");
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--new-text", "✓ answered: Ship it"]));
+    }
+
+    #[tokio::test]
+    async fn recent_resolution_unsends_poll_and_caption() {
+        let fake = Arc::new(FakeExecutor::new([REAL_CHATS, "{}", "{}"]));
+        let provider = IMessageProvider::new(fake.clone(), vec![]);
+        provider
+            .cleanup_question(&ResolvedQuestionMessage {
+                conversation: "+15551234567".into(),
+                provider_guid: "poll-guid".into(),
+                caption_guid: Some("caption-guid".into()),
+                sent_at: chrono::Utc::now().timestamp(),
+                receipt: "✓ answered: Ship it".into(),
+            })
+            .await
+            .unwrap();
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(
+            calls[1],
+            vec![
+                "unsend",
+                "--chat",
+                "any;-;+15551234567",
+                "--message",
+                "poll-guid"
+            ]
+        );
+        assert_eq!(
+            calls[2],
+            vec![
+                "unsend",
+                "--chat",
+                "any;-;+15551234567",
+                "--message",
+                "caption-guid"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1311,15 +1936,32 @@ mod tests {
         let mutation = r#"{"rowid":10,"sender":"+14155550123","poll":{"original_guid":"poll","options":[{"id":"a","text":"Alpha"}],"votes":[]}}"#;
         assert_eq!(provider.ingest_watch_line(mutation).unwrap(), None);
         let vote = r#"{"rowid":11,"sender":"+14155550123","poll":{"original_guid":"poll","options":[{"id":"a","text":"Alpha"}],"votes":[{"participant":"+14155550123","option_id":"a"}]}}"#;
-        assert!(
-            matches!(provider.ingest_watch_line(vote).unwrap(), Some((11, InboundEvent::Selection { option_text, .. })) if option_text == "Alpha")
-        );
+        assert!(matches!(
+            provider.ingest_watch_line(vote).unwrap(),
+            Some((
+                11,
+                InboundEvent::Selections { changes, .. }
+            )) if changes.len() == 1
+                && changes[0].option_text == "Alpha"
+                && changes[0].selected
+        ));
         assert_eq!(provider.ingest_watch_line(vote).unwrap(), None);
+
+        let two_changes = r#"{"rowid":12,"sender":"+14155550123","poll":{"original_guid":"poll","options":[{"id":"a","text":"Alpha"},{"id":"b","text":"Beta"},{"id":"c","text":"Gamma"}],"votes":[{"participant":"+14155550123","option_id":"b"},{"participant":"+14155550123","option_id":"c"}]}}"#;
+        assert!(matches!(
+            provider.ingest_watch_line(two_changes).unwrap(),
+            Some((
+                12,
+                InboundEvent::Selections { changes, .. }
+            )) if changes.len() == 3
+                && changes.iter().filter(|change| change.selected).count() == 2
+                && changes.iter().filter(|change| !change.selected).count() == 1
+        ));
         let reply =
-            r#"{"rowid":12,"sender":"+14155550123","text":"2","thread_originator_guid":"poll"}"#;
+            r#"{"rowid":13,"sender":"+14155550123","text":"2","thread_originator_guid":"poll"}"#;
         assert!(matches!(
             provider.ingest_watch_line(reply).unwrap(),
-            Some((12, InboundEvent::Reply { .. }))
+            Some((13, InboundEvent::Reply { .. }))
         ));
         let echo = r#"{"rowid":13,"sender":"+14155550123","text":"mine","is_from_me":true}"#;
         assert_eq!(provider.ingest_watch_line(echo).unwrap(), None);
@@ -1329,9 +1971,22 @@ mod tests {
     fn normalizes_handles_and_parses_reply_numbers() {
         let allowlist = vec![" +1 (415) 555-0123 ".into(), "USER@Example.COM".into()];
         assert!(is_allowlisted("+14155550123", &allowlist));
+        assert!(is_allowlisted("415-555-0123", &allowlist));
         assert!(is_allowlisted(" user@example.com ", &allowlist));
         assert!(!is_allowlisted("+14155559999", &allowlist));
         assert_eq!(parse_reply_number(" 2. New", 3), Some(1));
         assert_eq!(parse_reply_number("4", 3), None);
+    }
+
+    #[test]
+    fn unknown_sender_diagnostic_names_both_sides_of_the_allowlist() {
+        assert_eq!(
+            sender_mismatch_diagnostic("", &["+1 (415) 555-0123".into()]),
+            "iMessage inbound sender `<missing>` does not match configured operator handle(s) `+1 (415) 555-0123`"
+        );
+        assert_eq!(
+            sender_mismatch_diagnostic("stranger@example.com", &[]),
+            "iMessage inbound sender `stranger@example.com` does not match configured operator handle(s) `<empty>`"
+        );
     }
 }

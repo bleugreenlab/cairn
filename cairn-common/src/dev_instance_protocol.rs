@@ -26,6 +26,10 @@ pub struct DevInstanceLaunchRequest {
     /// refs, and falls back to the project's own checkout when it is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout: Option<String>,
+    /// Terminal process key that initiated this launch, when the client runs
+    /// inside a tracked terminal. This is relationship metadata, not authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_terminal_session_id: Option<String>,
     pub seed: String,
     #[serde(default)]
     pub force_copy: bool,
@@ -270,6 +274,7 @@ mod tests {
             project_id: "project-1".into(),
             selector: Some("feature/dev".into()),
             checkout: Some("/repos/app".into()),
+            source_terminal_session_id: Some("terminal-session".into()),
             seed: "empty".into(),
             force_copy: true,
         });
@@ -349,6 +354,7 @@ mod tests {
             project_id: "p".into(),
             selector: None,
             checkout: None,
+            source_terminal_session_id: None,
             seed: "empty".into(),
             force_copy: true,
         })

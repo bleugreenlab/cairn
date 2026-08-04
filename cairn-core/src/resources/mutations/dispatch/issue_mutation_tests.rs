@@ -31,6 +31,137 @@ async fn seeded_orch() -> Orchestrator {
     .build()
 }
 
+#[tokio::test]
+async fn merged_issue_refuses_channel_messages() {
+    let orch = seeded_orch().await;
+    let (_, number) = seed_issue(&orch).await;
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{number}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"status": "merged"})),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let error = apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{number}/messages"),
+            ChangeMode::Append,
+            Some(serde_json::json!({"content": "too late"})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.error.contains("is terminal (merged)"), "{error:?}");
+}
+
+#[tokio::test]
+async fn agent_on_merged_issue_refuses_direct_messages() {
+    let orch = seeded_orch().await;
+    let (_, number) = seed_issue(&orch).await;
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{number}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"status": "merged"})),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let error = apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{number}/1/builder/messages"),
+            ChangeMode::Append,
+            Some(serde_json::json!({"content": "too late"})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.error.contains("is terminal (merged)"), "{error:?}");
+}
+
+#[tokio::test]
+async fn checks_alias_mute_and_unmute_use_the_canonical_condition_source() {
+    let orch = seeded_orch().await;
+    let (issue_id, number) = seed_issue(&orch).await;
+    orch.db
+        .local
+        .execute_script(&format!(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               SELECT 'exec-checks','recipe',id,project_id,'running',1,1 FROM issues WHERE id='{issue_id}';
+             INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, created_at, updated_at)
+               SELECT 'job-checks','exec-checks',project_id,id,'running','builder','builder','agent/test',1,1
+               FROM issues WHERE id='{issue_id}';"
+        ))
+        .await
+        .unwrap();
+    let target = format!("cairn://p/CAIRN/{number}/1/builder/wakes");
+    apply(
+        &orch,
+        &change_item(
+            &target,
+            ChangeMode::Append,
+            Some(serde_json::json!({"mute":{"kind":"checks"}})),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let subscriptions =
+        crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "job-checks")
+            .await
+            .unwrap();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].source_kind, "condition");
+    assert_eq!(
+        subscriptions[0].source_ref.as_deref(),
+        Some(format!("cairn://p/CAIRN/{number}/1/builder/checks").as_str())
+    );
+
+    apply(
+        &orch,
+        &change_item(
+            &target,
+            ChangeMode::Patch,
+            Some(serde_json::json!({"unmute":{"kind":"checks"}})),
+        ),
+    )
+    .await
+    .unwrap();
+    let subscriptions =
+        crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "job-checks")
+            .await
+            .unwrap();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(
+        subscriptions[0].state,
+        crate::orchestrator::wakes::WakeSubscriptionState::Active
+    );
+    let checks_uri = format!("cairn://p/CAIRN/{number}/1/builder/checks");
+    let (_, effective_wake) = crate::orchestrator::attention_push::push_with_fingerprint(
+        &orch.db.local,
+        "job-checks",
+        &checks_uri,
+        crate::orchestrator::attention_push::Wake::Wake,
+        crate::orchestrator::attention_push::Boundary::Event,
+        &format!("turn-checks:{checks_uri}"),
+        Some("state"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effective_wake,
+        crate::orchestrator::attention_push::Wake::Wake
+    );
+}
+
 /// Create a `CAIRN` project plus one issue; returns the issue id and number.
 async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
     let clock = RealClock;

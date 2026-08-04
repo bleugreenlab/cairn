@@ -130,13 +130,6 @@ async fn store_file_changes(
     Ok(())
 }
 
-/// Resolve `pull_on_merge` from workspace settings via the core config loader.
-fn pull_on_merge_setting() -> bool {
-    crate::config::get_config_dir()
-        .map(|dir| crate::config::settings::load_settings(&dir).pull_on_merge)
-        .unwrap_or(true)
-}
-
 /// Background post-merge reconciliation shared by the in-app merge
 /// (`merge_pr_for_job`) and the GitHub merge path.
 ///
@@ -152,13 +145,9 @@ fn pull_on_merge_setting() -> bool {
 /// (`resolve_pr_node`, which also fires base-advance notifications, plus the
 /// caller's attention emit) has already happened by the time this runs. Takes
 /// owned values so callers can spawn it detached via `tokio::spawn`.
-/// `force_checkout_pull` forces the user's main-checkout fast-forward pull
-/// regardless of the `pull_on_merge` setting. The GitHub-API merge path sets it
-/// for default-branch PRs: nothing locally rewrote the checkout (no local fold),
-/// so a `git pull` of the PR base branch is the only way the checkout catches up
-/// to the just-merged tip. The local-fold path passes `false` — the fold already
-/// advanced the local default ref, and `pull_on_merge` governs only the extra
-/// pull.
+/// Reconciliation follows the landing lifecycle: a GitHub landing pulls because
+/// no local fold advanced the checkout, while a local fold repairs the checkout
+/// from the ref it already advanced without an optional network operation.
 fn should_reconcile_main_checkout_after_merge(
     target_branch: &str,
     resolved_default_branch: &str,
@@ -166,11 +155,23 @@ fn should_reconcile_main_checkout_after_merge(
     target_branch == resolved_default_branch
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckoutReconciliation {
+    PullRemoteLanding,
+    RepairLocalFold,
+}
+
+impl CheckoutReconciliation {
+    fn pulls_remote(self) -> bool {
+        matches!(self, Self::PullRemoteLanding)
+    }
+}
+
 pub async fn reconcile_after_merge(
     orch: Orchestrator,
     db: Arc<LocalDb>,
     ctx: MergeMrContext,
-    force_checkout_pull: bool,
+    checkout_reconciliation: CheckoutReconciliation,
 ) {
     let owner_id = ctx.mr.job_id.clone();
     let repo_path = ctx.mr.repo_path.clone();
@@ -196,7 +197,7 @@ pub async fn reconcile_after_merge(
     //    unrelated work.
     if should_reconcile_main_checkout_after_merge(&target_branch, &resolved_default_branch) {
         let git = &*orch.services.git;
-        let pull = force_checkout_pull || (pr_number.is_some() && pull_on_merge_setting());
+        let pull = checkout_reconciliation.pulls_remote();
         if let Err(e) =
             reconcile_main_checkout_after_merge(git, &repo_path, &resolved_default_branch, pull)
         {
@@ -444,6 +445,7 @@ async fn merge_remote_pr_via_github(
     merge_context: MergeMrContext,
     merge_method: Option<String>,
     merge_started: std::time::Instant,
+    attribution: Option<super::PrResolutionAttribution>,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.clone();
     let issue_id = merge_context.issue_id.clone();
@@ -477,7 +479,7 @@ async fn merge_remote_pr_via_github(
     // through the terminal cascade (live work stopped, sessions closed, warm
     // processes evicted). Runs only after the GitHub call succeeded.
     let resolve_started = std::time::Instant::now();
-    resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
+    resolve_pr_node(orch, job_id, PrNodeResolution::Merge, attribution)
         .await
         .map_err(|error| {
             log::error!(
@@ -523,7 +525,13 @@ async fn merge_remote_pr_via_github(
         }
         // File capture, user-checkout fast-forward pull (forced — no local fold
         // moved it), worktree teardown, PR refresh.
-        reconcile_after_merge(orch_clone, db, reconcile_ctx, true).await;
+        reconcile_after_merge(
+            orch_clone,
+            db,
+            reconcile_ctx,
+            CheckoutReconciliation::PullRemoteLanding,
+        )
+        .await;
     });
 
     log::info!(
@@ -540,6 +548,7 @@ pub async fn merge_pr_for_job(
     orch: &Orchestrator,
     job_id: &str,
     merge_method: Option<String>,
+    attribution: Option<super::PrResolutionAttribution>,
 ) -> Result<String, String> {
     // Route to the owning database (team replica or private DB). The merge
     // request, its issue, and the producing job for a team execution all live in
@@ -643,6 +652,7 @@ pub async fn merge_pr_for_job(
             merge_context,
             merge_method,
             merge_started,
+            attribution,
         )
         .await;
     }
@@ -685,6 +695,7 @@ pub async fn merge_pr_for_job(
             };
             match crate::execution::checks::verify_review_tree(
                 orch,
+                db.clone(),
                 &merge_context.project_id,
                 &repo_path,
                 Path::new(&repo_path),
@@ -694,6 +705,7 @@ pub async fn merge_pr_for_job(
                 &prospective.changed_files,
                 job_id,
                 crate::fleet::CellPriority::ReviewCheck,
+                crate::execution::checks::ReviewTreeCheckScope::Gates,
             )
             .await
             {
@@ -760,7 +772,7 @@ pub async fn merge_pr_for_job(
     }
 
     let resolve_started = std::time::Instant::now();
-    resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
+    resolve_pr_node(orch, job_id, PrNodeResolution::Merge, attribution)
         .await
         .map_err(|error| {
             log::error!(
@@ -783,13 +795,13 @@ pub async fn merge_pr_for_job(
     }
 
     // Background reconciliation, shared with the GitHub webhook merge path. The
-    // local fold already re-attached and fast-forwarded the checkout, so the pull
-    // is governed by `pull_on_merge` (not forced).
+    // local fold already advanced the checkout ref, so reconciliation repairs the
+    // checkout without an unnecessary network pull.
     tokio::spawn(reconcile_after_merge(
         orch.clone(),
         db,
         merge_context,
-        false,
+        CheckoutReconciliation::RepairLocalFold,
     ));
 
     log::info!(
@@ -976,6 +988,12 @@ mod tests {
         assert!(error.contains("/repo"), "{error}");
         assert!(error.contains("src/lib.rs"), "{error}");
         assert!(!error.contains("src-tauri/Cargo.lock"), "{error}");
+    }
+
+    #[test]
+    fn reconciliation_is_driven_by_landing_lifecycle() {
+        assert!(CheckoutReconciliation::PullRemoteLanding.pulls_remote());
+        assert!(!CheckoutReconciliation::RepairLocalFold.pulls_remote());
     }
 
     #[test]

@@ -660,7 +660,6 @@ pub(crate) const SETTINGS_ACTIVE_BACKEND: KeySpec =
 pub(crate) const SETTINGS_TIERS: KeySpec = KeySpec::new("tiers", KeyType::Array, "tier ordering");
 pub(crate) const SETTINGS_BACKENDS: KeySpec =
     KeySpec::new("backends", KeyType::Object, "backend -> tier -> preset map");
-pub(crate) const SETTINGS_BRANCH_PREFIX: KeySpec = KeySpec::new("branchPrefix", KeyType::Str, "");
 pub(crate) const SETTINGS_MERGE_TYPE: KeySpec =
     KeySpec::new("mergeType", KeyType::Str, "squash|merge|rebase");
 pub(crate) const SETTINGS_MEMORY_REVIEW_ENABLED: KeySpec = KeySpec::new(

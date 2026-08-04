@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,8 @@ use cairn_common::uri::CairnResource;
 use cairn_db::turso::params;
 use tokio::sync::mpsc;
 
+use crate::messages::delivery::{latest_run_for_job, queue_system_direct};
+use crate::messages::queued::DeliveryUrgency;
 use crate::orchestrator::Orchestrator;
 use crate::services::GitClient;
 use crate::storage::RowExt;
@@ -30,6 +33,244 @@ const READY_MARKER: &str = "CAIRN_DEV_INSTANCE_READY=";
 const LEASE_TIMEOUT_MS: u64 = 30_000;
 const RECLAIM_GRACE_MS: u64 = 10_000;
 const RENEW_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Advance every live dev server launched from `branch` to the commit that now
+/// names that branch. The executor serializes this mutation with every other
+/// operation on the residency, while the caller performs it only after the
+/// branch publication lock has been released.
+///
+/// A dev checkout is a projection, not an authoring surface. Its refresh is
+/// therefore stricter than a terminal's: tracked dirt refuses the move and the
+/// owner receives a blocking state instead of the old tree continuing silently.
+pub(crate) async fn sync_live_branch_instances(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    new_tip: &str,
+) -> Vec<String> {
+    let fences = live_branch_instance_fences(orch.fleet.snapshot(), project_id, branch);
+
+    let mut failures = Vec::new();
+    for fence in fences {
+        let result = orch
+            .fleet
+            .operate_residency(
+                orch,
+                ResidencyOperation::RefreshCheckout {
+                    fence: fence.clone(),
+                    base_commit: new_tip.to_string(),
+                    require_clean: true,
+                },
+            )
+            .await;
+        if let ResidencyResult::Failed {
+            kind, diagnostic, ..
+        } = result
+        {
+            let state = if kind
+                == cairn_common::executor_protocol::ResidencyFailureKind::InvalidState
+                && diagnostic.contains("dirty checkout")
+            {
+                "dirty tree"
+            } else if kind == cairn_common::executor_protocol::ResidencyFailureKind::InvalidState {
+                "checkout conflict"
+            } else {
+                "executor unavailable"
+            };
+            let message = format!(
+                "⛔ BLOCKING [Dev instance sync: {state}] The live dev instance for `{branch}` could not advance to `{new_tip}` and may still be serving stale code. The running process was left intact. Exact diagnostic: {diagnostic}"
+            );
+            log::error!("{message}");
+            notify_branch_owner(orch, project_id, branch, &message).await;
+            failures.push(message);
+        }
+    }
+
+    failures
+}
+
+/// Reconcile dev residencies left behind by issues that reached a terminal
+/// state before deterministic teardown was introduced.
+pub async fn sweep_terminal_issue_instances(orch: &Orchestrator) -> Result<usize, String> {
+    let mut targets: std::collections::BTreeMap<String, (Vec<String>, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for db in orch.db.all_dbs().await {
+        let rows: Vec<(String, String, Option<String>)> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT j.id, j.project_id, j.branch
+                             FROM jobs j
+                             JOIN issues i ON i.id = j.issue_id
+                             WHERE i.status IN ('merged', 'closed')",
+                            (),
+                        )
+                        .await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push((row.text(0)?, row.text(1)?, row.opt_text(2)?));
+                    }
+                    Ok(out)
+                })
+            })
+            .await
+            .map_err(|error| format!("load terminal dev-instance owners: {error}"))?;
+        for (job_id, project_id, branch) in rows {
+            let target = targets.entry(project_id).or_default();
+            if !target.0.contains(&job_id) {
+                target.0.push(job_id);
+            }
+            if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+                if !target.1.contains(&branch) {
+                    target.1.push(branch);
+                }
+            }
+        }
+    }
+
+    let mut released = 0;
+    for (project_id, (job_ids, branches)) in targets {
+        let fences = issue_instance_fences(orch.fleet.snapshot(), &project_id, &job_ids, &branches);
+        released += fences.len();
+        let mut failures = Vec::new();
+        for fence in fences {
+            let holder = fence.holder.clone();
+            if let Err(diagnostic) = crate::fleet::residency::release(orch, &fence).await {
+                failures.push(format!("{holder:?}: {diagnostic}"));
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "startup dev-instance sweep was not verified: {}",
+                failures.join("; ")
+            ));
+        }
+    }
+    Ok(released)
+}
+
+/// Select dev-instance residencies owned by jobs being torn down. Older
+/// residencies may predate owner attribution, so an unattributed instance is
+/// matched by its project and agent branch. An instance attributed to a
+/// different job is never consumed merely because it shares a selector.
+fn issue_instance_fences(
+    snapshot: cairn_common::executor_protocol::FleetSnapshot,
+    project_id: &str,
+    job_ids: &[String],
+    branches: &[String],
+) -> Vec<cairn_common::executor_protocol::ResidencyFence> {
+    let job_ids: HashSet<&str> = job_ids.iter().map(String::as_str).collect();
+    let branches: HashSet<&str> = branches.iter().map(String::as_str).collect();
+    snapshot
+        .cells
+        .into_iter()
+        .filter_map(|cell| {
+            let residency = cell.residency?;
+            if cell.project_id != project_id
+                || !matches!(residency.holder, ResidencyHolder::DevInstance { .. })
+            {
+                return None;
+            }
+            let owned = residency
+                .owner_ref
+                .as_ref()
+                .and_then(|owner| owner.job_id.as_deref())
+                .map(|job_id| job_ids.contains(job_id))
+                .unwrap_or_else(|| {
+                    residency.owner_ref.is_none()
+                        && residency
+                            .selector
+                            .as_deref()
+                            .is_some_and(|selector| branches.contains(selector))
+                });
+            owned.then_some(cairn_common::executor_protocol::ResidencyFence {
+                holder: residency.holder,
+                incarnation_id: residency.incarnation_id,
+                cell_epoch: cell.cell_epoch,
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn release_issue_instances(
+    orch: &Orchestrator,
+    project_id: &str,
+    job_ids: &[String],
+    branches: &[String],
+) -> Result<(), String> {
+    let fences = issue_instance_fences(orch.fleet.snapshot(), project_id, job_ids, branches);
+    let mut failures = Vec::new();
+    for fence in fences {
+        let holder = fence.holder.clone();
+        if let Err(diagnostic) = crate::fleet::residency::release(orch, &fence).await {
+            failures.push(format!("{holder:?}: {diagnostic}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "dev-instance teardown was not verified: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn live_branch_instance_fences(
+    snapshot: cairn_common::executor_protocol::FleetSnapshot,
+    project_id: &str,
+    branch: &str,
+) -> Vec<cairn_common::executor_protocol::ResidencyFence> {
+    snapshot
+        .cells
+        .into_iter()
+        .filter_map(|cell| {
+            let residency = cell.residency?;
+            let is_instance = matches!(residency.holder, ResidencyHolder::DevInstance { .. });
+            (cell.project_id == project_id
+                && is_instance
+                && residency.selector.as_deref() == Some(branch))
+            .then_some(cairn_common::executor_protocol::ResidencyFence {
+                holder: residency.holder,
+                incarnation_id: residency.incarnation_id,
+                cell_epoch: cell.cell_epoch,
+            })
+        })
+        .collect()
+}
+
+async fn notify_branch_owner(orch: &Orchestrator, project_id: &str, branch: &str, message: &str) {
+    let project_id = project_id.to_string();
+    let branch = branch.to_string();
+    let job_id = orch
+        .db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM jobs WHERE project_id = ?1 AND branch = ?2 ORDER BY created_at DESC LIMIT 1",
+                        params![project_id.as_str(), branch.as_str()],
+                    )
+                    .await?;
+                rows.next().await?.map(|row| row.text(0)).transpose()
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+    if let Some(run_id) = job_id
+        .as_deref()
+        .and_then(|job| latest_run_for_job(&orch.db.local, job))
+    {
+        if let Err(error) = queue_system_direct(orch, &run_id, message, DeliveryUrgency::Steer) {
+            log::error!(
+                "could not notify dev instance owner after synchronization failure: {error}"
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevInstanceResolution {
@@ -801,7 +1042,9 @@ pub async fn run_launch_session(
             ResidencyOperation::StartProcess {
                 fence: fence.clone(),
                 process_key: PROCESS_KEY.into(),
-                kind: ResidentProcessKind::DevInstance,
+                kind: ResidentProcessKind::DevInstance {
+                    source_terminal_session_id: request.source_terminal_session_id.clone(),
+                },
                 // The dev server is the thing that works, so it is the thing
                 // that is charged. Its memory and disk are the residency's
                 // footprint, declared at acquire.
@@ -1185,6 +1428,7 @@ mod tests {
             project_id: "proj-1".into(),
             selector: selector.map(str::to_string),
             checkout: checkout.map(|path| path.to_string_lossy().into_owned()),
+            source_terminal_session_id: None,
             seed: "empty".into(),
             force_copy: false,
         }
@@ -2027,6 +2271,56 @@ mod tests {
     }
 
     #[test]
+    fn branch_advance_targets_only_the_matching_live_dev_instance() {
+        let mut matching = cell_state(
+            "proj-1",
+            "/matching",
+            Some(ResidencyHolder::DevInstance {
+                instance_id: "proj-1:feature".into(),
+            }),
+        );
+        matching.residency.as_mut().unwrap().selector = Some("agent/PROJ-1-builder-0".into());
+        matching.cell_epoch = 7;
+
+        let mut other_branch = matching.clone();
+        other_branch.cell_id = "other-branch".into();
+        other_branch.residency.as_mut().unwrap().selector = Some("agent/PROJ-2-builder-0".into());
+
+        let mut terminal = matching.clone();
+        terminal.cell_id = "terminal".into();
+        terminal.residency.as_mut().unwrap().holder = ResidencyHolder::Job {
+            job_id: "job".into(),
+        };
+
+        let fences = live_branch_instance_fences(
+            cairn_common::executor_protocol::FleetSnapshot {
+                cells: vec![matching, other_branch, terminal],
+                ..Default::default()
+            },
+            "proj-1",
+            "agent/PROJ-1-builder-0",
+        );
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].cell_epoch, 7);
+        assert!(matches!(
+            fences[0].holder,
+            ResidencyHolder::DevInstance { .. }
+        ));
+    }
+
+    #[test]
+    fn both_agent_commit_verbs_sync_live_dev_instances_after_publication() {
+        let write = include_str!("mcp/handlers/write/mod.rs");
+        let run = include_str!("mcp/handlers/run/mod.rs");
+        for (verb, source) in [("write", write), ("run", run)] {
+            assert!(
+                source.contains("sync_live_branch_instances"),
+                "{verb} can advance a branch without refreshing its live dev instance"
+            );
+        }
+    }
+
+    #[test]
     fn readiness_marker_survives_chunk_boundaries() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut buffer = b"noise\nCAIRN_DEV_INSTANCE_READY={\"appUrl\":\"http://app\",".to_vec();
@@ -2043,5 +2337,75 @@ mod tests {
                 },
             }
         );
+    }
+    #[test]
+    fn issue_teardown_targets_completed_owner_and_preserves_active_owner() {
+        let mut completed = cell_state(
+            "proj-1",
+            "/completed",
+            Some(ResidencyHolder::DevInstance {
+                instance_id: "proj-1:completed".into(),
+            }),
+        );
+        completed.residency.as_mut().unwrap().owner_ref = Some(CellOwnerRef {
+            project_id: "proj-1".into(),
+            project_key: Some("PROJ".into()),
+            issue_number: Some(1),
+            job_id: Some("completed-job".into()),
+            execution_seq: Some(1),
+            node_kind: Some("builder".into()),
+        });
+        completed.residency.as_mut().unwrap().selector = Some("agent/PROJ-1-builder".into());
+
+        let mut active = completed.clone();
+        active.cell_id = "active".into();
+        active
+            .residency
+            .as_mut()
+            .unwrap()
+            .owner_ref
+            .as_mut()
+            .unwrap()
+            .job_id = Some("active-job".into());
+
+        let fences = issue_instance_fences(
+            cairn_common::executor_protocol::FleetSnapshot {
+                cells: vec![completed, active],
+                ..Default::default()
+            },
+            "proj-1",
+            &["completed-job".into()],
+            &["agent/PROJ-1-builder".into()],
+        );
+        assert_eq!(fences.len(), 1);
+        assert_eq!(
+            fences[0].holder,
+            ResidencyHolder::DevInstance {
+                instance_id: "proj-1:completed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn issue_teardown_sweeps_legacy_unattributed_instance_by_branch() {
+        let mut orphan = cell_state(
+            "proj-1",
+            "/orphan",
+            Some(ResidencyHolder::DevInstance {
+                instance_id: "proj-1:orphan".into(),
+            }),
+        );
+        orphan.residency.as_mut().unwrap().selector = Some("agent/PROJ-1-builder".into());
+
+        let fences = issue_instance_fences(
+            cairn_common::executor_protocol::FleetSnapshot {
+                cells: vec![orphan],
+                ..Default::default()
+            },
+            "proj-1",
+            &["completed-job".into()],
+            &["agent/PROJ-1-builder".into()],
+        );
+        assert_eq!(fences.len(), 1);
     }
 }

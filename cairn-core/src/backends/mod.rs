@@ -54,7 +54,7 @@ pub enum SessionStart {
 }
 
 impl SessionStart {
-    fn session_id(&self) -> &str {
+    pub(crate) fn session_id(&self) -> &str {
         match self {
             SessionStart::New { session_id }
             | SessionStart::Resume { session_id, .. }

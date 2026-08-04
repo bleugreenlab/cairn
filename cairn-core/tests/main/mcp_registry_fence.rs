@@ -156,7 +156,7 @@ async fn workspace_mcp_create_denied_by_fence_changes_nothing() {
     // A pre-existing settings.yaml whose exact bytes must survive a denied write.
     let path = settings_path(&temp);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let original = "# Cairn Workspace Settings\nbranchPrefix: keep-me\n";
+    let original = "# Cairn Workspace Settings\nlogLevel: verbose\n";
     std::fs::write(&path, original).unwrap();
 
     let result = handle_write(&orch, &create_request()).await;

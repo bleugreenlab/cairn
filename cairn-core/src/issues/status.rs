@@ -376,6 +376,21 @@ pub(crate) async fn resolve_terminal(
         }
     }
 
+    if let Err(error) =
+        crate::execution::teardown::release_issue_dev_instances(orch, issue_id).await
+    {
+        match on_stop_failure {
+            StopFailure::Refuses => {
+                return Err(ResolutionRefusal::Rejected(format!(
+                    "Refusing terminal resolution because dev-instance teardown was not verified: {error}"
+                )))
+            }
+            StopFailure::Escalates => log::warn!(
+                "Terminal resolution of issue {issue_id} could not verify dev-instance teardown ({error}); the resolution already landed elsewhere, so recording it and leaving startup reconciliation to retry"
+            ),
+        }
+    }
+
     let closed_sessions = crud::resolve(owning_db, &*orch.services.clock, issue_id, resolution)
         .await
         .map_err(|e| ResolutionRefusal::Rejected(e.to_string()))?;

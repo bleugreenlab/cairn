@@ -8,6 +8,30 @@
 
 use super::SandboxPolicy;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+pub(crate) fn current_process_is_confined() -> bool {
+    static CONFINED: OnceLock<bool> = OnceLock::new();
+    *CONFINED.get_or_init(|| {
+        // Seatbelt profiles are inherited and cannot be replaced. Applying an
+        // allow-default profile in a disposable child therefore succeeds only
+        // when the parent is unconfined; a child of a sandboxed process exits
+        // because sandbox_apply is not permitted.
+        //
+        // Do not use the private sandbox_check API here. On current macOS it
+        // reports the platform's baseline policy as well as an inherited
+        // process profile: even an ordinary shell receives "denied" for a
+        // file-create query it can perform successfully.
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_or(true, |status| !status.success())
+    })
+}
 use std::time::SystemTime;
 
 /// Generate the SBPL profile string for a policy.

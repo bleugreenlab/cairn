@@ -13,6 +13,16 @@ use crate::models::{ExecutionSnapshot, IssueKind, RecipeNodeType};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
 
+struct IssuePrSummary {
+    number: Option<i32>,
+    url: Option<String>,
+    status: String,
+    action: Option<String>,
+    actor_kind: Option<String>,
+    actor_identity: Option<String>,
+    resolved_at: Option<i64>,
+}
+
 async fn render_dependencies_block(conn: &cairn_db::turso::Connection, issue_id: &str) -> String {
     let dependencies = match relations::list_dependency_uris(conn, issue_id).await {
         Ok(dependencies) => dependencies,
@@ -237,13 +247,14 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     }
 
     // Get PR data for this issue (via merge_requests)
-    let pr: Option<(Option<i32>, Option<String>, String)> = match conn
+    let pr: Option<IssuePrSummary> = match conn
         .query(
             "
-            SELECT github_pr_number, github_pr_url, status
-            FROM merge_requests
-            WHERE issue_id = ?1
-            ORDER BY opened_at DESC
+            SELECT mr.github_pr_number, mr.github_pr_url, mr.status, a.action, a.actor_kind, a.actor_identity, a.created_at
+            FROM merge_requests mr
+            LEFT JOIN pr_resolution_attributions a ON a.id = (SELECT a2.id FROM pr_resolution_attributions a2 WHERE a2.merge_request_id = mr.id ORDER BY a2.created_at DESC LIMIT 1)
+            WHERE mr.issue_id = ?1
+            ORDER BY mr.opened_at DESC
             LIMIT 1
             ",
             (issue_id.as_str(),),
@@ -251,11 +262,15 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         .await
     {
         Ok(mut rows) => rows.next().await.ok().flatten().and_then(|row| {
-            Some((
-                row.opt_i64(0).ok()?.map(|value| value as i32),
-                row.opt_text(1).ok()?,
-                row.text(2).ok()?,
-            ))
+            Some(IssuePrSummary {
+                number: row.opt_i64(0).ok()?.map(|value| value as i32),
+                url: row.opt_text(1).ok()?,
+                status: row.text(2).ok()?,
+                action: row.opt_text(3).ok()?,
+                actor_kind: row.opt_text(4).ok()?,
+                actor_identity: row.opt_text(5).ok()?,
+                resolved_at: row.opt_i64(6).ok()?,
+            })
         }),
         Err(_) => None,
     };
@@ -263,10 +278,43 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     // A non-positive number is not a pull-request binding: rendering "PR: #0"
     // here is what let a phantom binding pass for a real pull request on the
     // issue's own summary. See `bound_pr_number` in `pr_data::actions::context`.
-    if let Some((Some(pr_number), Some(pr_url), pr_status)) =
-        pr.filter(|(number, _, _)| number.is_some_and(|number| number > 0))
+    if let Some(IssuePrSummary {
+        number: Some(pr_number),
+        url: Some(pr_url),
+        status: pr_status,
+        action,
+        actor_kind,
+        actor_identity,
+        resolved_at,
+    }) = pr.filter(|pr| pr.number.is_some_and(|number| number > 0))
     {
         output.push_str(&format!("PR: #{} ({}) {}\n", pr_number, pr_status, pr_url));
+        let action_matches_state = matches!(
+            (pr_status.as_str(), action.as_deref()),
+            ("merged", Some("merge")) | ("closed", Some("close"))
+        );
+        if action_matches_state {
+            let actor = match (actor_kind.as_deref(), actor_identity.as_deref()) {
+                (Some("operator-ui"), _) => "operator (UI)",
+                (Some("operator-cli"), _) => "operator (CLI)",
+                (_, Some(identity)) => identity,
+                (Some("unjournaled"), _) | (None, _) => "merge performed by an unjournaled path",
+                (Some(kind), _) => kind,
+            };
+            let verb = if pr_status == "merged" {
+                "Merged"
+            } else {
+                "Closed"
+            };
+            output.push_str(&format!(
+                "{verb} by {actor} at {}\n",
+                resolved_at
+                    .map(|at| chrono::DateTime::from_timestamp(at, 0)
+                        .map(|v| v.to_rfc3339())
+                        .unwrap_or_else(|| at.to_string()))
+                    .unwrap_or_else(|| "unknown time".to_string())
+            ));
+        }
     }
     output.push('\n');
 

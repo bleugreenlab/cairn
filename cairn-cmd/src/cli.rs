@@ -26,6 +26,43 @@ pub(crate) fn default_callback_url() -> String {
     format!("http://127.0.0.1:{}/api/mcp", port)
 }
 
+fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid observation response: {error}"))?;
+    if !value
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("manual check observation failed")
+            .to_string());
+    }
+    let observation = value
+        .get("observation")
+        .ok_or_else(|| "observation response did not contain an observation".to_string())?;
+    match observation.get("state").and_then(serde_json::Value::as_str) {
+        Some("queued" | "running" | "parked" | "complete" | "failed") => Ok(observation.clone()),
+        Some(state) => Err(format!(
+            "observation response contained unknown state {state:?}"
+        )),
+        None => Err("observation response did not contain a state".to_string()),
+    }
+}
+
+fn check_run_status_request(client: &CairnCmd, observation_handle: &str) -> CallbackRequest {
+    CallbackRequest {
+        thread_id: None,
+        cwd: client.cwd.to_string(),
+        run_id: client.run_id.as_ref().map(ToString::to_string),
+        tool: "check_run".to_string(),
+        payload: serde_json::json!({ "observationHandle": observation_handle }),
+        tool_use_id: None,
+    }
+}
+
 /// Callback URL for CLI use: explicit env var (set by the runner or a remote
 /// executor relay for in-run invocations), else the local runner transport port.
 fn cli_callback_url() -> String {
@@ -337,6 +374,15 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| incomplete_check_result("the commit"))?;
     let short_commit = commit.get(..12).unwrap_or(commit);
+    let disposition = result
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| incomplete_check_result("the disposition"))?;
+    let cache = if disposition == "cached" {
+        "cache hit: suite input tree, verdict environment, schema, and reusable green matched"
+    } else {
+        "cache miss: no reusable green matched suite input tree, verdict environment, and schema"
+    };
 
     // A run that produced no verdict is a fact about Cairn, never a red against
     // the tree, so it renders from its own named cause instead of a ✗ line.
@@ -362,22 +408,24 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
                  failed, so this says nothing about your change. Run the command again."
             ),
         };
-        return Ok((format!("{headline}\n{cause}"), false));
+        return Ok((format!("{cache}\n{headline}\n{cause}"), false));
     }
 
-    let disposition = result
-        .get("disposition")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| incomplete_check_result("the disposition"))?;
     let passed = result
         .get("passed")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| incomplete_check_result("the verdict"))?;
     let observation = match result
-        .get("observationId")
+        .get("observationRef")
         .and_then(serde_json::Value::as_str)
     {
-        Some(id) => format!("observation {id}"),
+        Some(reference) => {
+            let ran_at = result
+                .get("ranAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("time unavailable");
+            format!("{suite}@{short_commit} · {ran_at} · {reference}")
+        }
         None => "Cairn recorded no observation for this run".to_string(),
     };
     // Only a green is worth annotating: a red is never reusable evidence, and
@@ -401,7 +449,7 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     };
     Ok((
         format!(
-            "{} {suite} ({disposition}, {short_commit}) · {observation}{reuse}",
+            "{cache}\n{suite} {} on {short_commit} ({disposition}) · {observation}{reuse}",
             if passed { "✓" } else { "✗" }
         ),
         passed,
@@ -430,7 +478,80 @@ pub(crate) async fn run_cli_check(suites: Vec<String>, branch: Option<String>) -
             all_passed = false;
             continue;
         }
-        match render_check_run_response(&outcome.result) {
+        let start: serde_json::Value = match serde_json::from_str(&outcome.result) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("cairn check run: invalid start response: {error}");
+                all_passed = false;
+                continue;
+            }
+        };
+        let Some(handle) = start
+            .get("observationHandle")
+            .and_then(serde_json::Value::as_str)
+        else {
+            eprintln!("cairn check run: start response did not contain an observation handle");
+            all_passed = false;
+            continue;
+        };
+        let mut last_state = String::new();
+        let final_response = loop {
+            let status = client
+                .call_tauri_full(&check_run_status_request(&client, handle))
+                .await;
+            if !status.transport_ok {
+                eprintln!("cairn check run: {}", status.result.trim_end());
+                all_passed = false;
+                break None;
+            }
+            let observation = match parse_check_run_observation(&status.result) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    eprintln!("cairn check run: {error}");
+                    all_passed = false;
+                    break None;
+                }
+            };
+            let state = observation
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            if state != last_state && matches!(state, "queued" | "running" | "parked") {
+                let diagnostic = observation
+                    .get("diagnostic")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(state);
+                eprintln!("cairn check run: {diagnostic}");
+                last_state = state.to_string();
+            }
+            match state {
+                "complete" => {
+                    break Some(
+                        serde_json::json!({
+                            "ok": true,
+                            "result": observation.get("result").cloned().unwrap_or_default()
+                        })
+                        .to_string(),
+                    )
+                }
+                "failed" => {
+                    eprintln!(
+                        "cairn check run: {}",
+                        observation
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("manual check failed")
+                    );
+                    all_passed = false;
+                    break None;
+                }
+                _ => tokio::time::sleep(Duration::from_secs(1)).await,
+            }
+        };
+        let Some(final_response) = final_response else {
+            continue;
+        };
+        match render_check_run_response(&final_response) {
             Ok((summary, passed)) => {
                 println!("{summary}");
                 all_passed &= passed;
@@ -473,10 +594,7 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
         return false;
     }
     let client = build_cli_client(callback_url);
-    match client
-        .write(Parameters(input), rmcp::model::RequestMetaObject::default())
-        .await
-    {
+    match client.write_cli(Parameters(input)).await {
         Ok(result) => emit_tool_result(&result),
         Err(e) => {
             eprintln!("cairn write failed: {e}");
@@ -558,6 +676,40 @@ mod tests {
     }
 
     #[test]
+    fn check_run_status_request_carries_only_the_observation_handle() {
+        let client = CairnCmd::new_with_home_uri(
+            "http://localhost".into(),
+            "/repo".into(),
+            Some("run-1".into()),
+            None,
+            vec![],
+            None,
+        );
+        let request = check_run_status_request(&client, "manual-obs-1");
+        assert_eq!(request.tool, "check_run");
+        assert_eq!(
+            request.payload,
+            serde_json::json!({ "observationHandle": "manual-obs-1" })
+        );
+    }
+
+    #[test]
+    fn check_run_unknown_handle_is_terminal() {
+        let error = parse_check_run_observation(
+            r#"{"ok":false,"error":"manual check observation missing is unknown or expired"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown or expired"));
+    }
+
+    #[test]
+    fn check_run_unknown_state_is_terminal() {
+        let error = parse_check_run_observation(r#"{"ok":true,"observation":{"state":"mystery"}}"#)
+            .unwrap_err();
+        assert!(error.contains("unknown state"));
+    }
+
+    #[test]
     fn check_run_response_renders_hit_and_its_observation() {
         let rendered = render_check_run_response(
             &serde_json::json!({
@@ -569,7 +721,8 @@ mod tests {
                     "passed": true,
                     "reusable": true,
                     "environmentFingerprint": "env-local",
-                    "observationId": "obs-source"
+                    "observationRef": "cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w",
+                    "ranAt": "2026-08-03 11:12 PDT"
                 }
             })
             .to_string(),
@@ -578,7 +731,7 @@ mod tests {
         assert_eq!(
             rendered,
             (
-                "✓ rust-tests (cached, 1234567890ab) · observation obs-source".to_string(),
+                "cache hit: suite input tree, verdict environment, schema, and reusable green matched\nrust-tests ✓ on 1234567890ab (cached) · rust-tests@1234567890ab · 2026-08-03 11:12 PDT · cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w".to_string(),
                 true,
             )
         );
@@ -596,7 +749,8 @@ mod tests {
                     "passed": false,
                     "reusable": false,
                     "environmentFingerprint": "env-local",
-                    "observationId": "obs-failed"
+                    "observationRef": "cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w",
+                    "ranAt": "2026-08-03 11:12 PDT"
                 }
             })
             .to_string(),
@@ -604,7 +758,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             summary,
-            "✗ rust-tests (fresh, 1234567890ab) · observation obs-failed"
+            "cache miss: no reusable green matched suite input tree, verdict environment, and schema\nrust-tests ✗ on 1234567890ab (fresh) · rust-tests@1234567890ab · 2026-08-03 11:12 PDT · cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w"
         );
         assert!(
             !passed,
@@ -628,14 +782,16 @@ mod tests {
                     "passed": true,
                     "reusable": false,
                     "environmentFingerprint": "",
-                    "observationId": "obs-remote"
+                    "observationRef": "cairn://p/CAIRN/check-observations/782ri3MzIRCrS7e-3avq_w",
+                    "ranAt": "2026-08-03 11:12 PDT"
                 }
             })
             .to_string(),
         )
         .unwrap();
         assert!(passed, "a remote green is still a green");
-        assert!(summary.starts_with("✓ rust-tests (fresh, 1234567890ab) · observation obs-remote"));
+        assert!(summary.contains("rust-tests ✓ on 1234567890ab (fresh) · rust-tests@1234567890ab"));
+        assert!(!summary.contains("obs-remote"));
         assert!(
             summary.contains("another machine ran this"),
             "an unreusable green must say why: {summary}"

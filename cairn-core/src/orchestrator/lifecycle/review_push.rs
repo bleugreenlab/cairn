@@ -507,20 +507,20 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) -> usize {
     candidates.len()
 }
 
-/// Re-arm at most one dormant review wave whose latest attempt ended because
-/// fleet capacity was unavailable. The one-row limit is deliberate pacing: a
-/// capacity transition can free many stranded waves at once, and releasing all
-/// of them would recreate the contention that stranded them.
+/// Re-arm at most one dormant review wave whose latest attempt ended because of
+/// a retryable infrastructure or capacity failure. The one-row limit is
+/// deliberate pacing: recovery can free many stranded waves at once, and
+/// releasing all of them would recreate the contention that stranded them.
 ///
 /// The durable per-check infrastructure streak remains the retry authority. A
 /// candidate at the bound is excluded here, and the execution claim checks the
 /// same bound atomically before a command can run, so this cadence cannot open a
 /// path around the circuit breaker.
-pub async fn rearm_one_capacity_failed_review(orch: &Orchestrator) -> bool {
-    let Some(job_id) = (match capacity_rearm_candidate_job(orch).await {
+pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
+    let Some(job_id) = (match bounded_rearm_candidate_job(orch).await {
         Ok(candidate) => candidate,
         Err(error) => {
-            log::warn!("review-checks capacity re-arm: candidate lookup failed: {error}");
+            log::warn!("review-checks bounded re-arm: candidate lookup failed: {error}");
             return false;
         }
     }) else {
@@ -528,7 +528,7 @@ pub async fn rearm_one_capacity_failed_review(orch: &Orchestrator) -> bool {
     };
 
     log::info!(
-        "review-checks capacity re-arm: re-spawning one dormant wave for job {}",
+        "review-checks bounded re-arm: re-spawning one dormant wave for job {}",
         &job_id[..job_id.len().min(8)]
     );
     spawn_turn_end_checks(orch, &job_id);
@@ -536,29 +536,29 @@ pub async fn rearm_one_capacity_failed_review(orch: &Orchestrator) -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct CapacityRearmCandidate {
+pub(super) struct BoundedRearmCandidate {
     pub(super) job_id: String,
     tree_hash: String,
     ran_at: i64,
 }
 
-pub(super) async fn capacity_rearm_candidate_job(
+pub(super) async fn bounded_rearm_candidate_job(
     orch: &Orchestrator,
 ) -> Result<Option<String>, String> {
-    for candidate in capacity_rearm_candidates(&orch.db).await? {
-        if capacity_candidate_matches_current_tree(orch, &candidate).await? {
+    for candidate in bounded_rearm_candidates(&orch.db).await? {
+        if bounded_candidate_matches_current_tree(orch, &candidate).await? {
             return Ok(Some(candidate.job_id));
         }
     }
     Ok(None)
 }
 
-pub(super) async fn capacity_rearm_candidates(
+pub(super) async fn bounded_rearm_candidates(
     dbs: &crate::db::DbState,
-) -> Result<Vec<CapacityRearmCandidate>, String> {
+) -> Result<Vec<BoundedRearmCandidate>, String> {
     let mut candidates = Vec::new();
     for db in dbs.all_dbs().await {
-        candidates.extend(capacity_rearm_candidates_in_db(&db).await?);
+        candidates.extend(bounded_rearm_candidates_in_db(&db).await?);
     }
     candidates.sort_by(|left, right| {
         left.ran_at
@@ -568,9 +568,9 @@ pub(super) async fn capacity_rearm_candidates(
     Ok(candidates)
 }
 
-async fn capacity_rearm_candidates_in_db(
+async fn bounded_rearm_candidates_in_db(
     db: &crate::storage::LocalDb,
-) -> Result<Vec<CapacityRearmCandidate>, String> {
+) -> Result<Vec<BoundedRearmCandidate>, String> {
     db.read(|conn| {
         Box::pin(async move {
             let mut rows = conn
@@ -579,7 +579,7 @@ async fn capacity_rearm_candidates_in_db(
                        FROM check_result_cache c
                        JOIN jobs j ON j.id = c.job_id
                        JOIN issues i ON i.id = j.issue_id
-                      WHERE c.failure_kind = 'capacity'
+                      WHERE c.failure_kind IN ('capacity', 'infrastructure')
                         AND c.infra_failure_streak < ?1
                         AND i.status NOT IN ('merged', 'closed')
                         AND j.status IN ('idle', 'complete', 'failed', 'blocked')
@@ -608,7 +608,7 @@ async fn capacity_rearm_candidates_in_db(
                 .await?;
             let mut candidates = Vec::new();
             while let Some(row) = rows.next().await? {
-                candidates.push(CapacityRearmCandidate {
+                candidates.push(BoundedRearmCandidate {
                     job_id: row.text(0)?,
                     tree_hash: row.text(1)?,
                     ran_at: row.i64(2)?,
@@ -621,9 +621,9 @@ async fn capacity_rearm_candidates_in_db(
     .map_err(|error| error.to_string())
 }
 
-async fn capacity_candidate_matches_current_tree(
+async fn bounded_candidate_matches_current_tree(
     orch: &Orchestrator,
-    candidate: &CapacityRearmCandidate,
+    candidate: &BoundedRearmCandidate,
 ) -> Result<bool, String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, &candidate.job_id)
         .await
@@ -645,7 +645,7 @@ async fn capacity_candidate_matches_current_tree(
             Ok(commit) => commit,
             Err(error) => {
                 log::warn!(
-                    "review-checks capacity re-arm: branch for job {} is unresolved ({error})",
+                    "review-checks bounded re-arm: branch for job {} is unresolved ({error})",
                     &candidate.job_id[..candidate.job_id.len().min(8)]
                 );
                 return Ok(false);

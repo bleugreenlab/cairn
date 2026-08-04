@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 static IMESSAGE_RUNTIME: OnceLock<Mutex<Option<Arc<imessage::IMessageProvider>>>> = OnceLock::new();
+static IMESSAGE_ROUTER_BLOCKER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static IMESSAGE_ADMISSION_STATE: OnceLock<Mutex<Option<(&'static str, String)>>> = OnceLock::new();
+static IMESSAGE_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
 const ADMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const ADMISSION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -15,6 +18,61 @@ struct AdmissionFailureReporter {
     last_error: Option<String>,
     last_reported_at: Option<Instant>,
     suppressed: u64,
+}
+
+fn admission_state_slot() -> &'static Mutex<Option<(&'static str, String)>> {
+    IMESSAGE_ADMISSION_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn set_admission_state(state: Option<(&'static str, String)>) {
+    *admission_state_slot()
+        .lock()
+        .expect("channel admission state lock poisoned") = state;
+}
+
+fn clear_admission_state() {
+    set_admission_state(None);
+}
+
+pub fn retry_admission() {
+    IMESSAGE_ADMISSION_WAKE
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_waiters();
+}
+
+fn router_blocker_slot() -> &'static Mutex<Option<String>> {
+    IMESSAGE_ROUTER_BLOCKER.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn set_router_blocker(error: Option<String>) {
+    *router_blocker_slot()
+        .lock()
+        .expect("channel router blocker lock poisoned") = error;
+}
+
+/// Why an outbound message exists. Operator responses and standing subscriptions
+/// are explicit operator intent and must never be treated as attention pushes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutboundInitiator {
+    OperatorInbound,
+    OperatorSubscription,
+    CairnPush,
+}
+
+impl OutboundInitiator {
+    pub fn is_presence_aware(self) -> bool {
+        matches!(self, Self::CairnPush)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedQuestionMessage {
+    pub conversation: String,
+    pub provider_guid: String,
+    pub caption_guid: Option<String>,
+    pub sent_at: i64,
+    pub receipt: String,
 }
 
 impl AdmissionFailureReporter {
@@ -40,21 +98,22 @@ impl AdmissionFailureReporter {
     }
 }
 
-async fn supervise_admission<L, C, F, Fut, R>(
+async fn supervise_admission<L, C, F, Fut, R, W, WFut>(
     mut load: L,
     mut run: F,
     mut report: R,
-    retry_interval: Duration,
+    mut wait_to_retry: W,
 ) where
     L: FnMut() -> Option<C>,
     F: FnMut(C) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
     R: FnMut(String),
+    W: FnMut() -> WFut,
+    WFut: std::future::Future<Output = ()>,
 {
     let mut failures = AdmissionFailureReporter::default();
     loop {
         let Some(config) = load() else {
-            tokio::time::sleep(retry_interval).await;
             return;
         };
         match run(config).await {
@@ -63,7 +122,7 @@ async fn supervise_admission<L, C, F, Fut, R>(
                 if let Some(message) = failures.record(Instant::now(), &error) {
                     report(message);
                 }
-                tokio::time::sleep(retry_interval).await;
+                wait_to_retry().await;
             }
         }
     }
@@ -85,6 +144,10 @@ pub struct ChannelRuntimeStatus {
     pub provider: &'static str,
     pub state: &'static str,
     pub detail: Option<String>,
+    pub feed_state: &'static str,
+    pub watch_started_at: Option<i64>,
+    pub last_receipt_at: Option<i64>,
+    pub last_receipt_rowid: Option<i64>,
     pub unsolicited_inbound: Vec<ChannelInboundSummary>,
 }
 
@@ -97,20 +160,48 @@ pub struct ChannelInboundSummary {
     pub received_at: i64,
 }
 
+fn classify_runtime_health(
+    health: Option<ChannelHealth>,
+    router_blocker: Option<String>,
+) -> (&'static str, Option<String>) {
+    match router_blocker {
+        Some(error) => (
+            "dead",
+            Some(format!("blocked: backlog seal failed: {error}")),
+        ),
+        None => match health {
+            Some(ChannelHealth::Ready) => ("bridgeUp", None),
+            Some(ChannelHealth::Degraded { reason }) => ("degraded", Some(reason)),
+            Some(ChannelHealth::Unavailable { reason }) if reason.contains("offline") => {
+                ("executorOffline", Some(reason))
+            }
+            Some(ChannelHealth::Unavailable { reason }) => ("dead", Some(reason)),
+            None => ("dead", Some("channel is not running".into())),
+        },
+    }
+}
+
 pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> ChannelRuntimeStatus {
-    let health = runtime_slot()
+    let runtime = runtime_slot()
         .lock()
         .expect("channel runtime lock poisoned")
-        .as_ref()
-        .map(|provider| provider.health());
-    let (state, detail) = match health {
-        Some(ChannelHealth::Ready) => ("bridgeUp", None),
-        Some(ChannelHealth::Degraded { reason }) => ("degraded", Some(reason)),
-        Some(ChannelHealth::Unavailable { reason }) if reason.contains("offline") => {
-            ("executorOffline", Some(reason))
-        }
-        Some(ChannelHealth::Unavailable { reason }) => ("dead", Some(reason)),
-        None => ("dead", Some("channel is not running".into())),
+        .clone();
+    let health = runtime.as_ref().map(|provider| provider.health());
+    let liveness = runtime.as_ref().map(|provider| provider.watch_liveness());
+    let router_blocker = router_blocker_slot()
+        .lock()
+        .expect("channel router blocker lock poisoned")
+        .clone();
+    let admission = admission_state_slot()
+        .lock()
+        .expect("channel admission state lock poisoned")
+        .clone();
+    let (state, detail) = if runtime.is_none() {
+        admission
+            .map(|(state, detail)| (state, Some(detail)))
+            .unwrap_or_else(|| classify_runtime_health(health, router_blocker))
+    } else {
+        classify_runtime_health(health, router_blocker)
     };
     let unsolicited_inbound = ledger::list_inbound(&orch.db.local, "imessage", 50)
         .await
@@ -127,7 +218,29 @@ pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> Channel
         provider: "imessage",
         state,
         detail,
+        feed_state: feed_state(liveness, chrono::Utc::now().timestamp()),
+        watch_started_at: liveness.and_then(|value| value.started_at),
+        last_receipt_at: liveness.and_then(|value| value.last_receipt_at),
+        last_receipt_rowid: liveness.and_then(|value| value.last_receipt_rowid),
         unsolicited_inbound,
+    }
+}
+
+const RECEIPT_RECENCY_SECONDS: i64 = 5 * 60;
+
+fn feed_state(liveness: Option<imessage::WatchLiveness>, now: i64) -> &'static str {
+    let Some(liveness) = liveness else {
+        return "stopped";
+    };
+    if !liveness.active {
+        return "stopped";
+    }
+    match (liveness.started_at, liveness.last_receipt_at) {
+        (_, Some(receipt)) if now.saturating_sub(receipt) <= RECEIPT_RECENCY_SECONDS => "receiving",
+        (Some(started), None) if now.saturating_sub(started) <= RECEIPT_RECENCY_SECONDS => {
+            "connected"
+        }
+        _ => "silent",
     }
 }
 
@@ -143,6 +256,20 @@ pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
                 .channels
                 .imessage;
             if config.enabled && !config.to.trim().is_empty() {
+                if let Some(name) = config.executor.as_deref() {
+                    if !orch.fleet.named_executor_is_connected(name) {
+                        set_admission_state(Some((
+                            "waitingForExecutor",
+                            format!("Waiting for executor `{name}` to attach"),
+                        )));
+                        tokio::select! {
+                            () = orch.fleet.wait_for_named_executor(name) => {},
+                            () = IMESSAGE_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                            () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {},
+                        }
+                        continue;
+                    }
+                }
                 supervise_admission(
                     || {
                         let config = crate::config::settings::load_settings(&orch.config_dir)
@@ -151,11 +278,38 @@ pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
                         (config.enabled && !config.to.trim().is_empty()).then_some(config)
                     },
                     |config| spawn_imessage(orch.clone(), config),
-                    |report| log::error!("{report}"),
-                    ADMISSION_RETRY_INTERVAL,
+                    |report| {
+                        set_admission_state(Some(("stopped", report.clone())));
+                        log::error!("{report}")
+                    },
+                    || {
+                        let orch = orch.clone();
+                        async move {
+                            let executor = crate::config::settings::load_settings(&orch.config_dir)
+                                .channels
+                                .imessage
+                                .executor;
+                            if let Some(name) = executor.as_deref() {
+                                if !orch.fleet.named_executor_is_connected(name) {
+                                    tokio::select! {
+                                        () = orch.fleet.wait_for_named_executor(name) => {},
+                                        () = IMESSAGE_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                                        () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {},
+                                    }
+                                    return;
+                                }
+                            }
+                            tokio::select! {
+                                () = IMESSAGE_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                                () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {},
+                            }
+                        }
+                    },
                 )
                 .await;
+                clear_admission_state();
             } else {
+                clear_admission_state();
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -208,6 +362,8 @@ async fn spawn_imessage(
         executor.clone(),
         config.allow_from.clone(),
     ));
+    set_admission_state(None);
+    set_router_blocker(None);
     *runtime_slot()
         .lock()
         .expect("channel runtime lock poisoned") = Some(provider.clone());
@@ -279,12 +435,13 @@ async fn spawn_imessage(
             {
                 *runtime = None;
             }
+            set_router_blocker(None);
             return Ok(());
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelCapabilities {
     pub structured_asks: bool,
@@ -322,6 +479,7 @@ pub enum OutboundAsk {
 pub struct OutboundMessage {
     pub intent_id: String,
     pub conversation: String,
+    pub initiated_by: OutboundInitiator,
     pub ask: OutboundAsk,
     pub context_header: String,
 }
@@ -341,6 +499,12 @@ pub enum InboundEvent {
         sender: String,
         option_id: String,
         option_text: String,
+        selected: bool,
+    },
+    Selections {
+        bound_guid: String,
+        sender: String,
+        changes: Vec<PollSelectionChange>,
     },
     Reply {
         bound_guid: String,
@@ -351,6 +515,14 @@ pub enum InboundEvent {
         sender: String,
         text: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PollSelectionChange {
+    pub option_id: String,
+    pub option_text: String,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +544,9 @@ pub trait ChannelProvider: Send + Sync {
     /// must never suppress one.
     async fn operator_presence(&self) -> OperatorPresence {
         OperatorPresence::Away
+    }
+    async fn cleanup_question(&self, _message: &ResolvedQuestionMessage) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -440,7 +615,7 @@ mod tests {
                 let reports = reports.clone();
                 move |report| reports.lock().unwrap().push(report)
             },
-            Duration::from_millis(10),
+            || tokio::time::sleep(Duration::from_millis(10)),
         )
         .await;
 
@@ -452,6 +627,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn executor_attachment_retries_without_waiting_for_timer_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attached = Arc::new(tokio::sync::Notify::new());
+        let (attempted_tx, mut attempted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(supervise_admission(
+            || Some(()),
+            {
+                let attempts = attempts.clone();
+                move |()| {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let attempted_tx = attempted_tx.clone();
+                    async move {
+                        attempted_tx.send(()).unwrap();
+                        if attempt == 0 {
+                            Err("executor disconnected".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            },
+            |_| {},
+            {
+                let attached = attached.clone();
+                move || {
+                    let attached = attached.clone();
+                    async move {
+                        tokio::select! {
+                            () = attached.notified() => {},
+                            () = tokio::time::sleep(Duration::from_secs(30)) => {
+                                panic!("timer fallback expired before executor attachment")
+                            },
+                        }
+                    }
+                }
+            },
+        ));
+        attempted_rx.recv().await.unwrap();
+        attached.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("attachment should wake admission immediately")
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
     #[tokio::test]
     async fn disabling_channel_stops_retrying_stale_admission_config() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -471,7 +693,7 @@ mod tests {
                 }
             },
             |_| {},
-            Duration::from_millis(1),
+            || tokio::time::sleep(Duration::from_millis(1)),
         )
         .await;
 
@@ -499,6 +721,71 @@ mod tests {
                 .record(start + ADMISSION_REPORT_INTERVAL, "executor disconnected")
                 .as_deref(),
             Some("executor disconnected (2 identical attempts suppressed)")
+        );
+    }
+
+    #[test]
+    fn not_runnable_transition_clears_waiting_or_stopped_admission_state() {
+        for state in ["waitingForExecutor", "stopped"] {
+            set_admission_state(Some((state, "not runnable".into())));
+            clear_admission_state();
+            assert!(admission_state_slot().lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn backlog_seal_failure_overrides_ready_bridge_health() {
+        let (state, detail) = classify_runtime_health(
+            Some(ChannelHealth::Ready),
+            Some("database unavailable".into()),
+        );
+
+        assert_eq!(state, "dead");
+        assert_eq!(
+            detail.as_deref(),
+            Some("blocked: backlog seal failed: database unavailable")
+        );
+    }
+
+    #[test]
+    fn feed_state_never_promotes_bridge_health_to_receipt_health() {
+        let now = 1_000;
+        assert_eq!(feed_state(None, now), "stopped");
+        assert_eq!(
+            feed_state(
+                Some(imessage::WatchLiveness {
+                    active: true,
+                    started_at: Some(now - 10),
+                    last_receipt_at: None,
+                    last_receipt_rowid: None,
+                }),
+                now,
+            ),
+            "connected"
+        );
+        assert_eq!(
+            feed_state(
+                Some(imessage::WatchLiveness {
+                    active: true,
+                    started_at: Some(now - 600),
+                    last_receipt_at: Some(now - 10),
+                    last_receipt_rowid: Some(42),
+                }),
+                now,
+            ),
+            "receiving"
+        );
+        assert_eq!(
+            feed_state(
+                Some(imessage::WatchLiveness {
+                    active: true,
+                    started_at: Some(now - 600),
+                    last_receipt_at: Some(now - 301),
+                    last_receipt_rowid: Some(42),
+                }),
+                now,
+            ),
+            "silent"
         );
     }
 

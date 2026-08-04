@@ -204,14 +204,14 @@ mod tests {
         let ws = TempDir::new().unwrap();
         std::fs::write(
             super::super::settings::get_settings_path(ws.path()),
-            "branchPrefix: custom\n",
+            "logLevel: verbose\n",
         )
         .unwrap();
         set_active_pdf(ws.path(), Some("bmd")).unwrap();
         assert_eq!(resolve_active_pdf(ws.path()), PdfProviderId::Bmd);
         let raw =
             std::fs::read_to_string(super::super::settings::get_settings_path(ws.path())).unwrap();
-        assert!(raw.contains("branchPrefix: custom"), "{raw}");
+        assert!(raw.contains("logLevel: verbose"), "{raw}");
         assert!(raw.contains("activePdf: bmd"), "{raw}");
     }
 }

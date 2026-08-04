@@ -28,7 +28,7 @@ pub(crate) use finalize::memory_review_turn_ended;
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state};
 pub(crate) use review_push::detach_onto_runtime;
 pub use review_push::{
-    create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_capacity_failed_review,
+    create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
 #[cfg(test)]

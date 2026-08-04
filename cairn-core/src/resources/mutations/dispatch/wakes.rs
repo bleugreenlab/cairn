@@ -79,11 +79,30 @@ pub(super) async fn dispatch(
                     )
                 }
             } else if let Some(value) = payload.get("mute") {
-                let filter = parse_wake_filter(index, item, value, "mute")?;
+                let filter = normalize_checks_filter(
+                    orch,
+                    index,
+                    item,
+                    parse_wake_filter(index, item, value, "mute")?,
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                )
+                .await?;
                 let until = payload
                     .get("until")
                     .map(|value| parse_wake_filter(index, item, value, "until"))
                     .transpose()?;
+                let until = match until {
+                    Some(filter) => Some(
+                        normalize_checks_filter(
+                            orch, index, item, filter, project, *number, *exec_seq, node_id,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
                 if dry_run {
                     format!("Would mute wake: {} {:?}", filter.kind, filter.reference)
                 } else {
@@ -129,7 +148,17 @@ pub(super) async fn dispatch(
             let value = payload
                 .get("unmute")
                 .ok_or_else(|| build_failure(index, item, "payload.unmute is required"))?;
-            let filter = parse_wake_filter(index, item, value, "unmute")?;
+            let filter = normalize_checks_filter(
+                orch,
+                index,
+                item,
+                parse_wake_filter(index, item, value, "unmute")?,
+                project,
+                *number,
+                *exec_seq,
+                node_id,
+            )
+            .await?;
             let job_id = crate::resources::node::resolve_node_or_task_job_id(
                 &orch.db.local,
                 project,
@@ -209,7 +238,39 @@ pub(super) async fn dispatch(
     Ok(Some(summary))
 }
 
-#[derive(Debug)]
+#[allow(clippy::too_many_arguments)]
+async fn normalize_checks_filter(
+    orch: &Orchestrator,
+    index: usize,
+    item: &ChangeItem,
+    mut filter: WakeFilterPayload,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+) -> ResourceMutationResult<WakeFilterPayload> {
+    if filter.kind != "checks" {
+        return Ok(filter);
+    }
+    if filter.suite.is_some() {
+        return Err(build_failure(
+            index,
+            item,
+            "a checks wake watches a whole node and does not accept suite",
+        ));
+    }
+    let home = cairn_common::uri::build_node_uri(project, number, exec_seq, node_id);
+    let reference = filter.reference.as_deref().unwrap_or("cairn:~/checks");
+    let target =
+        crate::execution::checks_settlement::resolve_checks_target(orch, reference, Some(&home))
+            .await
+            .map_err(|error| build_failure(index, item, error))?;
+    filter.kind = "condition".to_string();
+    filter.reference = Some(target.uri);
+    Ok(filter)
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct WakeFilterPayload {
     pub(super) kind: String,
     pub(super) reference: Option<String>,
@@ -333,23 +394,21 @@ async fn subscribe_checks_wake(
     exec_seq: i32,
     node_id: &str,
 ) -> ResourceMutationResult<String> {
-    if filter.suite.is_some() {
-        return Err(build_failure(
-            index,
-            item,
-            "a checks wake watches a whole node and does not accept suite; \
-             for one suite use run({commands:[{waitFor:{kind:\"checks\",ref:\"…/checks\",on:\"verdict\",suite:\"…\"}}]})",
-        ));
-    }
-    // An omitted ref means this node's own lanes, which is the commonest form of
-    // this subscription and reads better than making every caller spell out its
-    // own URI.
-    let home = cairn_common::uri::build_node_uri(project, number, exec_seq, node_id);
-    let reference = filter.reference.as_deref().unwrap_or("cairn:~/checks");
-    let target =
-        crate::execution::checks_settlement::resolve_checks_target(orch, reference, Some(&home))
-            .await
-            .map_err(|error| build_failure(index, item, error))?;
+    let filter = normalize_checks_filter(
+        orch,
+        index,
+        item,
+        filter.clone(),
+        project,
+        number,
+        exec_seq,
+        node_id,
+    )
+    .await?;
+    let reference = filter.reference.as_deref().expect("checks alias has a URI");
+    let target = crate::execution::checks_settlement::resolve_checks_target(orch, reference, None)
+        .await
+        .map_err(|error| build_failure(index, item, error))?;
 
     if dry_run {
         return Ok(format!("Would subscribe checks wake: {}", target.uri));

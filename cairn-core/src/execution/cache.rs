@@ -36,6 +36,10 @@ impl CheckResultIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecordedCheckObservation {
     pub id: String,
+    pub public_handle: String,
+    /// When the source observation actually ran (Unix seconds). Cached aliases
+    /// carry the source instant so every citation describes the same evidence.
+    pub ran_at: i64,
     /// The environment identity this observation and its commit alias are keyed
     /// by. Empty for legacy remote executors, whose rows remain addressable by id
     /// for diagnosis but cannot be reused.
@@ -968,6 +972,7 @@ pub(crate) struct CheckTestResultRow {
 #[derive(Debug, Clone)]
 pub(crate) struct FreshCheckObservationWrite {
     pub id: String,
+    pub public_handle: String,
     pub project_id: String,
     /// The commit whose content this execution evaluated.
     pub commit_sha: String,
@@ -1160,9 +1165,9 @@ pub(crate) fn record_fresh_check_observation(
                         executor_device_id, executor_connection_generation, executor_slot_id,
                         executor_lease_epoch, executor_started_at_unix_ms,
                         executor_finished_at_unix_ms, runner_build_id, toolchain_fingerprint,
-                        output_tail, defined_by_commit_sha
+                        output_tail, defined_by_commit_sha, public_handle
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
-                              ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)
+                              ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)
                        ON CONFLICT(id) DO NOTHING",
                     params![
                         observation.id.as_str(), observation.project_id.as_str(),
@@ -1180,7 +1185,7 @@ pub(crate) fn record_fresh_check_observation(
                         observation.executor_lease_epoch, observation.executor_started_at_unix_ms,
                         observation.executor_finished_at_unix_ms, observation.runner_build_id.as_deref(),
                         observation.toolchain_fingerprint.as_deref(), observation.output_tail.as_str(),
-                        observation.defined_by_commit_sha.as_str()
+                        observation.defined_by_commit_sha.as_str(), observation.public_handle.as_str()
                     ],
                 ).await?;
                 for test in &observation.tests {
@@ -1407,6 +1412,97 @@ pub(crate) fn get_check_result_observation(
                 Ok(Some(projection))
             })
         }).await.map_err(|e| format!("Failed to load check observation: {e}"))
+    })
+}
+
+/// Load one immutable observation by its internal key. Public callers decode an
+/// opaque permalink handle before crossing this boundary; the UUID never renders.
+pub(crate) fn get_check_result_observation_by_handle(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    public_handle: &str,
+) -> Result<Option<CheckResultObservationProjection>, String> {
+    let keys = (project_id.to_string(), public_handle.to_string());
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let keys = keys.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(
+                    "SELECT o.id,o.project_id,o.commit_sha,o.tree_hash,o.check_name,o.input_hash,
+                            o.environment_fingerprint,o.exit_code,o.verdict,o.failure_kind,o.complete,
+                            o.reusable,o.non_reusable_reason,o.parser_version,o.result_schema_version,
+                            o.ran_at,o.duration_ms,o.job_id,o.run_id,o.cadence,o.executor_id,
+                            o.executor_device_id,o.executor_connection_generation,o.executor_slot_id,
+                            o.executor_lease_epoch,o.executor_started_at_unix_ms,
+                            o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
+                            o.output_tail,o.defined_by_commit_sha
+                       FROM check_result_observations o
+                      WHERE o.project_id=?1 AND o.public_handle=?2",
+                    params![keys.0.as_str(), keys.1.as_str()],
+                ).await?;
+                let Some(row) = rows.next().await? else { return Ok(None); };
+                let id = row.text(0)?;
+                let mut projection = CheckResultObservationProjection {
+                    disposition: "fresh".into(),
+                    defined_by_commit_sha: row.opt_text(30)?,
+                    source_defined_by_commit_sha: row.opt_text(30)?,
+                    evaluated_tree_hash: row.text(3)?, evaluated_input_hash: row.text(5)?,
+                    evaluated_at: row.i64(15)?, observation_id: id.clone(), project_id: row.text(1)?,
+                    source_commit_sha: row.text(2)?, source_tree_hash: row.text(3)?,
+                    check_name: row.text(4)?, source_input_hash: row.text(5)?,
+                    environment_fingerprint: row.text(6)?, exit_code: row.i64(7)? as i32,
+                    verdict: row.text(8)?, failure_kind: row.opt_text(9)?, complete: row.i64(10)? != 0,
+                    reusable: row.i64(11)? != 0, non_reusable_reason: row.opt_text(12)?,
+                    parser_version: row.i64(13)?, result_schema_version: row.i64(14)?,
+                    ran_at: row.i64(15)?, duration_ms: row.i64(16)?, job_id: row.opt_text(17)?,
+                    run_id: row.opt_text(18)?, cadence: row.text(19)?, executor_id: row.opt_text(20)?,
+                    executor_device_id: row.opt_text(21)?, executor_connection_generation: row.opt_i64(22)?,
+                    executor_cell_id: row.opt_text(23)?, executor_lease_epoch: row.opt_i64(24)?,
+                    executor_started_at_unix_ms: row.opt_i64(25)?, executor_finished_at_unix_ms: row.opt_i64(26)?,
+                    runner_build_id: row.opt_text(27)?, toolchain_fingerprint: row.opt_text(28)?,
+                    output_tail: row.text(29)?, tests: Vec::new(), test_total: 0, test_offset: 0,
+                };
+                let mut tests = conn.query(
+                    "SELECT test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,
+                            declaration_source,flaky FROM check_test_results
+                      WHERE observation_id=?1 ORDER BY test_id ASC",
+                    params![id.as_str()],
+                ).await?;
+                while let Some(test) = tests.next().await? {
+                    projection.tests.push(CheckTestResultRow {
+                        test_id: test.text(0)?, status: test.text(1)?, duration_ms: test.opt_i64(2)?,
+                        attempt_count: test.opt_i64(3)?, failure_excerpt: test.opt_text(4)?,
+                        skip_reason: test.opt_text(5)?, declaration_source: test.opt_text(6)?,
+                        flaky: test.i64(7)? != 0,
+                    });
+                }
+                projection.test_total = projection.tests.len();
+                Ok(Some(projection))
+            })
+        }).await.map_err(|e| format!("Failed to load check observation: {e}"))
+    })
+}
+
+pub(crate) fn get_check_observation_public_handle(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    observation_id: &str,
+) -> Result<Option<String>, String> {
+    let keys = (project_id.to_string(), observation_id.to_string());
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let keys = keys.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(
+                    "SELECT public_handle FROM check_result_observations WHERE project_id=?1 AND id=?2",
+                    params![keys.0.as_str(), keys.1.as_str()],
+                ).await?;
+                match rows.next().await? {
+                    Some(row) => Ok(row.opt_text(0)?),
+                    None => Ok(None),
+                }
+            })
+        }).await.map_err(|e| format!("Failed to load check observation handle: {e}"))
     })
 }
 
@@ -1649,6 +1745,7 @@ mod tests {
     fn observation(id: &str, commit: &str, environment: &str) -> FreshCheckObservationWrite {
         FreshCheckObservationWrite {
             id: id.to_string(),
+            public_handle: format!("{id:0<24}"),
             project_id: "project-a".to_string(),
             commit_sha: commit.to_string(),
             defined_by_commit_sha: commit.to_string(),
@@ -2179,8 +2276,9 @@ mod tests {
     #[tokio::test]
     async fn fresh_observation_records_tests_alias_and_hot_identity_atomically() {
         let db = cache_db().await;
-        record_fresh_check_observation(db.clone(), observation("obs-1", "commit-1", "env-a"))
-            .unwrap();
+        let observation = observation("obs-1", "commit-1", "env-a");
+        let public_handle = observation.public_handle.clone();
+        record_fresh_check_observation(db.clone(), observation).unwrap();
         let loaded = get_check_result_observation(
             db.clone(),
             "project-a",
@@ -2197,6 +2295,11 @@ mod tests {
         .expect("fresh alias");
         assert_eq!(loaded.disposition, "fresh");
         assert_eq!(loaded.observation_id, "obs-1");
+        let permalink =
+            get_check_result_observation_by_handle(db.clone(), "project-a", &public_handle)
+                .unwrap()
+                .expect("the public handle resolves the exact immutable row");
+        assert_eq!(permalink.observation_id, "obs-1");
         assert_eq!(loaded.tests.len(), 1);
         assert_eq!(loaded.tests[0].test_id, "crate::passes");
         assert_eq!(

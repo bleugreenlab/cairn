@@ -1410,6 +1410,7 @@ async fn render_resource_body(
                     // restart is not a machine's property.
                     cairn_common::abnormal_exit::predecessor(),
                     captured_at,
+                    orch.substrate_health_snapshot().warming_up,
                 )
             }
         },
@@ -1460,6 +1461,16 @@ async fn render_resource_body(
         }
         CairnResource::ProjectCheckResults { project, revision } => {
             read_project_check_results(orch, request, &project, &revision, &params).await
+        }
+        CairnResource::ProjectCheckObservation { project, handle } => {
+            if let Some(error) = reject_query_params("check observation", &params) {
+                error
+            } else {
+                crate::resources::check_results::read_project_check_observation(
+                    orch, &project, &handle,
+                )
+                .await
+            }
         }
         CairnResource::ProjectImage { .. } => {
             unreachable!("project images are intercepted before text rendering")

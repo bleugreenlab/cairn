@@ -374,7 +374,6 @@ pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<V
         .await
         .map_err(|e| db_error("Job not found", e))
     })?;
-
     match execution_id {
         Some(exec_id) if recipe_node_id.is_some() => {
             crate::execution::advancement::advance_execution_with_actions(orch, &exec_id).await
@@ -588,7 +587,6 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
                 .map_err(|e| e.to_string())
         }
     })?;
-
     // ---- Load job -------------------------------------------------------
     let job = run_db(load_job(
         owning_db.clone(),
@@ -648,7 +646,6 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         behavior.inherits_branch,
         node.name.clone(),
     );
-
     log::info!(
         "[prepare_job] job {job_id}: behavior mints_branch={mints_branch} inherits_branch={inherits_branch} step={step_name}"
     );
@@ -1162,6 +1159,8 @@ fn continue_job_impl_with_intent(
     prompt_resume: Option<ResumeContext>,
     continuation_intent: ContinuationIntent,
 ) -> Result<Run, String> {
+    let resume_started = std::time::Instant::now();
+    let launch_wait_started = std::time::Instant::now();
     let launch_lock = orch.job_launch_lock(job_id);
     // A poisoned lock means some earlier launch panicked. What it guards is
     // durable rows that the recheck below re-reads from scratch, so recover the
@@ -1169,6 +1168,10 @@ fn continue_job_impl_with_intent(
     let _launch_guard = launch_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("launch_lock_acquired")
+        .elapsed(launch_wait_started);
+    event.job_id = Some(job_id);
+    event.emit();
 
     // A pre-created retry or owned-wait successor turn is the caller's own
     // claimed turn (pending, validated below), not somebody else's launch.
@@ -1204,6 +1207,7 @@ fn continue_job_impl_with_intent(
         identity_override,
         prompt_resume,
         continuation_intent,
+        resume_started,
     )
 }
 
@@ -1291,6 +1295,7 @@ fn continue_job_launch_locked(
     identity_override: Option<crate::identity::UserIdentity>,
     prompt_resume: Option<ResumeContext>,
     continuation_intent: ContinuationIntent,
+    resume_started: std::time::Instant,
 ) -> Result<Run, String> {
     // Resolve the job's owning database ONCE (fail-closed): a team job resumes
     // against its synced replica, never the private DB.
@@ -1303,6 +1308,10 @@ fn continue_job_launch_locked(
                 .map_err(|e| e.to_string())
         }
     })?;
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("owning_database_resolved")
+        .elapsed(resume_started);
+    event.job_id = Some(job_id);
+    event.emit();
 
     // ---- Load job -------------------------------------------------------
     let (job, project_id, issue_id, project_path) = run_db(load_job_context(
@@ -1359,6 +1368,11 @@ fn continue_job_launch_locked(
             "Job has no current session to resume".to_string()
         }
     })?;
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("resume_session_selected")
+        .elapsed(resume_started);
+    event.job_id = Some(job_id);
+    event.session_id = Some(current_session_id);
+    event.emit();
 
     // ---- Transition job to Running if in terminal state -------------------
     // Any resume (including the post-completion memory review) makes the agent
@@ -1757,6 +1771,18 @@ fn continue_job_launch_locked(
             Vec::new()
         }
     };
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("resume_queue_claimed")
+        .elapsed(resume_started);
+    event.job_id = Some(job_id);
+    event.session_id = Some(&session_id);
+    event.count = Some(queued_messages.len());
+    event.bytes = Some(
+        queued_messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum(),
+    );
+    event.emit();
     let has_queued = !queued_messages.is_empty();
 
     // When there is no explicit resume message but the user queued follow-ups,
@@ -1897,6 +1923,12 @@ fn continue_job_launch_locked(
         chrono::Utc::now(),
         previous_turn_end,
     );
+    let mut event =
+        crate::resume_timing::ResumeTimingEvent::new("resume_prompt_ready").elapsed(resume_started);
+    event.job_id = Some(job_id);
+    event.session_id = Some(&session_id);
+    event.bytes = Some(prompt.len());
+    event.emit();
 
     let job_model = job.model.as_ref().map(Model::new);
 
@@ -1953,10 +1985,11 @@ fn continue_job_launch_locked(
     if has_queued {
         for queued in &queued_messages {
             let display_message = queued.content.clone();
-            store_user_event_with_turn(
+            store_queued_user_event_with_turn(
                 orch,
                 &run_id,
                 &session_id,
+                &queued.id,
                 &display_message,
                 now,
                 Some(&turn_id),

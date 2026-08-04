@@ -14,6 +14,30 @@ pub(crate) enum TeardownScope {
     Issue(String),
 }
 
+/// Release the issue's dev-instance process trees while terminal resolution can
+/// still refuse to commit. The later full cleanup repeats this idempotently.
+pub(crate) async fn release_issue_dev_instances(
+    orch: &Orchestrator,
+    issue_id: &str,
+) -> Result<(), String> {
+    let db = crate::issues::crud::owning_db_for_issue(&orch.db, issue_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (job_ids, targets) = issue_targets(&db, issue_id).await?;
+    let mut dev_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for target in targets {
+        dev_targets
+            .entry(target.project_id)
+            .or_default()
+            .push(target.branch);
+    }
+    for (project_id, branches) in dev_targets {
+        crate::dev_instances::release_issue_instances(orch, &project_id, &job_ids, &branches)
+            .await?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeardownReason {
     Merged,
@@ -22,6 +46,7 @@ pub enum TeardownReason {
 
 #[derive(Debug, Clone)]
 struct BranchTarget {
+    project_id: String,
     branch: String,
     repo_path: String,
     job_ids: Vec<String>,
@@ -32,31 +57,35 @@ async fn issue_targets(
     issue_id: &str,
 ) -> Result<(Vec<String>, Vec<BranchTarget>), String> {
     let issue_id = issue_id.to_string();
-    let rows: Vec<(String, Option<String>, String)> = db.read(|conn| {
+    let rows: Vec<(String, String, Option<String>, String)> = db.read(|conn| {
         let issue_id = issue_id.clone();
         Box::pin(async move {
             let mut rows = conn.query(
-                "SELECT j.id, j.branch, p.repo_path FROM jobs j JOIN projects p ON p.id = j.project_id WHERE j.issue_id = ?1",
+                "SELECT j.id, j.project_id, j.branch, p.repo_path FROM jobs j JOIN projects p ON p.id = j.project_id WHERE j.issue_id = ?1",
                 (issue_id.as_str(),),
             ).await?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().await? {
-                out.push((row.text(0)?, row.opt_text(1)?, row.text(2)?));
+                out.push((row.text(0)?, row.text(1)?, row.opt_text(2)?, row.text(3)?));
             }
             Ok(out)
         })
     }).await.map_err(|e| format!("Failed to load issue job coordinates: {e}"))?;
 
     let job_ids = rows.iter().map(|row| row.0.clone()).collect();
-    let mut grouped: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    for (job_id, branch, repo_path) in rows {
+    let mut grouped: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    for (job_id, project_id, branch, repo_path) in rows {
         if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
-            grouped.entry((repo_path, branch)).or_default().push(job_id);
+            grouped
+                .entry((project_id, repo_path, branch))
+                .or_default()
+                .push(job_id);
         }
     }
     let targets = grouped
         .into_iter()
-        .map(|((repo_path, branch), job_ids)| BranchTarget {
+        .map(|((project_id, repo_path, branch), job_ids)| BranchTarget {
+            project_id,
             branch,
             repo_path,
             job_ids,
@@ -78,6 +107,17 @@ pub(crate) async fn cleanup_issue_jobs(
 
     kill_terminals_for_jobs(orch, &db, &job_ids).await;
     kill_repls_for_jobs(orch, &job_ids).await;
+    let mut dev_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for target in &targets {
+        dev_targets
+            .entry(target.project_id.clone())
+            .or_default()
+            .push(target.branch.clone());
+    }
+    for (project_id, branches) in dev_targets {
+        crate::dev_instances::release_issue_instances(orch, &project_id, &job_ids, &branches)
+            .await?;
+    }
     for job_id in &job_ids {
         crate::scratch::remove_job_scratch_dir(job_id);
     }

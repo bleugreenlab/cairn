@@ -94,7 +94,7 @@ impl ProviderUsageSnapshot {
         Self {
             backend: backend.to_string(),
             source: source.to_string(),
-            captured_at: chrono::Utc::now().timestamp(),
+            captured_at: 0,
             windows: Vec::new(),
             credits: None,
             reset_credits: None,
@@ -114,7 +114,7 @@ impl ProviderUsageSnapshot {
         Self {
             backend: backend.to_string(),
             source: source.to_string(),
-            captured_at: chrono::Utc::now().timestamp(),
+            captured_at: 0,
             windows: Vec::new(),
             credits: None,
             reset_credits: None,
@@ -147,6 +147,18 @@ impl ProviderUsageSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_and_error_snapshots_do_not_claim_a_capture_time() {
+        assert_eq!(
+            ProviderUsageSnapshot::unsupported("ollama", "ollama_usage", "unsupported").captured_at,
+            0
+        );
+        assert_eq!(
+            ProviderUsageSnapshot::error("claude", "claude_usage", "failed", None).captured_at,
+            0
+        );
+    }
 
     fn snapshot(source: &str) -> ProviderUsageSnapshot {
         ProviderUsageSnapshot {

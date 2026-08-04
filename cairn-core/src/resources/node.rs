@@ -350,7 +350,7 @@ pub(super) async fn read_node_wakes(
         ));
         out.push('\n');
     }
-    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- patch `{unmute:{kind,ref?}}`\n- delete `{unsubscribe:{kind,ref?}}`\n");
+    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- append `{mute:{kind:\"checks\",ref?}}` — mute this node's checks by default, or the referenced node's checks; verdicts become passive ride-alongs rather than being discarded\n- patch `{unmute:{kind,ref?}}` (including `kind:\"checks\"`)\n- delete `{unsubscribe:{kind,ref?}}`\n");
     out
 }
 

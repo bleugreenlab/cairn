@@ -8,6 +8,7 @@ use crate::jobs::queries::{node_uri_segment_for_job, parent_uri_segment_for_job}
 use crate::mcp::types::McpCallbackRequest;
 use crate::messages::{db as msg_db, delivery};
 use crate::models::ChannelType;
+use crate::models::IssueStatus;
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
@@ -36,6 +37,50 @@ async fn sender_name_for_run(db: &LocalDb, run_ctx: &super::RunContext) -> Resul
     } else {
         Ok(node_name.to_string())
     }
+}
+
+async fn ensure_issue_accepts_messages(
+    db: &LocalDb,
+    project_key: &str,
+    issue_number: i32,
+) -> Result<(), String> {
+    let lookup_key = project_key.to_uppercase();
+    let requested_key = project_key.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "
+                    SELECT i.status, p.key
+                    FROM issues i
+                    JOIN projects p ON i.project_id = p.id
+                    WHERE p.key = ?1 AND i.number = ?2
+                    LIMIT 1
+                    ",
+                    params![lookup_key.as_str(), issue_number],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Err(DbError::Row(format!(
+                    "Issue {}-{} not found",
+                    requested_key, issue_number
+                )));
+            };
+            let status: IssueStatus = row.text(0)?.parse().map_err(DbError::Row)?;
+            let canonical_key = row.text(1)?;
+            if status.is_terminal() {
+                return Err(DbError::Row(format!(
+                    "Issue {canonical_key}-{issue_number} is terminal ({status}); messages cannot be sent to it or its agents"
+                )));
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| match error {
+        DbError::Row(message) => message,
+        other => other.to_string(),
+    })
 }
 
 async fn sender_context(
@@ -232,6 +277,9 @@ pub async fn append_project_or_issue_message(
     // in its team replica, and reads are already routed there, so the append must
     // route too or posted messages disappear from the team-replica view.
     let owning_db = orch.db.for_project(project_key).await;
+    if let Some(number) = issue_number {
+        ensure_issue_accepts_messages(&owning_db, project_key, number).await?;
+    }
     let content =
         crate::durable_content::normalize_text(orch, request, project_key, content).await?;
     let channel_id = resolve_channel_id(&owning_db, project_key, issue_number).await?;
@@ -411,6 +459,7 @@ pub async fn append_direct_message_with_urgency(
     // resolution stays job-keyed against the private DB, as on the project/issue
     // message path.
     let owning_db = orch.db.for_project(project_key).await;
+    ensure_issue_accepts_messages(&owning_db, project_key, issue_number).await?;
     let content =
         crate::durable_content::normalize_text(orch, request, project_key, content).await?;
     let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;

@@ -533,6 +533,7 @@ fn request_at(
         },
         base_commit: base_commit.to_owned(),
         command_class: CellCommandClass::classify(&command),
+        placement_work_class: cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
         command,
         owner: None,
         cwd: String::new(),

@@ -261,21 +261,23 @@ pub async fn push(
     push_with_fingerprint(db, recipient, content_ref, wake, boundary, key, None).await
 }
 
-/// Downgrade an issue-sourced push (`review` / `question` / `permission` /
-/// rousing `resolved`) to
-/// `Passive` when the recipient holds an active **mute** on the subject issue.
+/// Downgrade an issue- or checks-sourced push to `Passive` when the recipient
+/// holds an active **mute** on that source.
 /// This is the creation-time sibling of [`lazy_resolve_live`]'s drain-time issue
 /// resolution: applying it centrally in [`push_with_fingerprint`] makes the
-/// muted-source bug-class structural — no issue-push creator can forget to
+/// muted-source bug-class structural — no push creator on a recognized source
+/// can forget to
 /// consult mute. The subject issue URI is the push key's suffix
 /// (`{prefix}:{issue_uri}`), which is exactly the `source_ref` an issue
 /// subscription stores, so no DB lookup of the issue is needed. Non-`Wake`
 /// levels (`Passive` already lowest, `Interrupt` never downgraded) and non-issue
-/// prefixes (`catchup` / `direct`) short-circuit without a query.
+/// prefixes (`catchup` / `direct`) short-circuit without a query. A
+/// `turn-checks` suffix is already the canonical checks URI stored by a
+/// `kind:"checks"` mute.
 /// A direct's source is its sender (peer/user axis), not the subject URI, so the
 /// direct creator applies the same [`crate::orchestrator::wakes::mute_downgrade`]
 /// rule explicitly at its own site rather than here.
-async fn issue_mute_downgrade(
+async fn source_mute_downgrade(
     db: &LocalDb,
     recipient: &str,
     key: &str,
@@ -284,18 +286,20 @@ async fn issue_mute_downgrade(
     if requested != Wake::Wake {
         return Ok(requested);
     }
-    let Some((prefix, issue_uri)) = key.split_once(':') else {
+    let Some((prefix, source_uri)) = key.split_once(':') else {
         return Ok(requested);
     };
-    if !matches!(prefix, "review" | "question" | "permission" | "resolved") {
-        return Ok(requested);
-    }
+    let (source_kind, fact_kind) = match prefix {
+        "review" | "question" | "permission" | "resolved" => ("issue", prefix),
+        "turn-checks" => ("condition", "checks_settled"),
+        _ => return Ok(requested),
+    };
     crate::orchestrator::wakes::mute_downgrade(
         db,
         recipient,
-        "issue",
-        Some(issue_uri),
-        prefix,
+        source_kind,
+        Some(source_uri),
+        fact_kind,
         requested,
     )
     .await
@@ -318,11 +322,11 @@ pub async fn push_with_fingerprint(
     key: &str,
     fingerprint: Option<&str>,
 ) -> DbResult<(String, Wake)> {
-    // Consult mute centrally for issue-sourced prefixes; a muted source's `Wake`
+    // Consult mute centrally for recognized source prefixes; a muted source's `Wake`
     // becomes `Passive` so the row is created as a ride-along rather than a
     // rousing wake (CAIRN-1900). The effective wake is returned so the caller
     // skips nudging a downgraded recipient.
-    let wake = issue_mute_downgrade(db, recipient, key, wake).await?;
+    let wake = source_mute_downgrade(db, recipient, key, wake).await?;
     let recipient = recipient.to_string();
     let content_ref = content_ref.to_string();
     let key = key.to_string();
@@ -1021,6 +1025,42 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn muted_turn_checks_push_is_created_passively() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        let checks_uri = "cairn://p/PROJ/2/1/builder/checks";
+        crate::orchestrator::wakes::mute(
+            &db,
+            "watcher",
+            "condition",
+            Some(checks_uri),
+            None,
+            None,
+            None,
+            "agent",
+        )
+        .await
+        .unwrap();
+
+        let (_, effective_wake) = push_with_fingerprint(
+            &db,
+            "watcher",
+            checks_uri,
+            Wake::Wake,
+            Boundary::Event,
+            &format!("turn-checks:{checks_uri}"),
+            Some("state"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effective_wake, Wake::Passive);
+        let pending = list_pending(&db, "watcher").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].wake, Wake::Passive);
     }
 
     #[tokio::test]

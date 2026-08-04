@@ -8,6 +8,97 @@ use cairn_db::turso::params;
 
 use super::context::{db_error, resolve_merge_mr_context_for_job, PrNodeResolution};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrResolutionAttribution {
+    pub actor_kind: &'static str,
+    pub actor_identity: Option<String>,
+    pub surface: &'static str,
+}
+
+pub struct StoredPrResolutionAttribution {
+    pub action: String,
+    pub actor_kind: String,
+    pub actor_identity: Option<String>,
+    pub surface: String,
+    pub created_at: i64,
+    pub lane_snapshot: String,
+}
+
+impl PrResolutionAttribution {
+    pub fn operator_ui() -> Self {
+        Self {
+            actor_kind: "operator-ui",
+            actor_identity: None,
+            surface: "operator-ui",
+        }
+    }
+    pub fn operator_cli() -> Self {
+        Self {
+            actor_kind: "operator-cli",
+            actor_identity: None,
+            surface: "operator-cli",
+        }
+    }
+    pub fn agent(uri: String) -> Self {
+        Self {
+            actor_kind: "agent",
+            actor_identity: Some(uri),
+            surface: "agent-resource-write",
+        }
+    }
+    pub fn internal(path: &'static str, identity: impl Into<String>) -> Self {
+        Self {
+            actor_kind: "internal",
+            actor_identity: Some(identity.into()),
+            surface: path,
+        }
+    }
+}
+
+async fn lane_snapshot_for_job(orch: &Orchestrator, db: &LocalDb, job_id: &str) -> String {
+    let job_id = job_id.to_string();
+    let execution = db.query_opt(
+        "SELECT json_object('executionStatus', e.status, 'executionSnapshot', json(e.snapshot), 'jobs', COALESCE((SELECT json_group_array(json_object('node', j2.uri_segment, 'status', j2.status)) FROM jobs j2 WHERE j2.execution_id = e.id), '[]')) FROM jobs j LEFT JOIN executions e ON e.id = j.execution_id WHERE j.id = ?1",
+        (job_id.clone(),),
+        |row| row.text(0),
+    ).await.ok().flatten().and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()).unwrap_or_else(|| serde_json::json!({"state":"unavailable"}));
+    let checks = crate::execution::checks_status::node_check_statuses(orch, &job_id)
+        .await
+        .and_then(|statuses| serde_json::to_value(statuses).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    serde_json::json!({ "execution": execution, "systematicChecks": checks }).to_string()
+}
+
+pub async fn latest_resolution_attribution(
+    db: &LocalDb,
+    mr_id: &str,
+) -> Option<StoredPrResolutionAttribution> {
+    let mr_id = mr_id.to_string();
+    db.query_opt("SELECT action, actor_kind, actor_identity, surface, created_at, lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1 ORDER BY created_at DESC LIMIT 1", (mr_id,), |row| Ok(StoredPrResolutionAttribution { action: row.text(0)?, actor_kind: row.text(1)?, actor_identity: row.opt_text(2)?, surface: row.text(3)?, created_at: row.i64(4)?, lane_snapshot: row.text(5)? })).await.ok().flatten()
+}
+
+pub async fn ensure_unjournaled_merge_observation(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    mr_id: &str,
+    job_id: &str,
+) -> Result<(), String> {
+    let lane_snapshot = lane_snapshot_for_job(orch, db, job_id).await;
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "INSERT INTO pr_resolution_attributions (id, merge_request_id, action, actor_kind, actor_identity, surface, lane_snapshot, created_at)
+         SELECT ?1, ?2, 'merge', 'unjournaled', NULL, 'github-refresh-observation', ?3, ?4
+         WHERE NOT EXISTS (
+             SELECT 1 FROM pr_resolution_attributions
+             WHERE merge_request_id = ?2 AND action = 'merge' AND actor_kind = 'unjournaled'
+         )",
+        params![uuid::Uuid::new_v4().to_string(), mr_id, lane_snapshot, now],
+    )
+    .await
+    .map_err(|e| db_error("Failed to journal unjournaled GitHub merge observation", e))?;
+    Ok(())
+}
+
 async fn mark_merge_request_closed_and_resolve_issue(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -69,6 +160,7 @@ pub async fn resolve_pr_node(
     orch: &Orchestrator,
     owner_id: &str,
     resolution: PrNodeResolution,
+    attribution: Option<PrResolutionAttribution>,
 ) -> Result<(), String> {
     // Route to the database that owns this PR's producing job (team replica or
     // private DB). Every row this resolution reads or writes — the merge_requests
@@ -83,6 +175,21 @@ pub async fn resolve_pr_node(
     let merge_context = resolve_merge_mr_context_for_job(&db, owner_id).await?;
     let mr_id = merge_context.mr.mr_id.clone();
     let now = chrono::Utc::now().timestamp();
+    let lane_snapshot = lane_snapshot_for_job(orch, &db, owner_id).await;
+    let attribution = attribution.unwrap_or_else(|| {
+        log::error!(
+            "merge performed by an unjournaled path: owner={owner_id} resolution={resolution:?}"
+        );
+        PrResolutionAttribution {
+            actor_kind: "unjournaled",
+            actor_identity: None,
+            surface: "unjournaled-path",
+        }
+    });
+    db.execute(
+        "INSERT INTO pr_resolution_attributions (id, merge_request_id, action, actor_kind, actor_identity, surface, lane_snapshot, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![uuid::Uuid::new_v4().to_string(), mr_id.as_str(), if matches!(resolution, PrNodeResolution::Merge) { "merge" } else { "close" }, attribution.actor_kind, attribution.actor_identity.as_deref(), attribution.surface, lane_snapshot.as_str(), now],
+    ).await.map_err(|e| db_error("Failed to journal PR resolution attribution", e))?;
     // Marking the PR resolved resolves its issue, and resolving an issue runs
     // the terminal cascade: the issue's live work is stopped, its queued work is
     // cancelled, its sessions close, and any in-flight turn-end review suite is
@@ -575,9 +682,26 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
 
-        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge)
+        resolve_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Merge,
+            Some(PrResolutionAttribution::agent(
+                "cairn://p/PRJ/1/1/thread".to_string(),
+            )),
+        )
+        .await
+        .expect("the merge resolution lands");
+
+        let attribution = latest_resolution_attribution(db, "mr-pr-node")
             .await
-            .expect("the merge resolution lands");
+            .expect("the resolution journals attribution");
+        assert_eq!(attribution.actor_kind, "agent");
+        assert_eq!(
+            attribution.actor_identity.as_deref(),
+            Some("cairn://p/PRJ/1/1/thread")
+        );
+        assert!(attribution.lane_snapshot.contains("executionStatus"));
 
         assert_eq!(
             scalar(
@@ -665,9 +789,16 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
 
-        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge)
+        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge, None)
             .await
             .expect("the merge resolution lands");
+
+        let phantom = latest_resolution_attribution(db, "mr-pr-node")
+            .await
+            .expect("an unattributed boundary is journaled loudly");
+        assert_eq!(phantom.action, "merge");
+        assert_eq!(phantom.actor_kind, "unjournaled");
+        assert_eq!(phantom.surface, "unjournaled-path");
 
         assert_eq!(
             scalar(
@@ -690,6 +821,45 @@ mod tests {
             "and nothing it closed is left with a turn in flight"
         );
         assert_eq!(live_run_count(db).await, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_github_merge_is_journaled_once_after_an_old_close() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = &orch.db.local;
+        db.execute(
+            "INSERT INTO pr_resolution_attributions (id, merge_request_id, action, actor_kind, surface, lane_snapshot, created_at)
+             VALUES ('old-close', 'mr-pr-node', 'close', 'operator-ui', 'operator-ui', '{}', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        ensure_unjournaled_merge_observation(&orch, db, "mr-pr-node", "builder-job")
+            .await
+            .unwrap();
+        ensure_unjournaled_merge_observation(&orch, db, "mr-pr-node", "builder-job")
+            .await
+            .unwrap();
+
+        let observed = latest_resolution_attribution(db, "mr-pr-node")
+            .await
+            .expect("the observed merge is durable");
+        assert_eq!(observed.action, "merge");
+        assert_eq!(observed.actor_kind, "unjournaled");
+        assert_eq!(observed.surface, "github-refresh-observation");
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM pr_resolution_attributions WHERE merge_request_id = 'mr-pr-node' AND action = 'merge' AND actor_kind = 'unjournaled'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -809,7 +979,7 @@ mod tests {
             .unwrap();
         }
 
-        resolve_pr_node(&orch, job_id, PrNodeResolution::Close)
+        resolve_pr_node(&orch, job_id, PrNodeResolution::Close, None)
             .await
             .expect("a team PR resolves its close transition against the injected replica");
 

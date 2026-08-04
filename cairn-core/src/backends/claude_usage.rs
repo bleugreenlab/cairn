@@ -5,11 +5,15 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
 
+use crate::identity::ClaudeAuth;
 use crate::models::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
 use crate::orchestrator::session::get_claude_path;
 use crate::orchestrator::Orchestrator;
 
-pub fn collect_claude_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapshot {
+pub fn collect_claude_usage_snapshot(
+    orch: &Orchestrator,
+    account_id: Option<&str>,
+) -> ProviderUsageSnapshot {
     let claude = match get_claude_path(&orch.process_state) {
         Ok(path) => path,
         Err(err) => {
@@ -20,7 +24,43 @@ pub fn collect_claude_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapsh
             )
         }
     };
-    collect_with_profile(Path::new(&claude), None)
+    let identity = match account_id {
+        Some(id) => match orch.resolve_provider_account("claude", id) {
+            Some(identity) => Some(identity),
+            None => {
+                return ProviderUsageSnapshot::error(
+                    "claude",
+                    "claude_usage",
+                    format!("Claude account '{id}' is unavailable"),
+                    None,
+                )
+            }
+        },
+        None => orch.get_identity(),
+    };
+    let profile = match claude_usage_profile(
+        identity
+            .as_ref()
+            .and_then(|identity| identity.claude_auth.as_ref()),
+        account_id,
+    ) {
+        Ok(profile) => profile,
+        Err(reason) => return ProviderUsageSnapshot::unsupported("claude", "claude_usage", reason),
+    };
+    collect_with_profile(Path::new(&claude), profile)
+}
+
+fn claude_usage_profile<'a>(
+    auth: Option<&'a ClaudeAuth>,
+    account_id: Option<&str>,
+) -> Result<Option<&'a Path>, String> {
+    match (auth, account_id) {
+        (Some(ClaudeAuth::ConfigDir(path)), _) => Ok(Some(path.as_path())),
+        (_, Some(id)) => Err(format!(
+            "Claude account '{id}' cannot report subscription usage because only Claude profile accounts can scope the CLI usage probe."
+        )),
+        _ => Ok(None),
+    }
 }
 
 pub fn collect_with_profile(claude: &Path, profile: Option<&Path>) -> ProviderUsageSnapshot {
@@ -43,6 +83,7 @@ pub fn collect_with_profile(claude: &Path, profile: Option<&Path>) -> ProviderUs
         }
         command.env("CLAUDE_CONFIG_DIR", profile);
     }
+
     let output = match command.output() {
         Ok(output) => output,
         Err(err) => {
@@ -133,6 +174,43 @@ fn slugify(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_usage_accounts_require_a_profile() {
+        let api_key = ClaudeAuth::ApiKey("key".into());
+        let oauth = ClaudeAuth::OAuthToken("token".into());
+        assert!(claude_usage_profile(Some(&api_key), Some("api-account")).is_err());
+        assert!(claude_usage_profile(Some(&oauth), Some("oauth-account")).is_err());
+        assert!(claude_usage_profile(None, Some("local-cli")).is_err());
+
+        let profile = ClaudeAuth::ConfigDir("/tmp/claude-profile".into());
+        assert_eq!(
+            claude_usage_profile(Some(&profile), Some("profile-account")).unwrap(),
+            Some(Path::new("/tmp/claude-profile"))
+        );
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn usage_probe_sets_selected_profile_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("selected-profile");
+        let script = temp.path().join("claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Current session: 1%% used\\nPROFILE=%s\\n' \"$CLAUDE_CONFIG_DIR\"\n",
+        ).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let snapshot = collect_with_profile(&script, Some(&profile));
+        assert!(snapshot.error.is_none());
+        assert!(snapshot.raw.unwrap()["output"]
+            .as_str()
+            .unwrap()
+            .contains(profile.to_str().unwrap()));
+    }
 
     #[test]
     fn parses_real_subscription_payload_with_model_window() {

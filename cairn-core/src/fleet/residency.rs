@@ -267,6 +267,7 @@ pub(crate) async fn refresh(
         ResidencyOperation::RefreshCheckout {
             fence: fence.clone(),
             base_commit: commit.to_string(),
+            require_clean: false,
         },
         "checkout refresh",
     )

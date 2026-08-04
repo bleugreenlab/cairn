@@ -77,6 +77,7 @@ pub use lifecycle::{in_flight_launch_for_test, reconcile_stale_active_turn_for_c
 #[cfg(test)]
 pub(crate) use lifecycle::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
 pub(crate) use slash_commands::resolve_skill_slash_command;
+pub(crate) use snapshots::queued_user_transcript_event;
 pub use snapshots::store_tool_result_event_with_turn;
 // Exercised end-to-end by the `synthetic_continuation_event` integration test,
 // which pins the stored event type that keeps a Cairn-synthesized resume out of

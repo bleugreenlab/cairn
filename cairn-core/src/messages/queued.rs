@@ -135,6 +135,7 @@ async fn record_operator_message(
     delivery: Delivery,
     delivered_at: Option<i64>,
 ) -> Result<QueuedMessage, String> {
+    let timing_started = std::time::Instant::now();
     let id = ids::mint_child(job_id);
     let job_id = job_id.to_string();
     let content = content.to_string();
@@ -179,6 +180,16 @@ async fn record_operator_message(
     // operator is the one participant whose interventions a coordinator never
     // sees. Best-effort — a failure here must not lose the operator's message.
     if recorded.is_ok() {
+        if let Ok(message) = &recorded {
+            let mut event = crate::resume_timing::ResumeTimingEvent::new("queue_enqueue_end")
+                .elapsed(timing_started);
+            event.job_id = Some(&message.job_id);
+            event.queued_message_id = Some(&message.id);
+            event.mode = Some(message.delivery.as_str());
+            event.count = Some(1);
+            event.bytes = Some(message.content.len());
+            event.emit();
+        }
         if let Err(error) =
             crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(db, &job_id)
                 .await
@@ -354,6 +365,15 @@ async fn claim_for_job_inner(
     job_id: &str,
     filter: ClaimFilter,
 ) -> Result<Vec<QueuedMessage>, String> {
+    let timing_started = std::time::Instant::now();
+    let mode = match filter {
+        ClaimFilter::All => "all",
+        ClaimFilter::ToolBoundary => "tool_boundary",
+    };
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("queue_claim_start");
+    event.job_id = Some(job_id);
+    event.mode = Some(mode);
+    event.emit();
     let job_id = job_id.to_string();
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
@@ -401,6 +421,15 @@ async fn claim_for_job_inner(
         })
     })
     .await
+    .inspect(|messages| {
+        let mut event =
+            crate::resume_timing::ResumeTimingEvent::new("queue_claim_end").elapsed(timing_started);
+        event.job_id = Some(&job_id);
+        event.mode = Some(mode);
+        event.count = Some(messages.len());
+        event.bytes = Some(messages.iter().map(|message| message.content.len()).sum());
+        event.emit();
+    })
     .map_err(|error| format!("Failed to claim queued messages: {error}"))
 }
 

@@ -1282,6 +1282,28 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         }
     }
 
+    if let (Some(resolution), Some(new_tip)) = (
+        logical_resolution.as_ref(),
+        commit.as_ref().and_then(|report| report.sha.as_deref()),
+    ) {
+        let sync_failures = crate::dev_instances::sync_live_branch_instances(
+            orch,
+            &resolution.project_id,
+            &resolution.rev,
+            new_tip,
+        )
+        .await;
+        if !sync_failures.is_empty() {
+            append_commit_warning(
+                &mut commit,
+                format!(
+                    "live dev instance sync blocked ({} instance(s)); the owner received a blocking notice",
+                    sync_failures.len()
+                ),
+            );
+        }
+    }
+
     // Synchronous when:write check runner: a write that sealed a source-touching
     // commit fires the affected when:write checks against that sealed commit,
     // streams their output live into this tool's transcript, runs them to

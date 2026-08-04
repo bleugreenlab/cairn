@@ -17,6 +17,18 @@ pub(crate) const PROJECT_IMAGE_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+pub(crate) const PROJECT_CHECK_OBSERVATION_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectCheckObservation,
+    uri_template: "cairn://p/{project}/check-observations/{handle}",
+    name: "Check observation",
+    description:
+        "One immutable check observation addressed by its stable public handle (read-only)",
+    read_projections: &[],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const PROJECT_IMAGES_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectImages,
     uri_template: "cairn://p/{project}/{issue}/images",
@@ -80,7 +92,7 @@ pub(crate) const SETTINGS_CONTRACT: ResourceContract =
         kind: ResourceKind::Settings,
         uri_template: "cairn://settings",
         name: "Workspace settings",
-        description: "The workspace-global settings document with every section: app prefs (branchPrefix, maxThinkingTokens, mergeType, pullOnMerge, orphanCleanupDays, repoTargetSweepDays, bugReports, thinkingDisplayMode, memoryReviewEnabled, pendingMemoryThreshold, externalReplies), backends (activeBackend/tiers/backends plus a read-only model catalog and usage), git identities, provider accounts, keybinds, build services, and read-only GitHub status. patch routes each present key to its existing store; GitHub is read-only and OAuth account-add stays UI-only.",
+        description: "The workspace-global settings document with every section: app prefs (maxThinkingTokens, mergeType, orphanCleanupDays, repoTargetSweepDays, bugReports, thinkingDisplayMode, memoryReviewEnabled, pendingMemoryThreshold, externalReplies), backends (activeBackend/tiers/backends plus a read-only model catalog and usage), git identities, provider accounts, keybinds, build services, and read-only GitHub status. patch routes each present key to its existing store; GitHub is read-only and OAuth account-add stays UI-only.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -88,7 +100,6 @@ pub(crate) const SETTINGS_CONTRACT: ResourceContract =
             mode: ChangeMode::Patch,
             required: &[],
             optional: &[
-                SETTINGS_BRANCH_PREFIX,
                 SETTINGS_MERGE_TYPE,
                 SETTINGS_MEMORY_REVIEW_ENABLED,
                 SETTINGS_ACTIVE_BACKEND,
@@ -100,7 +111,7 @@ pub(crate) const SETTINGS_CONTRACT: ResourceContract =
                 SETTINGS_BUILD_SERVICES,
             ],
             label: "patch workspace settings",
-            example: "write({changes:[{target:\"cairn://settings\",mode:\"patch\",payload:{branchPrefix:\"agent\",keybinds:{set:[{action:\"issue.create\",key:\"n\",modifiers:[\"meta\"]}]}}}]})",
+            example: "write({changes:[{target:\"cairn://settings\",mode:\"patch\",payload:{mergeType:\"squash\",keybinds:{set:[{action:\"issue.create\",key:\"n\",modifiers:[\"meta\"]}]}}}]})",
         }],
     };
 
@@ -160,7 +171,7 @@ pub(crate) const PROJECT_CHECK_RESULTS_CONTRACT: ResourceContract = ResourceCont
         },
         ProjectionSpec {
             key: "environment",
-            values: "required exact fingerprint, or current for the local runner",
+            values: "required exact fingerprint, current for the local runner, or unfingerprinted for legacy remote evidence",
         },
         ProjectionSpec {
             key: "status",

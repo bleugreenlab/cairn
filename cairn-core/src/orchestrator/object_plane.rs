@@ -550,6 +550,8 @@ mod tests {
             base_commit: "a".repeat(40),
             command: "check".into(),
             command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),

@@ -883,6 +883,8 @@ mod slot_publication_tests {
             base_commit: base.clone(),
             command: "true".into(),
             command_class: cairn_common::executor_protocol::CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
@@ -1666,7 +1668,7 @@ pub(crate) struct ResolvedRunBatch {
 }
 
 use crate::fleet::{CellOutcome, CellPriority, CellRequest, MutationPolicy};
-use cairn_common::executor_protocol::{executor_names_match, ExecutorSelector, RepositoryLocator};
+use cairn_common::executor_protocol::{ExecutorSelector, RepositoryLocator};
 
 use crate::mcp::git::GitAuthor;
 use crate::mcp::handlers::tool_use_correlation::Claim;
@@ -1953,7 +1955,24 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             Vec::new(),
         );
     }
+    if payload
+        .executor
+        .as_ref()
+        .is_some_and(|selector| !selector.is_empty())
+        && !has_process
+    {
+        return run_envelope(
+            "The executor option applies only to tree-bound shell or script batches; MCP gateway and REPL batches run on the host. Split the host-bound item into a run call without executor.".to_string(),
+            Vec::new(),
+        );
+    }
 
+    let batch_residence = BatchResidence::for_job_batch(
+        orch,
+        logical_resolution.as_ref(),
+        run_context.as_ref(),
+        payload.executor.as_ref(),
+    );
     let slot_target = if let Some(target) = branch_target.as_ref() {
         log::info!(
             "resolved branch run rev {} to commit {} in project {}",
@@ -1984,7 +2003,11 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 },
                 resolution.commit_id.clone(),
                 String::new(),
-                MutationPolicy::AllowDelta,
+                if batch_residence == BatchResidence::Detached && !commit_present {
+                    MutationPolicy::PureVerdict
+                } else {
+                    MutationPolicy::AllowDelta
+                },
             ))
         } else {
             None
@@ -2049,6 +2072,8 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 base_commit,
                 command,
                 command_class,
+                placement_work_class:
+                    cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
                 owner: run_context.as_ref().map(|ctx| {
                     cairn_common::executor_protocol::CellOwnerRef {
                         project_id: ctx.project_id.clone(),
@@ -2102,13 +2127,17 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 // their timeout. Acquiring that home is part of placing the
                 // batch, not a precondition checked above it, which is what lets
                 // a contended acquisition wait like any other placement.
-                environment: match (logical_resolution.as_ref(), run_context.as_ref(), run_db) {
-                    (Some(resolution), Some(ctx), Some(db)) => Some(JobEnvironment {
-                        db,
-                        job_id: ctx.job_id.clone(),
-                        base_commit: resolution.commit_id.clone(),
-                    }),
-                    _ => None,
+                environment: if batch_residence == BatchResidence::Home {
+                    match (logical_resolution.as_ref(), run_context.as_ref(), run_db) {
+                        (Some(resolution), Some(ctx), Some(db)) => Some(JobEnvironment {
+                            db,
+                            job_id: ctx.job_id.clone(),
+                            base_commit: resolution.commit_id.clone(),
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    None
                 },
                 commit_present,
                 capacity_wait_budget: declared_capacity_wait_budget(&payload, sequential),
@@ -2128,7 +2157,14 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 request: request.clone(),
                 run_context,
                 commit_msg: payload.commit_msg,
-                branch_target: branch_target.is_some(),
+                discards_tracked_changes: branch_target.is_some()
+                    || (batch_residence == BatchResidence::Detached && !commit_present),
+                residence_note: batch_residence.note(
+                    payload.executor.as_ref(),
+                    logical_resolution
+                        .as_ref()
+                        .map(|resolution| resolution.commit_id.as_str()),
+                ),
                 logical_resolution,
                 store_lock,
                 // Publication reads repository identity off this, which every
@@ -2222,7 +2258,8 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         request: request.clone(),
         run_context,
         commit_msg: payload.commit_msg,
-        branch_target: branch_target.is_some(),
+        discards_tracked_changes: branch_target.is_some(),
+        residence_note: None,
         logical_resolution,
         store_lock,
         routed_request: None,
@@ -2234,7 +2271,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         status_before,
         marker_escape,
     };
-    let settled = settle_run_batch(orch, &settlement, outcomes, None, None).await;
+    let settled = settle_run_batch(orch, &settlement, outcomes, None, None, None).await;
     run_envelope(settled.text, settled.images)
 }
 
@@ -2290,7 +2327,7 @@ const RUN_CEILING_DETAIL: &str = "it exceeded the 6-hour ceiling for a single `r
 /// actually happened -- the call is continuing -- and never implies anyone
 /// declined it. `crate::mcp::handlers::suspension_markers` pins that property.
 pub(crate) const RUN_BATCH_SUSPENDED_MARKER: &str =
-    "Run suspended; the same call resumes with this batch's completed result.";
+    "Run handed off to durable suspend; still running. The same call resumes with this batch's completed result.";
 
 /// What the agent reads for a batch one of whose ITEMS suspended durably -- an
 /// external MCP call awaiting its continuation, or a worktree-fence approval.
@@ -2319,6 +2356,63 @@ pub(crate) fn run_batch_lost_to_restart_text(commits: bool) -> String {
     .text()
 }
 
+/// Where a job's process batch obtains its checkout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchResidence {
+    Home,
+    Detached,
+}
+
+impl BatchResidence {
+    fn for_job_batch(
+        orch: &Orchestrator,
+        logical_resolution: Option<&super::branch::BranchResolution>,
+        run_context: Option<&crate::mcp::handlers::RunContext>,
+        selector: Option<&ExecutorSelector>,
+    ) -> Self {
+        let (Some(_), Some(context), Some(selector)) = (
+            logical_resolution,
+            run_context,
+            selector.filter(|value| !value.is_empty()),
+        ) else {
+            return Self::Home;
+        };
+        let holder = cairn_common::executor_protocol::ResidencyHolder::Job {
+            job_id: context.job_id.clone(),
+        };
+        let compatible = orch
+            .fleet
+            .job_home_executor(&holder)
+            .and_then(|executor_id| {
+                orch.fleet
+                    .executor_satisfies_selector(&executor_id, selector)
+            })
+            .unwrap_or(false);
+        if compatible {
+            Self::Home
+        } else {
+            Self::Detached
+        }
+    }
+
+    fn note(self, selector: Option<&ExecutorSelector>, commit: Option<&str>) -> Option<String> {
+        if self != Self::Detached {
+            return None;
+        }
+        let selector = selector?;
+        let destination = selector
+            .name
+            .as_deref()
+            .map(|name| format!("**{name}**"))
+            .unwrap_or_else(|| format!("an executor matching **{}**", selector.describe()));
+        let commit = commit.unwrap_or("the branch head");
+        let short = &commit[..commit.len().min(7)];
+        Some(format!(
+            "Ran on {destination} in a fresh checkout at {short} — not this job's working tree, so build caches and ignored files were absent and nothing outside the published commit was kept."
+        ))
+    }
+}
+
 /// Everything the batch tail needs, owned and `'static` so one settlement can
 /// outlive the call that started it.
 ///
@@ -2329,7 +2423,8 @@ struct RunBatchSettlement {
     request: McpCallbackRequest,
     run_context: Option<crate::mcp::handlers::RunContext>,
     commit_msg: Option<String>,
-    branch_target: bool,
+    discards_tracked_changes: bool,
+    residence_note: Option<String>,
     logical_resolution: Option<super::branch::BranchResolution>,
     store_lock: Option<std::path::PathBuf>,
     routed_request: Option<CellRequest>,
@@ -2402,38 +2497,8 @@ impl BatchPlacement {
         if fence.is_some() && !self.commit_present {
             request.mutation_policy = MutationPolicy::PureVerdict;
         }
-        request.pinned_executor_id = home_bound_pin(
-            self.template.executor.as_ref(),
-            resolve_home_executor(orch, fence).as_ref(),
-        )?;
+        request.pinned_executor_id = home_bound_pin(resolve_home_executor(orch, fence).as_ref());
         Ok(request)
-    }
-
-    /// The refusal a home-bound batch owes its caller BEFORE anything is
-    /// acquired or waited on.
-    ///
-    /// Ordering is the whole point. Acquiring the execution home waits out a
-    /// busy machine rather than refusing, so a contradiction discovered after
-    /// acquisition would let a batch pinned to another executor spend its entire
-    /// horizon queueing for a home it was never going to be allowed to use, and
-    /// then answer with capacity — never naming the constraint that doomed it.
-    /// The contradiction needs nothing from the acquisition to be knowable, so
-    /// it is answered first, and [`home_bound_pin`] stays behind it as the check
-    /// that catches a home which moved in between.
-    fn home_executor_conflict(&self, orch: &Orchestrator) -> Option<String> {
-        let environment = self.environment.as_ref()?;
-        let demanded = self.template.executor.as_ref()?.name.as_deref()?;
-        let holder = cairn_common::executor_protocol::ResidencyHolder::Job {
-            job_id: environment.job_id.clone(),
-        };
-        let home = orch
-            .fleet
-            .residency_route_executor(&holder)
-            .map(|executor_id| home_executor_name(orch, &executor_id));
-        match home {
-            Some(home) if executor_names_match(&home, demanded) => None,
-            home => Some(home_executor_refusal(home.as_deref(), demanded)),
-        }
     }
 }
 
@@ -2441,16 +2506,6 @@ impl BatchPlacement {
 /// pins placement and the name a refusal can print.
 struct HomeExecutor {
     executor_id: String,
-    name: String,
-}
-
-/// A home's executor by its public name, falling back to its identity when the
-/// link is down. A refusal naming an identity is worse than one naming a name,
-/// and better than one naming nothing.
-fn home_executor_name(orch: &Orchestrator, executor_id: &str) -> String {
-    orch.fleet
-        .executor_public_name(executor_id)
-        .unwrap_or_else(|| executor_id.to_string())
 }
 
 fn resolve_home_executor(
@@ -2458,53 +2513,12 @@ fn resolve_home_executor(
     fence: Option<&cairn_common::executor_protocol::ResidencyFence>,
 ) -> Option<HomeExecutor> {
     let executor_id = orch.fleet.residency_route_executor(&fence?.holder)?;
-    let name = home_executor_name(orch, &executor_id);
-    Some(HomeExecutor { executor_id, name })
+    Some(HomeExecutor { executor_id })
 }
 
-/// Why a home-bound batch cannot honor the executor its caller named. A home
-/// that is already placed names the machine; a home that is not yet placed names
-/// the reason the caller could not have chosen it either.
-fn home_executor_refusal(home: Option<&str>, demanded: &str) -> String {
-    match home {
-        Some(home) => format!(
-            "this batch runs in its job's execution home, which is resident on executor {home}, so the requested executor {demanded} cannot be honored. Read cairn://executors for live state."
-        ),
-        None => format!(
-            "this batch runs in its job's execution home, and the fleet places that home rather than the caller, so the requested executor {demanded} cannot be honored. Read cairn://executors for live state."
-        ),
-    }
-}
-
-/// Where a batch that runs inside a job's execution home is pinned.
-///
-/// The home is a leased cell on ONE machine holding this job's working tree, so
-/// its executor is not a preference the fleet may outrank — see
-/// [`crate::fleet::Fleet::residency_route_executor`]. A caller that named a
-/// different executor asked for something this batch cannot be: run somewhere
-/// its own tree is not. That contradiction is refused by name, the same way a
-/// worktree-population request naming a non-local executor is refused, because
-/// the alternative — quietly running on the home's executor while reporting
-/// nothing — is a placement the caller never asked for and cannot observe.
-/// Routing an agent batch to another machine is spill placement, which is
-/// designed on top of this seam rather than asserted through it.
-///
-/// The pin is the home's internal identity rather than its public name: a name
-/// can go unresolvable exactly when the link this pin protects is bouncing, and
-/// a pin that evaporates is a batch that quietly runs somewhere else.
-fn home_bound_pin(
-    declared: Option<&ExecutorSelector>,
-    home: Option<&HomeExecutor>,
-) -> Result<Option<String>, String> {
-    let Some(home) = home else {
-        return Ok(None);
-    };
-    if let Some(demanded) = declared.and_then(|selector| selector.name.as_deref()) {
-        if !executor_names_match(demanded, &home.name) {
-            return Err(home_executor_refusal(Some(&home.name), demanded));
-        }
-    }
-    Ok(Some(home.executor_id.clone()))
+/// Pin a home-bound batch to the executor holding its leased cell.
+fn home_bound_pin(home: Option<&HomeExecutor>) -> Option<String> {
+    home.map(|home| home.executor_id.clone())
 }
 
 /// What the placement task produced.
@@ -2515,9 +2529,6 @@ enum PlacedBatch {
     /// The job's execution home could not be acquired, for a reason no amount of
     /// waiting changes.
     NoEnvironment(String),
-    /// The batch named an executor that contradicts where it must
-    /// run. Nothing was placed, and no wait resolves it.
-    Unplaceable(String),
     /// The machine stayed full for longer than the agent's own declared bound.
     NoRoom(String),
 }
@@ -2662,9 +2673,6 @@ async fn place_and_run_batch(
     // batch whose declared executor contradicts where it must run is answered
     // now, with the contradiction, rather than after a queue it was never going
     // to leave.
-    if let Some(conflict) = placement.home_executor_conflict(orch) {
-        return PlacedBatch::Unplaceable(conflict);
-    }
     let mut wait = CapacityWait::new(placement.capacity_wait_budget);
     loop {
         if cancelled.load(Ordering::SeqCst) {
@@ -2698,10 +2706,9 @@ async fn place_and_run_batch(
                 Err(refusal) => return PlacedBatch::NoEnvironment(refusal.diagnostic),
             },
         };
-        let request = match placement.attempt(orch, fence.as_ref()) {
-            Ok(request) => request,
-            Err(conflict) => return PlacedBatch::Unplaceable(conflict),
-        };
+        let request = placement
+            .attempt(orch, fence.as_ref())
+            .expect("home pinning is infallible");
         let mut attempt = batch.clone();
         attempt.execution_residency = fence;
         let outcome = orch.fleet.submit_run_batch(orch, request, attempt).await;
@@ -2952,6 +2959,26 @@ async fn begin_batch_suspension(
         deadline: None,
         created: chrono::Utc::now().timestamp_millis(),
     };
+    // Admission to the durable run-batch bracket and base reconciliation share
+    // the jj store lock. Reconcile revalidates the row while holding this same
+    // guard immediately before moving the bookmark, so exactly one side wins.
+    let _bracket_guard = match acquire_store_lock(
+        orch,
+        settlement.store_lock.as_deref(),
+        "run batch suspension admission",
+        STORE_LOCK_TIMEOUT,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::warn!(
+                "failed to enter run batch suspension bracket for run {}: {error}",
+                ctx.run_id
+            );
+            return None;
+        }
+    };
     match durable_suspend::suspend(orch, &db, &record).await {
         Ok(handoff) => Some((record, db, handoff)),
         Err(error) => {
@@ -2980,9 +3007,6 @@ async fn settle_joined_batch(
             ))
             .text(),
         ),
-        Ok(PlacedBatch::Unplaceable(conflict)) => {
-            SettledRunBatch::failure(RunFailure::NotExecuted(format!("{conflict}.")).text())
-        }
         Ok(PlacedBatch::NoRoom(detail)) => {
             SettledRunBatch::failure(RunFailure::NotExecuted(detail).text())
         }
@@ -3002,6 +3026,7 @@ async fn settle_routed_run_batch(
     outcome: CellOutcome,
     ceiling: Option<String>,
 ) -> SettledRunBatch {
+    let mut publication_request = settlement.routed_request.clone();
     let (outcomes, routed_delta, routed_tracked_modifications) = match outcome {
         CellOutcome::Unavailable { reason, diagnostic } => {
             // Only a structural refusal reaches here: a capacity-shaped one is a
@@ -3044,30 +3069,36 @@ async fn settle_routed_run_batch(
             return SettledRunBatch::failure(RunFailure::Cancelled(ceiling).text())
         }
         CellOutcome::Completed {
+            attempt_id,
             output,
             mutation_delta,
             tracked_modifications,
             ..
-        } => match serde_json::from_str::<
-            Vec<cairn_common::executor_protocol::ProcessBatchItemOutcome>,
-        >(&output)
-        {
-            Ok(outcomes) => (
-                outcomes.into_iter().map(ItemOutcome::from).collect(),
-                mutation_delta,
-                tracked_modifications,
-            ),
-            Err(error) => {
-                // The commands ran; only their result is unreadable, so this is
-                // a publication failure and must classify as one.
-                return SettledRunBatch::failure(
-                    RunFailure::NotPublished(format!(
-                        "their result could not be read back ({error})."
-                    ))
-                    .text(),
-                );
+        } => {
+            if let Some(request) = publication_request.as_mut() {
+                request.attempt_id = attempt_id;
             }
-        },
+            match serde_json::from_str::<
+                Vec<cairn_common::executor_protocol::ProcessBatchItemOutcome>,
+            >(&output)
+            {
+                Ok(outcomes) => (
+                    outcomes.into_iter().map(ItemOutcome::from).collect(),
+                    mutation_delta,
+                    tracked_modifications,
+                ),
+                Err(error) => {
+                    // The commands ran; only their result is unreadable, so this is
+                    // a publication failure and must classify as one.
+                    return SettledRunBatch::failure(
+                        RunFailure::NotPublished(format!(
+                            "their result could not be read back ({error})."
+                        ))
+                        .text(),
+                    );
+                }
+            }
+        }
     };
     settle_run_batch(
         orch,
@@ -3075,6 +3106,7 @@ async fn settle_routed_run_batch(
         outcomes,
         routed_delta,
         routed_tracked_modifications,
+        publication_request.as_ref(),
     )
     .await
 }
@@ -3090,10 +3122,11 @@ async fn settle_run_batch(
     routed_tracked_modifications: Option<
         cairn_common::executor_protocol::TrackedModificationEvidence,
     >,
+    publication_request: Option<&CellRequest>,
 ) -> SettledRunBatch {
     let mut result = compose_run_output(&outcomes);
 
-    if s.branch_target {
+    if s.discards_tracked_changes {
         let mut modified_paths = std::collections::BTreeSet::new();
         if let Some(evidence) = routed_tracked_modifications {
             modified_paths.extend(evidence.paths);
@@ -3113,6 +3146,12 @@ async fn settle_run_batch(
                 modified_paths.len(),
                 modified_paths.into_iter().collect::<Vec<_>>().join(", ")
             ));
+        }
+        if let Some(note) = &s.residence_note {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(note);
         }
         if !s.cd_advisory.is_empty() {
             if !result.is_empty() {
@@ -3168,7 +3207,7 @@ async fn settle_run_batch(
             let routed = match (
                 s.commit_msg.as_deref(),
                 routed_delta.as_ref(),
-                s.routed_request.as_ref(),
+                publication_request.or(s.routed_request.as_ref()),
                 s.logical_resolution.as_ref(),
             ) {
                 (Some(message), Some(delta), Some(request), Some(resolution)) => Some(match s.store_lock.as_deref() {
@@ -3317,6 +3356,22 @@ async fn settle_run_batch(
                                     message
                                 }
                             };
+                            if let Some(resolution) = s.logical_resolution.as_ref() {
+                                let sync_failures =
+                                    crate::dev_instances::sync_live_branch_instances(
+                                        orch,
+                                        &resolution.project_id,
+                                        &resolution.rev,
+                                        &landed.head,
+                                    )
+                                    .await;
+                                if !sync_failures.is_empty() {
+                                    message.push_str(&format!(
+                                        " — ⚠️ live dev instance sync blocked ({} instance(s)); the owner received a blocking notice",
+                                        sync_failures.len()
+                                    ));
+                                }
+                            }
                             message.push_str(&notes);
                             if let (Some(resolution), Some((_run, db))) =
                                 (s.logical_resolution.as_ref(), routed.as_ref())
@@ -3414,6 +3469,12 @@ async fn settle_run_batch(
         result.push_str(note);
     }
 
+    if let Some(note) = &s.residence_note {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(note);
+    }
     if !s.cd_advisory.is_empty() {
         if !result.is_empty() {
             result.push_str("\n\n");
@@ -3485,165 +3546,16 @@ mod tests {
     fn local_home() -> HomeExecutor {
         HomeExecutor {
             executor_id: "colocated".into(),
-            name: "local".into(),
         }
     }
 
-    /// A batch with no execution home is pinned to nothing: it is placed from
-    /// exactly what the caller declared.
     #[test]
-    fn an_unbound_batch_is_pinned_to_nothing() {
-        assert_eq!(home_bound_pin(None, None), Ok(None));
-        let declared = ExecutorSelector {
-            name: Some("bglab-ub".into()),
-            ..ExecutorSelector::default()
-        };
-        assert_eq!(home_bound_pin(Some(&declared), None), Ok(None));
-    }
-
-    /// The home pins the batch by identity, a caller naming that same machine is
-    /// honored rather than second-guessed, and the name is matched through the
-    /// same normalization the resource publishes.
-    #[test]
-    fn a_home_bound_batch_is_pinned_to_the_machine_holding_its_tree() {
+    fn only_home_batches_receive_the_home_pin() {
+        assert_eq!(home_bound_pin(None), None);
         assert_eq!(
-            home_bound_pin(None, Some(&local_home())),
-            Ok(Some("colocated".to_string()))
+            home_bound_pin(Some(&local_home())),
+            Some("colocated".to_string())
         );
-
-        let toolchain_only = ExecutorSelector {
-            required_toolchains: vec!["rust".into()],
-            ..ExecutorSelector::default()
-        };
-        assert_eq!(
-            home_bound_pin(Some(&toolchain_only), Some(&local_home())),
-            Ok(Some("colocated".to_string()))
-        );
-
-        let agreeing = ExecutorSelector {
-            name: Some("LOCAL".into()),
-            ..ExecutorSelector::default()
-        };
-        assert_eq!(
-            home_bound_pin(Some(&agreeing), Some(&local_home())),
-            Ok(Some("colocated".to_string()))
-        );
-    }
-
-    /// The contradiction is answered before the execution home is acquired.
-    ///
-    /// The home here is unreachable: no job row exists, and no executor is
-    /// attached, so acquisition can only refuse or queue. Either of those
-    /// answers would prove the constraint was checked too late — which is
-    /// exactly the shape of a capacity-blocked home, where the batch would
-    /// otherwise wait out its whole horizon and then report congestion instead
-    /// of the executor it was pinned to. The constraint has to win, and it has
-    /// to win without waiting.
-    #[tokio::test]
-    async fn a_contradicted_executor_refuses_before_the_home_is_acquired() {
-        use crate::db::DbState;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::SearchIndex;
-
-        let config = tempfile::tempdir().unwrap();
-        let db = std::sync::Arc::new(crate::storage::migrated_test_db("home-conflict.db").await);
-        let search =
-            std::sync::Arc::new(SearchIndex::open_or_create(config.path().join("search")).unwrap());
-        let orch = Orchestrator::builder(
-            std::sync::Arc::new(DbState::new(db.clone(), search)),
-            std::sync::Arc::new(TestServicesBuilder::new().build()),
-            config.path().to_path_buf(),
-        )
-        .build();
-
-        let mut template = CellRequest {
-            request_id: "batch-home-conflict".into(),
-            attempt_id: String::new(),
-            project_id: "project".into(),
-            repository: RepositoryLocator::ManagedObjects {
-                project_id: "project".into(),
-                repository_id: "project".into(),
-                object_format: cairn_common::executor_protocol::GitObjectFormat::Sha1,
-            },
-            base_commit: "a".repeat(40),
-            command: "true".into(),
-            command_class: CellCommandClass::Other,
-            owner: None,
-            cwd: String::new(),
-            env: Vec::new(),
-            priority: CellPriority::AgentInteractive,
-            wait_horizon_unix_ms: u64::MAX,
-            waiting_since_unix_ms: 0,
-            timeout_ms: 1_000,
-            mutation_policy: MutationPolicy::PureVerdict,
-            requesting_job_id: Some("job-without-a-home".into()),
-            affinity_key: None,
-            executor: None,
-            pinned_executor_id: None,
-            placement_mobility: Default::default(),
-            verdict_platforms: Vec::new(),
-            command_resource_identity: None,
-            resource_reservation: Default::default(),
-            learned_estimate: None,
-        };
-        template.executor = Some(ExecutorSelector {
-            name: Some("bglab-ub".into()),
-            ..ExecutorSelector::default()
-        });
-        let placement = BatchPlacement {
-            template,
-            environment: Some(JobEnvironment {
-                db,
-                job_id: "job-without-a-home".into(),
-                base_commit: "a".repeat(40),
-            }),
-            commit_present: false,
-            capacity_wait_budget: None,
-        };
-        let batch = ResolvedRunBatch {
-            request: crate::mcp::types::McpCallbackRequest {
-                thread_id: None,
-                cwd: String::new(),
-                run_id: None,
-                tool: "run".into(),
-                payload: serde_json::json!({}),
-                tool_use_id: None,
-            },
-            run_context: None,
-            resolved: vec![shell(None)],
-            tool_use_id: String::new(),
-            stop_on_error: true,
-            originally_sequential: false,
-            execution_residency: None,
-        };
-
-        let placed = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            place_and_run_batch(
-                &orch,
-                placement,
-                batch,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ),
-        )
-        .await
-        .expect("a contradicted constraint must never enter a capacity wait");
-
-        match placed {
-            PlacedBatch::Unplaceable(conflict) => {
-                assert!(conflict.contains("bglab-ub"), "{conflict}");
-                assert!(conflict.contains("execution home"), "{conflict}");
-            }
-            other => panic!(
-                "the constraint must be answered before the home: {}",
-                match other {
-                    PlacedBatch::NoEnvironment(diagnostic) =>
-                        format!("NoEnvironment({diagnostic})"),
-                    PlacedBatch::NoRoom(detail) => format!("NoRoom({detail})"),
-                    _ => "a placed cell".to_string(),
-                }
-            ),
-        }
     }
 
     /// The forbidden outcome: a caller demanding an executor the batch cannot
@@ -3651,16 +3563,20 @@ mod tests {
     /// pinned to a remote machine ran locally and said nothing. It now refuses,
     /// naming both machines.
     #[test]
-    fn a_declared_executor_that_contradicts_the_execution_home_is_refused_by_name() {
-        let declared = ExecutorSelector {
+    fn detached_residence_note_names_the_cold_checkout() {
+        let selector = ExecutorSelector {
             name: Some("bglab-ub".into()),
             ..ExecutorSelector::default()
         };
-        let refusal = home_bound_pin(Some(&declared), Some(&local_home()))
-            .expect_err("a contradicted executor must refuse, never be rewritten");
-        assert!(refusal.contains("bglab-ub"), "{refusal}");
-        assert!(refusal.contains("local"), "{refusal}");
-        assert!(refusal.contains("cairn://executors"), "{refusal}");
+        let note = BatchResidence::Detached
+            .note(Some(&selector), Some("abcdef012345"))
+            .unwrap();
+        assert!(note.contains("bglab-ub"), "{note}");
+        assert!(note.contains("abcdef0"), "{note}");
+        assert!(note.contains("fresh checkout"), "{note}");
+        assert!(BatchResidence::Home
+            .note(Some(&selector), Some("abcdef0"))
+            .is_none());
     }
 
     fn shell(timeout: Option<u32>) -> (String, Result<RunSpec, String>) {
@@ -4102,6 +4018,8 @@ mod tests {
             base_commit: "base".into(),
             command: "true".into(),
             command_class: CellCommandClass::Other,
+            placement_work_class:
+                cairn_common::executor_protocol::PlacementWorkClass::AgentSessions,
             owner: None,
             cwd: String::new(),
             env: Vec::new(),

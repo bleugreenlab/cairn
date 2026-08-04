@@ -1,5 +1,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Default)]
+pub(crate) struct ParseMetrics {
+    pub attempts: usize,
+    pub failures: usize,
+    pub duration: Duration,
+}
+
+impl ParseMetrics {
+    pub(crate) fn parse(&mut self, line: &str) -> Result<(ClaudeEvent, Value), String> {
+        let started = Instant::now();
+        self.attempts += 1;
+        let result = parse_event(line);
+        self.duration += started.elapsed();
+        if result.is_err() {
+            self.failures += 1;
+        }
+        result
+    }
+}
 
 /// Events emitted by Claude CLI with --output-format stream-json
 /// Each line of output is one of these event types
@@ -286,6 +307,9 @@ pub struct TranscriptEvent {
     /// carried reasoning; `None` (and omitted from JSON) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) thinking_ms: Option<i64>,
+    /// Durable identity of the queued user message promoted into this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_message_id: Option<String>,
     /// Remainder of raw JSON after stripping extracted fields.
     /// None if only boilerplate fields remain.
     pub raw: Option<Value>,
@@ -350,6 +374,7 @@ impl TranscriptEvent {
                     tool_result: None,
                     is_error: false,
                     thinking_ms: None,
+                    queued_message_id: None,
                     raw: strip_extracted_fields(raw, &event_type),
                 }
             }
@@ -375,6 +400,7 @@ impl TranscriptEvent {
                     tool_result,
                     is_error,
                     thinking_ms: None,
+                    queued_message_id: None,
                     raw: strip_extracted_fields(raw, &event_type),
                 }
             }
@@ -408,6 +434,7 @@ impl TranscriptEvent {
                     tool_result: None,
                     is_error: false,
                     thinking_ms: None,
+                    queued_message_id: None,
                     raw: strip_extracted_fields(raw, "assistant"),
                 }
             }
@@ -432,6 +459,7 @@ impl TranscriptEvent {
                     tool_result: None,
                     is_error: *is_error,
                     thinking_ms: None,
+                    queued_message_id: None,
                     raw: strip_extracted_fields(raw, &event_type),
                 }
             }
@@ -453,6 +481,7 @@ impl TranscriptEvent {
                 tool_result: None,
                 is_error: false,
                 thinking_ms: None,
+                queued_message_id: None,
                 raw: strip_extracted_fields(raw, "stream_event"),
             },
             // ControlResponse is handled specially in session.rs - this should not be called
@@ -471,6 +500,7 @@ impl TranscriptEvent {
                     tool_result: None,
                     is_error: false,
                     thinking_ms: None,
+                    queued_message_id: None,
                     raw: strip_extracted_fields(raw, &event_type),
                 }
             }
@@ -495,6 +525,7 @@ impl TranscriptEvent {
                     tool_result: None,
                     is_error: false,
                     thinking_ms: None,
+                    queued_message_id: None,
                     raw: strip_extracted_fields(raw, event_type),
                 }
             }
@@ -831,6 +862,15 @@ fn normalize_control_response(raw: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_metrics_count_attempts_failures_and_duration() {
+        let mut metrics = ParseMetrics::default();
+        assert!(metrics.parse(r#"{"type":"unknown"}"#).is_ok());
+        assert!(metrics.parse("not json").is_err());
+        assert_eq!(metrics.attempts, 2);
+        assert_eq!(metrics.failures, 1);
+    }
 
     // Every payload below is a real rejected tool input, recovered from the
     // `__unparsedToolInput` markers the runtime handed back on this machine.
@@ -1247,6 +1287,7 @@ mod tests {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         }
     }

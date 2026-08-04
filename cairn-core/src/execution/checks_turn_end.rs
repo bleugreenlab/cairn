@@ -102,6 +102,7 @@ pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, canc
             e
         );
     }
+
     // Release the single-flight slot before the idempotent readiness recovery
     // edge. Review creation no longer waits for detached checks, but completion
     // remains a useful re-evaluation point if another semantic gate settled too.
@@ -118,6 +119,65 @@ pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, canc
     // green, and a subscriber waiting on the latter must not be stranded by the
     // former (CAIRN-3437).
     crate::orchestrator::wakes::route_checks_settled_edge(&orch, &job_id).await;
+}
+
+async fn persist_turn_check_delivery(
+    db: &LocalDb,
+    recipient: &str,
+    checks_uri: &str,
+    fingerprint: Option<&str>,
+    any_genuine_failed: bool,
+) -> Result<(TurnCheckDelivery, Option<attention_push::Wake>), String> {
+    let key = format!("turn-checks:{checks_uri}");
+    let latest = attention_push::latest_push_fingerprint(db, recipient, &key)
+        .await
+        .map_err(|error| format!("failed to read turn-check fingerprint: {error}"))?;
+    let delivery = turn_check_delivery(
+        latest.as_ref().map(|value| value.as_deref()),
+        fingerprint,
+        any_genuine_failed,
+    );
+    if delivery == TurnCheckDelivery::Suppress {
+        return Ok((delivery, None));
+    }
+    let (_, effective_wake) = attention_push::push_with_fingerprint(
+        db,
+        recipient,
+        checks_uri,
+        delivery_wake(any_genuine_failed),
+        attention_push::Boundary::Event,
+        &key,
+        fingerprint,
+    )
+    .await
+    .map_err(|error| format!("failed to queue turn-check results push: {error}"))?;
+    Ok((delivery, Some(effective_wake)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnCheckDelivery {
+    Suppress,
+    Deliver(&'static str),
+}
+
+fn turn_check_delivery(
+    latest: Option<Option<&str>>,
+    fingerprint: Option<&str>,
+    any_genuine_failed: bool,
+) -> TurnCheckDelivery {
+    let Some(fingerprint) = fingerprint else {
+        return TurnCheckDelivery::Deliver("ambiguous/fail-open");
+    };
+    if latest.flatten() == Some(fingerprint) {
+        return TurnCheckDelivery::Suppress;
+    }
+    if !any_genuine_failed {
+        TurnCheckDelivery::Deliver("green")
+    } else if latest.is_none() {
+        TurnCheckDelivery::Deliver("new")
+    } else {
+        TurnCheckDelivery::Deliver("changed")
+    }
 }
 
 /// Signal every in-flight turn-end (`when:review`) check suite belonging to
@@ -715,7 +775,6 @@ async fn run_turn_end_checks_inner(
             }
         })
         .collect();
-    let delivery_commit = sealed_commit.trim().to_string();
     let batch = PlannedCheckBatchRequest {
         project_id: coords.project_id.clone(),
         repository: canonical_repo,
@@ -848,52 +907,36 @@ async fn run_turn_end_checks_inner(
         }
     );
 
-    // 10. Deliver one push per distinct sealed check state. Red execution evidence
-    // is deliberately not reusable, so the attention ledger, not the result cache,
-    // owns notification dampening. Green remains passive and records a transition
-    // that allows a later identical-looking red to wake again.
+    // 10. Deliver one push per distinct check state. Red execution evidence is
+    // deliberately not reusable, so the attention ledger, not the result cache,
+    // owns notification dampening. The stable lane-state key records green/red
+    // transitions without treating volatile execution detail as a new state.
     let checks_uri = checks_uri_for_job(&coords);
-    let key = format!("turn-checks:{checks_uri}");
-    let fingerprint = turn_check_fingerprint(&tree_hash, &delivery_commit, &outcomes);
-    let latest = attention_push::latest_push_fingerprint(&owning, job_id, &key)
-        .await
-        .map_err(|error| format!("failed to read turn-check fingerprint: {error}"))?;
-    let duplicate_failure = any_genuine_failed
-        && fingerprint.is_some()
-        && latest.as_ref().and_then(|value| value.as_ref()) == fingerprint.as_ref();
+    let fingerprint = turn_check_fingerprint(&tree_hash, &outcomes);
+    let (delivery, effective_wake) = persist_turn_check_delivery(
+        &owning,
+        job_id,
+        &checks_uri,
+        fingerprint.as_deref(),
+        any_genuine_failed,
+    )
+    .await?;
 
-    if duplicate_failure {
+    if delivery == TurnCheckDelivery::Suppress {
         log::info!(
-            "turn-end checks for job {}: deduped unchanged failing delivery",
+            "turn-end checks for job {}: deduped unchanged check state",
             short_id(job_id)
         );
     } else {
-        let decision = if fingerprint.is_none() {
-            "ambiguous/fail-open"
-        } else if !any_genuine_failed {
-            "green"
-        } else if latest.is_none() {
-            "new"
-        } else {
-            "changed"
+        let TurnCheckDelivery::Deliver(decision) = delivery else {
+            unreachable!("suppression handled above")
         };
         log::info!(
             "turn-end checks for job {}: delivery decision {}",
             short_id(job_id),
             decision
         );
-        let (_, effective_wake) = attention_push::push_with_fingerprint(
-            &owning,
-            job_id,
-            &checks_uri,
-            delivery_wake(any_genuine_failed),
-            attention_push::Boundary::Event,
-            &key,
-            fingerprint.as_deref(),
-        )
-        .await
-        .map_err(|error| format!("failed to queue turn-check results push: {error}"))?;
-        if any_genuine_failed && effective_wake == attention_push::Wake::Wake {
+        if any_genuine_failed && effective_wake == Some(attention_push::Wake::Wake) {
             if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
                 orch,
                 job_id,
@@ -953,8 +996,7 @@ async fn run_turn_end_checks_inner(
     Ok(())
 }
 
-const TURN_CHECK_FINGERPRINT_VERSION: &str = "turn-check-state-v1";
-const SALIENT_FAILURE_CHARS: usize = 1_500;
+const TURN_CHECK_FINGERPRINT_VERSION: &str = "turn-check-state-v2";
 
 fn normalized_salient(value: &str) -> Option<String> {
     let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
@@ -962,16 +1004,11 @@ fn normalized_salient(value: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.contains('\0') {
         return None;
     }
-    Some(tail(trimmed, SALIENT_FAILURE_CHARS))
+    Some(trimmed.to_string())
 }
 
-fn turn_check_fingerprint(
-    tree_hash: &str,
-    sealed_commit: &str,
-    outcomes: &[CheckOutcome],
-) -> Option<String> {
+fn turn_check_fingerprint(tree_hash: &str, outcomes: &[CheckOutcome]) -> Option<String> {
     let tree_hash = normalized_salient(tree_hash)?;
-    let sealed_commit = normalized_salient(sealed_commit)?;
     if outcomes.is_empty() {
         return None;
     }
@@ -989,50 +1026,11 @@ fn turn_check_fingerprint(
                 .map(|kind| kind.as_str().to_string())
                 .unwrap_or_else(|| "ordinary_failure".to_string())
         };
-        let salient = if outcome.passed {
-            None
-        } else if outcome
-            .failure_kind
-            .is_some_and(CheckFailureKind::is_infrastructure)
-        {
-            // An infrastructure failure contributes its KIND and nothing else. Its
-            // text is substrate noise that varies between otherwise identical
-            // failures — a different pid in an sccache transport error, a
-            // different dependency crate behind a rustc exit 254 — so folding it
-            // in makes every re-execution look like a new delivery state and
-            // defeats the dampening entirely. The fingerprint must move only when
-            // a GENUINE verdict moves.
-            None
-        } else if let Some(parsed) = &outcome.parsed {
-            if parsed.failures.is_empty() {
-                Some(normalized_salient(&outcome.output_tail)?)
-            } else {
-                let mut failures = Vec::with_capacity(parsed.failures.len());
-                for failure in &parsed.failures {
-                    failures.push((
-                        normalized_salient(&failure.name)?,
-                        match failure.message.as_deref() {
-                            Some(message) => Some(normalized_salient(message)?),
-                            None => None,
-                        },
-                    ));
-                }
-                failures.sort();
-                Some(serde_json::to_string(&failures).ok()?)
-            }
-        } else {
-            Some(normalized_salient(&outcome.output_tail)?)
-        };
-        canonical.push((name, outcome.passed, kind, salient));
+        canonical.push((name, outcome.passed, kind));
     }
     canonical.sort_by(|left, right| left.0.cmp(&right.0));
-    let payload = serde_json::to_vec(&(
-        TURN_CHECK_FINGERPRINT_VERSION,
-        tree_hash,
-        sealed_commit,
-        canonical,
-    ))
-    .ok()?;
+    let payload =
+        serde_json::to_vec(&(TURN_CHECK_FINGERPRINT_VERSION, tree_hash, canonical)).ok()?;
     Some(format!("sha256:{:x}", Sha256::digest(payload)))
 }
 
@@ -1526,6 +1524,8 @@ mod tests {
 
     fn status(name: &str, state: NodeCheckState) -> NodeCheckStatus {
         NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
             name: name.to_string(),
             state,
             policy: "advisory".to_string(),
@@ -1548,10 +1548,9 @@ mod tests {
     fn fingerprint_is_order_independent_and_state_sensitive() {
         let rust = outcome("rust", false, None, "assertion A");
         let lint = outcome("lint", true, None, "");
-        let first = turn_check_fingerprint("tree", "commit", &[rust, lint]).unwrap();
+        let first = turn_check_fingerprint("tree", &[rust, lint]).unwrap();
         let second = turn_check_fingerprint(
             "tree",
-            "commit",
             &[
                 outcome("lint", true, None, ""),
                 outcome("rust", false, None, "assertion A"),
@@ -1559,44 +1558,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second);
-        assert_ne!(
+        // Failure text is execution noise, not stable evidence about a lane state.
+        assert_eq!(
             first,
             turn_check_fingerprint(
                 "tree",
-                "commit",
-                &[outcome("rust", false, None, "assertion B")]
+                &[
+                    outcome("lint", true, None, ""),
+                    outcome("rust", false, None, "assertion B"),
+                ],
             )
             .unwrap()
         );
         assert_ne!(
             first,
-            turn_check_fingerprint(
-                "tree-2",
-                "commit",
-                &[outcome("rust", false, None, "assertion A")]
-            )
-            .unwrap()
+            turn_check_fingerprint("tree-2", &[outcome("rust", false, None, "assertion A")])
+                .unwrap()
         );
         assert_ne!(
             first,
-            turn_check_fingerprint(
-                "tree",
-                "commit-2",
-                &[outcome("rust", false, None, "assertion A")]
-            )
-            .unwrap()
+            turn_check_fingerprint("tree", &[outcome("rust", false, None, "assertion A")]).unwrap()
         );
     }
 
     #[test]
     fn fingerprint_distinguishes_green_ordinary_and_infrastructure_red() {
-        let green =
-            turn_check_fingerprint("tree", "commit", &[outcome("rust", true, None, "")]).unwrap();
-        let red = turn_check_fingerprint("tree", "commit", &[outcome("rust", false, None, "same")])
-            .unwrap();
+        let green = turn_check_fingerprint("tree", &[outcome("rust", true, None, "")]).unwrap();
+        let red = turn_check_fingerprint("tree", &[outcome("rust", false, None, "same")]).unwrap();
         let infrastructure = turn_check_fingerprint(
             "tree",
-            "commit",
             &[outcome(
                 "rust",
                 false,
@@ -1610,16 +1600,129 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_fails_open_when_required_identity_or_failure_detail_is_ambiguous() {
-        assert!(turn_check_fingerprint("", "commit", &[outcome("rust", true, None, "")]).is_none());
-        assert!(turn_check_fingerprint("tree", "", &[outcome("rust", true, None, "")]).is_none());
-        assert!(turn_check_fingerprint("tree", "commit", &[]).is_none());
-        assert!(turn_check_fingerprint(
-            "tree",
-            "commit",
-            &[outcome("rust", false, None, "  \r\n  ")]
+    fn fingerprint_fails_open_when_required_identity_is_ambiguous() {
+        assert!(turn_check_fingerprint("", &[outcome("rust", true, None, "")]).is_none());
+        assert!(turn_check_fingerprint("tree", &[]).is_none());
+    }
+
+    #[test]
+    fn fingerprint_ignores_real_wave_execution_noise_on_the_same_tree() {
+        // CAIRN-3515 produced these two rust-test shapes on the same tree: the
+        // selected failures, progress tail, and sealed commit all changed while
+        // the lane-level verdict set did not.
+        let first = [
+            outcome("lint", true, None, ""),
+            outcome(
+                "rust-tests",
+                false,
+                None,
+                "PASS [1.147s] (1871/3246)\nproject_checkout_validation_rejects_disposable_and_missing_paths",
+            ),
+        ];
+        let second = [
+            outcome("lint", true, None, ""),
+            outcome(
+                "rust-tests",
+                false,
+                None,
+                "a_full_machine_makes_a_batch_slower_not_broken\noutput_wake_fires_when_process_exits_before_phrase",
+            ),
+        ];
+        assert_eq!(
+            turn_check_fingerprint("2670caaa55", &first),
+            turn_check_fingerprint("2670caaa55", &second)
+        );
+    }
+
+    #[test]
+    fn fingerprint_moves_when_a_lane_appears_or_disappears() {
+        let rust = outcome("rust", false, None, "failure");
+        let with_lint = [
+            outcome("rust", false, None, "different failure"),
+            outcome("lint", true, None, ""),
+        ];
+        assert_ne!(
+            turn_check_fingerprint("tree", &[rust]),
+            turn_check_fingerprint("tree", &with_lint)
+        );
+    }
+
+    #[test]
+    fn delivery_decision_dampens_equal_red_and_green_states() {
+        assert_eq!(
+            turn_check_delivery(None, Some("red"), true),
+            TurnCheckDelivery::Deliver("new")
+        );
+        assert_eq!(
+            turn_check_delivery(Some(Some("red")), Some("red"), true),
+            TurnCheckDelivery::Suppress
+        );
+        assert_eq!(
+            turn_check_delivery(Some(Some("green")), Some("green"), false),
+            TurnCheckDelivery::Suppress
+        );
+        assert_eq!(
+            turn_check_delivery(Some(Some("red")), Some("changed"), true),
+            TurnCheckDelivery::Deliver("changed")
+        );
+        assert_eq!(
+            turn_check_delivery(Some(Some("red")), None, true),
+            TurnCheckDelivery::Deliver("ambiguous/fail-open")
+        );
+        assert_eq!(
+            turn_check_delivery(None, Some("green"), false),
+            TurnCheckDelivery::Deliver("green")
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_persistent_red_creates_one_turn_checks_wake() {
+        let db = crate::storage::migrated_test_db("turn-check-delivery.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','PROJ','/tmp/repo',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('i','p',1,'I','active','active','none',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,created_at,updated_at)
+               VALUES('job','p','i','complete','builder',1,1);",
         )
-        .is_none());
+        .await
+        .unwrap();
+        let uri = "cairn://p/PROJ/1/1/builder/checks";
+        let first = turn_check_fingerprint(
+            "same-tree",
+            &[outcome("rust-tests", false, None, "first flaky failure")],
+        );
+        let second = turn_check_fingerprint(
+            "same-tree",
+            &[outcome(
+                "rust-tests",
+                false,
+                None,
+                "different flaky failures and tail",
+            )],
+        );
+
+        assert_eq!(
+            persist_turn_check_delivery(&db, "job", uri, first.as_deref(), true)
+                .await
+                .unwrap(),
+            (
+                TurnCheckDelivery::Deliver("new"),
+                Some(attention_push::Wake::Wake)
+            )
+        );
+        assert_eq!(
+            persist_turn_check_delivery(&db, "job", uri, second.as_deref(), true)
+                .await
+                .unwrap(),
+            (TurnCheckDelivery::Suppress, None)
+        );
+        let pushes = attention_push::list_pending(&db, "job").await.unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].key, format!("turn-checks:{uri}"));
+        assert_eq!(pushes[0].wake, attention_push::Wake::Wake);
     }
 
     #[test]
@@ -1995,7 +2098,6 @@ mod tests {
     fn infrastructure_flake_text_never_moves_the_fingerprint() {
         let first = turn_check_fingerprint(
             "tree",
-            "commit",
             &[outcome(
                 "rust-full",
                 false,
@@ -2006,7 +2108,6 @@ mod tests {
         .unwrap();
         let second = turn_check_fingerprint(
             "tree",
-            "commit",
             &[outcome(
                 "rust-full",
                 false,
@@ -2020,21 +2121,11 @@ mod tests {
             "an infrastructure outcome contributes its kind, never its text"
         );
 
-        // Control: a GENUINE red's text still moves the fingerprint, so a real
-        // regression that changes its failure still wakes.
-        assert_ne!(
-            turn_check_fingerprint(
-                "tree",
-                "commit",
-                &[outcome("rust", false, None, "failure A")]
-            )
-            .unwrap(),
-            turn_check_fingerprint(
-                "tree",
-                "commit",
-                &[outcome("rust", false, None, "failure B")]
-            )
-            .unwrap(),
+        // The lane stayed ordinarily red, so different failure text is not a
+        // delivery-state change.
+        assert_eq!(
+            turn_check_fingerprint("tree", &[outcome("rust", false, None, "failure A")]).unwrap(),
+            turn_check_fingerprint("tree", &[outcome("rust", false, None, "failure B")]).unwrap(),
         );
     }
 
@@ -2045,7 +2136,6 @@ mod tests {
     fn a_genuine_verdict_beside_an_infrastructure_failure_still_moves_the_fingerprint() {
         let infra_only = turn_check_fingerprint(
             "tree",
-            "commit",
             &[
                 outcome("lint", true, None, ""),
                 outcome(
@@ -2059,7 +2149,6 @@ mod tests {
         .unwrap();
         let now_genuinely_red = turn_check_fingerprint(
             "tree",
-            "commit",
             &[
                 outcome("lint", false, None, "clippy: unused import"),
                 outcome(

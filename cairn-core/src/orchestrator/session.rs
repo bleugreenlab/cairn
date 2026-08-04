@@ -67,6 +67,7 @@ pub(crate) fn persist_system_prompt_event(
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: Some(serde_json::json!({
             "backend": backend,
             "bytes": full_prompt.len(),
@@ -74,7 +75,6 @@ pub(crate) fn persist_system_prompt_event(
             "segments": segment_map,
         })),
     };
-
     let data = serde_json::to_string(&transcript_event).unwrap_or_default();
     let insert_result = run_db_blocking({
         let dbs = orch.db.clone();
@@ -1139,6 +1139,7 @@ pub fn insert_error_event(
         tool_result: None,
         is_error: true,
         thinking_ms: None,
+        queued_message_id: None,
         raw: Some(serde_json::json!({"error": error_message})),
     };
 
@@ -1223,7 +1224,6 @@ pub fn get_claude_path(
         log::debug!("get_claude_path: {}", e);
         e
     })?;
-
     log::debug!("get_claude_path: found claude at: {}", path);
 
     // Cache and return
@@ -1507,7 +1507,12 @@ pub fn start_agent_session(
 ) -> Result<(), String> {
     log::debug!("start_agent_session: entered");
     let start_time = std::time::Instant::now();
-    log::info!("[PROFILE] start_agent_session begin");
+    let session_id_for_timing = session_start.session_id().to_string();
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("session_prepare_start");
+    event.run_id = Some(run_id);
+    event.session_id = Some(&session_id_for_timing);
+    event.bytes = Some(prompt.len());
+    event.emit();
 
     // Ensure MCP config file exists and get its path. The output schema is no
     // longer plumbed to cairn-cmd — agents write their artifact via `write`
@@ -1516,6 +1521,11 @@ pub fn start_agent_session(
 
     // Resolve session DB context early — home_uri is required for the MCP config.
     let db_context = session_db_context(orch, run_id)?;
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("session_db_context_ready")
+        .elapsed(start_time);
+    event.run_id = Some(run_id);
+    event.session_id = Some(&session_id_for_timing);
+    event.emit();
     let home_uri = db_context.home_uri.clone();
     let session_project_id = db_context.project_id.clone();
     let process_residence = db_context
@@ -1536,6 +1546,7 @@ pub fn start_agent_session(
             project_path,
         )?;
     }
+    let contextual_ready = std::time::Instant::now();
     let contextual_policy = crate::config::contextual_packages::load_contextual_packages(
         db_context.project_path.as_deref(),
     );
@@ -1574,6 +1585,13 @@ pub fn start_agent_session(
             .then(|| serde_json::to_string(&agent_infos).ok())
             .flatten()
     };
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("contextual_packages_ready")
+        .elapsed(contextual_ready);
+    event.run_id = Some(run_id);
+    event.session_id = Some(&session_id_for_timing);
+    event.count = Some(selected_file_agents.len());
+    event.bytes = Some(agents_json.as_ref().map_or(0, String::len));
+    event.emit();
 
     // Build the MCP config inline (passed per-run to the backend, never written
     // to a shared file) so concurrent sessions can't clobber each other's
@@ -1591,7 +1609,12 @@ pub fn start_agent_session(
         log_level.as_str(),
     );
     log::debug!("start_agent_session: MCP config built inline");
-    log::info!("[PROFILE] MCP config done: {:?}", start_time.elapsed());
+    let mut event =
+        crate::resume_timing::ResumeTimingEvent::new("mcp_config_ready").elapsed(start_time);
+    event.run_id = Some(run_id);
+    event.session_id = Some(&session_id_for_timing);
+    event.bytes = Some(mcp_config_json.len());
+    event.emit();
 
     let workspace_settings = crate::config::settings::load_settings(&orch.config_dir);
 
@@ -2094,6 +2117,7 @@ pub fn start_agent_session(
         .project_key
         .clone()
         .ok_or_else(|| format!("Run {run_id} has no project key authority"))?;
+    let stable_images_started = std::time::Instant::now();
     let message_text = final_prompt.clone();
     let resolve_project_id = project_id.clone();
     let resolve_project_key = project_key.clone();
@@ -2106,6 +2130,19 @@ pub fn start_agent_session(
         )
         .await
     })?;
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("stable_images_resolved")
+        .elapsed(stable_images_started);
+    event.run_id = Some(run_id);
+    event.session_id = Some(&session_id_for_timing);
+    event.bytes = Some(
+        message_content.text.len()
+            + message_content
+                .images
+                .iter()
+                .map(|image| image.bytes.len())
+                .sum::<usize>(),
+    );
+    event.emit();
 
     let session_config = SessionConfig {
         run_id: run_id.to_string(),
@@ -2135,6 +2172,12 @@ pub fn start_agent_session(
         is_ephemeral_call: constrain_output_natively,
     };
 
+    let mut event =
+        crate::resume_timing::ResumeTimingEvent::new("backend_handoff").elapsed(start_time);
+    event.run_id = Some(run_id);
+    event.session_id = Some(&session_id_for_timing);
+    event.bytes = Some(session_config.prompt.len());
+    event.emit();
     backend.start_session(session_config, orch)
 }
 
@@ -2576,6 +2619,7 @@ mod tests {
                     tool_result: None,
                     is_error: false,
                     thinking_ms: None,
+                    queued_message_id: None,
                     raw: None,
                 };
                 let data = serde_json::to_string(&event).unwrap();

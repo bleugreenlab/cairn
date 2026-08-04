@@ -252,6 +252,7 @@ pub(super) fn finalize_agent_message(
                 tool_result: None,
                 is_error: false,
                 thinking_ms: None,
+                queued_message_id: None,
                 raw: None,
             }),
         );
@@ -269,6 +270,7 @@ pub(super) fn finalize_agent_message(
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         };
         store_event(orch, run_db, emitter, run_id, session_id, &event);
@@ -410,6 +412,7 @@ fn store_usage_result_event(
         tool_result: None,
         is_error,
         thinking_ms: None,
+        queued_message_id: None,
         raw: None,
     };
     let event_id = ids::mint_child(run_id);
@@ -541,6 +544,7 @@ pub(super) fn build_codex_compaction_event(raw: Value) -> TranscriptEvent {
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: Some(json!({
             "provider": "codex",
             "compaction": raw,

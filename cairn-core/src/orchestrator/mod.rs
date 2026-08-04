@@ -59,6 +59,8 @@ pub use crate::account::AnonDeviceManager;
 pub use account_manager::AccountManager;
 pub use attention::{AttentionEvent, AttentionFact, AttentionFactKey};
 
+type ProviderUsageSnapshots = Arc<RwLock<HashMap<(String, Option<String>), ProviderUsageSnapshot>>>;
+
 pub struct OrchestratorBuilder {
     db: Arc<DbState>,
     services: Arc<Services>,
@@ -89,7 +91,7 @@ pub struct OrchestratorBuilder {
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
     browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
-    provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
+    provider_usage_snapshots: ProviderUsageSnapshots,
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
     boot_at: i64,
@@ -389,6 +391,15 @@ impl OrchestratorBuilder {
 
 const JJ_STORE_LOCK_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 const JJ_STORE_LOCK_SAMPLE_CAPACITY: usize = 256;
+/// Three heartbeat intervals: startup silence becomes evidence only after the
+/// fleet has had ample opportunity to report into this runner session.
+const FLEET_STARTUP_GRACE_SECS: i64 = 90;
+
+fn fleet_is_warming(executor_count: usize, boot_at: i64, captured_at_unix_ms: u64) -> bool {
+    executor_count == 0
+        && captured_at_unix_ms / 1_000
+            < boot_at.saturating_add(FLEET_STARTUP_GRACE_SECS).max(0) as u64
+}
 
 #[derive(Default)]
 pub struct JjStoreLockMetrics {
@@ -704,6 +715,7 @@ struct TurnEndCancelInner {
 pub(crate) struct TurnEndCheckRuntimeStatus {
     pub tree_hash: String,
     pub applicable_names: HashSet<String>,
+    pub request_ids: HashMap<String, String>,
 }
 
 impl Default for TurnEndCancel {
@@ -748,12 +760,21 @@ impl TurnEndCancel {
             *status = Some(TurnEndCheckRuntimeStatus {
                 tree_hash,
                 applicable_names,
+                request_ids: HashMap::new(),
             });
         }
     }
 
     fn runtime_status(&self) -> Option<TurnEndCheckRuntimeStatus> {
         self.inner.status.lock().ok()?.clone()
+    }
+
+    fn set_request_id(&self, check_name: String, request_id: String) {
+        if let Ok(mut status) = self.inner.status.lock() {
+            if let Some(status) = status.as_mut() {
+                status.request_ids.insert(check_name, request_id);
+            }
+        }
     }
 }
 
@@ -992,8 +1013,8 @@ pub struct Orchestrator {
 
     /// Cached provider model catalog loaded at startup and refreshed on demand.
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
-    /// Latest provider/account usage snapshots keyed by backend name.
-    pub provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
+    /// Latest usage snapshots keyed by backend and requested account.
+    pub provider_usage_snapshots: ProviderUsageSnapshots,
     /// Latest normalized context-token snapshots keyed by durable session id.
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
 
@@ -1227,8 +1248,9 @@ impl Orchestrator {
                 holds: summarize_bounded(&metrics.holds_ms),
             })
             .collect::<Vec<_>>();
+        let warming_up = fleet_is_warming(executors.len(), self.boot_at, captured_at_unix_ms);
         let mut reasons = Vec::new();
-        if executors.is_empty() {
+        if executors.is_empty() && !warming_up {
             reasons.push(SubstrateHealthReason::NoExecutors);
         }
         for executor in &executors {
@@ -1240,6 +1262,7 @@ impl Orchestrator {
             captured_at_unix_ms,
             status,
             reasons,
+            warming_up,
             executors,
             // Read from the supervisor's cached state. Snapshot construction
             // stays non-blocking: it must never probe a daemon or run
@@ -1717,6 +1740,19 @@ impl Orchestrator {
             .runtime_status()
     }
 
+    pub(crate) fn set_turn_end_check_request_id(
+        &self,
+        job_id: &str,
+        check_name: String,
+        request_id: String,
+    ) {
+        if let Ok(checks) = self.turn_end_checks_in_flight.lock() {
+            if let Some(cancel) = checks.get(job_id) {
+                cancel.set_request_id(check_name, request_id);
+            }
+        }
+    }
+
     /// Signal any in-flight turn-end check suite for `job_id` to quit. Best-effort
     /// and idempotent: a no-op when no suite is in flight for the job. Fired when
     /// the job's issue reaches a terminal (merged/closed) state so a minutes-long
@@ -2003,6 +2039,7 @@ impl Orchestrator {
     pub async fn run_default_advance_reconcile(&self) {
         crate::projects::crud::reconcile_default_branches(&self.db.local).await;
         crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
+        crate::execution::checks_main::spawn_all_current(self).await;
         crate::orchestrator::base_advance::sweep_reconcile_intents(self).await;
     }
 
@@ -2018,10 +2055,16 @@ impl Orchestrator {
 
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
+            crate::execution::checks_main::spawn_all_current(&orch).await;
+            orch.spawn_reconcile_intent_sweep();
+        });
+    }
 
-            // Durable sibling intents outlive their initiating tool call. Consume
-            // pending work at startup and periodically reclaim expired leases
-            // left by task cancellation or runner shutdown.
+    /// Drain durable sibling intents periodically, including work re-queued when
+    /// a branch is protected by an in-flight RunBatch bracket.
+    pub fn spawn_reconcile_intent_sweep(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move {
             loop {
                 crate::orchestrator::base_advance::sweep_reconcile_intents(&orch).await;
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -2465,6 +2508,14 @@ impl Orchestrator {
     /// Claude (`rate_limit_event`) and Codex (`account/rateLimits/updated`) route
     /// here, as does the manual refresh command.
     pub fn store_provider_usage_snapshot(&self, snapshot: ProviderUsageSnapshot) {
+        self.store_provider_account_usage_snapshot(None, snapshot);
+    }
+
+    pub fn store_provider_account_usage_snapshot(
+        &self,
+        account_id: Option<String>,
+        snapshot: ProviderUsageSnapshot,
+    ) {
         {
             let Ok(mut guard) = self.provider_usage_snapshots.write() else {
                 return;
@@ -2475,17 +2526,19 @@ impl Orchestrator {
             // the canonical 5-hour + weekly windows) already cached, or the panel
             // would flip shape mid-run. Equal-or-greater rank still updates, so
             // Codex's rich live events and every manual refresh flow through.
-            if let Some(existing) = guard.get(&snapshot.backend) {
+            let key = (snapshot.backend.clone(), account_id.clone());
+            if let Some(existing) = guard.get(&key) {
                 if snapshot.panel_rank() < existing.panel_rank() {
                     return;
                 }
             }
-            guard.insert(snapshot.backend.clone(), snapshot.clone());
+            guard.insert(key, snapshot.clone());
         }
         let _ = self.services.emitter.emit(
             "provider-usage-updated",
             serde_json::json!({
                 "backend": snapshot.backend,
+                "accountId": account_id,
                 "snapshot": snapshot,
             }),
         );
@@ -2661,6 +2714,14 @@ mod tests {
     use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
     use crate::services::EventEmitter;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+
+    #[test]
+    fn startup_silence_warms_until_deadline_then_becomes_evidence() {
+        let boot_at = 1_000;
+        assert!(fleet_is_warming(0, boot_at, 1_089_999));
+        assert!(!fleet_is_warming(0, boot_at, 1_090_000));
+        assert!(!fleet_is_warming(1, boot_at, 1_001_000));
+    }
 
     async fn test_db() -> Arc<DbState> {
         let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("orch.db"))

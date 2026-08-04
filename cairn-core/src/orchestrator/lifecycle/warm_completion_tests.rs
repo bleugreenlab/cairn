@@ -17,6 +17,47 @@ struct SharedCaptureEmitter {
     events: Arc<Mutex<Vec<(String, Value)>>>,
 }
 
+#[tokio::test]
+async fn user_stop_cancels_a_yielded_durable_wait_and_settles_its_turn() {
+    let db = test_db().await;
+    seed_top_level_run(
+        &db,
+        "run-wait-stop",
+        "job-wait-stop",
+        "turn-wait-stop",
+        "none",
+    )
+    .await;
+    db.write(|conn| {
+        Box::pin(async move {
+            conn.execute("INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-wait-stop','job-wait-stop','open','handle-wait-stop',1,1)", ()).await?;
+            conn.execute("UPDATE runs SET session_id='session-wait-stop' WHERE id='run-wait-stop'", ()).await?;
+            conn.execute("UPDATE turns SET session_id='session-wait-stop',run_id='run-wait-stop',state='yielded',yield_reason='wait' WHERE id='turn-wait-stop'", ()).await?;
+            conn.execute("INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-stop','job-wait-stop','run-wait-stop','session-wait-stop','turn-wait-stop','tool-wait-stop','{\"kind\":\"terminal\"}','pending',1)", ()).await?;
+            Ok::<_, DbError>(())
+        })
+    }).await.unwrap();
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-wait-stop", Some("job-wait-stop"));
+    orch.process_state
+        .set_current_turn_id("run-wait-stop", Some("turn-wait-stop"));
+
+    stop_job(&orch, "job-wait-stop").expect("Stop should abandon the durable wait");
+
+    assert_eq!(turn_state(&orch, "turn-wait-stop").await, "cancelled");
+    assert_eq!(
+        scalar_text(
+            &orch,
+            "SELECT state FROM agent_waits WHERE id = ?1",
+            "wait-stop"
+        )
+        .await
+        .as_deref(),
+        Some("cancelled"),
+        "the wait must not fire after Stop"
+    );
+}
+
 impl SharedCaptureEmitter {
     fn events_named(&self, name: &str) -> Vec<Value> {
         self.events

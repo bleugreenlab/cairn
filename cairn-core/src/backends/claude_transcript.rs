@@ -31,7 +31,113 @@
 //! uuid, role, and block index, so the upstream defect stays visible.
 
 use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
+
+const FINGERPRINT_BYTES: u64 = 4096;
+const REPAIR_INDEX_CAPACITY: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct RepairIndexEntry {
+    validated_len: u64,
+    fingerprint: u64,
+    modified: Option<SystemTime>,
+    identity: Option<FileIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    file: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    // std does not expose a stable cross-platform file id. On these targets the
+    // cache still uses length, modification time, and the bounded fingerprint.
+    None
+}
+
+type RepairIndexKey = (PathBuf, String);
+
+struct RepairIndex {
+    entries: HashMap<RepairIndexKey, RepairIndexEntry>,
+    insertion_order: VecDeque<RepairIndexKey>,
+    capacity: usize,
+}
+
+impl RepairIndex {
+    fn new() -> Self {
+        Self::with_capacity(REPAIR_INDEX_CAPACITY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            insertion_order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn get(&self, key: &RepairIndexKey) -> Option<&RepairIndexEntry> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: RepairIndexKey, entry: RepairIndexEntry) {
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = entry;
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(key, entry);
+    }
+
+    fn remove(&mut self, key: &RepairIndexKey) {
+        if self.entries.remove(key).is_some() {
+            self.insertion_order.retain(|queued| queued != key);
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &RepairIndexKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+fn repair_index() -> &'static Mutex<RepairIndex> {
+    static INDEX: OnceLock<Mutex<RepairIndex>> = OnceLock::new();
+    INDEX.get_or_init(|| Mutex::new(RepairIndex::new()))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RepairPass {
+    pub(crate) bytes_read: u64,
+    pub(crate) lines_parsed: usize,
+    pub(crate) used_full_scan: bool,
+}
 
 /// Stands in for a message whose every block was empty. A message with no
 /// content blocks is as rejectable as an empty one, so something must remain;
@@ -79,52 +185,188 @@ pub(crate) fn repair_before_resume(
     config_dir: Option<&Path>,
     working_dir: &Path,
     backend_id: &str,
-) {
+) -> RepairPass {
     let Some(path) = transcript_path(config_dir, working_dir, backend_id) else {
         // A first resume after the transcript was pruned, or a backend id this
         // machine never ran. Nothing to repair; the CLI reports the miss.
         log::debug!("No Claude transcript found for session {backend_id}; skipping repair");
-        return;
+        return RepairPass::default();
     };
 
-    let bytes = match std::fs::read(&path) {
+    let mut index = repair_index()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    repair_path(&path, backend_id, &mut index)
+}
+
+fn repair_path(path: &Path, backend_id: &str, index: &mut RepairIndex) -> RepairPass {
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = (canonical_path, backend_id.to_string());
+    let mut pass = RepairPass::default();
+    if let Some(previous) = index.get(&key).copied() {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let len = metadata.len();
+            let identity = file_identity(&metadata);
+            let same_identity = previous.identity.is_none() || previous.identity == identity;
+            if same_identity
+                && len == previous.validated_len
+                && metadata.modified().ok() == previous.modified
+            {
+                return pass;
+            }
+            // The append fast path deliberately trusts only stable file identity
+            // plus a bounded fingerprint immediately before the old EOF. An
+            // arbitrary in-place mutation earlier in a growing file cannot be
+            // distinguished portably without rereading the full prefix. Same-size
+            // changes do fall back because they cannot be legitimate appends.
+            if same_identity
+                && len > previous.validated_len
+                && fingerprint_at(path, previous.validated_len, &mut pass)
+                    == Some(previous.fingerprint)
+            {
+                if let Some(fingerprint) =
+                    validate_appended_tail(path, previous.validated_len, len, &mut pass)
+                {
+                    index.insert(
+                        key,
+                        RepairIndexEntry {
+                            validated_len: len,
+                            fingerprint,
+                            modified: metadata.modified().ok(),
+                            identity,
+                        },
+                    );
+                    return pass;
+                }
+            }
+        }
+    }
+
+    pass.used_full_scan = true;
+    let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
             log::warn!(
                 "Could not read Claude transcript {}: {error}",
                 path.display()
             );
-            return;
+            index.remove(&key);
+            return pass;
         }
     };
-    // Rewriting a transcript that is not valid UTF-8 would mangle the bytes the
-    // CLI still parses around, so leave it whole and say so.
+    pass.bytes_read += bytes.len() as u64;
+    let complete = bytes.ends_with(b"\n");
     let Ok(contents) = String::from_utf8(bytes) else {
         log::warn!(
             "Claude transcript {} is not valid UTF-8; leaving it untouched",
             path.display()
         );
-        return;
+        index.remove(&key);
+        return pass;
     };
-
-    let Some((repaired, repairs)) = repair_transcript(&contents) else {
-        return;
-    };
-
-    if let Err(error) = write_atomic(&path, &repaired) {
-        log::warn!(
-            "Could not rewrite repaired Claude transcript {}: {error}",
-            path.display()
-        );
-        return;
+    let certain = lines_are_json(&contents, &mut pass.lines_parsed);
+    if let Some((repaired, repairs)) = repair_transcript(&contents) {
+        if let Err(error) = write_atomic(path, &repaired) {
+            log::warn!(
+                "Could not rewrite repaired Claude transcript {}: {error}",
+                path.display()
+            );
+            index.remove(&key);
+            return pass;
+        }
+        log_repairs(path, backend_id, &repairs);
+        let repaired_bytes = repaired.as_bytes();
+        if complete && certain {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                index.insert(
+                    key,
+                    RepairIndexEntry {
+                        validated_len: repaired_bytes.len() as u64,
+                        fingerprint: fingerprint(repaired_bytes),
+                        modified: metadata.modified().ok(),
+                        identity: file_identity(&metadata),
+                    },
+                );
+            } else {
+                index.remove(&key);
+            }
+        } else {
+            index.remove(&key);
+        }
+    } else if complete && certain {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            index.insert(
+                key,
+                RepairIndexEntry {
+                    validated_len: contents.len() as u64,
+                    fingerprint: fingerprint(contents.as_bytes()),
+                    modified: metadata.modified().ok(),
+                    identity: file_identity(&metadata),
+                },
+            );
+        } else {
+            index.remove(&key);
+        }
+    } else {
+        index.remove(&key);
     }
+    pass
+}
 
+fn validate_appended_tail(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    pass: &mut RepairPass,
+) -> Option<u64> {
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::with_capacity((len - offset) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    pass.bytes_read += bytes.len() as u64;
+    if !bytes.ends_with(b"\n") {
+        return None;
+    }
+    let tail = std::str::from_utf8(&bytes).ok()?;
+    if !lines_are_json(tail, &mut pass.lines_parsed) || repair_transcript(tail).is_some() {
+        return None;
+    }
+    fingerprint_at(path, len, pass)
+}
+
+fn lines_are_json(contents: &str, parsed: &mut usize) -> bool {
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| {
+            *parsed += 1;
+            serde_json::from_str::<Value>(line).is_ok()
+        })
+}
+
+fn fingerprint_at(path: &Path, offset: u64, pass: &mut RepairPass) -> Option<u64> {
+    let start = offset.saturating_sub(FINGERPRINT_BYTES);
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = vec![0; (offset - start) as usize];
+    file.read_exact(&mut bytes).ok()?;
+    pass.bytes_read += bytes.len() as u64;
+    Some(fingerprint(&bytes))
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let tail = &bytes[bytes.len().saturating_sub(FINGERPRINT_BYTES as usize)..];
+    let mut hasher = DefaultHasher::new();
+    tail.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn log_repairs(path: &Path, backend_id: &str, repairs: &[TranscriptRepair]) {
     log::warn!(
         "Repaired {} rejectable content block(s) in Claude transcript {} before resuming session {backend_id}",
-        repairs.len(),
-        path.display()
+        repairs.len(), path.display()
     );
-    for repair in &repairs {
+    for repair in repairs {
         log::warn!(
             "  entry #{} (uuid={}, role={}) block #{}: {}",
             repair.entry,
@@ -313,6 +555,7 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// The CAIRN-3242 specimen, verbatim in shape: a thinking entry and the
     /// empty-text entry of the same assistant message, then the CLI's own nudge.
@@ -511,5 +754,205 @@ mod tests {
     fn a_missing_transcript_is_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
         repair_before_resume(Some(temp.path()), temp.path(), "session-absent");
+    }
+
+    fn healthy_line(uuid: &str, text: &str) -> String {
+        json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn repair_index_evicts_the_oldest_session_at_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut index = RepairIndex::with_capacity(2);
+        let paths = (0..3)
+            .map(|number| temp.path().join(format!("session-{number}.jsonl")))
+            .collect::<Vec<_>>();
+        for (number, path) in paths.iter().enumerate() {
+            std::fs::write(path, healthy_line(&format!("a{number}"), "healthy")).unwrap();
+            repair_path(path, &format!("session-{number}"), &mut index);
+        }
+
+        assert_eq!(index.entries.len(), 2);
+        assert!(!index.contains_key(&(paths[0].clone(), "session-0".into())));
+        assert!(repair_path(&paths[0], "session-0", &mut index).used_full_scan);
+        assert!(!repair_path(&paths[2], "session-2", &mut index).used_full_scan);
+    }
+
+    #[test]
+    fn unchanged_and_append_only_passes_do_not_scan_the_validated_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let prefix = (0..200)
+            .map(|index| healthy_line(&format!("a{index}"), &"x".repeat(100)))
+            .collect::<String>();
+        std::fs::write(&path, &prefix).unwrap();
+        let mut index = RepairIndex::new();
+
+        let initial = repair_path(&path, "session", &mut index);
+        assert!(initial.used_full_scan);
+        assert_eq!(initial.lines_parsed, 200);
+
+        let unchanged = repair_path(&path, "session", &mut index);
+        assert_eq!(unchanged, RepairPass::default());
+
+        let appended = healthy_line("new", "tail");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(appended.as_bytes())
+            .unwrap();
+        let append_pass = repair_path(&path, "session", &mut index);
+        assert!(!append_pass.used_full_scan);
+        assert_eq!(append_pass.lines_parsed, 1);
+        assert!(append_pass.bytes_read <= appended.len() as u64 + 2 * FINGERPRINT_BYTES);
+        assert!(append_pass.bytes_read < prefix.len() as u64);
+    }
+
+    #[test]
+    fn truncation_replacement_incomplete_and_malformed_tails_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let original = healthy_line("a1", "original");
+        let mut index = RepairIndex::new();
+
+        std::fs::write(&path, &original).unwrap();
+        repair_path(&path, "session", &mut index);
+        std::fs::write(&path, healthy_line("a2", "x")).unwrap();
+        assert!(repair_path(&path, "session", &mut index).used_full_scan);
+
+        std::fs::write(&path, &original).unwrap();
+        repair_path(&path, "session", &mut index);
+        std::fs::write(&path, "{}\n").unwrap();
+        assert!(repair_path(&path, "session", &mut index).used_full_scan);
+
+        std::fs::write(&path, &original).unwrap();
+        repair_path(&path, "session", &mut index);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"type\":")
+            .unwrap();
+        assert!(repair_path(&path, "session", &mut index).used_full_scan);
+
+        std::fs::write(&path, &original).unwrap();
+        repair_path(&path, "session", &mut index);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{not json}\n")
+            .unwrap();
+        assert!(repair_path(&path, "session", &mut index).used_full_scan);
+        assert!(!index.contains_key(&(path.clone(), "session".to_string())));
+    }
+
+    #[test]
+    fn rejectable_append_falls_back_repairs_and_indexes_the_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(&path, healthy_line("a1", "healthy")).unwrap();
+        let mut index = RepairIndex::new();
+        repair_path(&path, "session", &mut index);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(poisoned_transcript().as_bytes())
+            .unwrap();
+
+        let repaired = repair_path(&path, "session", &mut index);
+        assert!(repaired.used_full_scan);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(ELISION_MARKER));
+        assert_eq!(
+            repair_path(&path, "session", &mut index),
+            RepairPass::default()
+        );
+    }
+
+    #[test]
+    fn malformed_repairable_transcript_is_rewritten_but_not_cached() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let transcript = format!("{}{{not_json}}\n", poisoned_transcript());
+        std::fs::write(&path, transcript).unwrap();
+        let mut index = RepairIndex::new();
+
+        let repaired = repair_path(&path, "session", &mut index);
+        assert!(repaired.used_full_scan);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(ELISION_MARKER));
+        assert!(index.is_empty());
+        assert!(repair_path(&path, "session", &mut index).used_full_scan);
+    }
+
+    #[test]
+    fn incomplete_repairable_transcript_is_rewritten_but_not_cached() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let transcript = poisoned_transcript().trim_end_matches('\n').to_string();
+        std::fs::write(&path, transcript).unwrap();
+        let mut index = RepairIndex::new();
+
+        let repaired = repair_path(&path, "session", &mut index);
+        assert!(repaired.used_full_scan);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(ELISION_MARKER));
+        assert!(index.is_empty());
+        assert!(repair_path(&path, "session", &mut index).used_full_scan);
+    }
+
+    #[test]
+    fn same_size_large_prefix_rewrite_falls_back_outside_bounded_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let original = (0..100)
+            .map(|index| healthy_line(&format!("a{index}"), &"x".repeat(100)))
+            .collect::<String>();
+        std::fs::write(&path, &original).unwrap();
+        let mut index = RepairIndex::new();
+        repair_path(&path, "session", &mut index);
+
+        let mut rewritten = original.into_bytes();
+        let mutation = rewritten.iter().position(|byte| *byte == b'x').unwrap();
+        rewritten[mutation] = b'y';
+        std::fs::write(&path, rewritten).unwrap();
+
+        let pass = repair_path(&path, "session", &mut index);
+        assert!(pass.used_full_scan);
+        assert!(pass.bytes_read > FINGERPRINT_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_file_with_same_contents_does_not_hit_cached_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let replacement = temp.path().join("replacement.jsonl");
+        let contents = healthy_line("a1", "healthy");
+        std::fs::write(&path, &contents).unwrap();
+        let mut index = RepairIndex::new();
+        repair_path(&path, "session", &mut index);
+        let original_identity = file_identity(&std::fs::metadata(&path).unwrap());
+
+        std::fs::write(&replacement, &contents).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_ne!(
+            original_identity,
+            file_identity(&std::fs::metadata(&path).unwrap())
+        );
+
+        assert!(repair_path(&path, "session", &mut index).used_full_scan);
     }
 }

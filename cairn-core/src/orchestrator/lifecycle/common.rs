@@ -100,7 +100,12 @@ pub(super) fn apply_turn_outcome(
                     if from == outcome {
                         return Ok(());
                     }
-                    if from.is_terminal() {
+                    if from.is_terminal()
+                        && !matches!(
+                            (&from, &outcome),
+                            (TurnState::Yielded, TurnState::Cancelled)
+                        )
+                    {
                         return Err(db_internal(transition_error(
                             "turn",
                             &turn_id,
@@ -113,6 +118,7 @@ pub(super) fn apply_turn_outcome(
                     match (&from, &outcome) {
                         (TurnState::Running, _) => {}
                         (TurnState::Pending, TurnState::Failed | TurnState::Cancelled) => {}
+                        (TurnState::Yielded, TurnState::Cancelled) => {}
                         _ => {
                             return Err(db_internal(transition_error(
                                 "turn",

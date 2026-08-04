@@ -141,6 +141,7 @@ impl AssistantStreamState {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(json!({
                 "backend": self.backend_key.clone(),
                 "generationId": generation_id,
@@ -204,6 +205,7 @@ pub(super) fn store_assistant_message(
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: Some(json!({
             "backend": backend_key,
             "generationId": generation_id,
@@ -322,6 +324,7 @@ pub(super) fn store_assistant_tool_call(
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(json!({
                 "backend": backend_key,
                 "generationId": generation_id,
@@ -367,6 +370,7 @@ pub(super) fn store_tool_result(
             tool_result: Some(render_tool_result(result.clone())),
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(json!({"backend": backend_key, "reminders": result.reminders})),
         },
         TokenCounts::default(),
@@ -406,6 +410,7 @@ pub(super) fn store_success_result(
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(json!({
                 "backend": backend_key,
                 "generationId": generation_id,

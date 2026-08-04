@@ -101,8 +101,6 @@ pub struct SettingsFile {
     #[serde(default, skip_serializing)]
     preferred_models: Option<Vec<Model>>,
 
-    #[serde(default)]
-    branch_prefix: Option<String>,
     /// Double Option to distinguish:
     /// - None = field missing → default to Some(31999)
     /// - Some(None) = field set to null → disabled
@@ -111,8 +109,6 @@ pub struct SettingsFile {
     max_thinking_tokens: Option<Option<i32>>,
     #[serde(default)]
     merge_type: Option<MergeType>,
-    #[serde(default)]
-    pull_on_merge: Option<bool>,
     /// Deprecated — always true. Kept for deserialization compat (silently ignored).
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -350,14 +346,9 @@ impl SettingsFile {
             active_backend: presets.active_backend,
             tiers: presets.tiers,
             backends: presets.backends,
-            branch_prefix: self
-                .branch_prefix
-                .clone()
-                .unwrap_or_else(|| "agent".to_string()),
             system_prompt: String::new(), // Deprecated, always empty
             max_thinking_tokens,
             merge_type: self.merge_type.clone().unwrap_or(MergeType::Squash),
-            pull_on_merge: self.pull_on_merge.unwrap_or(true),
             auto_start_jobs: true, // Always true — setting removed
             orphan_cleanup_days: self.orphan_cleanup_days.unwrap_or(3),
             repo_target_sweep_days: self.repo_target_sweep_days.unwrap_or(0).max(0),
@@ -402,10 +393,8 @@ impl SettingsFile {
             mcp_servers: None,
             default_model: None,
             preferred_models: None,
-            branch_prefix: Some(settings.branch_prefix.clone()),
             max_thinking_tokens: Some(settings.max_thinking_tokens),
             merge_type: Some(settings.merge_type.clone()),
-            pull_on_merge: Some(settings.pull_on_merge),
             auto_start_jobs: None, // No longer serialized
             orphan_cleanup_days: Some(settings.orphan_cleanup_days),
             repo_target_sweep_days: Some(settings.repo_target_sweep_days.max(0)),
@@ -761,6 +750,7 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "activeBackend",
     "tiers",
     "backends",
+    // Removed DTO keys remain here so the next save deletes stale YAML.
     "branchPrefix",
     "maxThinkingTokens",
     "mergeType",
@@ -842,17 +832,11 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     if let Some(value) = input.backends {
         current.backends = value;
     }
-    if let Some(value) = input.branch_prefix {
-        current.branch_prefix = value;
-    }
     if let Some(value) = input.max_thinking_tokens {
         current.max_thinking_tokens = value;
     }
     if let Some(value) = input.merge_type {
         current.merge_type = value;
-    }
-    if let Some(value) = input.pull_on_merge {
-        current.pull_on_merge = value;
     }
     if let Some(value) = input.orphan_cleanup_days {
         current.orphan_cleanup_days = value.clamp(1, 30);
@@ -1086,10 +1070,8 @@ mod tests {
             settings.backends["claude"]["lg"].model,
             Model::new(Model::OPUS)
         );
-        assert_eq!(settings.branch_prefix, "agent");
         assert_eq!(settings.max_thinking_tokens, Some(31999));
         assert_eq!(settings.merge_type, MergeType::Squash);
-        assert!(settings.pull_on_merge);
         assert_eq!(settings.orphan_cleanup_days, 3);
         assert_eq!(settings.repo_target_sweep_days, 0);
         assert!(settings.auto_start_jobs); // Always true
@@ -1135,12 +1117,30 @@ externalReplies: disabled
     }
 
     #[test]
+    fn removed_git_settings_are_ignored_and_stripped_while_merge_type_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        std::fs::write(
+            get_settings_path(dir),
+            "branchPrefix: legacy\npullOnMerge: false\nmergeType: rebase\n",
+        )
+        .unwrap();
+
+        let settings = load_settings(dir);
+        assert_eq!(settings.merge_type, MergeType::Rebase);
+
+        save_settings(dir, &settings).unwrap();
+        let yaml = std::fs::read_to_string(get_settings_path(dir)).unwrap();
+        assert!(!yaml.contains("branchPrefix"), "{yaml}");
+        assert!(!yaml.contains("pullOnMerge"), "{yaml}");
+        assert!(yaml.contains("mergeType: rebase"), "{yaml}");
+    }
+
+    #[test]
     fn test_settings_roundtrip() {
         let settings = Settings {
-            branch_prefix: "feature".to_string(),
             max_thinking_tokens: Some(16000),
             merge_type: MergeType::Rebase,
-            pull_on_merge: false,
             repo_target_sweep_days: 14,
             transcript_text_size: TranscriptTextSize::Large,
             transcript_density: TranscriptDensity::Relaxed,
@@ -1152,10 +1152,8 @@ externalReplies: disabled
 
         assert_eq!(restored.active_backend, settings.active_backend);
         assert_eq!(restored.backends, settings.backends);
-        assert_eq!(restored.branch_prefix, settings.branch_prefix);
         assert_eq!(restored.max_thinking_tokens, settings.max_thinking_tokens);
         assert_eq!(restored.merge_type, settings.merge_type);
-        assert_eq!(restored.pull_on_merge, settings.pull_on_merge);
         assert_eq!(restored.repo_target_sweep_days, 14);
         assert!(restored.auto_start_jobs); // Always true
         assert_eq!(
@@ -1174,8 +1172,13 @@ externalReplies: disabled
         let default_channel = defaults.to_settings().channels.imessage;
         assert!(!default_channel.enabled);
         assert_eq!(default_channel.route, ChannelRouteConfig::default());
+        assert_eq!(
+            defaults.to_settings().channels.default_thread,
+            "cairn://p/CAIRN/3404"
+        );
 
         let channels = ChannelsConfig {
+            default_thread: "cairn://p/CAIRN/3404".to_string(),
             imessage: IMessageChannelConfig {
                 enabled: true,
                 executor: Some("bglab-mac".to_string()),
@@ -1291,7 +1294,6 @@ externalReplies: disabled
         let settings = Settings {
             max_thinking_tokens: None,
             merge_type: MergeType::Rebase,
-            pull_on_merge: false,
             ..test_settings()
         };
 
@@ -1304,10 +1306,8 @@ externalReplies: disabled
     #[test]
     fn test_yaml_serialization() {
         let file = SettingsFile {
-            branch_prefix: Some("test".to_string()),
             max_thinking_tokens: Some(Some(16000)),
             merge_type: Some(MergeType::Merge),
-            pull_on_merge: Some(true),
             orphan_cleanup_days: Some(3),
             repo_target_sweep_days: Some(14),
             bug_reports: Some(true),
@@ -1318,7 +1318,6 @@ externalReplies: disabled
         let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.preferred_models, file.preferred_models);
-        assert_eq!(parsed.branch_prefix, file.branch_prefix);
         assert_eq!(parsed.max_thinking_tokens, file.max_thinking_tokens);
         assert_eq!(parsed.repo_target_sweep_days, Some(14));
     }
@@ -1361,7 +1360,7 @@ externalReplies: disabled
     fn accepted_fence_commands_set_load_and_persist() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
-        std::fs::write(get_settings_path(dir), "branchPrefix: agent\n").unwrap();
+        std::fs::write(get_settings_path(dir), "logLevel: standard\n").unwrap();
 
         // Accept a command for a project.
         set_accepted_fence_command(dir, "proj-1", "bun run dev:instance", true).unwrap();
@@ -1390,7 +1389,7 @@ externalReplies: disabled
     fn build_services_parse_and_persist_across_save() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
-        let yaml = r#"branchPrefix: agent
+        let yaml = r#"logLevel: standard
 buildServices:
   sccache:
     enabled: true
@@ -1434,7 +1433,7 @@ buildServices:
     fn set_build_service_enabled_materializes_default_and_preserves_other_settings() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
-        std::fs::write(get_settings_path(dir), "branchPrefix: custom\n").unwrap();
+        std::fs::write(get_settings_path(dir), "logLevel: verbose\n").unwrap();
 
         // No buildServices block yet: toggling the default entry materializes it.
         set_build_service_enabled(dir, "sccache", false).unwrap();
@@ -1444,7 +1443,6 @@ buildServices:
             "toggle must write an explicit buildServices block"
         );
         // Unrelated settings survive the surgical write.
-        assert_eq!(load_settings(dir).branch_prefix, "custom");
 
         // Toggle back on; unknown service errors.
         set_build_service_enabled(dir, "sccache", true).unwrap();
@@ -1504,7 +1502,7 @@ buildServices:
     fn web_fetch_pdf_and_active_selectors_persist_across_save() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
-        let yaml = r#"branchPrefix: agent
+        let yaml = r#"logLevel: standard
 webFetch:
   firecrawl:
     onlyMainContent: false
@@ -1568,7 +1566,7 @@ futureUserKey:
     fn malformed_settings_fail_closed_without_changing_bytes() {
         let temp = TempDir::new().unwrap();
         let path = get_settings_path(temp.path());
-        let malformed = b"branchPrefix: [unterminated\n";
+        let malformed = b"mergeType: [unterminated\n";
         std::fs::write(&path, malformed).unwrap();
 
         let error = save_settings(temp.path(), &test_settings()).unwrap_err();
@@ -1592,7 +1590,6 @@ futureUserKey:
             update_settings(
                 &prefix_home,
                 UpdateSettings {
-                    branch_prefix: Some("concurrent-prefix".to_string()),
                     ..UpdateSettings::default()
                 },
             )
@@ -1618,7 +1615,6 @@ futureUserKey:
         reports.join().unwrap();
 
         let settings = load_settings(&home);
-        assert_eq!(settings.branch_prefix, "concurrent-prefix");
         assert!(!settings.bug_reports);
     }
 
@@ -1681,12 +1677,11 @@ futureUserKey:
     fn test_yaml_deserialization_partial() {
         // Legacy format without backends → defaults are generated
         let yaml = r#"
-branchPrefix: custom
+logLevel: verbose
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
         let settings = file.to_settings();
 
-        assert_eq!(settings.branch_prefix, "custom");
         assert_eq!(settings.max_thinking_tokens, Some(31999));
         assert_eq!(settings.merge_type, MergeType::Squash);
         assert_eq!(
@@ -1701,7 +1696,7 @@ branchPrefix: custom
         // Old format with defaultModel: opus patches opus into its natural tier.
         let yaml = r#"
 defaultModel: opus
-branchPrefix: agent
+logLevel: standard
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
         let settings = file.to_settings();
@@ -1908,7 +1903,6 @@ autoStartJobs: false
             let path = temp.path().join("settings.yaml");
 
             let settings = Settings {
-                branch_prefix: "dev".to_string(),
                 max_thinking_tokens: None,
                 ..test_settings()
             };
@@ -1922,7 +1916,6 @@ autoStartJobs: false
             let loaded: SettingsFile = serde_yaml::from_str(&loaded_content).unwrap();
             let loaded_settings = loaded.to_settings();
 
-            assert_eq!(loaded_settings.branch_prefix, "dev");
             assert!(loaded_settings.auto_start_jobs); // Always true
             assert_eq!(loaded_settings.max_thinking_tokens, None);
             // Default presets should be present
@@ -1934,7 +1927,7 @@ autoStartJobs: false
     fn test_yaml_deserialization_missing_field() {
         let yaml = r#"
 defaultModel: opus
-branchPrefix: custom
+logLevel: verbose
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(file.max_thinking_tokens, None);
@@ -1947,7 +1940,7 @@ branchPrefix: custom
     fn test_yaml_deserialization_null_field() {
         let yaml = r#"
 defaultModel: opus
-branchPrefix: custom
+logLevel: verbose
 maxThinkingTokens: null
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
@@ -1972,7 +1965,7 @@ thinkingDisplayMode: full
     #[test]
     fn test_log_level_defaults_to_standard_and_roundtrips() {
         // Absent in YAML → the light Standard default.
-        let file: SettingsFile = serde_yaml::from_str("branchPrefix: custom\n").unwrap();
+        let file: SettingsFile = serde_yaml::from_str("{}\n").unwrap();
         assert_eq!(file.log_level, None);
         assert_eq!(file.to_settings().log_level, LogLevel::Standard);
 
@@ -2041,16 +2034,29 @@ mod fleet_settings_tests {
 buildSlots:
   capacityWaitHorizonSeconds: 900
   defaultTimeoutSeconds: 1800
+  cpuAdmission:
+    entryUtilization: 0.8
+    clearUtilization: 0.65
+    entryWindowMs: 20000
+    clearWindowMs: 10000
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
         let fleet = file.fleet.as_ref().unwrap();
         assert_eq!(fleet.capacity_wait_horizon_seconds, 900);
         assert_eq!(fleet.default_timeout_seconds, 1800);
+        assert_eq!(fleet.cpu_admission.entry_utilization, 0.8);
+        assert_eq!(
+            fleet
+                .resolve_executor_policy("executor-without-override")
+                .cpu_admission,
+            fleet.cpu_admission
+        );
         let serialized = serde_yaml::to_string(&file).unwrap();
         let reparsed: SettingsFile = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.fleet, file.fleet);
         assert!(serialized.contains("buildSlots:"));
         assert!(fleet.remote_executors.is_empty());
+        assert!(serialized.contains("cpuAdmission:"));
     }
 
     /// The retired `acquisitionDeadlineSeconds` is IGNORED rather than adopted,
@@ -2161,26 +2167,114 @@ buildSlots:
 
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
-        std::fs::write(
-            super::get_settings_path(dir),
-            "branchPrefix: custom\nlogLevel: standard\n",
-        )
-        .unwrap();
+        std::fs::write(super::get_settings_path(dir), "logLevel: standard\n").unwrap();
         let config = FleetConfig {
             capacity_wait_horizon_seconds: 120,
             default_timeout_seconds: 900,
-            executor_policies: Default::default(),
-            remote_executors: Default::default(),
-            remote_host_identities: Default::default(),
+            cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy {
+                entry_utilization: 0.82,
+                clear_utilization: 0.68,
+                entry_window_ms: 20_000,
+                clear_window_ms: 10_000,
+            },
+            ..FleetConfig::default()
         };
 
         super::set_fleet(dir, &config).unwrap();
 
         assert_eq!(super::load_fleet(dir), config);
-        let reopened = super::load_settings_file(dir).unwrap();
-        assert_eq!(reopened.branch_prefix.as_deref(), Some("custom"));
         let yaml = std::fs::read_to_string(super::get_settings_path(dir)).unwrap();
         assert!(yaml.contains("logLevel: standard"));
+        assert!(yaml.contains("cpuAdmission:"));
         assert!(!yaml.contains("projects:"));
+    }
+
+    #[test]
+    fn legacy_fleet_config_loads_with_code_owned_default_profile() {
+        use crate::fleet::{PlacementStance, PlacementWorkClass, DEFAULT_PLACEMENT_PROFILE};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            super::get_settings_path(temp.path()),
+            "buildSlots:\n  capacityWaitHorizonSeconds: 900\n",
+        )
+        .unwrap();
+        let fleet = super::load_fleet(temp.path());
+        assert_eq!(fleet.active_placement_profile, DEFAULT_PLACEMENT_PROFILE);
+        assert!(fleet.placement_profiles.is_empty());
+        assert_eq!(
+            fleet
+                .active_placement_profile()
+                .stance(PlacementWorkClass::ReviewChecks),
+            PlacementStance::Any
+        );
+        assert_eq!(fleet.resolved_placement_profiles().len(), 3);
+    }
+
+    #[test]
+    fn custom_profile_and_activation_survive_reopen() {
+        use crate::fleet::{
+            built_in_placement_profiles, FleetConfig, INTERACTIVE_PLACEMENT_PROFILE,
+        };
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let mut fleet = FleetConfig::default();
+        let mut profile = built_in_placement_profiles()[INTERACTIVE_PLACEMENT_PROFILE].clone();
+        profile.machine_priority = vec!["local".into()];
+        fleet
+            .save_placement_profile("focused".into(), profile.clone())
+            .unwrap();
+        fleet.activate_placement_profile("focused").unwrap();
+        super::set_fleet(temp.path(), &fleet).unwrap();
+
+        let reopened = super::load_fleet(temp.path());
+        assert_eq!(reopened.active_placement_profile, "focused");
+        assert_eq!(reopened.active_placement_profile(), &profile);
+    }
+
+    #[test]
+    fn invalid_active_profile_heals_on_load_but_is_rejected_on_save() {
+        use crate::fleet::{FleetConfig, DEFAULT_PLACEMENT_PROFILE};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            super::get_settings_path(temp.path()),
+            "buildSlots:\n  activePlacementProfile: vanished\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::load_fleet(temp.path()).active_placement_profile,
+            DEFAULT_PLACEMENT_PROFILE
+        );
+
+        let invalid = FleetConfig {
+            active_placement_profile: "vanished".into(),
+            ..FleetConfig::default()
+        };
+        assert!(super::set_fleet(temp.path(), &invalid).is_err());
+    }
+
+    #[test]
+    fn built_in_profiles_cannot_be_shadowed_or_deleted() {
+        use crate::fleet::{built_in_placement_profiles, FleetConfig, DEFAULT_PLACEMENT_PROFILE};
+
+        let mut fleet = FleetConfig::default();
+        let profile = built_in_placement_profiles()[DEFAULT_PLACEMENT_PROFILE].clone();
+        assert!(fleet
+            .save_placement_profile(DEFAULT_PLACEMENT_PROFILE.into(), profile)
+            .is_err());
+        assert!(fleet
+            .delete_placement_profile(DEFAULT_PLACEMENT_PROFILE)
+            .is_err());
+    }
+
+    #[test]
+    fn fleet_validation_rejects_an_invalid_workspace_cpu_fallback() {
+        let mut fleet = crate::fleet::FleetConfig::default();
+        fleet.cpu_admission.clear_utilization = fleet.cpu_admission.entry_utilization;
+        assert!(fleet.validate().is_err());
     }
 }

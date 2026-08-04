@@ -27,7 +27,10 @@ use crate::orchestrator::Orchestrator;
 
 type CodexUsageProbeEnv = (HashMap<String, String>, String, Option<PathBuf>, bool);
 
-pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapshot {
+pub fn collect_codex_usage_snapshot(
+    orch: &Orchestrator,
+    account_id: Option<&str>,
+) -> ProviderUsageSnapshot {
     let codex_path = match find_binary("codex") {
         Ok(path) => path,
         Err(err) => {
@@ -39,7 +42,21 @@ pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapsho
         }
     };
 
-    let (env, cwd, temp_home, uses_codex_oauth) = match codex_usage_probe_env(orch) {
+    let identity = match account_id {
+        Some(id) => match orch.resolve_provider_account("codex", id) {
+            Some(identity) => Some(identity),
+            None => {
+                return ProviderUsageSnapshot::error(
+                    "codex",
+                    "codex_rate_limits",
+                    format!("Codex account '{id}' is unavailable"),
+                    None,
+                )
+            }
+        },
+        None => orch.get_identity(),
+    };
+    let (env, cwd, temp_home, uses_codex_oauth) = match codex_usage_probe_env(orch, identity) {
         Ok(parts) => parts,
         Err(err) => return ProviderUsageSnapshot::error("codex", "codex_rate_limits", err, None),
     };
@@ -85,9 +102,19 @@ pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapsho
         .unwrap_or_else(|err| ProviderUsageSnapshot::error("codex", "codex_rate_limits", err, None))
 }
 
-pub fn consume_codex_usage_reset(orch: &Orchestrator) -> Result<ProviderUsageResetResult, String> {
+pub fn consume_codex_usage_reset(
+    orch: &Orchestrator,
+    account_id: Option<&str>,
+) -> Result<ProviderUsageResetResult, String> {
     let codex_path = find_binary("codex").map_err(|err| format!("Codex CLI not found: {err}"))?;
-    let (env, cwd, temp_home, uses_codex_oauth) = codex_usage_probe_env(orch)?;
+    let identity = match account_id {
+        Some(id) => Some(
+            orch.resolve_provider_account("codex", id)
+                .ok_or_else(|| format!("Codex account '{id}' is unavailable"))?,
+        ),
+        None => orch.get_identity(),
+    };
+    let (env, cwd, temp_home, uses_codex_oauth) = codex_usage_probe_env(orch, identity)?;
 
     let result = (|| -> Result<ProviderUsageResetResult, String> {
         let client = Arc::new(
@@ -134,11 +161,14 @@ pub fn consume_codex_usage_reset(orch: &Orchestrator) -> Result<ProviderUsageRes
     result
 }
 
-fn codex_usage_probe_env(orch: &Orchestrator) -> Result<CodexUsageProbeEnv, String> {
+fn codex_usage_probe_env(
+    orch: &Orchestrator,
+    identity: Option<crate::identity::UserIdentity>,
+) -> Result<CodexUsageProbeEnv, String> {
     let mut env = HashMap::new();
     let mut temp_home = None;
     let mut uses_codex_oauth = false;
-    if let Some(identity) = orch.get_identity() {
+    if let Some(identity) = identity {
         match identity.codex_auth {
             Some(CodexAuth::OAuthToken(auth_json)) => {
                 let home = prepare_codex_auth_home(&auth_json)?;

@@ -1004,6 +1004,7 @@ async fn ensure_terminal_checkout_current(
             ResidencyOperation::RefreshCheckout {
                 fence: fence.clone(),
                 base_commit: tip.to_string(),
+                require_clean: false,
             },
         )
         .await;
@@ -2759,6 +2760,9 @@ async fn spawn_terminal_session(
     let mut env: Vec<(String, String)> = std::env::vars().collect();
     env.push(("PATH".into(), crate::env::agent_shell_path()));
     env.push(("CAIRN_WORKTREE".into(), target.cwd.clone()));
+    // Child tooling can carry the exact tracked-terminal relationship across a
+    // launcher handoff. This is provenance only; it grants no terminal control.
+    env.push(("CAIRN_TERMINAL_SESSION_ID".into(), session_id.clone()));
     env.push((
         "CAIRN_CALLBACK_URL".into(),
         format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),

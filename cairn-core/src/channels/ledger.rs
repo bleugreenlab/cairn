@@ -17,6 +17,146 @@ pub struct NewOutbound<'a> {
     pub created_at: i64,
 }
 
+pub async fn is_thread_followed(
+    db: &LocalDb,
+    channel: &str,
+    thread_uri: &str,
+) -> Result<bool, String> {
+    db.query_opt_i64(
+        "SELECT 1 FROM channel_thread_follow WHERE channel = ?1 AND thread_uri = ?2",
+        params![channel.to_string(), thread_uri.to_string()],
+    )
+    .await
+    .map(|value| value.is_some())
+    .map_err(|error| error.to_string())
+}
+
+/// Claims provider cleanup for any sent outbound bubble. Question cleanup uses
+/// the stricter helper above because it also carries answer-resolution meaning;
+/// thread-update retraction only needs the exactly-once side-effect claim.
+pub async fn claim_outbound_cleanup(
+    db: &LocalDb,
+    id: &str,
+    resolved_at: i64,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound SET status = 'resolved', resolved_at = ?2, last_error = NULL WHERE id = ?1 AND status = 'sent'",
+        params![id.to_string(), resolved_at],
+    ).await.map(|changed| changed == 1).map_err(|error| error.to_string())
+}
+
+pub async fn advance_thread_cursor(
+    db: &LocalDb,
+    channel: &str,
+    thread_uri: &str,
+    cursor_rowid: i64,
+) -> Result<(), String> {
+    db.execute(
+        "UPDATE channel_thread_follow SET cursor_rowid = MAX(cursor_rowid, ?3) WHERE channel = ?1 AND thread_uri = ?2",
+        params![channel.to_string(), thread_uri.to_string(), cursor_rowid.max(0)],
+    ).await.map(|_| ()).map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadFollow {
+    pub thread_uri: String,
+    pub followed_at: i64,
+    pub cursor_rowid: i64,
+}
+
+pub async fn follow_thread(
+    db: &LocalDb,
+    channel: &str,
+    thread_uri: &str,
+    followed_at: i64,
+    cursor_rowid: i64,
+) -> Result<bool, String> {
+    db.execute(
+        "INSERT OR IGNORE INTO channel_thread_follow (channel, thread_uri, followed_at, cursor_rowid) VALUES (?1, ?2, ?3, ?4)",
+        params![channel.to_string(), thread_uri.to_string(), followed_at, cursor_rowid.max(0)],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
+pub async fn unfollow_thread(
+    db: &LocalDb,
+    channel: &str,
+    thread_uri: &str,
+) -> Result<bool, String> {
+    db.execute(
+        "DELETE FROM channel_thread_follow WHERE channel = ?1 AND thread_uri = ?2",
+        params![channel.to_string(), thread_uri.to_string()],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
+pub async fn list_thread_follows(db: &LocalDb, channel: &str) -> Result<Vec<ThreadFollow>, String> {
+    db.query_all(
+        "SELECT thread_uri, followed_at, cursor_rowid FROM channel_thread_follow WHERE channel = ?1 ORDER BY followed_at DESC",
+        params![channel.to_string()],
+        |row| Ok(ThreadFollow { thread_uri: row.text(0)?, followed_at: row.i64(1)?, cursor_rowid: row.i64(2)? }),
+    ).await.map_err(|error| error.to_string())
+}
+
+pub async fn set_thread_focus(
+    db: &LocalDb,
+    channel: &str,
+    thread_uri: &str,
+    selected_at: i64,
+) -> Result<(), String> {
+    db.execute(
+        "INSERT INTO channel_thread_focus (channel, thread_uri, selected_at) VALUES (?1, ?2, ?3) ON CONFLICT(channel) DO UPDATE SET thread_uri = excluded.thread_uri, selected_at = excluded.selected_at",
+        params![channel.to_string(), thread_uri.to_string(), selected_at],
+    ).await.map(|_| ()).map_err(|error| error.to_string())
+}
+
+pub async fn get_thread_focus(db: &LocalDb, channel: &str) -> Result<Option<String>, String> {
+    db.query_opt(
+        "SELECT thread_uri FROM channel_thread_focus WHERE channel = ?1",
+        params![channel.to_string()],
+        |row| row.text(0),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Preserves an inbound answer when a simultaneous live-snapshot cleanup claimed
+/// resolution first. Only the first inbound answer may fill the resolved row.
+pub async fn record_answer_after_cleanup_claim(
+    db: &LocalDb,
+    id: &str,
+    answer: &str,
+) -> Result<bool, String> {
+    let answer_json = serde_json::json!({ "answer": answer }).to_string();
+    db.execute(
+        "UPDATE channel_outbound SET options_json = ?2 WHERE id = ?1 AND kind = 'question' AND status = 'resolved' AND json_extract(options_json, '$.answer') IS NULL",
+        params![id.to_string(), answer_json],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
+/// Claims ownership of question cleanup while recording its durable resolution.
+/// Only the path that observes `sent` may perform provider side effects.
+pub async fn claim_question_cleanup(
+    db: &LocalDb,
+    id: &str,
+    resolved_at: i64,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound SET status = 'resolved', resolved_at = ?2, last_error = NULL WHERE id = ?1 AND kind = 'question' AND status = 'sent'",
+        params![id.to_string(), resolved_at],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
 pub async fn mark_expired(db: &LocalDb, id: &str, expired_at: i64) -> Result<bool, String> {
     db.execute(
         "UPDATE channel_outbound SET status = 'expired', resolved_at = ?2 WHERE id = ?1 AND status = 'pending'",
@@ -151,11 +291,16 @@ pub async fn update_options(db: &LocalDb, id: &str, options_json: &str) -> Resul
     .map_err(|error| error.to_string())
 }
 
-pub async fn record_answer(db: &LocalDb, id: &str, answer: &str) -> Result<bool, String> {
+pub async fn claim_question_answer(
+    db: &LocalDb,
+    id: &str,
+    answer: &str,
+    resolved_at: i64,
+) -> Result<bool, String> {
     let answer_json = serde_json::json!({ "answer": answer }).to_string();
     db.execute(
-        "UPDATE channel_outbound SET options_json = ?2 WHERE id = ?1 AND status = 'sent'",
-        params![id.to_string(), answer_json],
+        "UPDATE channel_outbound SET options_json = ?2, status = 'resolved', resolved_at = ?3, last_error = NULL WHERE id = ?1 AND kind = 'question' AND status = 'sent'",
+        params![id.to_string(), answer_json, resolved_at],
     )
     .await
     .map(|changed| changed == 1)
@@ -173,7 +318,7 @@ pub async fn answered_for_prompt(
         let prefix = prefix.clone();
         Box::pin(async move {
             let mut rows = conn.query(
-                "SELECT binding_ref, json_extract(options_json, '$.answer') FROM channel_outbound WHERE channel = ?1 AND kind = 'question' AND binding_ref LIKE ?2 AND status = 'resolved' ORDER BY binding_ref",
+                "SELECT binding_ref, json_extract(options_json, '$.answer') FROM channel_outbound WHERE channel = ?1 AND kind = 'question' AND binding_ref LIKE ?2 AND status = 'resolved' AND json_extract(options_json, '$.answer') IS NOT NULL ORDER BY binding_ref",
                 params![channel, prefix],
             ).await?;
             let mut answers = Vec::new();
@@ -301,6 +446,20 @@ mod tests {
     use super::*;
     use crate::storage::migrated_test_db;
 
+    #[tokio::test]
+    async fn followed_state_reflects_follow_and_unfollow() {
+        let db = migrated_test_db("channel-ledger-follow-state.db").await;
+        let thread = "cairn://p/CAIRN/3404";
+
+        assert!(!is_thread_followed(&db, "imessage", thread).await.unwrap());
+        assert!(follow_thread(&db, "imessage", thread, 10, 20)
+            .await
+            .unwrap());
+        assert!(is_thread_followed(&db, "imessage", thread).await.unwrap());
+        assert!(unfollow_thread(&db, "imessage", thread).await.unwrap());
+        assert!(!is_thread_followed(&db, "imessage", thread).await.unwrap());
+    }
+
     fn intent<'a>(id: &'a str) -> NewOutbound<'a> {
         NewOutbound {
             id,
@@ -313,6 +472,52 @@ mod tests {
             rendering: "poll",
             created_at: 10,
         }
+    }
+
+    #[tokio::test]
+    async fn only_one_resolver_can_claim_question_cleanup() {
+        let db = migrated_test_db("channel-ledger-cleanup-claim.db").await;
+        assert!(insert_intent(&db, &intent("question")).await.unwrap());
+        assert!(mark_sent(&db, "question", "guid", None, None, 11)
+            .await
+            .unwrap());
+
+        let (first, second) = tokio::join!(
+            claim_question_cleanup(&db, "question", 12),
+            claim_question_cleanup(&db, "question", 12),
+        );
+
+        assert_ne!(first.unwrap(), second.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prompt_answers_ignore_cleanup_only_resolved_siblings() {
+        let db = migrated_test_db("channel-ledger-mixed-question-resolution.db").await;
+        let mut answered = intent("answered");
+        answered.binding_ref = "prompt-1:0";
+        let mut cleanup_only = intent("cleanup-only");
+        cleanup_only.binding_ref = "prompt-1:1";
+        assert!(insert_intent(&db, &answered).await.unwrap());
+        assert!(insert_intent(&db, &cleanup_only).await.unwrap());
+        assert!(mark_sent(&db, "answered", "guid-a", None, None, 11)
+            .await
+            .unwrap());
+        assert!(mark_sent(&db, "cleanup-only", "guid-b", None, None, 11)
+            .await
+            .unwrap());
+        assert!(claim_question_answer(&db, "answered", "Ship it", 12)
+            .await
+            .unwrap());
+        assert!(claim_question_cleanup(&db, "cleanup-only", 12)
+            .await
+            .unwrap());
+
+        assert_eq!(
+            answered_for_prompt(&db, "imessage", "prompt-1")
+                .await
+                .unwrap(),
+            vec![(0, "Ship it".into())]
+        );
     }
 
     #[tokio::test]
@@ -412,6 +617,64 @@ mod tests {
         assert_eq!(
             list_inbound(&db, "imessage", 10).await.unwrap()[0].acknowledged_at,
             Some(21)
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_focus_tracks_the_most_recent_selection_and_follows_survive() {
+        let db = migrated_test_db("channel-ledger-thread-focus.db").await;
+        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 10, 42)
+            .await
+            .unwrap());
+        set_thread_focus(&db, "imessage", "cairn://p/CAIRN/1", 10)
+            .await
+            .unwrap();
+        set_thread_focus(&db, "imessage", "cairn://p/CAIRN/2", 11)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_thread_focus(&db, "imessage").await.unwrap().as_deref(),
+            Some("cairn://p/CAIRN/2")
+        );
+        assert_eq!(
+            list_thread_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_rebases_surviving_follow_to_the_current_live_edge() {
+        let db = migrated_test_db("channel-ledger-thread-restart.db").await;
+        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 10, 5)
+            .await
+            .unwrap());
+
+        advance_thread_cursor(&db, "imessage", "cairn://p/CAIRN/1", 99)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            list_thread_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
+            99,
+            "events accumulated before the restarted session's live edge are skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn refollow_starts_at_the_new_live_edge_instead_of_replaying_backlog() {
+        let db = migrated_test_db("channel-ledger-thread-refollow.db").await;
+        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 10, 5)
+            .await
+            .unwrap());
+        assert!(unfollow_thread(&db, "imessage", "cairn://p/CAIRN/1")
+            .await
+            .unwrap());
+        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 20, 99)
+            .await
+            .unwrap());
+        assert_eq!(
+            list_thread_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
+            99
         );
     }
 }

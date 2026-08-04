@@ -1187,6 +1187,7 @@ mod restart_call_tests {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         })
         .unwrap();

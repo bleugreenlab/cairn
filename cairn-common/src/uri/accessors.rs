@@ -299,7 +299,8 @@ impl CairnResource {
             // sub-resource: an image collection routes by project, so reporting
             // an issue number here would send it down the issue-content path.
             | Self::ProjectImages { .. }
-            | Self::ProjectCheckResults { .. } => None,
+            | Self::ProjectCheckResults { .. }
+            | Self::ProjectCheckObservation { .. } => None,
         }
     }
 
@@ -312,6 +313,7 @@ impl CairnResource {
             | Self::ProjectImages { project, .. }
             | Self::ProjectIssues { project }
             | Self::ProjectCheckResults { project, .. }
+            | Self::ProjectCheckObservation { project, .. }
             | Self::Issue { project, .. }
             | Self::ThreadAlias { project, .. }
             | Self::Node { project, .. }
@@ -497,7 +499,9 @@ impl CairnResource {
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,
-            Self::ProjectImage { .. } | Self::ProjectImages { .. } => None,
+            Self::ProjectImage { .. }
+            | Self::ProjectImages { .. }
+            | Self::ProjectCheckObservation { .. } => None,
         }
     }
 

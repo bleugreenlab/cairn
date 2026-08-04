@@ -57,6 +57,7 @@ pub(crate) async fn insert_attention_push_events(
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: Some(serde_json::json!({ "attention_push_ids": push_ids })),
     };
     let data = serde_json::to_string(&transcript_event).unwrap_or_default();
@@ -109,6 +110,7 @@ pub(crate) fn insert_system_message_sync(
         tool_result: None,
         is_error: false,
         thinking_ms: None,
+        queued_message_id: None,
         raw: Some(raw),
     };
     let data = serde_json::to_string(&event).map_err(|error| error.to_string())?;
@@ -142,22 +144,11 @@ pub(crate) async fn insert_queued_user_events(
 
     for msg in messages {
         let event_id = ids::mint_child(run_id);
-        let content = msg.content.clone();
-        let transcript_event = TranscriptEvent {
-            event_type: "user".to_string(),
-            session_id: session_id.map(|s| s.to_string()),
-            parent_tool_use_id: None,
-            content: Some(content),
-            thinking: None,
-            tool_name: None,
-            tool_input: None,
-            tool_uses: None,
-            tool_use_id: None,
-            tool_result: None,
-            is_error: false,
-            thinking_ms: None,
-            raw: None,
-        };
+        let transcript_event = crate::execution::jobs::queued_user_transcript_event(
+            session_id.unwrap_or_default(),
+            &msg.id,
+            &msg.content,
+        );
         let data = serde_json::to_string(&transcript_event).unwrap_or_default();
 
         if let Err(error) = insert_user_event(
@@ -214,6 +205,7 @@ pub(crate) async fn insert_side_channel_events(
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(serde_json::json!({
                 "side_channel_notice_id": notice.id,
                 "child_uri": notice.child_uri,
@@ -278,6 +270,7 @@ pub(crate) fn insert_side_channel_events_sync(
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: Some(serde_json::json!({
                 "side_channel_notice_id": notice.id,
                 "child_uri": notice.child_uri,
@@ -631,6 +624,27 @@ mod tests {
         let changes = events_changes(&events);
         assert_eq!(changes.len(), 1);
         assert_scoped_events_insert(&changes[0]);
+
+        let data = orch
+            .db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT data FROM events WHERE run_id = 'run-1' AND event_type = 'user'",
+                            (),
+                        )
+                        .await?;
+                    crate::storage::next_text(&mut rows, 0).await
+                })
+            })
+            .await
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(data.as_deref().expect("queued event data")).unwrap();
+        assert_eq!(stored["queuedMessageId"], "qm-1");
+        assert_eq!(stored["raw"]["queued_message_id"], "qm-1");
     }
 
     #[tokio::test]

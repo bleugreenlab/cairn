@@ -89,6 +89,7 @@ mod node_segments;
 mod notify;
 mod orchestrator;
 mod resources;
+mod resume_timing;
 mod services;
 mod storage;
 mod team_remote_intents;

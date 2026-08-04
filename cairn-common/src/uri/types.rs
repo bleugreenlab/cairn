@@ -92,6 +92,10 @@ pub enum CairnResource {
     Project {
         project: String,
     },
+    ProjectCheckObservation {
+        project: String,
+        handle: String,
+    },
     ProjectIssues {
         project: String,
     },
@@ -670,6 +674,7 @@ impl CairnResource {
             Self::Project { .. } => ResourceKind::Project,
             Self::ProjectIssues { .. } => ResourceKind::ProjectIssues,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
+            Self::ProjectCheckObservation { .. } => ResourceKind::ProjectCheckObservation,
             Self::ProjectImage { .. } => ResourceKind::ProjectImage,
             Self::ProjectImages { .. } => ResourceKind::ProjectImages,
             Self::ProjectMessages { .. } => ResourceKind::ProjectMessages,

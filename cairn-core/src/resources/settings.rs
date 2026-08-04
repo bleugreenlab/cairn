@@ -21,7 +21,6 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
     // --- App preferences ---
     let settings = orch.get_settings();
     out.push_str("## App preferences\n\n");
-    out.push_str(&format!("- branchPrefix: `{}`\n", settings.branch_prefix));
     out.push_str(&format!(
         "- maxThinkingTokens: {}\n",
         settings
@@ -30,10 +29,6 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
             .unwrap_or_else(|| "disabled".to_string())
     ));
     out.push_str(&format!("- mergeType: {:?}\n", settings.merge_type));
-    out.push_str(&format!(
-        "- pullOnMerge: {}\n",
-        yes_no(settings.pull_on_merge)
-    ));
     out.push_str(&format!(
         "- orphanCleanupDays: {}\n",
         settings.orphan_cleanup_days
@@ -108,13 +103,17 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
     if let Ok(snapshots) = orch.provider_usage_snapshots.read() {
         if !snapshots.is_empty() {
             out.push_str("## Provider usage (read-only)\n\n");
-            let mut keys: Vec<&String> = snapshots.keys().collect();
+            let mut keys: Vec<&(String, Option<String>)> = snapshots.keys().collect();
             keys.sort();
             for key in keys {
                 let snapshot = &snapshots[key];
                 out.push_str(&format!(
-                    "- {}: {} window(s)",
+                    "- {}{}: {} window(s)",
                     snapshot.backend,
+                    key.1
+                        .as_deref()
+                        .map(|id| format!(" account {id}"))
+                        .unwrap_or_default(),
                     snapshot.windows.len()
                 ));
                 if let Some(reason) = &snapshot.unsupported_reason {
@@ -166,18 +165,23 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         out.push_str("No customizations (defaults in effect).\n\n");
     } else {
         for keybind in &keybinds.keybinds {
-            let mods = keybind
-                .modifiers
-                .iter()
-                .map(|m| format!("{m:?}"))
-                .collect::<Vec<_>>()
-                .join("+");
-            let combo = if keybind.key.is_empty() {
+            let combo = if keybind.sequence.is_empty() {
                 "(disabled)".to_string()
-            } else if mods.is_empty() {
-                keybind.key.clone()
             } else {
-                format!("{mods}+{}", keybind.key)
+                keybind
+                    .sequence
+                    .iter()
+                    .map(|stroke| {
+                        let mut parts = stroke
+                            .modifiers
+                            .iter()
+                            .map(|modifier| modifier.normalized_name())
+                            .collect::<Vec<_>>();
+                        parts.push(&stroke.key);
+                        parts.join("+")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
             };
             out.push_str(&format!("- {}: {}\n", keybind.action, combo));
         }

@@ -6,8 +6,7 @@
 use crate::agent_process::args::{build_claude_args, ClaudeArgsConfig};
 use crate::agent_process::memory::{MemoryProbe, OsMemoryProbe};
 use crate::agent_process::stream::{
-    parse_event, ClaudeEvent, DeltaContent, RateLimitInfo, StreamEventInner, TokenCounts,
-    TranscriptEvent, Usage,
+    ClaudeEvent, DeltaContent, RateLimitInfo, StreamEventInner, TokenCounts, TranscriptEvent, Usage,
 };
 use crate::agent_process::turn_boundary::{
     should_interrupt_terminal_tool_at_boundary, TurnBoundaryChecker,
@@ -420,6 +419,19 @@ fn emit_streaming_delta(
     thinking_ms: Option<i64>,
     tool_write: Option<&StreamingToolWrite>,
 ) {
+    if crate::resume_timing::mark_first(format!("claude-streaming-emit:{run_id}")) {
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("claude_first_streaming_emit");
+        event.run_id = Some(run_id);
+        event.stream_id = Some(event_id);
+        event.bytes = Some(
+            delta.content_delta.as_ref().map_or(0, String::len)
+                + delta.thinking_delta.as_ref().map_or(0, String::len),
+        );
+        event.emit();
+    }
+    crate::transcripts::stream_store::trace_first_frontend_delta_emit(
+        run_id, None, event_id, delta,
+    );
     let _ = orch.services.emitter.emit(
         "streaming-update",
         serde_json::json!({
@@ -1029,6 +1041,16 @@ impl AgentBackend for ClaudeBackend {
         let start_time = std::time::Instant::now();
 
         let session_id = Some(config.session_start.session_id().to_string());
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("claude_prepare_start");
+        event.run_id = Some(&config.run_id);
+        event.session_id = session_id.as_deref();
+        event.mode = Some(if config.session_start.replayed_backend_id().is_some() {
+            "resume"
+        } else {
+            "new"
+        });
+        event.bytes = Some(config.prompt.len());
+        event.emit();
 
         // Effective model recorded on the process handle for warm-reuse
         // reconciliation (captured before `config.model` is moved into args).
@@ -1112,11 +1134,15 @@ impl AgentBackend for ClaudeBackend {
         let claude_path = get_claude_path(&orch.process_state)?;
 
         log::debug!("ClaudeBackend: command built, claude_path={}", claude_path);
-        log::debug!("ClaudeBackend: args={:?}", claude_args);
+        log::debug!("ClaudeBackend: argument count={}", claude_args.len());
         log::debug!("ClaudeBackend: working_dir={}", config.working_dir);
 
-        log::info!("[PROFILE] Command built: {:?}", start_time.elapsed());
-        log::info!("Spawning claude: {} {:?}", claude_path, claude_args);
+        let mut event =
+            crate::resume_timing::ResumeTimingEvent::new("claude_args_ready").elapsed(start_time);
+        event.run_id = Some(&config.run_id);
+        event.session_id = session_id.as_deref();
+        event.count = Some(claude_args.len());
+        event.emit();
 
         // Get MCP authentication secret (shared secret for TOTP-style passcodes)
         let mcp_secret = orch
@@ -1208,15 +1234,30 @@ impl AgentBackend for ClaudeBackend {
         // with the same 400 (CAIRN-3263). Repair it now, while no CLI process
         // holds the file open.
         if let Some(backend_id) = config.session_start.replayed_backend_id() {
-            super::claude_transcript::repair_before_resume(
+            let repair_started = std::time::Instant::now();
+            let repair = super::claude_transcript::repair_before_resume(
                 claude_config_dir.as_deref(),
                 std::path::Path::new(&config.working_dir),
                 backend_id,
             );
+            let mut event =
+                crate::resume_timing::ResumeTimingEvent::new("claude_transcript_repair")
+                    .elapsed(repair_started);
+            event.run_id = Some(&config.run_id);
+            event.session_id = session_id.as_deref();
+            event.mode = Some(if repair.used_full_scan {
+                "full"
+            } else {
+                "incremental"
+            });
+            event.count = Some(repair.lines_parsed);
+            event.bytes = Some(repair.bytes_read.min(usize::MAX as u64) as usize);
+            event.emit();
         }
 
         // Check if we need to evict a warm process to make room
         orch.collect_warm_if_needed();
+        let spawn_started = std::time::Instant::now();
 
         log::debug!("ClaudeBackend: about to spawn");
         let mut child = orch.services.process.spawn(spawn_config).map_err(|e| {
@@ -1230,7 +1271,11 @@ impl AgentBackend for ClaudeBackend {
             e
         })?;
         log::debug!("ClaudeBackend: spawned, pid={}", child.id());
-        log::info!("[PROFILE] Process spawned: {:?}", start_time.elapsed());
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("claude_process_spawned")
+            .elapsed(spawn_started);
+        event.run_id = Some(&config.run_id);
+        event.session_id = session_id.as_deref();
+        event.emit();
 
         // Transition run to Running AFTER successful spawn (sets started_at accurately)
         log::debug!("ClaudeBackend: transitioning run to running");
@@ -1292,6 +1337,13 @@ impl AgentBackend for ClaudeBackend {
                 stdin_writer
                     .flush()
                     .map_err(|e| format!("Failed to flush stdin: {}", e))?;
+                let mut event =
+                    crate::resume_timing::ResumeTimingEvent::new("claude_initial_stdin_written")
+                        .elapsed(start_time);
+                event.run_id = Some(&config.run_id);
+                event.session_id = session_id.as_deref();
+                event.bytes = Some(initial_message.to_string().len());
+                event.emit();
                 log::info!(
                     "Sent initial prompt via stdin ({} chars)",
                     config.prompt.len()
@@ -1304,7 +1356,7 @@ impl AgentBackend for ClaudeBackend {
         let orch = orch.clone();
         let emitter = orch.services.emitter.clone();
 
-        let thread_session_id = session_id;
+        let thread_session_id = session_id.clone();
 
         // Spawn thread to read stdout and emit events
         thread::spawn(move || {
@@ -1320,10 +1372,11 @@ impl AgentBackend for ClaudeBackend {
             );
         });
 
-        log::info!(
-            "[PROFILE] ClaudeBackend::start_session returning: {:?}",
-            start_time.elapsed()
-        );
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("claude_reader_started")
+            .elapsed(start_time);
+        event.run_id = Some(&config.run_id);
+        event.session_id = session_id.as_deref();
+        event.emit();
         Ok(())
     }
 
@@ -1510,6 +1563,11 @@ impl ClaudeBackend {
         log::debug!("[PROFILE] Reader thread started");
         let mut lines_read: u64 = 0;
         let mut first_event_logged = false;
+        let mut first_stdout_logged = false;
+        let mut parse_metrics = crate::agent_process::stream::ParseMetrics::default();
+        let mut read_failures: usize = 0;
+        let mut first_message_start_logged = false;
+        let mut first_nonempty_delta_logged = false;
         let mut boundary_checker = TurnBoundaryChecker::new();
         let mut terminal_tool_suspended = false;
         // Set when we send the terminal-tool boundary interrupt to end a work
@@ -1549,6 +1607,16 @@ impl ClaudeBackend {
             let line = match line_result {
                 Ok(l) => {
                     lines_read += 1;
+                    if !first_stdout_logged {
+                        let mut event =
+                            crate::resume_timing::ResumeTimingEvent::new("claude_first_stdout")
+                                .elapsed(thread_start);
+                        event.run_id = Some(run_id);
+                        event.session_id = session_id.as_deref();
+                        event.bytes = Some(l.len());
+                        event.emit();
+                        first_stdout_logged = true;
+                    }
                     if !l.contains("\"type\":\"stream_event\"") {
                         log::trace!(
                             "reader_thread: line {}: {}",
@@ -1559,6 +1627,7 @@ impl ClaudeBackend {
                     l
                 }
                 Err(e) => {
+                    read_failures += 1;
                     log::debug!("reader_thread: error reading line: {}", e);
                     log::error!("Error reading line: {}", e);
                     continue;
@@ -1569,8 +1638,20 @@ impl ClaudeBackend {
                 continue;
             }
 
-            match parse_event(&line) {
+            let parse_started = std::time::Instant::now();
+            match parse_metrics.parse(&line) {
                 Ok((event, raw)) => {
+                    if !first_event_logged {
+                        let mut timing = crate::resume_timing::ResumeTimingEvent::new(
+                            "claude_first_parsed_event",
+                        )
+                        .elapsed(parse_started);
+                        timing.run_id = Some(run_id);
+                        timing.session_id = session_id.as_deref();
+                        timing.count = Some(parse_metrics.failures);
+                        timing.emit();
+                        first_event_logged = true;
+                    }
                     last_event_kind = claude_event_kind(&event);
                     // A terminal Result seen at any point means the turn completed;
                     // capture it before any branch so a later EOF finalizes Exited.
@@ -1728,14 +1809,6 @@ impl ClaudeBackend {
                         continue;
                     }
 
-                    if !first_event_logged {
-                        log::info!(
-                            "[PROFILE] First event received: {:?}",
-                            thread_start.elapsed()
-                        );
-                        first_event_logged = true;
-                    }
-
                     // Handle streaming events (skip if session ended via terminal tool)
                     if let ClaudeEvent::StreamEvent {
                         inner,
@@ -1762,6 +1835,17 @@ impl ClaudeBackend {
                         }
                         match inner {
                             StreamEventInner::MessageStart { .. } => {
+                                let current_turn = orch.process_state.get_current_turn_id(run_id);
+                                if !first_message_start_logged {
+                                    let mut timing = crate::resume_timing::ResumeTimingEvent::new(
+                                        "claude_first_message_start",
+                                    );
+                                    timing.run_id = Some(run_id);
+                                    timing.session_id = session_id.as_deref();
+                                    timing.turn_id = current_turn.as_deref();
+                                    timing.emit();
+                                    first_message_start_logged = true;
+                                }
                                 if streaming_state.is_some() {
                                     log::warn!("New MessageStart while a stream is still active");
                                     finalize_streaming_message(
@@ -1778,7 +1862,6 @@ impl ClaudeBackend {
                                 }
                                 pending_delta_usage = None;
                                 last_thinking_tokens = pending_thinking_tokens.take();
-                                let current_turn = orch.process_state.get_current_turn_id(run_id);
                                 match open_stream(
                                     run_db.clone(),
                                     run_id,
@@ -1843,6 +1926,31 @@ impl ClaudeBackend {
                                 }
                             }
                             StreamEventInner::ContentBlockDelta { delta, .. } => {
+                                let delta_trace = match delta {
+                                    DeltaContent::TextDelta { text } if !text.is_empty() => {
+                                        Some(("content", text.len()))
+                                    }
+                                    DeltaContent::ThinkingDelta { thinking }
+                                        if !thinking.is_empty() =>
+                                    {
+                                        Some(("thinking", thinking.len()))
+                                    }
+                                    _ => None,
+                                };
+                                if !first_nonempty_delta_logged {
+                                    if let Some((mode, bytes)) = delta_trace {
+                                        let mut timing =
+                                            crate::resume_timing::ResumeTimingEvent::new(
+                                                "claude_first_nonempty_delta",
+                                            );
+                                        timing.run_id = Some(run_id);
+                                        timing.session_id = session_id.as_deref();
+                                        timing.mode = Some(mode);
+                                        timing.bytes = Some(bytes);
+                                        timing.emit();
+                                        first_nonempty_delta_logged = true;
+                                    }
+                                }
                                 if let Some(ref mut state) = streaming_state {
                                     match delta {
                                         DeltaContent::TextDelta { text } => {
@@ -2419,6 +2527,15 @@ impl ClaudeBackend {
             }
         }
 
+        let mut parse_summary =
+            crate::resume_timing::ResumeTimingEvent::new("claude_stream_parse_summary");
+        parse_summary.run_id = Some(run_id);
+        parse_summary.session_id = session_id.as_deref();
+        parse_summary.duration_us = Some(parse_metrics.duration.as_micros());
+        parse_summary.parse_attempts = Some(parse_metrics.attempts);
+        parse_summary.parse_failures = Some(parse_metrics.failures + read_failures);
+        parse_summary.emit();
+
         // Finalize any remaining durable stream on EOF
         finalize_streaming_message(
             orch,
@@ -2843,6 +2960,7 @@ mod flush_pending_tests {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         }
     }
@@ -2865,6 +2983,7 @@ mod flush_pending_tests {
             tool_result: None,
             is_error: false,
             thinking_ms: None,
+            queued_message_id: None,
             raw: None,
         }
     }
