@@ -106,7 +106,7 @@ fn store_transcript_event_with_turn(
 ) -> Result<(), String> {
     let event_id = ids::mint_child(run_id);
     let event_type = transcript_event.event_type.clone();
-    let event_data = serde_json::to_string(&transcript_event).unwrap_or_default();
+    let event_data = transcript_event.observed().to_event_json();
     let turn_id = turn_id.map(str::to_string);
 
     let event = EventInsert {

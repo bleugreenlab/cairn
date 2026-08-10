@@ -24,13 +24,16 @@ mod review_push;
 mod stop;
 
 pub(crate) use common::set_exit_reason;
-pub(crate) use finalize::memory_review_turn_ended;
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state};
+pub(crate) use finalize::{
+    finalize_run_for_recovery, memory_review_turn_ended, report_recovery_launch_failure,
+};
 pub(crate) use review_push::detach_onto_runtime;
 pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
+pub(crate) use stop::PROVIDER_SILENCE_RECOVERY_EXIT_REASON;
 #[cfg(test)]
 pub(crate) use stop::USER_STOP_TOOL_RESULT;
 pub use stop::{
@@ -46,7 +49,7 @@ pub(crate) use finalize::finish_memory_review_if_due;
 #[cfg(test)]
 pub(crate) use finalize::handle_session_crash;
 #[cfg(test)]
-pub(crate) use review_push::review_artifact_ref;
+pub(crate) use review_push::{record_bounded_rearm_lookup_failure, review_artifact_ref};
 #[cfg(test)]
 pub(crate) use stop::{stop_session_internal, InterruptFailurePolicy};
 

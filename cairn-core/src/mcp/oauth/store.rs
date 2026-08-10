@@ -17,6 +17,39 @@ use serde::{Deserialize, Serialize};
 
 use super::{refresh_access_token, TokenSet, EXPIRY_SKEW_SECS};
 
+/// Short-lived authorization state stored in the same keychain namespace as
+/// tokens so a deep-link callback can safely complete a later process turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingAuthorization {
+    pub state: String,
+    pub code_verifier: String,
+    pub created_at: i64,
+}
+
+pub fn save_pending(key: &str, pending: &PendingAuthorization) -> Result<(), String> {
+    let blob = serde_json::to_string(pending)
+        .map_err(|e| format!("Failed to serialize pending OAuth authorization: {e}"))?;
+    entry(key)?
+        .set_password(&blob)
+        .map_err(|e| format!("Failed to store pending OAuth authorization: {e}"))
+}
+
+pub fn take_pending(key: &str) -> Result<Option<PendingAuthorization>, String> {
+    let Some(raw) = (match entry(key)?.get_password() {
+        Ok(value) => Some(value),
+        Err(Error::NoEntry) => None,
+        Err(e) => return Err(format!("Failed to read pending OAuth authorization: {e}")),
+    }) else {
+        return Ok(None);
+    };
+    entry(key)?
+        .delete_credential()
+        .map_err(|e| format!("Failed to clear pending OAuth authorization: {e}"))?;
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| format!("Stored pending OAuth authorization is corrupt: {e}"))
+}
+
 /// Everything needed to attach a bearer token and refresh it without re-running
 /// discovery: the resolved endpoints, the client, the canonical resource, the
 /// granted scopes, and the tokens.
@@ -286,6 +319,21 @@ mod tests {
             scopes: vec!["read".to_string()],
             needs_scopes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pending_authorization_is_consumed_once() {
+        mock_keychain::install();
+        let key = "pending-consumed-once";
+        let pending = PendingAuthorization {
+            state: "state".to_string(),
+            code_verifier: "verifier".to_string(),
+            created_at: 123,
+        };
+
+        save_pending(key, &pending).unwrap();
+        assert_eq!(take_pending(key).unwrap(), Some(pending));
+        assert_eq!(take_pending(key).unwrap(), None);
     }
 
     #[test]

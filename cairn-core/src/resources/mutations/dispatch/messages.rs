@@ -26,9 +26,15 @@ pub(super) async fn dispatch(
                     content.len()
                 )
             } else {
-                messages::append_project_or_issue_message(orch, request, project, None, content)
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?
+                messages::append_project_or_issue_message(
+                    orch,
+                    messages::MessageAuthor::Mcp(request),
+                    project,
+                    None,
+                    content,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?
             }
         }
         (CairnResource::IssueMessages { project, number }, ChangeMode::Append) => {
@@ -43,7 +49,7 @@ pub(super) async fn dispatch(
             } else {
                 messages::append_project_or_issue_message(
                     orch,
-                    request,
+                    messages::MessageAuthor::Mcp(request),
                     project,
                     Some(*number),
                     content,

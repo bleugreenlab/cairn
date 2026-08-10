@@ -510,20 +510,21 @@ async fn delete_remote_branches_for_repo(
             return;
         }
     };
-    let creds =
-        match crate::github::credentials::get_credentials_for_owner(&orch.db.local, &owner).await {
-            Ok(creds) => creds,
-            Err(e) => {
-                log::warn!(
-                    "Teardown: skipping remote branch cleanup (no GitHub credentials): {}",
-                    e
-                );
-                return;
-            }
-        };
+    let auth = match crate::security::broker::github::installation_authority(&orch.db.local, &owner)
+        .await
+    {
+        Ok(auth) => auth,
+        Err(e) => {
+            log::warn!(
+                "Teardown: skipping remote branch cleanup (no GitHub credentials): {}",
+                e
+            );
+            return;
+        }
+    };
     crate::github::api::delete_remote_branches(
         &*orch.services.http,
-        &creds,
+        &auth,
         &owner,
         &repo,
         branches,

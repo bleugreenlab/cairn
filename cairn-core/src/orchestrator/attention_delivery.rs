@@ -3,17 +3,18 @@
 //! Creates and renders attention pushes. Two responsibilities:
 //!
 //! 1. **Create pushes.** [`create_resolved_push`] turns a terminal `Resolved`
-//!    fact into a `resolved:{issue}` push to the issue's watchers. Failure is
-//!    rousing; successful resolution remains passive.
+//!    fact into a `resolved:{issue}` push to the issue's watchers. Terminal child
+//!    resolution rouses its parent coordinator; mutes downgrade that push to a
+//!    passive digest entry.
 //!    [`create_catchup_push`] creates the passive `catchup:{child-job}` push at
 //!    the user→child message moment, resolved at delivery against the parent's
 //!    read cursor. Question and permission pushes are created at their own emit
 //!    sites (where the producing node is known) through
 //!    [`push_to_issue_watchers`].
-//! 2. **Render pushes at resume time.** [`render_pushes_resolved`] resolves most
-//!    drained push `content_ref`s to rendered resource content so a resumed agent
-//!    acts without a round-trip read. Terminal `resolved:` pushes are rendered as
-//!    concise confirmations instead of dumping the resolved issue body.
+//! 2. **Render pushes at resume time.** [`render_pushes_resolved`] gives every
+//!    drained push a compact reference-first summary. Cheap, targeted database
+//!    details are retained for direct messages, catch-up digests, and terminal
+//!    resolutions; full resources are read by the agent only when needed.
 
 use cairn_db::turso::params;
 
@@ -29,8 +30,9 @@ use crate::storage::{run_db_blocking, LocalDb, RowExt};
 /// idle edge, the PR webhook, and `wake_for_issue`) through the
 /// `emit_attention_event` funnel. Non-`Resolved` facts are ignored — question
 /// and permission pushes are created at their own emit sites where the producing
-/// node is known. Failed resolution wakes subscribed idle watchers; merged and
-/// closed resolution remain passive ride-along information. Supersede-by-key
+/// node is known. Failed resolution wakes subscribed idle watchers; every terminal
+/// resolution wakes the resolved child's parent coordinator. Other successful
+/// resolution subscriptions remain passive. Supersede-by-key
 /// collapses repeat undelivered emits, while a status/update fingerprint prevents
 /// the same terminal resolution from re-firing after delivery. The resolved child
 /// issue's own jobs are excluded so a child never receives its own notification.
@@ -38,11 +40,6 @@ pub(crate) fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) 
     let final_status = match &event.fact {
         AttentionFact::Resolved { final_status } => final_status.clone(),
         _ => return,
-    };
-    let wake = if final_status == crate::models::IssueStatus::Failed {
-        Wake::Wake
-    } else {
-        Wake::Passive
     };
     let fingerprint = format!("status:{final_status}:{}", event.updated_at);
     let status_text = final_status.to_string();
@@ -55,6 +52,8 @@ pub(crate) fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) 
             .map_err(|e| e.to_string())?;
         let key = format!("resolved:{issue_uri}");
         let watchers = crate::orchestrator::wakes::watcher_jobs_for_issue(&db, &issue_uri).await?;
+        let parent_coordinator =
+            crate::orchestrator::wakes::coordinating_job_for_child_issue(&db, &issue_uri).await?;
         let mut pushed = Vec::new();
         for recipient in watchers {
             if job_belongs_to_issue(&db, &recipient, &issue_id).await? {
@@ -75,11 +74,18 @@ pub(crate) fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) 
                     continue;
                 }
             }
+            let requested_wake = if final_status == crate::models::IssueStatus::Failed
+                || parent_coordinator.as_deref() == Some(recipient.as_str())
+            {
+                Wake::Wake
+            } else {
+                Wake::Passive
+            };
             let (_, effective) = super::attention_push::push_with_fingerprint(
                 &db,
                 &recipient,
                 &issue_uri,
-                wake,
+                requested_wake,
                 Boundary::Event,
                 &key,
                 Some(&fingerprint),
@@ -455,36 +461,6 @@ async fn count_job_chat_turns(db: &LocalDb, job_id: &str) -> i64 {
     .unwrap_or(0)
 }
 
-/// Resolve a single `cairn://` (or file/web) URI to rendered markdown via the
-/// same `read_batch` path that backs `cairn read [uri]`. `run_id` is `None` so
-/// the briefing never pollutes the agent's read-dedup state. Returns `None` on a
-/// resolution failure (e.g. a fence suspension string, which is not an
-/// envelope) or an empty body, so the caller can fall back to a bare pointer.
-async fn resolve_uri_to_markdown(orch: &Orchestrator, uri: &str) -> Option<String> {
-    let request = crate::mcp::types::McpCallbackRequest {
-        thread_id: None,
-        cwd: String::new(),
-        run_id: None,
-        tool: "read_batch".to_string(),
-        payload: serde_json::json!({ "paths": [uri] }),
-        tool_use_id: None,
-    };
-    let cursors = std::sync::Mutex::new(std::collections::HashMap::new());
-    let raw = crate::mcp::handlers::read::handle_read_batch(orch, &request, &cursors).await;
-    let envelope: cairn_common::read::ReadBatchEnvelope = serde_json::from_str(&raw).ok()?;
-    let text = envelope.text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
-/// Max characters of resolved push content inlined into a reminder/prompt
-/// (CAIRN-1891). A full PR diff can be huge; cap to a useful rendered view and
-/// keep the `content_ref` URI so the agent can follow it for the rest.
-const PUSH_CONTENT_CAP: usize = 4000;
-
 /// How many operator messages a catch-up digest names, and how much of each.
 const CATCHUP_DIGEST_MESSAGES: usize = 5;
 const CATCHUP_DIGEST_CHARS: usize = 240;
@@ -492,13 +468,10 @@ const CATCHUP_DIGEST_CHARS: usize = 240;
 /// The operator messages a watcher has not caught up on for `child_job_id`, as a
 /// bounded digest line per message (CAIRN-3342).
 ///
-/// This exists because the catch-up window alone cannot carry the fact reliably.
-/// The window is `{child}/chat?offset={cursor}` and [`cap_push_content`] cuts it
-/// **from the front**, so for a busy child — whose unread window can run to
-/// dozens of turns — the newest thing in it, which is precisely the operator's
-/// message, is the first thing discarded. The digest is rendered ahead of the
-/// window so the load-bearing fact survives the cap, and the window follows as
-/// context.
+/// This exists because the reference alone cannot carry the fact reliably. A
+/// busy child's unread chat window can run to dozens of turns, while the newest
+/// operator message is the load-bearing reason for the notification. The digest
+/// carries that bounded fact inline and the URI supplies context on demand.
 ///
 /// The one source is `queued_messages`, because it is the one durable record
 /// whose every row is text a human typed at this job: the composer's queued
@@ -511,7 +484,8 @@ const CATCHUP_DIGEST_CHARS: usize = 240;
 /// issue bodies they had written themselves (CAIRN-3390), which is both noise a
 /// long-lived thread pays for forever and a false claim about who spoke. What
 /// cannot be established as operator-authored is therefore left out rather than
-/// guessed at; the chat window that follows still carries it as context.
+/// guessed at; the canonical chat-window URI still supplies that context on
+/// demand.
 ///
 /// A row is named while it is still **pending** — the node has not read it, so it
 /// stays live information for as long as that holds — or when it was sent at or
@@ -630,14 +604,61 @@ async fn resolved_issue_confirmation(orch: &Orchestrator, issue_uri: &str) -> Op
                 return Ok(None);
             };
             let message = match issue.status {
-                crate::models::IssueStatus::Merged => "Issue Merged Successfully",
-                crate::models::IssueStatus::Closed => "Issue Closed Successfully",
+                crate::models::IssueStatus::Merged => "merged",
+                crate::models::IssueStatus::Closed => "closed",
                 crate::models::IssueStatus::Failed => {
-                    "Issue Failed — inspect the child and retry or delegate a fix"
+                    return Ok(Some(format!(
+                        "{}-{} \"{}\" failed — inspect the child and retry or delegate a fix",
+                        issue.project_key, issue.number, issue.title
+                    )))
                 }
                 _ => return Ok(None),
             };
-            Ok(Some(message.to_string()))
+            let mut rows = conn
+                .query(
+                    "SELECT mr.github_pr_number, mr.status, a.action, a.actor_kind, a.actor_identity
+                     FROM merge_requests mr
+                     LEFT JOIN pr_resolution_attributions a ON a.id = (
+                         SELECT a2.id FROM pr_resolution_attributions a2
+                         WHERE a2.merge_request_id = mr.id
+                         ORDER BY a2.created_at DESC LIMIT 1
+                     )
+                     WHERE mr.issue_id = ?1
+                     ORDER BY mr.updated_at DESC LIMIT 1",
+                    params![issue.issue_id.as_str()],
+                )
+                .await?;
+            let pr = match rows.next().await? {
+                Some(row) => {
+                    let number = row.opt_i64(0)?;
+                    let pr_status = row.text(1)?;
+                    let action = row.opt_text(2)?;
+                    let actor_kind = row.opt_text(3)?;
+                    let actor_identity = row.opt_text(4)?;
+                    let action_matches_state = matches!(
+                        (message, pr_status.as_str(), action.as_deref()),
+                        ("merged", "merged", Some("merge")) | ("closed", "closed", Some("close"))
+                    );
+                    number
+                        .filter(|number| *number > 0 && action_matches_state)
+                        .map(|number| {
+                            let actor = match (actor_kind.as_deref(), actor_identity.as_deref()) {
+                                (Some("operator-ui"), _) => "operator (UI)".to_string(),
+                                (Some("operator-cli"), _) => "operator (CLI)".to_string(),
+                                (_, Some(identity)) => identity.to_string(),
+                                (Some(kind), _) => kind.to_string(),
+                                _ => "unknown actor".to_string(),
+                            };
+                            format!(" PR #{number}, by {actor}")
+                        })
+                }
+                None => None,
+            }
+            .unwrap_or_default();
+            Ok(Some(format!(
+                "{}-{} \"{}\" {message}.{pr}",
+                issue.project_key, issue.number, issue.title
+            )))
         })
     })
     .await
@@ -645,14 +666,15 @@ async fn resolved_issue_confirmation(orch: &Orchestrator, issue_uri: &str) -> Op
     .flatten()
 }
 
-/// Render a drained attention push with its referent content resolved inline
-/// (CAIRN-1891), so the agent acts without a round-trip read. The header carries
-/// the wake level and the `content_ref` URI; the body is the rendered resource
-/// (the PR summary/diff, plan, question, or permission), capped. Resolution uses
-/// the same in-process read that backs `cairn read {uri}` (and the briefing).
-/// Terminal `resolved:` pushes are intentionally concise confirmations instead
-/// of a full issue read. Falls back to the bare header line when resolution
-/// yields nothing, so the agent still has the URI to follow.
+/// Render a drained attention push as a compact, reference-first update.
+///
+/// Direct messages, catch-up digests, terminal resolutions, and check verdicts
+/// have bounded, targeted database lookups because their essential detail is not
+/// represented by the resource URI alone. Other push kinds deliberately do not
+/// render their full resource here: resume prompt assembly holds the launch lock,
+/// and making a resource read per pending push made user messages wait tens of
+/// seconds. The URI remains the canonical route to the live content through the
+/// read tool.
 pub(crate) async fn render_push_resolved(
     orch: &Orchestrator,
     push: &crate::orchestrator::attention_push::Push,
@@ -667,6 +689,20 @@ pub(crate) async fn render_push_resolved(
             Some(body) => format!("{header}\n\n{body}"),
             None => header,
         };
+    }
+
+    // A `turn-checks:` push exists to say that a check went red, and a verdict is
+    // short. Waking an agent only to send it somewhere else to find out why costs
+    // a whole turn to learn one sentence, so the verdicts are rendered here from
+    // the job's own recorded rows (CAIRN-3848). Deliberately scoped to the
+    // `turn-checks:` prefix: the sibling `turn-checks-infrastructure:` push goes
+    // to the PARENT, whose own rows are not the ones it reports on.
+    if push.key.starts_with("turn-checks:") {
+        if let Some(body) =
+            crate::execution::checks_status::check_wake_body(orch, &push.recipient).await
+        {
+            return format!("{header}\n\n{body}");
+        }
     }
 
     // A `direct:` push carries frozen message content, not an idempotent
@@ -684,9 +720,8 @@ pub(crate) async fn render_push_resolved(
             _ => header,
         };
     }
-    // A `catchup:` push leads with the operator-message digest and follows with
-    // the chat window, so the fact the coordinator must not miss sits ahead of
-    // the cap rather than behind it (CAIRN-3342).
+    // A `catchup:` push carries the operator-message digest without rendering the
+    // potentially enormous chat window. The URI remains available for follow-up.
     let digest = match push.key.strip_prefix("catchup:") {
         Some(child_job_id) => {
             let db = crate::execution::routing::owning_db_for_job(&orch.db, child_job_id)
@@ -696,19 +731,23 @@ pub(crate) async fn render_push_resolved(
         }
         None => None,
     };
-    let body = resolve_uri_to_markdown(orch, &push.content_ref)
-        .await
-        .map(|body| cap_push_content(&body, &push.content_ref));
-    match (digest, body) {
-        (Some(digest), Some(body)) => format!("{header}\n\n{digest}\n\n{body}"),
-        (Some(digest), None) => format!("{header}\n\n{digest}"),
-        (None, Some(body)) => format!("{header}\n\n{body}"),
-        (None, None) => header,
+    if let Some(digest) = digest {
+        return format!("{header}\n\n{digest}");
     }
+    let prefix = push
+        .key
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(&push.key);
+    let (_, headline) = super::attention_push::push_kind_headline(prefix);
+    format!(
+        "{header}\n\n{headline}. Read {} for the current content.",
+        push.content_ref
+    )
 }
 
-/// Resolve and render several pushes into one block (CAIRN-1891), or `None` when
-/// the slice is empty so callers can fold it into an optional prompt section.
+/// Render several pushes concurrently into one compact block, or `None` when the
+/// slice is empty so callers can fold it into an optional prompt section.
 pub(crate) async fn render_pushes_resolved(
     orch: &Orchestrator,
     pushes: &[crate::orchestrator::attention_push::Push],
@@ -716,21 +755,19 @@ pub(crate) async fn render_pushes_resolved(
     if pushes.is_empty() {
         return None;
     }
-    let mut blocks = Vec::with_capacity(pushes.len());
-    for push in pushes {
-        blocks.push(render_push_resolved(orch, push).await);
-    }
-    Some(blocks.join("\n\n"))
-}
+    use futures_util::{stream, StreamExt};
 
-/// Cap resolved push content to [`PUSH_CONTENT_CAP`] characters on a char
-/// boundary, appending a pointer to the full resource when truncated.
-fn cap_push_content(body: &str, uri: &str) -> String {
-    if body.chars().count() <= PUSH_CONTENT_CAP {
-        return body.to_string();
-    }
-    let truncated: String = body.chars().take(PUSH_CONTENT_CAP).collect();
-    format!("{truncated}\n\n… [truncated — read {uri} for the full content]")
+    let mut blocks = stream::iter(pushes.iter().enumerate())
+        .map(|(index, push)| async move { (index, render_push_resolved(orch, push).await) })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    blocks.sort_by_key(|(index, _)| *index);
+    let blocks = blocks
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect::<Vec<_>>();
+    Some(blocks.join("\n\n"))
 }
 
 #[cfg(test)]
@@ -739,33 +776,6 @@ mod tests {
     use crate::storage::LocalDb;
 
     const CHILD_URI: &str = "cairn://p/PROJ/2";
-
-    #[test]
-    fn cap_push_content_passes_short_content_through() {
-        let body = "a short rendered body";
-        assert_eq!(cap_push_content(body, "cairn://p/PROJ/2"), body);
-    }
-
-    #[test]
-    fn cap_push_content_truncates_and_points_to_uri() {
-        let body = "x".repeat(PUSH_CONTENT_CAP + 500);
-        let uri = "cairn://p/PROJ/2/1/builder/pr";
-        let capped = cap_push_content(&body, uri);
-        assert!(capped.chars().count() < body.chars().count());
-        assert!(capped.contains("truncated"));
-        assert!(
-            capped.contains(uri),
-            "truncation must keep a pointer to the full resource"
-        );
-    }
-
-    #[test]
-    fn cap_push_content_respects_char_boundaries() {
-        // A multi-byte char at the cap boundary must not panic the truncation.
-        let body = "\u{1f600}".repeat(PUSH_CONTENT_CAP + 10);
-        let capped = cap_push_content(&body, "cairn://p/PROJ/2");
-        assert!(capped.contains("truncated"));
-    }
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("attention-delivery.db").await
@@ -843,13 +853,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_push_is_reference_first_without_rendering_the_resource() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        db.execute_script(
+            "UPDATE issues SET description='expensive body sentinel' WHERE id='issue-1';",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        let uri = "cairn://p/PROJ/2/1/builder/create-pr";
+        let push = crate::orchestrator::attention_push::Push {
+            id: "push-review".into(),
+            recipient: "watcher".into(),
+            content_ref: uri.into(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: "review:child-job".into(),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(
+            rendered.contains("Work product ready for review"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&format!("Read {uri}")), "{rendered}");
+        assert!(!rendered.contains("expensive body sentinel"), "{rendered}");
+    }
+
+    /// The delivery seam for CAIRN-3848: a checks wake carries the verdicts, so
+    /// the agent it rouses learns which lane went red and what failed in it
+    /// rather than being sent to a resource to find out.
+    #[tokio::test]
+    async fn checks_push_renders_the_verdicts_instead_of_a_pointer() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        db.execute_script(
+            r#"
+            INSERT INTO check_result_cache
+              (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+               output_tail, duration_ms, ran_at, target_results_json, job_id)
+            VALUES
+              ('p','tree','ih-rust','rust-tests',101,0,'',1000,1,
+               '{"parser":"nextest","passed":64,"failed":2,"skipped":0,
+                 "failures":[{"name":"cairn_core a::b","message":null},
+                             {"name":"cairn_core c::d","message":null}]}',
+               'child-job'),
+              ('p','tree','ih-fmt','rust-fmt',0,1,'',10,1,NULL,'child-job');
+            "#,
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        let uri = "cairn://p/PROJ/2/1/builder/checks";
+        let push = crate::orchestrator::attention_push::Push {
+            id: "push-checks".into(),
+            recipient: "child-job".into(),
+            content_ref: uri.into(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: format!("turn-checks:{uri}"),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(
+            rendered.contains("✗ rust-tests — 2 of 66 failed: cairn_core a::b, cairn_core c::d"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("✓ passing: rust-fmt"), "{rendered}");
+        assert!(
+            !rendered.contains("for the current content"),
+            "a wake must not spend a turn telling the agent to go read: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_push_batch_preserves_delivery_order() {
+        let orch = test_orchestrator(migrated_db().await);
+        let make_push = |id: &str, uri: &str| crate::orchestrator::attention_push::Push {
+            id: id.into(),
+            recipient: "watcher".into(),
+            content_ref: uri.into(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: format!("review:{id}"),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+        let pushes = vec![
+            make_push("first", "cairn://p/PROJ/1/1/first/create-pr"),
+            make_push("second", "cairn://p/PROJ/2/1/second/create-pr"),
+            make_push("third", "cairn://p/PROJ/3/1/third/create-pr"),
+        ];
+
+        let rendered = render_pushes_resolved(&orch, &pushes).await.unwrap();
+
+        let first = rendered.find(&pushes[0].content_ref).unwrap();
+        let second = rendered.find(&pushes[1].content_ref).unwrap();
+        let third = rendered.find(&pushes[2].content_ref).unwrap();
+        assert!(first < second && second < third, "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn direct_push_keeps_frozen_message_content_inline() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO messages
+               (id, channel_type, channel_id, sender_run_id, sender_name,
+                recipient_run_id, content, created_at)
+             VALUES
+               ('direct-message', 'direct', NULL, NULL,
+                'cairn://p/PROJ/1/1/sender', NULL, 'frozen direct content', 1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        let push = crate::orchestrator::attention_push::Push {
+            id: "direct-push".into(),
+            recipient: "watcher".into(),
+            content_ref: "cairn://p/PROJ/1/1/watcher/messages".into(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: "direct:direct-message".into(),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(rendered.contains("frozen direct content"), "{rendered}");
+        assert!(rendered.contains("sender/messages"), "{rendered}");
+    }
+
+    #[tokio::test]
     async fn render_resolved_push_uses_concise_confirmation_not_issue_body() {
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
         db.execute_script(
             "UPDATE issues
              SET status='merged', description='This long child issue description should not be inlined.'
-             WHERE id='issue-1';",
+             WHERE id='issue-1';
+             INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch,
+                status, opened_at, updated_at, github_pr_number)
+             VALUES
+               ('mr-child', 'child-job', 'p', 'issue-1', 'Child PR', 'child', 'main',
+                'merged', 1, 2, 42);
+             INSERT INTO pr_resolution_attributions
+               (id, merge_request_id, action, actor_kind, surface, lane_snapshot, created_at)
+             VALUES
+               ('attr-child', 'mr-child', 'merge', 'operator-ui', 'operator-ui', '{}', 2);",
         )
         .await
         .unwrap();
@@ -868,9 +1027,26 @@ mod tests {
         let rendered = render_push_resolved(&orch, &push).await;
 
         assert!(rendered.contains("Attention update (passive): cairn://p/PROJ/2"));
-        assert!(rendered.contains("Issue Merged Successfully"));
+        assert!(rendered.contains("PROJ-2 \"Child\" merged"), "{rendered}");
+        assert!(rendered.contains("PR #42, by operator (UI)"), "{rendered}");
         assert!(!rendered.contains("Description"));
         assert!(!rendered.contains("This long child issue description"));
+
+        orch.db
+            .local
+            .execute(
+                "UPDATE merge_requests SET status='open' WHERE id='mr-child'",
+                (),
+            )
+            .await
+            .unwrap();
+        let mismatched = render_push_resolved(&orch, &push).await;
+        assert!(
+            mismatched.contains("PROJ-2 \"Child\" merged"),
+            "{mismatched}"
+        );
+        assert!(!mismatched.contains("PR #42"), "{mismatched}");
+        assert!(!mismatched.contains("operator (UI)"), "{mismatched}");
     }
 
     #[tokio::test]
@@ -906,7 +1082,10 @@ mod tests {
 
         let rendered = render_push_resolved(&orch, &push).await;
 
-        assert!(rendered.contains("Issue Failed"), "{rendered}");
+        assert!(
+            rendered.contains("TEAM-9 \"Failed child\" failed"),
+            "{rendered}"
+        );
         assert!(rendered.contains("retry or delegate a fix"), "{rendered}");
         assert!(!rendered.contains("Successfully"), "{rendered}");
     }
@@ -1108,13 +1287,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_resolved_push_keeps_successful_resolution_passive() {
+    async fn terminal_child_resolution_wakes_parent_without_subscription_row() {
         use crate::models::{IssueAttention, IssueStatus};
         use crate::orchestrator::attention::{AttentionEvent, AttentionFact};
         use crate::orchestrator::attention_push::list_pending;
         for final_status in [IssueStatus::Merged, IssueStatus::Closed] {
             let db = migrated_db().await;
             seed(&db, "active", None, None).await;
+            db.execute_script(
+                "DELETE FROM wake_subscriptions;
+                 UPDATE issues SET parent_issue_id = 'parent' WHERE id = 'issue-1';",
+            )
+            .await
+            .unwrap();
             let orch = test_orchestrator(db);
 
             super::create_resolved_push(
@@ -1128,16 +1313,108 @@ mod tests {
                     attention: IssueAttention::None,
                     status: final_status,
                     updated_at: 1,
+                    route_provenance: None,
                 },
             );
 
             let watcher = list_pending(&orch.db.local, "watcher").await.unwrap();
             assert_eq!(watcher.len(), 1);
-            // Successful resolution is informational: passive, rides along.
-            assert_eq!(watcher[0].wake, Wake::Passive);
+            assert_eq!(watcher[0].wake, Wake::Wake);
             assert_eq!(watcher[0].key, format!("resolved:{CHILD_URI}"));
             assert_eq!(watcher[0].content_ref, CHILD_URI);
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_thread_child_wakes_the_session_and_marks_its_chapter() {
+        use crate::models::{IssueAttention, IssueStatus};
+        use crate::orchestrator::attention::{AttentionEvent, AttentionFact};
+        use crate::orchestrator::attention_push::list_pending;
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES('thread','p','general','active','none',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_thread_id, created_at, updated_at)
+               VALUES('issue-1','p',2,'Child','merged','complete','none','thread',1,2);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        super::create_resolved_push(
+            &orch,
+            &AttentionEvent {
+                issue_id: "issue-1".into(),
+                issue_uri: CHILD_URI.into(),
+                fact: AttentionFact::Resolved {
+                    final_status: IssueStatus::Merged,
+                },
+                attention: IssueAttention::None,
+                status: IssueStatus::Merged,
+                updated_at: 2,
+                route_provenance: None,
+            },
+        );
+
+        let job_id = orch
+            .db
+            .local
+            .query_opt_text("SELECT id FROM jobs WHERE thread_id='thread'", ())
+            .await
+            .unwrap()
+            .expect("terminal attention establishes the dormant thread session");
+        let pushes = list_pending(&orch.db.local, &job_id).await.unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].wake, Wake::Wake);
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64(
+                    "SELECT COUNT(*) FROM thread_compaction_marks WHERE job_id=?1 AND child_issue_id='issue-1'",
+                    params![job_id],
+                )
+                .await
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn muted_terminal_child_resolution_rides_parent_digest() {
+        use crate::models::{IssueAttention, IssueStatus};
+        use crate::orchestrator::attention::{AttentionEvent, AttentionFact};
+        use crate::orchestrator::attention_push::list_pending;
+        let db = migrated_db().await;
+        seed(&db, "muted", Some(r#"["resolved"]"#), None).await;
+        db.execute(
+            "UPDATE issues SET parent_issue_id = 'parent' WHERE id = 'issue-1'",
+            (),
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        super::create_resolved_push(
+            &orch,
+            &AttentionEvent {
+                issue_id: "issue-1".into(),
+                issue_uri: CHILD_URI.into(),
+                fact: AttentionFact::Resolved {
+                    final_status: IssueStatus::Merged,
+                },
+                attention: IssueAttention::None,
+                status: IssueStatus::Merged,
+                updated_at: 1,
+                route_provenance: None,
+            },
+        );
+
+        let watcher = list_pending(&orch.db.local, "watcher").await.unwrap();
+        assert_eq!(watcher.len(), 1);
+        assert_eq!(watcher[0].wake, Wake::Passive);
     }
 
     #[tokio::test]
@@ -1160,6 +1437,7 @@ mod tests {
                 attention: IssueAttention::None,
                 status: IssueStatus::Failed,
                 updated_at: 1,
+                route_provenance: None,
             },
         );
 
@@ -1189,6 +1467,7 @@ mod tests {
                 attention: IssueAttention::None,
                 status: IssueStatus::Failed,
                 updated_at: 1,
+                route_provenance: None,
             },
         );
 
@@ -1218,6 +1497,7 @@ mod tests {
                 attention: IssueAttention::None,
                 status: IssueStatus::Failed,
                 updated_at: 1,
+                route_provenance: None,
             },
         );
 
@@ -1337,6 +1617,55 @@ mod tests {
                 .await
                 .unwrap(),
             "a passive catch-up push never wakes an idle parent"
+        );
+    }
+
+    /// End to end on the shape that broke (CAIRN-3712): a `plan>coordinator`
+    /// graph whose two nodes were minted in one pass and share a `created_at`. A
+    /// user message on a child the coordinator spawned addresses the catch-up to
+    /// the COORDINATOR; the upstream planner is not woken for work it never
+    /// delegated.
+    #[tokio::test]
+    async fn child_catchup_reaches_the_coordinator_that_spawned_it() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('parent','p',1,'Parent','active','active','none',1,1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('exec-parent','plan-coordinator','parent','p','running',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, uri_segment, status, current_session_id, created_at, updated_at)
+              VALUES('planner','p','parent','exec-parent','planner','complete','sess-planner',5,5);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, uri_segment, status, current_session_id, created_at, updated_at)
+              VALUES('coordinator','p','parent','exec-parent','coordinator','running','sess-coord',5,5);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_issue_id, parent_job_id, created_at, updated_at)
+              VALUES('issue-1','p',2,'Child','active','active','none','parent','coordinator',1,1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('exec-1','r','issue-1','p','running',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, uri_segment, status, current_session_id, created_at, updated_at)
+              VALUES('child-job','p','issue-1','exec-1','builder','running','sess2',1,1);
+            INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
+              VALUES('run-1','p','child-job','issue-1',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+        add_chat_turn(&db, "t1", 1).await;
+
+        assert_eq!(
+            super::create_catchup_pushes_for_watchers(&db, &child_node_uri(), None)
+                .await
+                .unwrap(),
+            1,
+            "exactly one node is caught up on the child"
+        );
+        assert_eq!(pending_catchup(&db, "coordinator").await.len(), 1);
+        assert!(
+            pending_catchup(&db, "planner").await.is_empty(),
+            "the planner receives no catch-up for a child it did not spawn"
         );
     }
 
@@ -1607,9 +1936,15 @@ mod tests {
 
     /// The CAIRN-3342 specimen. The operator messages a child node whose
     /// coordinator has been superseded by a newer execution on the parent issue.
-    /// `issues.parent_job_id` still names the retired spawner — exactly what the
-    /// retired `load_parent_job` route would have addressed — while the derived
-    /// recipient is the coordinator actually driving the parent now.
+    /// `issues.parent_job_id` still names the retired spawner, and it is still
+    /// perfectly resumable — what disqualifies it is that its execution is no
+    /// longer the parent's latest, so the child moves to the coordinator driving
+    /// the parent now.
+    ///
+    /// Supersession is an execution fact, not a recency one: a newer sibling root
+    /// job alone must never retire a spawner, because every node of one graph is
+    /// minted together and the coordinator's own upstream planner is such a
+    /// sibling.
     #[tokio::test]
     async fn operator_message_catchup_reaches_the_live_coordinator_not_the_spawner() {
         let db = migrated_db().await;
@@ -1617,8 +1952,13 @@ mod tests {
         db.execute_script(
             "DELETE FROM wake_subscriptions;
              UPDATE issues SET parent_issue_id='parent', parent_job_id='watcher' WHERE id='issue-1';
-             INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-               VALUES('successor','p','parent','running','sess3',5,5);",
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('exec-retired','r','parent','p','complete',1,1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('exec-live','r','parent','p','running',5,2);
+             UPDATE jobs SET execution_id='exec-retired' WHERE id='watcher';
+             INSERT INTO jobs(id, project_id, issue_id, execution_id, status, current_session_id, created_at, updated_at)
+               VALUES('successor','p','parent','exec-live','running','sess3',5,5);",
         )
         .await
         .unwrap();
@@ -1944,10 +2284,9 @@ mod tests {
         }
     }
 
-    /// The digest leads the render, ahead of the chat window, because
-    /// [`cap_push_content`] truncates from the front: for a busy child the window
-    /// runs to dozens of turns and the operator's message — the newest thing in it
-    /// — would be the first thing discarded.
+    /// Catch-up carries the bounded operator-message digest inline and leaves the
+    /// potentially enormous chat window behind its canonical URI for an on-demand
+    /// read.
     #[tokio::test]
     async fn rendered_catchup_leads_with_the_operator_digest() {
         let db = migrated_db().await;
@@ -2063,10 +2402,7 @@ mod tests {
             !rendered.contains("**User:**"),
             "nothing in this window was typed by a user: {rendered}"
         );
-        assert!(
-            rendered.contains(crate::transcripts::LAUNCH_MARKER_LINE),
-            "the launch turn should still be accounted for, just not quoted: {rendered}"
-        );
+        assert!(!rendered.contains(crate::transcripts::LAUNCH_MARKER_LINE));
     }
 
     #[tokio::test]

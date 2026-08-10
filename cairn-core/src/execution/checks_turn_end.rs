@@ -68,7 +68,7 @@ use cairn_common::uri::{build_node_checks_uri, build_task_checks_uri};
 use sha2::{Digest, Sha256};
 
 use crate::execution::checks::{
-    applicable_turn_end_checks, check_platform_identity, check_resource_identity, check_result_key,
+    applicable_turn_end_checks, check_platform_identity, check_result_key,
     check_toolchain_identity, load_checks_contract_at_commit, resolve_check_timeout_ms,
     run_planned_checks_at_commit, submit_planned_check_batch, CheckExecMode, CheckFailureKind,
     CheckOutcome, PlannedCheckBatchItem, PlannedCheckBatchRequest, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
@@ -77,16 +77,15 @@ use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
 };
 use crate::execution::selection::CheckPlan;
+use crate::execution::wire::CheckResourceIdentityInput;
 use crate::fleet::CellPriority;
 use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries, JjEnv};
 use crate::orchestrator::{attention_push, Orchestrator, TurnEndCancel};
 use crate::storage::{LocalDb, RowExt};
 
-/// Env var handed to an isolated review check naming a file of newline-delimited
-/// changed paths, so `scripts/lib/check-base.ts` can attribute findings to the
-/// agent's diff without any VCS metadata in the `.jj`-stripped clone. Must match
-/// `CHANGED_FILES_ENV` in that script.
-const CHANGED_FILES_ENV: &str = "CAIRN_CHECK_CHANGED_FILES";
+/// Internal batch input carrying newline-delimited changed paths to the executor,
+/// which materializes them and sets `CAIRN_CHECK_CHANGED_FILES` to the local path.
+const CHANGED_FILES_CONTENT_ENV: &str = "CAIRN_CHECK_CHANGED_FILES_CONTENT";
 /// Chars of the live log file surfaced in the "running" render.
 const LOG_TAIL_CHARS: usize = 2_000;
 
@@ -613,6 +612,7 @@ async fn run_turn_end_checks_inner(
     let cache_tree_hash = tree_hash.clone();
     let cache_project_id = coords.project_id.clone();
     let cache_job_id = job_id.to_string();
+    let cache_commit = sealed_commit.clone();
     let cache_filtered = tokio::task::spawn_blocking(move || {
         let entries = planning_entries;
         let blobs = TreeBlobs {
@@ -645,12 +645,15 @@ async fn run_turn_end_checks_inner(
                 &cache_project_id,
                 &plan.name,
                 &input_hash,
+                &cache_job_id,
+                &cache_commit,
             ) {
                 Ok(Some(entry)) => {
                     crate::execution::checks::record_suppressed_check(
                         &cache_db,
                         &cache_tree_hash,
                         &cache_job_id,
+                        &cache_commit,
                         &plan.name,
                         entry,
                     );
@@ -718,20 +721,12 @@ async fn run_turn_end_checks_inner(
     // 9. Build the changed-files override consumed by diff-scoped check scripts.
     // Cell checkouts are materialized at the immutable request base, so the
     // already-computed agent delta remains the canonical attribution source.
-    let changed_files_path = log_dir.join("changed-files.txt");
     let changed_files_body = changed
         .iter()
         .map(|change| change.path.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let extra_env = std::fs::write(&changed_files_path, changed_files_body)
-        .map(|()| {
-            vec![(
-                CHANGED_FILES_ENV.to_string(),
-                changed_files_path.to_string_lossy().into_owned(),
-            )]
-        })
-        .map_err(|error| format!("failed to write review changed-files input: {error}"))?;
+    let extra_env = vec![(CHANGED_FILES_CONTENT_ENV.to_string(), changed_files_body)];
 
     // 10. Submit every miss through one sequential pure-verdict lease, then feed
     // the keyed outcomes through the shared persistence, parsing, and ordering path.
@@ -752,18 +747,18 @@ async fn run_turn_end_checks_inner(
                 index,
                 name: plan.name.clone(),
                 input_hash: input_hash.clone(),
-                resource_identity_key: check_resource_identity(
-                    &plan.name,
-                    checks
+                resource_identity: CheckResourceIdentityInput::Configured {
+                    name: plan.name.clone(),
+                    check: checks
                         .get(&plan.name)
-                        .expect("planned check must retain its configured definition"),
-                )
-                .key,
+                        .expect("planned check must retain its configured definition")
+                        .clone(),
+                },
                 command: plan.command.clone(),
                 stream_id: crate::mcp::handlers::run::check_stream_id(&checks_tool_id, index),
                 env: extra_env.clone(),
                 verdict_environment_names: plan.verdict_environment_names.clone(),
-                timeout_ms: timeouts[index],
+                timeout_ms: timeouts[index].into(),
                 executor: checks
                     .get(&plan.name)
                     .and_then(|check| check.executor.clone()),
@@ -820,10 +815,10 @@ async fn run_turn_end_checks_inner(
                 to_run.len()
             );
             if orch.fleet.cancel_job_requests(job_id) > 0 {
-                let _ = orch.services.emitter.emit(
-                    "db-change",
-                    serde_json::json!({"table": "build_slots", "action": "cancel"}),
-                );
+                let _ = orch
+                    .services
+                    .emitter
+                    .emit("substrate-health-change", serde_json::json!({}));
             }
             return Ok(());
         }
@@ -1519,6 +1514,7 @@ mod tests {
             recorded: None,
             duration_ms: 1,
             suppressed_after: None,
+            not_recorded: None,
         }
     }
 
@@ -1985,6 +1981,7 @@ mod tests {
                 resource_class: crate::config::project_settings::CheckResourceClass::Shared,
                 verdict_environment_names: Vec::new(),
                 config_error: None,
+                verdict_platforms: Vec::new(),
             },
             format!("input-{name}"),
         )

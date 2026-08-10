@@ -48,6 +48,11 @@ pub(crate) fn stamp(timestamp: i64) -> Option<String> {
     host().stamp(timestamp)
 }
 
+/// `2026-08-01 16:47 PDT` from a millisecond instant.
+pub(crate) fn stamp_millis(millis: i64) -> Option<String> {
+    host().stamp_millis(millis)
+}
+
 /// `2026-08-01 16:47:03 PDT`, for surfaces where second-level precision earns
 /// its width (progress logs, message streams, forensic records).
 pub(crate) fn stamp_with_seconds(timestamp: i64) -> Option<String> {
@@ -116,6 +121,14 @@ impl HostClock {
 
     pub(crate) fn stamp(&self, timestamp: i64) -> Option<String> {
         Some(self.at(timestamp)?.format("%Y-%m-%d %H:%M %Z").to_string())
+    }
+
+    pub(crate) fn stamp_millis(&self, millis: i64) -> Option<String> {
+        Some(
+            self.at_millis(millis)?
+                .format("%Y-%m-%d %H:%M %Z")
+                .to_string(),
+        )
     }
 
     pub(crate) fn stamp_with_seconds(&self, timestamp: i64) -> Option<String> {
@@ -307,6 +320,10 @@ mod tests {
         let clock = HostClock::fixed("America/Los_Angeles");
         let at = 1_752_381_600; // 2025-07-12 21:40:00 PDT / 2025-07-13 04:40 UTC
         assert_eq!(clock.stamp(at).unwrap(), "2025-07-12 21:40 PDT");
+        assert_eq!(
+            clock.stamp_millis(at * 1000).unwrap(),
+            "2025-07-12 21:40 PDT"
+        );
         assert_eq!(
             clock.stamp_with_seconds(at).unwrap(),
             "2025-07-12 21:40:00 PDT"

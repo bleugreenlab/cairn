@@ -9,7 +9,7 @@ use super::common::{
 };
 
 use crate::issues::relations;
-use crate::models::{ExecutionSnapshot, IssueKind, RecipeNodeType};
+use crate::models::{ExecutionSnapshot, RecipeNodeType};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
 
@@ -53,14 +53,43 @@ async fn render_dependencies_block(conn: &cairn_db::turso::Connection, issue_id:
     output
 }
 
+/// The canonical URI of a thread, from its id.
+async fn thread_uri_for_id(conn: &cairn_db::turso::Connection, thread_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "SELECT p.key, t.name
+             FROM threads t
+             JOIN projects p ON p.id = t.project_id
+             WHERE t.id = ?1
+             LIMIT 1",
+            params![thread_id],
+        )
+        .await
+        .ok()?;
+    let row = rows.next().await.ok()??;
+    Some(cairn_common::uri::build_thread_uri(
+        &row.text(0).ok()?,
+        &row.text(1).ok()?,
+    ))
+}
+
 async fn render_family_block(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
     parent_issue_id: Option<&str>,
+    parent_thread_id: Option<&str>,
 ) -> String {
     let mut lines = Vec::new();
+    // One parent line whichever kind the edge names — the two columns are
+    // exclusive, and an issue owned by a thread is no more parentless than one
+    // owned by an issue. Without this the overview of an adopted issue reads
+    // exactly like an orphan's while the thread's census lists it.
     if let Some(parent_issue_id) = parent_issue_id {
         if let Ok(parent_uri) = relations::issue_uri_for_id(conn, parent_issue_id).await {
+            lines.push(format!("Parent: `{parent_uri}`"));
+        }
+    } else if let Some(parent_thread_id) = parent_thread_id {
+        if let Some(parent_uri) = thread_uri_for_id(conn, parent_thread_id).await {
             lines.push(format!("Parent: `{parent_uri}`"));
         }
     }
@@ -176,7 +205,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     let mut issue_rows = match conn
         .query(
             "
-            SELECT id, title, status, description, created_at, parent_issue_id, kind
+            SELECT id, title, status, description, created_at, parent_issue_id, parent_thread_id
             FROM issues
             WHERE project_id = ?1 AND number = ?2
             LIMIT 1
@@ -189,7 +218,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         Err(error) => return storage_error("Failed to load issue", error.into()),
     };
 
-    let (issue_id, title, status, description, created_at, parent_issue_id, kind) =
+    let (issue_id, title, status, description, created_at, parent_issue_id, parent_thread_id) =
         match issue_rows.next().await {
             Ok(Some(row)) => {
                 let parsed: DbResult<_> = (|| {
@@ -200,9 +229,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
                         row.opt_text(3)?,
                         row.i64(4)? as i32,
                         row.opt_text(5)?,
-                        row.opt_text(6)?
-                            .and_then(|kind| kind.parse::<IssueKind>().ok())
-                            .unwrap_or_default(),
+                        row.opt_text(6)?,
                     ))
                 })();
                 match parsed {
@@ -223,18 +250,8 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     let created_date =
         crate::clock::date(created_at as i64).unwrap_or_else(|| "Unknown".to_string());
 
-    // The kind is stated only when it is not the default, so an ordinary issue
-    // reads exactly as it always did and a thread announces itself. Absence of
-    // the segment is therefore as informative as its presence.
-    let kind_segment = match kind {
-        IssueKind::Issue => String::new(),
-        IssueKind::Thread => format!("Kind: {kind} | "),
-    };
     let mut output = format!("# {}-{}: {}\n\n", project_key, number, title);
-    output.push_str(&format!(
-        "{}Status: {} | Created: {}\n",
-        kind_segment, status, created_date
-    ));
+    output.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
     if !labels.is_empty() {
         output.push_str(&format!(
             "Labels: {}\n",
@@ -318,7 +335,15 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     }
     output.push('\n');
 
-    output.push_str(&render_family_block(&conn, &issue_id, parent_issue_id.as_deref()).await);
+    output.push_str(
+        &render_family_block(
+            &conn,
+            &issue_id,
+            parent_issue_id.as_deref(),
+            parent_thread_id.as_deref(),
+        )
+        .await,
+    );
 
     // Description
     if !description.is_empty() {
@@ -770,6 +795,23 @@ pub(super) async fn read_issue_execution(
     render_execution_snapshot(project_key, number, exec_seq, &snapshot)
 }
 
+/// One agent's routing decision, as a line someone reading the execution months
+/// later can act on: what decided, and why.
+fn routing_line(decision: &crate::models::ModelRoutingDecision) -> String {
+    use crate::models::ModelRoutingSource;
+    match decision.source {
+        ModelRoutingSource::LabelBinding => format!(
+            "{} — {}",
+            decision.tier.as_deref().unwrap_or("(unnamed tier)"),
+            decision.note
+        ),
+        ModelRoutingSource::AgentDefault | ModelRoutingSource::DemotionRefused => {
+            format!("agent default — {}", decision.note)
+        }
+        ModelRoutingSource::ExplicitLaunch => decision.note.clone(),
+    }
+}
+
 fn render_execution_snapshot(
     project_key: &str,
     number: i32,
@@ -812,6 +854,20 @@ fn render_execution_snapshot(
     }
     output.push('\n');
 
+    if let Some(routing) = &snapshot.model_routing {
+        output.push_str("## model routing\n");
+        let labels = if routing.labels.is_empty() {
+            "(none)".to_string()
+        } else {
+            routing.labels.join(", ")
+        };
+        output.push_str(&format!("labels: {labels}\n"));
+        if let Some(generation) = &routing.generation {
+            output.push_str(&format!("generation: {generation}\n"));
+        }
+        output.push_str(&format!("rules: {}\n\n", routing.rule_count));
+    }
+
     output.push_str("## agents\n");
     let mut agent_ids: Vec<&String> = snapshot.agents.keys().collect();
     agent_ids.sort();
@@ -824,6 +880,13 @@ fn render_execution_snapshot(
             None => "(unresolved)".to_string(),
         };
         output.push_str(&format!("selection: {}\n", selection));
+        if let Some(decision) = snapshot
+            .model_routing
+            .as_ref()
+            .and_then(|routing| routing.decisions.get(agent_id))
+        {
+            output.push_str(&format!("routing: {}\n", routing_line(decision)));
+        }
         output.push_str(&format!("fence: {:?}\n", agent.fence.unwrap_or_default()));
         output.push_str(&format!("tools: {}\n", agent.tools.len()));
         let skills = match &agent.skills {
@@ -848,6 +911,138 @@ fn render_execution_snapshot(
     }
 
     output
+}
+
+#[cfg(test)]
+mod routing_render_tests {
+    use super::*;
+    use crate::models::{
+        AgentSnapshot, Model, ModelRouting, ModelRoutingDecision, ModelRoutingSource,
+        ModelSelection, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
+    };
+    use std::collections::{BTreeMap, HashMap};
+
+    fn snapshot(routing: Option<ModelRouting>) -> ExecutionSnapshot {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "builder".to_string(),
+            AgentSnapshot {
+                id: "builder".to_string(),
+                name: "Builder".to_string(),
+                description: String::new(),
+                prompt: String::new(),
+                tools: vec![],
+                tier: None,
+                backend_preference: None,
+                selection: Some(ModelSelection {
+                    backend: "codex".to_string(),
+                    model: Model::new("gpt-5.6-sol"),
+                }),
+                disallowed_tools: None,
+                skills: None,
+                fence: None,
+                sandbox: None,
+                on_escape: None,
+                model: None,
+                resolved_backend: None,
+                extras: None,
+            },
+        );
+        let mut snapshot = ExecutionSnapshot::new(
+            RecipeSnapshot {
+                id: "r".to_string(),
+                name: "Build".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![],
+                edges: vec![],
+            },
+            agents,
+            HashMap::new(),
+            TriggerContext {
+                issue_id: Some("issue-1".to_string()),
+                project_id: "proj-1".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+        );
+        snapshot.model_routing = routing;
+        snapshot
+    }
+
+    /// Reading an execution must answer "why this model" without anyone having
+    /// to go find the table that decided it.
+    #[test]
+    fn a_routed_execution_reads_its_labels_generation_and_per_agent_reason() {
+        let rendered = render_execution_snapshot(
+            "CAIRN",
+            1,
+            1,
+            &snapshot(Some(ModelRouting {
+                labels: vec!["migration".to_string(), "rust".to_string()],
+                generation: Some("gen-0".to_string()),
+                rule_count: 1,
+                decisions: BTreeMap::from([(
+                    "builder".to_string(),
+                    ModelRoutingDecision {
+                        source: ModelRoutingSource::LabelBinding,
+                        rule: Some("migration-builder".to_string()),
+                        matched_labels: vec!["migration".to_string()],
+                        tier: Some("codex/lg".to_string()),
+                        note: "rule 'migration-builder' matched migration".to_string(),
+                    },
+                )]),
+            })),
+        );
+        assert!(rendered.contains("## model routing"), "{rendered}");
+        assert!(rendered.contains("labels: migration, rust"), "{rendered}");
+        assert!(rendered.contains("generation: gen-0"), "{rendered}");
+        assert!(rendered.contains("rules: 1"), "{rendered}");
+        assert!(
+            rendered
+                .contains("routing: codex/lg \u{2014} rule 'migration-builder' matched migration"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unrouted_agent_reads_as_the_agent_default() {
+        let rendered = render_execution_snapshot(
+            "CAIRN",
+            1,
+            1,
+            &snapshot(Some(ModelRouting {
+                labels: Vec::new(),
+                generation: None,
+                rule_count: 0,
+                decisions: BTreeMap::from([(
+                    "builder".to_string(),
+                    ModelRoutingDecision {
+                        source: ModelRoutingSource::AgentDefault,
+                        rule: None,
+                        matched_labels: Vec::new(),
+                        tier: None,
+                        note: "no labels on issue".to_string(),
+                    },
+                )]),
+            })),
+        );
+        assert!(rendered.contains("labels: (none)"), "{rendered}");
+        assert!(
+            rendered.contains("routing: agent default \u{2014} no labels on issue"),
+            "{rendered}"
+        );
+    }
+
+    /// An execution frozen before routing existed says nothing about it, rather
+    /// than claiming it was routed to its default.
+    #[test]
+    fn a_pre_routing_execution_renders_no_routing_section() {
+        let rendered = render_execution_snapshot("CAIRN", 1, 1, &snapshot(None));
+        assert!(!rendered.contains("model routing"), "{rendered}");
+        assert!(!rendered.contains("routing:"), "{rendered}");
+    }
 }
 
 #[cfg(test)]

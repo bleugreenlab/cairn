@@ -39,6 +39,10 @@ pub mod account {
     pub use crate::account::*;
 }
 
+pub mod authorization {
+    pub use crate::authorization::*;
+}
+
 pub mod agent_process {
     pub use crate::agent_process::*;
 }
@@ -49,6 +53,10 @@ pub mod api {
 
 pub mod backends {
     pub use crate::backends::*;
+}
+
+pub mod security {
+    pub use crate::security::*;
 }
 
 pub mod browser_network {

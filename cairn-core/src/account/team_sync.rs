@@ -289,7 +289,13 @@ pub async fn read_device_jwt(local: &LocalDb) -> Result<Option<String>, String> 
         .flatten();
 
     match encrypted {
-        Some(enc) => super::jwt::decrypt_jwt_from_storage(&enc).map(Some),
+        Some(enc) => {
+            let jwt = super::jwt::decrypt_jwt_from_storage(&enc)?;
+            // The one place stored account ciphertext becomes plaintext, and
+            // therefore the one place that has to register it.
+            crate::security::broker::account::device_credential(&jwt);
+            Ok(Some(jwt))
+        }
         None => Ok(None),
     }
 }

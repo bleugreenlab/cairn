@@ -1025,6 +1025,12 @@ pub async fn build_node_memory_uri_for_memory(db: &LocalDb, memory: &Memory) -> 
     .await
 }
 
+/// The memory a `.../{node}/memories/{seq}` URI addresses.
+///
+/// Resolves the owning job through the shared owner-aware resolver first, so a
+/// thread's memories are addressable by the same URI shape a node's are. Walking
+/// issues and executions inline here — as this once did — excludes any owner
+/// that has neither.
 pub async fn resolve_node_memory_id(
     db: &LocalDb,
     project_key: &str,
@@ -1033,25 +1039,21 @@ pub async fn resolve_node_memory_id(
     node_id: &str,
     memory_seq: i32,
 ) -> DbResult<Option<String>> {
-    let project_key = project_key.to_uppercase();
-    let node_id = node_id.to_string();
+    let Some(job_id) = crate::jobs::queries::job_id_for_node_coordinate(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_id,
+        None,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     db.query_opt(
-        "SELECT m.id
-         FROM memories m
-         JOIN jobs j ON j.id = m.job_id
-         JOIN executions e ON e.id = j.execution_id
-         JOIN issues i ON i.id = j.issue_id
-         JOIN projects p ON p.id = j.project_id
-         WHERE p.key = ?1 AND i.number = ?2 AND e.seq = ?3
-           AND j.uri_segment = ?4 AND m.node_seq = ?5
-         LIMIT 1",
-        params![
-            project_key.as_str(),
-            number as i64,
-            exec_seq as i64,
-            node_id.as_str(),
-            memory_seq as i64
-        ],
+        "SELECT id FROM memories WHERE job_id = ?1 AND node_seq = ?2 LIMIT 1",
+        params![job_id.as_str(), memory_seq as i64],
         |row| row.text(0),
     )
     .await

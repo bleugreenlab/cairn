@@ -55,6 +55,12 @@ impl RawImportedServer {
             // Imported servers carry no OAuth config; authorize it later in
             // Settings if the remote endpoint requires it.
             oauth: None,
+            // An imported config has no declared-secret list: the source format
+            // has no such concept, and inventing one from the variable names
+            // would be the byte-level guessing the broker exists to avoid.
+            // Values entered through Settings land in the keychain, which is a
+            // declaration on its own.
+            secrets: Vec::new(),
         }
     }
 }

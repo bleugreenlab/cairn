@@ -32,6 +32,7 @@ pub mod delegation;
 pub mod dispatch;
 pub mod inputs;
 pub mod jobs;
+pub mod model_routing;
 pub mod ownership;
 pub mod queries;
 pub mod recipe;
@@ -42,6 +43,7 @@ pub mod snapshot_edit;
 pub mod step_behavior;
 pub mod teardown;
 pub mod triggers;
+pub(crate) mod wire;
 
 /// Resolver key for auto-started DAG jobs and cold resumes. Defined in
 /// `models::execution`; re-exported here so existing `crate::execution::Initiator`

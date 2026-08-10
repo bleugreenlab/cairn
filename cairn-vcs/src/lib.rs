@@ -84,6 +84,7 @@ fn jj_settings(identity: Option<&PublicationIdentity>) -> Result<UserSettings, S
             .set_value(key, value)
             .map_err(|error| format!("set jj setting `{key}`: {error}"))?;
     }
+
     let mut config = StackedConfig::with_defaults();
     config.add_layer(layer);
     UserSettings::from_config(config).map_err(|error| format!("load jj settings: {error}"))
@@ -755,6 +756,7 @@ async fn merge_base_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jj_lib::git::{self, GitImportOptions};
     use std::io::Write as _;
     use std::process::Command;
 
@@ -788,46 +790,11 @@ mod tests {
         command("git", &["-C", path, "remote", "add", "origin", path]);
         command(
             "git",
-            &[
-                "-C",
-                path,
-                "update-ref",
-                "refs/remotes/origin/remote",
-                "HEAD",
-            ],
+            &["-C", path, "update-ref", "refs/remotes/origin/main", "HEAD"],
         );
-        command("jj", &["git", "init", "--colocate", path]);
-        command("jj", &["-R", path, "git", "fetch", "--remote", "origin"]);
-        command(
-            "jj",
-            &["-R", path, "bookmark", "create", "feature", "-r", "@"],
-        );
-        let commit = command(
-            "jj",
-            &[
-                "-R",
-                path,
-                "log",
-                "-r",
-                "feature",
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ],
-        );
-        let change = command(
-            "jj",
-            &[
-                "-R",
-                path,
-                "log",
-                "-r",
-                "feature",
-                "--no-graph",
-                "-T",
-                "change_id",
-            ],
-        );
+        let git_head = command("git", &["-C", path, "rev-parse", "HEAD"]);
+        let commit = init_jj_fixture(dir.path(), &git_head);
+        let change = bookmark_change_id(dir.path(), "feature");
         let ids = command("git", &["-C", path, "rev-list", "--all"]);
         let mut ambiguous = None;
         for width in 1..=2 {
@@ -872,23 +839,7 @@ mod tests {
         .unwrap();
         assert_ne!(result.head, expected);
         assert_ne!(result.change_id, old_change);
-        assert_eq!(
-            command(
-                "jj",
-                &[
-                    "-R",
-                    dir.path().to_str().unwrap(),
-                    "log",
-                    "-r",
-                    "feature",
-                    "--no-graph",
-                    "-T",
-                    "commit_id",
-                    "--ignore-working-copy",
-                ],
-            ),
-            result.head
-        );
+        assert_eq!(bookmark_commit(dir.path()), result.head);
         // The COMMITTER is asserted alongside the author: jj-lib's built-in
         // defaults leave `user.name`/`user.email` empty, and a commit with an
         // empty committer is rendered as `JJ_EMPTY_STRING` on git export and
@@ -926,21 +877,113 @@ mod tests {
         assert!(stale.contains("changed from"));
     }
 
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn import_options() -> GitImportOptions {
+        GitImportOptions {
+            abandon_unreachable_commits: false,
+            record_synthetic_predecessors: false,
+            remote_auto_track_bookmarks: HashMap::new(),
+        }
+    }
+
+    fn init_jj_fixture(repository: &Path, head: &str) -> String {
+        runtime().block_on(async {
+            let settings = jj_settings(None).unwrap();
+            let (workspace, repo) =
+                Workspace::init_external_git(&settings, repository, &repository.join(".git"))
+                    .await
+                    .unwrap();
+            let mut tx = repo.start_transaction();
+            git::import_refs(tx.repo_mut(), &import_options())
+                .await
+                .unwrap();
+            let head_id = CommitId::try_from_hex(head).unwrap();
+            let head = tx.repo_mut().store().get_commit(&head_id).unwrap();
+            let working_copy = tx
+                .repo_mut()
+                .new_commit(vec![head_id], head.tree())
+                .write()
+                .await
+                .unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("feature"),
+                RefTarget::normal(working_copy.id().clone()),
+            );
+            tx.repo_mut()
+                .set_wc_commit(
+                    workspace.workspace_name().to_owned(),
+                    working_copy.id().clone(),
+                )
+                .unwrap();
+            let id = working_copy.id().hex();
+            tx.commit("initialize test fixture").await.unwrap();
+            id
+        })
+    }
+
+    fn init_jj_store(workspace: &Path, git_repository: &Path) {
+        std::fs::create_dir_all(workspace).unwrap();
+        runtime().block_on(async {
+            let settings = jj_settings(None).unwrap();
+            let (_, repo) =
+                Workspace::init_external_git(&settings, workspace, &git_repository.join(".git"))
+                    .await
+                    .unwrap();
+            let mut tx = repo.start_transaction();
+            git::import_refs(tx.repo_mut(), &import_options())
+                .await
+                .unwrap();
+            tx.commit("initialize test store").await.unwrap();
+        });
+    }
+
+    fn bookmark_change_id(repository: &Path, name: &str) -> String {
+        runtime().block_on(async {
+            let repo = load_repo_at_head(repository).await.unwrap();
+            let id = resolve_symbol_at(&repo, name).unwrap();
+            repo.store()
+                .get_commit(&id)
+                .unwrap()
+                .change_id()
+                .to_string()
+        })
+    }
+
+    fn import_git_refs(repository: &Path) {
+        runtime().block_on(async {
+            let repo = load_repo_at_head(repository).await.unwrap();
+            let mut tx = repo.start_transaction();
+            git::import_refs(tx.repo_mut(), &import_options())
+                .await
+                .unwrap();
+            tx.commit("import test git refs").await.unwrap();
+        });
+    }
+
+    fn set_bookmark(repository: &Path, name: &str, commit: &str) {
+        runtime().block_on(async {
+            let repo = load_repo_at_head(repository).await.unwrap();
+            let mut tx = repo.start_transaction();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new(name),
+                RefTarget::normal(CommitId::try_from_hex(commit).unwrap()),
+            );
+            tx.commit(format!("set test bookmark `{name}`"))
+                .await
+                .unwrap();
+        });
+    }
+
     fn bookmark_commit(repository: &Path) -> String {
-        command(
-            "jj",
-            &[
-                "-R",
-                repository.to_str().unwrap(),
-                "log",
-                "-r",
-                "feature",
-                "--no-graph",
-                "-T",
-                "commit_id",
-                "--ignore-working-copy",
-            ],
-        )
+        runtime()
+            .block_on(resolve_coordinate(repository, "feature"))
+            .unwrap()
     }
 
     /// A batch that straddles a base advance seals its delta against the base
@@ -1261,7 +1304,7 @@ mod tests {
 
     #[test]
     fn logical_head_amend_preserves_change_id_and_foreign_guard_creates_child() {
-        let (dir, expected, expected_change, _) = fixture();
+        let (dir, expected, _, _) = fixture();
         let delta = delta_commit(dir.path(), &expected, "amended\n");
         let child_before = delta_commit(dir.path(), &expected, "stacked child\n");
         command(
@@ -1274,16 +1317,8 @@ mod tests {
                 &child_before,
             ],
         );
-        command(
-            "jj",
-            &[
-                "-R",
-                dir.path().to_str().unwrap(),
-                "git",
-                "import",
-                "--ignore-working-copy",
-            ],
-        );
+        import_git_refs(dir.path());
+        let expected_change = bookmark_change_id(dir.path(), "feature");
         let head_author = command(
             "git",
             &[
@@ -1325,20 +1360,9 @@ mod tests {
             ),
             format!("{head_author}|Amend Committer|amend@cairn.local")
         );
-        let child_after = command(
-            "jj",
-            &[
-                "-R",
-                dir.path().to_str().unwrap(),
-                "log",
-                "-r",
-                "child-seed",
-                "--no-graph",
-                "-T",
-                "commit_id",
-                "--ignore-working-copy",
-            ],
-        );
+        let child_after = runtime()
+            .block_on(resolve_coordinate(dir.path(), "child-seed"))
+            .unwrap();
         assert_ne!(child_after, child_before);
         assert_eq!(
             command(
@@ -1355,19 +1379,7 @@ mod tests {
             amended.head
         );
         let guarded_delta = delta_commit(dir.path(), &amended.head, "guarded\n");
-        command(
-            "jj",
-            &[
-                "-R",
-                dir.path().to_str().unwrap(),
-                "bookmark",
-                "create",
-                "sibling",
-                "-r",
-                &amended.head,
-                "--ignore-working-copy",
-            ],
-        );
+        set_bookmark(dir.path(), "sibling", &amended.head);
         let guarded = publish_logical_head(
             dir.path(),
             "feature",
@@ -1402,20 +1414,9 @@ mod tests {
             Some("amend converted to a new commit: the previous commit is shared with sibling")
         );
         assert_eq!(
-            command(
-                "jj",
-                &[
-                    "-R",
-                    dir.path().to_str().unwrap(),
-                    "log",
-                    "-r",
-                    "sibling",
-                    "--no-graph",
-                    "-T",
-                    "commit_id",
-                    "--ignore-working-copy",
-                ],
-            ),
+            runtime()
+                .block_on(resolve_coordinate(dir.path(), "sibling"))
+                .unwrap(),
             amended.head
         );
     }
@@ -1528,7 +1529,7 @@ mod tests {
                 &["-C", path, "commit", "-qm", &format!("other work {index}")],
             );
         }
-        command("jj", &["git", "init", "--colocate", path]);
+        init_jj_store(dir.path(), dir.path());
         dir
     }
 
@@ -1561,7 +1562,9 @@ mod tests {
         let dir = advanced_base_fixture();
         let path = dir.path().to_str().unwrap();
         let advanced = git_rev(dir.path(), "main");
-        command("jj", &["-R", path, "rebase", "-b", "feature", "-d", "main"]);
+        command("git", &["-C", path, "checkout", "-q", "feature"]);
+        command("git", &["-C", path, "rebase", "main"]);
+        import_git_refs(dir.path());
 
         let resolved = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1588,7 +1591,7 @@ mod tests {
         std::fs::write(dir.path().join("stranger"), "unrelated\n").unwrap();
         command("git", &["-C", path, "add", "stranger"]);
         command("git", &["-C", path, "commit", "-qm", "unrelated root"]);
-        command("jj", &["-R", path, "git", "import"]);
+        import_git_refs(dir.path());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1631,8 +1634,7 @@ mod tests {
         command("git", &["-C", path, "commit", "-qm", "base"]);
         let base = git_rev(&project, "HEAD");
         command("git", &["-C", path, "branch", "agent/x", &base]);
-        let store_arg = store.to_str().unwrap();
-        command("jj", &["git", "init", "--git-repo", path, store_arg]);
+        init_jj_store(&store, &project);
 
         // Two independent children of `base`, both made reachable so the store
         // imports them, neither yet claimed by `agent/x`.
@@ -1646,35 +1648,16 @@ mod tests {
             "git",
             &["-C", path, "update-ref", "refs/heads/keep-g", &git_side],
         );
-        command(
-            "jj",
-            &["-R", store_arg, "--ignore-working-copy", "git", "import"],
-        );
+        import_git_refs(&store);
 
         // The local side advances inside jj and is deliberately not exported;
         // the git ref then advances outside jj. The next import sees both.
-        command(
-            "jj",
-            &[
-                "-R",
-                store_arg,
-                "--ignore-working-copy",
-                "bookmark",
-                "set",
-                "agent/x",
-                "-r",
-                &local,
-                "--allow-backwards",
-            ],
-        );
+        set_bookmark(&store, "agent/x", &local);
         command(
             "git",
             &["-C", path, "update-ref", "refs/heads/agent/x", &git_side],
         );
-        command(
-            "jj",
-            &["-R", store_arg, "--ignore-working-copy", "git", "import"],
-        );
+        import_git_refs(&store);
         (dir, store, local, git_side)
     }
 

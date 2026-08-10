@@ -488,15 +488,18 @@ async fn fire_scheduled_recipe(
         None,
         None,
         None,
-        crate::models::IssueKind::Issue,
+        None,
     )
     .await?;
 
+    // A scheduled run takes the recipe exactly as authored: nothing is present
+    // at the trigger to have asked for a delta.
     crate::execution::recipe::start_recipe_execution_and_advance(
         orch,
         &outcome.issue_id,
         Some(&recipe.id),
         &recipe.project_id,
+        None,
         None,
         None,
         None,

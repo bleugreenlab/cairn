@@ -31,6 +31,158 @@ macro_rules! shared_tail {
     };
 }
 
+/// CAIRN-3810: recency ordering for the semantic lane's turn sweep. `turns` is
+/// shared project state, so the index is composed once into both lineages.
+macro_rules! shared_tail_turns_created_at_index {
+    () => {
+        Migration::new(
+            "0163",
+            "turns_created_at_index",
+            include_str!("../../../../turso_migrations/0163_turns_created_at_index.sql"),
+        )
+    };
+}
+
+/// Private-only: an authority grant is this operator's decision about this
+/// install and must never replicate to a teammate's machine. See the SQL
+/// file's header for why that is an authorization property, not a storage one.
+macro_rules! private_authority_grants {
+    () => {
+        Migration::new(
+            "0166",
+            "authority_grants",
+            include_str!("../../../../turso_migrations/0166_authority_grants.sql"),
+        )
+    };
+}
+
+/// CAIRN-3861: thread ownership was never stamped on a delegated child, so a
+/// task a thread spawned could not be listed or opened from the thread pane.
+/// Carries the inheritance job creation now performs back over existing rows.
+macro_rules! shared_tail_inherit_thread_id_for_child_jobs {
+    () => {
+        Migration::new(
+            "0167",
+            "inherit_thread_id_for_child_jobs",
+            include_str!("../../../../turso_migrations/0167_inherit_thread_id_for_child_jobs.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_thread_title_retires {
+    () => {
+        Migration::new(
+            "0160",
+            "thread_title_retires",
+            include_str!("../../../../turso_migrations/0160_thread_title_retires.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_migrate_issue_threads {
+    () => {
+        Migration::new(
+            "0157",
+            "migrate_issue_threads",
+            include_str!("../../../../turso_migrations/0157_migrate_issue_threads.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_threads_entity {
+    () => {
+        Migration::new(
+            "0156",
+            "threads_entity",
+            include_str!("../../../../turso_migrations/0156_threads_entity.sql"),
+        )
+    };
+}
+
+/// CAIRN-3823: one unit for `check_result_cache.ran_at`. The observation
+/// projection writes milliseconds; the pre-observation writer wrote seconds.
+macro_rules! shared_tail_check_result_cache_ran_at_millis {
+    () => {
+        Migration::new(
+            "0165",
+            "check_result_cache_ran_at_millis",
+            include_str!("../../../../turso_migrations/0165_check_result_cache_ran_at_millis.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_verdict_reuse_facts {
+    () => {
+        Migration::new(
+            "0155",
+            "verdict_reuse_facts",
+            include_str!("../../../../turso_migrations/0155_verdict_reuse_facts.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_repair_check_observation_public_handle {
+    () => {
+        Migration::new(
+            "0154",
+            "repair_check_observation_public_handle",
+            include_str!(
+                "../../../../turso_migrations/0154_repair_check_observation_public_handle.sql"
+            ),
+        )
+    };
+}
+
+macro_rules! private_route_firing_content {
+    () => {
+        Migration::new(
+            "0159",
+            "route_firing_content",
+            include_str!("../../../../turso_migrations/0159_route_firing_content.sql"),
+        )
+    };
+}
+
+macro_rules! private_channel_outbound_route_kind {
+    () => {
+        Migration::new(
+            "0153",
+            "channel_outbound_route_kind",
+            include_str!("../../../../turso_migrations/0153_channel_outbound_route_kind.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_rebase_replay_status {
+    () => {
+        Migration::new(
+            "0150",
+            "rebase_replay_status",
+            include_str!("../../../../turso_migrations/0150_rebase_replay_status.sql"),
+        )
+    };
+}
+
+macro_rules! private_command_contention_profiles {
+    () => {
+        Migration::new(
+            "0149",
+            "command_contention_profiles",
+            include_str!("../../../../turso_migrations/0149_command_contention_profiles.sql"),
+        )
+    };
+}
+
+macro_rules! private_channel_thread_suppression {
+    () => {
+        Migration::new(
+            "0148",
+            "channel_thread_suppression",
+            include_str!("../../../../turso_migrations/0148_channel_thread_suppression.sql"),
+        )
+    };
+}
+
 macro_rules! shared_tail_check_observation_public_handle {
     () => {
         Migration::new(
@@ -611,6 +763,38 @@ macro_rules! private_command_duration_profiles {
     };
 }
 
+macro_rules! private_route_firings {
+    () => {
+        Migration::new(
+            "0152",
+            "route_firings",
+            include_str!("../../../../turso_migrations/0152_route_firings.sql"),
+        )
+    };
+}
+
+macro_rules! private_response_invocations {
+    () => {
+        Migration::new(
+            "0151",
+            "response_invocations",
+            include_str!("../../../../turso_migrations/0151_response_invocations.sql"),
+        )
+    };
+}
+
+macro_rules! private_quarantine_saturation_memory_profiles {
+    () => {
+        Migration::new(
+            "0147",
+            "quarantine_saturation_memory_profiles",
+            include_str!(
+                "../../../../turso_migrations/0147_quarantine_saturation_memory_profiles.sql"
+            ),
+        )
+    };
+}
+
 macro_rules! private_thread_compaction {
     () => {
         Migration::new(
@@ -677,6 +861,15 @@ macro_rules! team_lineage {
             shared_tail_issue_kind!(),
             shared_tail_pr_resolution_attribution!(),
             shared_tail_check_observation_public_handle!(),
+            shared_tail_repair_check_observation_public_handle!(),
+            shared_tail_verdict_reuse_facts!(),
+            shared_tail_rebase_replay_status!(),
+            shared_tail_threads_entity!(),
+            shared_tail_migrate_issue_threads!(),
+            shared_tail_thread_title_retires!(),
+            shared_tail_turns_created_at_index!(),
+            shared_tail_check_result_cache_ran_at_millis!(),
+            shared_tail_inherit_thread_id_for_child_jobs!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -874,12 +1067,34 @@ macro_rules! private_lineage {
             // entries around it carries no dependency.
             private_thread_compaction!(),
             private_command_duration_profiles!(),
+            private_quarantine_saturation_memory_profiles!(),
             private_channel_persistence!(),
             private_channel_outbound_expired!(),
             private_channel_thread_state!(),
+            private_channel_thread_suppression!(),
             shared_tail_issue_kind!(),
             shared_tail_pr_resolution_attribution!(),
             shared_tail_check_observation_public_handle!(),
+            shared_tail_repair_check_observation_public_handle!(),
+            shared_tail_verdict_reuse_facts!(),
+            private_command_contention_profiles!(),
+            // Keep the shared rebase state at 0150 before private Response history at 0151.
+            shared_tail_rebase_replay_status!(),
+            // Response observability is runner-local and intentionally not team replicated.
+            private_response_invocations!(),
+            private_route_firings!(),
+            private_channel_outbound_route_kind!(),
+            // Must follow both: it adds columns to `route_firings` and backfills
+            // them from `channel_outbound`.
+            private_route_firing_content!(),
+            shared_tail_threads_entity!(),
+            shared_tail_migrate_issue_threads!(),
+            Migration::new(
+                "0158",
+                "executor_desktop_automation",
+                include_str!("../../../../turso_migrations/0158_executor_desktop_automation.sql"),
+            ),
+            shared_tail_thread_title_retires!(),
             // Must follow `private_thread_compaction!()`: they alter that table.
             Migration::new(
                 "0140",
@@ -895,6 +1110,35 @@ macro_rules! private_lineage {
                     "../../../../turso_migrations/0141_thread_compaction_capacity_trigger.sql"
                 ),
             ),
+            // Data-only clear of a derived cache. The table is shared with the
+            // team lineage, but nothing here is schema, and a team replica's
+            // stale rows self-heal: an unparseable row is a cache miss that
+            // rebuilds in the compact shape.
+            Migration::new(
+                "0161",
+                "clear_skyline_cache_for_compact_bars",
+                include_str!(
+                    "../../../../turso_migrations/0161_clear_skyline_cache_for_compact_bars.sql"
+                ),
+            ),
+            // CAIRN-3810: per-turn semantic vectors backing the search lane.
+            // Private-only for the same reason `resource_embeddings` is.
+            Migration::new(
+                "0162",
+                "turn_embeddings",
+                include_str!("../../../../turso_migrations/0162_turn_embeddings.sql"),
+            ),
+            shared_tail_turns_created_at_index!(),
+            // CAIRN-3810: separates the sweep's consent boundary from its
+            // reconciliation floor. Private-only, like `turn_embeddings`.
+            Migration::new(
+                "0164",
+                "turn_embedding_state",
+                include_str!("../../../../turso_migrations/0164_turn_embedding_state.sql"),
+            ),
+            shared_tail_check_result_cache_ran_at_millis!(),
+            private_authority_grants!(),
+            shared_tail_inherit_thread_id_for_child_jobs!(),
         ]
     };
 }
@@ -1519,6 +1763,18 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("artifacts", TableScope::ProjectScoped),
     ("attention_pushes", TableScope::ProjectScoped),
     ("attention_read_cursors", TableScope::ProjectScoped),
+    // Authorization state is this operator's decision about this install.
+    // Replicating a grant would authorize a teammate's agents against their own
+    // workspace configuration, which is the blast-radius expansion the
+    // authorization subsystem exists to gate.
+    (
+        "authority_grants",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "authorization_events",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     ("check_result_cache", TableScope::ProjectScoped),
     ("check_result_commit_aliases", TableScope::ProjectScoped),
     ("check_result_observations", TableScope::ProjectScoped),
@@ -1571,6 +1827,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("sessions", TableScope::ProjectScoped),
     ("skill_configs", TableScope::ProjectScoped),
     ("suppressed_wakes", TableScope::ProjectScoped),
+    ("threads", TableScope::ProjectScoped),
     ("todos", TableScope::ProjectScoped),
     ("token_rollup", TableScope::ProjectScoped),
     ("token_rollup_runs", TableScope::ProjectScoped),
@@ -1605,6 +1862,21 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // teammate's replica could use, and rebuildable by running the work again.
     (
         "command_duration_profiles",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // Machine-local slowdown curves learned from executions with stated start
+    // load (0149). Same category as the duration/resource profiles above:
+    // observations of how work behaves HERE, rebuildable by running it again.
+    (
+        "command_contention_profiles",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // The desktop-automation capabilities this runner last probed off each
+    // enrolled executor (0158). A cached answer about machines THIS runner can
+    // reach, refreshed by probing again; a teammate's replica would describe a
+    // different fleet.
+    (
+        "executor_desktop_automation",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
     // ── Private: identity & credentials ──────────────────────────────────────
@@ -1684,6 +1956,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "workflow_call",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // Runner-local observability history (0151/0152): what THIS runner's
+    // Response invocations and route firings did. Intentionally not
+    // team-replicated, same category as the workflow journal above.
+    (
+        "response_invocations",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "route_firings",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "write_replay_ledger",
         TableScope::Private(PrivateReason::RunnerTransient),
@@ -1746,6 +2029,23 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
             issue: "CAIRN-2210",
             target: ScopeTarget::ProjectScoped,
         }),
+    ),
+    // turn_embeddings: the same store one granularity finer, so the same
+    // deferral. Sharing it needs the identical routing + mechanism decision,
+    // and splitting the two apart would answer that question twice.
+    (
+        "turn_embeddings",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-2210",
+            target: ScopeTarget::ProjectScoped,
+        }),
+    ),
+    // turn_embedding_state: this host's sweep progress, alongside the
+    // archival-backfill progress the same reason already covers. It describes
+    // when THIS install began participating, so it is meaningless elsewhere.
+    (
+        "turn_embedding_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // config_disables: a host-side resolution override; team-config propagation is
     // a separate cross-scope feature, deferred with a named owner.
@@ -1840,7 +2140,7 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "comments",
-        id_columns: &["id", "issue_id"],
+        id_columns: &["id", "issue_id", "thread_id"],
     },
     RekeyTableManifest {
         table: "condition_evaluations",
@@ -1896,7 +2196,13 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "issues",
-        id_columns: &["id", "project_id", "parent_issue_id", "parent_job_id"],
+        id_columns: &[
+            "id",
+            "project_id",
+            "parent_issue_id",
+            "parent_job_id",
+            "parent_thread_id",
+        ],
     },
     RekeyTableManifest {
         table: "jj_reconcile_incoming_files",
@@ -1931,6 +2237,7 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &[
             "id",
             "execution_id",
+            "thread_id",
             "parent_job_id",
             "issue_id",
             "project_id",
@@ -2039,6 +2346,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "suppressed_wakes",
         id_columns: &["id", "subscription_id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "threads",
+        id_columns: &["id", "project_id"],
     },
     RekeyTableManifest {
         table: "todos",
@@ -2253,78 +2564,93 @@ mod tests {
                 "0136_conflict_resolution_sessions".to_string(),
                 "0139_thread_compaction".to_string(),
                 "0143_command_duration_profiles".to_string(),
+                "0147_quarantine_saturation_memory_profiles".to_string(),
                 "0137_channel_persistence".to_string(),
                 "0142_channel_outbound_expired".to_string(),
                 "0144_channel_thread_state".to_string(),
+                "0148_channel_thread_suppression".to_string(),
                 "0138_issue_kind".to_string(),
                 "0145_pr_resolution_attribution".to_string(),
                 "0146_add_check_observation_public_handle".to_string(),
+                "0154_repair_check_observation_public_handle".to_string(),
+                "0155_verdict_reuse_facts".to_string(),
+                "0149_command_contention_profiles".to_string(),
+                "0150_rebase_replay_status".to_string(),
+                "0151_response_invocations".to_string(),
+                "0152_route_firings".to_string(),
+                "0153_channel_outbound_route_kind".to_string(),
+                "0159_route_firing_content".to_string(),
+                "0156_threads_entity".to_string(),
+                "0157_migrate_issue_threads".to_string(),
+                "0158_executor_desktop_automation".to_string(),
+                "0160_thread_title_retires".to_string(),
                 "0140_thread_compaction_seed_bytes".to_string(),
                 "0141_thread_compaction_capacity_trigger".to_string(),
+                "0161_clear_skyline_cache_for_compact_bars".to_string(),
+                "0162_turn_embeddings".to_string(),
+                "0163_turns_created_at_index".to_string(),
+                "0164_turn_embedding_state".to_string(),
+                "0165_check_result_cache_ran_at_millis".to_string(),
+                "0166_authority_grants".to_string(),
+                "0167_inherit_thread_id_for_child_jobs".to_string(),
             ]
         );
         Ok(db)
     }
 
-    /// CAIRN-3387: the kind discriminator arrives with zero behavior change for
-    /// rows that predate it. A row written before the migration reads as an
-    /// ordinary issue afterwards, and the column default carries that without a
-    /// backfill statement of its own — which is what lets a synced replica table
-    /// take the column via a plain ADD COLUMN instead of a rebuild.
     #[tokio::test]
-    async fn issue_kind_defaults_existing_rows_to_issue() {
+    async fn repairs_comment_only_public_handle_migration_on_an_applied_database() {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("issue-kind.turso.db"))
+        let db = LocalDb::open(temp.path().join("observation-handle-repair.turso.db"))
             .await
             .unwrap();
-        // Everything composed BEFORE the migration under test; composition order
-        // is not file-number order, so this selects by version rather than
-        // slicing positionally.
-        let before = TURSO_MIGRATIONS
+
+        // Model a live database whose registry includes the no-op 0146 and every
+        // subsequently shipped migration, but not the new repair.
+        let previously_shipped = TURSO_MIGRATIONS
             .iter()
-            .take_while(|migration| migration.version != "0138")
+            .filter(|migration| migration.version != "0154")
             .copied()
             .collect::<Vec<_>>();
-        MigrationRunner::new(before).run(&db).await.unwrap();
-        db.execute_script(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
-             INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
-             VALUES ('legacy', 'project', 1, 'Written before kind existed', 1, 1);",
-        )
-        .await
-        .unwrap();
-
+        MigrationRunner::new(previously_shipped)
+            .run(&db)
+            .await
+            .unwrap();
         assert_eq!(
             query_i64(
                 &db,
-                "SELECT COUNT(*) FROM pragma_table_info('issues') WHERE name = 'kind'"
+                "SELECT COUNT(*) FROM pragma_table_info('check_result_observations') WHERE name = 'public_handle'"
             )
             .await
             .unwrap(),
-            0,
-            "the column must not exist before the migration under test"
+            0
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM issue_workspaces WHERE issue_id='thread'"
+            )
+            .await
+            .unwrap(),
+            0
         );
 
         let applied = MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
             .run(&db)
             .await
             .unwrap();
-        // The migration under test is what this run reaches first. Whatever is
-        // composed after it also applies and will keep growing, so pinning the
-        // whole pending tail here would only make every later migration edit an
-        // unrelated test.
-        assert_eq!(applied.first().map(String::as_str), Some("0138_issue_kind"));
-
+        assert_eq!(
+            applied,
+            vec!["0154_repair_check_observation_public_handle".to_string()]
+        );
         assert_eq!(
             query_i64(
                 &db,
-                "SELECT COUNT(*) FROM issues WHERE id = 'legacy' AND kind = 'issue'"
+                "SELECT COUNT(*) FROM pragma_table_info('check_result_observations') WHERE name = 'public_handle'"
             )
             .await
             .unwrap(),
-            1,
-            "a row predating the discriminator reads as an ordinary issue"
+            1
         );
     }
 
@@ -2803,6 +3129,64 @@ mod tests {
             .await
             .unwrap(),
             "dangling-not-action-run"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_firing_content_backfills_delivered_text_from_the_ledger() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("firing-content.turso.db"))
+            .await
+            .unwrap();
+
+        // Every migration before the content columns, so the seed writes the
+        // schema a running installation actually has. Filter by version rather
+        // than slicing: composition order is not file-number order.
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < "0159")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+
+        // Two channel firings: one whose ledger row survives, one whose does not.
+        db.execute_batch(
+            "INSERT INTO route_firings
+                 (id,route_id,scope_key,seq,trigger_source,fact_identity,status,sink_kind,sink_ref,created_at)
+                 VALUES ('f1','followed-thread-stream','workspace',1,'thread_stream',
+                         'cairn://p/CAIRN/3404:event:99','fired','channel','channel_outbound:o1',10),
+                        ('f2','followed-thread-stream','workspace',2,'thread_stream',
+                         'cairn://p/CAIRN/3404:event:100','fired','channel','channel_outbound:gone',20);
+             INSERT INTO channel_outbound
+                 (id,channel,kind,binding_ref,conversation,rendered_text,rendering,status,created_at)
+                 VALUES ('o1','imessage','route',
+                         'route:followed-thread-stream:cairn://p/CAIRN/3404:event:99',
+                         'c','nineteen merges today','text','sent',10);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(&db, "SELECT payload_text FROM route_firings WHERE id='f1'")
+                .await
+                .unwrap(),
+            "nineteen merges today",
+            "a firing whose ledger row survives recovers what it delivered"
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM route_firings WHERE id='f2' AND payload_text IS NULL",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1),
+            "a firing with no surviving ledger row stays unrecorded rather than wrong"
         );
     }
 
@@ -3957,7 +4341,213 @@ mod tests {
         assert_eq!(after, before + 1, "issues search trigger must still fire");
     }
 
-    // ── Team lineage (TEAM_MIGRATIONS) ──────────────────────────────────────
+    #[tokio::test]
+    async fn migrates_issue_backed_threads_to_first_class_ownership() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("thread-cutover.turso.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0157")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','default','Cairn','CAIRN','/tmp/cairn',1,1);
+            INSERT INTO issues(id,project_id,number,title,status,kind,created_at,updated_at)
+              VALUES('thread','p',3404,'General','active','thread',2,3);
+            INSERT INTO issues(id,project_id,number,title,status,kind,created_at,updated_at)
+              VALUES('fake','p',3443,'Settings','closed','issue',2,3);
+            INSERT INTO issues(id,project_id,number,title,parent_issue_id,kind,created_at,updated_at)
+              VALUES('child','p',4000,'Child','thread','issue',2,3);
+            INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+              VALUES('exec','build','thread','p','running',4,1);
+            INSERT INTO jobs(id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at)
+              VALUES('job','exec','thread','p','builder','running',4,4);
+            INSERT INTO runs(id,issue_id,project_id,job_id,status,created_at,updated_at)
+              VALUES('run','thread','p','job','running',4,4);
+            INSERT INTO messages(id,channel_type,channel_id,sender_name,content,created_at)
+              VALUES('message','issue','CAIRN/3404','user','hello',5);
+            INSERT INTO comments(id,issue_id,content,source,created_at)
+              VALUES('comment','thread','note','user',5);
+            INSERT INTO labels(id,workspace_id,name,color,created_at,updated_at)
+              VALUES('label','default','thread','#000000',5,5);
+            INSERT INTO issue_labels(issue_id,label_id,created_at) VALUES('thread','label',5);
+            INSERT INTO issue_workspaces(issue_id,execution_id,surface,layout_json,schema_version,updated_at,revision)
+              VALUES('thread','exec','desktop','{}',1,5,1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![shared_tail_migrate_issue_threads!()])
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(&db, "SELECT name FROM threads WHERE id='thread'")
+                .await
+                .unwrap(),
+            "general"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT status FROM threads WHERE id='fake'")
+                .await
+                .unwrap(),
+            "closed"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT thread_id FROM jobs WHERE id='job'")
+                .await
+                .unwrap(),
+            "thread"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT channel_id FROM messages WHERE id='message'")
+                .await
+                .unwrap(),
+            "thread"
+        );
+        assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM jobs WHERE id='job' AND issue_id IS NULL AND execution_id IS NULL").await.unwrap(), 1);
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM runs WHERE id='run' AND issue_id IS NULL"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            query_text(&db, "SELECT channel_type FROM messages WHERE id='message'")
+                .await
+                .unwrap(),
+            "thread"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT thread_id FROM comments WHERE id='comment'")
+                .await
+                .unwrap(),
+            "thread"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT parent_thread_id FROM issues WHERE id='child'")
+                .await
+                .unwrap(),
+            "thread"
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM executions WHERE id='exec'")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM issues WHERE id IN ('thread','fake')"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM issue_labels WHERE issue_id='thread'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('issues') WHERE name='kind'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    /// The backfill is what makes an already-spawned thread task openable: the
+    /// thread pane can only see jobs whose `thread_id` matches, so a child that
+    /// was never stamped stays orphaned forever without it. A grandchild proves
+    /// the walk is recursive rather than one generation deep, and the issue job
+    /// proves ownership is inherited, not invented — a child of a job that
+    /// belongs to no thread must keep belonging to no thread.
+    #[tokio::test]
+    async fn backfills_thread_ownership_onto_children_of_thread_jobs() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("thread-child-backfill.turso.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0167")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','default','Cairn','CAIRN','/tmp/cairn',1,1);
+            INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+              VALUES('t','p','general','active','none',1,1);
+            INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('session','t','p','idle','thread','Thread',1,1);
+            INSERT INTO jobs(id, parent_job_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('task','session','p','complete','survey','Survey',2,2);
+            INSERT INTO jobs(id, parent_job_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('subtask','task','p','complete','probe','Probe',3,3);
+            INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+              VALUES('i','p',1,'Work','active',1,1);
+            INSERT INTO jobs(id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('builder','i','p','running','builder','Builder',1,1);
+            INSERT INTO jobs(id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('issue-task','builder','i','p','complete','explore','Explore',2,2);
+            ",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![shared_tail_inherit_thread_id_for_child_jobs!()])
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(&db, "SELECT thread_id FROM jobs WHERE id='task'")
+                .await
+                .unwrap(),
+            "t",
+            "a task spawned by a thread's session belongs to that thread"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT thread_id FROM jobs WHERE id='subtask'")
+                .await
+                .unwrap(),
+            "t",
+            "ownership carries down every generation, not just the first"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM jobs WHERE thread_id IS NOT NULL AND id IN ('builder','issue-task')"
+            )
+            .await
+            .unwrap(),
+            0,
+            "an issue execution's jobs belong to no thread"
+        );
+    }
+
+    // ── Team lineage (TEAM_MIGRATIONS) ──────────────────────────────────
 
     /// Reads `sqlite_master` rows of one object kind into a name→DDL map.
     async fn schema_objects(
@@ -4074,6 +4664,15 @@ mod tests {
                 "0138_issue_kind".to_string(),
                 "0145_pr_resolution_attribution".to_string(),
                 "0146_add_check_observation_public_handle".to_string(),
+                "0154_repair_check_observation_public_handle".to_string(),
+                "0155_verdict_reuse_facts".to_string(),
+                "0150_rebase_replay_status".to_string(),
+                "0156_threads_entity".to_string(),
+                "0157_migrate_issue_threads".to_string(),
+                "0160_thread_title_retires".to_string(),
+                "0163_turns_created_at_index".to_string(),
+                "0165_check_result_cache_ran_at_millis".to_string(),
+                "0167_inherit_thread_id_for_child_jobs".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

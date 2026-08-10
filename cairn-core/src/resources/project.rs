@@ -7,7 +7,6 @@ use super::common::{
     parse_optional_i64_param, parse_optional_usize_param, storage_error,
 };
 
-use crate::models::IssueKind;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
@@ -103,7 +102,6 @@ struct ProjectIssueSummary {
     title: String,
     status: String,
     labels: Vec<String>,
-    kind: IssueKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,14 +126,13 @@ struct ProjectIssuesQuery {
     ready: Option<bool>,
     label: Option<String>,
     labels: Option<Vec<String>>,
-    kind: Option<IssueKind>,
 }
 
 const PROJECT_ISSUES_SUPPORTED_PARAMS: &[&str] = &[
-    "status", "limit", "offset", "sort", "ready", "label", "labels", "kind",
+    "status", "limit", "offset", "sort", "ready", "label", "labels",
 ];
 const PROJECT_ISSUES_SUPPORTED_PARAMS_TEXT: &str =
-    "status, limit, offset, sort, ready, label, labels, kind";
+    "status, limit, offset, sort, ready, label, labels";
 const PROJECT_ISSUES_ALLOWED_STATUSES: &[&str] = &[
     "backlog", "active", "waiting", "merged", "closed", "failed", "complete",
 ];
@@ -151,7 +148,6 @@ impl Default for ProjectIssuesQuery {
             ready: None,
             label: None,
             labels: None,
-            kind: None,
         }
     }
 }
@@ -206,14 +202,6 @@ impl ProjectIssuesQuery {
             }
             query.labels = Some(labels);
         }
-        if let Some(value) = find_query_value(params, "kind") {
-            query.kind = Some(
-                value
-                    .trim()
-                    .parse::<IssueKind>()
-                    .map_err(|error| format!("Invalid kind query parameter: {error}"))?,
-            );
-        }
         Ok(query)
     }
 
@@ -222,7 +210,6 @@ impl ProjectIssuesQuery {
             || self.ready.is_some()
             || self.label.is_some()
             || self.labels.is_some()
-            || self.kind.is_some()
     }
 }
 
@@ -333,10 +320,6 @@ fn issue_filter_clause(query: &ProjectIssuesQuery) -> String {
         clause.push(' ');
         clause.push_str(ready_sql_condition(ready));
     }
-    if let Some(kind) = query.kind {
-        let kind = quoted_sql_literal(&kind.to_string());
-        clause.push_str(&format!(" AND LOWER(i.kind) = {kind}"));
-    }
     let label_filters = query
         .label
         .iter()
@@ -386,7 +369,7 @@ async fn load_project_issue_summaries(
     };
     let sql = format!(
         "
-        SELECT i.number, i.title, i.status, GROUP_CONCAT(l.name, char(31)), i.kind
+        SELECT i.number, i.title, i.status, GROUP_CONCAT(l.name, char(31))
         FROM issues i
         LEFT JOIN issue_labels il ON il.issue_id = i.id
         LEFT JOIN labels l ON l.id = il.label_id
@@ -411,12 +394,6 @@ async fn load_project_issue_summaries(
         else {
             continue;
         };
-        let kind = row
-            .opt_text(4)
-            .ok()
-            .flatten()
-            .and_then(|kind| kind.parse::<IssueKind>().ok())
-            .unwrap_or_default();
         let labels = labels
             .unwrap_or_default()
             .split('\u{1f}')
@@ -428,7 +405,6 @@ async fn load_project_issue_summaries(
             title,
             status,
             labels,
-            kind,
         });
     }
 
@@ -465,20 +441,13 @@ fn render_project_issue_entries(
                     .join(" ")
             )
         };
-        // Only a thread is tagged: an untagged entry is an ordinary issue, so
-        // the common case stays quiet and the exception is legible.
-        let kind_tag = match issue.kind {
-            IssueKind::Issue => String::new(),
-            IssueKind::Thread => format!(" [{}]", issue.kind),
-        };
         output.push_str(&format!(
-            "- [{}-{}]({}) [{}] {}{}{}\n",
+            "- [{}-{}]({}) [{}] {}{}\n",
             project_key.to_uppercase(),
             issue.number,
             build_issue_uri(project_key, issue.number),
             status_indicator,
             issue.title,
-            kind_tag,
             labels
         ));
     }
@@ -730,6 +699,8 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
         issue_stats.closed
     ));
 
+    output.push_str(&render_main_attestation(orch, &project_id));
+
     output.push_str("## [Labels](cairn://labels)\n\n");
     if labels.is_empty() {
         output.push_str("No labels defined.\n\n");
@@ -814,6 +785,33 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
 // ============================================================================
 // Projects collection + project settings readers
 // ============================================================================
+
+/// The default-branch attestation wave converging right now, if one is.
+///
+/// A wave records nothing until its whole applicable review suite returns — nine
+/// cache hits and two fresh suites is minutes, not seconds — so for that whole
+/// window the store holds no observation and no commit alias for the freshly
+/// advanced head. Read alone, that is the same emptiness a convergence that never
+/// ran would leave behind, and CAIRN-3823 was filed on exactly that reading. The
+/// line below is the difference: while it is present, the absence of rows for the
+/// current head is a wave still working, not a gap.
+///
+/// Silent when nothing is converging, because then the aliases already say
+/// everything there is to say.
+fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
+    let Some((branch, armed_at_unix_ms)) =
+        crate::execution::checks_main::in_flight(orch, project_id)
+    else {
+        return String::new();
+    };
+    let elapsed_seconds = (chrono::Utc::now().timestamp_millis() - armed_at_unix_ms).max(0) / 1000;
+    format!(
+        "## Main attestation\n\nConverging `{branch}` — armed {} ago. Verdicts for the current \
+         default head are recorded when this finishes, so rows missing for it now are pending, \
+         not absent.\n\n",
+        crate::clock::format_elapsed(elapsed_seconds)
+    )
+}
 
 pub(super) async fn read_projects(db: &LocalDb) -> String {
     let conn = match connect_for_read(db).await {
@@ -1229,8 +1227,17 @@ pub(super) async fn read_project_search(
     if let Err(error) = orch.db.apply_pending_search().await {
         return format!("Search index update failed: {error}");
     }
-    match crate::search::search_content(&routed_db, &orch.db.search_index, query, Some(filters))
-        .await
+    match crate::search::search_content(
+        &routed_db,
+        &orch.db.search_index,
+        query,
+        Some(filters),
+        Some(crate::search::SemanticLane {
+            search: orch.semantic_search(),
+            vectors: &orch.db.local,
+        }),
+    )
+    .await
     {
         Ok(results) => crate::mcp::handlers::search::format_search_results(
             &results,
@@ -1306,71 +1313,8 @@ mod project_issues_query_tests {
     fn rejects_unknown_params_with_supported_list() {
         let error = ProjectIssuesQuery::parse(&[param("foo", "bar")]).unwrap_err();
         assert!(error.contains("Unsupported query parameter 'foo' for project issues"));
-        assert!(error.contains(
-            "Supported parameters: status, limit, offset, sort, ready, label, labels, kind"
-        ));
-    }
-
-    #[test]
-    fn parses_kind_and_rejects_an_unknown_one() {
-        assert_eq!(
-            ProjectIssuesQuery::parse(&[param("kind", "thread")])
-                .unwrap()
-                .kind,
-            Some(IssueKind::Thread)
-        );
-        assert_eq!(ProjectIssuesQuery::default().kind, None);
-        let error = ProjectIssuesQuery::parse(&[param("kind", "discussion")]).unwrap_err();
-        assert!(error.contains("Invalid kind query parameter"), "{error}");
-        assert!(error.contains("issue, thread"), "{error}");
-    }
-
-    /// The filter reaches the SQL, not just the parsed query: a `kind` filter
-    /// windows the page and its total together, the way every other filter does.
-    #[tokio::test]
-    async fn filters_by_kind() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn).await;
-                seed_issue(conn, "i-work", 1, "Ordinary work").await;
-                seed_issue(conn, "i-thread", 2, "Long thread").await;
-                conn.execute(
-                    "UPDATE issues SET kind = 'thread' WHERE id = 'i-thread'",
-                    (),
-                )
-                .await
-                .unwrap();
-
-                let query = ProjectIssuesQuery::parse(&[param("kind", "thread")]).unwrap();
-                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
-                    .await
-                    .unwrap();
-                assert_eq!(total, 1);
-                assert_eq!(issues.len(), 1);
-                assert_eq!(issues[0].title, "Long thread");
-                assert_eq!(issues[0].kind, IssueKind::Thread);
-
-                let query = ProjectIssuesQuery::parse(&[param("kind", "issue")]).unwrap();
-                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
-                    .await
-                    .unwrap();
-                assert_eq!(total, 1);
-                assert_eq!(issues[0].title, "Ordinary work");
-                assert_eq!(issues[0].kind, IssueKind::Issue);
-
-                // Unfiltered, both are present and each carries its own kind.
-                let query = ProjectIssuesQuery::default();
-                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
-                    .await
-                    .unwrap();
-                assert_eq!(total, 2);
-                assert_eq!(issues.len(), 2);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
+        assert!(error
+            .contains("Supported parameters: status, limit, offset, sort, ready, label, labels"));
     }
 
     async fn test_db() -> LocalDb {

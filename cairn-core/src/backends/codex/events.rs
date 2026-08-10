@@ -717,7 +717,10 @@ fn store_event_with_id(
     counts: TokenCounts,
 ) {
     let now = chrono::Utc::now().timestamp() as i32;
-    let data = serde_json::to_string(event).unwrap_or_default();
+    // Transcript crossing (CAIRN-3822). Codex's discrete event path reaches the
+    // durable row and the frontend emission without passing through the
+    // streaming finalizer, so it needs the guard in its own right.
+    let data = event.clone().observed().to_event_json();
 
     let current_turn = orch.process_state.get_current_turn_id(run_id);
     if crate::transcripts::stream_store::insert_event_emit(

@@ -216,7 +216,7 @@ async fn insert_job_for_node_conn(
     } else {
         None
     };
-    let child_backend = backend_for_job_session(snapshot, agent_config_id);
+    let child_backend = backend_for_job_session(snapshot, agent_config_id, model_str.as_deref());
     let create_forked_session = requested_forked_session
         && parent_backend
             .as_deref()
@@ -250,20 +250,38 @@ async fn insert_job_for_node_conn(
 
     let base_branch = base_branch_for_issue_job(conn, project_id, issue_id).await?;
 
+    // Which job this one is spawned beneath. A delegated node names its
+    // delegating parent in its packet, and that is the only place it is known
+    // here: the control-edge `parent_job_id` above is derived from THIS
+    // execution's graph, and a thread session owns no node in it (delegation
+    // books its packets in a synthetic execution), so it resolves to None and
+    // the lineage is written later by `reparent_delegated_jobs`. Asking the
+    // packet means the thread a task belongs to is on the row from birth rather
+    // than a moment after it.
+    let delegating_parent_job_id = delegated_packet
+        .map(|packet| packet.parent_job_id.as_str())
+        .or(parent_job_id);
+    let thread_id = match delegating_parent_job_id {
+        Some(parent) => crate::threads::inherited_thread_id_conn(conn, parent).await?,
+        None => None,
+    };
+
     conn.execute(
         "INSERT INTO jobs(
             id, execution_id, recipe_node_id, parent_job_id,
             branch, base_commit, current_session_id, resume_session_id,
             status, agent_config_id, issue_id, project_id, task_description,
             created_at, updated_at, completed_at, parent_tool_use_id, task_index,
-            started_at, model, node_name, base_branch, current_turn_id, uri_segment
+            started_at, model, node_name, base_branch, current_turn_id, uri_segment,
+            thread_id
          )
          VALUES(
             ?1, ?2, ?3, ?4,
             NULL, NULL, ?5, NULL,
             'pending', ?6, ?7, ?8, ?9,
             ?10, ?10, NULL, NULL, NULL,
-            NULL, ?11, ?12, ?13, NULL, ?14
+            NULL, ?11, ?12, ?13, NULL, ?14,
+            ?15
          )",
         params![
             job_id.as_str(),
@@ -284,6 +302,7 @@ async fn insert_job_for_node_conn(
             Some(node.name.as_str()),
             base_branch.as_deref(),
             uri_segment.as_str(),
+            thread_id.as_deref(),
         ],
     )
     .await?;
@@ -400,17 +419,22 @@ async fn default_branch_for_project(
     ))
 }
 
-fn backend_for_job_session(snapshot: &ExecutionSnapshot, agent_config_id: Option<&str>) -> String {
-    agent_config_id
-        .and_then(|id| snapshot.agents.get(id))
-        .and_then(|agent| {
-            agent
-                .selection
-                .as_ref()
-                .map(|selection| selection.backend.clone())
-                .or_else(|| agent.backend_preference.clone())
-        })
-        .unwrap_or_else(|| "claude".to_string())
+/// The backend the job's first session is opened on — the provider that serves
+/// the model written to `jobs.model` in the same INSERT, asked through the one
+/// resolution the spawn uses, so the session row can never claim a provider the
+/// process will not start.
+fn backend_for_job_session(
+    snapshot: &ExecutionSnapshot,
+    agent_config_id: Option<&str>,
+    model: Option<&str>,
+) -> String {
+    let agent = agent_config_id.and_then(|id| snapshot.agents.get(id));
+    crate::backends::effective_backend_name(
+        agent.and_then(|agent| agent.selection.as_ref()),
+        agent.and_then(|agent| agent.backend_preference.as_deref()),
+        model,
+    )
+    .unwrap_or_else(|| "claude".to_string())
 }
 
 async fn load_session_backend_sequence_conn(
@@ -538,10 +562,12 @@ mod tests {
     }
 
     /// A child of a thread is stamped with the project default branch, the same
-    /// coordinate a parentless issue gets. This column is also what the PR node
-    /// reads for its base ref (`find_implementation_context` →
-    /// `resolve_effective_pr_base`), so stamping the default here is what makes
-    /// the child's pull request target the project default branch.
+    /// coordinate a parentless issue gets: `parent_thread_id` resolves to no
+    /// inherited branch, because a thread's session runs branchless on the base.
+    /// This column is also what the PR node reads for its base ref
+    /// (`find_implementation_context` → `resolve_effective_pr_base`), so
+    /// stamping the default here is what makes the child's pull request target
+    /// the project default branch.
     #[tokio::test(flavor = "current_thread")]
     async fn base_branch_for_a_thread_child_is_the_project_default() {
         let db = migrated_db().await;
@@ -554,28 +580,14 @@ mod tests {
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO issues (id, project_id, number, title, kind, created_at, updated_at)
-                     VALUES ('thread', 'proj-1', 1, 'Thread', 'thread', 1, 1)",
+                    "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+                     VALUES ('thread-1', 'proj-1', 'topic', 'active', 'none', 1, 1)",
                     (),
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO issues (id, project_id, number, title, parent_issue_id, created_at, updated_at)
-                     VALUES ('child', 'proj-1', 2, 'Child', 'thread', 1, 1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
-                     VALUES ('exec-1', 'recipe-default', 'thread', 'proj-1', 'running', 1, 1)",
-                    (),
-                )
-                .await?;
-                // A branch-bearing job on the thread, so the assertion rests on the
-                // kind rather than on a thread happening to own no branch.
-                conn.execute(
-                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, created_at, updated_at)
-                     VALUES ('job-thread', 'exec-1', 'node', 'thread', 'proj-1', 'running', 'agent/thread', 1, 1)",
+                    "INSERT INTO issues (id, project_id, number, title, parent_thread_id, created_at, updated_at)
+                     VALUES ('child', 'proj-1', 1, 'Child', 'thread-1', 1, 1)",
                     (),
                 )
                 .await?;

@@ -70,10 +70,13 @@ pub(crate) use lifecycle::continue_automatic_retry;
 // emits all the way to the commit a delegated task starts from.
 pub use lifecycle::{
     continue_job_impl, continue_job_or_enqueue, on_job_complete_impl, prepare_job,
-    resume_job_from_digest, ResumeContext,
+    preview_job_digest, resume_job_from_digest, DigestPreview, ResumeContext,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use lifecycle::{in_flight_launch_for_test, reconcile_stale_active_turn_for_continue_for_test};
+pub use lifecycle::{
+    continue_job_or_enqueue_with_before_resume_for_test, in_flight_launch_for_test,
+    reconcile_stale_active_turn_for_continue_for_test,
+};
 #[cfg(test)]
 pub(crate) use lifecycle::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
 pub(crate) use slash_commands::resolve_skill_slash_command;
@@ -251,7 +254,12 @@ where
             .block_on(future)
     })
     .join()
-    .map_err(|_| "Database task panicked".to_string())?
+    .map_err(|payload| {
+        format!(
+            "Database task panicked: {}",
+            crate::storage::panic_message(&*payload)
+        )
+    })?
 }
 
 fn db_error(context: &str, error: DbError) -> String {

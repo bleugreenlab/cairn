@@ -15,6 +15,88 @@ pub(crate) struct CheckResultIdentity {
     pub input_hash: String,
 }
 
+/// Tree listing for one node head: the latest row per check name at this sealed
+/// tree. Powers the `/checks` projection and, through it, the settle-wait —
+/// whatever this returns is what a lane renders and what "has this lane produced
+/// a verdict?" is answered from.
+///
+/// Two row FAMILIES share `check_result_cache`, and `environment_fingerprint` is
+/// the only thing that tells them apart:
+///
+/// * VERDICT rows, projected from an immutable observation. Their fingerprint is
+///   the verdict environment identity that produced them — or `''` on rows
+///   written before that identity existed.
+/// * INFRASTRUCTURE rows, written by [`store_check_result`] purely for retry and
+///   suppression diagnosis. Their fingerprint is the
+///   [`infra_suppression_scope`] string, which binds the row to the one job and
+///   commit that hit the failure so a stumble on one head cannot render on
+///   another.
+///
+/// So the predicate below says: every verdict row at this tree, plus
+/// infrastructure rows belonging to THIS head. It used to be spelled
+/// `fingerprint = '' OR fingerprint = scope`, which stated the same thing back
+/// when `''` was the only value a verdict row could carry. Once verdicts began
+/// carrying a real environment identity, that spelling selected exactly the
+/// NON-verdicts: every lane on every node rendered `pending` over a store full of
+/// recorded green, and settle-waits called those lanes verdictless (CAIRN-3823).
+/// Discriminate on the `infra:` prefix — the same discriminator
+/// [`clear_infra_suppressions`] uses — never on the value a verdict happens to
+/// carry today.
+///
+/// One tree can hold several verdicts for one check, one per environment that
+/// ran it, so the newest row wins and the caller gets one row per check name.
+pub(crate) fn list_check_results_for_head(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    tree_hash: &str,
+    job_id: &str,
+    commit_sha: &str,
+) -> Result<Vec<CheckResultCacheEntry>, String> {
+    let project_id = project_id.to_string();
+    let tree_hash = tree_hash.to_string();
+    let scope = infra_suppression_scope(job_id, commit_sha);
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let project_id = project_id.clone();
+            let tree_hash = tree_hash.clone();
+            let scope = scope.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
+                                c.passed, c.output_tail, c.duration_ms, c.ran_at, c.target_results_json,
+                                c.job_id, c.cached, c.failure_kind, c.executor_id, c.executor_device_id,
+                                c.executor_connection_generation, c.executor_slot_id, c.executor_lease_epoch,
+                                c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
+                                c.toolchain_fingerprint, c.infra_failure_streak, c.defined_by_commit_sha
+                           FROM (
+                                SELECT r.*,
+                                       ROW_NUMBER() OVER (
+                                           PARTITION BY r.check_name
+                                           ORDER BY r.ran_at DESC, r.rowid DESC
+                                       ) AS recency_rank
+                                  FROM check_result_cache r
+                                 WHERE r.project_id = ?1 AND r.tree_hash = ?2
+                                   AND (r.environment_fingerprint NOT LIKE 'infra:%'
+                                        OR r.environment_fingerprint = ?3)
+                           ) c
+                          WHERE c.recency_rank = 1
+                          ORDER BY c.check_name ASC",
+                        params![project_id.as_str(), tree_hash.as_str(), scope.as_str()],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row_to_check_result(&row)?);
+                }
+                Ok::<_, crate::storage::DbError>(out)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to list head-scoped check result rows: {e}"))
+    })
+}
+
 impl CheckResultIdentity {
     pub(crate) fn new(project_id: &str, check_name: &str, input_hash: &str) -> Self {
         Self {
@@ -37,7 +119,7 @@ impl CheckResultIdentity {
 pub(crate) struct RecordedCheckObservation {
     pub id: String,
     pub public_handle: String,
-    /// When the source observation actually ran (Unix seconds). Cached aliases
+    /// When the source observation actually ran (Unix milliseconds). Cached aliases
     /// carry the source instant so every citation describes the same evidence.
     pub ran_at: i64,
     /// The environment identity this observation and its commit alias are keyed
@@ -144,56 +226,86 @@ pub(crate) fn get_check_result(
     })
 }
 
-/// Load the exact reusable hot-index row. Unlike the legacy lookup, this refuses
-/// environment/schema ambiguity and requires an immutable reusable source.
-///
-/// Definition provenance participates in the refusal: a row that does not record
-/// which commit declared its check cannot prove the definition behind it, so it
-/// stays diagnostic-only. Reuse ACROSS commits remains allowed — the command and
-/// content identity in the input hash is what proves two commits ask the same
-/// question — and the alias written for the hit records the evaluated commit's
-/// own defining commit.
-pub(crate) fn get_exact_reusable_check_result(
+/// Load the most recent reusable verdict admitted by the project's declared trust set.
+pub(crate) struct ReusableCheckLookup<'a> {
+    pub project_id: &'a str,
+    pub check_name: &'a str,
+    pub input_hash: &'a str,
+    pub verdict_platforms: &'a [String],
+    pub implementation_identity: &'a str,
+    pub verdict_environment_hash: &'a str,
+    pub result_schema_version: i64,
+}
+
+pub(crate) fn get_reusable_check_result(
     db: Arc<LocalDb>,
-    project_id: &str,
-    check_name: &str,
-    input_hash: &str,
-    environment_fingerprint: &str,
-    result_schema_version: i64,
-) -> Result<Option<CheckResultCacheEntry>, String> {
-    if environment_fingerprint.is_empty() || result_schema_version <= 0 {
+    lookup: ReusableCheckLookup<'_>,
+) -> Result<Option<ReusableCheckResult>, String> {
+    let ReusableCheckLookup {
+        project_id,
+        check_name,
+        input_hash,
+        verdict_platforms,
+        implementation_identity,
+        verdict_environment_hash,
+        result_schema_version,
+    } = lookup;
+    if verdict_platforms.is_empty()
+        || implementation_identity.is_empty()
+        || verdict_environment_hash.is_empty()
+        || result_schema_version <= 0
+    {
         return Ok(None);
     }
     let keys = (
         project_id.to_string(),
         check_name.to_string(),
         input_hash.to_string(),
-        environment_fingerprint.to_string(),
+        verdict_platforms.to_vec(),
+        implementation_identity.to_string(),
+        verdict_environment_hash.to_string(),
     );
     run_checkpoint_cache_db(async move {
         db.read(|conn| {
             let keys = keys.clone();
             Box::pin(async move {
-                let mut rows = conn.query(
+                let placeholders = (0..keys.3.len()).map(|i| format!("?{}", i + 7))
+                    .collect::<Vec<_>>().join(",");
+                let sql = format!(
                     "SELECT c.project_id,c.tree_hash,c.input_hash,c.check_name,c.exit_code,
                             c.passed,c.output_tail,c.duration_ms,c.ran_at,c.target_results_json,
                             c.job_id,c.cached,c.failure_kind,c.executor_id,c.executor_device_id,
                             c.executor_connection_generation,c.executor_slot_id,c.executor_lease_epoch,
                             c.executor_started_at_unix_ms,c.executor_finished_at_unix_ms,
-                            c.toolchain_fingerprint,c.infra_failure_streak,c.defined_by_commit_sha
+                            c.toolchain_fingerprint,c.infra_failure_streak,c.defined_by_commit_sha,
+                            c.source_observation_id,o.environment_fingerprint
                        FROM check_result_cache c
                        JOIN check_result_observations o ON o.id=c.source_observation_id
                       WHERE c.project_id=?1 AND c.check_name=?2 AND c.input_hash=?3
-                        AND c.environment_fingerprint=?4 AND c.result_schema_version=?5
-                        AND c.passed=1 AND c.failure_kind IS NULL AND o.reusable=1
-                        AND o.complete=1 AND o.verdict='passed'
+                        AND c.result_schema_version=?4 AND o.runner_build_id=?5
+                        AND o.verdict_environment_hash=?6
+                        AND o.verdict_platform IN ({placeholders})
+                        AND c.failure_kind IS NULL AND o.reusable=1
+                        AND o.complete=1 AND o.failure_kind IS NULL
+                        AND o.verdict IN ('passed','failed')
                         AND c.defined_by_commit_sha IS NOT NULL
-                        AND o.defined_by_commit_sha IS NOT NULL",
-                    params![keys.0.as_str(),keys.1.as_str(),keys.2.as_str(),keys.3.as_str(),result_schema_version]
-                ).await?;
-                rows.next().await?.map(|row| row_to_check_result(&row)).transpose()
+                        AND o.defined_by_commit_sha IS NOT NULL
+                      ORDER BY o.ran_at DESC, o.rowid DESC LIMIT 1"
+                );
+                let mut values: Vec<cairn_db::turso::Value> = vec![
+                    keys.0.into(), keys.1.into(), keys.2.into(),
+                    result_schema_version.into(), keys.4.into(), keys.5.into(),
+                ];
+                values.extend(keys.3.into_iter().map(Into::into));
+                let mut rows = conn.query(&sql, values).await?;
+                let Some(row) = rows.next().await? else { return Ok(None); };
+                Ok(Some(ReusableCheckResult {
+                    entry: row_to_check_result(&row)?,
+                    source_observation_id: row.text(23)?,
+                    environment_fingerprint: row.text(24)?,
+                }))
             })
-        }).await.map_err(|e| format!("Failed to load exact reusable check result: {e}"))
+        }).await.map_err(|e| format!("Failed to load reusable check result: {e}"))
     })
 }
 
@@ -222,6 +334,10 @@ pub(crate) fn get_exact_reusable_check_result(
 /// that residue needs deduplication of identical concurrent work, not a stricter
 /// counter: CAIRN-3271.
 pub(crate) const OBSERVED_INFRA_FAILURE_BOUND: i64 = 3;
+
+pub(crate) fn infra_suppression_scope(job_id: &str, commit_sha: &str) -> String {
+    format!("infra:{}:{job_id}:{commit_sha}", job_id.len())
+}
 
 /// How one write moves a triple's consecutive-infrastructure-failure counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,16 +407,20 @@ pub(crate) fn get_suppressed_check_result(
     project_id: &str,
     check_name: &str,
     input_hash: &str,
+    job_id: &str,
+    commit_sha: &str,
 ) -> Result<Option<CheckResultCacheEntry>, String> {
     let project_id = project_id.to_string();
     let check_name = check_name.to_string();
     let input_hash = input_hash.to_string();
+    let scope = infra_suppression_scope(job_id, commit_sha);
 
     run_checkpoint_cache_db(async move {
         db.read(|conn| {
             let project_id = project_id.clone();
             let check_name = check_name.clone();
             let input_hash = input_hash.clone();
+            let scope = scope.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
@@ -314,14 +434,15 @@ pub(crate) fn get_suppressed_check_result(
                                defined_by_commit_sha
                         FROM check_result_cache
                         WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                          AND environment_fingerprint = '' AND result_schema_version = 0
+                          AND environment_fingerprint = ?5 AND result_schema_version = 0
                           AND infra_failure_streak >= ?4
                         ",
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
                             input_hash.as_str(),
-                            OBSERVED_INFRA_FAILURE_BOUND
+                            OBSERVED_INFRA_FAILURE_BOUND,
+                            scope.as_str()
                         ],
                     )
                     .await?;
@@ -348,22 +469,26 @@ pub(crate) fn claim_infra_escalation(
     project_id: &str,
     check_name: &str,
     input_hash: &str,
+    job_id: &str,
+    commit_sha: &str,
 ) -> Result<bool, String> {
     let project_id = project_id.to_string();
     let check_name = check_name.to_string();
     let input_hash = input_hash.to_string();
+    let scope = infra_suppression_scope(job_id, commit_sha);
 
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
             let project_id = project_id.clone();
             let check_name = check_name.clone();
             let input_hash = input_hash.clone();
+            let scope = scope.clone();
             Box::pin(async move {
                 let changed = conn
                     .execute(
                         "UPDATE check_result_cache SET infra_escalated_at = ?5
                          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                           AND environment_fingerprint = '' AND result_schema_version = 0
+                           AND environment_fingerprint = ?6 AND result_schema_version = 0
                            AND infra_failure_streak >= ?4
                            AND infra_escalated_at IS NULL",
                         params![
@@ -371,7 +496,8 @@ pub(crate) fn claim_infra_escalation(
                             check_name.as_str(),
                             input_hash.as_str(),
                             OBSERVED_INFRA_FAILURE_BOUND,
-                            chrono::Utc::now().timestamp()
+                            chrono::Utc::now().timestamp(),
+                            scope.as_str()
                         ],
                     )
                     .await?;
@@ -416,30 +542,35 @@ pub(crate) fn claim_check_execution(
     project_id: &str,
     check_name: &str,
     input_hash: &str,
+    job_id: &str,
+    commit_sha: &str,
 ) -> Result<CheckExecutionClaim, String> {
     let project_id = project_id.to_string();
     let check_name = check_name.to_string();
     let input_hash = input_hash.to_string();
+    let scope = infra_suppression_scope(job_id, commit_sha);
 
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
             let project_id = project_id.clone();
             let check_name = check_name.clone();
             let input_hash = input_hash.clone();
+            let scope = scope.clone();
             Box::pin(async move {
                 let changed = conn
                     .execute(
                         "UPDATE check_result_cache
                             SET infra_failure_streak = infra_failure_streak + 1
                           WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                            AND environment_fingerprint = '' AND result_schema_version = 0
+                            AND environment_fingerprint = ?5 AND result_schema_version = 0
                             AND infra_failure_streak >= 1
                             AND infra_failure_streak < ?4",
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
                             input_hash.as_str(),
-                            OBSERVED_INFRA_FAILURE_BOUND
+                            OBSERVED_INFRA_FAILURE_BOUND,
+                            scope.as_str()
                         ],
                     )
                     .await?;
@@ -455,11 +586,12 @@ pub(crate) fn claim_check_execution(
                     .query(
                         "SELECT infra_failure_streak FROM check_result_cache
                           WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                            AND environment_fingerprint = '' AND result_schema_version = 0",
+                            AND environment_fingerprint = ?4 AND result_schema_version = 0",
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
-                            input_hash.as_str()
+                            input_hash.as_str(),
+                            scope.as_str()
                         ],
                     )
                     .await?;
@@ -494,7 +626,7 @@ pub(crate) async fn clear_infra_suppressions(db: &LocalDb) -> Result<u64, String
     db.execute(
         "UPDATE check_result_cache
          SET infra_failure_streak = 0, infra_escalated_at = NULL
-         WHERE environment_fingerprint = '' AND result_schema_version = 0
+         WHERE environment_fingerprint LIKE 'infra:%' AND result_schema_version = 0
            AND infra_failure_streak > 0",
         (),
     )
@@ -514,7 +646,11 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
         db.write(|conn| {
             let result = result.clone();
             Box::pin(async move {
-                let ran_at = chrono::Utc::now().timestamp();
+                // Unix MILLISECONDS, the one unit this column speaks. The
+                // observation projection that writes every verdict row into the
+                // same table records the observation's own millisecond instant,
+                // and recency rankings compare the two families directly.
+                let ran_at = chrono::Utc::now().timestamp_millis();
                 conn.execute(
                     "
                     INSERT INTO check_result_cache (
@@ -523,11 +659,12 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         failure_kind, executor_id, executor_device_id,
                         executor_connection_generation, executor_slot_id, executor_lease_epoch,
                         executor_started_at_unix_ms, executor_finished_at_unix_ms,
-                        toolchain_fingerprint, defined_by_commit_sha, infra_failure_streak
+                        toolchain_fingerprint, defined_by_commit_sha, infra_failure_streak,
+                        environment_fingerprint, verdict_platform, verdict_arch, verdict_environment_hash
                     )
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?23,
-                            CASE WHEN ?22 = 1 THEN 1 ELSE 0 END)
+                            CASE WHEN ?22 = 1 THEN 1 ELSE 0 END, ?24, ?25, ?26, ?27)
                     ON CONFLICT(project_id, check_name, input_hash, environment_fingerprint,
                                 result_schema_version) DO UPDATE SET
                         tree_hash = excluded.tree_hash,
@@ -560,7 +697,10 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         infra_escalated_at = CASE
                             WHEN ?22 = 0 THEN NULL
                             ELSE check_result_cache.infra_escalated_at
-                        END
+                        END,
+                        verdict_platform = excluded.verdict_platform,
+                        verdict_arch = excluded.verdict_arch,
+                        verdict_environment_hash = excluded.verdict_environment_hash
                     WHERE check_result_cache.passed = 0 OR excluded.passed = 1
                     ",
                     params![
@@ -589,6 +729,9 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         result.toolchain_fingerprint.as_deref(),
                         streak_op,
                         result.defined_by_commit_sha.as_deref(),
+                        result.environment_fingerprint.as_str(),
+                        result.verdict_platform.as_deref(), result.verdict_arch.as_deref(),
+                        result.verdict_environment_hash.as_deref(),
                     ],
                 )
                 .await?;
@@ -603,6 +746,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
 /// List every cached check result for a project at one sealed tree identity,
 /// ordered by check name. Powers the `/checks` projection and the PR-node
 /// `### Systematic checks` section, which render all of a tree's verdicts at once.
+#[cfg(test)]
 pub(crate) fn list_check_results(
     db: Arc<LocalDb>,
     project_id: &str,
@@ -789,54 +933,67 @@ pub(crate) fn list_latest_passing_check_results_for_job(
 /// List the most recent cached result per check name for one job, independent of
 /// the current worktree/tree pointer. This is the durable fallback for node-level
 /// surfaces after worktree teardown or movement.
+///
+/// The synchronous bridge over [`latest_check_results_for_job`], for the blocking
+/// cache path; callers already on a runtime await that one directly.
 pub(crate) fn list_check_results_for_job(
     db: Arc<LocalDb>,
     job_id: &str,
 ) -> Result<Vec<CheckResultCacheEntry>, String> {
     let job_id = job_id.to_string();
-    run_checkpoint_cache_db(async move {
-        db.read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
-                               c.passed, c.output_tail, c.duration_ms, c.ran_at,
-                               c.target_results_json, c.job_id, c.cached, c.failure_kind, c.executor_id,
-                               c.executor_device_id, c.executor_connection_generation,
-                               c.executor_slot_id, c.executor_lease_epoch,
-                               c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
-                               c.toolchain_fingerprint, c.infra_failure_streak,
-                               c.defined_by_commit_sha
-                        FROM check_result_cache c
-                        WHERE c.job_id = ?1
-                          AND NOT EXISTS (
-                              SELECT 1 FROM check_result_cache newer
-                              WHERE newer.job_id = c.job_id
-                                AND newer.check_name = c.check_name
-                                AND (newer.ran_at > c.ran_at
-                                     OR (newer.ran_at = c.ran_at
-                                         AND newer.tree_hash > c.tree_hash)
-                                     OR (newer.ran_at = c.ran_at
-                                         AND newer.tree_hash = c.tree_hash
-                                         AND newer.input_hash > c.input_hash))
-                          )
-                        ORDER BY c.check_name ASC
-                        ",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    out.push(row_to_check_result(&row)?);
-                }
-                Ok::<_, crate::storage::DbError>(out)
-            })
+    run_checkpoint_cache_db(async move { latest_check_results_for_job(&db, &job_id).await })
+}
+
+/// The most recent cached result per check name for one job — one indexed query,
+/// no worktree and no VCS. Cheap enough to render inside resume assembly, which
+/// is why the attention wake body reads verdicts through here rather than through
+/// the full `/checks` status projection.
+pub(crate) async fn latest_check_results_for_job(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Vec<CheckResultCacheEntry>, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "
+                    SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
+                           c.passed, c.output_tail, c.duration_ms, c.ran_at,
+                           c.target_results_json, c.job_id, c.cached, c.failure_kind, c.executor_id,
+                           c.executor_device_id, c.executor_connection_generation,
+                           c.executor_slot_id, c.executor_lease_epoch,
+                           c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
+                           c.toolchain_fingerprint, c.infra_failure_streak,
+                           c.defined_by_commit_sha
+                    FROM check_result_cache c
+                    WHERE c.job_id = ?1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM check_result_cache newer
+                          WHERE newer.job_id = c.job_id
+                            AND newer.check_name = c.check_name
+                            AND (newer.ran_at > c.ran_at
+                                 OR (newer.ran_at = c.ran_at
+                                     AND newer.tree_hash > c.tree_hash)
+                                 OR (newer.ran_at = c.ran_at
+                                     AND newer.tree_hash = c.tree_hash
+                                     AND newer.input_hash > c.input_hash))
+                      )
+                    ORDER BY c.check_name ASC
+                    ",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(row_to_check_result(&row)?);
+            }
+            Ok::<_, crate::storage::DbError>(out)
         })
-        .await
-        .map_err(|e| format!("Failed to list job check result cache rows: {e}"))
     })
+    .await
+    .map_err(|e| format!("Failed to list job check result cache rows: {e}"))
 }
 
 /// Return rows attributable to one executor connection generation. This is the
@@ -925,6 +1082,14 @@ pub struct CheckResultCacheEntry {
     pub(crate) defined_by_commit_sha: Option<String>,
 }
 
+/// A reusable hot-cache result and the immutable observation that produced it.
+#[derive(Debug, Clone)]
+pub(crate) struct ReusableCheckResult {
+    pub(crate) entry: CheckResultCacheEntry,
+    pub(crate) source_observation_id: String,
+    pub(crate) environment_fingerprint: String,
+}
+
 /// Write payload for a check-result cache row.
 #[derive(Debug, Clone)]
 pub struct CheckResultCacheWrite {
@@ -954,6 +1119,12 @@ pub struct CheckResultCacheWrite {
     /// The commit whose `.cairn/config.yaml` declared this check — see
     /// [`CheckResultCacheEntry::defined_by_commit_sha`].
     pub defined_by_commit_sha: Option<String>,
+    /// Empty for legacy verdict rows; a head-scoped namespace for infrastructure
+    /// breaker rows so overlapping jobs and commits cannot mutate each other.
+    pub environment_fingerprint: String,
+    pub verdict_platform: Option<String>,
+    pub verdict_arch: Option<String>,
+    pub verdict_environment_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -985,6 +1156,9 @@ pub(crate) struct FreshCheckObservationWrite {
     pub check_name: String,
     pub input_hash: String,
     pub environment_fingerprint: String,
+    pub verdict_platform: Option<String>,
+    pub verdict_arch: Option<String>,
+    pub verdict_environment_hash: Option<String>,
     pub exit_code: i32,
     pub verdict: String,
     pub failure_kind: Option<String>,
@@ -1087,6 +1261,16 @@ pub(crate) fn record_fresh_check_observation(
         db.write(|conn| {
             let observation = observation.clone();
             Box::pin(async move {
+                // Keep immutable equality and insertion under Turso's positional
+                // bind limit by carrying the trailing provenance as one value.
+                let trailing_provenance = serde_json::json!({
+                    "definedByCommitSha": observation.defined_by_commit_sha,
+                    "publicHandle": observation.public_handle,
+                    "verdictPlatform": observation.verdict_platform,
+                    "verdictArch": observation.verdict_arch,
+                    "verdictEnvironmentHash": observation.verdict_environment_hash,
+                })
+                .to_string();
                 let mut existing = conn
                     .query(
                         "SELECT COUNT(*) FROM check_result_observations
@@ -1101,7 +1285,11 @@ pub(crate) fn record_fresh_check_observation(
                            AND executor_lease_epoch IS ?25 AND executor_started_at_unix_ms IS ?26
                            AND executor_finished_at_unix_ms IS ?27 AND runner_build_id IS ?28
                            AND toolchain_fingerprint IS ?29 AND output_tail=?30
-                           AND defined_by_commit_sha IS ?31",
+                           AND defined_by_commit_sha IS json_extract(?31,'$.definedByCommitSha')
+                           AND public_handle IS json_extract(?31,'$.publicHandle')
+                           AND verdict_platform IS json_extract(?31,'$.verdictPlatform')
+                           AND verdict_arch IS json_extract(?31,'$.verdictArch')
+                           AND verdict_environment_hash IS json_extract(?31,'$.verdictEnvironmentHash')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -1116,7 +1304,7 @@ pub(crate) fn record_fresh_check_observation(
                             observation.executor_cell_id.as_deref(), observation.executor_lease_epoch,
                             observation.executor_started_at_unix_ms, observation.executor_finished_at_unix_ms,
                             observation.runner_build_id.as_deref(), observation.toolchain_fingerprint.as_deref(),
-                            observation.output_tail.as_str(), observation.defined_by_commit_sha.as_str()],
+                            observation.output_tail.as_str(), trailing_provenance.as_str()],
                     )
                     .await?;
                 let exact_existing = existing.next().await?.expect("COUNT returns a row").i64(0)? == 1;
@@ -1165,28 +1353,34 @@ pub(crate) fn record_fresh_check_observation(
                         executor_device_id, executor_connection_generation, executor_slot_id,
                         executor_lease_epoch, executor_started_at_unix_ms,
                         executor_finished_at_unix_ms, runner_build_id, toolchain_fingerprint,
-                        output_tail, defined_by_commit_sha, public_handle
+                        output_tail, defined_by_commit_sha, public_handle, verdict_platform,
+                        verdict_arch, verdict_environment_hash
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
-                              ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)
+                              ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
+                              json_extract(?31,'$.definedByCommitSha'),
+                              json_extract(?31,'$.publicHandle'),
+                              json_extract(?31,'$.verdictPlatform'),
+                              json_extract(?31,'$.verdictArch'),
+                              json_extract(?31,'$.verdictEnvironmentHash'))
                        ON CONFLICT(id) DO NOTHING",
-                    params![
-                        observation.id.as_str(), observation.project_id.as_str(),
-                        observation.commit_sha.as_str(), observation.tree_hash.as_str(),
-                        observation.check_name.as_str(), observation.input_hash.as_str(),
-                        observation.environment_fingerprint.as_str(), observation.exit_code as i64,
-                        observation.verdict.as_str(), observation.failure_kind.as_deref(),
-                        i64::from(observation.complete), i64::from(observation.reusable),
-                        observation.non_reusable_reason.as_deref(), observation.parser_version,
-                        observation.result_schema_version, observation.ran_at,
-                        observation.duration_ms, observation.job_id.as_deref(),
-                        observation.run_id.as_deref(), observation.cadence.as_str(),
-                        observation.executor_id.as_deref(), observation.executor_device_id.as_deref(),
-                        observation.executor_connection_generation, observation.executor_cell_id.as_deref(),
-                        observation.executor_lease_epoch, observation.executor_started_at_unix_ms,
-                        observation.executor_finished_at_unix_ms, observation.runner_build_id.as_deref(),
-                        observation.toolchain_fingerprint.as_deref(), observation.output_tail.as_str(),
-                        observation.defined_by_commit_sha.as_str(), observation.public_handle.as_str()
-                    ],
+                    Vec::<cairn_db::turso::Value>::from([
+                        observation.id.as_str().into(), observation.project_id.as_str().into(),
+                        observation.commit_sha.as_str().into(), observation.tree_hash.as_str().into(),
+                        observation.check_name.as_str().into(), observation.input_hash.as_str().into(),
+                        observation.environment_fingerprint.as_str().into(), (observation.exit_code as i64).into(),
+                        observation.verdict.as_str().into(), observation.failure_kind.as_deref().into(),
+                        i64::from(observation.complete).into(), i64::from(observation.reusable).into(),
+                        observation.non_reusable_reason.as_deref().into(), observation.parser_version.into(),
+                        observation.result_schema_version.into(), observation.ran_at.into(),
+                        observation.duration_ms.into(), observation.job_id.as_deref().into(),
+                        observation.run_id.as_deref().into(), observation.cadence.as_str().into(),
+                        observation.executor_id.as_deref().into(), observation.executor_device_id.as_deref().into(),
+                        observation.executor_connection_generation.into(), observation.executor_cell_id.as_deref().into(),
+                        observation.executor_lease_epoch.into(), observation.executor_started_at_unix_ms.into(),
+                        observation.executor_finished_at_unix_ms.into(), observation.runner_build_id.as_deref().into(),
+                        observation.toolchain_fingerprint.as_deref().into(), observation.output_tail.as_str().into(),
+                        trailing_provenance.into()
+                    ]),
                 ).await?;
                 for test in &observation.tests {
                     conn.execute(
@@ -1201,6 +1395,18 @@ pub(crate) fn record_fresh_check_observation(
                             i64::from(test.flaky)],
                     ).await?;
                 }
+                // A commit coordinate names the latest evaluation, not the
+                // immutable evidence itself. An explicit retry at the same
+                // coordinate supersedes this pointer while both source
+                // observations remain immutable and independently citable.
+                conn.execute(
+                    "DELETE FROM check_result_commit_aliases
+                      WHERE project_id=?1 AND commit_sha=?2 AND check_name=?3
+                        AND environment_fingerprint=?4 AND result_schema_version=?5",
+                    params![observation.project_id.as_str(), observation.commit_sha.as_str(),
+                        observation.check_name.as_str(), observation.environment_fingerprint.as_str(),
+                        observation.result_schema_version],
+                ).await?;
                 let alias_inserted = conn.execute(
                     "INSERT INTO check_result_commit_aliases (
                         project_id, commit_sha, check_name, environment_fingerprint,
@@ -1217,7 +1423,7 @@ pub(crate) fn record_fresh_check_observation(
                 ).await?;
                 if alias_inserted != 1 {
                     return Err(crate::storage::DbError::internal(
-                        "fresh observation conflicts with an existing immutable commit alias",
+                        "fresh observation could not establish its commit alias",
                     ));
                 }
                 conn.execute(
@@ -1228,9 +1434,9 @@ pub(crate) fn record_fresh_check_observation(
                             executor_id, executor_device_id, executor_connection_generation,
                             executor_slot_id, executor_lease_epoch, executor_started_at_unix_ms,
                             executor_finished_at_unix_ms, toolchain_fingerprint,
-                            defined_by_commit_sha
+                            defined_by_commit_sha, verdict_platform, verdict_arch, verdict_environment_hash
                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14,
-                                   ?15,?16,?17,?18,?19,?20,?21,?22,?23)
+                                   ?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)
                          ON CONFLICT(project_id, check_name, input_hash, environment_fingerprint,
                                      result_schema_version) DO UPDATE SET
                             tree_hash=excluded.tree_hash, source_observation_id=excluded.source_observation_id,
@@ -1244,7 +1450,10 @@ pub(crate) fn record_fresh_check_observation(
                             executor_started_at_unix_ms=excluded.executor_started_at_unix_ms,
                             executor_finished_at_unix_ms=excluded.executor_finished_at_unix_ms,
                             toolchain_fingerprint=excluded.toolchain_fingerprint,
-                            defined_by_commit_sha=excluded.defined_by_commit_sha",
+                            defined_by_commit_sha=excluded.defined_by_commit_sha,
+                            verdict_platform=excluded.verdict_platform,
+                            verdict_arch=excluded.verdict_arch,
+                            verdict_environment_hash=excluded.verdict_environment_hash",
                         params![observation.project_id.as_str(), observation.tree_hash.as_str(),
                             observation.input_hash.as_str(), observation.check_name.as_str(),
                             observation.environment_fingerprint.as_str(), observation.result_schema_version,
@@ -1256,7 +1465,9 @@ pub(crate) fn record_fresh_check_observation(
                             observation.executor_cell_id.as_deref(), observation.executor_lease_epoch,
                             observation.executor_started_at_unix_ms, observation.executor_finished_at_unix_ms,
                             observation.toolchain_fingerprint.as_deref(),
-                            observation.defined_by_commit_sha.as_str()],
+                            observation.defined_by_commit_sha.as_str(),
+                            observation.verdict_platform.as_deref(), observation.verdict_arch.as_deref(),
+                            observation.verdict_environment_hash.as_deref()],
                     ).await?;
                     conn.execute(
                         "UPDATE check_result_cache SET target_results_json=?1
@@ -1268,6 +1479,30 @@ pub(crate) fn record_fresh_check_observation(
                             observation.environment_fingerprint.as_str(), observation.result_schema_version,
                             observation.id.as_str()],
                     ).await?;
+                let infrastructure = observation
+                    .failure_kind
+                    .as_deref()
+                    .and_then(crate::execution::checks::CheckFailureKind::from_stored)
+                    .is_some_and(crate::execution::checks::CheckFailureKind::is_infrastructure);
+                if !infrastructure {
+                    if let Some(job_id) = observation.job_id.as_deref() {
+                        let scope = infra_suppression_scope(job_id, &observation.commit_sha);
+                        conn.execute(
+                            "UPDATE check_result_cache
+                                SET infra_failure_streak = 0, infra_escalated_at = NULL
+                              WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+                                AND environment_fingerprint = ?4
+                                AND result_schema_version = 0",
+                            params![
+                                observation.project_id.as_str(),
+                                observation.check_name.as_str(),
+                                observation.input_hash.as_str(),
+                                scope.as_str()
+                            ],
+                        )
+                        .await?;
+                    }
+                }
                 Ok(())
             })
         }).await.map_err(|e| format!("Failed to record fresh check observation: {e}"))
@@ -1506,55 +1741,52 @@ pub(crate) fn get_check_observation_public_handle(
     })
 }
 
-/// Return the immutable reusable source selected by the exact hot-cache identity.
-/// Empty/legacy environment fingerprints and schema version zero are never hits.
-#[allow(dead_code)]
-pub(crate) fn get_reusable_check_observation_id(
+#[cfg(test)]
+fn get_exact_reusable_check_result(
     db: Arc<LocalDb>,
     project_id: &str,
     check_name: &str,
     input_hash: &str,
-    environment_fingerprint: &str,
+    environment: &str,
+    result_schema_version: i64,
+) -> Result<Option<CheckResultCacheEntry>, String> {
+    get_reusable_check_result(
+        db,
+        ReusableCheckLookup {
+            project_id,
+            check_name,
+            input_hash,
+            verdict_platforms: &["linux".into()],
+            implementation_identity: cairn_common::check_environment::implementation_identity(),
+            verdict_environment_hash: environment,
+            result_schema_version,
+        },
+    )
+    .map(|result| result.map(|result| result.entry))
+}
+
+#[cfg(test)]
+fn get_reusable_check_observation_id(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    check_name: &str,
+    input_hash: &str,
+    environment: &str,
     result_schema_version: i64,
 ) -> Result<Option<String>, String> {
-    if environment_fingerprint.is_empty() || result_schema_version <= 0 {
-        return Ok(None);
-    }
-    let keys = (
-        project_id.to_string(),
-        check_name.to_string(),
-        input_hash.to_string(),
-        environment_fingerprint.to_string(),
-    );
-    run_checkpoint_cache_db(async move {
-        db.read(|conn| {
-            let keys = keys.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT c.source_observation_id FROM check_result_cache c
-                       JOIN check_result_observations o ON o.id=c.source_observation_id
-                      WHERE c.project_id=?1 AND c.check_name=?2 AND c.input_hash=?3
-                        AND c.environment_fingerprint=?4 AND c.result_schema_version=?5
-                        AND c.passed=1 AND c.failure_kind IS NULL AND o.reusable=1
-                        AND o.complete=1 AND o.verdict='passed'
-                        AND c.defined_by_commit_sha IS NOT NULL
-                        AND o.defined_by_commit_sha IS NOT NULL",
-                        params![
-                            keys.0.as_str(),
-                            keys.1.as_str(),
-                            keys.2.as_str(),
-                            keys.3.as_str(),
-                            result_schema_version
-                        ],
-                    )
-                    .await?;
-                rows.next().await?.map(|row| row.text(0)).transpose()
-            })
-        })
-        .await
-        .map_err(|e| format!("Failed to load reusable check observation: {e}"))
-    })
+    get_reusable_check_result(
+        db,
+        ReusableCheckLookup {
+            project_id,
+            check_name,
+            input_hash,
+            verdict_platforms: &["linux".into()],
+            implementation_identity: cairn_common::check_environment::implementation_identity(),
+            verdict_environment_hash: environment,
+            result_schema_version,
+        },
+    )
+    .map(|result| result.map(|result| result.source_observation_id))
 }
 
 /// Normalize a shell command string for stable cache key comparison.
@@ -1739,6 +1971,10 @@ mod tests {
             executor_finished_at_unix_ms: None,
             toolchain_fingerprint: None,
             defined_by_commit_sha: Some(format!("commit-{hash}")),
+            environment_fingerprint: String::new(),
+            verdict_platform: None,
+            verdict_arch: None,
+            verdict_environment_hash: None,
         }
     }
 
@@ -1753,6 +1989,9 @@ mod tests {
             check_name: "rust".to_string(),
             input_hash: "input-rust".to_string(),
             environment_fingerprint: environment.to_string(),
+            verdict_platform: Some("linux".to_string()),
+            verdict_arch: Some("x86_64".to_string()),
+            verdict_environment_hash: Some(environment.to_string()),
             exit_code: 0,
             verdict: "passed".to_string(),
             failure_kind: None,
@@ -1773,7 +2012,9 @@ mod tests {
             executor_lease_epoch: Some(3),
             executor_started_at_unix_ms: Some(90),
             executor_finished_at_unix_ms: Some(100),
-            runner_build_id: Some("runner-1".to_string()),
+            runner_build_id: Some(
+                cairn_common::check_environment::implementation_identity().to_string(),
+            ),
             toolchain_fingerprint: Some("tools-1".to_string()),
             output_tail: "ok".to_string(),
             target_results_json: None,
@@ -1822,6 +2063,7 @@ mod tests {
             },
             failure_kind: kind.map(str::to_string),
             cached: Some(false),
+            environment_fingerprint: infra_suppression_scope("job-test", "commit-test"),
             ..test_result(project_id, hash, check_name)
         }
     }
@@ -1838,9 +2080,16 @@ mod tests {
     }
 
     fn suppressed(db: &Arc<LocalDb>, check_name: &str, input_hash: &str) -> bool {
-        get_suppressed_check_result(db.clone(), "project-a", check_name, input_hash)
-            .unwrap()
-            .is_some()
+        get_suppressed_check_result(
+            db.clone(),
+            "project-a",
+            check_name,
+            input_hash,
+            "job-test",
+            "commit-test",
+        )
+        .unwrap()
+        .is_some()
     }
 
     /// One full evaluation of a triple whose command infrastructure-fails:
@@ -1853,7 +2102,16 @@ mod tests {
     /// never observe the bound, which is exactly the hole that let concurrent
     /// cadences overshoot it.
     fn evaluate_infra_failure(db: &Arc<LocalDb>, check_name: &str, input_hash: &str) -> bool {
-        match claim_check_execution(db.clone(), "project-a", check_name, input_hash).unwrap() {
+        match claim_check_execution(
+            db.clone(),
+            "project-a",
+            check_name,
+            input_hash,
+            "job-test",
+            "commit-test",
+        )
+        .unwrap()
+        {
             CheckExecutionClaim::Suppressed => false,
             CheckExecutionClaim::Clear => {
                 store_check_result(
@@ -1868,11 +2126,33 @@ mod tests {
 
     /// Spend a triple's entire retry budget, leaving it suppressed.
     fn drive_to_bound(db: &Arc<LocalDb>, check_name: &str, input_hash: &str) {
-        for attempt in 1..=OBSERVED_INFRA_FAILURE_BOUND {
-            assert!(
-                evaluate_infra_failure(db, check_name, input_hash),
-                "attempt {attempt} of {OBSERVED_INFRA_FAILURE_BOUND} must still be admitted"
-            );
+        drive_scope_to_bound(db, check_name, input_hash, "job-test", "commit-test");
+    }
+
+    fn drive_scope_to_bound(
+        db: &Arc<LocalDb>,
+        check_name: &str,
+        input_hash: &str,
+        job_id: &str,
+        commit_sha: &str,
+    ) {
+        for _ in 1..=OBSERVED_INFRA_FAILURE_BOUND {
+            assert!(matches!(
+                claim_check_execution(
+                    db.clone(),
+                    "project-a",
+                    check_name,
+                    input_hash,
+                    job_id,
+                    commit_sha,
+                )
+                .unwrap(),
+                CheckExecutionClaim::Clear
+            ));
+            let mut failure =
+                failing_result("project-a", input_hash, check_name, Some("infrastructure"));
+            failure.environment_fingerprint = infra_suppression_scope(job_id, commit_sha);
+            store_check_result(db.clone(), failure).unwrap();
         }
     }
 
@@ -1911,6 +2191,225 @@ mod tests {
             .is_none());
     }
 
+    /// Reproduces CAIRN-3583: one head exhausts the infrastructure retry budget,
+    /// then a fresh head with byte-identical check inputs arrives after repair.
+    #[tokio::test]
+    async fn new_head_rearms_suppressed_check_with_unchanged_inputs() {
+        let db = cache_db().await;
+        drive_to_bound(&db, "rust", "ih-rust");
+
+        assert!(matches!(
+            claim_check_execution(
+                db.clone(),
+                "project-a",
+                "rust",
+                "ih-rust",
+                "job-test",
+                "commit-after-repair",
+            )
+            .unwrap(),
+            CheckExecutionClaim::Clear
+        ));
+        assert!(
+            get_suppressed_check_result(
+                db.clone(),
+                "project-a",
+                "rust",
+                "ih-rust",
+                "job-test",
+                "commit-after-repair",
+            )
+            .unwrap()
+            .is_none(),
+            "the repaired head must never inherit the old head's diagnostic"
+        );
+
+        let mut repaired = test_result("project-a", "tree-after-repair", "rust");
+        repaired.input_hash = "ih-rust".to_string();
+        store_check_result(db.clone(), repaired).unwrap();
+        assert!(
+            get_check_result(db, "project-a", "rust", "ih-rust")
+                .unwrap()
+                .is_some(),
+            "the admitted lane must be able to replace suppression with a real verdict"
+        );
+    }
+
+    /// A late result from an older head cannot mutate the newer head's breaker.
+    /// Each scope spends its own retry budget and retains its own diagnostic even
+    /// when claims and completions interleave.
+    #[tokio::test]
+    async fn overlapping_heads_cannot_reset_or_overwrite_each_other() {
+        let db = cache_db().await;
+        drive_to_bound(&db, "rust", "ih-rust");
+
+        assert!(matches!(
+            claim_check_execution(
+                db.clone(),
+                "project-a",
+                "rust",
+                "ih-rust",
+                "job-test",
+                "commit-new",
+            )
+            .unwrap(),
+            CheckExecutionClaim::Clear
+        ));
+
+        let mut late_old = failing_result("project-a", "ih-rust", "rust", Some("infrastructure"));
+        late_old.output_tail = "old-head diagnostic".to_string();
+        store_check_result(db.clone(), late_old).unwrap();
+
+        for attempt in 1..=OBSERVED_INFRA_FAILURE_BOUND {
+            if attempt > 1 {
+                assert!(matches!(
+                    claim_check_execution(
+                        db.clone(),
+                        "project-a",
+                        "rust",
+                        "ih-rust",
+                        "job-test",
+                        "commit-new",
+                    )
+                    .unwrap(),
+                    CheckExecutionClaim::Clear
+                ));
+            }
+            let mut failure =
+                failing_result("project-a", "ih-rust", "rust", Some("infrastructure"));
+            failure.environment_fingerprint = infra_suppression_scope("job-test", "commit-new");
+            failure.output_tail = "new-head diagnostic".to_string();
+            store_check_result(db.clone(), failure).unwrap();
+        }
+
+        assert!(matches!(
+            claim_check_execution(
+                db.clone(),
+                "project-a",
+                "rust",
+                "ih-rust",
+                "job-test",
+                "commit-new",
+            )
+            .unwrap(),
+            CheckExecutionClaim::Suppressed
+        ));
+        let new_head = get_suppressed_check_result(
+            db.clone(),
+            "project-a",
+            "rust",
+            "ih-rust",
+            "job-test",
+            "commit-new",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(new_head.output_tail, "new-head diagnostic");
+        let old_head = get_suppressed_check_result(
+            db,
+            "project-a",
+            "rust",
+            "ih-rust",
+            "job-test",
+            "commit-test",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(old_head.output_tail, "old-head diagnostic");
+    }
+
+    /// The specimen CAIRN-3823 was built from. A verdict recorded through the
+    /// production writer carries the environment identity that produced it, and
+    /// the surface that renders lanes must be able to see it. The predicate this
+    /// replaced tested for the EMPTY fingerprint, so from the moment verdicts
+    /// began carrying a real identity every lane on every node rendered
+    /// `pending` over a store full of recorded green, and settle-waits declared
+    /// those same lanes verdictless.
+    #[tokio::test]
+    async fn head_listing_returns_a_verdict_carrying_a_real_environment_identity() {
+        let db = cache_db().await;
+        record_fresh_check_observation(db.clone(), observation("obs-1", "commit-1", "env-a"))
+            .unwrap();
+
+        let rows =
+            list_check_results_for_head(db, "project-a", "tree-commit-1", "job-1", "commit-1")
+                .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.check_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rust"],
+            "the lane's own recorded verdict must reach the surface that renders it"
+        );
+        assert!(rows[0].passed);
+    }
+
+    /// An infrastructure row is diagnosis, not a verdict, and stays bound to the
+    /// head that hit it: an unchanged tree on a new head must not render another
+    /// head's stumble. Restoring the verdict families to this listing must not
+    /// cost that scoping.
+    #[tokio::test]
+    async fn head_listing_shows_only_this_heads_infrastructure_row() {
+        let db = cache_db().await;
+        store_check_result(
+            db.clone(),
+            CheckResultCacheWrite {
+                environment_fingerprint: infra_suppression_scope("job-1", "commit-1"),
+                ..failing_result("project-a", "tree-commit-1", "mine", Some("infrastructure"))
+            },
+        )
+        .unwrap();
+        store_check_result(
+            db.clone(),
+            CheckResultCacheWrite {
+                environment_fingerprint: infra_suppression_scope("job-2", "commit-2"),
+                ..failing_result(
+                    "project-a",
+                    "tree-commit-1",
+                    "theirs",
+                    Some("infrastructure"),
+                )
+            },
+        )
+        .unwrap();
+
+        let rows =
+            list_check_results_for_head(db, "project-a", "tree-commit-1", "job-1", "commit-1")
+                .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.check_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mine"]
+        );
+    }
+
+    /// One tree can hold one check's verdict from several environments at once,
+    /// one per machine that ran it. A lane renders ONE state, so it renders the
+    /// most recent evidence rather than whichever row a name-keyed map happened
+    /// to keep last.
+    #[tokio::test]
+    async fn head_listing_keeps_the_newest_of_one_checks_per_environment_verdicts() {
+        let db = cache_db().await;
+        record_fresh_check_observation(db.clone(), observation("obs-green", "commit-1", "env-a"))
+            .unwrap();
+        let mut red = observation("obs-red", "commit-1", "env-b");
+        red.ran_at = 200;
+        red.verdict = "failed".to_string();
+        red.exit_code = 1;
+        red.tests[0].status = "failed".to_string();
+        record_fresh_check_observation(db.clone(), red).unwrap();
+
+        let rows =
+            list_check_results_for_head(db, "project-a", "tree-commit-1", "job-1", "commit-1")
+                .unwrap();
+        assert_eq!(rows.len(), 1, "one lane renders one state");
+        assert!(
+            !rows[0].passed,
+            "the newer red must not hide behind an older green from another environment"
+        );
+    }
+
     /// The bound must hold when two cadences evaluate one triple at the same
     /// moment. This is precisely what a plain read cannot cover: at
     /// `BOUND - 1` both would observe "not suppressed", both would launch, and
@@ -1933,7 +2432,15 @@ mod tests {
                 let db = db.clone();
                 tokio::task::spawn_blocking(move || {
                     matches!(
-                        claim_check_execution(db, "project-a", "rust", "ih-rust").unwrap(),
+                        claim_check_execution(
+                            db,
+                            "project-a",
+                            "rust",
+                            "ih-rust",
+                            "job-test",
+                            "commit-test",
+                        )
+                        .unwrap(),
                         CheckExecutionClaim::Clear
                     )
                 })
@@ -1972,7 +2479,15 @@ mod tests {
                 let db = db.clone();
                 tokio::task::spawn_blocking(move || {
                     matches!(
-                        claim_check_execution(db, "project-a", "rust", "ih-rust").unwrap(),
+                        claim_check_execution(
+                            db,
+                            "project-a",
+                            "rust",
+                            "ih-rust",
+                            "job-test",
+                            "commit-test",
+                        )
+                        .unwrap(),
                         CheckExecutionClaim::Clear
                     )
                 })
@@ -2010,7 +2525,15 @@ mod tests {
                 let db = db.clone();
                 tokio::task::spawn_blocking(move || {
                     matches!(
-                        claim_check_execution(db, "project-a", "rust", "ih-rust").unwrap(),
+                        claim_check_execution(
+                            db,
+                            "project-a",
+                            "rust",
+                            "ih-rust",
+                            "job-test",
+                            "commit-test",
+                        )
+                        .unwrap(),
                         CheckExecutionClaim::Clear
                     )
                 })
@@ -2046,7 +2569,15 @@ mod tests {
                 let db = db.clone();
                 tokio::task::spawn_blocking(move || {
                     matches!(
-                        claim_check_execution(db, "project-a", "rust", "ih-rust").unwrap(),
+                        claim_check_execution(
+                            db,
+                            "project-a",
+                            "rust",
+                            "ih-rust",
+                            "job-test",
+                            "commit-test",
+                        )
+                        .unwrap(),
                         CheckExecutionClaim::Clear
                     )
                 })
@@ -2134,7 +2665,15 @@ mod tests {
         let db = cache_db().await;
         drive_to_bound(&db, "rust", "ih-rust");
         assert!(suppressed(&db, "rust", "ih-rust"));
-        assert!(claim_infra_escalation(db.clone(), "project-a", "rust", "ih-rust").unwrap());
+        assert!(claim_infra_escalation(
+            db.clone(),
+            "project-a",
+            "rust",
+            "ih-rust",
+            "job-test",
+            "commit-test",
+        )
+        .unwrap());
 
         // An ORDINARY red is a genuine verdict too: the command ran and answered.
         store_check_result(
@@ -2149,27 +2688,52 @@ mod tests {
         drive_to_bound(&db, "rust", "ih-rust");
         assert!(suppressed(&db, "rust", "ih-rust"));
         assert!(
-            claim_infra_escalation(db.clone(), "project-a", "rust", "ih-rust").unwrap(),
+            claim_infra_escalation(
+                db.clone(),
+                "project-a",
+                "rust",
+                "ih-rust",
+                "job-test",
+                "commit-test",
+            )
+            .unwrap(),
             "a relapse after a genuine verdict is a new escalation, not a duplicate"
         );
     }
 
-    /// A pass clears it too, and is additionally shielded from demotion by the
-    /// upsert's pass-retention clause.
+    /// A pass carries an executor environment identity, while suppression carries
+    /// the job/head scope. The production observation writer must bridge those
+    /// identities without clearing another head's independent breaker.
     #[tokio::test]
-    async fn a_pass_clears_the_streak() {
+    async fn a_pass_clears_only_its_scopes_streak() {
         let db = cache_db().await;
-        drive_to_bound(&db, "rust", "ih-rust");
-        assert!(suppressed(&db, "rust", "ih-rust"));
+        drive_scope_to_bound(&db, "rust", "input-rust", "job-test", "commit-test");
+        drive_scope_to_bound(&db, "rust", "input-rust", "job-other", "commit-other");
 
-        let mut pass = test_result("project-a", "ih-rust", "rust");
-        pass.cached = Some(false);
-        store_check_result(db.clone(), pass).unwrap();
-        assert_eq!(streak_of(&db, "ih-rust", "rust").await, 0);
-        assert!(!suppressed(&db, "rust", "ih-rust"));
-        assert!(get_check_result(db.clone(), "project-a", "rust", "ih-rust")
-            .unwrap()
-            .is_some());
+        let mut pass = observation("obs-pass-reset", "commit-test", "executor-environment");
+        pass.job_id = Some("job-test".to_string());
+        record_fresh_check_observation(db.clone(), pass).unwrap();
+
+        assert!(!get_suppressed_check_result(
+            db.clone(),
+            "project-a",
+            "rust",
+            "input-rust",
+            "job-test",
+            "commit-test"
+        )
+        .unwrap()
+        .is_some());
+        assert!(get_suppressed_check_result(
+            db,
+            "project-a",
+            "rust",
+            "input-rust",
+            "job-other",
+            "commit-other"
+        )
+        .unwrap()
+        .is_some());
     }
 
     /// The counter lives on the input-hash-keyed row, so a change to the check's
@@ -2200,10 +2764,26 @@ mod tests {
     async fn exactly_one_escalation_is_claimed_per_triple() {
         let db = cache_db().await;
         drive_to_bound(&db, "rust", "ih-rust");
-        assert!(claim_infra_escalation(db.clone(), "project-a", "rust", "ih-rust").unwrap());
+        assert!(claim_infra_escalation(
+            db.clone(),
+            "project-a",
+            "rust",
+            "ih-rust",
+            "job-test",
+            "commit-test",
+        )
+        .unwrap());
         for _ in 0..5 {
             assert!(
-                !claim_infra_escalation(db.clone(), "project-a", "rust", "ih-rust").unwrap(),
+                !claim_infra_escalation(
+                    db.clone(),
+                    "project-a",
+                    "rust",
+                    "ih-rust",
+                    "job-test",
+                    "commit-test",
+                )
+                .unwrap(),
                 "the escalation fires once per triple, not once per evaluation"
             );
         }
@@ -2218,7 +2798,15 @@ mod tests {
             failing_result("project-a", "ih-rust", "rust", Some("infrastructure")),
         )
         .unwrap();
-        assert!(!claim_infra_escalation(db.clone(), "project-a", "rust", "ih-rust").unwrap());
+        assert!(!claim_infra_escalation(
+            db.clone(),
+            "project-a",
+            "rust",
+            "ih-rust",
+            "job-test",
+            "commit-test",
+        )
+        .unwrap());
     }
 
     /// A cache-hit re-stamp reports an older verdict onto a new tree. Nothing
@@ -2229,7 +2817,15 @@ mod tests {
     async fn a_cache_hit_restamp_holds_the_counter_still() {
         let db = cache_db().await;
         drive_to_bound(&db, "rust", "ih-rust");
-        assert!(claim_infra_escalation(db.clone(), "project-a", "rust", "ih-rust").unwrap());
+        assert!(claim_infra_escalation(
+            db.clone(),
+            "project-a",
+            "rust",
+            "ih-rust",
+            "job-test",
+            "commit-test",
+        )
+        .unwrap());
 
         let mut restamp = failing_result("project-a", "tree-later", "rust", Some("infrastructure"));
         restamp.input_hash = "ih-rust".to_string();
@@ -2243,7 +2839,15 @@ mod tests {
         );
         assert!(suppressed(&db, "rust", "ih-rust"));
         assert!(
-            !claim_infra_escalation(db.clone(), "project-a", "rust", "ih-rust").unwrap(),
+            !claim_infra_escalation(
+                db.clone(),
+                "project-a",
+                "rust",
+                "ih-rust",
+                "job-test",
+                "commit-test",
+            )
+            .unwrap(),
             "a re-stamp must not reopen the escalation"
         );
     }
@@ -2256,10 +2860,15 @@ mod tests {
         let db = cache_db().await;
         for check in ["rust", "frontend"] {
             drive_to_bound(&db, check, &format!("ih-{check}"));
-            assert!(
-                claim_infra_escalation(db.clone(), "project-a", check, &format!("ih-{check}"))
-                    .unwrap()
-            );
+            assert!(claim_infra_escalation(
+                db.clone(),
+                "project-a",
+                check,
+                &format!("ih-{check}"),
+                "job-test",
+                "commit-test",
+            )
+            .unwrap());
         }
 
         assert_eq!(clear_infra_suppressions(&db).await.unwrap(), 2);
@@ -2666,39 +3275,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_alias_conflict_rolls_back_observation_tests_and_hot_projection() {
+    async fn later_fresh_observation_supersedes_alias_and_hot_projection() {
         let db = cache_db().await;
         record_fresh_check_observation(db.clone(), observation("obs-1", "commit-1", "env-a"))
             .unwrap();
-        let mut conflict = observation("obs-2", "commit-1", "env-a");
-        conflict.input_hash = "different-input".to_string();
-        assert!(record_fresh_check_observation(db.clone(), conflict).is_err());
+        let mut retry = observation("obs-2", "commit-1", "env-a");
+        retry.ran_at = 200;
+        retry.exit_code = 1;
+        retry.verdict = "failed".to_string();
+        retry.reusable = true;
+        retry.output_tail = "retry result".to_string();
+        record_fresh_check_observation(db.clone(), retry).unwrap();
 
         let observation_count = db
             .query_one(
-                "SELECT COUNT(*) FROM check_result_observations WHERE id='obs-2'",
+                "SELECT COUNT(*) FROM check_result_observations WHERE id IN ('obs-1','obs-2')",
                 (),
                 |row| row.i64(0),
             )
             .await
             .unwrap();
-        let test_count = db
+        let alias_source = db
             .query_one(
-                "SELECT COUNT(*) FROM check_test_results WHERE observation_id='obs-2'",
+                "SELECT source_observation_id FROM check_result_commit_aliases
+                  WHERE project_id='project-a' AND commit_sha='commit-1' AND check_name='rust'",
                 (),
-                |row| row.i64(0),
+                |row| row.text(0),
             )
             .await
             .unwrap();
-        let hot_count = db
+        let hot_source = db
             .query_one(
-                "SELECT COUNT(*) FROM check_result_cache WHERE source_observation_id='obs-2'",
+                "SELECT source_observation_id FROM check_result_cache
+                  WHERE project_id='project-a' AND check_name='rust' AND input_hash='input-rust'",
                 (),
-                |row| row.i64(0),
+                |row| row.text(0),
             )
             .await
             .unwrap();
-        assert_eq!((observation_count, test_count, hot_count), (0, 0, 0));
+        assert_eq!(observation_count, 2, "both immutable observations remain");
+        assert_eq!(alias_source, "obs-2");
+        assert_eq!(hot_source, "obs-2");
     }
 
     #[tokio::test]
@@ -2714,6 +3331,42 @@ mod tests {
         let visible = list_check_results(db.clone(), "project-a", "tree-commit-failed").unwrap();
         assert_eq!(visible.len(), 1);
         assert!(!visible[0].passed);
+        assert!(
+            get_exact_reusable_check_result(db, "project-a", "rust", "input-rust", "env-a", 1,)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_genuine_red_is_an_exact_reusable_verdict() {
+        let db = cache_db().await;
+        let mut failed = observation("obs-failed", "commit-failed", "env-a");
+        failed.exit_code = 1;
+        failed.verdict = "failed".to_string();
+        failed.reusable = true;
+        failed.output_tail = "assertion failed".to_string();
+        record_fresh_check_observation(db.clone(), failed).unwrap();
+
+        let hit =
+            get_exact_reusable_check_result(db, "project-a", "rust", "input-rust", "env-a", 1)
+                .unwrap()
+                .expect("a complete genuine red is a verdict");
+        assert!(!hit.passed);
+        assert_eq!(hit.output_tail, "assertion failed");
+    }
+
+    #[tokio::test]
+    async fn infrastructure_failure_is_never_an_exact_reusable_verdict() {
+        let db = cache_db().await;
+        let mut failed = observation("obs-infra", "commit-infra", "env-a");
+        failed.exit_code = 1;
+        failed.verdict = "failed".to_string();
+        failed.failure_kind = Some("infrastructure".to_string());
+        failed.reusable = false;
+        failed.non_reusable_reason = Some("infrastructure failure".to_string());
+        record_fresh_check_observation(db.clone(), failed).unwrap();
+
         assert!(
             get_exact_reusable_check_result(db, "project-a", "rust", "input-rust", "env-a", 1,)
                 .unwrap()
@@ -3272,5 +3925,43 @@ mod tests {
             "latest-per-check must not rescan history per row; took {elapsed:?} over {} rows",
             checks.len() * rows_per_check
         );
+    }
+    #[tokio::test]
+    async fn reusable_lookup_honors_declared_platform_and_returns_source_identity() {
+        let db = cache_db().await;
+        let source = observation("obs-trust", "commit-trust", "declared-env");
+        record_fresh_check_observation(db.clone(), source).unwrap();
+
+        assert!(get_reusable_check_result(
+            db.clone(),
+            ReusableCheckLookup {
+                project_id: "project-a",
+                check_name: "rust",
+                input_hash: "input-rust",
+                verdict_platforms: &["macos".into()],
+                implementation_identity: cairn_common::check_environment::implementation_identity(),
+                verdict_environment_hash: "declared-env",
+                result_schema_version: 1,
+            }
+        )
+        .unwrap()
+        .is_none());
+
+        let reused = get_reusable_check_result(
+            db,
+            ReusableCheckLookup {
+                project_id: "project-a",
+                check_name: "rust",
+                input_hash: "input-rust",
+                verdict_platforms: &["macos".into(), "linux".into()],
+                implementation_identity: cairn_common::check_environment::implementation_identity(),
+                verdict_environment_hash: "declared-env",
+                result_schema_version: 1,
+            },
+        )
+        .unwrap()
+        .expect("linux is in the declared trust set");
+        assert_eq!(reused.source_observation_id, "obs-trust");
+        assert_eq!(reused.environment_fingerprint, "declared-env");
     }
 }

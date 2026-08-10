@@ -46,7 +46,7 @@ pub(super) async fn read_node_progress(
         }
     }
 
-    let job_id = match super::node::resolve_node_or_task_job_id(
+    let job_id = match super::node::resolve_node_or_task_job_id_for_read(
         db,
         project_key,
         number,

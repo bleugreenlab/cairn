@@ -243,6 +243,7 @@ async fn synthesize_event(
         attention,
         status,
         updated_at,
+        route_provenance: None,
     }
 }
 
@@ -317,6 +318,7 @@ async fn latest_external_reply_event(
         attention,
         status,
         updated_at,
+        route_provenance: None,
     }))
 }
 
@@ -412,6 +414,7 @@ pub async fn handle_watch(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                             attention: ctx.attention,
                             status: ctx.status,
                             updated_at: idle.updated_at,
+                            route_provenance: None,
                         };
                         if event_is_actionable(&event, since) {
                             if let Some(json) =
@@ -570,6 +573,7 @@ mod tests {
             attention: IssueAttention::None,
             status: IssueStatus::Active,
             updated_at: 101,
+            route_provenance: None,
         };
 
         assert!(event_is_actionable(&event, Some(100)));

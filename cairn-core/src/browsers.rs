@@ -1048,7 +1048,7 @@ mod tests {
                 &browser.id,
                 &browser.webview_label,
                 r#"{"id":"restart-1","ts":1,"method":"GET","url":"https://example.test/data"}"#,
-                &crate::browser_network::RedactionPolicy::default(),
+                &crate::security::RedactionPolicy::default(),
             )
             .unwrap();
         assert!(archive.get(&browser.id, "restart-1").is_some());

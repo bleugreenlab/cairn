@@ -338,3 +338,163 @@ async fn shell_path_crossing_session_grant_generalizes_across_commands() {
         "a path-keyed session grant must short-circuit without a new request"
     );
 }
+
+// ============================================================================
+// Authority prompts are not agent-answerable
+// ============================================================================
+
+/// An authority `tool_input`, as `raise_authority` stores it: a normalized
+/// scope, the concrete mutation, and the resultant configuration identity. It
+/// carries no `descriptor`, which is what keeps it from ever parsing as a fence
+/// crossing.
+fn authority_tool_input() -> String {
+    json!({
+        "kind": "authority_request",
+        "verb": "write",
+        "authority": {
+            "scope": {
+                "place": {
+                    "place": "tool",
+                    "workspace_id": "default",
+                    "kind": "mcp_server",
+                    "canonical_name": "linear"
+                },
+                "action": "write"
+            },
+            "mutation": "create",
+            "summary": "install workspace MCP server 'linear'",
+            "facts": {
+                "mcp_config": {
+                    "algorithm": "sha256",
+                    "encoding_version": 1,
+                    "digest": "fixture-digest"
+                }
+            }
+        },
+        "reason": "workspace_tool_capability",
+        "principal": {
+            "node_uri": "cairn://p/TPA/1/1/builder",
+            "run_id": "run-1",
+            "agent_id": "build"
+        },
+        "audience": {"workspace_id": "default"},
+        "request": {
+            "cwd": "/wt",
+            "run_id": "run-1",
+            "tool": "write",
+            "payload": {},
+            "tool_use_id": "toolu-perm"
+        }
+    })
+    .to_string()
+}
+
+async fn make_request_an_authority_prompt(db: &LocalDb) {
+    let tool_input = authority_tool_input();
+    db.write(|conn| {
+        let tool_input = tool_input.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE permission_requests SET tool_input = ?1, tool_name = 'write' \
+                 WHERE id = 'perm-row-1'",
+                params![tool_input.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn grant_count(db: &LocalDb) -> i64 {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM authority_grants", ())
+                .await?;
+            Ok(rows
+                .next()
+                .await?
+                .and_then(|row| row.i64(0).ok())
+                .unwrap_or(0))
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// The residual CAIRN-3803 shipped: an agent could answer its own authority
+/// prompt through the `permissions` resource, including with `standing` — the
+/// one lifetime that crosses runs. Every lifetime must now be refused, and the
+/// refusal must leave the prompt pending for the operator rather than resolving
+/// it into a denial the agent chose.
+#[tokio::test]
+async fn an_agent_cannot_approve_an_authority_prompt_at_any_lifetime() {
+    for lifetime in ["once", "turn", "session", "standing"] {
+        let (temp, db) = common::migrated_db().await;
+        let db = Arc::new(db);
+        insert_permission_fixture(&db).await;
+        make_request_an_authority_prompt(&db).await;
+        let orch = orchestrator(&temp, db.clone());
+
+        let result = handle_write(
+            &orch,
+            &change_request(json!({
+                "changes": [{
+                    "target": "cairn://p/TPA/1/1/builder/permissions/perm-1",
+                    "mode": "patch",
+                    "payload": {"decision": "allow", "lifetime": lifetime}
+                }]
+            })),
+        )
+        .await;
+
+        assert!(
+            result.contains("only an authenticated operator"),
+            "lifetime {lifetime}: expected a self-approval refusal, got: {result}"
+        );
+        assert_eq!(
+            perm_status(&db).await.as_deref(),
+            Some("pending"),
+            "lifetime {lifetime}: a refused self-approval must leave the prompt pending for the \
+             operator, not resolve it"
+        );
+        assert_eq!(
+            grant_count(&db).await,
+            0,
+            "lifetime {lifetime}: no grant may be minted"
+        );
+    }
+}
+
+/// Denial stays open to every surface. An agent recognizing that it should not
+/// be doing something is behavior worth keeping, and removing it would be a
+/// regression dressed up as hardening.
+#[tokio::test]
+async fn an_agent_can_still_deny_an_authority_prompt() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_permission_fixture(&db).await;
+    make_request_an_authority_prompt(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let result = handle_write(
+        &orch,
+        &change_request(json!({
+            "changes": [{
+                "target": "cairn://p/TPA/1/1/builder/permissions/perm-1",
+                "mode": "patch",
+                "payload": {"decision": "deny"}
+            }]
+        })),
+    )
+    .await;
+
+    assert!(
+        result.contains("Answered permission perm-1"),
+        "unexpected result: {result}"
+    );
+    assert_eq!(perm_status(&db).await.as_deref(), Some("denied"));
+    assert_eq!(grant_count(&db).await, 0);
+}

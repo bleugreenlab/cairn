@@ -383,18 +383,28 @@ impl ChangeTestRepo {
         handle_write(&self.orch, &request).await
     }
 
-    /// Turn this fixture's issue into a thread, changing nothing else. The kind
-    /// is then the only difference between the two directions asserted below.
-    async fn become_a_thread(&self) {
+    /// Turn this fixture's issue into a thread, changing nothing else, and
+    /// return the thread's id. The kind is then the only difference between the
+    /// two directions asserted below.
+    ///
+    /// `execute_script`, not `execute`: this is several statements and `execute`
+    /// runs only the first. Re-pointing the job at the thread is the statement
+    /// that makes it thread-owned, so losing it left an ordinary issue-owned job
+    /// the fence then correctly declined to refuse (CAIRN-3874).
+    ///
+    /// The run is detached from the issue before the issue is deleted, because
+    /// `runs.issue_id` cascades — and because that IS a thread session's shape:
+    /// a job and a run, with no issue anywhere in the chain.
+    async fn become_a_thread(&self) -> String {
         self.orch
             .db
             .local
-            .execute(
-                "UPDATE issues SET kind = 'thread' WHERE id = 'issue-change'",
-                params![],
+            .execute_script(
+                "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) SELECT id,project_id,'change-thread','active','none',created_at,updated_at FROM issues WHERE id='issue-change'; UPDATE jobs SET thread_id='issue-change',issue_id=NULL,execution_id=NULL WHERE issue_id='issue-change'; UPDATE runs SET issue_id=NULL WHERE issue_id='issue-change'; DELETE FROM executions WHERE issue_id='issue-change'; DELETE FROM issues WHERE id='issue-change'",
             )
             .await
             .unwrap();
+        "issue-change".to_string()
     }
 }
 
@@ -431,7 +441,23 @@ async fn a_thread_cannot_commit_a_tracked_file_and_an_ordinary_issue_still_can()
         "an ordinary issue's commit must reach the branch unchanged: {report:?}"
     );
 
-    repo.become_a_thread().await;
+    let thread_id = repo.become_a_thread().await;
+    // The conversion is the whole experiment, so it is asserted rather than
+    // assumed: a fixture that inserts a thread row but leaves the job
+    // issue-owned tests nothing, and every assertion below would pass for the
+    // wrong reason.
+    assert_eq!(
+        common::scalar_text_by_id(
+            &repo.orch.db.local,
+            "SELECT thread_id FROM jobs WHERE id = ?1",
+            "job-change"
+        )
+        .await
+        .as_deref(),
+        Some(thread_id.as_str()),
+        "the job under test must actually belong to the thread"
+    );
+
     let refusal = repo
         .change_raw(json!({
             "changes": [{
@@ -444,7 +470,7 @@ async fn a_thread_cannot_commit_a_tracked_file_and_an_ordinary_issue_still_can()
         .await;
 
     assert!(
-        refusal.contains("it is a thread") && refusal.contains("child issue"),
+        refusal.contains("thread-owned job") && refusal.contains("child issue"),
         "the thread must be told the posture and where the work belongs: {refusal}"
     );
     assert_eq!(
@@ -466,17 +492,30 @@ async fn a_thread_still_writes_resources() {
     };
     repo.become_a_thread().await;
 
+    // Project messages, not the converted issue's: a first-class thread has no
+    // backing issue, so `cairn://p/CHG/1/messages` names a row the conversion
+    // deletes. The target has to be one a thread session genuinely still writes,
+    // or the batch fails on a missing resource and says nothing about the guard.
     let report = repo
         .change_report(json!({
             "changes": [{
-                "target": "cairn://p/CHG/1/messages",
+                "target": "cairn://p/CHG/messages",
                 "mode": "append",
-                "payload": { "content": "a thread speaking on its own issue" }
+                "payload": { "content": "a thread speaking on its project" }
             }]
         }))
         .await;
 
     assert_successful_change(&report, 1);
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND content = 'a thread speaking on its project'"
+        )
+        .await,
+        1,
+        "the mutation must reach the database, not just the report: {report:?}"
+    );
 }
 
 /// The incident shape: a patch that inserts a block *before* an anchor and

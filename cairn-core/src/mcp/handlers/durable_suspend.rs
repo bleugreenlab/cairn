@@ -1346,7 +1346,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
-    use crate::config::mcp_servers::McpServerConfig;
     use crate::mcp::gateway::{
         McpCallOutcome, McpGateway, McpResourceDef, McpTaskOutcome, McpToolCallResult,
         McpToolCatalog,
@@ -1537,7 +1536,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
         ) -> Result<McpToolCatalog, String> {
             Ok(McpToolCatalog::default())
         }
@@ -1545,7 +1544,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
         ) -> Result<Vec<McpResourceDef>, String> {
             Ok(vec![])
         }
@@ -1553,7 +1552,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
             _: &str,
         ) -> Result<String, String> {
             Ok(String::new())
@@ -1562,7 +1561,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
             _: &str,
             _: serde_json::Value,
             input: Option<serde_json::Value>,
@@ -1588,7 +1587,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
             task_id: &str,
         ) -> Result<McpTaskOutcome, String> {
             self.task_polls.lock().unwrap().push(task_id.into());
@@ -1602,7 +1601,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
             task_id: &str,
             input: serde_json::Value,
             operation_id: Option<&str>,

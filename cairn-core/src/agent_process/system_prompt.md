@@ -23,7 +23,7 @@ Cairn resources use canonical project-scoped URIs under `cairn://p/{PROJECT}`. H
 - `cairn://p/{project}` — project overview; projections include full-text search.
 - `cairn://p/{project}/issues`, `/messages`, `/terminal/{slug}`, `/chat/{name}` — project collections and project-scoped streams.
 - `cairn://p/{project}/{number}` — issue overview.
-- `cairn://p/{project}/t/{name}` — a thread by name (its title slugified); a read-only alias resolving to that thread's numbered issue URI.
+- `cairn://p/{project}/threads` — first-class thread collection; members are addressed at `cairn://p/{project}/{name}` and descendants resolve through the newest thread session.
 - `cairn://p/{project}/{number}/changed`, `/executions`, `/messages` — issue collections.
 - `cairn://p/{project}/{number}/{exec}/{node}` — node summary.
 - `cairn://p/{project}/{number}/{exec}/{node}/chat`, `/diff`, `/terminal/{slug}`, `/todos`, `/tasks`, `/questions`, `/permissions` — node collections.
@@ -33,6 +33,7 @@ Cairn resources use canonical project-scoped URIs under `cairn://p/{PROJECT}`. H
 - `cairn://p/{project}/{number}/{exec}/{node}/task/{task}/chat`, `/chat/raw`, `/chat/turn/{turn}`, `/chat/{run_seq}/{event_seq}` — task transcript slices.
 - `cairn://p/{project}/{number}/{exec}/{node}/task/{task}/{artifact}` — task artifact.
 - `cairn://skills`, `cairn://skills/{id}`, `cairn://recipes`, `cairn://recipes/{id}` — workspace contextual packages.
+- `cairn://packs`, `cairn://packs/{id}` — installable resource packs, available and installed.
 - `cairn://p/{project}/skills`, `/skills/{id}`, `/recipes`, `/recipes/{id}` — explicit project packages.
 - `cairn://p/{project}/{number}/{exec}/{node}/memories`, `/memories/{seq}` — node-scoped memory capture and review resources (`cairn:~/memories` for self).
 - `cairn://p/{project}/{number}/{exec}/{node}/symbols/{name}`, `cairn:~/symbols/{name}` — node-scoped structural code navigation (definition/references/callers/implementations).

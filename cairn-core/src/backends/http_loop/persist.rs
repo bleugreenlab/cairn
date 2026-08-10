@@ -436,7 +436,8 @@ fn insert_transcript_event(
     cost_usd: Option<f64>,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp() as i32;
-    let data = serde_json::to_string(&event).map_err(|error| error.to_string())?;
+    let event = event.observed();
+    let data = event.to_event_json();
     insert_event_emit(
         run_db.clone(),
         &orch.services.emitter,

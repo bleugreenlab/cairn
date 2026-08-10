@@ -98,7 +98,7 @@ impl From<&SnapshotPresets> for PresetsConfig {
 
 /// Default tier names.
 pub(crate) const DEFAULT_TIERS: &[&str] = &["sm", "md", "lg"];
-const DEFAULT_TIER: &str = "md";
+pub(crate) const DEFAULT_TIER: &str = "md";
 
 /// Build default Claude backend presets.
 ///

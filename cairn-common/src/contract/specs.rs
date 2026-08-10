@@ -13,10 +13,19 @@ pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(
     KeyType::Str,
     "phase name (kind=phase) or log message (kind=log)",
 );
+pub(crate) const EXECUTOR_DESKTOP_AUTOMATION: KeySpec = KeySpec::with_aliases(
+    "desktopAutomation", &["desktop_automation"], KeyType::Bool,
+    "whether desktop automation is enabled for this machine; stored fleet configuration, not an authorization gate",
+);
 pub(crate) const REBASE_RESOLUTION: KeySpec = KeySpec::new(
     "resolution",
     KeyType::Str,
     "take-committed-tip — explicitly use the branch's committed tip content for the session's conflicting paths",
+);
+pub(crate) const REBASE_DROP_INCOMING_REASON: KeySpec = KeySpec::new(
+    "drop_incoming_reason",
+    KeyType::Str,
+    "why discarding the incoming hunks a take-committed-tip would drop is correct; only needed when the replay is refused for dropping them",
 );
 pub(crate) const OLD_STRING: KeySpec = KeySpec::new(
     "old_string",
@@ -188,7 +197,14 @@ pub(crate) const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 pub(crate) const EXECUTION: KeySpec = KeySpec::new(
     "execution",
     KeyType::Object,
-    "{recipe, backend?} to also start an execution once the issue is created (recipe required); omit to create only",
+    "{recipe, backend?, overrides?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call",
+);
+/// Ad-hoc launch deltas, shared verbatim by the executions-collection append and
+/// the issue-create `execution` block — one grammar, described once.
+pub(crate) const LAUNCH_OVERRIDES: KeySpec = KeySpec::new(
+    "overrides",
+    KeyType::Object,
+    "ad-hoc adjustments to THIS launch only, never to the recipe others run. `without:[node,...]` removes nodes and splices their edges through, e.g. {without:[\"review\"]} to skip review on a tiny fix; `nodes:{node:{agent}}` rebinds one node to a different agent and re-resolves its snapshot from that agent's config, e.g. {nodes:{\"builder\":{\"agent\":\"coordinator\"}}}; `agents:{agentId:{...}}` merges agent-snapshot fields (prompt, tier, backend, selection, tools, disallowedTools, skills, extras, description) using the same grammar as the post-create snapshot patch. Address a node by its name or by the agent id it runs — recipe-file node ids are not stable and a token matching no node is refused, never skipped. Removing the trigger, the last agent node, or anything that would strand a node from the trigger is refused; a fence is not settable here",
 );
 pub(crate) const ISSUE_KIND: KeySpec = KeySpec::new(
     "kind",
@@ -198,7 +214,7 @@ pub(crate) const ISSUE_KIND: KeySpec = KeySpec::new(
 pub(crate) const PARENT: KeySpec = KeySpec::new(
     "parent",
     KeyType::Str,
-    "issue URI (cairn://p/PROJECT/N) of the parent; child branches from / PRs into the parent's branch and wakes it on attention",
+    "canonical issue URI (cairn://p/PROJECT/N) or thread URI (cairn://p/PROJECT/thread-name) of the parent: an issue parent also confers branch ancestry (the child branches from / PRs into it), a thread parent routes attention only; defaults to the thread the creating agent is acting for, and to unparented outside a thread",
 );
 pub(crate) const TODOS: KeySpec = KeySpec::new("todos", KeyType::Array, "");
 pub(crate) const CONFIRMED: KeySpec = KeySpec::new(
@@ -233,6 +249,15 @@ pub(crate) const REBASE_FINGERPRINT: KeySpec = KeySpec::new(
 );
 pub(crate) const UPDATES: KeySpec = KeySpec::new("updates", KeyType::Array, "");
 pub(crate) const SKILL_NAME: KeySpec = KeySpec::new("name", KeyType::Str, "");
+
+/// Dedicated to the pack member: `install` materializes an available pack,
+/// `update` re-syncs an installed one. Deliberately not shared with
+/// `NODE_ACTION`/`PR_ACTION`, which no sibling contract can perform.
+pub(crate) const PACK_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "install (materialize an available pack) | update (re-sync an installed one, preserving edits) | restore (bring back items you removed)",
+);
 pub(crate) const SKILL_PROMPT: KeySpec = KeySpec::new("prompt", KeyType::Str, "SKILL.md body");
 pub(crate) const MEMORY_NAME: KeySpec = KeySpec::new(
     "name",

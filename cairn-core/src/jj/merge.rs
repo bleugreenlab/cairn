@@ -1007,7 +1007,12 @@ pub struct RebaseSideSelection {
 
 /// Name-status of a store-side diff as `(status, path)` pairs. Advisory: any jj
 /// error yields an empty list rather than failing the rebase that produced it.
-fn diff_name_status(jj: &JjEnv, store: &Path, from: &str, to: &str) -> Vec<(String, String)> {
+pub(crate) fn diff_name_status(
+    jj: &JjEnv,
+    store: &Path,
+    from: &str,
+    to: &str,
+) -> Vec<(String, String)> {
     jj.run(
         store,
         &[

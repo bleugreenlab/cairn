@@ -90,7 +90,7 @@ pub(super) fn post_chat_completion(
 /// model with no schema-capable provider then fails the request loudly (an HTTP
 /// error naming the model), which is the intended behavior. A no-op when the run
 /// carries no output schema, leaving schema-less sessions bit-for-bit unchanged.
-fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
+pub(super) fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
     let Some(schema) = schema else {
         return;
     };
@@ -112,7 +112,7 @@ fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
     }
 }
 
-fn openrouter_headers(api_key: &str) -> Result<Vec<(String, String)>, String> {
+pub(super) fn openrouter_headers(api_key: &str) -> Result<Vec<(String, String)>, String> {
     Ok(vec![
         ("authorization".to_string(), format!("Bearer {api_key}")),
         ("content-type".to_string(), "application/json".to_string()),

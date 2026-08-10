@@ -2,9 +2,7 @@ use super::*;
 use crate::db::DbState;
 use crate::issues::comments;
 use crate::issues::crud as issue_crud;
-use crate::models::{
-    CommentSource, CreateComment, CreateIssue, CreateProject, IssueKind, IssueStatus,
-};
+use crate::models::{CommentSource, CreateComment, CreateIssue, CreateProject, IssueStatus};
 use crate::orchestrator::OrchestratorBuilder;
 use crate::projects::crud as project_crud;
 use crate::services::testing::TestServicesBuilder;
@@ -29,6 +27,142 @@ async fn seeded_orch() -> Orchestrator {
         tempfile::tempdir().unwrap().keep(),
     )
     .build()
+}
+
+async fn preview(orch: &Orchestrator, item: &ChangeItem) -> ResourceMutationResult<String> {
+    dispatch_resource_change(orch, &request(), 0, item, true)
+        .await
+        .map(|change| change.summary)
+}
+
+#[tokio::test]
+async fn route_preview_performs_apply_validation_without_writing() {
+    let orch = seeded_orch().await;
+    seed_issue(&orch).await;
+    let route_path = orch.config_dir.join("routes/valid.yaml");
+
+    let invalid = preview(
+        &orch,
+        &change_item(
+            "cairn://routes",
+            ChangeMode::Create,
+            Some(serde_json::json!({"definition": {
+                "name": "",
+                "description": "invalid",
+                "when": [{"fact": "attention"}],
+                "to": {"kind": "message", "target": "cairn://p/CAIRN"}
+            }})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(invalid.error.contains("route name cannot be empty"));
+
+    let missing_target = preview(
+        &orch,
+        &change_item(
+            "cairn://routes",
+            ChangeMode::Create,
+            Some(serde_json::json!({"definition": {
+                "name": "Missing target",
+                "description": "invalid",
+                "when": [{"fact": "attention"}],
+                "to": {"kind": "message", "target": "cairn://p/MISSING"}
+            }})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(missing_target.error.contains("Project not found: MISSING"));
+
+    let summary = preview(
+        &orch,
+        &change_item(
+            "cairn://routes",
+            ChangeMode::Create,
+            Some(serde_json::json!({"definition": {
+                "name": "Valid",
+                "description": "valid",
+                "when": [{"fact": "attention"}],
+                "to": {"kind": "message", "target": "cairn://p/CAIRN"}
+            }})),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary, "Would create route 'valid'");
+    assert!(
+        !route_path.exists(),
+        "preview must not write the route file"
+    );
+}
+
+#[tokio::test]
+async fn route_preview_resolves_response_bindings_and_issue_recipes() {
+    let orch = seeded_orch().await;
+    std::fs::create_dir_all(orch.config_dir.join("responses")).unwrap();
+    std::fs::write(
+        orch.config_dir.join("responses/summarize.md"),
+        "---\nname: Summarize\ndescription: test\nvariables:\n  - name: input\n    required: true\n---\n{{input}}",
+    )
+    .unwrap();
+
+    let bad_field = preview(
+        &orch,
+        &change_item(
+            "cairn://routes",
+            ChangeMode::Create,
+            Some(serde_json::json!({"definition": {
+                "name": "Bad field",
+                "description": "invalid",
+                "when": [{"fact": "attention"}, {"fact": "thread_stream"}],
+                "transforms": [{"response": "summarize", "args": {"input": {"field": "attention"}}}],
+                "to": {"kind": "channel", "register": "notify"}
+            }})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(bad_field
+        .error
+        .contains("not available from every fact source"));
+
+    let missing_variable = preview(
+        &orch,
+        &change_item(
+            "cairn://routes",
+            ChangeMode::Create,
+            Some(serde_json::json!({"definition": {
+                "name": "Missing variable",
+                "description": "invalid",
+                "when": [{"fact": "attention"}],
+                "transforms": [{"response": "summarize"}],
+                "to": {"kind": "channel", "register": "notify"}
+            }})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(missing_variable
+        .error
+        .contains("Missing required variable 'input'"));
+
+    let missing_recipe = preview(
+        &orch,
+        &change_item(
+            "cairn://routes",
+            ChangeMode::Create,
+            Some(serde_json::json!({"definition": {
+                "name": "Missing recipe",
+                "description": "invalid",
+                "when": [{"fact": "attention"}],
+                "to": {"kind": "issue", "labels": ["bug"], "recipe": "missing"}
+            }})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(missing_recipe.error.contains("Unknown recipe 'missing'"));
 }
 
 #[tokio::test]
@@ -192,7 +326,6 @@ async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
             description: Some("body".to_string()),
             backend_override: None,
             label_ids: None,
-            kind: IssueKind::Issue,
         },
     )
     .await
@@ -466,7 +599,6 @@ async fn add_issue(orch: &Orchestrator, project_id: &str, title: &str) -> (Strin
             description: None,
             backend_override: None,
             label_ids: None,
-            kind: IssueKind::Issue,
         },
     )
     .await
@@ -488,6 +620,133 @@ async fn parent_issue_id_of(orch: &Orchestrator, issue_id: &str) -> Option<Strin
         .unwrap()
         .unwrap()
         .parent_issue_id
+}
+
+async fn parent_thread_id_of(orch: &Orchestrator, issue_id: &str) -> Option<String> {
+    issue_crud::get(&orch.db.local, issue_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .parent_thread_id
+}
+
+/// Seed a thread in `project_id`; returns its id. `migrated_from` gives it the
+/// issue number the thread cutover vacated, which stays a valid address for it.
+async fn add_thread(
+    orch: &Orchestrator,
+    project_id: &str,
+    name: &str,
+    migrated_from: Option<i32>,
+) -> String {
+    let id = format!("t-{name}");
+    let migrated = match migrated_from {
+        Some(number) => number.to_string(),
+        None => "NULL".to_string(),
+    };
+    exec_sql(
+        orch,
+        format!(
+            "INSERT INTO threads (id, project_id, name, status, attention, \
+             migrated_from_number, created_at, updated_at) \
+             VALUES ('{id}', '{project_id}', '{name}', 'active', 'none', {migrated}, 1, 1)"
+        ),
+    )
+    .await;
+    id
+}
+
+/// The node recorded as having filed this issue, which is null for every issue
+/// nobody filed under an issue parent.
+async fn parent_job_id_of(orch: &Orchestrator, issue_id: &str) -> Option<String> {
+    orch.db
+        .local
+        .query_all(
+            "SELECT parent_job_id FROM issues WHERE id = ?1",
+            (issue_id.to_string(),),
+            |row| crate::storage::RowExt::opt_text(row, 0),
+        )
+        .await
+        .unwrap()
+        .pop()
+        .flatten()
+}
+
+/// Seed a thread in `project_id` together with its session job and a live run
+/// on that session — the shape an agent actually holds a thread in. Returns
+/// (thread id, session job id, run id).
+async fn seed_thread_session_run(
+    orch: &Orchestrator,
+    project_id: &str,
+    name: &str,
+) -> (String, String, String) {
+    let thread_id = add_thread(orch, project_id, name, None).await;
+    let session = crate::threads::ensure_thread_session(&orch.db.local, &thread_id)
+        .await
+        .unwrap();
+    let run_id = format!("run-{name}");
+    exec_sql(
+        orch,
+        format!(
+            "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at) \
+             VALUES ('{run_id}', '{project_id}', '{session}', 'live', 1, 1)"
+        ),
+    )
+    .await;
+    (thread_id, session, run_id)
+}
+
+/// Append an issue to `CAIRN`'s collection as `run_id` would, carrying `parent`
+/// only when one is given. Returns the created issue's id and number.
+async fn create_issue_as_run(
+    orch: &Orchestrator,
+    run_id: &str,
+    title: &str,
+    parent: Option<&str>,
+) -> (String, i32) {
+    let mut payload = serde_json::json!({"title": title});
+    if let Some(parent) = parent {
+        payload["parent"] = serde_json::json!(parent);
+    }
+    apply_as_run(
+        orch,
+        &change_item("cairn://p/CAIRN/issues", ChangeMode::Append, Some(payload)),
+        run_id,
+    )
+    .await
+    .unwrap();
+    let mut found = orch
+        .db
+        .local
+        .query_all(
+            "SELECT id, number FROM issues WHERE title = ?1",
+            (title.to_string(),),
+            |row| {
+                Ok((
+                    crate::storage::RowExt::text(row, 0)?,
+                    crate::storage::RowExt::opt_i64(row, 1)?.unwrap_or_default() as i32,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "expected exactly one issue titled {title}");
+    found.pop().unwrap()
+}
+
+/// The branch a child would inherit from its current parent, straight from the
+/// resolver every execution launch consults.
+async fn parent_branch_of(orch: &Orchestrator, issue_id: &str) -> Option<String> {
+    let issue_id = issue_id.to_string();
+    orch.db
+        .local
+        .read(move |conn| {
+            let issue_id = issue_id.clone();
+            Box::pin(async move {
+                crate::issues::relations::resolve_parent_branch(conn, &issue_id).await
+            })
+        })
+        .await
+        .unwrap()
 }
 
 /// Run a SQL statement against the local db in a test.
@@ -1028,10 +1287,602 @@ async fn patch_parent_unknown_uri_rejected() {
     );
     let err = apply(&orch, &item).await.unwrap_err();
     assert!(
-        err.error.contains("parent issue not found"),
+        err.error.contains("parent issue or thread not found"),
         "got: {}",
         err.error
     );
+}
+
+/// The operation this whole seam exists for: a thread claiming work that was
+/// filed without it. The patch takes the canonical thread URI, the edge lands in
+/// `parent_thread_id` alone, and the thread's census shows the issue as its own.
+#[tokio::test]
+async fn patch_parent_adopts_issue_under_a_thread() {
+    let orch = seeded_orch().await;
+    let (child_id, child_num) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &child_id).await;
+    let thread_id = add_thread(&orch, &project_id, "thread-ux", None).await;
+
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{child_num}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux"})),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        parent_thread_id_of(&orch, &child_id).await.as_deref(),
+        Some(thread_id.as_str())
+    );
+    assert_eq!(parent_issue_id_of(&orch, &child_id).await, None);
+
+    let overview = crate::resources::read::produce_cairn_resource(
+        &orch,
+        &request(),
+        "cairn://p/CAIRN/thread-ux",
+    )
+    .await;
+    assert!(
+        overview
+            .content
+            .contains(&format!("cairn://p/CAIRN/{child_num}")),
+        "the thread's census should list the adopted issue: {}",
+        overview.content
+    );
+
+    // ...and the issue says whose it is, at the address an operator confirming
+    // the adoption actually reads.
+    let child = crate::resources::read::produce_cairn_resource(
+        &orch,
+        &request(),
+        &format!("cairn://p/CAIRN/{child_num}"),
+    )
+    .await;
+    assert!(
+        child
+            .content
+            .contains("Parent: `cairn://p/CAIRN/thread-ux`"),
+        "the adopted issue should name its thread parent: {}",
+        child.content
+    );
+}
+
+/// Patch resolves a thread by every address create does, including the number
+/// the thread cutover vacated — both paths ask the same resolver.
+#[tokio::test]
+async fn patch_parent_accepts_a_migrated_thread_number() {
+    let orch = seeded_orch().await;
+    let (child_id, child_num) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &child_id).await;
+    let thread_id = add_thread(&orch, &project_id, "general", Some(3404)).await;
+
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{child_num}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"parent": "cairn://p/CAIRN/3404"})),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        parent_thread_id_of(&orch, &child_id).await.as_deref(),
+        Some(thread_id.as_str())
+    );
+}
+
+/// An adopted child's attention reaches the thread's live session, and it gets
+/// there by the parent edge alone — adoption mints no subscription row.
+#[tokio::test]
+async fn an_adopted_child_wakes_the_thread_without_minting_a_subscription() {
+    let orch = seeded_orch().await;
+    let (child_id, child_num) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &child_id).await;
+    let thread_id = add_thread(&orch, &project_id, "thread-ux", None).await;
+    let session = crate::threads::ensure_thread_session(&orch.db.local, &thread_id)
+        .await
+        .unwrap();
+
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{child_num}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux"})),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        crate::orchestrator::wakes::watcher_jobs_for_issue(
+            &orch.db.local,
+            &format!("cairn://p/CAIRN/{child_num}")
+        )
+        .await
+        .unwrap(),
+        vec![session.clone()]
+    );
+    let subscriptions: Vec<String> = orch
+        .db
+        .local
+        .query_all(
+            "SELECT job_id FROM wake_subscriptions WHERE source_kind = 'issue' AND source_ref = ?1",
+            (format!("cairn://p/CAIRN/{child_num}"),),
+            |row| crate::storage::RowExt::text(row, 0),
+        )
+        .await
+        .unwrap();
+    assert!(
+        subscriptions.is_empty(),
+        "adoption routes by the edge, not by a minted row: {subscriptions:?}"
+    );
+    // The child issue is also what the thread's session sees itself watching.
+    assert_eq!(
+        crate::orchestrator::wakes::coordinated_child_issue_uris_for_job(&orch.db.local, &session)
+            .await
+            .unwrap(),
+        vec![format!("cairn://p/CAIRN/{child_num}")]
+    );
+}
+
+/// An issue an agent files while holding a thread belongs to that thread. The
+/// payload names no parent; the edge lands anyway, and it lands as a thread
+/// edge — routing attention back to the session that decided on the work,
+/// carrying neither an issue parent nor a spawning job.
+#[tokio::test]
+async fn an_issue_filed_from_a_thread_defaults_to_that_thread() {
+    let orch = seeded_orch().await;
+    let (seed_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &seed_id).await;
+    let (thread_id, session, run_id) =
+        seed_thread_session_run(&orch, &project_id, "thread-ux").await;
+
+    let (child_id, child_num) =
+        create_issue_as_run(&orch, &run_id, "Filed by the thread", None).await;
+
+    assert_eq!(
+        parent_thread_id_of(&orch, &child_id).await.as_deref(),
+        Some(thread_id.as_str())
+    );
+    assert_eq!(parent_issue_id_of(&orch, &child_id).await, None);
+    assert_eq!(
+        parent_job_id_of(&orch, &child_id).await,
+        None,
+        "a thread edge routes attention and confers no branch ancestry, so nothing\
+         records a spawning node"
+    );
+
+    let overview = crate::resources::read::produce_cairn_resource(
+        &orch,
+        &request(),
+        "cairn://p/CAIRN/thread-ux",
+    )
+    .await;
+    assert!(
+        overview
+            .content
+            .contains(&format!("cairn://p/CAIRN/{child_num}")),
+        "the thread's census should list the issue it filed: {}",
+        overview.content
+    );
+
+    // Attention reaches the thread's live session by the parent edge alone, the
+    // same way an adopted child's does — creation mints no subscription either.
+    let child_uri = format!("cairn://p/CAIRN/{child_num}");
+    assert_eq!(
+        crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, &child_uri)
+            .await
+            .unwrap(),
+        vec![session.clone()]
+    );
+    let subscriptions: Vec<String> = orch
+        .db
+        .local
+        .query_all(
+            "SELECT job_id FROM wake_subscriptions WHERE source_kind = 'issue' AND source_ref = ?1",
+            (child_uri.clone(),),
+            |row| crate::storage::RowExt::text(row, 0),
+        )
+        .await
+        .unwrap();
+    assert!(
+        subscriptions.is_empty(),
+        "the edge routes the child; nothing is minted: {subscriptions:?}"
+    );
+}
+
+/// A sub-agent a thread delegated to is acting for the thread, so what it files
+/// is the thread's too. The task job here carries no thread id of its own, so
+/// the answer can only come from the owning-node walk.
+#[tokio::test]
+async fn a_subagent_of_a_thread_files_for_that_thread() {
+    let orch = seeded_orch().await;
+    let (seed_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &seed_id).await;
+    let (thread_id, session, _run_id) =
+        seed_thread_session_run(&orch, &project_id, "thread-ux").await;
+    exec_sql(
+        &orch,
+        format!(
+            "INSERT INTO jobs(id, parent_job_id, project_id, status, node_name, uri_segment, \
+             created_at, updated_at) \
+             VALUES ('thread-task', '{session}', '{project_id}', 'running', 'Explore', 'explore', 2, 2)"
+        ),
+    )
+    .await;
+    exec_sql(
+        &orch,
+        format!(
+            "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at) \
+             VALUES ('run-thread-task', '{project_id}', 'thread-task', 'live', 2, 2)"
+        ),
+    )
+    .await;
+
+    let (child_id, _) =
+        create_issue_as_run(&orch, "run-thread-task", "Filed by a sub-agent", None).await;
+
+    assert_eq!(
+        parent_thread_id_of(&orch, &child_id).await.as_deref(),
+        Some(thread_id.as_str())
+    );
+}
+
+/// The inference is a default, not a rule: a thread that names a parent gets
+/// the parent it named, whether that is another thread or an issue.
+#[tokio::test]
+async fn an_explicit_parent_beats_the_creating_thread() {
+    let orch = seeded_orch().await;
+    let (seed_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &seed_id).await;
+    let (_thread_id, session, run_id) =
+        seed_thread_session_run(&orch, &project_id, "thread-ux").await;
+    let other_thread = add_thread(&orch, &project_id, "thread-ops", None).await;
+    let (parent_issue_id, parent_num) = add_issue(&orch, &project_id, "Parent").await;
+
+    let (to_other_thread, _) = create_issue_as_run(
+        &orch,
+        &run_id,
+        "Handed to another thread",
+        Some("cairn://p/CAIRN/thread-ops"),
+    )
+    .await;
+    assert_eq!(
+        parent_thread_id_of(&orch, &to_other_thread)
+            .await
+            .as_deref(),
+        Some(other_thread.as_str())
+    );
+
+    let (to_issue, _) = create_issue_as_run(
+        &orch,
+        &run_id,
+        "Filed under an issue",
+        Some(&format!("cairn://p/CAIRN/{parent_num}")),
+    )
+    .await;
+    assert_eq!(
+        parent_issue_id_of(&orch, &to_issue).await.as_deref(),
+        Some(parent_issue_id.as_str())
+    );
+    assert_eq!(
+        parent_thread_id_of(&orch, &to_issue).await,
+        None,
+        "the two columns stay one edge"
+    );
+    assert_eq!(
+        parent_job_id_of(&orch, &to_issue).await.as_deref(),
+        Some(session.as_str()),
+        "an issue parent still records the node that filed the child"
+    );
+}
+
+/// Outside a thread nothing changes: an agent on an issue's execution, and a
+/// caller with no run identity at all, both still create an unparented issue
+/// when the payload names no parent.
+#[tokio::test]
+async fn an_issue_filed_outside_a_thread_stays_unparented() {
+    let orch = seeded_orch().await;
+    let (_number, _job_id, run_id) = seed_running_node(&orch).await;
+
+    let (from_execution, _) = create_issue_as_run(&orch, &run_id, "Filed by a builder", None).await;
+    assert_eq!(parent_thread_id_of(&orch, &from_execution).await, None);
+    assert_eq!(parent_issue_id_of(&orch, &from_execution).await, None);
+
+    apply(
+        &orch,
+        &change_item(
+            "cairn://p/CAIRN/issues",
+            ChangeMode::Append,
+            Some(serde_json::json!({"title": "Filed by a person"})),
+        ),
+    )
+    .await
+    .unwrap();
+    let ambient = orch
+        .db
+        .local
+        .query_all(
+            "SELECT parent_issue_id, parent_thread_id FROM issues WHERE title = 'Filed by a person'",
+            (),
+            |row| {
+                Ok((
+                    crate::storage::RowExt::opt_text(row, 0)?,
+                    crate::storage::RowExt::opt_text(row, 1)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ambient, vec![(None, None)]);
+}
+
+/// The inferred parent is scoped to the project that owns the issue. A thread
+/// filing into another project gets no edge rather than one that would route
+/// the work's attention out of the project holding it — the same rule an
+/// explicitly named cross-project parent is refused by.
+#[tokio::test]
+async fn a_thread_filing_into_another_project_infers_no_parent() {
+    let orch = seeded_orch().await;
+    let (seed_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &seed_id).await;
+    let (_thread_id, _session, run_id) =
+        seed_thread_session_run(&orch, &project_id, "thread-ux").await;
+    project_crud::create_db(
+        &orch.db.local,
+        &RealClock,
+        &CreateProject {
+            id: None,
+            name: "Other".to_string(),
+            key: "OTHER".to_string(),
+            repo_path: tempfile::tempdir()
+                .unwrap()
+                .keep()
+                .to_string_lossy()
+                .to_string(),
+            team_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    apply_as_run(
+        &orch,
+        &change_item(
+            "cairn://p/OTHER/issues",
+            ChangeMode::Append,
+            Some(serde_json::json!({"title": "Filed across projects"})),
+        ),
+        &run_id,
+    )
+    .await
+    .unwrap();
+
+    let edges = orch
+        .db
+        .local
+        .query_all(
+            "SELECT parent_issue_id, parent_thread_id FROM issues WHERE title = 'Filed across projects'",
+            (),
+            |row| {
+                Ok((
+                    crate::storage::RowExt::opt_text(row, 0)?,
+                    crate::storage::RowExt::opt_text(row, 1)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(edges, vec![(None, None)]);
+}
+
+/// Branch ancestry is the half of parenthood a thread does not carry. Moving a
+/// child from an issue parent to a thread drops the inherited branch, which is
+/// what puts the child's own pull request back on the project base.
+#[tokio::test]
+async fn adopting_under_a_thread_drops_the_inherited_branch() {
+    let orch = seeded_orch().await;
+    let (parent_num, _job_id, _run_id) = seed_running_node(&orch).await;
+    let parent_issue =
+        crate::issues::relations::issue_id_for_project_number(&orch.db.local, "CAIRN", parent_num)
+            .await
+            .unwrap()
+            .unwrap();
+    let project_id = project_id_of(&orch, &parent_issue).await;
+    add_thread(&orch, &project_id, "thread-ux", None).await;
+    let (child_id, child_num) = add_issue(&orch, &project_id, "Child").await;
+
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{child_num}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{parent_num}")})),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        parent_branch_of(&orch, &child_id).await.as_deref(),
+        Some("agent/builder"),
+        "an issue parent confers its integration branch"
+    );
+
+    apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{child_num}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux"})),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        parent_branch_of(&orch, &child_id).await,
+        None,
+        "a thread parent leaves the child on the project base"
+    );
+}
+
+/// The two columns are one edge however often it is re-pointed: every step
+/// leaves at most one populated, and `null` clears both.
+///
+/// The order walks every transition, including both direct hand-offs between
+/// the two kinds. A sequence that only ever passes through `null` would leave
+/// each arm's clear of the *other* column unexercised, and that clear failing is
+/// silent where it hurts most: two columns set at once routes attention to the
+/// new issue parent while the census still lists the old thread and
+/// `resolve_parent_branch` still refuses the inherited branch.
+#[tokio::test]
+async fn parent_round_trips_between_thread_issue_and_none() {
+    let orch = seeded_orch().await;
+    let (child_id, child_num) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &child_id).await;
+    let thread_id = add_thread(&orch, &project_id, "thread-ux", None).await;
+    let (parent_id, parent_num) = add_issue(&orch, &project_id, "Parent").await;
+    let child_uri = format!("cairn://p/CAIRN/{child_num}");
+    let thread = serde_json::json!("cairn://p/CAIRN/thread-ux");
+    let issue = serde_json::json!(format!("cairn://p/CAIRN/{parent_num}"));
+    let none = serde_json::Value::Null;
+
+    let steps: [(serde_json::Value, Option<&str>, Option<&str>); 6] = [
+        // none -> thread
+        (thread.clone(), None, Some(thread_id.as_str())),
+        // thread -> issue, the hand-off that needs the issue arm's thread clear
+        (issue.clone(), Some(parent_id.as_str()), None),
+        // issue -> thread, the hand-off that needs the thread arm's issue clear
+        (thread.clone(), None, Some(thread_id.as_str())),
+        // thread -> none
+        (none.clone(), None, None),
+        // none -> issue
+        (issue, Some(parent_id.as_str()), None),
+        // issue -> none
+        (none, None, None),
+    ];
+    for (parent, expected_issue, expected_thread) in steps {
+        apply(
+            &orch,
+            &change_item(
+                &child_uri,
+                ChangeMode::Patch,
+                Some(serde_json::json!({"parent": parent})),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                parent_issue_id_of(&orch, &child_id).await.as_deref(),
+                parent_thread_id_of(&orch, &child_id).await.as_deref()
+            ),
+            (expected_issue, expected_thread),
+            "after adopting under {parent:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn patch_parent_unknown_thread_rejected() {
+    let orch = seeded_orch().await;
+    let (_child_id, child_num) = seed_issue(&orch).await;
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{child_num}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-nobody"})),
+    );
+    let err = apply(&orch, &item).await.unwrap_err();
+    assert!(
+        err.error.contains("parent issue or thread not found"),
+        "got: {}",
+        err.error
+    );
+}
+
+#[tokio::test]
+async fn patch_parent_cross_project_thread_rejected() {
+    let orch = seeded_orch().await;
+    let (_child_id, child_num) = seed_issue(&orch).await;
+    let repo_path = tempfile::tempdir()
+        .unwrap()
+        .keep()
+        .to_string_lossy()
+        .to_string();
+    let other = project_crud::create_db(
+        &orch.db.local,
+        &RealClock,
+        &CreateProject {
+            id: None,
+            name: "Agg".to_string(),
+            key: "AGG".to_string(),
+            repo_path,
+            team_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    add_thread(&orch, &other.id, "thread-elsewhere", None).await;
+
+    let item = change_item(
+        &format!("cairn://p/CAIRN/{child_num}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"parent": "cairn://p/AGG/thread-elsewhere"})),
+    );
+    let err = apply(&orch, &item).await.unwrap_err();
+    assert!(err.error.contains("same project"), "got: {}", err.error);
+}
+
+/// A thread's sub-resource is not the thread, and `cairn:~/` is whoever is
+/// writing rather than whoever should parent. Both are refused by shape, with
+/// the accepted forms named.
+#[tokio::test]
+async fn patch_parent_rejects_descendant_and_home_relative_uris() {
+    let orch = seeded_orch().await;
+    let (child_id, child_num) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &child_id).await;
+    add_thread(&orch, &project_id, "thread-ux", None).await;
+
+    let descendant = apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{child_num}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux/chat"})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        descendant.error.contains("canonical thread URI"),
+        "got: {}",
+        descendant.error
+    );
+
+    let home_relative = apply(
+        &orch,
+        &change_item(
+            &format!("cairn://p/CAIRN/{child_num}"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"parent": "cairn:~/"})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        home_relative
+            .error
+            .contains("cairn:~/ resolves to the node"),
+        "got: {}",
+        home_relative.error
+    );
+    assert_eq!(parent_thread_id_of(&orch, &child_id).await, None);
 }
 
 #[tokio::test]
@@ -1209,6 +2060,7 @@ fn dummy_value(ty: cairn_common::contract::KeyType) -> serde_json::Value {
         KeyType::Int => serde_json::json!(1),
         KeyType::Array => serde_json::json!([]),
         KeyType::Object => serde_json::json!({}),
+        KeyType::Any => serde_json::Value::Null,
     }
 }
 
@@ -1245,6 +2097,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::Projects => "cairn://projects",
         K::ProjectSettings => "cairn://p/CAIRN/settings",
         K::ProjectIssues => "cairn://p/CAIRN/issues",
+        K::ProjectThreads => "cairn://p/CAIRN/threads",
+        K::Thread => "cairn://p/CAIRN/design-review",
         K::ProjectMessages => "cairn://p/CAIRN/messages",
         K::ProjectTerminal => "cairn://p/CAIRN/terminal/dev",
         K::ProjectBrowser => "cairn://p/CAIRN/browser/main",
@@ -1280,6 +2134,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectSkill => "cairn://p/CAIRN/skills/testing",
         K::ProjectReferences => "cairn://p/CAIRN/references",
         K::ProjectReference => "cairn://p/CAIRN/references/openpnp",
+        K::Packs => "cairn://packs",
+        K::Pack => "cairn://packs/matlab",
         K::Labels => "cairn://labels",
         K::Label => "cairn://labels/bug",
         K::NodeMemories => "cairn://p/CAIRN/1/1/builder/memories",
@@ -1299,6 +2155,15 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::NodeCalls => "cairn://p/CAIRN/1/1/builder/calls",
         K::Executors => "cairn://executors",
         K::Executor => "cairn://executors/bglab-ub",
+        K::Routes => "cairn://routes",
+        K::Route => "cairn://routes/notify-on-attention",
+        K::ProjectRoutes => "cairn://p/CAIRN/routes",
+        K::ProjectRoute => "cairn://p/CAIRN/routes/notify-on-attention",
+        K::Responses => "cairn://responses",
+        K::Response => "cairn://responses/summarize",
+        K::ProjectResponses => "cairn://p/CAIRN/responses",
+        K::ProjectResponse => "cairn://p/CAIRN/responses/summarize",
+        K::Grant => "cairn://grants/grant-1",
         other => {
             panic!("sample_resource: {other:?} carries a mutation but has no sample URI; add one")
         }
@@ -1339,6 +2204,166 @@ async fn contract_mutations_all_have_dispatch_arms() {
                     failure.error
                 );
             }
+        }
+    }
+}
+
+/// The same parity claim, aimed at a THREAD's writable subtree.
+///
+/// `contract_mutations_all_have_dispatch_arms` samples one URI per kind, and
+/// every node-family sample it carries is an issue coordinate — which is how a
+/// whole writable subtree behind a thread shipped with the contract advertising
+/// mutations and nothing behind them. Here the thread address itself is the
+/// target: each path is normalized to its node-family kind, and every mutation
+/// that kind advertises is dispatched at the thread URI. A path that reaches the
+/// contract but falls off the end of dispatch fails.
+#[tokio::test]
+async fn thread_subtree_mutations_all_have_dispatch_arms() {
+    const SENTINEL: &str = "no dispatch arm handles it";
+    let orch = seeded_orch().await;
+    orch.db
+        .local
+        .execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p-thr', 'default', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+             INSERT INTO threads (id, project_id, name, created_at, updated_at)
+             VALUES ('t-dr', 'p-thr', 'design-review', 2, 2);",
+        )
+        .await
+        .unwrap();
+
+    let mut covered = 0;
+    for path in [
+        "arc",
+        "todos",
+        "tasks",
+        "wakes",
+        "questions",
+        "memories",
+        "messages",
+        "permissions",
+        "progress",
+        "terminal/smoke",
+        "repl/analysis",
+        "browser",
+        "artifact",
+        "task/probe",
+        "task/probe/todos",
+        "task/probe/messages",
+        "task/probe/artifact",
+        "task/probe/return",
+        "task/probe/permissions",
+        "task/probe/terminal/build",
+        "task/probe/browser",
+    ] {
+        let uri = format!("cairn://p/CAIRN/design-review/{path}");
+        let delegated = crate::resources::threads::delegate_thread_descendant(
+            cairn_common::uri::parse_uri(&uri).expect("a thread path parses"),
+        )
+        .unwrap_or_else(|error| panic!("{path} must delegate: {error}"));
+        let Some(contract) = cairn_common::contract::contract_for(delegated.kind()) else {
+            continue;
+        };
+        for spec in contract.mutations {
+            let item = change_item(&uri, spec.mode, Some(required_payload(spec)));
+            if let Err(failure) = dispatch_resource_change(&orch, &request(), 0, &item, true).await
+            {
+                assert!(
+                    !failure.error.contains(SENTINEL),
+                    "a thread's {path} advertises {:?} mode={} with no dispatch arm behind it: {}",
+                    delegated.kind(),
+                    mode_name(spec.mode),
+                    failure.error
+                );
+            }
+            covered += 1;
+        }
+    }
+    assert!(
+        covered >= 15,
+        "only {covered} thread-subtree mutations were exercised; this test is not \
+         covering what it claims"
+    );
+}
+
+/// A dispatch arm has to RESOLVE, not merely exist.
+///
+/// `thread_subtree_mutations_all_have_dispatch_arms` dry-runs, and several arms
+/// (repl create, terminal create) short-circuit inside `if dry_run` before any
+/// job resolution happens — so it proves an arm was reached and cannot prove the
+/// arm can find its owner. That gap let `repl/<slug>` from a thread pass the
+/// parity test while failing at runtime on an issue-shaped resolver, which is
+/// the exact bug class this family is about: the contract advertises a mutation
+/// and nothing usable is behind it.
+///
+/// This wet-runs the paths whose resolution is owner-sensitive and asserts that
+/// whatever comes back, it is never a failure to resolve the owning job.
+#[tokio::test]
+async fn thread_subtree_mutations_resolve_their_owning_job() {
+    let orch = seeded_orch().await;
+    orch.db
+        .local
+        .execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p-thr', 'default', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+             INSERT INTO threads (id, project_id, name, created_at, updated_at)
+             VALUES ('t-dr', 'p-thr', 'design-review', 2, 2);",
+        )
+        .await
+        .unwrap();
+    // The session must exist for a task to hang off it, and writes to a thread's
+    // own resources mint it anyway.
+    let session = crate::threads::ensure_thread_session(&orch.db.local, "t-dr")
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO jobs (id, parent_job_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('j-probe', ?1, 'p-thr', 'running', 'probe', 'probe', 3, 3)",
+            (session.as_str(),),
+        )
+        .await
+        .unwrap();
+
+    for (path, mode, payload) in [
+        (
+            "repl/analysis",
+            ChangeMode::Create,
+            Some(serde_json::json!({"interpreter": "python"})),
+        ),
+        (
+            "todos",
+            ChangeMode::Replace,
+            Some(serde_json::json!({"todos": []})),
+        ),
+        (
+            "wakes",
+            ChangeMode::Append,
+            Some(serde_json::json!({"subscribe": {"kind": "checks"}})),
+        ),
+        (
+            "task/probe/todos",
+            ChangeMode::Replace,
+            Some(serde_json::json!({"todos": []})),
+        ),
+    ] {
+        let uri = format!("cairn://p/CAIRN/design-review/{path}");
+        let item = change_item(&uri, mode, payload);
+        if let Err(failure) = dispatch_resource_change(&orch, &request(), 0, &item, false).await {
+            // The signatures of an owner that could not be resolved: the reserved
+            // coordinate leaking into an agent-facing message, or a lookup that
+            // reported the job itself missing.
+            assert!(
+                !failure.error.contains("/0/0/"),
+                "a thread's {path} leaked the reserved coordinate: {}",
+                failure.error
+            );
+            assert!(
+                !failure.error.contains("No node found")
+                    && !failure.error.contains("no dispatch arm handles it"),
+                "a thread's {path} could not resolve its owning job: {}",
+                failure.error
+            );
         }
     }
 }
@@ -1413,4 +2438,89 @@ fn agent_frontmatter_honors_model_alias_for_tier() {
     }))
     .expect("frontmatter with model alias should deserialize");
     assert_eq!(front.tier.as_deref(), Some("md"));
+}
+
+/// Launch overrides are refused at the write, not after the jobs exist. The
+/// preview path never reaches the start, so a refusal that shows up here is one
+/// that lands before an execution row could be created — which is the whole
+/// reason the grammar is validated at the door rather than compiled later.
+#[tokio::test]
+async fn executions_append_refuses_a_malformed_override_before_starting() {
+    let orch = seeded_orch().await;
+    let (_, number) = seed_issue(&orch).await;
+    let target = format!("cairn://p/CAIRN/{number}/executions");
+
+    let append = |overrides: serde_json::Value| {
+        change_item(
+            &target,
+            ChangeMode::Append,
+            Some(serde_json::json!({"recipe": "build", "overrides": overrides})),
+        )
+    };
+
+    let typo = preview(&orch, &append(serde_json::json!({"witout": ["review"]})))
+        .await
+        .unwrap_err();
+    assert!(
+        typo.error.contains("is not a launch override key"),
+        "{}",
+        typo.error
+    );
+    assert!(typo.error.contains("payload.overrides"), "{}", typo.error);
+
+    let fence = preview(
+        &orch,
+        &append(serde_json::json!({"agents": {"build": {"fence": "allow"}}})),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        fence.error.contains("not settable at launch"),
+        "{}",
+        fence.error
+    );
+
+    // A well-formed delta gets past the door; the recipe itself is resolved by
+    // the start, which a preview deliberately does not perform.
+    let accepted = preview(&orch, &append(serde_json::json!({"without": ["review"]})))
+        .await
+        .unwrap();
+    assert!(
+        accepted.starts_with("Would start an execution"),
+        "{accepted}"
+    );
+}
+
+/// The create-and-start door takes the same grammar, and says so in its own
+/// coordinates: a caller reading `payload.overrides` on an issue-create would go
+/// looking for a top-level key that door does not have.
+#[tokio::test]
+async fn issue_create_reports_override_failures_under_its_own_key() {
+    let orch = seeded_orch().await;
+    seed_issue(&orch).await;
+
+    let failure = preview(
+        &orch,
+        &change_item(
+            "cairn://p/CAIRN/issues",
+            ChangeMode::Append,
+            Some(serde_json::json!({
+                "title": "tiny fix",
+                "execution": {"recipe": "build", "overrides": {"witout": ["review"]}}
+            })),
+        ),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        failure.error.contains("payload.execution.overrides"),
+        "{}",
+        failure.error
+    );
+    assert!(
+        !failure.error.contains("payload.overrides."),
+        "the collection-append coordinates must not leak into the create door: {}",
+        failure.error
+    );
 }

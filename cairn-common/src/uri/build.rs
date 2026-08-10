@@ -58,14 +58,22 @@ pub fn build_project_check_results_uri(project: &str, revision: &str) -> String 
     format!("{}/check-results/{}", build_project_uri(project), revision)
 }
 
-/// The name-addressed alias for a thread (`cairn://p/PROJECT/t/NAME`).
+pub fn build_project_threads_uri(project: &str) -> String {
+    format!("{}/threads", build_project_uri(project))
+}
+
+pub fn build_thread_uri(project: &str, name: &str) -> String {
+    format!("{}/{}", build_project_uri(project), name)
+}
+
+/// The canonical home URI for a sub-agent task a thread's session spawned.
 ///
-/// Nothing in Cairn emits this form — the alias is accepted on input and
-/// resolved to the numbered issue URI, which is what every rendered link, wake
-/// ref, and parent field keeps using. It exists so the one parser can round-trip
-/// the shape and so a refusal can name it.
-pub fn build_thread_alias_uri(project: &str, name: &str) -> String {
-    format!("{}/t/{}", build_project_uri(project), name)
+/// A thread addresses its descendants the way an issue node addresses its own:
+/// the task hangs beneath its parent as `/task/{segment}`, on the thread address
+/// rather than an issue coordinate. This is the form the thread read surface
+/// already resolves, by the task's `parent_job_id` and `uri_segment`.
+pub fn build_thread_task_uri(project: &str, name: &str, task_segment: &str) -> String {
+    format!("{}/task/{}", build_thread_uri(project, name), task_segment)
 }
 
 pub fn build_project_issues_uri(project: &str) -> String {
@@ -130,13 +138,67 @@ pub(crate) fn build_issue_execution_uri(project: &str, number: i32, exec_seq: i3
     )
 }
 
+/// Who owns the node coordinate a URI is being built from.
+///
+/// An execution node is addressed by `{issue}/{exec_seq}/{segment}`. A thread's
+/// session job has neither an issue nor an execution, yet it owns the same
+/// job-scoped resource families a node does — todos, tasks, terminals, wakes,
+/// artifacts. Those families therefore carry the reserved `(0, 0, thread-name)`
+/// coordinate, which [`NodeAddress::new`] is the one place that recognizes.
+///
+/// The sentinel is safe because it is unspellable: every numeric segment of a
+/// parsed node URI goes through `parse_positive_i32`, so no URI a caller can
+/// write ever produces `(0, 0)`. `thread_coordinate_is_unspellable` pins that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAddress<'a> {
+    Node {
+        number: i32,
+        exec_seq: i32,
+        node_id: &'a str,
+    },
+    Thread {
+        name: &'a str,
+    },
+}
+
+impl<'a> NodeAddress<'a> {
+    /// Read a raw node coordinate as the address it actually names.
+    ///
+    /// This is the single interpretation of the reserved coordinate. Every node
+    /// and task sub-resource URI composes from [`build_node_uri`], which routes
+    /// through here, so a thread-owned resource renders at its thread address
+    /// rather than leaking `cairn://p/PROJECT/0/0/thread-name/...`.
+    pub fn new(number: i32, exec_seq: i32, node_id: &'a str) -> Self {
+        if number == 0 && exec_seq == 0 {
+            return Self::Thread { name: node_id };
+        }
+        Self::Node {
+            number,
+            exec_seq,
+            node_id,
+        }
+    }
+
+    /// The canonical base URI this address renders as.
+    pub fn render(&self, project: &str) -> String {
+        match self {
+            Self::Node {
+                number,
+                exec_seq,
+                node_id,
+            } => format!(
+                "{}/{}/{}",
+                build_issue_uri(project, *number),
+                exec_seq,
+                node_id
+            ),
+            Self::Thread { name } => build_thread_uri(project, name),
+        }
+    }
+}
+
 pub fn build_node_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
-    format!(
-        "{}/{}/{}",
-        build_issue_uri(project, number),
-        exec_seq,
-        node_id
-    )
+    NodeAddress::new(number, exec_seq, node_id).render(project)
 }
 
 fn build_node_subresource_uri(
@@ -212,6 +274,23 @@ pub fn build_node_chat_uri(project: &str, number: i32, exec_seq: i32, node_id: &
     build_node_subresource_uri(project, number, exec_seq, node_id, "chat")
 }
 
+/// Build a node transcript TURN URI (`.../{node}/chat/turn/{n}`). `turn_seq` is
+/// `turns.sequence` within the node's primary session — the only session the
+/// turn coordinate addresses.
+pub fn build_node_chat_turn_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    turn_seq: i32,
+) -> String {
+    format!(
+        "{}/turn/{}",
+        build_node_chat_uri(project, number, exec_seq, node_id),
+        turn_seq
+    )
+}
+
 pub fn build_node_artifact_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_artifact_uri_named(project, number, exec_seq, node_id, None)
 }
@@ -281,6 +360,23 @@ pub fn build_task_chat_uri(
     task_name: &str,
 ) -> String {
     build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "chat")
+}
+
+/// Build a task transcript TURN URI (`.../task/{task}/chat/turn/{n}`), the task
+/// sibling of [`build_node_chat_turn_uri`].
+pub fn build_task_chat_turn_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    turn_seq: i32,
+) -> String {
+    format!(
+        "{}/turn/{}",
+        build_task_chat_uri(project, number, exec_seq, node_id, task_name),
+        turn_seq
+    )
 }
 
 pub fn build_task_artifact_uri(
@@ -411,7 +507,7 @@ pub fn build_project_terminal_uri(project: &str, slug: &str) -> String {
     format!("{}/terminal/{}", build_project_uri(project), slug)
 }
 
-fn build_node_browser_uri(
+pub fn build_node_browser_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -421,7 +517,7 @@ fn build_node_browser_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "browser", slug)
 }
 
-fn build_task_browser_uri(
+pub fn build_task_browser_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -493,6 +589,14 @@ fn append_path(base: String, path: &[String]) -> String {
 
 pub fn build_bug_uri() -> String {
     "cairn://bug".to_string()
+}
+
+pub fn build_packs_uri() -> String {
+    "cairn://packs".to_string()
+}
+
+pub fn build_pack_uri(pack_id: &str) -> String {
+    format!("cairn://packs/{pack_id}")
 }
 
 pub fn build_skills_uri() -> String {
@@ -602,6 +706,66 @@ pub fn build_project_workflow_uri(project: &str, workflow_id: &str) -> String {
     format!("{}/workflows/{}", build_project_uri(project), workflow_id)
 }
 
+pub fn build_routes_uri() -> String {
+    "cairn://routes".into()
+}
+pub fn build_route_uri(id: &str) -> String {
+    format!("cairn://routes/{id}")
+}
+pub fn build_route_history_uri(id: &str) -> String {
+    format!("{}/history", build_route_uri(id))
+}
+pub fn build_route_history_entry_uri(id: &str, seq: i64) -> String {
+    format!("{}/{seq}", build_route_history_uri(id))
+}
+pub fn build_project_routes_uri(project: &str) -> String {
+    format!("{}/routes", build_project_uri(project))
+}
+pub fn build_project_route_uri(project: &str, id: &str) -> String {
+    format!("{}/{id}", build_project_routes_uri(project))
+}
+pub fn build_project_route_history_uri(project: &str, id: &str) -> String {
+    format!("{}/history", build_project_route_uri(project, id))
+}
+pub fn build_project_route_history_entry_uri(project: &str, id: &str, seq: i64) -> String {
+    format!("{}/{seq}", build_project_route_history_uri(project, id))
+}
+
+pub fn build_responses_uri() -> String {
+    "cairn://responses".to_string()
+}
+pub fn build_response_uri(response_id: &str) -> String {
+    format!("cairn://responses/{response_id}")
+}
+pub fn build_response_history_uri(response_id: &str) -> String {
+    format!("{}/history", build_response_uri(response_id))
+}
+pub fn build_response_history_entry_uri(response_id: &str, seq: i64) -> String {
+    format!("{}/{seq}", build_response_history_uri(response_id))
+}
+pub fn build_project_responses_uri(project: &str) -> String {
+    format!("{}/responses", build_project_uri(project))
+}
+pub fn build_project_response_uri(project: &str, response_id: &str) -> String {
+    format!("{}/{response_id}", build_project_responses_uri(project))
+}
+pub fn build_project_response_history_uri(project: &str, response_id: &str) -> String {
+    format!(
+        "{}/history",
+        build_project_response_uri(project, response_id)
+    )
+}
+pub fn build_project_response_history_entry_uri(
+    project: &str,
+    response_id: &str,
+    seq: i64,
+) -> String {
+    format!(
+        "{}/{seq}",
+        build_project_response_history_uri(project, response_id)
+    )
+}
+
 fn build_agents_uri() -> String {
     "cairn://agents".to_string()
 }
@@ -662,7 +826,19 @@ impl CairnResource {
                 build_project_image_uri(project, reference)
             }
             Self::Issue { project, number } => build_issue_uri(project, *number),
-            Self::ThreadAlias { project, name } => build_thread_alias_uri(project, name),
+            Self::ProjectThreads { project } => build_project_threads_uri(project),
+            Self::Thread {
+                project,
+                name,
+                path,
+            } => {
+                let mut uri = build_thread_uri(project, name);
+                for segment in path {
+                    uri.push('/');
+                    uri.push_str(segment);
+                }
+                uri
+            }
             Self::Node {
                 project,
                 number,
@@ -690,11 +866,7 @@ impl CairnResource {
                 exec_seq,
                 node_id,
                 turn_seq,
-            } => format!(
-                "{}/turn/{}",
-                build_node_chat_uri(project, *number, *exec_seq, node_id),
-                turn_seq
-            ),
+            } => build_node_chat_turn_uri(project, *number, *exec_seq, node_id, *turn_seq),
             Self::NodeChatEvent {
                 project,
                 number,
@@ -806,11 +978,9 @@ impl CairnResource {
                 node_id,
                 task_name,
                 turn_seq,
-            } => format!(
-                "{}/turn/{}",
-                build_task_chat_uri(project, *number, *exec_seq, node_id, task_name),
-                turn_seq
-            ),
+            } => {
+                build_task_chat_turn_uri(project, *number, *exec_seq, node_id, task_name, *turn_seq)
+            }
             Self::TaskChatEvent {
                 project,
                 number,
@@ -992,7 +1162,12 @@ impl CairnResource {
             Self::DevPid => "cairn://dev/pid".to_string(),
             Self::Logs => "cairn://logs".to_string(),
             Self::Executors => "cairn://executors".to_string(),
+            Self::Grants => "cairn://grants".to_string(),
+            Self::Grant { id } => format!("cairn://grants/{id}"),
             Self::Executor { name } => format!("cairn://executors/{name}"),
+            Self::ExecutorAction { name, action } => {
+                format!("cairn://executors/{name}/{action}")
+            }
             Self::Bug => "cairn://bug".to_string(),
             Self::Help => "cairn://help".to_string(),
             Self::WebSearch => "cairn://websearch".to_string(),
@@ -1008,6 +1183,8 @@ impl CairnResource {
                 }
                 s
             }
+            Self::Packs => build_packs_uri(),
+            Self::Pack { pack_id } => build_pack_uri(pack_id),
             Self::Skills => build_skills_uri(),
             Self::Skill { skill_id, path } => build_skill_uri(skill_id, path),
             Self::ProjectSkills { project } => build_project_skills_uri(project),
@@ -1046,6 +1223,42 @@ impl CairnResource {
                 project,
                 workflow_id,
             } => build_project_workflow_uri(project, workflow_id),
+            Self::Routes => build_routes_uri(),
+            Self::Route { route_id } => build_route_uri(route_id),
+            Self::RouteHistory { route_id } => build_route_history_uri(route_id),
+            Self::RouteHistoryEntry { route_id, seq } => {
+                build_route_history_entry_uri(route_id, *seq)
+            }
+            Self::ProjectRoutes { project } => build_project_routes_uri(project),
+            Self::ProjectRoute { project, route_id } => build_project_route_uri(project, route_id),
+            Self::ProjectRouteHistory { project, route_id } => {
+                build_project_route_history_uri(project, route_id)
+            }
+            Self::ProjectRouteHistoryEntry {
+                project,
+                route_id,
+                seq,
+            } => build_project_route_history_entry_uri(project, route_id, *seq),
+            Self::Responses => build_responses_uri(),
+            Self::Response { response_id } => build_response_uri(response_id),
+            Self::ResponseHistory { response_id } => build_response_history_uri(response_id),
+            Self::ResponseHistoryEntry { response_id, seq } => {
+                build_response_history_entry_uri(response_id, *seq)
+            }
+            Self::ProjectResponses { project } => build_project_responses_uri(project),
+            Self::ProjectResponse {
+                project,
+                response_id,
+            } => build_project_response_uri(project, response_id),
+            Self::ProjectResponseHistory {
+                project,
+                response_id,
+            } => build_project_response_history_uri(project, response_id),
+            Self::ProjectResponseHistoryEntry {
+                project,
+                response_id,
+                seq,
+            } => build_project_response_history_entry_uri(project, response_id, *seq),
             Self::Agents => build_agents_uri(),
             Self::Agent { agent_id } => build_agent_uri(agent_id),
             Self::ProjectAgents { project } => build_project_agents_uri(project),

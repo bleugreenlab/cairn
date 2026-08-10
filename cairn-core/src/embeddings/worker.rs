@@ -19,6 +19,12 @@
 //!   network call).
 //!
 //! Per-URI ordering is preserved because all variants flow through one channel.
+//!
+//! The per-turn embedding sweep behind search's semantic lane starts alongside
+//! this worker (see `Orchestrator::start_embed_worker`) as a sibling task
+//! rather than another arm of this loop: it walks history in bounded passes,
+//! and this loop owes each incoming event its color and position fold promptly.
+//! See [`super::turns`].
 
 use std::sync::Arc;
 use std::time::Instant;

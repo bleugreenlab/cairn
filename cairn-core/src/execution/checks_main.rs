@@ -2,12 +2,98 @@
 //! verdict for every applicable review check.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::execution::checks::{verify_review_tree, ReviewTreeCheckScope, ReviewTreeGateResult};
 use crate::fleet::CellPriority;
 use crate::jj::{logical_tree_hash, tree_entries, GraphFileChange, JjEnv};
 use crate::orchestrator::{attention_push, Orchestrator};
 use crate::storage::RowExt;
+
+const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Clone)]
+pub(crate) struct MainCheckRun {
+    generation: String,
+    /// The default branch this wave attests, and when it was armed. A wave writes
+    /// nothing until `verify_review_tree` returns, so between the advance and
+    /// that moment the store holds no observation and no alias for the new head
+    /// -- indistinguishable, from the store alone, from a convergence that never
+    /// happened. These two fields are what [`in_flight`] reports, so a reader can
+    /// tell "still running" from "never ran" (CAIRN-3823).
+    branch: String,
+    armed_at_unix_ms: i64,
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+/// The default-branch attestation converging for `project_id` right now, if any:
+/// the branch it attests and the instant it was armed.
+pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<(String, i64)> {
+    wave_in_flight(&orch.main_checks_in_flight, project_id)
+}
+
+fn wave_in_flight(
+    waves: &std::sync::Mutex<std::collections::HashMap<String, MainCheckRun>>,
+    project_id: &str,
+) -> Option<(String, i64)> {
+    waves
+        .lock()
+        .unwrap()
+        .get(project_id)
+        .map(|wave| (wave.branch.clone(), wave.armed_at_unix_ms))
+}
+
+async fn await_settle(wave: &MainCheckRun, window: std::time::Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(window) => true,
+        _ = wave.cancelled() => false,
+    }
+}
+
+async fn run_or_cancel<T>(
+    wave: &MainCheckRun,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        result = work => Some(result),
+        _ = wave.cancelled() => None,
+    }
+}
+
+fn install_latest_wave(
+    waves: &mut std::collections::HashMap<String, MainCheckRun>,
+    project_id: String,
+    wave: MainCheckRun,
+) {
+    if let Some(stale) = waves.insert(project_id, wave) {
+        stale.cancel();
+    }
+}
+
+impl MainCheckRun {
+    fn new(branch: impl Into<String>) -> Self {
+        Self {
+            generation: uuid::Uuid::new_v4().to_string(),
+            branch: branch.into(),
+            armed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    async fn cancelled(&self) {
+        while !self.cancelled.load(Ordering::SeqCst) {
+            self.notify.notified().await;
+        }
+    }
+}
 
 /// Re-evaluate default-branch attestation after its canonical bookmark has been
 /// reconciled. Calling this on every observed advance is intentional: immutable
@@ -20,29 +106,78 @@ pub(crate) fn spawn(
     default_branch: String,
     carried_by_job: Option<String>,
 ) {
-    let orch = orch.clone();
+    let operation_orch = orch.clone();
+    spawn_project_wave(
+        orch.main_checks_in_flight.clone(),
+        project_id.clone(),
+        default_branch.clone(),
+        SETTLE_WINDOW,
+        move || {
+            let orch = operation_orch.clone();
+            let project_id = project_id.clone();
+            let repo_path = repo_path.clone();
+            let default_branch = default_branch.clone();
+            let carried_by_job = carried_by_job.clone();
+            async move {
+                run(
+                    &orch,
+                    &project_id,
+                    &repo_path,
+                    &default_branch,
+                    carried_by_job.as_deref(),
+                )
+                .await
+            }
+        },
+    );
+}
+
+fn spawn_project_wave<F, Fut>(
+    waves: Arc<std::sync::Mutex<std::collections::HashMap<String, MainCheckRun>>>,
+    project_id: String,
+    branch: String,
+    settle_window: std::time::Duration,
+    mut converge: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let wave = MainCheckRun::new(branch);
+    install_latest_wave(&mut waves.lock().unwrap(), project_id.clone(), wave.clone());
     tokio::spawn(async move {
-        for attempt in 1..=3 {
-            match run(
-                &orch,
-                &project_id,
-                &repo_path,
-                &default_branch,
-                carried_by_job.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => return,
-                Err(error) if attempt < 3 => {
-                    log::warn!("main-verdict convergence for project {project_id} attempt {attempt}: {error}; retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                }
-                Err(error) => {
-                    log::error!("main-verdict convergence for project {project_id} exhausted retries: {error}");
+        let work = async {
+            if !await_settle(&wave, settle_window).await {
+                return;
+            }
+            for attempt in 1..=3 {
+                let Some(result) = run_or_cancel(&wave, converge()).await else {
+                    return;
+                };
+                match result {
+                    Ok(()) => return,
+                    Err(error) if attempt < 3 => {
+                        log::warn!("main-verdict convergence for project {project_id} attempt {attempt}: {error}; retrying");
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                            _ = wave.cancelled() => return,
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("main-verdict convergence for project {project_id} exhausted retries: {error}");
+                    }
                 }
             }
+        };
+        work.await;
+        let mut waves = waves.lock().unwrap();
+        if waves
+            .get(&project_id)
+            .is_some_and(|current| current.generation == wave.generation)
+        {
+            waves.remove(&project_id);
         }
-    });
+    })
 }
 
 /// Startup repair edge. A process may exit after observing an advance but before
@@ -118,6 +253,15 @@ async fn run(
     let owner = carried_by_job
         .map(str::to_string)
         .unwrap_or_else(|| format!("main:{project_id}"));
+    let project_key = result_db
+        .query_opt_text(
+            "SELECT key FROM projects WHERE id = ?1",
+            (project_id.to_string(),),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| project_id.to_string());
+    let short_commit = commit.chars().take(8).collect::<String>();
 
     let result = verify_review_tree(
         orch,
@@ -132,6 +276,10 @@ async fn run(
         &owner,
         CellPriority::ReviewCheck,
         ReviewTreeCheckScope::All,
+        Some(crate::execution::checks::ReviewTreeOwner {
+            project_key,
+            revision: short_commit,
+        }),
     )
     .await;
     deliver(orch, project_id, carried_by_job, &commit, result).await
@@ -258,7 +406,6 @@ async fn main_health_issue(
             description: Some("Cairn detected a failing check on the current default-branch tree. Repair this with a surgical child change and no ride-alongs.".to_string()),
             backend_override: None,
             label_ids: None,
-            kind: crate::models::IssueKind::Issue,
         },
     )
     .await
@@ -321,11 +468,112 @@ fn main_health_report(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn merge_burst_keeps_only_the_final_wave_and_supersedes_every_stale_head() {
+        let waves = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+
+        for head in ["first", "second", "final"] {
+            let runs = runs.clone();
+            tasks.push(spawn_project_wave(
+                waves.clone(),
+                "project".into(),
+                "main".into(),
+                std::time::Duration::from_millis(10),
+                move || {
+                    let runs = runs.clone();
+                    async move {
+                        runs.lock().unwrap().push(head);
+                        Ok(())
+                    }
+                },
+            ));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(*runs.lock().unwrap(), vec!["final"]);
+        assert!(waves.lock().unwrap().is_empty());
+        // Nothing is converging once the burst drains, so the surface says
+        // nothing rather than leaving a stale "still working" claim standing
+        // over a store that is now complete.
+        assert_eq!(wave_in_flight(&waves, "project"), None);
+    }
+
+    /// The whole point of carrying the branch and the arming instant on the live
+    /// wave. A wave records nothing until its suite returns, so while it runs the
+    /// store is empty for the freshly advanced head -- the same reading a
+    /// convergence that never fired would leave. A reader that can see the wave
+    /// can tell the two apart; CAIRN-3823 was filed by one that could not.
     #[test]
-    fn whole_tree_drives_applicability_without_a_merge_diff() {
+    fn a_converging_wave_reports_its_branch_and_arming_instant() {
+        let waves = std::sync::Mutex::new(std::collections::HashMap::new());
+        assert_eq!(wave_in_flight(&waves, "project"), None);
+
+        let before = chrono::Utc::now().timestamp_millis();
+        install_latest_wave(
+            &mut waves.lock().unwrap(),
+            "project".to_string(),
+            MainCheckRun::new("trunk"),
+        );
+
+        let (branch, armed_at) =
+            wave_in_flight(&waves, "project").expect("a converging wave must be visible");
+        assert_eq!(branch, "trunk");
+        assert!(armed_at >= before);
+        assert_eq!(
+            wave_in_flight(&waves, "another-project"),
+            None,
+            "one project's convergence says nothing about another's"
+        );
+    }
+
+    #[tokio::test]
+    async fn advancing_main_drops_work_running_for_the_stale_head() {
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let wave = MainCheckRun::new("main");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        let task_wave = wave.clone();
+        let task = tokio::spawn(async move {
+            run_or_cancel(&task_wave, async move {
+                let _signal = signal;
+                std::future::pending::<()>().await;
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        wave.cancel();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), task)
+                .await
+                .expect("stale work should stop promptly")
+                .unwrap(),
+            None
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(wave.cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn whole_tree_is_only_an_applicability_signal_without_a_merge_diff() {
         let changed = whole_tree_applicability(&[("src/lib.rs".into(), "blob".into())]);
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].path, "src/lib.rs");
+        assert_eq!(
+            crate::execution::selection::whole_suite_command("bun run test:rust {changedFiles}")
+                .unwrap(),
+            "bun run test:rust"
+        );
     }
 
     #[test]

@@ -43,7 +43,6 @@ struct ShowResponse {
 #[derive(Debug)]
 struct HostModels {
     account_id: String,
-    label: String,
     models: Vec<(String, ShowResponse)>,
     errors: Vec<String>,
 }
@@ -51,7 +50,6 @@ struct HostModels {
 #[derive(Default)]
 struct MergedModel {
     account_ids: Vec<String>,
-    host_labels: Vec<String>,
     context_window: Option<i64>,
     supports_tools: bool,
 }
@@ -102,7 +100,7 @@ fn discover_hosts_with_errors(
     let mut ok = Vec::new();
     let mut errors = Vec::new();
     for (id, label, url) in hosts {
-        match discover_host(&id, &label, &url) {
+        match discover_host(&id, &url) {
             Ok(v) => {
                 if !v.errors.is_empty() {
                     errors.push(format!("{label}: {}", bounded_model_failures(&v.errors)));
@@ -125,7 +123,7 @@ fn error_with_causes(context: &str, error: &dyn Error) -> String {
     message
 }
 
-fn discover_host(account_id: &str, label: &str, base_url: &str) -> Result<HostModels, String> {
+fn discover_host(account_id: &str, base_url: &str) -> Result<HostModels, String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(DISCOVERY_TIMEOUT)
         .timeout(DISCOVERY_TIMEOUT)
@@ -169,7 +167,6 @@ fn discover_host(account_id: &str, label: &str, base_url: &str) -> Result<HostMo
     }
     Ok(HostModels {
         account_id: account_id.into(),
-        label: label.into(),
         models,
         errors,
     })
@@ -185,7 +182,6 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
             let entry = merged.entry(tag).or_default();
             let is_priority_host = entry.account_ids.is_empty();
             entry.account_ids.push(host.account_id.clone());
-            entry.host_labels.push(host.label.clone());
             if is_priority_host {
                 // Discovery receives hosts in account priority order. Keep the
                 // advertised runtime metadata aligned with the host routing will
@@ -201,13 +197,14 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
             id: tag.clone(),
             model: tag.clone(),
             display_name: tag,
-            description: Some(format!("Served by {}", entry.host_labels.join(", "))),
+            description: None,
             hidden: false,
             is_default: false,
             default_reasoning_effort: None,
             supported_reasoning_efforts: vec![],
             context_window: entry.context_window,
-            canonical_slug: Some(entry.account_ids.join(",")),
+            canonical_slug: None,
+            serving_account_ids: entry.account_ids,
             pricing: None,
             supported_parameters: if entry.supports_tools {
                 vec!["tools".into()]
@@ -243,13 +240,11 @@ mod tests {
         let m = merge_hosts(vec![
             HostModels {
                 account_id: "a".into(),
-                label: "Fast".into(),
                 models: vec![("qwen".into(), show(32768, false))],
                 errors: vec![],
             },
             HostModels {
                 account_id: "b".into(),
-                label: "Large".into(),
                 models: vec![
                     ("qwen".into(), show(131072, true)),
                     ("llama".into(), show(8192, false)),
@@ -257,11 +252,42 @@ mod tests {
                 errors: vec![],
             },
         ]);
+        // A tag installed on two hosts stays one selectable model, described by
+        // the highest-priority host's runtime metadata.
         assert_eq!(m.len(), 2);
         let q = m.iter().find(|m| m.id == "qwen").unwrap();
         assert_eq!(q.context_window, Some(32768));
-        assert_eq!(q.canonical_slug.as_deref(), Some("a,b"));
         assert!(q.supported_parameters.is_empty());
+        assert_eq!(
+            q.serving_account_ids,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Serving hosts are typed identity, never smuggled through canonical_slug.
+        assert_eq!(q.canonical_slug, None);
+
+        let llama = m.iter().find(|m| m.id == "llama").unwrap();
+        assert_eq!(llama.serving_account_ids, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn serving_hosts_follow_configured_account_priority() {
+        let m = merge_hosts(vec![
+            HostModels {
+                account_id: "low".into(),
+                models: vec![("qwen".into(), show(8192, false))],
+                errors: vec![],
+            },
+            HostModels {
+                account_id: "high".into(),
+                models: vec![("qwen".into(), show(32768, false))],
+                errors: vec![],
+            },
+        ]);
+        let q = m.iter().find(|m| m.id == "qwen").unwrap();
+        assert_eq!(
+            q.serving_account_ids,
+            vec!["low".to_string(), "high".to_string()]
+        );
     }
     #[derive(Debug)]
     struct TestError {

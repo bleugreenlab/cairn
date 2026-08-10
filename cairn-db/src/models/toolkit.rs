@@ -23,8 +23,10 @@
 /// *declared*, so allow-listing the three verbs does not hide anything. The
 /// only way to remove a built-in from the declared surface is to name it here.
 /// That means this list must be kept current — when a CLI update adds a new
-/// built-in, add it here or it will leak into agent sessions. Observed set as of
-/// Claude Code (2026-06):
+/// built-in, add it here or it will leak into agent sessions. Nothing here is
+/// guesswork: a session's `init` event reports the tools actually declared, and
+/// `agent_process::toolkits` warns with the exact name to add when one escapes.
+/// Observed set as of Claude Code 2.1.225 (2026-08):
 pub const ALWAYS_DISALLOWED_TOOLS: &[&str] = &[
     // Cairn-managed equivalents
     "EnterPlanMode",
@@ -44,7 +46,11 @@ pub const ALWAYS_DISALLOWED_TOOLS: &[&str] = &[
     "Monitor",
     "TaskStop",
     "PushNotification",
+    // Agent-to-agent messaging: `SendMessage` addresses peers that `ListAgents`
+    // enumerates. Both are off — delegation is a `write` to the node's tasks
+    // collection, and replies are `write` appends to a `cairn://` messages URI.
     "SendMessage",
+    "ListAgents",
     "ReportFindings",
     "DesignSync",
     "Workflow",

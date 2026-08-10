@@ -287,7 +287,7 @@ mod tests {
         // Serialized from the same struct the storage path builds, so the
         // fixture cannot drift from what actually lands in `data`.
         let event_data = |event_type: &str, content: &str| {
-            serde_json::to_string(&TranscriptEvent {
+            TranscriptEvent {
                 event_type: event_type.to_string(),
                 session_id: Some("sess-1".to_string()),
                 parent_tool_use_id: None,
@@ -302,8 +302,9 @@ mod tests {
                 thinking_ms: None,
                 queued_message_id: None,
                 raw: None,
-            })
-            .unwrap()
+            }
+            .observed()
+            .to_event_json()
         };
         let launch = event_data(launch_type, THE_TASK);
         let reply = event_data("assistant", "on it");

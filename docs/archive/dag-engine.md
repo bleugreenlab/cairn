@@ -1,5 +1,15 @@
 # Execution Engine
 
+> **ARCHIVED — describes a retired implementation.**
+>
+> This document is kept as design history: it records how Cairn was built at the
+> time it was written, and parts of it were already inaccurate when it was last
+> touched. It is not a description of the current system and must not be read as
+> one or updated to match one. Where it disagrees with the code, the code is
+> right.
+>
+> Current equivalents: `docs/recipe-execution.md` for the recipe and node model, `docs/state-machines.md` for status derivation, and `docs/execution-fabric.md` for how work is placed.
+
 The execution engine turns recipe definitions into running multi-agent workflows. A recipe is a DAG of typed nodes connected by edges. When triggered, the recipe is snapshotted, jobs are created for executable nodes, and an advancement loop drives the workflow forward by checking dependencies and dispatching work.
 
 ## Concepts

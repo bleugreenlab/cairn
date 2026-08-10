@@ -42,11 +42,15 @@ pub mod mcp_import;
 pub mod mcp_servers;
 pub mod mcp_setup;
 pub mod mcp_tools;
+pub mod model_routing;
+pub mod pack;
 pub mod pdf;
 pub mod presets;
 pub mod project_settings;
 pub mod provider_options;
 pub mod recipes;
+pub mod responses;
+pub mod routes;
 pub mod secrets;
 pub mod settings;
 pub mod skill_archive;
@@ -216,7 +220,7 @@ fn git_commit_with_identity(repo_root: &Path, msg: &str) -> Option<String> {
 /// not inside any git work tree (an older install where `~/.cairn` is not a
 /// repo) is silently skipped. Returns the (work-tree root, sha) of each commit
 /// actually made, so callers can tell which repository committed.
-pub(crate) fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<(PathBuf, String)> {
+pub fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<(PathBuf, String)> {
     use std::collections::BTreeMap;
 
     // Map each repo's work-tree root to a directory inside it that we can run
@@ -388,7 +392,7 @@ fn config_root_subdirs(
 }
 
 pub fn ensure_config_dirs(config_dir: &Path) -> Result<(), String> {
-    for dir in ["recipes", "agents", "skills"] {
+    for dir in ["recipes", "agents", "responses", "routes", "skills"] {
         let path = config_dir.join(dir);
         std::fs::create_dir_all(&path)
             .map_err(|e| format!("Failed to create directory {:?}: {}", path, e))?;
@@ -397,114 +401,124 @@ pub fn ensure_config_dirs(config_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Bundled resource subtrees seeded into a workspace on startup by the bundle
-/// sync (`workspace::bundle::sync_bundle_resources`) and folded into its
-/// content-hash marker. Flat dirs (`agents`, `recipes`) are per-file
-/// copy-when-missing with in-place bundle updates; package dirs (`skills`,
-/// `workflows`) are whole-directory copy-when-missing and never overwritten, so
-/// a user's edited package is preserved.
-///
-/// This is the NON-destructive provisioning set. The destructive
-/// "restore bundled defaults" reset uses the narrower [`MIRROR_RESET_DIRS`] —
-/// `workflows` is deliberately absent there so a restore can never wipe
-/// user-authored workflow packages.
-pub(crate) const BUNDLE_RESOURCE_DIRS: [&str; 4] = ["agents", "recipes", "skills", "workflows"];
-
 /// Managed subtrees the destructive "restore bundled defaults" command wipes and
-/// re-mirrors ([`mirror_bundle_resources_with_fs`]). A strict subset of
-/// [`BUNDLE_RESOURCE_DIRS`]: `workflows` is excluded because a workflow package
-/// is user-authorable and copy-when-missing everywhere else, so a wholesale
-/// reset must not delete `<CAIRN_HOME>/workflows`. A deleted built-in workflow
-/// is re-seeded non-destructively by the next startup sync instead.
-const MIRROR_RESET_DIRS: [&str; 3] = ["agents", "recipes", "skills"];
+/// re-materializes ([`mirror_bundle_resources_with`]). A strict subset of
+/// [`pack::CONTENT_DIRS`]: `workflows` is excluded because a workflow package is
+/// user-authorable and copy-when-missing everywhere else, so a wholesale reset
+/// must not delete `<CAIRN_HOME>/workflows`. A deleted built-in workflow is
+/// re-seeded non-destructively by the next startup sync instead.
+const MIRROR_RESET_DIRS: [&str; 4] = ["agents", "recipes", "responses", "skills"];
 
-/// Mirror bundled agents, recipes, and skills into `target_dir`, resetting them
-/// to their shipped defaults.
+/// Reset agents, recipes, responses, and skills in `config_dir` to the shipped
+/// defaults of the packs that workspace has INSTALLED.
 ///
-/// Only those three managed subtrees ([`MIRROR_RESET_DIRS`]) are deleted and
+/// Only those four managed subtrees ([`MIRROR_RESET_DIRS`]) are deleted and
 /// replaced; sibling user-local files such as `.gitignore`, `settings.yaml`, and
 /// `AGENTS.md` are left alone — and so is `<CAIRN_HOME>/workflows`, since a
 /// wholesale reset must never delete user-authored workflow packages (they are
 /// re-seeded copy-when-missing by the startup sync).
-pub fn mirror_bundle_resources(resource_dir: &Path, target_dir: &Path) -> Result<(), String> {
-    let fs = crate::services::RealFileSystem;
-    mirror_bundle_resources_with_fs(&fs, resource_dir, target_dir)
+///
+/// Packs make "the defaults" a per-workspace question: restoring must bring back
+/// what this workspace installed, not everything the app happens to ship. A
+/// workspace with no locks yet (a restore before its first pack sync) falls back
+/// to the default pack set, which is what a fresh install would have had.
+pub fn mirror_bundle_resources(resource_dir: &Path, config_dir: &Path) -> Result<(), String> {
+    mirror_bundle_resources_with(
+        &crate::services::RealGitClient,
+        &crate::services::RealFileSystem,
+        resource_dir,
+        config_dir,
+    )
 }
 
-fn mirror_bundle_resources_with_fs(
+/// The packs a "restore defaults" re-asserts: everything currently installed,
+/// plus every pack that ships as a default.
+///
+/// The default set is included unconditionally, which is what the command's name
+/// promises. Clicking it is a second explicit decision that supersedes an
+/// earlier uninstall of a default pack — and going through the install path (see
+/// below) is what clears that pack's uninstall marker, so the workspace never
+/// ends up holding a pack's files while the catalog reports it uninstalled.
+///
+/// Within that scope the restore is total: edits, pack uninstalls, and item
+/// removals alike are re-asserted to what the app ships.
+fn restorable_packs(resource_dir: &Path, config_dir: &Path) -> Vec<pack::PackManifest> {
+    let installed: HashSet<String> = pack::installed_packs(config_dir)
+        .into_iter()
+        .map(|lock| lock.id)
+        .collect();
+    pack::discover_available_packs(resource_dir)
+        .into_iter()
+        .filter(|manifest| manifest.default || installed.contains(&manifest.id))
+        .collect()
+}
+
+fn mirror_bundle_resources_with(
+    git: &dyn crate::services::GitClient,
     fs: &dyn crate::services::FileSystem,
     resource_dir: &Path,
-    target_dir: &Path,
+    config_dir: &Path,
 ) -> Result<(), String> {
-    fs.create_dir_all(target_dir)?;
+    fs.create_dir_all(config_dir)?;
+    let packs = restorable_packs(resource_dir, config_dir);
+
+    // Wipe first: overwriting the user's edited copies with the shipped ones is
+    // the whole point of a restore, and the install path below is deliberately
+    // copy-when-missing. Packs share the flat destination, so this happens once
+    // rather than per pack, which would erase the pack before it.
     for dir_name in MIRROR_RESET_DIRS {
-        let source = resource_dir.join(dir_name);
-        let dest = target_dir.join(dir_name);
+        let dest = config_dir.join(dir_name);
         if fs.exists(&dest) {
             fs.remove_dir_all(&dest)?;
         }
-        if fs.exists(&source) {
-            mirror_dir_with_fs(fs, &source, &dest)?;
-        } else {
-            fs.create_dir_all(&dest)?;
-            log::debug!(
-                "Bundled {} directory not found at {:?}; leaving empty managed tree",
-                dir_name,
-                source
-            );
+        fs.create_dir_all(&dest)?;
+    }
+
+    // Re-materialize through the ordinary install, not a raw copy. That is what
+    // keeps this button and `patch cairn://packs/<id> {action:"install"}` one
+    // mechanism: each pack's lock is rewritten, its files land committed under
+    // its own subject (so they stay pack-owned and updatable), and any uninstall
+    // marker is cleared. A raw mirror left those files untracked and claimed by
+    // no pack — frozen against every future update.
+    for manifest in &packs {
+        // Within its scope, a restore overrides every user decision uniformly:
+        // an edited file (the wipe above), an uninstalled default pack (the
+        // marker `sync_one_pack` clears), and an item removed from a pack. An
+        // exception for the third would have no rule behind it, and undoing an
+        // item removal has no other route a user can reach without driving
+        // Cairn through an agent. Re-removing one item is a click; discovering
+        // an agent-only resource mutation is not.
+        if pack::lock::read_lock(config_dir, &manifest.id).is_some() {
+            pack::lock::restore_removed_items(fs, config_dir, &manifest.id)?;
         }
+        crate::workspace::bundle::sync_one_pack(git, fs, resource_dir, config_dir, &manifest.id)?;
     }
     Ok(())
 }
 
-fn mirror_dir_with_fs(
-    fs: &dyn crate::services::FileSystem,
-    source_dir: &Path,
-    dest_dir: &Path,
-) -> Result<(), String> {
-    if fs.exists(dest_dir) {
-        fs.remove_dir_all(dest_dir)?;
-    }
-    fs.copy_dir_recursive(source_dir, dest_dir)
-}
+/// IDs restored by mirroring the installed packs' `dir_name` subtree.
+pub fn bundled_resource_ids(
+    resource_dir: &Path,
+    config_dir: &Path,
+    dir_name: &str,
+) -> Result<Vec<String>, String> {
+    let kind = match dir_name {
+        "agents" => pack::PackItemKind::Agent,
+        "recipes" => pack::PackItemKind::Recipe,
+        "responses" => pack::PackItemKind::Response,
+        "skills" => pack::PackItemKind::Skill,
+        "workflows" => pack::PackItemKind::Workflow,
+        other => return Err(format!("`{other}` is not a pack content directory")),
+    };
 
-/// Return IDs restored by mirroring a bundled resource subtree.
-pub fn bundled_resource_ids(resource_dir: &Path, dir_name: &str) -> Result<Vec<String>, String> {
-    let dir = resource_dir.join(dir_name);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut ids = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| {
-        format!(
-            "Failed to read bundled {} directory {:?}: {}",
-            dir_name, dir, e
-        )
-    })? {
-        let entry = entry.map_err(|e| format!("Failed to read bundled entry: {}", e))?;
-        let path = entry.path();
-        if dir_name == "skills" {
-            if path.is_dir() && path.join("SKILL.md").exists() {
-                if let Some(id) = path.file_name().and_then(|name| name.to_str()) {
-                    ids.push(id.to_string());
-                }
-            }
-        } else if path.is_file() {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let matches = match dir_name {
-                "agents" => ext == "md",
-                "recipes" => ext == "yaml" || ext == "yml",
-                _ => false,
-            };
-            if matches {
-                if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    ids.push(id.to_string());
-                }
-            }
-        }
-    }
+    let mut ids: Vec<String> = restorable_packs(resource_dir, config_dir)
+        .iter()
+        .flat_map(|manifest| manifest.items())
+        .filter(|item| item.kind == kind)
+        .map(|item| item.id)
+        .collect();
     ids.sort();
+    ids.dedup();
     Ok(ids)
 }
 
@@ -528,7 +542,7 @@ pub(crate) fn id_from_path(path: &std::path::Path) -> Option<String> {
 ///
 /// Unicode-aware: preserves letters and digits from any script. Used for agent,
 /// skill, and recipe identifiers where names may be non-ASCII.
-pub(crate) fn slugify(name: &str) -> String {
+pub fn slugify(name: &str) -> String {
     name.to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -748,25 +762,31 @@ mod tests {
     use super::*;
 
     /// The destructive "restore bundled defaults" reset
-    /// ([`mirror_bundle_resources_with_fs`]) resets agents/recipes/skills to the
+    /// ([`mirror_bundle_resources_with`]) resets agents/recipes/skills to the
     /// bundle but must NEVER touch `<CAIRN_HOME>/workflows` — a user's authored or
     /// edited workflow package survives a restore. Guards the decoupling of the
     /// provisioning set from the destructive reset set.
     #[test]
     fn restore_mirror_preserves_user_workflows() {
-        use crate::services::RealFileSystem;
+        use crate::services::{RealFileSystem, RealGitClient};
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();
         let resource_dir = temp.path().join("resources");
         let home = temp.path().join("home");
 
-        // Bundle ships an agent and a workflow.
-        std::fs::create_dir_all(resource_dir.join("agents")).unwrap();
-        std::fs::write(resource_dir.join("agents/explore.md"), "bundle\n").unwrap();
-        std::fs::create_dir_all(resource_dir.join("workflows/fan-out")).unwrap();
+        // The default `core` pack ships an agent and a workflow.
+        let core = resource_dir.join("packs/core");
+        std::fs::create_dir_all(core.join("agents")).unwrap();
         std::fs::write(
-            resource_dir.join("workflows/fan-out/workflow.yaml"),
+            core.join("cairn-pack.yaml"),
+            "id: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
+        )
+        .unwrap();
+        std::fs::write(core.join("agents/explore.md"), "bundle\n").unwrap();
+        std::fs::create_dir_all(core.join("workflows/fan-out")).unwrap();
+        std::fs::write(
+            core.join("workflows/fan-out/workflow.yaml"),
             "name: Fan Out\ndescription: d\n",
         )
         .unwrap();
@@ -781,7 +801,8 @@ mod tests {
         std::fs::create_dir_all(home.join("workflows/fan-out")).unwrap();
         std::fs::write(home.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
 
-        mirror_bundle_resources_with_fs(&RealFileSystem, &resource_dir, &home).unwrap();
+        mirror_bundle_resources_with(&RealGitClient, &RealFileSystem, &resource_dir, &home)
+            .unwrap();
 
         // Agents were reset to the bundle…
         assert_eq!(
@@ -794,6 +815,175 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(home.join("workflows/fan-out/main.ts")).unwrap(),
             "// user edit\n"
+        );
+
+        assert_eq!(
+            bundled_resource_ids(&resource_dir, &home, "agents").unwrap(),
+            vec!["explore".to_string()]
+        );
+    }
+
+    /// A restore brings back what this workspace INSTALLED, not everything the
+    /// app ships. An optional pack the user never installed must not appear.
+    /// "Restore bundled defaults" is a deliberate click that supersedes an
+    /// earlier uninstall of a DEFAULT pack. What it must never do is put the
+    /// files back while leaving the pack uninstalled: those files would be
+    /// claimed by no pack, tracked by nothing, and skipped by every later sync.
+    #[test]
+    fn restore_after_uninstalling_everything_reinstalls_coherently() {
+        use crate::services::{GitClient, RealFileSystem, RealGitClient};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let resource_dir = temp.path().join("resources");
+        let home = temp.path().join("home");
+        let core = resource_dir.join("packs/core");
+        std::fs::create_dir_all(core.join("agents")).unwrap();
+        std::fs::write(
+            core.join("cairn-pack.yaml"),
+            "id: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
+        )
+        .unwrap();
+        std::fs::write(core.join("agents/explore.md"), "shipped\n").unwrap();
+
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
+            .unwrap();
+        crate::workspace::bundle::uninstall_pack(&git, &fs, &home, "core").unwrap();
+        assert!(!home.join("agents/explore.md").exists());
+
+        mirror_bundle_resources_with(&git, &fs, &resource_dir, &home).unwrap();
+
+        assert!(home.join("agents/explore.md").exists());
+        assert!(
+            pack::lock::read_lock(&home, "core").is_some(),
+            "restored files must be claimed by their pack"
+        );
+        assert!(
+            !pack::lock::is_uninstalled(&home, "core"),
+            "restoring supersedes the earlier uninstall rather than contradicting it"
+        );
+
+        // And the next ordinary sync keeps it, rather than skipping a pack it
+        // still considers removed.
+        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
+            .unwrap();
+        assert!(pack::lock::read_lock(&home, "core").is_some());
+        assert!(home.join("agents/explore.md").exists());
+
+        // The restored file is tracked and pack-owned, so a later shipped change
+        // still reaches it.
+        let tracked = git.run(&home, vec!["ls-files".into()]).unwrap();
+        assert!(tracked
+            .stdout
+            .lines()
+            .any(|line| line == "agents/explore.md"));
+    }
+
+    /// A restore overrides every user decision within its scope, uniformly. An
+    /// item removal is not an exception: undoing one otherwise has no route a
+    /// user can reach without driving Cairn through an agent, and re-removing
+    /// it afterwards is a single click.
+    #[test]
+    fn restore_undoes_an_item_removal_too() {
+        use crate::services::{GitClient, RealFileSystem, RealGitClient};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let resource_dir = temp.path().join("resources");
+        let home = temp.path().join("home");
+        let core = resource_dir.join("packs/core");
+        std::fs::create_dir_all(core.join("agents")).unwrap();
+        std::fs::write(
+            core.join("cairn-pack.yaml"),
+            "id: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
+        )
+        .unwrap();
+        std::fs::write(core.join("agents/explore.md"), "shipped\n").unwrap();
+        std::fs::write(core.join("agents/plan.md"), "shipped\n").unwrap();
+
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
+            .unwrap();
+
+        crate::config::agents::delete_agent(&home, "plan", None).unwrap();
+        assert!(!home.join("agents/plan.md").exists());
+        assert!(pack::lock::read_lock(&home, "core")
+            .unwrap()
+            .is_removed(pack::PackItemKind::Agent, "plan"));
+        // One user action, one commit: the record and the deletion it describes
+        // land together, so neither can be reverted without the other.
+        assert_eq!(
+            git.status(&home).unwrap().trim(),
+            "",
+            "a removal must leave no uncommitted state behind"
+        );
+
+        mirror_bundle_resources_with(&git, &fs, &resource_dir, &home).unwrap();
+
+        assert!(home.join("agents/plan.md").exists());
+        assert!(
+            pack::lock::read_lock(&home, "core")
+                .unwrap()
+                .removed
+                .is_empty(),
+            "the removal record is cleared, so the next sync keeps the item"
+        );
+        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
+            .unwrap();
+        assert!(home.join("agents/plan.md").exists());
+
+        // The record and its undo are both durable. An uncommitted lock would be
+        // reverted by an ordinary `git checkout`, leaving the record and the tree
+        // disagreeing about what is installed.
+        assert_eq!(
+            git.status(&home).unwrap().trim(),
+            "",
+            "a restore must leave no uncommitted pack state behind"
+        );
+    }
+
+    #[test]
+    fn restore_mirror_only_reinstates_installed_packs() {
+        use crate::services::{RealFileSystem, RealGitClient};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let resource_dir = temp.path().join("resources");
+        let home = temp.path().join("home");
+
+        for (id, default) in [("core", true), ("matlab", false)] {
+            let root = resource_dir.join("packs").join(id);
+            std::fs::create_dir_all(root.join("agents")).unwrap();
+            std::fs::write(
+                root.join("cairn-pack.yaml"),
+                format!("id: {id}\nname: {id}\nversion: 1.0.0\ndefault: {default}\n"),
+            )
+            .unwrap();
+            std::fs::write(root.join(format!("agents/{id}.md")), "shipped\n").unwrap();
+        }
+
+        // Only `core` is locked as installed.
+        std::fs::create_dir_all(home.join("packs/core")).unwrap();
+        std::fs::write(
+            home.join("packs/core/pack.yaml"),
+            "cairnVersion: 1\nid: core\nname: Core\nversion: 1.0.0\ninstalledAt: now\ncontentHash: h\nsource:\n  kind: bundled\n",
+        )
+        .unwrap();
+
+        mirror_bundle_resources_with(&RealGitClient, &RealFileSystem, &resource_dir, &home)
+            .unwrap();
+
+        assert!(home.join("agents/core.md").exists());
+        assert!(
+            !home.join("agents/matlab.md").exists(),
+            "a restore must not install a pack the user never chose"
+        );
+        assert_eq!(
+            bundled_resource_ids(&resource_dir, &home, "agents").unwrap(),
+            vec!["core".to_string()]
         );
     }
 

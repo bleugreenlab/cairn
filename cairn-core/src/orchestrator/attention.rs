@@ -125,6 +125,8 @@ pub struct AttentionEvent {
     pub attention: IssueAttention,
     pub status: IssueStatus,
     pub updated_at: i64,
+    #[serde(default)]
+    pub route_provenance: Option<String>,
 }
 
 /// Fact-key for short-window dedupe: same discriminant + same detail uri inside
@@ -143,6 +145,43 @@ impl AttentionFact {
         match self {
             AttentionFact::ExternalMessageReply { .. } => DeliveryUrgency::Steer,
             _ => DeliveryUrgency::Queue,
+        }
+    }
+
+    /// One human line naming what happened, for surfaces that show a fact to an
+    /// operator instead of dispatching on it. The serialized envelope is the
+    /// wire form and reads as JSON; this is the same fact in words.
+    pub fn summary(&self) -> String {
+        match self {
+            AttentionFact::Question { content, .. } => match content.questions.first() {
+                Some(first) => format!("Asked: {}", first.question),
+                None => "Asked a question".into(),
+            },
+            AttentionFact::Permission { content, .. } => {
+                format!("Wants permission to run {}", content.tool_name)
+            }
+            AttentionFact::ArtifactWritten { content, .. } => {
+                let what = content
+                    .title
+                    .as_deref()
+                    .or(content.summary.as_deref())
+                    .unwrap_or(&content.artifact_type);
+                let verb = if content.version > 1 {
+                    "Revised"
+                } else {
+                    "Wrote"
+                };
+                format!("{verb} {}: {what}", content.output_name)
+            }
+            AttentionFact::AgentIdleWithWork { .. } => "Went idle with work remaining".into(),
+            AttentionFact::PrStateChange { content, .. } => match content.title.as_deref() {
+                Some(title) => format!("PR #{} is {}: {title}", content.number, content.state),
+                None => format!("PR #{} is {}", content.number, content.state),
+            },
+            AttentionFact::ExternalMessageReply { content, .. } => {
+                format!("{} replied: {}", content.sender, content.body)
+            }
+            AttentionFact::Resolved { final_status } => format!("Resolved as {final_status}"),
         }
     }
 
@@ -913,6 +952,7 @@ mod tests {
             attention: IssueAttention::None,
             status: IssueStatus::Merged,
             updated_at: 42,
+            route_provenance: None,
         };
         let json = event_to_watch_json(&event);
         assert_eq!(json["status"], "resolved");
@@ -934,6 +974,7 @@ mod tests {
             attention: IssueAttention::NeedsInput,
             status: IssueStatus::Active,
             updated_at: 5,
+            route_provenance: None,
         };
         let json = event_to_watch_json(&event);
         assert_eq!(json["status"], "actionable");
@@ -961,6 +1002,7 @@ mod tests {
                     body: "done".to_string(),
                 },
             },
+            route_provenance: None,
         };
 
         let json = event_to_watch_json(&event);

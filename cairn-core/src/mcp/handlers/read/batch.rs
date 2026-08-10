@@ -146,7 +146,7 @@ pub(crate) async fn handle_read_batch(
     // both dedup passes: a deduped or affordance-collapsed segment has already
     // been replaced by a stub carrying no images, so nothing is stored for a read
     // whose result the agent will not see.
-    super::durable_images::promote_read_images(orch, request, &mut segments).await;
+    crate::mcp::handlers::durable_images::promote_read_images(orch, request, &mut segments).await;
 
     let envelope = if payload.include_bodies {
         view::assemble_with_bodies(segments)
@@ -354,14 +354,18 @@ async fn produce_resource_segment(
     let identity = split_target_query(&resolved_target)
         .map(|split| split.identity)
         .unwrap_or_else(|_| resolved_target.clone());
-    if matches!(
-        parse_uri(&identity),
-        Some(
-            CairnResource::NodeTerminal { .. }
-                | CairnResource::TaskTerminal { .. }
-                | CairnResource::ProjectTerminal { .. }
-        )
-    ) {
+    // Classify against the NORMALIZED resource, so a thread's terminal — at
+    // either the session or the task level — is recognized as a terminal by the
+    // same map the dispatchers use. Matching a raw `Thread` path here meant this
+    // router carried its own copy of the thread-path vocabulary, and it knew
+    // only the session-level shape.
+    let terminal_resource = matches!(
+        parse_uri(&identity).map(crate::resources::delegate_thread_descendant),
+        Some(Ok(CairnResource::NodeTerminal { .. }
+            | CairnResource::TaskTerminal { .. }
+            | CairnResource::ProjectTerminal { .. }))
+    );
+    if terminal_resource {
         return produce_terminal_segment(orch, request, read_cursors, target, &resolved_target)
             .await;
     }

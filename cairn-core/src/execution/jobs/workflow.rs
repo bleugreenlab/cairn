@@ -903,7 +903,6 @@ pub async fn launch_standalone_workflow(
             description: Some(format!("Standalone run of the `{workflow_id}` workflow.")),
             backend_override: None,
             label_ids: None,
-            kind: crate::models::IssueKind::Issue,
         },
     )
     .await
@@ -915,6 +914,8 @@ pub async fn launch_standalone_workflow(
     let execution_id = ids::mint_child(project_id);
     let snapshot = crate::models::ExecutionSnapshot {
         branch_target: Default::default(),
+        // A workflow host node runs no recipe agents, so nothing was routed.
+        model_routing: None,
         recipe: crate::models::RecipeSnapshot {
             id: format!("workflow-{workflow_id}"),
             name: format!("Workflow: {display_name}"),

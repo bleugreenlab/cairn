@@ -17,9 +17,7 @@ pub(super) struct ParentRunContext {
     pub(super) run_id: String,
     pub(super) job_id: String,
     pub(super) execution_id: Option<String>,
-    pub(super) exec_seq: Option<i32>,
     pub(super) issue_id: Option<String>,
-    pub(super) issue_number: Option<i32>,
     pub(super) project_id: String,
     pub(super) project_key: String,
 }
@@ -191,16 +189,16 @@ async fn lookup_run_context_by_id(
     conn: &cairn_db::turso::Connection,
     run_id: &str,
 ) -> DbResult<Option<ParentRunContext>> {
+    // The parent's own identity and project, nothing about an issue coordinate:
+    // a delegating parent may be an issue node or a thread session, and every
+    // URI a delegated task needs is built from the CHILD's canonical home.
     let mut rows = conn
         .query(
             "
-            SELECT r.id, r.job_id, j.execution_id, r.issue_id, i.number,
-                   j.project_id, p.key, j.node_name, e.seq
+            SELECT r.id, r.job_id, j.execution_id, r.issue_id, j.project_id, p.key
             FROM runs r
             JOIN jobs j ON r.job_id = j.id
-            LEFT JOIN issues i ON r.issue_id = i.id
             JOIN projects p ON j.project_id = p.id
-            LEFT JOIN executions e ON j.execution_id = e.id
             WHERE r.id = ?1
             LIMIT 1
             ",
@@ -219,10 +217,8 @@ fn run_context_from_row(row: &cairn_db::turso::Row, _job_type: &str) -> DbResult
         job_id: row.text(1)?,
         execution_id: row.opt_text(2)?,
         issue_id: row.opt_text(3)?,
-        issue_number: row.opt_i64(4)?.map(|value| value as i32),
-        project_id: row.text(5)?,
-        project_key: row.text(6)?,
-        exec_seq: row.opt_i64(8)?.map(|value| value as i32),
+        project_id: row.text(4)?,
+        project_key: row.text(5)?,
     })
 }
 
@@ -250,6 +246,9 @@ pub(super) async fn ensure_task_execution_context(
 
     let snapshot = ExecutionSnapshot {
         branch_target: Default::default(),
+        // A synthetic delegation host runs no agent node of its own, so there is
+        // nothing for a routing table to have decided.
+        model_routing: None,
         recipe: RecipeSnapshot {
             id: format!("delegation-{}", parent_ctx.job_id),
             name: "Delegated Work".to_string(),

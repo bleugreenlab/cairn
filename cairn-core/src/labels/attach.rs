@@ -175,6 +175,23 @@ pub(crate) async fn replace_issue_labels(
     Ok(created)
 }
 
+/// Add labels without disturbing labels already attached to the issue.
+pub(crate) async fn add_issue_labels(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+    refs: &[String],
+    now: i64,
+) -> Result<Vec<Label>, String> {
+    let mut combined = list_labels_for_issue(conn, issue_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|label| label.id)
+        .collect::<Vec<_>>();
+    combined.extend_from_slice(refs);
+    replace_issue_labels(conn, issue_id, &combined, now).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

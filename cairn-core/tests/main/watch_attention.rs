@@ -274,6 +274,7 @@ async fn typed_question_event_carries_inline_questions() {
     let event = AttentionEvent {
         issue_id: issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
+        route_provenance: None,
         fact: AttentionFact::Question {
             detail_uri: "cairn://p/WATCH/1/1/planner/questions/q-1".to_string(),
             content: QuestionContent {
@@ -333,6 +334,7 @@ async fn distinct_facts_for_same_issue_each_pass_through_dedupe() {
     let artifact = AttentionEvent {
         issue_id: issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
+        route_provenance: None,
         fact: AttentionFact::ArtifactWritten {
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
             content: ArtifactSummary {
@@ -351,6 +353,7 @@ async fn distinct_facts_for_same_issue_each_pass_through_dedupe() {
     let idle = AttentionEvent {
         issue_id: issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
+        route_provenance: None,
         fact: AttentionFact::AgentIdleWithWork {
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
         },
@@ -648,6 +651,7 @@ async fn watch_returns_event_fact_in_response_json() {
     fixture.orch.emit_attention_event(AttentionEvent {
         issue_id: fixture.issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
+        route_provenance: None,
         fact: AttentionFact::ArtifactWritten {
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
             content: ArtifactSummary {
@@ -814,6 +818,7 @@ async fn watch_returns_on_idle_with_work_event_with_none_attention() {
     fixture.orch.emit_attention_event(AttentionEvent {
         issue_id: fixture.issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
+        route_provenance: None,
         fact: AttentionFact::AgentIdleWithWork {
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
         },

@@ -520,6 +520,7 @@ mod tests {
 
         let make_snapshot = |tt: TriggerType| ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "r".to_string(),
                 name: "R".to_string(),

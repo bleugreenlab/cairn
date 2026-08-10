@@ -3,9 +3,7 @@
 use crate::error::CairnError;
 use crate::issues::relations;
 use crate::labels::attach;
-use crate::models::{
-    CreateIssue, Issue, IssueAttention, IssueKind, IssueProgress, IssueStatus, UpdateIssue,
-};
+use crate::models::{CreateIssue, Issue, IssueAttention, IssueProgress, IssueStatus, UpdateIssue};
 use crate::services::Clock;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::transitions::Resolution;
@@ -15,7 +13,7 @@ use std::sync::Arc;
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, progress,
     attention, priority, completed_at, dismissed_at, created_at, updated_at, model,
-    merged_at, closed_at, parent_issue_id, kind";
+    merged_at, closed_at, parent_issue_id, parent_thread_id";
 
 fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
@@ -102,62 +100,12 @@ fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
         merged_at: row.opt_i64(14)?,
         closed_at: row.opt_i64(15)?,
         parent_issue_id: row.opt_text(16)?,
+        parent_thread_id: row.opt_text(17)?,
         unmet_dependency_count: 0,
         depends_on: Vec::new(),
         unmet_depends_on: Vec::new(),
         labels: Vec::new(),
-        // An unrecognized kind reads as an ordinary issue rather than failing
-        // the whole row: the column is the discriminator, not the record, and a
-        // row Cairn cannot classify is still a row it must be able to show.
-        kind: row
-            .opt_text(17)?
-            .and_then(|kind| kind.parse().ok())
-            .unwrap_or_default(),
     })
-}
-
-/// What an issue is, together with the identity a message names it by. One
-/// query so a caller deciding on the kind can also speak about the issue — the
-/// thread refusal in [`crate::issues::status::check_resolution`] needs both.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IssueIdentity {
-    pub kind: IssueKind,
-    pub project_key: String,
-    pub number: i32,
-}
-
-/// Resolve an issue id to its kind and project-scoped identity. `None` when no
-/// such issue exists.
-pub async fn identity(db: &LocalDb, id: &str) -> Result<Option<IssueIdentity>, CairnError> {
-    let id = id.to_string();
-    db.read(|conn| {
-        let id = id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT i.kind, p.key, i.number
-                     FROM issues i
-                     JOIN projects p ON p.id = i.project_id
-                     WHERE i.id = ?1
-                     LIMIT 1",
-                    params![id.as_str()],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => Ok(Some(IssueIdentity {
-                    kind: row
-                        .opt_text(0)?
-                        .and_then(|kind| kind.parse().ok())
-                        .unwrap_or_default(),
-                    project_key: row.text(1)?,
-                    number: row.i64(2)? as i32,
-                })),
-                None => Ok(None),
-            }
-        })
-    })
-    .await
-    .map_err(CairnError::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +194,6 @@ pub async fn create(
         description,
         backend_override,
         label_ids,
-        kind,
     } = input;
     let id = ids::mint_child(&project_id);
     let now = clock.now();
@@ -279,9 +226,9 @@ pub async fn create(
             conn.execute(
                 "INSERT INTO issues (
                     id, project_id, number, title, description, status, progress, attention,
-                    priority, created_at, updated_at, model, kind
+                    priority, created_at, updated_at, model
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7)",
                 params![
                     id.as_str(),
                     project_id.as_str(),
@@ -289,8 +236,7 @@ pub async fn create(
                     title.as_str(),
                     description.as_deref(),
                     now,
-                    backend_override.as_deref(),
-                    kind.to_string()
+                    backend_override.as_deref()
                 ],
             )
             .await?;
@@ -319,11 +265,11 @@ pub async fn create(
                 merged_at: None,
                 closed_at: None,
                 parent_issue_id: None,
+                parent_thread_id: None,
                 unmet_dependency_count: 0,
                 depends_on: Vec::new(),
                 unmet_depends_on: Vec::new(),
                 labels: Vec::new(),
-                kind,
             };
             hydrate_issue_relations(conn, std::slice::from_mut(&mut issue)).await?;
             Ok(issue)
@@ -580,129 +526,22 @@ pub async fn delete_db(db: &LocalDb, issue_id: &str) -> Result<(), CairnError> {
     db.write(|conn| {
         let issue_id = issue_id.clone();
         Box::pin(async move {
-            // The issue's subtree is interlinked in ways no single delete order
-            // satisfies under immediate FK enforcement, and Turso supports
-            // neither `PRAGMA foreign_keys = OFF` inside a transaction nor
-            // `defer_foreign_keys`. So first null the pointer columns that form
-            // cycles or self-references, then delete each non-cascade referrer
-            // before the row it points at, and finally the issue (whose
-            // ON DELETE CASCADE clears the cascade-linked tables).
-            //
-            // Pointers nulled: jobs -> their current turn / resume session
-            // (current_session_id is not an FK but harmless to null), turns ->
-            // predecessor turn, sessions -> replaced_by/parent session, and
-            // artifacts -> parent version. Artifacts cascade on job delete, so
-            // their self-reference is nulled to let that cascade run freely.
-            conn.execute(
-                "UPDATE jobs SET current_session_id = NULL, current_turn_id = NULL,
-                                 resume_session_id = NULL
-                 WHERE issue_id = ?1",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "UPDATE turns SET predecessor_id = NULL
-                 WHERE run_id IN (SELECT id FROM runs WHERE issue_id = ?1)
-                    OR job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "UPDATE sessions SET replaced_by_id = NULL, parent_session_id = NULL
-                 WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "UPDATE artifacts SET parent_version_id = NULL
-                 WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-
-            // events/prompts/permission_requests reference `turns` via turn_id
-            // with no cascade, so they must go before the turns they point at.
-            // (They cascade on run delete, but turns are deleted first here.)
-            conn.execute(
-                "DELETE FROM events WHERE run_id IN (SELECT id FROM runs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM prompts WHERE run_id IN (SELECT id FROM runs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM permission_requests
-                 WHERE run_id IN (SELECT id FROM runs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-
-            // Now the turns themselves, then sessions, then the remaining
-            // non-cascade referrers of jobs/executions/issues.
-            conn.execute(
-                "DELETE FROM turns
-                 WHERE run_id IN (SELECT id FROM runs WHERE issue_id = ?1)
-                    OR job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
+            // Owner-specific references that are not rooted at a job.
             conn.execute(
                 "DELETE FROM execution_trigger_sources
-                 WHERE source_job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)
-                    OR triggered_execution_id IN (SELECT id FROM executions WHERE issue_id = ?1)",
+                 WHERE triggered_execution_id IN (SELECT id FROM executions WHERE issue_id = ?1)",
                 params![issue_id.as_str()],
             )
             .await?;
             conn.execute(
-                "DELETE FROM merge_requests
-                 WHERE issue_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)",
+                "DELETE FROM merge_requests WHERE issue_id = ?1",
                 params![issue_id.as_str()],
             )
             .await?;
-
-            // memories.job_id has no cascade either. Then runs (now unreferenced),
-            // jobs, and finally the issue, whose cascade clears executions and the
-            // remaining cascade-linked tables.
-            conn.execute(
-                "DELETE FROM runs WHERE issue_id = ?1",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM memories
-                 WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)",
-                params![issue_id.as_str()],
-            )
-            .await?;
-            // Thread compaction state hangs off jobs. Turso does not cascade on
-            // DELETE at runtime, so declaring the cascade is not the same as
-            // getting one: sweep it explicitly, child rows before the jobs they
-            // name.
-            for table in [
-                "thread_compaction_entries",
-                "thread_compactions",
-                "thread_compaction_marks",
-            ] {
-                conn.execute(
-                    &format!(
-                        "DELETE FROM {table}
-                         WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)"
-                    ),
-                    params![issue_id.as_str()],
-                )
-                .await?;
-            }
-            conn.execute(
-                "DELETE FROM jobs WHERE issue_id = ?1",
-                params![issue_id.as_str()],
+            crate::jobs::cleanup::delete_owned_jobs(
+                conn,
+                crate::jobs::cleanup::JobOwner::Issue,
+                &issue_id,
             )
             .await?;
             conn.execute(
@@ -825,6 +664,47 @@ mod tests {
         assert_eq!(children[1].depends_on, issue_one.depends_on);
         assert_eq!(children[1].unmet_depends_on, issue_one.unmet_depends_on);
         assert_eq!(children[1].labels, issue_one.labels);
+    }
+
+    /// The desktop's `Issue` type is hand-maintained TypeScript, so nothing but
+    /// a test holds the two shapes together. The threads cutover added the
+    /// column and the TypeScript field but not the Rust one, so every client
+    /// read `undefined` for every thread child from the cutover onward with no
+    /// compiler or suite noticing. Assert the serialized payload rather than
+    /// only the struct field: the camelCase key is what crosses the wire.
+    #[tokio::test]
+    async fn listed_issues_carry_their_parent_thread_on_the_wire() {
+        let db = crate::storage::migrated_test_db("issue-parent-thread.db").await;
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p-one', 'default', 'One', 'ONE', '/tmp/one', 1, 1);
+            INSERT INTO threads(id, project_id, name, created_at, updated_at)
+            VALUES('t-one', 'p-one', 'thread-ux', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_thread_id, created_at, updated_at)
+            VALUES('child', 'p-one', 1, 'Thread child', 'active', 'active', 'none', 't-one', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('loose', 'p-one', 2, 'Unparented', 'active', 'active', 'none', 2, 2);
+            ",
+        )
+        .await
+        .unwrap();
+
+        let issues = list(&db, "p-one").await.unwrap();
+        let child = issues.iter().find(|issue| issue.id == "child").unwrap();
+        let loose = issues.iter().find(|issue| issue.id == "loose").unwrap();
+        assert_eq!(child.parent_thread_id.as_deref(), Some("t-one"));
+        assert_eq!(child.parent_issue_id, None);
+        assert_eq!(loose.parent_thread_id, None);
+
+        let wire = serde_json::to_value(child).unwrap();
+        assert_eq!(wire["parentThreadId"], serde_json::json!("t-one"));
+        assert_eq!(wire["parentIssueId"], serde_json::Value::Null);
+
+        // `get` reads through the same column list: loading one issue must show
+        // the same edge the list does.
+        let single = get(&db, "child").await.unwrap().unwrap();
+        assert_eq!(single.parent_thread_id.as_deref(), Some("t-one"));
     }
 
     #[tokio::test]
@@ -993,6 +873,38 @@ mod tests {
         ] {
             let count = db.query_one(sql, (), |row| row.i64(0)).await.unwrap();
             assert_eq!(count, 0, "{table} rows should be gone after delete");
+        }
+    }
+    #[tokio::test]
+    async fn delete_db_removes_issue_run_without_job() {
+        let db = crate::storage::migrated_test_db("issue-delete-jobless-run.db").await;
+        db.execute_script(
+            "
+            INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-jobless', 'default', 'Project', 'JOBLESS', '/tmp/jobless', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
+             VALUES ('issue-jobless', 'project-jobless', 1, 'Issue', 1, 1);
+            INSERT INTO runs(id, project_id, issue_id, status, created_at, updated_at, start_mode)
+             VALUES ('run-jobless', 'project-jobless', 'issue-jobless', 'live', 1, 1, 'resume');
+            INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+             VALUES ('event-jobless', 'run-jobless', 1, 1, 'message', '{}', 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        delete_db(&db, "issue-jobless").await.unwrap();
+
+        for table in ["events", "runs", "issues"] {
+            let count = db
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE id LIKE '%jobless'"),
+                    (),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
         }
     }
 }

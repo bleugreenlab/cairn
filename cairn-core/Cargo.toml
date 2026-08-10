@@ -17,7 +17,7 @@ regex = "1"
 pulldown-cmark = "0.13"
 evalexpr = "11"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
-tokio = { version = "1", features = ["time", "rt", "macros", "sync", "net", "process"] }
+tokio = { version = "1", features = ["time", "rt", "macros", "sync", "net", "process", "io-util"] }
 portable-pty = "0.8"
 log = "0.4"
 # Direct tracing dependency: the backend resource sampler (`pressure`) gates on
@@ -35,6 +35,14 @@ serde_yaml = "0.9"
 toml = "0.8"
 json5 = "0.4"
 base64 = "0.22"
+# Volatile, non-elidable zeroing for the secret registry's plaintext. A manual
+# clearing loop is a valid optimization target and can be removed entirely.
+zeroize = "1"
+# Substring search for the secret scrubber, which runs over every model-visible
+# tool input and file read once per registered form. `memmem::find` borrows the
+# needle rather than owning it, so scanning never makes a second, un-zeroized
+# copy of a credential.
+memchr = "2"
 rand = "0.8"
 chacha20poly1305 = "0.10"
 crypto_box = "0.9"
@@ -91,6 +99,13 @@ lsp-types = "0.97"
 htmd = "0.5"
 pdf-extract = "0.7"
 matfile = "0.5"
+# Pure-Rust three-way text merge, for the ADVISORY merge preview `cairn:~/rebase`
+# serves and for the invariant that decides whether taking a branch's committed
+# tip whole would discard incoming work. Chosen over shelling out to
+# `git merge-file` because both live in a read path that must not touch a
+# checkout; neither is more authoritative than the other, since the real replay
+# is judged by jj's own merge.
+diffy = "0.5"
 
 # OS keychain access for MCP server secrets. Backend is selected per target so a
 # Finder-launched app (minimal process env) still resolves token-bearing

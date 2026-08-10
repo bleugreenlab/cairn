@@ -3,7 +3,7 @@
 
 use crate::execution::teardown::{cleanup_issue_jobs, TeardownReason, TeardownScope};
 use crate::github::api;
-use crate::github::credentials::{get_credentials_for_owner, get_owner_repo};
+use crate::github::credentials::get_owner_repo;
 use crate::models::{Check, CheckState, MergeableState, PrCache, PrState};
 use crate::orchestrator::Orchestrator;
 use crate::pr_data::helpers::{
@@ -14,6 +14,7 @@ use crate::pr_data::publication::{
     probe_unbound_publication, publication_summary, DiscoveredPr, HeadDivergence, Publication,
     UNVERIFIED_VERDICT_NOTE,
 };
+use crate::security::broker::github::installation_authority;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::path::Path;
@@ -287,10 +288,10 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
     };
 
     let (owner, repo) = get_owner_repo(&repo_path)?;
-    let creds = get_credentials_for_owner(&orch.db.local, &owner).await?;
+    let auth = installation_authority(&orch.db.local, &owner).await?;
 
     let http = &*orch.services.http;
-    let mut pr_details = fetch_pr_via_api(http, &creds, &owner, &repo, pr_number).await?;
+    let mut pr_details = fetch_pr_via_api(http, &auth, &owner, &repo, pr_number).await?;
     if let Some((source_branch, target_branch)) = load_mr_branches(&db, &mr_id).await.ok().flatten()
     {
         // A green signal on a head the branch has moved past is a verdict on a
@@ -314,7 +315,7 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
             source_tip_is_conflicted(orch, &repo_path, &source_branch, &target_branch),
         );
     }
-    let checks = fetch_checks_via_api(http, &creds, &owner, &repo, &pr_details.head_sha)
+    let checks = fetch_checks_via_api(http, &auth, &owner, &repo, &pr_details.head_sha)
         .await
         .unwrap_or_default();
     let checks_status = compute_checks_status(&checks);
@@ -650,10 +651,10 @@ pub async fn close_pr_for_job(
 
     if let Some(pr_number) = mr_context.github_pr_number {
         let (owner, repo) = get_owner_repo(&repo_path)?;
-        let creds = get_credentials_for_owner(&orch.db.local, &owner).await?;
+        let auth = installation_authority(&orch.db.local, &owner).await?;
 
         let http = &*orch.services.http;
-        api::close_pr(http, &creds, &owner, &repo, pr_number).await?;
+        api::close_pr(http, &auth, &owner, &repo, pr_number).await?;
     }
 
     resolve_pr_node(orch, job_id, PrNodeResolution::Close, attribution).await?;
@@ -805,13 +806,13 @@ pub async fn render_live_pr_section(
         Ok(v) => v,
         Err(e) => return Some(format!("{header}\n(failed to resolve repo: {e})\n")),
     };
-    let creds = match get_credentials_for_owner(&orch.db.local, &owner).await {
+    let auth = match installation_authority(&orch.db.local, &owner).await {
         Ok(c) => c,
         Err(e) => return Some(format!("{header}\n(failed to resolve credentials: {e})\n")),
     };
 
     let http = &*orch.services.http;
-    let mut pr_details = match fetch_pr_via_api(http, &creds, &owner, &repo, pr_number).await {
+    let mut pr_details = match fetch_pr_via_api(http, &auth, &owner, &repo, pr_number).await {
         Ok(d) => d,
         Err(e) => return Some(format!("{header}\n(failed to fetch live PR: {e})\n")),
     };
@@ -849,11 +850,11 @@ pub async fn render_live_pr_section(
         divergence.is_some(),
         source_conflict.as_ref().is_some_and(|r| r.tip_conflicted),
     );
-    let checks = fetch_checks_via_api(http, &creds, &owner, &repo, &pr_details.head_sha)
+    let checks = fetch_checks_via_api(http, &auth, &owner, &repo, &pr_details.head_sha)
         .await
         .unwrap_or_default();
     let checks_status = compute_checks_status(&checks);
-    let files = api::fetch_pr_files(http, &creds, &owner, &repo, pr_number)
+    let files = api::fetch_pr_files(http, &auth, &owner, &repo, pr_number)
         .await
         .unwrap_or_default();
 

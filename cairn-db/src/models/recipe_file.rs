@@ -1628,21 +1628,27 @@ edges: []
         let recipes: &[(&str, &str)] = &[
             (
                 "planbuild",
-                include_str!("../../../../recipes/planbuild.yaml"),
+                include_str!("../../../../packs/core/recipes/planbuild.yaml"),
             ),
-            ("build", include_str!("../../../../recipes/build.yaml")),
+            (
+                "build",
+                include_str!("../../../../packs/core/recipes/build.yaml"),
+            ),
             (
                 "coordinator",
-                include_str!("../../../../recipes/coordinator.yaml"),
+                include_str!("../../../../packs/core/recipes/coordinator.yaml"),
             ),
             (
                 "task-list",
-                include_str!("../../../../recipes/task-list.yaml"),
+                include_str!("../../../../packs/core/recipes/task-list.yaml"),
             ),
-            ("setup", include_str!("../../../../recipes/setup.yaml")),
+            (
+                "setup",
+                include_str!("../../../../packs/core/recipes/setup.yaml"),
+            ),
             (
                 "memory-triage",
-                include_str!("../../../../recipes/memory-triage.yaml"),
+                include_str!("../../../../packs/core/recipes/memory-triage.yaml"),
             ),
         ];
         for (name, yaml) in recipes {
@@ -1758,8 +1764,10 @@ edges:
         // (the `new` branch target). Under `base` the node is pruned and the
         // framing disappears with it, so the text must live here and nowhere
         // else.
-        let parsed = RecipeFile::from_yaml(include_str!("../../../../recipes/coordinator.yaml"))
-            .expect("coordinator parses");
+        let parsed = RecipeFile::from_yaml(include_str!(
+            "../../../../packs/core/recipes/coordinator.yaml"
+        ))
+        .expect("coordinator parses");
         assert!(
             !parsed
                 .nodes
@@ -1873,8 +1881,10 @@ edges:
 
     #[test]
     fn task_list_uses_executor_agent_node() {
-        let parsed =
-            RecipeFile::from_yaml(include_str!("../../../../recipes/task-list.yaml")).unwrap();
+        let parsed = RecipeFile::from_yaml(include_str!(
+            "../../../../packs/core/recipes/task-list.yaml"
+        ))
+        .unwrap();
         let executor = parsed
             .nodes
             .iter()
@@ -1896,8 +1906,10 @@ edges:
     fn planbuild_plan_artifact_node_carries_user_confirm_gate() {
         // Under the port model the plan gate lives on the `plan` ArtifactNode
         // between planner and builder, not on an inline planner outputSchema.
-        let parsed =
-            RecipeFile::from_yaml(include_str!("../../../../recipes/planbuild.yaml")).unwrap();
+        let parsed = RecipeFile::from_yaml(include_str!(
+            "../../../../packs/core/recipes/planbuild.yaml"
+        ))
+        .unwrap();
 
         // The planner agent carries no inline output schema.
         let planner = parsed
@@ -1951,12 +1963,12 @@ edges:
         for (recipe_name, yaml, producer) in [
             (
                 "coordinator",
-                include_str!("../../../../recipes/coordinator.yaml"),
+                include_str!("../../../../packs/core/recipes/coordinator.yaml"),
                 "coordinator-1",
             ),
             (
                 "build",
-                include_str!("../../../../recipes/build.yaml"),
+                include_str!("../../../../packs/core/recipes/build.yaml"),
                 "builder-1",
             ),
         ] {
@@ -2025,8 +2037,10 @@ edges:
         // (agent nodes on `none`, no PR node, long-running derivation) is
         // asserted in cairn-core's `execution::branch_target` tests, which can
         // reach `is_long_running_node`.
-        let parsed = RecipeFile::from_yaml(include_str!("../../../../recipes/coordinator.yaml"))
-            .expect("coordinator parses");
+        let parsed = RecipeFile::from_yaml(include_str!(
+            "../../../../packs/core/recipes/coordinator.yaml"
+        ))
+        .expect("coordinator parses");
         assert_eq!(
             parsed.branch_targets,
             vec![BranchTarget::New, BranchTarget::Base]
@@ -2177,8 +2191,10 @@ edges:
         // The coordinator carries a living plan/board as a context-self doc,
         // independent of its terminal `create-pr` output. The board is an
         // auto-confirm ArtifactNode named `board`, reached by a context-self edge.
-        let parsed = RecipeFile::from_yaml(include_str!("../../../../recipes/coordinator.yaml"))
-            .expect("coordinator parses");
+        let parsed = RecipeFile::from_yaml(include_str!(
+            "../../../../packs/core/recipes/coordinator.yaml"
+        ))
+        .expect("coordinator parses");
 
         let ctx_self: Vec<&RecipeFileEdge> = parsed
             .edges

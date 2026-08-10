@@ -30,6 +30,22 @@ const CHANGED_FILES_PLACEHOLDER: &str = "{changedFiles}";
 /// (e.g. `-p crateA -p crateB`).
 const TARGETS_PLACEHOLDER: &str = "{targets}";
 
+/// Recover the declared whole-suite command from a safely placed selector.
+/// Commands without a selector are already whole-suite commands.
+pub(crate) fn whole_suite_command(template: &str) -> Result<String, String> {
+    for placeholder in [CHANGED_FILES_PLACEHOLDER, TARGETS_PLACEHOLDER] {
+        if template.contains(placeholder) {
+            if !placeholder_is_expandable(template, placeholder) {
+                return Err(format!(
+                    "{placeholder} is not in the supported trailing selector position"
+                ));
+            }
+            return Ok(substitute(template, placeholder, "").trim().to_string());
+        }
+    }
+    Ok(template.to_string())
+}
+
 /// Whether a planned run covers the whole check or a selected subset.
 ///
 /// The inheritance step needs this distinction: a `Full` run establishes the
@@ -70,6 +86,8 @@ pub struct CheckPlan {
     /// Environment variables whose values can change this check's verdict.
     /// Includes variables automatically required by the check runtime.
     pub(crate) verdict_environment_names: Vec<String>,
+    /// Platforms whose observations the project accepts as this check's verdict.
+    pub(crate) verdict_platforms: Vec<String>,
     /// Set when the check's DECLARATION cannot be expanded safely, which makes
     /// the check unrunnable rather than merely un-narrowed.
     ///
@@ -141,6 +159,7 @@ fn unexpandable_plan(name: &str, check: &CheckCommand, placeholder: &str) -> Che
         verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
             check,
         ),
+        verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
         config_error: Some(error),
     }
 }
@@ -162,6 +181,7 @@ fn plan_one(
         verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
             check,
         ),
+        verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
         config_error: None,
     };
 
@@ -222,6 +242,7 @@ fn plan_one(
             verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
                 check,
             ),
+            verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
             config_error: None,
         }
     } else if check.command.contains(TARGETS_PLACEHOLDER) {
@@ -251,6 +272,7 @@ fn plan_one(
                     resource_class: check.resource_class,
                     verdict_environment_names:
                         crate::execution::check_identity::verdict_environment_names(check),
+                    verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
                     config_error: None,
                 }
             }
@@ -266,6 +288,7 @@ fn plan_one(
                     resource_class: check.resource_class,
                     verdict_environment_names:
                         crate::execution::check_identity::verdict_environment_names(check),
+                    verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
                     config_error: None,
                 }
             }
@@ -743,6 +766,16 @@ mod tests {
     }
 
     // --- {changedFiles} substitution ---------------------------------------
+
+    #[test]
+    fn whole_suite_command_drops_only_a_safe_trailing_selector() {
+        assert_eq!(
+            whole_suite_command("bun run test:rust {changedFiles}").unwrap(),
+            "bun run test:rust"
+        );
+        assert_eq!(whole_suite_command("cargo test").unwrap(), "cargo test");
+        assert!(whole_suite_command("tool --files={changedFiles}").is_err());
+    }
 
     #[test]
     fn related_substitutes_matched_changed_files() {

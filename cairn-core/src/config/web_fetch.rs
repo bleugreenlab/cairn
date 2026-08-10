@@ -18,6 +18,7 @@
 //!
 //! - **Regular** — no auth; the built-in default.
 //! - **Jina / Firecrawl** — an API key in the OS keychain keyed by provider id.
+//! - **Cloudflare** — OAuth 2.0 Authorization Code with PKCE.
 //! - **bmd** — no pasteable key: it reuses the configured `bmd` MCP server's
 //!   OAuth connection, calling bmd's `fetch` tool through the host gateway.
 //!
@@ -40,14 +41,16 @@ pub enum FetchProviderId {
     Bmd,
     Jina,
     Firecrawl,
+    Cloudflare,
 }
 
 impl FetchProviderId {
     /// Every shipped provider, in display order.
-    pub const ALL: [FetchProviderId; 3] = [
+    pub const ALL: [FetchProviderId; 4] = [
         FetchProviderId::Bmd,
         FetchProviderId::Jina,
         FetchProviderId::Firecrawl,
+        FetchProviderId::Cloudflare,
     ];
 
     /// The stable lowercase id used in `settings.yaml`, the keychain, and the UI.
@@ -56,6 +59,7 @@ impl FetchProviderId {
             FetchProviderId::Bmd => "bmd",
             FetchProviderId::Jina => "jina",
             FetchProviderId::Firecrawl => "firecrawl",
+            FetchProviderId::Cloudflare => "cloudflare",
         }
     }
 
@@ -65,6 +69,7 @@ impl FetchProviderId {
             "bmd" => Some(FetchProviderId::Bmd),
             "jina" => Some(FetchProviderId::Jina),
             "firecrawl" => Some(FetchProviderId::Firecrawl),
+            "cloudflare" => Some(FetchProviderId::Cloudflare),
             _ => None,
         }
     }
@@ -75,6 +80,7 @@ impl FetchProviderId {
             FetchProviderId::Bmd => "bmd",
             FetchProviderId::Jina => "Jina",
             FetchProviderId::Firecrawl => "Firecrawl",
+            FetchProviderId::Cloudflare => "Cloudflare Browser Run",
         }
     }
 
@@ -88,6 +94,7 @@ impl FetchProviderId {
             FetchProviderId::Firecrawl => FetchAuth::ApiKey {
                 secret_var: "FIRECRAWL_API_KEY",
             },
+            FetchProviderId::Cloudflare => FetchAuth::OAuth,
         }
     }
 
@@ -100,6 +107,27 @@ impl FetchProviderId {
                 "Main content only",
                 true,
             )],
+            FetchProviderId::Cloudflare => vec![
+                ProviderOption::text("accountId", "Account ID", "", "Cloudflare account ID"),
+                ProviderOption::select(
+                    "browser",
+                    "Browser",
+                    &[
+                        ("kitesurf", "Kitesurf (fast, free beta)"),
+                        ("chromium", "Chromium (full browser)"),
+                    ],
+                    "kitesurf",
+                ),
+                ProviderOption::select(
+                    "waitUntil",
+                    "Wait until",
+                    &[
+                        ("load", "Page load (fastest)"),
+                        ("networkidle0", "Network idle (JS-heavy pages)"),
+                    ],
+                    "load",
+                ),
+            ],
         }
     }
 }
@@ -114,6 +142,8 @@ pub enum FetchAuth {
     ApiKey { secret_var: &'static str },
     /// Reuses the named MCP server's connection (OAuth) via the host gateway.
     Mcp { server: &'static str },
+    /// Provider-native OAuth managed by Cairn.
+    OAuth,
 }
 
 impl FetchAuth {
@@ -123,6 +153,7 @@ impl FetchAuth {
             FetchAuth::None => "none",
             FetchAuth::ApiKey { .. } => "apiKey",
             FetchAuth::Mcp { .. } => "mcp",
+            FetchAuth::OAuth => "oauth",
         }
     }
 
@@ -279,6 +310,9 @@ mod tests {
         );
         assert_eq!(FetchProviderId::Bmd.auth().mcp_server(), Some("bmd"));
         assert_eq!(FetchProviderId::Jina.auth().kind(), "apiKey");
+        assert_eq!(FetchProviderId::Cloudflare.auth(), FetchAuth::OAuth);
+        assert_eq!(FetchProviderId::Cloudflare.auth().kind(), "oauth");
+        assert_eq!(FetchProviderId::Cloudflare.auth().secret_var(), None);
         assert_eq!(FetchAuth::None.kind(), "none");
     }
 
@@ -358,6 +392,32 @@ mod tests {
         match resolve_active_fetch(ws.path()) {
             ActiveFetch::Provider { id, .. } => assert_eq!(id, FetchProviderId::Bmd),
             other => panic!("expected bmd provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_picks_cloudflare_with_options() {
+        let ws = TempDir::new().unwrap();
+        upsert_web_fetch_options(
+            ws.path(),
+            FetchProviderId::Cloudflare,
+            &opts(&[
+                ("accountId", "account-123".into()),
+                ("browser", "chromium".into()),
+                ("waitUntil", "networkidle0".into()),
+            ]),
+        )
+        .unwrap();
+        set_active_web_fetch(ws.path(), Some("cloudflare")).unwrap();
+        match resolve_active_fetch(ws.path()) {
+            ActiveFetch::Provider { id, options } => {
+                assert_eq!(id, FetchProviderId::Cloudflare);
+                assert_eq!(
+                    options.get("accountId").and_then(|value| value.as_str()),
+                    Some("account-123")
+                );
+            }
+            other => panic!("expected Cloudflare provider, got {other:?}"),
         }
     }
 }

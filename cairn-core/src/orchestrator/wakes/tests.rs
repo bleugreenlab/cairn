@@ -19,6 +19,484 @@ async fn migrated_db() -> LocalDb {
     crate::storage::migrated_test_db("wakes.db").await
 }
 
+/// Write a thread's standing definition through the canonical update path and
+/// name the session job it establishes — the derived trigger index these tests
+/// inspect is rebuilt inside that one transaction.
+async fn write_thread_definition(
+    db: &LocalDb,
+    thread_id: &str,
+    definition: &str,
+) -> Result<String, String> {
+    update_thread(
+        db,
+        crate::models::UpdateThread {
+            id: thread_id.to_string(),
+            name: None,
+            jurisdiction: None,
+            definition: Some(Some(definition.to_string())),
+            status: None,
+            model: None,
+        },
+    )
+    .await?;
+    crate::threads::ensure_thread_session(db, thread_id).await
+}
+
+async fn update_thread(db: &LocalDb, input: crate::models::UpdateThread) -> Result<(), String> {
+    crate::threads::crud::update(db, input)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_thread_child_establishes_and_reaches_its_thread_session() {
+    let db = migrated_db().await;
+    db.execute_script(
+        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+           VALUES('p','w','P','P','/tmp',1,1);
+         INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+           VALUES('thread','p','general','active','none',1,1);
+         INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_thread_id, created_at, updated_at)
+           VALUES('child','p',2,'Child','active','active','none','thread',2,2);",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.query_opt_i64("SELECT COUNT(*) FROM jobs WHERE thread_id='thread'", ())
+            .await
+            .unwrap(),
+        Some(0)
+    );
+
+    let recipient = coordinating_job_for_child_issue(&db, CHILD_URI)
+        .await
+        .unwrap()
+        .expect("a dormant thread acquires a session before child attention is routed");
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec![recipient.clone()]
+    );
+    assert_eq!(
+        coordinated_child_issue_uris_for_job(&db, &recipient)
+            .await
+            .unwrap(),
+        vec![CHILD_URI.to_string()],
+        "the /wakes inverse projection lists thread-parented children"
+    );
+
+    crate::orchestrator::attention_delivery::push_to_issue_watchers(
+        &db,
+        CHILD_URI,
+        None,
+        "cairn://p/P/2/1/builder/questions",
+        Wake::Wake,
+        crate::orchestrator::attention_push::Boundary::Event,
+        "question:q1",
+    )
+    .await
+    .unwrap();
+    let pushes = crate::orchestrator::attention_push::list_pending(&db, &recipient)
+        .await
+        .unwrap();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0].wake, Wake::Wake);
+}
+
+/// Closing a thread quiets the RECIPIENT, never the child's fact.
+///
+/// The distinction is the whole design: the child issue keeps producing
+/// attention and every other watcher keeps receiving it; what disappears is the
+/// derived coordinator on the thread axis, and it comes back on reopen without
+/// anything being rebuilt.
+#[tokio::test(flavor = "current_thread")]
+async fn a_closed_thread_stops_coordinating_its_children_without_silencing_them() {
+    let db = migrated_db().await;
+    db.execute_script(
+        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+           VALUES('p','w','P','P','/tmp',1,1);
+         INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+           VALUES('thread','p','general','closed','none',1,1);
+         INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_thread_id, created_at, updated_at)
+           VALUES('child','p',2,'Child','active','active','none','thread',2,2);
+         INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+           VALUES('watcher-issue','p',3,'Watcher','active','active','none',3,3);
+         INSERT INTO jobs(id, issue_id, project_id, status, node_name, uri_segment, current_session_id, created_at, updated_at)
+           VALUES('j-watcher','watcher-issue','p','running','builder','builder','s-watcher',3,3);",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        coordinating_job_for_child_issue(&db, CHILD_URI)
+            .await
+            .unwrap(),
+        None,
+        "a closed thread is no derived coordinator"
+    );
+    assert_eq!(
+        db.query_opt_i64("SELECT COUNT(*) FROM jobs WHERE thread_id='thread'", ())
+            .await
+            .unwrap(),
+        Some(0),
+        "and resolving that answer establishes no session behind the closure"
+    );
+
+    // An explicit watcher on the same child is untouched.
+    super::store::subscribe(&db, "j-watcher", "issue", Some(CHILD_URI), None, "agent")
+        .await
+        .unwrap();
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["j-watcher".to_string()],
+        "the child's own watchers keep receiving what it produces"
+    );
+    crate::orchestrator::attention_delivery::push_to_issue_watchers(
+        &db,
+        CHILD_URI,
+        None,
+        "cairn://p/P/2/1/builder/questions",
+        Wake::Wake,
+        crate::orchestrator::attention_push::Boundary::Event,
+        "question:q1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::orchestrator::attention_push::list_pending(&db, "j-watcher")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    update_thread(
+        &db,
+        crate::models::UpdateThread {
+            id: "thread".into(),
+            name: None,
+            jurisdiction: None,
+            definition: None,
+            status: Some(crate::models::ThreadStatus::Active),
+            model: None,
+        },
+    )
+    .await
+    .unwrap();
+    let recipient = coordinating_job_for_child_issue(&db, CHILD_URI)
+        .await
+        .unwrap()
+        .expect("reopening restores the thread as its children's coordinator");
+    assert!(
+        watcher_jobs_for_issue(&db, CHILD_URI)
+            .await
+            .unwrap()
+            .contains(&recipient),
+        "and it takes its place beside the explicit watcher"
+    );
+}
+
+/// A wake addressed at a closed thread's session is DROPPED, not delivered and
+/// not consumed. A one-shot subscription the thread was holding when it closed
+/// still fires on reopen — dormancy suspends delivery rather than spending it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_targeted_wake_to_a_closed_thread_is_dropped_and_spends_nothing() {
+    let db = migrated_db().await;
+    db.execute_script(
+        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+           VALUES('p','w','P','P','/tmp',1,1);
+         INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+           VALUES('thread','p','general','active','none',1,1);",
+    )
+    .await
+    .unwrap();
+    let job_id = crate::threads::ensure_thread_session(&db, "thread")
+        .await
+        .unwrap();
+    super::store::subscribe_one_shot(
+        &db,
+        &job_id,
+        "process",
+        Some("cairn://p/P/general/terminal/build"),
+        None,
+        "agent",
+    )
+    .await
+    .unwrap();
+
+    // Delivering the reopened wake resumes the thread's session, which cold-starts
+    // its agent process; this test asserts routing, not process mechanics.
+    let orch = test_orchestrator_with_services(
+        db,
+        TestServicesBuilder::new()
+            .with_process(RecordingProcessSpawner::new().clone())
+            .build(),
+    );
+    let exit_wake = || WakeEvent {
+        source: WakeSource::Process {
+            reference: "cairn://p/P/general/terminal/build".into(),
+        },
+        fact_kind: "exit".into(),
+        detail_uri: None,
+        delivery: WakeDelivery::Broadcast {
+            message: "[Process update] build exited.".into(),
+        },
+        urgency: DeliveryUrgency::Queue,
+    };
+
+    set_thread_status(&orch.db.local, "closed").await;
+    assert_eq!(
+        route_wake(&orch, exit_wake()).await.unwrap(),
+        WakeRouteAction::Dropped,
+        "a closed thread's session is not a deliverable recipient"
+    );
+    assert_eq!(
+        list_subscriptions_for_job(&orch.db.local, &job_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|subscription| subscription.one_shot)
+            .count(),
+        1,
+        "and the one-shot it was holding is not spent by the drop"
+    );
+
+    set_thread_status(&orch.db.local, "active").await;
+    assert_eq!(
+        route_wake(&orch, exit_wake()).await.unwrap(),
+        WakeRouteAction::Delivered,
+        "reopening restores wake delivery"
+    );
+}
+
+async fn set_thread_status(db: &LocalDb, status: &str) {
+    db.execute(
+        "UPDATE threads SET status = ?1 WHERE id = 'thread'",
+        params![status],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
+    let db = migrated_db().await;
+    db.execute_script(
+        "
+        INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+        INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES('p','w','P','P','/tmp',1,1);
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+          VALUES('child','p',2,'Child','active','active','none',1,1);
+        INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+          VALUES('thread','p','triage','active','none',1,1);
+        ",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.query_opt_i64("SELECT COUNT(*) FROM jobs WHERE thread_id='thread'", ())
+            .await
+            .unwrap(),
+        Some(0),
+        "the definition write starts from a genuinely session-less thread"
+    );
+
+    let definition = serde_json::json!({
+        "agent": "thread",
+        "artifacts": ["arc"],
+        "triggers": [{
+            "fact": "attention",
+            "detailUri": CHILD_URI,
+            "status": ["merged", "closed", "failed"]
+        }]
+    })
+    .to_string();
+    let job_id = write_thread_definition(&db, "thread", &definition)
+        .await
+        .unwrap();
+
+    let derived = list_subscriptions_for_job(&db, &job_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|subscription| subscription.id.starts_with(DERIVED_THREAD_ID_PREFIX))
+        .collect::<Vec<_>>();
+    assert_eq!(derived.len(), 1);
+    assert_eq!(derived[0].source_ref.as_deref(), Some(CHILD_URI));
+    assert_eq!(
+        derived[0].fact_kinds.as_deref(),
+        Some(&["resolved".into()][..])
+    );
+
+    // Delivering a wake to a session-less thread cold-starts its agent process
+    // (the thread message-delivery path), so the orchestrator needs a spawner
+    // that accepts the launch; this test asserts routing, not process mechanics.
+    let orch = test_orchestrator_with_services(
+        db,
+        TestServicesBuilder::new()
+            .with_process(RecordingProcessSpawner::new().clone())
+            .build(),
+    );
+    let action = route_wake(
+        &orch,
+        WakeEvent {
+            source: WakeSource::Issue {
+                reference: CHILD_URI.into(),
+            },
+            fact_kind: "resolved".into(),
+            detail_uri: Some(CHILD_URI.into()),
+            delivery: WakeDelivery::Broadcast {
+                message: "[Child update] resolved".into(),
+            },
+            urgency: DeliveryUrgency::Queue,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(action, WakeRouteAction::Delivered);
+
+    orch.db
+        .local
+        .exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "CREATE TRIGGER fail_derived_thread_subscription
+             BEFORE INSERT ON wake_subscriptions
+             WHEN NEW.id LIKE 'derived:thread:%'
+             BEGIN
+               SELECT RAISE(FAIL, 'forced derived rebuild failure');
+             END",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let failing_definition = serde_json::json!({
+        "agent": "thread",
+        "artifacts": ["arc"],
+        "triggers": [{
+            "fact": "attention",
+            "detailUri": "cairn://p/P/3",
+            "status": ["merged", "closed", "failed"]
+        }]
+    })
+    .to_string();
+    assert!(
+        write_thread_definition(&orch.db.local, "thread", &failing_definition)
+            .await
+            .unwrap_err()
+            .contains("forced derived rebuild failure")
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_one(
+                "SELECT definition FROM threads WHERE id='thread'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap(),
+        definition,
+        "a failed rebuild rolls the definition write back"
+    );
+    let surviving = list_subscriptions_for_job(&orch.db.local, &job_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|subscription| subscription.id.starts_with(DERIVED_THREAD_ID_PREFIX))
+        .collect::<Vec<_>>();
+    assert_eq!(surviving.len(), 1);
+    assert_eq!(surviving[0].source_ref.as_deref(), Some(CHILD_URI));
+    orch.db
+        .local
+        .exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("DROP TRIGGER fail_derived_thread_subscription", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+             VALUES('duplicate','p','taken','active','none',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(update_thread(
+        &orch.db.local,
+        crate::models::UpdateThread {
+            id: "thread".into(),
+            name: Some("taken".into()),
+            jurisdiction: None,
+            definition: Some(Some(failing_definition.clone())),
+            status: None,
+            model: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .contains("UNIQUE"));
+    assert_eq!(
+        orch.db
+            .local
+            .query_one(
+                "SELECT definition FROM threads WHERE id='thread'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap(),
+        definition,
+        "a duplicate-name metadata failure rolls back the definition too"
+    );
+    assert_eq!(
+        list_subscriptions_for_job(&orch.db.local, &job_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|subscription| subscription.id.starts_with(DERIVED_THREAD_ID_PREFIX))
+            .and_then(|subscription| subscription.source_ref),
+        Some(CHILD_URI.to_string()),
+        "a duplicate-name metadata failure preserves the old derived index"
+    );
+
+    let rewritten = serde_json::json!({
+        "agent": "thread",
+        "artifacts": ["arc"],
+        "triggers": []
+    })
+    .to_string();
+    assert_eq!(
+        write_thread_definition(&orch.db.local, "thread", &rewritten)
+            .await
+            .unwrap(),
+        job_id,
+        "definition rebuild reuses the live session"
+    );
+    assert!(
+        list_subscriptions_for_job(&orch.db.local, &job_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|subscription| !subscription.id.starts_with(DERIVED_THREAD_ID_PREFIX)),
+        "whole-index rebuild deletes stale derived rows"
+    );
+}
+
 fn test_orchestrator(db: LocalDb) -> Orchestrator {
     test_orchestrator_with_services(db, TestServicesBuilder::new().build())
 }
@@ -71,6 +549,51 @@ async fn seed_child_issue(db: &LocalDb) {
         )
         .await
         .unwrap();
+}
+
+/// A `plan>coordinator` execution on the fixture's parent issue `i`, plus the
+/// child issue it owns.
+///
+/// Both agent nodes are recipe-root, both already hold a session, and both carry
+/// the SAME `created_at` — that is not a convenience, it is how
+/// `create_jobs_for_execution` mints a graph: one pass, one timestamp for every
+/// node. Neither has started yet.
+async fn seed_plan_coordinator_graph(db: &LocalDb) {
+    db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e1','plan-coordinator','i','p','running',5,1);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, node_name, status, current_session_id, created_at, updated_at)
+              VALUES('planner','p','i','e1','planner','pending','s-planner',5,5);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, node_name, status, current_session_id, created_at, updated_at)
+              VALUES('coordinator','p','i','e1','coordinator','pending','s-coord',5,5);
+            ",
+        )
+        .await
+        .unwrap();
+    seed_child_issue(db).await;
+}
+
+/// Record `job_id` as the node that filed the fixture's child issue, the way
+/// `create_issue_row` stamps it.
+async fn stamp_spawning_node(db: &LocalDb, job_id: &str) {
+    let job_id = job_id.to_string();
+    db.write(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE issues SET parent_job_id = ?1 WHERE id = 'child'",
+                params![job_id.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
 }
 
 struct QueueableNodeFixture {
@@ -1035,10 +1558,13 @@ async fn a_new_coordinator_execution_takes_over_the_parents_children() {
     );
 }
 
-/// Acquisition path 2: a child filed by some *other* job, already parented. The
-/// filer is irrelevant — only the parent edge decides.
+/// A child filed by a job working some *other* issue, then parented here. The
+/// recorded spawner only names the recipient while it sits on the child's own
+/// parent issue, so this one is rejected and the parent's driver takes it. This
+/// is one of CAIRN-3293's two failure modes, answered by validation rather than
+/// by discarding the record.
 #[tokio::test(flavor = "current_thread")]
-async fn a_child_filed_by_another_job_reaches_the_parents_coordinator() {
+async fn a_child_filed_by_another_issues_job_reaches_the_parents_coordinator() {
     let db = migrated_db().await;
     seed_job(&db).await;
     seed_child_issue(&db).await;
@@ -1052,11 +1578,135 @@ async fn a_child_filed_by_another_job_reaches_the_parents_coordinator() {
         )
         .await
         .unwrap();
+    stamp_spawning_node(&db, "filer").await;
 
     assert_eq!(
         watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
         vec!["j".to_string()],
-        "the filing job never enters the child's watcher set"
+        "a spawner on another issue never enters the child's watcher set"
+    );
+}
+
+/// CAIRN-3712, the reported bug. Every node of a `plan>coordinator` graph is
+/// minted in one pass with one shared `created_at`, so recency alone cannot tell
+/// the upstream planner from the coordinator that actually spawned the children —
+/// and the tie resolved to the planner, which then received every child's
+/// catch-up, question, permission, and review. The child records which node filed
+/// it, so it reaches that node.
+#[tokio::test(flavor = "current_thread")]
+async fn a_spawned_child_reaches_the_node_that_filed_it_not_its_upstream() {
+    let db = migrated_db().await;
+    seed_plan_coordinator_graph(&db).await;
+    stamp_spawning_node(&db, "coordinator").await;
+
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["coordinator".to_string()]
+    );
+    assert_eq!(
+        coordinated_child_issue_uris_for_job(&db, "coordinator")
+            .await
+            .unwrap(),
+        vec![CHILD_URI.to_string()],
+        "and the /wakes projection agrees with the routing"
+    );
+    assert!(
+        coordinated_child_issue_uris_for_job(&db, "planner")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the upstream planner coordinates nothing it did not file"
+    );
+}
+
+/// CAIRN-3293's case under the new design. The recorded spawner is validated on
+/// every wake, so a coordinator whose execution has been superseded stops
+/// receiving: the parent's children move to the execution that replaced it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_superseded_spawner_hands_its_children_to_the_new_execution() {
+    let db = migrated_db().await;
+    seed_plan_coordinator_graph(&db).await;
+    stamp_spawning_node(&db, "coordinator").await;
+    db.execute_script(
+            "
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e2','plan-coordinator','i','p','running',20,2);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, node_name, status, current_session_id, started_at, created_at, updated_at)
+              VALUES('coordinator-2','p','i','e2','coordinator','running','s-coord-2',21,20,20);
+            ",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["coordinator-2".to_string()],
+        "a retired coordinator does not keep the children it filed"
+    );
+    assert!(coordinated_child_issue_uris_for_job(&db, "coordinator")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A spawner that can no longer receive anything is no recipient: resolution
+/// falls through to whoever is driving the parent now.
+#[tokio::test(flavor = "current_thread")]
+async fn a_dead_spawner_falls_through_to_the_parents_driver() {
+    let db = migrated_db().await;
+    seed_plan_coordinator_graph(&db).await;
+    stamp_spawning_node(&db, "coordinator").await;
+    db.execute_script(
+        "
+            UPDATE jobs SET started_at = 6, status = 'complete' WHERE id = 'planner';
+            UPDATE jobs SET status = 'failed' WHERE id = 'coordinator';
+            ",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["planner".to_string()]
+    );
+}
+
+/// With no spawner recorded (a human-created child, a legacy row, an adopted
+/// issue) the recipient is derived — and the same one-pass `created_at` tie is
+/// broken by which node has actually started.
+#[tokio::test(flavor = "current_thread")]
+async fn the_derived_driver_is_the_node_that_started_last() {
+    let db = migrated_db().await;
+    seed_plan_coordinator_graph(&db).await;
+
+    // The planner ran and finished; the coordinator started after it and is now
+    // holding the issue open.
+    db.execute_script(
+        "
+            UPDATE jobs SET started_at = 6, status = 'complete' WHERE id = 'planner';
+            UPDATE jobs SET started_at = 7, status = 'idle' WHERE id = 'coordinator';
+            ",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["coordinator".to_string()],
+        "a started coordinator outranks the finished planner it came from"
+    );
+
+    // Rewind: the coordinator has not started yet, so the planner is still the
+    // node driving the parent.
+    db.execute(
+        "UPDATE jobs SET started_at = NULL, status = 'pending' WHERE id = 'coordinator'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        vec!["planner".to_string()],
+        "a pending coordinator never outranks the node still running"
     );
 }
 

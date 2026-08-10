@@ -911,30 +911,29 @@ pub async fn apply_placement_profile_config(
     let mut changes = Vec::new();
     for executor in attached {
         let executor_id = executor.health.identity.executor_id;
-        let device_id = executor.health.identity.device_id;
-        let generation = orch
-            .fleet
-            .managed_generation(&executor_id, &device_id)
-            .ok_or_else(|| {
-                format!("executor {executor_id} changed generation during profile activation")
-            })?;
+        let generation = executor.health.connection_generation;
+        let policy_key = if executor_id == super::COLOCATED_EXECUTOR_ID {
+            super::LOCAL_EXECUTOR_NAME
+        } else {
+            executor_id.as_str()
+        };
         let baseline = |config: &crate::fleet::FleetConfig| {
             config
                 .executor_policies
-                .get(&executor_id)
+                .get(policy_key)
                 .cloned()
                 .unwrap_or_default()
         };
         let old_policy = previous
             .active_placement_profile()
             .executor_policy_overrides
-            .get(&executor_id)
+            .get(policy_key)
             .cloned()
             .unwrap_or_else(|| baseline(&previous));
         let new_policy = next
             .active_placement_profile()
             .executor_policy_overrides
-            .get(&executor_id)
+            .get(policy_key)
             .cloned()
             .unwrap_or_else(|| baseline(&next));
         if old_policy != new_policy {
@@ -943,38 +942,105 @@ pub async fn apply_placement_profile_config(
     }
 
     crate::config::settings::set_fleet(&orch.config_dir, &next)?;
+    sync_desired_profile_policies(orch, &next);
     let mut applied: Vec<(String, u64, ExecutorRuntimePolicy)> = Vec::new();
     for (executor_id, generation, old_policy, new_policy) in &changes {
-        if let Err(error) = orch
-            .fleet
-            .set_executor_runtime_policy(executor_id, *generation, new_policy.clone())
-            .await
+        match apply_profile_runtime_policy(orch, executor_id, *generation, new_policy.clone()).await
         {
-            let mut rollback_errors = Vec::new();
-            for (applied_id, applied_generation, applied_policy) in applied.into_iter().rev() {
-                if let Err(rollback) = orch
-                    .fleet
-                    .set_executor_runtime_policy(&applied_id, applied_generation, applied_policy)
+            Ok(Some(applied_generation)) => {
+                applied.push((executor_id.clone(), applied_generation, old_policy.clone()));
+            }
+            Ok(None) => continue,
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                sync_desired_profile_policies(orch, &previous);
+                for (applied_id, applied_generation, applied_policy) in applied.into_iter().rev() {
+                    if let Err(rollback) = apply_profile_runtime_policy(
+                        orch,
+                        &applied_id,
+                        applied_generation,
+                        applied_policy,
+                    )
                     .await
-                {
-                    rollback_errors.push(format!("{applied_id}: {rollback}"));
+                    {
+                        rollback_errors.push(format!("{applied_id}: {rollback}"));
+                    }
                 }
-            }
-            if let Err(rollback) = crate::config::settings::set_fleet(&orch.config_dir, &previous) {
-                rollback_errors.push(format!("settings: {rollback}"));
-            }
-            let suffix = if rollback_errors.is_empty() {
-                String::new()
-            } else {
-                format!("; rollback also failed for {}", rollback_errors.join(", "))
-            };
-            return Err(format!(
+                if let Err(rollback) =
+                    crate::config::settings::set_fleet(&orch.config_dir, &previous)
+                {
+                    rollback_errors.push(format!("settings: {rollback}"));
+                }
+                let suffix = if rollback_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; rollback also failed for {}", rollback_errors.join(", "))
+                };
+                return Err(format!(
                 "failed to apply placement profile {name} to executor {executor_id}: {error}{suffix}"
             ));
+            }
         }
-        applied.push((executor_id.clone(), *generation, old_policy.clone()));
     }
     Ok(next)
+}
+
+fn sync_desired_profile_policies(orch: &Orchestrator, config: &crate::fleet::FleetConfig) {
+    for policy_key in std::iter::once(super::LOCAL_EXECUTOR_NAME)
+        .chain(config.remote_executors.keys().map(String::as_str))
+    {
+        let policy = config
+            .active_placement_profile()
+            .executor_policy_overrides
+            .get(policy_key)
+            .cloned()
+            .unwrap_or_else(|| config.resolve_executor_policy(policy_key));
+        let executor_id = if policy_key == super::LOCAL_EXECUTOR_NAME {
+            super::COLOCATED_EXECUTOR_ID
+        } else {
+            policy_key
+        };
+        orch.fleet
+            .set_desired_executor_runtime_policy(executor_id, policy);
+    }
+}
+
+async fn apply_profile_runtime_policy(
+    orch: &Orchestrator,
+    executor_id: &str,
+    expected_generation: u64,
+    policy: ExecutorRuntimePolicy,
+) -> Result<Option<u64>, String> {
+    let mut generation = expected_generation;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match orch
+            .fleet
+            .set_executor_runtime_policy(executor_id, generation, policy.clone())
+            .await
+        {
+            Ok(_) => return Ok(Some(generation)),
+            Err(error) => {
+                let current_generation = orch
+                    .fleet
+                    .executor_health(unix_time_ms())
+                    .into_iter()
+                    .find(|executor| executor.identity.executor_id == executor_id)
+                    .map(|executor| executor.connection_generation);
+                // The generation fence prevents a policy request intended for
+                // one connection from being applied to its replacement. Follow
+                // that replacement so settings and live state converge; only a
+                // genuinely detached executor has no live state to reconcile.
+                match current_generation {
+                    None => return Ok(None),
+                    Some(current) if current != generation && attempts < 2 => generation = current,
+                    Some(current) if current != generation => return Ok(None),
+                    Some(_) => return Err(error),
+                }
+            }
+        }
+    }
 }
 
 pub async fn set_runtime_policy(
@@ -1055,6 +1121,7 @@ mod tests {
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use cairn_common::executor_protocol::ExecutorMessage;
 
     async fn test_orchestrator(config_dir: &std::path::Path) -> Orchestrator {
         let local = LocalDb::open(config_dir.join("management.db"))
@@ -1072,6 +1139,72 @@ mod tests {
             config_dir.to_path_buf(),
         )
         .build()
+    }
+
+    #[tokio::test]
+    async fn profile_activation_tolerates_generation_change_before_live_application() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (first_sender, _first_executor) = tokio::sync::mpsc::unbounded_channel();
+        let snapshotted_generation = orch.fleet.attach_executor(first_sender);
+        let expected_policy = ExecutorRuntimePolicy {
+            cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy {
+                entry_utilization: 0.75,
+                clear_utilization: 0.60,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        orch.fleet.set_desired_executor_runtime_policy(
+            crate::fleet::COLOCATED_EXECUTOR_ID,
+            expected_policy.clone(),
+        );
+        let (replacement_sender, mut replacement_executor) = tokio::sync::mpsc::unbounded_channel();
+        let replacement_generation = orch.fleet.attach_executor(replacement_sender);
+        let ExecutorMessage::RuntimePolicyRequest {
+            policy: attached_policy,
+            ..
+        } = replacement_executor
+            .recv()
+            .await
+            .expect("replacement receives desired policy while attaching")
+        else {
+            panic!("replacement received an unexpected attach message");
+        };
+        assert_eq!(attached_policy, expected_policy);
+
+        let application = apply_profile_runtime_policy(
+            &orch,
+            crate::fleet::COLOCATED_EXECUTOR_ID,
+            snapshotted_generation,
+            expected_policy.clone(),
+        );
+        let response = async {
+            let ExecutorMessage::RuntimePolicyRequest {
+                correlation_id,
+                policy,
+            } = replacement_executor
+                .recv()
+                .await
+                .expect("replacement receives policy")
+            else {
+                panic!("replacement received an unexpected message");
+            };
+            assert_eq!(policy, expected_policy);
+            orch.fleet.handle_executor_message(
+                crate::fleet::COLOCATED_EXECUTOR_ID,
+                replacement_generation,
+                ExecutorMessage::RuntimePolicyResponse {
+                    correlation_id,
+                    result: Ok(policy),
+                },
+            );
+        };
+        let (applied, ()) = tokio::join!(application, response);
+        let applied = applied.expect("connection churn does not fail durable profile activation");
+
+        assert_eq!(applied, Some(replacement_generation));
+        assert!(replacement_generation > snapshotted_generation);
     }
 
     fn request(host: &str) -> EnrollmentRequest {

@@ -310,6 +310,10 @@ pub fn delete_workflow(
     if dir.is_dir() {
         std::fs::remove_dir_all(&dir)
             .map_err(|e| format!("Failed to delete workflow directory: {e}"))?;
+        // A workflow an installed pack ships is copy-when-missing like every
+        // other pack item, so without recording the removal the next startup
+        // sync puts it straight back.
+        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Workflow, id);
     }
     Ok(())
 }
@@ -548,18 +552,18 @@ mod tests {
         let temp = tempdir().unwrap();
         assert!(get_workflow(temp.path(), "nope", None).unwrap().is_none());
     }
-    /// The built-in `fan-out` workflow shipped in-repo under `src-tauri/workflows/`
-    /// is seeded into every workspace by the bundle sync (`BUNDLE_RESOURCE_DIRS`
-    /// includes `workflows`). Guard that the SHIPPED package actually loads: its
+    /// The built-in `fan-out` workflow shipped in-repo under the `core` pack is
+    /// seeded into every workspace when that pack installs (which it does on
+    /// every fresh run). Guard that the SHIPPED package actually loads: its
     /// manifest parses, its args JSON Schema validates, and it declares a
     /// description. Verifying the shipped file directly beats dogfooding through
     /// the running host, which serves a stale binary and a stale synced copy.
     #[test]
     fn bundled_fan_out_workflow_loads() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../workflows/fan-out")
+            .join("../../packs/core/workflows/fan-out")
             .canonicalize()
-            .expect("bundled fan-out workflow dir exists at src-tauri/workflows/fan-out");
+            .expect("fan-out workflow ships in the core pack");
         match load_workflow_dir(&dir, false) {
             ConfigResult::Ok(w) => {
                 assert_eq!(w.id, "fan-out");

@@ -234,12 +234,16 @@ async fn ask_questions_owned(
                         false
                     };
 
-                    if let Some(ref issue_id) = issue_id {
+                    if let Some(ref job_id) = job_id {
                         if let Err(e) =
-                            crate::transitions::outcome::recompute_issue_status_conn(conn, issue_id)
-                                .await
+                            crate::transitions::outcome::recompute_job_owner_attention_conn(
+                                conn,
+                                job_id,
+                                issue_id.as_deref(),
+                            )
+                            .await
                         {
-                            log::warn!("Failed to recompute issue status {}: {}", issue_id, e);
+                            log::warn!("Failed to recompute owner attention for {job_id}: {e}");
                         }
                     }
 
@@ -322,6 +326,7 @@ async fn ask_questions_owned(
                     attention: issue_ctx.attention,
                     status: issue_ctx.status,
                     updated_at: issue_ctx.updated_at,
+                    route_provenance: None,
                 });
             }
         } else if let Some(issue_id) = ctx.issue_id.as_deref() {

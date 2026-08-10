@@ -82,6 +82,36 @@ pub(super) async fn resolve_run_item(
                     let spec = resolve_mcp_call(orch, run_context, server, resource, item).await;
                     (header, spec)
                 }
+                Some(CairnResource::ExecutorAction { name, action }) => (
+                    header,
+                    resolve_executor_action(name, action, item),
+                ),
+                Some(CairnResource::Response { response_id }) => (
+                    header,
+                    Ok(RunSpec::ResponseCall {
+                        response_id,
+                        project: None,
+                        args: item
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.args_json.clone())
+                            .unwrap_or_else(|| serde_json::json!({})),
+                        timeout: item.timeout,
+                    }),
+                ),
+                Some(CairnResource::ProjectResponse { project, response_id }) => (
+                    header,
+                    Ok(RunSpec::ResponseCall {
+                        response_id,
+                        project: Some(project),
+                        args: item
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.args_json.clone())
+                            .unwrap_or_else(|| serde_json::json!({})),
+                        timeout: item.timeout,
+                    }),
+                ),
                 _ => {
                     let spec = resolve_script_spec(orch, request, target, item).await;
                     (header, spec)
@@ -91,6 +121,28 @@ pub(super) async fn resolve_run_item(
         ["code"] => resolve_code_spec(item),
         _ => unreachable!("present holds only command/target/code"),
     }
+}
+
+fn resolve_executor_action(
+    executor_name: String,
+    action: String,
+    item: &RunItem,
+) -> Result<RunSpec, String> {
+    let args = match item.payload.as_ref().and_then(|payload| payload.args_json.clone()) {
+        None | Some(serde_json::Value::Null) => serde_json::json!({}),
+        Some(value @ serde_json::Value::Object(_)) => value,
+        Some(_) => return Err(format!(
+            "Executor action args (payload.args_json) for '{executor_name}/{action}' must be a JSON object of named arguments"
+        )),
+    };
+    Ok(RunSpec::ExecutorAction(Box::new(
+        super::types::ExecutorActionSpec {
+            executor_name,
+            action,
+            args,
+            timeout: item.timeout,
+        },
+    )))
 }
 
 fn resolve_matlab_spec(
@@ -400,8 +452,13 @@ async fn resolve_mcp_call(
     })))
 }
 
-/// Resolve the env-expanded config for a named MCP server from workspace +
-/// project settings (project overlays workspace).
+/// Resolve the authored config for a named MCP server from workspace + project
+/// settings (project overlays workspace), together with its scoped credential
+/// key.
+///
+/// Deliberately does *not* expand `${VAR}` references. The resolved spec is
+/// cloned, carried across a batch, and may be persisted on a suspend, so
+/// expansion happens through the broker at the gateway call instead.
 async fn resolve_mcp_server_config(
     orch: &Orchestrator,
     run_context: Option<&RunContext>,
@@ -429,7 +486,7 @@ async fn resolve_mcp_server_config(
                 .as_deref()
                 .filter(|_| project_servers.contains_key(server));
             let credential_key = crate::config::secrets::credential_key(server, project_scope);
-            Ok((cfg.expanded(&credential_key), credential_key))
+            Ok((cfg.clone(), credential_key))
         }
         None => {
             let mut names: Vec<&str> = servers.keys().map(|s| s.as_str()).collect();
@@ -520,6 +577,45 @@ fn resolve_interpreter(script_path: &std::path::Path) -> Result<(String, Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn executor_action_item(args_json: serde_json::Value) -> RunItem {
+        serde_json::from_value(serde_json::json!({
+            "target": "cairn://executors/bglab-ub/look",
+            "payload": { "args_json": args_json },
+            "timeout": 5000
+        }))
+        .expect("executor action run item")
+    }
+
+    #[test]
+    fn executor_action_resolution_preserves_address_args_and_timeout() {
+        let spec = resolve_executor_action(
+            "bglab-ub".into(),
+            "Look_Now".into(),
+            &executor_action_item(serde_json::json!({"app": "Finder"})),
+        )
+        .expect("valid action");
+        let RunSpec::ExecutorAction(spec) = spec else {
+            panic!("expected executor action spec")
+        };
+        assert_eq!(spec.executor_name, "bglab-ub");
+        assert_eq!(spec.action, "Look_Now");
+        assert_eq!(spec.args, serde_json::json!({"app": "Finder"}));
+        assert_eq!(spec.timeout, Some(5000));
+    }
+
+    #[test]
+    fn executor_action_resolution_rejects_positional_args() {
+        let error = resolve_executor_action(
+            "bglab-ub".into(),
+            "look".into(),
+            &executor_action_item(serde_json::json!(["Finder"])),
+        )
+        .err()
+        .expect("positional args must be rejected");
+        assert!(error.contains("payload.args_json"), "{error}");
+        assert!(error.contains("bglab-ub/look"), "{error}");
+    }
 
     #[test]
     fn test_handle_run_command_unwrap_uses_semantic_inner_command() {

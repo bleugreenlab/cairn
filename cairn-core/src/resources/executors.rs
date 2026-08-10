@@ -21,9 +21,9 @@
 //!   inspecting the fleet costs nothing that running work would notice.
 
 use cairn_common::executor_protocol::{
-    ExecutorHealthStatus, ExecutorInspection, Measurement, MeasurementReading, PlacementOutcome,
-    PlacementPrediction, PlacementSyncCost, ReservationRationale,
-    MIN_CONFIDENT_RESERVATION_SAMPLES,
+    ExecutorHealthStatus, ExecutorInspection, Measurement, MeasurementReading, PlacementDecision,
+    PlacementOutcome, PlacementPrediction, PlacementReason, PlacementSyncCost,
+    ReservationRationale, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 // Deliberately its own statement rather than folded into the import above. That
 // list is edited by whoever touches the reservation rendering; keeping the
@@ -288,7 +288,7 @@ fn last_attempt(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
     }
 }
 
-/// Render one machine in full.
+/// Render one machine's compact operational status.
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     let health = &executor.health;
     let capabilities = &health.advertisement.capabilities;
@@ -410,14 +410,16 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
 
     out.push_str("## Admission\n");
     let admission = &health.admission;
-    out.push_str(&format!(
-        "- Concurrency: {} of {} units reserved\n",
-        admission.active_reservation.concurrency_units,
-        admission
-            .concurrency_capacity
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unstated".into())
-    ));
+    let reserved = admission.active_reservation.concurrency_units;
+    match admission.concurrency_capacity {
+        Some(u32::MAX) => out.push_str(&format!("- Concurrency: {reserved} reserved\n")),
+        Some(capacity) => out.push_str(&format!(
+            "- Concurrency: {reserved} of {capacity} units reserved\n"
+        )),
+        None => out.push_str(&format!(
+            "- Concurrency: {reserved} units reserved (capacity unstated)\n"
+        )),
+    }
     out.push_str(&format!(
         "- Accepted {} / rejected {} / timed out {}\n",
         admission.accepted_count, admission.rejected_count, admission.timed_out_count
@@ -462,11 +464,9 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     ));
     out.push('\n');
 
-    render_placements(&mut out, executor);
-
     out.push_str(&format!(
-        "Target this machine with `run({{executor:{{name:\"{}\"}}}})`. Renaming it is an operator action: `cairn executor rename {} <new-name>`.\n",
-        executor.name, executor.name
+        "Placement history: cairn://executors/{}?view=placements\n\nTarget this machine with `run({{executor:{{name:\"{}\"}}}})`. Renaming it is an operator action: `cairn executor rename {} <new-name>`.\n",
+        executor.name, executor.name, executor.name
     ));
     out
 }
@@ -478,120 +478,205 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
 /// read off the same record, which is why there is no second placement log.
 /// Local execution appears here on the same terms as any other machine: it says
 /// what it won on, and "local fallback" is never an unstated state.
-fn render_placements(out: &mut String, executor: &ExecutorInspection) {
-    out.push_str("## Placement\n");
+pub(crate) fn render_placements(executor: &ExecutorInspection) -> String {
+    let mut out = format!("# Executor {} placement decisions\n\n", executor.name);
     if executor.recent_placements.is_empty() {
         out.push_str(
             "- No placement decision in the runner's recent window named this machine.\n\n",
         );
-        return;
+        return out;
     }
-    for decision in &executor.recent_placements {
+    let routine = executor
+        .recent_placements
+        .iter()
+        .filter(|decision| is_routine_placement(decision))
+        .count();
+    if routine > 0 {
+        out.push_str(&format!(
+            "- {routine} routine {} (pinned, home, or sole candidate)\n",
+            if routine == 1 {
+                "placement"
+            } else {
+                "placements"
+            }
+        ));
+        let requests = executor
+            .recent_placements
+            .iter()
+            .filter(|decision| is_routine_placement(decision))
+            .map(|decision| {
+                format!(
+                    "[`{}`](cairn://executors/{}?view=placement&request={})",
+                    decision.request_id, executor.name, decision.request_id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("  - Requests: {requests}\n"));
+    }
+    for decision in executor
+        .recent_placements
+        .iter()
+        .filter(|decision| !is_routine_placement(decision))
+    {
         let asked = match (&decision.selector, &decision.pinned_executor_id) {
             (_, Some(_)) => "pinned to its execution home".to_string(),
             (Some(selector), None) => selector.describe(),
             (None, None) => "any executor".to_string(),
         };
+        let outcome = match &decision.outcome {
+            PlacementOutcome::Selected(selection) => format!(
+                "chose {} because {}",
+                selection.executor_name,
+                selection.reason.as_str()
+            ),
+            PlacementOutcome::Refused { diagnostic } => format!("refused: {diagnostic}"),
+        };
         out.push_str(&format!(
-            "- Request `{}` ({}, asked for {asked})\n",
+            "- Request `{}` ({}, asked for {asked}): {outcome}\n  - Detail: cairn://executors/{}?view=placement&request={}\n",
             decision.request_id,
-            decision.mobility.as_str()
+            decision.mobility.as_str(),
+            executor.name,
+            decision.request_id,
         ));
-        match &decision.outcome {
-            PlacementOutcome::Selected(selection) => {
-                out.push_str(&format!(
-                    "  - Chose {} because {}\n",
-                    selection.executor_name,
-                    selection.reason.as_str()
-                ));
-                out.push_str(&format!(
-                    "  - CPU: {}\n",
-                    reading(
-                        &selection.readings.cpu,
-                        decision.decided_at_unix_ms,
-                        |cpu| {
-                            format!(
-                                "{:.0}% busy across {} cores",
-                                cpu.utilization * 100.0,
-                                cpu.logical_cores
-                            )
-                        }
-                    )
-                ));
-                out.push_str(&format!(
-                    "  - Memory: {}\n",
-                    reading(
-                        &selection.readings.memory,
-                        decision.decided_at_unix_ms,
-                        |memory| {
-                            format!(
-                                "{} available of {}",
-                                bytes(memory.available_bytes),
-                                bytes(memory.total_bytes)
-                            )
-                        }
-                    )
-                ));
-                out.push_str(&format!(
-                    "  - Volume: {}\n",
-                    reading(
-                        &selection.readings.volume,
-                        decision.decided_at_unix_ms,
-                        |volume| {
-                            format!(
-                                "{} free of {}",
-                                bytes(volume.free_bytes),
-                                bytes(volume.total_bytes)
-                            )
-                        }
-                    )
-                ));
-                out.push_str(&format!(
-                    "  - Reserved: {} memory, {} disk, {} concurrency ({:?}); {}\n",
-                    bytes(selection.reservation.memory_bytes),
-                    bytes(selection.reservation.disk_growth_bytes),
-                    selection.reservation.concurrency_units,
-                    selection.reservation.source,
-                    describe_rationale(&selection.reservation_rationale)
-                ));
-                out.push_str(&format!(
-                    "  - Repository sync: {}\n",
-                    match selection.sync_cost {
-                        PlacementSyncCost::Known { bytes: value } =>
-                            format!("{} of objects to send", bytes(value)),
-                        PlacementSyncCost::Unknown => "not estimable".to_string(),
+    }
+    out.push('\n');
+    out
+}
+
+fn is_routine_placement(decision: &PlacementDecision) -> bool {
+    matches!(
+        &decision.outcome,
+        PlacementOutcome::Selected(selection)
+            if matches!(
+                selection.reason,
+                PlacementReason::Pinned | PlacementReason::ColocatedHome | PlacementReason::OnlyCandidate
+            )
+    )
+}
+
+pub(crate) fn render_placement(executor: &ExecutorInspection, request_id: &str) -> String {
+    let Some(decision) = executor
+        .recent_placements
+        .iter()
+        .find(|decision| decision.request_id == request_id)
+    else {
+        return format!(
+            "No recent placement decision for request `{request_id}` names executor `{}`. Read cairn://executors/{}?view=placements for the available request ids.\n",
+            executor.name, executor.name
+        );
+    };
+    let mut out = format!(
+        "# Executor {} placement `{}`\n\n",
+        executor.name, decision.request_id
+    );
+    render_placement_detail(&mut out, decision);
+    out
+}
+
+fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
+    let asked = match (&decision.selector, &decision.pinned_executor_id) {
+        (_, Some(_)) => "pinned to its execution home".to_string(),
+        (Some(selector), None) => selector.describe(),
+        (None, None) => "any executor".to_string(),
+    };
+    out.push_str(&format!(
+        "- Request `{}` ({}, asked for {asked})\n",
+        decision.request_id,
+        decision.mobility.as_str()
+    ));
+    match &decision.outcome {
+        PlacementOutcome::Selected(selection) => {
+            out.push_str(&format!(
+                "  - Chose {} because {}\n",
+                selection.executor_name,
+                selection.reason.as_str()
+            ));
+            out.push_str(&format!(
+                "  - CPU: {}\n",
+                reading(
+                    &selection.readings.cpu,
+                    decision.decided_at_unix_ms,
+                    |cpu| {
+                        format!(
+                            "{:.0}% busy across {} cores",
+                            cpu.utilization * 100.0,
+                            cpu.logical_cores
+                        )
                     }
+                )
+            ));
+            out.push_str(&format!(
+                "  - Memory: {}\n",
+                reading(
+                    &selection.readings.memory,
+                    decision.decided_at_unix_ms,
+                    |memory| {
+                        format!(
+                            "{} available of {}",
+                            bytes(memory.available_bytes),
+                            bytes(memory.total_bytes)
+                        )
+                    }
+                )
+            ));
+            out.push_str(&format!(
+                "  - Volume: {}\n",
+                reading(
+                    &selection.readings.volume,
+                    decision.decided_at_unix_ms,
+                    |volume| {
+                        format!(
+                            "{} free of {}",
+                            bytes(volume.free_bytes),
+                            bytes(volume.total_bytes)
+                        )
+                    }
+                )
+            ));
+            out.push_str(&format!(
+                "  - Reserved: {} memory, {} disk, {} concurrency ({:?}); {}\n",
+                bytes(selection.reservation.memory_bytes),
+                bytes(selection.reservation.disk_growth_bytes),
+                selection.reservation.concurrency_units,
+                selection.reservation.source,
+                describe_rationale(&selection.reservation_rationale)
+            ));
+            out.push_str(&format!(
+                "  - Repository sync: {}\n",
+                match selection.sync_cost {
+                    PlacementSyncCost::Known { bytes: value } =>
+                        format!("{} of objects to send", bytes(value)),
+                    PlacementSyncCost::Unknown => "not estimable".to_string(),
+                }
+            ));
+            if let Some(coordinate) = &selection.object_transfer {
+                out.push_str(&format!(
+                    "  - Objects travel as request {} attempt {} on connection generation {}\n",
+                    coordinate.request_id, coordinate.attempt_id, coordinate.connection_generation
                 ));
-                if let Some(coordinate) = &selection.object_transfer {
-                    out.push_str(&format!(
-                        "  - Objects travel as request {} attempt {} on connection generation {}\n",
-                        coordinate.request_id,
-                        coordinate.attempt_id,
-                        coordinate.connection_generation
-                    ));
-                }
-                out.push_str(&format!("  - {}\n", selection.observation_reuse.describe()));
-                if let Some(prediction) = &selection.prediction {
-                    render_prediction(out, "Predicted", prediction);
-                }
             }
-            PlacementOutcome::Refused { diagnostic } => {
-                out.push_str(&format!("  - Refused: {diagnostic}\n"));
+            out.push_str(&format!("  - {}\n", selection.observation_reuse.describe()));
+            if let Some(prediction) = &selection.prediction {
+                render_prediction(out, "Predicted", prediction);
             }
         }
-        for rejection in &decision.rejected {
-            out.push_str(&format!(
-                "  - Passed over {}: {}\n",
-                rejection.executor_name,
-                rejection.reason.describe()
-            ));
-            // A machine that was actually ranked shows its own numbers here, so
-            // "why not that one" is answered by the same record that answered
-            // "why this one". A structurally rejected machine was never priced
-            // and prints nothing rather than a fabricated total.
-            if let Some(prediction) = &rejection.prediction {
-                render_prediction(out, "    Predicted", prediction);
-            }
+        PlacementOutcome::Refused { diagnostic } => {
+            out.push_str(&format!("  - Refused: {diagnostic}\n"));
+        }
+    }
+    for rejection in &decision.rejected {
+        out.push_str(&format!(
+            "  - Passed over {}: {}\n",
+            rejection.executor_name,
+            rejection.reason.describe()
+        ));
+        // A machine that was actually ranked shows its own numbers here, so
+        // "why not that one" is answered by the same record that answered
+        // "why this one". A structurally rejected machine was never priced
+        // and prints nothing rather than a fabricated total.
+        if let Some(prediction) = &rejection.prediction {
+            render_prediction(out, "    Predicted", prediction);
         }
     }
     out.push('\n');
@@ -617,9 +702,19 @@ fn render_prediction(out: &mut String, label: &str, prediction: &PlacementPredic
         }
     ));
     out.push_str(&format!(
-        "    - Run: {} · {}\n",
-        duration_ms(prediction.run.predicted_ms),
+        "    - Run: {} base, {} after contention · {}\n",
+        duration_ms(prediction.base_run_ms),
+        duration_ms(prediction.adjusted_run_ms),
         prediction.run.describe()
+    ));
+    out.push_str(&format!(
+        "    - Contention: {}{}\n",
+        prediction.contention.describe(),
+        match prediction.contention.sample_count {
+            0 => String::new(),
+            1 => " (1 sample)".to_string(),
+            count => format!(" ({count} samples)"),
+        }
     ));
     out.push_str(&format!("    - Cache: {}\n", prediction.warmth.describe()));
     // Preparation is evidence, never a summand. No transfer history exists to
@@ -1206,6 +1301,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unbounded_concurrency_capacity_is_named_without_rendering_its_sentinel() {
+        let mut executor = inspection("bglab-ub", false);
+        executor
+            .health
+            .admission
+            .active_reservation
+            .concurrency_units = 0;
+        executor.health.admission.concurrency_capacity = Some(u32::MAX);
+
+        let rendered = render_executor(&executor);
+
+        assert!(rendered.contains("Concurrency: 0 reserved"));
+        assert!(
+            !rendered.contains("Concurrency: 0 reserved ("),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Concurrency: 0/"), "{rendered}");
+        assert!(!rendered.contains("Concurrency: 0 of "), "{rendered}");
+        assert!(!rendered.contains('∞'), "{rendered}");
+        assert!(!rendered.contains(&u32::MAX.to_string()), "{rendered}");
+    }
+
+    #[test]
+    fn finite_concurrency_capacity_keeps_its_configured_value() {
+        let mut executor = inspection("finite", false);
+        executor
+            .health
+            .admission
+            .active_reservation
+            .concurrency_units = 2;
+        executor.health.admission.concurrency_capacity = Some(6);
+
+        let rendered = render_executor(&executor);
+
+        assert!(
+            rendered.contains("Concurrency: 2 of 6 units reserved"),
+            "{rendered}"
+        );
+    }
+
     /// The collection is an address book: every machine listed under the name a
     /// placement request accepts, with the platform and toolchains that decide
     /// whether it is the right one.
@@ -1628,8 +1764,29 @@ mod tests {
             }],
         }];
 
-        let rendered = render_executor(&executor);
-        assert!(rendered.contains("## Placement"), "{rendered}");
+        let status = render_executor(&executor);
+        assert!(!status.contains("check-cadence-7"), "{status}");
+        assert!(
+            status.contains("cairn://executors/bglab-ub?view=placements"),
+            "{status}"
+        );
+
+        let listed = render_placements(&executor);
+        assert!(listed.contains("check-cadence-7"), "{listed}");
+        assert!(
+            listed.contains("?view=placement&request=check-cadence-7"),
+            "{listed}"
+        );
+        assert!(
+            !listed.contains("3% busy across 16 cores"),
+            "decision lists must not inline evidence trees: {listed}"
+        );
+        assert!(
+            !listed.contains("Passed over local"),
+            "candidate details belong to the single-decision view: {listed}"
+        );
+
+        let rendered = render_placement(&executor, "check-cadence-7");
         assert!(rendered.contains("check-cadence-7"), "{rendered}");
         assert!(rendered.contains("spillEligible"), "{rendered}");
         assert!(rendered.contains("predictedEarliestVerdict"), "{rendered}");
@@ -1661,17 +1818,38 @@ mod tests {
             rendered.contains("Passed over local: volume is unavailable: sampling failed"),
             "the idle machine's own reason is readable off the record: {rendered}"
         );
+
+        let PlacementOutcome::Selected(selection) = &mut executor.recent_placements[0].outcome
+        else {
+            unreachable!("fixture is selected")
+        };
+        selection.reason = PlacementReason::Pinned;
+        let routine = render_placements(&executor);
+        assert!(routine.contains("1 routine placement"), "{routine}");
+        assert!(routine.contains("Requests:"), "{routine}");
+        assert!(
+            routine.contains("?view=placement&request=check-cadence-7"),
+            "collapsed routine decisions remain individually drillable: {routine}"
+        );
+        assert!(!routine.contains("Passed over local"), "{routine}");
     }
 
     /// A machine that has taken part in no recent decision says that, rather
     /// than rendering an empty heading an operator has to interpret.
     #[test]
     fn a_machine_with_no_recent_placement_says_so() {
-        let rendered = render_executor(&inspection("bglab-win", false));
+        let rendered = render_placements(&inspection("bglab-win", false));
         assert!(
             rendered.contains("No placement decision in the runner's recent window"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn an_unknown_placement_request_points_back_to_the_available_list() {
+        let rendered = render_placement(&inspection("bglab-win", false), "missing");
+        assert!(rendered.contains("missing"), "{rendered}");
+        assert!(rendered.contains("?view=placements"), "{rendered}");
     }
 
     #[test]

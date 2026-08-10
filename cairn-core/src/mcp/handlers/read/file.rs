@@ -1337,6 +1337,17 @@ pub(crate) async fn produce_file_segment(
     // relative targets never derive authority from process cwd.
     if let Ok(full) = crate::mcp::file_targets::resolve_file_path_lenient(worktree, &split.identity)
     {
+        // The desktop operator credential is refused rather than prompted, and
+        // the check is deliberately independent of the read denylist below: a
+        // denied read raises an APPROVABLE crossing, and allowing a containment
+        // crossing is something an agent may do through its own `permissions`
+        // resource. A prompt here would therefore be one self-approval away
+        // from disclosing the credential that approves authority.
+        if let Some(refusal) =
+            crate::authorization::protected::read_refusal(&orch.config_dir, &full)
+        {
+            return Produced::Segment(error_segment(uri, refusal.to_string()));
+        }
         if crate::mcp::file_targets::target_crosses_logical_root(&split.identity).unwrap_or(true)
             && crate::mcp::file_targets::path_within_any(&full, &orch.sandbox_deny_read())
         {

@@ -26,6 +26,20 @@ const INDEX_WRITER_MEMORY_BUDGET: usize = 50_000_000;
 /// same term appearing only in the body.
 const TITLE_BOOST: tantivy::Score = 2.0;
 
+/// Multiplier on the all-tokens clause a multi-token query carries alongside its
+/// per-token should-clauses (see `build_text_query`). At 1.0 a document holding
+/// every token scores its tokens twice — decisively above any partial match —
+/// without the clause being able to exclude a partial match outright.
+const ALL_TOKENS_BOOST: tantivy::Score = 1.0;
+
+/// How many query tokens each additional required match buys. A longer query is
+/// more evidence about the topic, so the bar rises with it: two tokens require
+/// one match (either word may be the topic), while a seven-word question
+/// requires three. Without this, a natural-language query drowns in its own
+/// filler — six low-value tokens (`what`, `did`, `we`, `about`) outscore the one
+/// word that carried the meaning, no matter how rare that word is.
+const TOKENS_PER_REQUIRED_MATCH: usize = 3;
+
 /// Ceiling of the additive recency term (in BM25 score points). Kept well below
 /// a single point so relevance differences dominate and recency only breaks
 /// ties between near-equal scores.
@@ -48,6 +62,40 @@ pub struct SearchIndexHit {
     pub snippet: String,
     pub rank: f64,
     pub created_at: i64,
+}
+
+impl SearchIndexHit {
+    /// Build a transcript hit that did not come from the text index.
+    ///
+    /// The semantic lane retrieves turns by vector similarity, and its hits
+    /// must land in the SAME span structure as text hits before the two are
+    /// fused — fusion happens at span rank, not raw hit rank. So it produces
+    /// hits in this shape rather than a parallel one. `role` is the index's own
+    /// filter facet and means nothing off the index, so it stays empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transcript(
+        id: String,
+        project_id: String,
+        issue_id: Option<String>,
+        job_id: Option<String>,
+        title: String,
+        snippet: String,
+        rank: f64,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            id,
+            content_type: SearchContentType::Event,
+            project_id,
+            issue_id,
+            job_id,
+            role: String::new(),
+            title,
+            snippet,
+            rank,
+            created_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -392,12 +440,25 @@ impl SearchIndex {
 
     /// Build the scored text query.
     ///
-    /// Every token becomes a `Must` clause, so a multi-word query requires all
-    /// of its words to match somewhere (AND across tokens) — the fix for the old
-    /// OR-of-everything semantics that made multi-word queries noisier. Within a
-    /// token, each field contributes a forgiving `Should` of an exact term plus
-    /// — only on the trailing token, the word the user is still typing — a
-    /// prefix-fuzzy term. That is classic search-as-you-type without fuzzing
+    /// Every token becomes a `Should` clause, so a multi-word query is a scored
+    /// disjunction: one document need not hold every word. That matters because
+    /// the corpus is largely single-event documents, and a conversation spreads
+    /// its vocabulary across adjacent events — requiring all tokens in one
+    /// document made every multi-word question about a discussion structurally
+    /// unanswerable. Ranking, not exclusion, does the filtering: BM25 sums the
+    /// matched should-clauses, and an extra all-tokens clause (boosted by
+    /// `ALL_TOKENS_BOOST`) scores a document holding every word twice, so a full
+    /// match still outranks a partial one. Consumers that group event hits into
+    /// conversation spans then re-concentrate the partial matches (see
+    /// `cairn_core::search`).
+    ///
+    /// A floor of required matches scales with query length
+    /// (`TOKENS_PER_REQUIRED_MATCH`) so a long question is not answered by its
+    /// filler words alone.
+    ///
+    /// Within a token, each field contributes a forgiving `Should` of an exact
+    /// term plus — only on the trailing token, the word the user is still typing
+    /// — a prefix-fuzzy term. That is classic search-as-you-type without fuzzing
     /// words the user already finished, the biggest source of fuzz noise.
     /// Title-field clauses are boosted so title matches outrank body matches.
     fn build_text_query(&self, query: &str, fields: &[Field]) -> DbResult<Option<Box<dyn Query>>> {
@@ -405,17 +466,40 @@ impl SearchIndex {
         let Some(last_index) = tokens.len().checked_sub(1) else {
             return Ok(None);
         };
-        let clauses: Vec<(Occur, Box<dyn Query>)> = tokens
+        let token_clauses: Vec<Box<dyn Query>> = tokens
             .iter()
             .enumerate()
-            .map(|(index, token)| {
-                (
-                    Occur::Must,
-                    self.token_clause(token, index == last_index, fields),
-                )
-            })
+            .map(|(index, token)| self.token_clause(token, index == last_index, fields))
             .collect();
-        Ok(Some(Box::new(BooleanQuery::new(clauses))))
+
+        // A single token has nothing to disjoin: its own cross-field clause is
+        // the whole query, and wrapping it would only add an identical copy.
+        if token_clauses.len() == 1 {
+            return Ok(token_clauses.into_iter().next());
+        }
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = token_clauses
+            .iter()
+            .map(|clause| (Occur::Should, clause.box_clone()))
+            .collect();
+        let all_tokens: Vec<(Occur, Box<dyn Query>)> = token_clauses
+            .into_iter()
+            .map(|clause| (Occur::Must, clause))
+            .collect();
+        clauses.push((
+            Occur::Should,
+            Box::new(BoostQuery::new(
+                Box::new(BooleanQuery::new(all_tokens)),
+                ALL_TOKENS_BOOST,
+            )),
+        ));
+        // The all-tokens clause rides along as an extra Should. It can only be
+        // satisfied by a document that already matched every token, so it never
+        // helps a document clear the floor it would otherwise miss.
+        Ok(Some(Box::new(BooleanQuery::with_minimum_required_clauses(
+            clauses,
+            required_matches(tokens.len()),
+        ))))
     }
 
     /// A single token's cross-field `Should` group (see `build_text_query`).
@@ -1008,6 +1092,16 @@ fn parse_outbox_op(value: &str) -> DbResult<SearchOutboxOp> {
 
 fn source_key(content_type: &SearchContentType, source_id: &str) -> String {
     format!("{content_type}:{source_id}")
+}
+
+/// How many of a query's tokens a document must match to be a candidate at all.
+/// One for a short query, rising by one every `TOKENS_PER_REQUIRED_MATCH`
+/// tokens, never above the token count.
+fn required_matches(token_count: usize) -> usize {
+    if token_count == 0 {
+        return 0;
+    }
+    (1 + (token_count - 1) / TOKENS_PER_REQUIRED_MATCH).min(token_count)
 }
 
 /// Wrap a query in a title `BoostQuery` when `apply` is set, else pass it
@@ -1735,7 +1829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_token_query_requires_all_tokens() {
+    async fn multi_token_query_ranks_full_match_above_partial_match() {
         let db = migrated_db().await.unwrap();
         insert_workspace_and_project(&db, "project-1")
             .await
@@ -1764,11 +1858,126 @@ mod tests {
         let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
         assert_eq!(index.apply_pending(&db).await.unwrap(), 2);
 
-        // Only issue-both contains both words. The old OR-of-everything query
-        // would also return issue-one (it has "retry").
+        // Multi-token queries are a scored disjunction: the partial match is
+        // still reachable (a conversation spreads its words across documents),
+        // but the document holding both words ranks first.
         let hits = index.search("retry backoff", None).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "issue-both");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "issue-both", "full match must rank first");
+        assert_eq!(hits[1].id, "issue-one");
+        assert!(
+            hits[0].rank > hits[1].rank,
+            "full match must outscore partial match, got {} vs {}",
+            hits[0].rank,
+            hits[1].rank
+        );
+    }
+
+    #[test]
+    fn required_matches_rises_with_query_length() {
+        // Short queries stay fully disjunctive; long ones demand more evidence.
+        assert_eq!(required_matches(0), 0);
+        assert_eq!(required_matches(1), 1);
+        assert_eq!(required_matches(2), 1);
+        assert_eq!(required_matches(3), 1);
+        assert_eq!(required_matches(4), 2);
+        assert_eq!(required_matches(7), 3);
+        assert_eq!(required_matches(10), 4);
+    }
+
+    #[tokio::test]
+    async fn a_long_query_is_not_answered_by_its_filler_words() {
+        let db = migrated_db().await.unwrap();
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                // A corpus where the question's filler words are genuinely
+                // common — which is what makes them cheap. Every one of these
+                // matches four of the query's seven tokens.
+                for number in 1..=25 {
+                    let id = format!("issue-filler-{number}");
+                    conn.execute(
+                        "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                         VALUES (?1, 'project-1', ?2, 'What about that', 'what did we about it', ?2, ?2)",
+                        params![id.as_str(), number],
+                    )
+                    .await?;
+                }
+                // The document that actually carries the topic, and only one of
+                // the filler words.
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-topic', 'project-1', 99, 'Worktree fences', 'about zephyrine quixotry', 99, 99)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert_eq!(index.apply_pending(&db).await.unwrap(), 26);
+
+        // Seven tokens: the topic document matches three (its floor exactly),
+        // the filler documents four — and the topic still wins, because two rare
+        // words outweigh four ubiquitous ones.
+        let hits = index
+            .search("what did we decide about zephyrine quixotry", None)
+            .unwrap();
+        assert_eq!(hits[0].id, "issue-topic", "the topic must rank first");
+
+        // Three tokens require only one match, so the filler documents are
+        // reachable — but never above the document holding the rare words.
+        let narrow = index.search("about zephyrine quixotry", None).unwrap();
+        assert_eq!(narrow[0].id, "issue-topic");
+    }
+
+    #[tokio::test]
+    async fn multi_token_query_finds_words_split_across_documents() {
+        let db = migrated_db().await.unwrap();
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        // The scenario the disjunction exists for: neither word co-occurs in a
+        // single document, exactly as a discussion spreads across transcript
+        // events. Under all-tokens-required this query returned nothing.
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-alpha', 'project-1', 1, 'First half', 'zephyrine body', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-beta', 'project-1', 2, 'Second half', 'quixotry body', 2, 2)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert_eq!(index.apply_pending(&db).await.unwrap(), 2);
+
+        let mut ids: Vec<String> = index
+            .search("zephyrine quixotry", None)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["issue-alpha", "issue-beta"]);
     }
 
     #[tokio::test]

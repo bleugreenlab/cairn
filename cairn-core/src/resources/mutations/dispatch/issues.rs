@@ -7,7 +7,6 @@ use super::super::{
 use super::append_payload;
 use crate::mcp::handlers::{comments_artifacts, issues};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
-use crate::models::IssueKind;
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::CairnResource;
 
@@ -39,6 +38,9 @@ pub(super) async fn dispatch(
                     ));
                 }
             }
+            // The same shape gate the patch path takes, so "what may parent an
+            // issue" reads identically whether the issue is being created under
+            // a parent or adopted by one later.
             let parent = if let Some(parent) = payload.get("parent") {
                 let Some(parent) = parent
                     .as_str()
@@ -51,44 +53,25 @@ pub(super) async fn dispatch(
                         "payload.parent must be a non-empty string",
                     ));
                 };
-                Some(parent.to_string())
+                Some(
+                    issues::canonicalize_parent_uri(parent)
+                        .map_err(|e| build_failure(index, item, e))?,
+                )
             } else {
                 None
             };
             let execution = parse_create_execution_spec(index, item, payload)?;
             let labels = parse_string_array_field(index, item, payload, "labels", &[])?;
-            let kind = parse_create_kind(index, item, payload)?;
-            // Asked here rather than at the execution door, so a create-and-start
-            // that cannot start leaves no thread behind: the same rule the
-            // malformed-execution check follows. What is refused is the branch or
-            // the pull request the named recipe would produce, not the pairing of
-            // a thread with an execution — a thread's whole life is executions,
-            // they just have to be branchless ones.
-            if let (IssueKind::Thread, Some(spec)) = (kind, execution.as_ref()) {
-                if let Some(reason) = crate::execution::recipe::thread_recipe_refusal(
-                    orch,
-                    project,
-                    spec.recipe.as_deref(),
-                )
-                .await
-                {
-                    return Err(build_failure(
-                        index,
-                        item,
-                        format!("A thread cannot start this execution: {reason}. A thread owns no branch and never opens a pull request. Start it with a recipe that runs on the base branch and ships no PR, or create an ordinary issue for work that needs a branch."),
-                    ));
-                }
-            }
             if dry_run {
                 match &execution {
                     Some(spec) => format!(
-                        "Would create {kind} in project {project}: {title} and start an execution{}",
+                        "Would create issue in project {project}: {title} and start an execution{}",
                         spec.recipe
                             .as_deref()
                             .map(|r| format!(" (recipe '{r}')"))
                             .unwrap_or_default()
                     ),
-                    None => format!("Would create {kind} in project {project}: {title}"),
+                    None => format!("Would create issue in project {project}: {title}"),
                 }
             } else {
                 let description = match payload_str(payload, "description", &[]) {
@@ -107,7 +90,12 @@ pub(super) async fn dispatch(
                     labels,
                     execution,
                     parent,
-                    kind,
+                    // The calling run identifies the node filing this child, so
+                    // a child issue records the node that spawned it
+                    // (`docs/wakes.md`, "Child attention follows the spawning
+                    // node"). Without this the child has no owner to route its
+                    // questions, reviews, and messages back to.
+                    request.run_id.clone(),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -241,7 +229,9 @@ pub(super) async fn dispatch(
             }
             // Re-parenting: absent leaves the parent untouched, null/empty
             // orphans the issue, a string adopts it under that canonical issue
-            // URI. Existence, same-project, and cycle checks happen in the txn.
+            // or thread URI. Only the URI's shape is decided here; which edge it
+            // names, plus existence, same-project, and cycle checks, happen in
+            // the txn through the same resolver the create path uses.
             let parent = match payload.get("parent") {
                 None => None,
                 Some(serde_json::Value::Null) => Some(None),
@@ -250,13 +240,13 @@ pub(super) async fn dispatch(
                         build_failure(
                             index,
                             item,
-                            "payload.parent must be an issue URI string or null",
+                            "payload.parent must be an issue or thread URI string, or null",
                         )
                     })?;
                     if raw.trim().is_empty() {
                         Some(None)
                     } else {
-                        let canonical = crate::issues::relations::canonicalize_issue_uri(raw)
+                        let canonical = issues::canonicalize_parent_uri(raw)
                             .map_err(|e| build_failure(index, item, e))?;
                         Some(Some(canonical))
                     }
@@ -420,36 +410,6 @@ async fn resolve_issue_comment_id(
         })
 }
 
-/// Parse the optional `kind` on an issue-create payload. Absent or null means an
-/// ordinary issue, so every caller that predates threads keeps creating exactly
-/// what it created before. An unrecognized value is refused by name rather than
-/// silently defaulted — a caller that asked for a thread and got an issue would
-/// only find out much later, when the branch it never wanted appeared.
-fn parse_create_kind(
-    index: usize,
-    item: &ChangeItem,
-    payload: &serde_json::Value,
-) -> ResourceMutationResult<IssueKind> {
-    match payload.get("kind") {
-        None | Some(serde_json::Value::Null) => Ok(IssueKind::Issue),
-        Some(value) => {
-            let raw = value.as_str().ok_or_else(|| {
-                build_failure(
-                    index,
-                    item,
-                    format!(
-                        "payload.kind must be a string. Accepted values: {}",
-                        IssueKind::ACCEPTED_VALUES
-                    ),
-                )
-            })?;
-            raw.trim()
-                .parse::<IssueKind>()
-                .map_err(|error| build_failure(index, item, error))
-        }
-    }
-}
-
 /// Parse the optional `execution` object on an issue-create payload into a
 /// create+start spec. Absent or null -> None (create only). When present it must
 /// be an object whose `recipe`/`backend`, if set, are strings.
@@ -466,7 +426,7 @@ fn parse_create_execution_spec(
         build_failure(
             index,
             item,
-            "payload.execution must be an object {recipe?, backend?}",
+            "payload.execution must be an object {recipe?, backend?, overrides?}",
         )
     })?;
     let str_field = |key: &str| -> ResourceMutationResult<Option<String>> {
@@ -484,5 +444,184 @@ fn parse_create_execution_spec(
     Ok(Some(issues::CreateExecutionSpec {
         recipe: str_field("recipe")?,
         backend: str_field("backend")?,
+        overrides: super::executions::parse_launch_overrides(index, item, Some(value)).map_err(
+            |mut failure| {
+                // The key is `execution.overrides` here, not the top-level
+                // `overrides` the collection append takes.
+                failure.error = failure
+                    .error
+                    .replace("payload.overrides", "payload.execution.overrides");
+                failure
+            },
+        )?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
+    use cairn_db::turso::params;
+    use std::sync::Arc;
+
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        OrchestratorBuilder::new(
+            db_state,
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build()
+    }
+
+    /// The seam between an agent's `write` and issue creation: the calling run
+    /// has to reach `create_issue_in_project`, or a spawned child records no
+    /// owner and its questions, reviews, and messages route by derivation alone.
+    #[tokio::test]
+    async fn appending_a_child_issue_records_the_calling_node() {
+        let db = crate::storage::migrated_test_db("issue-dispatch.db").await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
+              VALUES('p','w','Project','PROJ','/tmp/repo',2,1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('parent','p',1,'Parent','active','active','none',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+              VALUES('coordinator','p','parent','running','sess',1,1);
+            INSERT INTO runs(id, project_id, job_id, issue_id, status, created_at, updated_at)
+              VALUES('run-coordinator','p','coordinator','parent','live',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        let item = ChangeItem {
+            target: "cairn://p/PROJ/issues".to_string(),
+            mode: ChangeMode::Append,
+            payload: Some(serde_json::json!({
+                "title": "Spawned child",
+                "parent": "cairn://p/PROJ/1",
+            })),
+        };
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: "/tmp/repo".to_string(),
+            run_id: Some("run-coordinator".to_string()),
+            tool: "write".to_string(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+        };
+        let mut applied_data = None;
+        dispatch(
+            &orch,
+            &request,
+            0,
+            &item,
+            false,
+            &CairnResource::ProjectIssues {
+                project: "PROJ".to_string(),
+            },
+            &mut applied_data,
+        )
+        .await
+        .unwrap();
+
+        let spawner = orch
+            .db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT parent_job_id FROM issues WHERE number = 2",
+                            params![],
+                        )
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => row.opt_text(0),
+                        None => Ok(None),
+                    }
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(spawner.as_deref(), Some("coordinator"));
+    }
+
+    #[tokio::test]
+    async fn appending_children_to_both_thread_addresses_records_the_thread_edge() {
+        let db = crate::storage::migrated_test_db("thread-child-dispatch.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
+               VALUES('p','w','Project','PROJ','/tmp/repo',1,1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, migrated_from_number, created_at, updated_at)
+               VALUES('thread','p','general','active','none',3404,1,1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: "/tmp/repo".to_string(),
+            run_id: None,
+            tool: "write".to_string(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+        };
+
+        for (title, parent) in [
+            ("Name child", "cairn://p/PROJ/general"),
+            ("Alias child", "cairn://p/PROJ/3404"),
+        ] {
+            let item = ChangeItem {
+                target: "cairn://p/PROJ/issues".to_string(),
+                mode: ChangeMode::Append,
+                payload: Some(serde_json::json!({"title": title, "parent": parent})),
+            };
+            let mut applied_data = None;
+            dispatch(
+                &orch,
+                &request,
+                0,
+                &item,
+                false,
+                &CairnResource::ProjectIssues {
+                    project: "PROJ".to_string(),
+                },
+                &mut applied_data,
+            )
+            .await
+            .unwrap();
+        }
+
+        let edges = orch
+            .db
+            .local
+            .query_all(
+                "SELECT parent_issue_id, parent_thread_id, parent_job_id FROM issues ORDER BY number",
+                (),
+                |row| Ok((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edges,
+            vec![
+                (None, Some("thread".into()), None),
+                (None, Some("thread".into()), None)
+            ]
+        );
+    }
 }

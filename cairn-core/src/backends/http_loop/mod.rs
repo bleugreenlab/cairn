@@ -78,9 +78,9 @@ pub(in crate::backends) struct TurnToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::backends) struct TurnUsage {
     #[serde(default)]
-    prompt_tokens: Option<i32>,
+    pub(in crate::backends) prompt_tokens: Option<i32>,
     #[serde(default)]
-    completion_tokens: Option<i32>,
+    pub(in crate::backends) completion_tokens: Option<i32>,
     #[serde(default)]
     total_tokens: Option<i32>,
     #[serde(default)]
@@ -90,7 +90,7 @@ pub(in crate::backends) struct TurnUsage {
     #[serde(default)]
     completion_tokens_details: Option<Value>,
     #[serde(default)]
-    cost: Option<f64>,
+    pub(in crate::backends) cost: Option<f64>,
     #[serde(default)]
     cost_details: Option<Value>,
 }

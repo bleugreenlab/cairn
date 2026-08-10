@@ -23,12 +23,40 @@ pub(super) struct CodexAuthState {
     tokens: CodexOAuthTokens,
 }
 
+/// The provider these credentials belong to, for the broker's audit record.
+const CODEX_PROVIDER: &str = "openai";
+
+/// Register a Codex token set for scrubbing.
+///
+/// Codex authenticates over HTTP from inside this process rather than through
+/// a child's environment, so there is no injection point to lease against; what
+/// registration buys is that a token echoed back — in an OAuth error body, in a
+/// diagnostic, in an agent's own reading of the auth file — is scrubbed rather
+/// than transcribed. The refresh token matters most: it outlives both of the
+/// others and mints replacements for them.
+fn register_codex_tokens(account_id: Option<&str>, tokens: &CodexOAuthTokens) {
+    let account = account_id.unwrap_or("default");
+    let register = |suffix: &str, value: &str| {
+        crate::security::broker::backend::register_injected(
+            CODEX_PROVIDER,
+            &format!("{account}/{suffix}"),
+            value,
+        );
+    };
+    register("id", &tokens.id_token);
+    register("access", &tokens.access_token);
+    if let Some(refresh) = tokens.refresh_token.as_deref() {
+        register("refresh", refresh);
+    }
+}
+
 impl CodexAuthState {
     pub(super) fn new_for_account(
         raw_json: &str,
         account_id: Option<String>,
     ) -> Result<Self, String> {
         let tokens = parse_codex_oauth_tokens(raw_json)?;
+        register_codex_tokens(account_id.as_deref(), &tokens);
         Ok(Self {
             account_id,
             raw_json: raw_json.to_string(),
@@ -103,6 +131,8 @@ impl CodexAuthState {
             refresh_token: refresh_to_store,
             chatgpt_account_id: account_id,
         };
+
+        register_codex_tokens(self.account_id.as_deref(), &self.tokens);
 
         self.raw_json = serde_json::to_string(&value)
             .map_err(|e| format!("Failed to serialize Codex auth JSON: {}", e))?;

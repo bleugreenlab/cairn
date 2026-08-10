@@ -30,8 +30,12 @@ pub(crate) fn blocking_append_kind(item: &ChangeItem) -> Option<BlockingKind> {
     }
     match parse_uri(&item.target) {
         Some(CairnResource::NodeTasks { .. }) => Some(BlockingKind::Tasks),
+        Some(CairnResource::Thread { path, .. }) if path == ["tasks"] => Some(BlockingKind::Tasks),
         Some(CairnResource::NodeCalls { .. }) => Some(BlockingKind::Calls),
         Some(CairnResource::NodeQuestions { .. }) => Some(BlockingKind::Questions),
+        Some(CairnResource::Thread { path, .. }) if path == ["questions"] => {
+            Some(BlockingKind::Questions)
+        }
         _ => None,
     }
 }
@@ -134,6 +138,11 @@ fn node_tasks_coords(target: &str) -> Option<NodeTasksCoords> {
             exec_seq,
             node_id,
         }) => Some((project, number, exec_seq, node_id)),
+        Some(CairnResource::Thread {
+            project,
+            name,
+            path,
+        }) if path == ["tasks"] => Some((project, 0, 0, name)),
         _ => None,
     }
 }
@@ -351,11 +360,11 @@ async fn resolve_task_routing(
         .map_err(|e| format!("Failed to resolve caller node for task spawn: {e}"))?;
     let mut target_job_ids: Vec<String> = Vec::with_capacity(coords.len());
     for (project, number, exec_seq, node_id) in coords {
-        let (_, job) = crate::resources::common::connect_and_find_node_job(
-            db, project, *number, *exec_seq, node_id,
+        let job_id = crate::resources::resolve_node_or_task_job_id(
+            db, project, *number, *exec_seq, node_id, None,
         )
         .await?;
-        target_job_ids.push(job.id);
+        target_job_ids.push(job_id);
     }
     let route = classify_task_route(&caller_job_id, &target_job_ids);
     Ok(TaskRouting {
@@ -630,6 +639,14 @@ mod blocking_group_tests {
         );
         assert_eq!(
             blocking_append_kind(&append("cairn://p/CAIRN/1/1/builder/questions")),
+            Some(BlockingKind::Questions)
+        );
+        assert_eq!(
+            blocking_append_kind(&append("cairn://p/CAIRN/design-review/tasks")),
+            Some(BlockingKind::Tasks)
+        );
+        assert_eq!(
+            blocking_append_kind(&append("cairn://p/CAIRN/design-review/questions")),
             Some(BlockingKind::Questions)
         );
         // Non-collection or non-append targets are not blocking.

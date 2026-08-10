@@ -539,7 +539,12 @@ async fn update_org_memberships(db: &DbState, memberships_json: &str) -> Result<
             })
         })
         .await
-        .map_err(|error| account_db_error("Failed to update org memberships", error))
+        .map_err(|error| account_db_error("Failed to update org memberships", error))?;
+    // Memberships changed, so a team the operator has just left may still have
+    // a live sync token. Revoking here is what makes leaving a team take effect
+    // on this machine rather than at the token's own expiry.
+    crate::security::broker::account::revoke_all_sync_tokens();
+    Ok(())
 }
 
 async fn upsert_account(db: &DbState, account: DbAccount) -> Result<(), String> {
@@ -579,7 +584,12 @@ async fn upsert_account(db: &DbState, account: DbAccount) -> Result<(), String> 
             })
         })
         .await
-        .map_err(|error| account_db_error("Failed to upsert account", error))
+        .map_err(|error| account_db_error("Failed to upsert account", error))?;
+    // The row is replaced wholesale, so this may be a different user on the
+    // same machine. Tokens derived from the previous account must not carry
+    // over.
+    crate::security::broker::account::revoke_all_sync_tokens();
+    Ok(())
 }
 
 async fn delete_account(db: &DbState) -> Result<(), String> {
@@ -591,7 +601,12 @@ async fn delete_account(db: &DbState) -> Result<(), String> {
             })
         })
         .await
-        .map_err(|error| account_db_error("Failed to delete account", error))
+        .map_err(|error| account_db_error("Failed to delete account", error))?;
+    // Deleting the row stops the device credential being read again, but sync
+    // tokens already derived from it are held in the lease book and would keep
+    // working until they expired on their own.
+    crate::security::broker::account::revoke_all_sync_tokens();
+    Ok(())
 }
 
 async fn get_account_connection(db: &DbState) -> Result<Option<AccountConnection>, String> {

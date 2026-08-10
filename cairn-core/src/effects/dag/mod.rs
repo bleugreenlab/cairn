@@ -617,6 +617,7 @@ mod tests {
         };
         let snap = ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),

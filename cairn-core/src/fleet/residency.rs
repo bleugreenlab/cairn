@@ -40,6 +40,60 @@ pub(crate) async fn job_residency_request(
     wait_horizon_unix_ms: u64,
     waiting_since_unix_ms: u64,
 ) -> Result<ResidencyAcquireRequest, String> {
+    let JobResidence {
+        owner_ref,
+        repo_path,
+    } = job_residence(db, job_id).await?;
+    let project_id = owner_ref.project_id.clone();
+    Ok(ResidencyAcquireRequest {
+        holder: ResidencyHolder::Job {
+            job_id: job_id.to_string(),
+        },
+        owner_ref: Some(owner_ref),
+        selector: None,
+        executor: None,
+        repository: RepositoryLocator::ColocatedPath {
+            project_id: project_id.clone(),
+            repository_id: project_id,
+            absolute_path: repo_path,
+        },
+        initial_base_commit: base_commit.to_string(),
+        // What the environment costs while it sits idle, and nothing more. Its
+        // checkout is real and durable for the residency's life, and the shells
+        // and REPLs it keeps resident between batches have real RSS that nothing
+        // else declares. It holds no CPU: an idle environment runs nothing, and
+        // the batches that do run inside it arrive as their own cell requests,
+        // which charge and release a unit through ordinary admission. There is
+        // no concurrency field here to declare otherwise.
+        footprint: ResidencyFootprint {
+            memory_bytes: 64 * 1024 * 1024,
+            disk_growth_bytes: 1024 * 1024 * 1024,
+        },
+        death_policy: OwnerDeathPolicy {
+            heartbeat_timeout_ms: JOB_EXECUTION_HEARTBEAT_TIMEOUT_MS,
+            reclaim_grace_ms: JOB_EXECUTION_RECLAIM_GRACE_MS,
+        },
+        priority: CellPriority::AgentInteractive,
+        // The acquiring caller's horizon, not this function's. A batch that is
+        // acquiring its job's home before running has its own answer to how long
+        // that is worth waiting for, and acquiring the home is part of placing
+        // the batch rather than a precondition with a separate clock.
+        wait_horizon_unix_ms,
+        waiting_since_unix_ms: waiting_since_unix_ms.min(crate::fleet::unix_time_ms()),
+    })
+}
+
+/// Who a job's cell belongs to, and which repository it is a checkout of.
+///
+/// One read answers both, so every surface that acquires on a job's behalf
+/// attributes the cell identically whether the job runs on a branch of its own
+/// or in the project's live checkout.
+pub(crate) struct JobResidence {
+    pub owner_ref: CellOwnerRef,
+    pub repo_path: String,
+}
+
+pub(crate) async fn job_residence(db: &LocalDb, job_id: &str) -> Result<JobResidence, String> {
     let owned_job_id = job_id.to_string();
     let (project_id, project_key, repo_path, node_name, issue_number, exec_seq) = db
         .read(move |conn| {
@@ -76,48 +130,88 @@ pub(crate) async fn job_residency_request(
         })
         .await
         .map_err(|error| format!("resolve job execution environment: {error}"))?;
-    Ok(ResidencyAcquireRequest {
-        holder: ResidencyHolder::Job {
-            job_id: job_id.to_string(),
-        },
-        owner_ref: Some(CellOwnerRef {
-            project_id: project_id.clone(),
+    Ok(JobResidence {
+        owner_ref: CellOwnerRef {
+            project_id,
             project_key: Some(project_key),
             issue_number,
             job_id: Some(job_id.to_string()),
             execution_seq: exec_seq,
             node_kind: node_name,
-        }),
+        },
+        repo_path,
+    })
+}
+
+/// The request a **branchless** owner presents to acquire a residency over the
+/// project's live checkout.
+///
+/// A thread session owns no branch by construction — it is commit-fenced, has no
+/// worktree and no PR — so there is no managed checkout to materialize for it.
+/// Every long-lived process it runs (its terminals, its REPLs) therefore lives in
+/// the project's own checkout, read-only, under one holder keyed by the session's
+/// job so those processes share an environment with each other and with nobody
+/// else. A project terminal is the same shape with the project as its owner.
+///
+/// The live checkout is externally owned and always at its own HEAD: Cairn never
+/// moves it, which is why this resolves the head with plain `git` rather than a
+/// logical bookmark, and why a caller must not follow this acquisition with a
+/// checkout refresh.
+pub(crate) async fn live_checkout_residency_request(
+    owner_id: &str,
+    project_id: &str,
+    repo_path: &str,
+    owner_ref: Option<CellOwnerRef>,
+    wait_horizon_unix_ms: u64,
+) -> Result<ResidencyAcquireRequest, String> {
+    let checkout = repo_path.to_string();
+    let base_commit = tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&checkout)
+            .output()
+            .map_err(|error| format!("resolve project checkout head: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "resolve project checkout head: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
+    .await
+    .map_err(|error| format!("live checkout head resolution task failed: {error}"))??;
+
+    Ok(ResidencyAcquireRequest {
+        holder: ResidencyHolder::ProjectTerminals {
+            project_id: owner_id.to_string(),
+        },
+        owner_ref,
         selector: None,
         executor: None,
-        repository: RepositoryLocator::ColocatedPath {
-            project_id: project_id.clone(),
-            repository_id: project_id,
-            absolute_path: repo_path,
+        repository: RepositoryLocator::ExistingCheckout {
+            project_id: project_id.to_string(),
+            repository_id: project_id.to_string(),
+            absolute_path: repo_path.to_string(),
         },
-        initial_base_commit: base_commit.to_string(),
-        // What the environment costs while it sits idle, and nothing more. Its
-        // checkout is real and durable for the residency's life, and the shells
-        // and REPLs it keeps resident between batches have real RSS that nothing
-        // else declares. It holds no CPU: an idle environment runs nothing, and
-        // the batches that do run inside it arrive as their own cell requests,
-        // which charge and release a unit through ordinary admission. There is
-        // no concurrency field here to declare otherwise.
+        initial_base_commit: base_commit,
+        // A place to live in, not a workload: the checkout already exists and is
+        // not Cairn's to grow, so the only declared cost is what the resident
+        // shells and interpreters hold in memory.
         footprint: ResidencyFootprint {
             memory_bytes: 64 * 1024 * 1024,
-            disk_growth_bytes: 1024 * 1024 * 1024,
+            disk_growth_bytes: 0,
         },
+        // The terminal window, because terminal recovery is sized from these
+        // exact constants and a thread's REPL shares the holder its terminals
+        // hold. One owner cannot have two answers for when it is considered dead.
         death_policy: OwnerDeathPolicy {
-            heartbeat_timeout_ms: JOB_EXECUTION_HEARTBEAT_TIMEOUT_MS,
-            reclaim_grace_ms: JOB_EXECUTION_RECLAIM_GRACE_MS,
+            heartbeat_timeout_ms: crate::terminal_host::TERMINAL_HEARTBEAT_TIMEOUT_MS,
+            reclaim_grace_ms: crate::terminal_host::TERMINAL_RECLAIM_GRACE_MS,
         },
         priority: CellPriority::AgentInteractive,
-        // The acquiring caller's horizon, not this function's. A batch that is
-        // acquiring its job's home before running has its own answer to how long
-        // that is worth waiting for, and acquiring the home is part of placing
-        // the batch rather than a precondition with a separate clock.
         wait_horizon_unix_ms,
-        waiting_since_unix_ms: waiting_since_unix_ms.min(crate::fleet::unix_time_ms()),
+        waiting_since_unix_ms: crate::fleet::unix_time_ms(),
     })
 }
 

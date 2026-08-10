@@ -343,6 +343,7 @@ pub fn delete_skill(
     if dir_path.exists() && dir_path.is_dir() {
         std::fs::remove_dir_all(&dir_path)
             .map_err(|e| format!("Failed to delete skill directory: {}", e))?;
+        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Skill, id);
     }
     Ok(())
 }
@@ -486,21 +487,37 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), markdown).unwrap();
     }
 
-    /// Every skill shipped in-repo under `src-tauri/skills/` is copied into the
-    /// workspace by the bundle sync (`BUNDLE_RESOURCE_DIRS` includes `skills`)
-    /// and then read as `cairn://skills/<id>`. Guard that each bundled package
-    /// parses, and that the `workflows` skill is present and well-formed.
-    /// Verifying the shipped file directly beats dogfooding through the running
-    /// host, which serves a stale binary and a stale synced copy.
+    /// Every skill shipped in-repo under `src-tauri/packs/<id>/skills/` is
+    /// copied into the workspace when its pack installs and then read as
+    /// `cairn://skills/<id>`. Guard that each shipped package parses, and that
+    /// the `workflows` skill is present and well-formed. Verifying the shipped
+    /// file directly beats dogfooding through the running host, which serves a
+    /// stale binary and a stale synced copy.
     #[test]
     fn bundled_skills_load_and_include_workflows() {
-        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../skills")
-            .canonicalize()
-            .expect("bundled skills dir exists at src-tauri/skills");
+        let src_tauri = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("cairn-core manifest is nested under src-tauri");
+        let packs = crate::config::pack::discover_available_packs(src_tauri);
+        assert!(
+            !packs.is_empty(),
+            "the repo ships packs under src-tauri/packs"
+        );
+        let skill_dirs: Vec<std::path::PathBuf> = packs
+            .iter()
+            .flat_map(|manifest| {
+                std::fs::read_dir(manifest.root.join("skills"))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+            })
+            .collect();
+        assert!(!skill_dirs.is_empty(), "shipped packs carry skills");
+
         let mut saw_workflows = false;
-        for entry in std::fs::read_dir(&bundled).unwrap() {
-            let path = entry.unwrap().path();
+        for path in skill_dirs {
             if !path.join("SKILL.md").exists() {
                 continue;
             }

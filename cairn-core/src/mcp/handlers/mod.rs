@@ -2,10 +2,12 @@
 //!
 //! Framework-agnostic handler logic. Both Tauri and cairn-server dispatch to these.
 
+pub mod authority;
 pub(crate) mod branch;
 pub mod bug_report;
 pub(crate) mod check_run;
 pub mod comments_artifacts;
+pub(crate) mod durable_images;
 pub(crate) mod durable_suspend;
 pub mod executions;
 pub mod fence;
@@ -77,6 +79,7 @@ pub struct RunContext {
     pub project_id: String,
     pub project_key: String,
     pub job_name: Option<String>, // Human-readable job name from execution snapshot (e.g., "builder-1")
+    pub agent_config_id: Option<String>, // "workflow" identifies harness-backed workflow runs
 }
 
 impl RunContext {

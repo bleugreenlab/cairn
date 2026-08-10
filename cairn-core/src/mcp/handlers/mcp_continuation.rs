@@ -50,7 +50,7 @@ async fn dispatch_pending_operation(
                 .call_tool_once(
                     &state.session_key,
                     &state.server,
-                    &state.config,
+                    &state.brokered("mcp continuation round"),
                     &state.tool,
                     state.arguments.clone(),
                     Some(input_responses),
@@ -71,7 +71,7 @@ async fn dispatch_pending_operation(
                 .update_task(
                     &state.session_key,
                     &state.server,
-                    &state.config,
+                    &state.brokered("mcp task input"),
                     &task_id,
                     input_responses,
                     Some(&operation_id),
@@ -105,6 +105,14 @@ pub(crate) enum PendingOperation {
 pub(crate) struct McpContinuationState {
     pub server: String,
     pub session_key: String,
+    /// The server's **authored** configuration, `${VAR}` references intact.
+    ///
+    /// This row is persisted between protocol rounds, so an expanded config
+    /// here would write the server's resolved credentials into the database and
+    /// leave them there for the life of the record. The reference is expanded
+    /// through the broker immediately before each gateway call instead, which
+    /// also means a rotated credential takes effect on the next round rather
+    /// than at the next fresh call.
     pub config: McpServerConfig,
     pub tool: String,
     #[serde(default)]
@@ -129,6 +137,17 @@ pub(crate) struct McpContinuationState {
     pub next_poll_at_ms: Option<i64>,
     #[serde(default)]
     pub deadline_ms: Option<i64>,
+}
+
+impl McpContinuationState {
+    /// Expand this server's `${VAR}` references for one gateway call.
+    ///
+    /// `server` is the scoped credential key, which is also what the gateway
+    /// receives, so the config is resolved against exactly the credentials the
+    /// call will authenticate with.
+    fn brokered(&self, purpose: &str) -> crate::security::BrokeredMcpConfig {
+        self.config.brokered(&self.server, purpose)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -432,7 +451,12 @@ async fn drive_inner(
     match orch
         .mcp_gateway()
         .ok_or("MCP gateway is not available")?
-        .get_task(&state.session_key, &state.server, &state.config, &task.id)
+        .get_task(
+            &state.session_key,
+            &state.server,
+            &state.brokered("mcp task poll"),
+            &task.id,
+        )
         .await?
     {
         McpTaskOutcome::Working { poll_interval_ms } => {
@@ -703,6 +727,49 @@ mod tests {
             next_poll_at_ms: None,
             deadline_ms: None,
         }
+    }
+
+    /// The row that survives between protocol rounds must carry the `${VAR}`
+    /// reference, not what it resolves to.
+    ///
+    /// Multi-round MCP calls used to persist the *expanded* config here, which
+    /// wrote the server's resolved credentials into the database and left them
+    /// there for the life of the record — a durable disclosure that no amount of
+    /// output scrubbing reaches. The expansion happens per gateway call now.
+    #[test]
+    fn the_persisted_row_holds_the_reference_and_never_the_resolved_value() {
+        crate::config::secrets::mock_keychain::install();
+        let secret = "cont-Rt48Km19Zc03Qb";
+        crate::config::secrets::set_secret("mock", "CONT_TOKEN", secret).unwrap();
+
+        let mut state = state();
+        state.config = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": "https://example.test/mcp",
+            "headers": {"Authorization": "Bearer ${CONT_TOKEN}"}
+        }))
+        .unwrap();
+
+        let encoded = encode(&state).expect("state encodes");
+        assert!(
+            encoded.contains("${CONT_TOKEN}"),
+            "the durable row must keep the reference: {encoded}"
+        );
+        assert!(
+            !encoded.contains(secret),
+            "the durable row must not carry the resolved value"
+        );
+
+        // And the reference still resolves when the call actually happens.
+        let brokered = state.brokered("test");
+        assert_eq!(
+            brokered
+                .resolved_for_connect()
+                .headers
+                .get("Authorization")
+                .unwrap(),
+            &format!("Bearer {secret}")
+        );
     }
 
     async fn db() -> LocalDb {

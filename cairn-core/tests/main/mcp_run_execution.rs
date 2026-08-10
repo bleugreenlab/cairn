@@ -1024,13 +1024,35 @@ async fn a_thread_cannot_commit_from_a_run_and_an_ordinary_issue_still_can() {
     );
 
     let (_thread_temp, thread_db, thread_orch, thread_cwd) = setup("run-posture-thread").await;
+    // `execute_script`, not `execute`: this fixture is several statements, and
+    // `execute` runs only the first. Re-pointing the job at the thread is the
+    // statement that makes it thread-owned, so losing it left an ordinary
+    // issue-owned job that the fence then correctly declined to refuse.
+    //
+    // The run is detached from the issue before the issue is deleted, because
+    // `runs.issue_id` cascades — and because that IS a thread session's shape:
+    // it has a job and a run, and no issue anywhere in the chain.
     thread_db
-        .execute(
-            "UPDATE issues SET kind = 'thread' WHERE id = 'issue-run-posture-thread'",
-            params![],
+        .execute_script(
+            "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) SELECT id,project_id,'posture-thread','active','none',created_at,updated_at FROM issues WHERE id='issue-run-posture-thread'; UPDATE jobs SET thread_id='issue-run-posture-thread',issue_id=NULL,execution_id=NULL WHERE issue_id='issue-run-posture-thread'; UPDATE runs SET issue_id=NULL WHERE issue_id='issue-run-posture-thread'; DELETE FROM executions WHERE issue_id='issue-run-posture-thread'; DELETE FROM issues WHERE id='issue-run-posture-thread'",
         )
         .await
         .unwrap();
+    // The conversion is the whole experiment, so it is asserted rather than
+    // assumed: a fixture that inserts a thread row but leaves the job
+    // issue-owned tests nothing. The `write` half asserts the same invariant
+    // against its own fixture, so both verbs prove one thing (CAIRN-3874).
+    assert_eq!(
+        common::scalar_text_by_id(
+            &thread_db,
+            "SELECT thread_id FROM jobs WHERE id = ?1",
+            "job-run-posture-thread"
+        )
+        .await
+        .as_deref(),
+        Some("issue-run-posture-thread"),
+        "the job under test must actually belong to the thread"
+    );
 
     let refusal = run_text(
         &handle_run(
@@ -1040,7 +1062,7 @@ async fn a_thread_cannot_commit_from_a_run_and_an_ordinary_issue_still_can() {
         .await,
     );
     assert!(
-        refusal.contains("it is a thread") && refusal.contains("child issue"),
+        refusal.contains("thread-owned job") && refusal.contains("child issue"),
         "the thread must be told the posture and where the work belongs: {refusal}"
     );
     assert!(
@@ -1111,10 +1133,12 @@ async fn a_thread_is_refused_before_a_workflow_target_can_suspend_the_caller() {
 
     let (_thread_temp, thread_db, thread_orch, thread_cwd) =
         setup_without_executor("run-workflow-thread").await;
+    // `execute_script`, not `execute` — see the sibling posture test: `execute`
+    // runs only the first of these four statements, which left the job
+    // issue-owned and sent the batch on to workflow dispatch.
     thread_db
-        .execute(
-            "UPDATE issues SET kind = 'thread' WHERE id = 'issue-run-workflow-thread'",
-            params![],
+        .execute_script(
+            "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) SELECT id,project_id,'workflow-thread','active','none',created_at,updated_at FROM issues WHERE id='issue-run-workflow-thread'; UPDATE jobs SET thread_id='issue-run-workflow-thread',issue_id=NULL,execution_id=NULL WHERE issue_id='issue-run-workflow-thread'; UPDATE runs SET issue_id=NULL WHERE issue_id='issue-run-workflow-thread'; DELETE FROM executions WHERE issue_id='issue-run-workflow-thread'; DELETE FROM issues WHERE id='issue-run-workflow-thread'",
         )
         .await
         .unwrap();
@@ -1127,7 +1151,7 @@ async fn a_thread_is_refused_before_a_workflow_target_can_suspend_the_caller() {
         .await,
     );
     assert!(
-        refusal.contains("it is a thread"),
+        refusal.contains("thread-owned job"),
         "the thread must be refused: {refusal}"
     );
     assert!(
@@ -2265,6 +2289,7 @@ async fn repl_state_persists_across_handle_run_calls() {
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),
+        agent_config_id: None,
     };
 
     let Ok(session) = repl::spawn_session(
@@ -2341,6 +2366,7 @@ async fn repl_typescript_rejects_deps() {
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),
+        agent_config_id: None,
     };
     let result = repl::spawn_session(
         &orch,
@@ -2382,6 +2408,7 @@ async fn repl_typescript_state_persists_across_handle_run_calls() {
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),
+        agent_config_id: None,
     };
 
     let Ok(session) = repl::spawn_session(
@@ -2468,6 +2495,7 @@ fn repl_ctx(run_id: &str, _cwd: &str) -> cairn_core::internal::mcp::handlers::Ru
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),
+        agent_config_id: None,
     }
 }
 
@@ -2742,6 +2770,304 @@ async fn repl_row_outlives_the_process_and_resumes_as_a_new_generation() {
         store::next_seq(db, &resumed.id).await.expect("next seq"),
         2,
         "seq stays monotonic across generations"
+    );
+}
+
+// A thread session is branchless by construction: it is commit-fenced, owns no
+// branch and no PR. `spawn_session` used to read the job's branch, fall back to
+// its base branch, and refuse a job with neither — a refusal no thread could ever
+// satisfy, so REPL in a thread pane's + menu was dead and so was
+// `write cairn:~/repl/<slug>` from a thread agent. A branchless owner now lands
+// in the project's live checkout, exactly where its terminals already run, while
+// an issue node's job keeps resolving its own branch.
+#[tokio::test]
+async fn repl_spawns_for_a_branchless_thread_session() {
+    use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
+
+    let run_id = "run-repl-thread";
+    let (_temp, db, orch, cwd) = setup(run_id).await;
+    let ctx = repl_ctx(run_id, &cwd);
+    let project_id = project_id_for_job(&db, &ctx.job_id).await;
+    seed_thread_session_job(&db, &project_id, "job-thread-session", None).await;
+
+    // The UI's create path carries no run context, which is the shape a thread
+    // pane's + menu produces.
+    let branchless = repl::spawn_session(
+        &orch,
+        "job-thread-session",
+        &project_id,
+        &cwd,
+        None,
+        ReplLang::Python,
+        "thread",
+        &[],
+    )
+    .await;
+    match branchless {
+        Ok(session) => {
+            assert_eq!(
+                session.managed_branch(),
+                None,
+                "a thread session's REPL follows no branch: it lives in the live checkout"
+            );
+            // And it evaluates: a send into a branchless session must not try to
+            // align a checkout that has no logical head to align to.
+            orch.repl_state.insert(
+                "job-thread-session".to_string(),
+                "thread".to_string(),
+                session,
+            );
+            let exchange = repl::send_recorded(
+                &orch,
+                "job-thread-session",
+                "thread",
+                "1 + 1",
+                Duration::from_secs(30),
+                repl::ReplOrigin::User,
+                Some(ReplLang::Python),
+            )
+            .await
+            .expect("a branchless session takes a send");
+            assert_eq!(exchange.status, repl::ReplExchangeStatus::Success);
+            assert_eq!(exchange.value.as_deref(), Some("2"));
+            if let Some(session) = orch.repl_state.remove("job-thread-session", "thread") {
+                session.stop_and_release(&orch).await;
+            }
+        }
+        Err(error) => {
+            assert!(
+                !error.contains("logical branch"),
+                "a branchless owner must never be refused for having no branch: {error}"
+            );
+            eprintln!(
+                "skipping the live half of repl_spawns_for_a_branchless_thread_session: {error}"
+            );
+        }
+    }
+
+    // The branch path is untouched: an issue node's REPL still resolves the job's
+    // own branch and pins its cell to that logical head.
+    let Ok(node_session) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "node",
+        &[],
+    )
+    .await
+    else {
+        eprintln!("skipping the node half: no python/uv available to spawn the eval-server");
+        return;
+    };
+    assert_eq!(
+        node_session.managed_branch(),
+        Some("agent/RHG-1-builder-0"),
+        "an issue node's REPL keeps following its job's branch"
+    );
+    node_session.stop_and_release(&orch).await;
+}
+
+/// The project a seeded job belongs to, so a test can address the same project a
+/// thread session would hang off.
+async fn project_id_for_job(db: &LocalDb, job_id: &str) -> String {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query("SELECT project_id FROM jobs WHERE id = ?1", params![job_id])
+                .await?;
+            let row = rows.next().await?.expect("the seeded job exists");
+            Ok(row.get_value(0)?.as_text().expect("project id").to_string())
+        })
+    })
+    .await
+    .expect("read project id")
+}
+
+/// A thread and its session job: `uri_segment = 'thread'` with no parent, and
+/// NULL branch/base_branch — the branchless shape a thread session always has.
+///
+/// `execution` binds the job to an execution and a run of its own, which is what
+/// a thread looks like once it has delegated a sub-agent task and the only shape
+/// in which its worktree fence resolves at all. A thread that has never delegated
+/// carries neither, so nothing confines it — tracked as CAIRN-3871.
+async fn seed_thread_session_job(
+    db: &LocalDb,
+    project_id: &str,
+    job_id: &str,
+    execution: Option<(&str, &str)>,
+) {
+    let project_id = project_id.to_string();
+    let job_id = job_id.to_string();
+    let execution = execution.map(|(exec, run)| (exec.to_string(), run.to_string()));
+    db.write(move |conn| {
+        let project_id = project_id.clone();
+        let job_id = job_id.clone();
+        let execution = execution.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT OR IGNORE INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+                 VALUES ('thread-1', ?1, 'general', 'active', 'none', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO jobs (id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+                 VALUES (?1, 'thread-1', ?2, 'thread', 'thread', 'idle', 1, 1)",
+                params![job_id.as_str(), project_id.as_str()],
+            )
+            .await?;
+            if let Some((execution_id, run_id)) = execution {
+                conn.execute(
+                    "UPDATE jobs SET execution_id = ?1, agent_config_id = 'agent-1' WHERE id = ?2",
+                    params![execution_id.as_str(), job_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at, start_mode)
+                     VALUES (?1, ?2, ?3, 'live', 1, 1, 'resume')",
+                    params![run_id.as_str(), project_id.as_str(), job_id.as_str()],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .expect("seed thread session job");
+}
+
+/// The project's live checkout path, which is the tree a branchless owner's
+/// processes run in.
+async fn repo_path_for_project(db: &LocalDb, project_id: &str) -> String {
+    let project_id = project_id.to_string();
+    db.read(move |conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT repo_path FROM projects WHERE id = ?1",
+                    params![project_id],
+                )
+                .await?;
+            let row = rows.next().await?.expect("the seeded project exists");
+            Ok(row.get_value(0)?.as_text().expect("repo path").to_string())
+        })
+    })
+    .await
+    .expect("read repo path")
+}
+
+/// Re-stamp the seeded execution's agent with a fence. The fixture's default is
+/// `allow` (which deliberately applies no confinement anywhere), so a test about
+/// what confinement is applied has to ask for a fence that applies some.
+async fn set_seeded_fence(db: &LocalDb, execution_id: &str, fence: &str) {
+    let execution_id = execution_id.to_string();
+    let fence = fence.to_string();
+    let snapshot = db
+        .read({
+            let execution_id = execution_id.clone();
+            move |conn| {
+                let execution_id = execution_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT snapshot FROM executions WHERE id = ?1",
+                            params![execution_id],
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("the seeded execution exists");
+                    Ok(row.get_value(0)?.as_text().expect("snapshot").to_string())
+                })
+            }
+        })
+        .await
+        .expect("read snapshot");
+    let mut parsed: Value = serde_json::from_str(&snapshot).expect("snapshot is json");
+    parsed["agents"]["agent-1"]["fence"] = json!(fence);
+    let updated = parsed.to_string();
+    db.execute(
+        "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
+        params![updated.as_str(), execution_id.as_str()],
+    )
+    .await
+    .expect("stamp fence");
+}
+
+// The fence a REPL spawns under belongs to its OWNER, not to whoever asked for
+// it. A REPL opened from a node or thread pane's `+` menu carries no run context
+// at all, and deriving the fence identity from the caller answered "nobody's
+// agent operation": no policy was built, the resident spec declared itself
+// unconfined, and the interpreter could write whatever checkout it landed in —
+// including, for a branchless owner, the operator's live tree. A terminal has
+// always resolved the job's latest run from the job row for exactly this reason.
+#[tokio::test]
+async fn repl_sandbox_follows_the_owner_fence_when_the_caller_has_no_run_context() {
+    use cairn_common::executor_protocol::ProcessSandboxMode;
+    use cairn_core::internal::mcp::handlers::repl;
+
+    let run_id = "run-repl-fence";
+    let (_temp, db, orch, cwd) = setup_without_executor(run_id).await;
+    let ctx = repl_ctx(run_id, &cwd);
+    let project_id = project_id_for_job(&db, &ctx.job_id).await;
+    let repo_path = repo_path_for_project(&db, &project_id).await;
+    set_seeded_fence(&db, &format!("exec-{run_id}"), "ask").await;
+
+    // An issue node's REPL, opened the way the UI opens one: confined to the
+    // agent's own checkout, which it may write.
+    let (mode, policy) = repl::repl_sandbox(
+        &orch,
+        &ctx.job_id,
+        &project_id,
+        &cwd,
+        &repo_path,
+        Some("agent/RHG-1-builder-0"),
+        None,
+    )
+    .await;
+    let policy = policy.expect("a fenced owner must produce a policy without a caller run context");
+    assert_eq!(mode, ProcessSandboxMode::Confined);
+    assert!(
+        policy.worktree_writable,
+        "a REPL in the agent's own execution home writes that checkout"
+    );
+
+    // A branchless owner's REPL, opened the same way: the live checkout is its
+    // worktree and is NOT writable, and no session grant may reopen it.
+    seed_thread_session_job(
+        &db,
+        &project_id,
+        "job-thread-fence",
+        Some((&format!("exec-{run_id}"), "run-thread-fence")),
+    )
+    .await;
+    let (mode, policy) = repl::repl_sandbox(
+        &orch,
+        "job-thread-fence",
+        &project_id,
+        &cwd,
+        &repo_path,
+        None,
+        None,
+    )
+    .await;
+    let policy = policy.expect("a fenced branchless owner must produce a policy");
+    assert_eq!(mode, ProcessSandboxMode::ReadOnlyCheckout);
+    assert_eq!(policy.worktree, Path::new(&repo_path));
+    assert!(
+        !policy.worktree_writable,
+        "a branchless REPL must not be able to write the operator's live checkout"
+    );
+    assert!(
+        !policy
+            .writable_paths()
+            .iter()
+            .any(|path| path.starts_with(&repo_path)),
+        "nothing inside the live checkout may be writable"
     );
 }
 

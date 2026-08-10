@@ -4,8 +4,10 @@
 //! the cached UI snapshot. Scheduling, workspaces, processes, cancellation, and
 //! mutation sealing exist only in the executor process.
 
+pub mod desktop;
 pub mod management;
 pub(crate) mod occupancy;
+pub(crate) mod output_guard;
 pub(crate) mod placement;
 pub(crate) mod residency;
 mod resource_profiles;
@@ -15,22 +17,24 @@ use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
     aged_priority, CacheWarmthEvidence, CellCheckoutKind, CellCommandClass, CellResidency,
-    CpuAdmissionState, DurationEstimate, DurationFallback, EnrolledRemote, ExecutionWarmth,
-    ExecutorAdvertisement, ExecutorCapabilities, ExecutorConfig, ExecutorHealthSnapshot,
-    ExecutorHealthStatus, ExecutorIdentity, ExecutorInspection, ExecutorMessage, ExecutorSelector,
-    ExecutorSubstrateEvidence, ExecutorSubstrateReport, ExecutorSubstrateState,
-    InventoryAuthorityState, MachineMeasurement, MaterializationReadFailureKind,
-    MaterializationReadRequest, MaterializationReadResult, ObjectTransferCoordinate,
-    ObservationReuse, PlacementDecision, PlacementMobility, PlacementOutcome,
-    PlacementPolicyEvidence, PlacementPrediction, PlacementReadings, PlacementReason,
-    PlacementRejection, PlacementRejectionReason, PlacementSelection, PlacementSyncCost,
-    PreparationForecast, ProcessBatch, ProcessBatchExecution, ProcessBatchItem, ProcessSandboxMode,
-    QueueForecast, QueueUnknownReason, RemoteAttachAttempt, RemoteLinkState, RepositoryLocator,
-    ReservationFallback, ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind,
-    ResidencyFence, ResidencyHolder, ResidencyOperation, ResidencyResult, ResidentProcessEvent,
-    ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult, WarmthUnknownReason,
-    CPU_ADMISSION_SAMPLE_INTERVAL_MS, EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME,
-    MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    ContentionEstimate, CpuAdmissionState, DurationEstimate, DurationFallback, EnrolledRemote,
+    ExecutionLoadContext, ExecutionWarmth, ExecutorAdvertisement, ExecutorCapabilities,
+    ExecutorConfig, ExecutorHealthSnapshot, ExecutorHealthStatus, ExecutorIdentity,
+    ExecutorInspection, ExecutorMessage, ExecutorSelector, ExecutorSubstrateEvidence,
+    ExecutorSubstrateReport, ExecutorSubstrateState, InventoryAuthorityState, MachineMeasurement,
+    MaterializationReadFailureKind, MaterializationReadRequest, MaterializationReadResult,
+    ObjectTransferCoordinate, ObservationReuse, PlacementDecision, PlacementMobility,
+    PlacementOutcome, PlacementPolicyEvidence, PlacementPrediction, PlacementReadings,
+    PlacementReason, PlacementRejection, PlacementRejectionReason, PlacementSelection,
+    PlacementSyncCost, PreparationForecast, ProcessBatch, ProcessBatchExecution, ProcessBatchFile,
+    ProcessBatchItem, ProcessSandboxMode, QueueForecast, QueueUnknownReason,
+    QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget, RemoteAttachAttempt,
+    RemoteLinkState, RepositoryLocator, ReservationFallback, ReservationRationale,
+    ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyHolder,
+    ResidencyOperation, ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind,
+    RunnerCallback, RunnerCallbackResult, WarmthUnknownReason, CPU_ADMISSION_SAMPLE_INTERVAL_MS,
+    EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME, MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS,
+    RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, EXECUTOR_NAME_RULE,
@@ -66,6 +70,100 @@ pub enum PlacementStance {
     RemoteOnly,
     #[default]
     Any,
+}
+
+/// One executor admission transition, recorded with the placement survey that
+/// led work to this machine. The executor owns the capacity decision while the
+/// runner owns the fleet refusal set; joining them here is the only point where
+/// an operator can later answer both "why here?" and "why still waiting?".
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdmissionParkedEvidence {
+    executor_id: String,
+    executor_name: String,
+    queued: cairn_common::executor_protocol::QueuedCellRequest,
+    admission: cairn_common::executor_protocol::AdmissionHealth,
+    machine: cairn_common::executor_protocol::MachineTelemetry,
+    placement: PlacementDecision,
+}
+
+fn queued_placement_evidence(decision: &PlacementDecision) -> QueuedPlacementEvidence {
+    let selected = match &decision.outcome {
+        PlacementOutcome::Selected(selection) => Some(QueuedPlacementTarget {
+            executor_name: selection.executor_name.clone(),
+            executor_id: selection.executor_id.clone(),
+            available_memory_bytes: selection
+                .readings
+                .memory
+                .value()
+                .map(|value| value.available_bytes),
+            free_volume_bytes: selection
+                .readings
+                .volume
+                .value()
+                .map(|value| value.free_bytes),
+            reservation: selection.reservation.clone(),
+        }),
+        PlacementOutcome::Refused { .. } => None,
+    };
+    QueuedPlacementEvidence {
+        decided_at_unix_ms: decision.decided_at_unix_ms,
+        mobility: decision.mobility,
+        pinned_executor_id: decision.pinned_executor_id.clone(),
+        selected,
+        rejected: decision
+            .rejected
+            .iter()
+            .map(|rejection| QueuedPlacementRejection {
+                executor_name: rejection.executor_name.clone(),
+                executor_id: rejection.executor_id.clone(),
+                reason: rejection.reason.clone(),
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+fn placement_prediction(
+    entry: &ExecutorConnectionState,
+    warmth: CacheWarmthEvidence,
+    queue: QueueForecast,
+    run: DurationEstimate,
+    sync_cost: SyncCost,
+) -> PlacementPrediction {
+    placement_prediction_with_contention(
+        entry,
+        warmth,
+        queue,
+        run,
+        resource_profiles::contention_prior(&candidate_load(entry)),
+        sync_cost,
+    )
+}
+
+fn candidate_load(entry: &ExecutorConnectionState) -> ExecutionLoadContext {
+    let (compile, light) =
+        entry
+            .snapshot
+            .executing_requests
+            .iter()
+            .fold((0_u32, 0_u32), |counts, request| {
+                if request.command_class.is_compile_class() {
+                    (counts.0.saturating_add(1), counts.1)
+                } else {
+                    (counts.0, counts.1.saturating_add(1))
+                }
+            });
+    ExecutionLoadContext {
+        co_resident_compile_jobs: compile,
+        co_resident_light_jobs: light,
+        cpu_utilization_millis: entry
+            .health
+            .host
+            .cpu_admission
+            .utilization
+            .map(|value| (value.clamp(0.0, 1.0) * 1_000.0).round() as u32),
+    }
 }
 
 fn default_active_placement_profile() -> String {
@@ -271,6 +369,93 @@ pub struct FleetConfig {
     /// a host; only the host itself can authoritatively identify it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_host_identities: BTreeMap<String, String>,
+    #[serde(default)]
+    pub desktop_automation: DesktopAutomationConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopAutomationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub machines: HashMap<String, MachineDesktopAutomation>,
+}
+
+impl Default for DesktopAutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            machines: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MachineDesktopAutomation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDesktopAutomation {
+    pub enabled: bool,
+    pub binary: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl DesktopAutomationConfig {
+    /// Carry a machine's desktop configuration with it when it is renamed.
+    ///
+    /// This map is keyed by public name rather than by executor identity,
+    /// because the colocated machine has no remote declaration to hang it off.
+    /// That makes a rename a move: leaving the entry under the old name would
+    /// silently strip the machine of the binary it was configured with, and the
+    /// only symptom would be desktop automation quietly resolving the platform
+    /// default instead.
+    pub fn rename_machine(&mut self, from: &str, to: &str) {
+        let (Some(from), Some(to)) = (normalize_executor_name(from), normalize_executor_name(to))
+        else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        if let Some(machine) = self.machines.remove(&from) {
+            self.machines.insert(to, machine);
+        }
+    }
+
+    /// Drop a removed machine's desktop configuration along with it, so removal
+    /// leaves no entry addressing a machine that no longer exists.
+    pub fn forget_machine(&mut self, name: &str) {
+        if let Some(name) = normalize_executor_name(name) {
+            self.machines.remove(&name);
+        }
+    }
+
+    pub fn resolve(&self, machine_name: &str, os: &str) -> ResolvedDesktopAutomation {
+        let machine =
+            normalize_executor_name(machine_name).and_then(|name| self.machines.get(&name));
+        ResolvedDesktopAutomation {
+            enabled: machine
+                .and_then(|config| config.enabled)
+                .unwrap_or(self.enabled),
+            binary: machine
+                .and_then(|config| config.binary.clone())
+                .unwrap_or_else(|| match os {
+                    "windows" => "axon-win.exe".to_string(),
+                    "linux" => "axon-linux".to_string(),
+                    _ => "axon".to_string(),
+                }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -800,6 +985,7 @@ impl Default for FleetConfig {
             executor_policies: HashMap::new(),
             remote_executors: BTreeMap::new(),
             remote_host_identities: BTreeMap::new(),
+            desktop_automation: DesktopAutomationConfig::default(),
         }
     }
 }
@@ -1032,6 +1218,43 @@ struct EnrolledRemoteRecord {
     last_seen_unix_ms: Option<u64>,
 }
 
+const EXPLORATION_INTERVAL: usize = 4;
+
+#[derive(Debug, Clone)]
+struct ExplorationState {
+    decisions_since_exploration: usize,
+    /// Least recently explored first. Executors not present have never received
+    /// a bootstrap attempt and precede every entry here.
+    explored_executors: VecDeque<String>,
+}
+
+impl Default for ExplorationState {
+    fn default() -> Self {
+        Self {
+            decisions_since_exploration: EXPLORATION_INTERVAL - 1,
+            explored_executors: VecDeque::new(),
+        }
+    }
+}
+
+impl ExplorationState {
+    fn record(&mut self, explored_executor_id: Option<&str>) {
+        match explored_executor_id {
+            Some(executor_id) => {
+                self.decisions_since_exploration = 0;
+                self.explored_executors.retain(|known| known != executor_id);
+                self.explored_executors.push_back(executor_id.to_string());
+            }
+            None => {
+                self.decisions_since_exploration = self
+                    .decisions_since_exploration
+                    .saturating_add(1)
+                    .min(EXPLORATION_INTERVAL - 1);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Fleet {
     connections: Arc<Mutex<HashMap<String, ExecutorConnectionState>>>,
@@ -1042,6 +1265,8 @@ pub struct Fleet {
     pending_residency: Arc<Mutex<PendingResidencyResults>>,
     pending_materialization_reads: Arc<Mutex<PendingMaterializationReads>>,
     pending_policy: Arc<Mutex<HashMap<String, PendingPolicyResult>>>,
+    desired_runtime_policies:
+        Arc<Mutex<HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>>>,
     pending_drain: Arc<Mutex<HashMap<String, PendingDrainResult>>>,
     residency_routes: Arc<Mutex<HashMap<(String, String), ResidencyRoute>>>,
     residency_route_path: Arc<Option<PathBuf>>,
@@ -1054,12 +1279,27 @@ pub struct Fleet {
     coalesced_leaders: Arc<Mutex<HashSet<RequestIdentity>>>,
     preparing_leaders: Arc<Mutex<HashMap<RequestIdentity, LeaderPreparation>>>,
     in_flight: Arc<Mutex<InFlightRegistry>>,
-    runner_contexts: Arc<Mutex<HashMap<String, RunnerCallbackContext>>>,
+    runner_contexts: Arc<Mutex<HashMap<String, RunnerContextEntry>>>,
+    /// Streaming scrubbers for resident-process output, one per live stream.
+    ///
+    /// Terminals, REPLs, workflows, and dev instances all reach their consumers
+    /// through one fan-out, and all of them are handed this runner's own
+    /// `CAIRN_MCP_SECRET`. An executor cannot scrub for a credential it was
+    /// never told about, so this is the pass that covers them.
+    resident_output: output_guard::SharedRelayedOutput,
     recent_cached_completions:
         Arc<Mutex<VecDeque<cairn_common::executor_protocol::CellCompletion>>>,
     expected_executor_build_ids: Arc<Mutex<HashMap<String, String>>>,
     /// The placement decisions this runner most recently took, newest last.
     recent_placements: Arc<Mutex<VecDeque<PlacementDecision>>>,
+    /// Request attempts whose transition into executor admission has been
+    /// journaled. Missing placement evidence is retried on later snapshots; it
+    /// is never made durable as a partial record.
+    journaled_admission_parks: Arc<Mutex<HashSet<RequestIdentity>>>,
+    /// Atomic cadence accounting, separate from the operator ledger because a
+    /// placement must consume its exploration slot before concurrent ranking can
+    /// spend the same slot.
+    exploration_by_work_class: Arc<Mutex<HashMap<PlacementWorkClass, ExplorationState>>>,
     colocated_substrate_state: Arc<Mutex<Option<ExecutorSubstrateEvidence>>>,
     /// Every machine this runner is enrolled with, keyed by executor id and
     /// kept whether or not the machine is attached. Always locked AFTER
@@ -1138,6 +1378,75 @@ struct RunnerCallbackContext {
     /// The only executor session allowed to exercise this short-lived capability.
     /// Populated after placement and before the process batch is submitted.
     executor_binding: Option<RunnerContextExecutorBinding>,
+    /// Streaming scrubbers for this batch's relayed output, one per item stream.
+    ///
+    /// Shared with the submitting future, which drains them at the batch's
+    /// terminal outcome. It has to be shared rather than owned here, because
+    /// this entry is often revoked *before* that future returns — the result
+    /// message revokes the context on its way in — and a scrubber dropped
+    /// without a flush silently truncates the tail of the stream.
+    output: output_guard::SharedRelayedOutput,
+}
+
+/// One live runner callback context and the registration that hides its
+/// capability.
+///
+/// The key of this map *is* the batch's relay capability: the executor injects
+/// it into every item as `CAIRN_MCP_SECRET`, so a batch that dumps its own
+/// environment echoes it straight back. Registering it inside the entry means
+/// its scrub lifetime is exactly its authorization lifetime — batch completion,
+/// `revoke_runner_contexts_for_request`, `revoke_mcp_relay_contexts_for_executor`
+/// and the coalesced-leader guard all remove from this map, so none of them can
+/// forget to release it. That is the CAIRN-3385 property held by construction
+/// rather than by four call sites agreeing.
+struct RunnerContextEntry {
+    context: RunnerCallbackContext,
+    /// Held, never read: dropping it is the whole contract.
+    _capability: Option<crate::security::SecretGuard<'static>>,
+}
+
+impl RunnerContextEntry {
+    fn new(runner_context_id: &str, batch_label: &str, context: RunnerCallbackContext) -> Self {
+        use crate::security::{registry, SecretCategory, SecretId, SecretMaterial};
+
+        // Non-secret metadata: the id reaches logs and detection reports, so it
+        // names the batch and never the capability. Deriving it from the value
+        // would publish the capability to exactly the places the registry exists
+        // to keep it out of.
+        //
+        // The counter is what makes it *unique*, and that is load-bearing rather
+        // than tidy. Registering an id that already exists takes a second hold
+        // and REPLACES the stored forms, so two live contexts spelling one id
+        // would leave the first capability unregistered-for while it is still
+        // minted, injected, and authorized. Batch identity alone does not
+        // guarantee distinctness — the coalesced path names a request with no
+        // attempt — so the id carries a process-local sequence instead of
+        // relying on callers never colliding.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = SecretId::new(format!("batch-capability:{batch_label}:{sequence}"));
+        let capability = match registry().register(
+            id.clone(),
+            SecretCategory::BatchCapability,
+            "per-batch executor relay capability",
+            SecretMaterial::from_string(runner_context_id.to_string()),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                // Loud: the capability is minted and sent either way, so a
+                // producer that believes it registered and did not believes in a
+                // guarantee it does not have.
+                log::warn!(
+                    "per-batch relay capability {id} was not registered for scrubbing: {error}"
+                );
+                None
+            }
+        };
+        Self {
+            context,
+            _capability: capability,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1146,6 +1455,37 @@ struct RunnerContextExecutorBinding {
     generation: u64,
     request_id: String,
     attempt_id: String,
+}
+
+/// Scrub the free-form text an executor reports with a terminal outcome.
+///
+/// This is the model-visible copy of a batch's output, and unlike the live
+/// stream it arrives whole, so one exact pass covers it completely with no
+/// chunk boundaries to reason about. The diagnostics are included because a
+/// spawn failure, a preparation timeout, or a storage error quotes the command
+/// and whatever it managed to print.
+fn scrub_cell_outcome(outcome: &mut CellOutcome) {
+    use crate::security::{Crossing, DetectionReport, Sanitizer};
+
+    let mut sanitizer = Sanitizer::exact();
+    if sanitizer.is_noop() {
+        return;
+    }
+    match outcome {
+        CellOutcome::Completed { output, .. } => sanitizer.text_in_place(output),
+        CellOutcome::Unavailable { diagnostic, .. }
+        | CellOutcome::FailedAfterExecution { diagnostic, .. }
+        | CellOutcome::StorageFailure { diagnostic, .. } => sanitizer.text_in_place(diagnostic),
+        CellOutcome::Cancelled { .. } => {}
+    }
+    for report in DetectionReport::from_detections(
+        &sanitizer.into_detections(),
+        Crossing::ProcessOutput,
+        None,
+        None,
+    ) {
+        report.log();
+    }
 }
 
 /// Whether a submitted batch runs in the project's externally owned live
@@ -1265,6 +1605,7 @@ impl Fleet {
         let contexts = self.runner_contexts.lock().unwrap();
         let context = contexts
             .get(runner_context_id)
+            .map(|entry| &entry.context)
             .ok_or_else(|| "unknown or expired runner callback context".to_string())?;
         let binding = context.executor_binding.as_ref().ok_or_else(|| {
             "runner callback context is not bound to an active process batch".to_string()
@@ -1301,6 +1642,7 @@ impl Fleet {
         let mut contexts = self.runner_contexts.lock().unwrap();
         let context = contexts
             .get_mut(context_id)
+            .map(|entry| &mut entry.context)
             .ok_or_else(|| "process batch names an unknown runner callback context".to_string())?;
         context.executor_binding = Some(RunnerContextExecutorBinding {
             executor_id: executor_id.to_string(),
@@ -1317,10 +1659,14 @@ impl Fleet {
         attempt_id: &str,
     ) -> Vec<String> {
         let mut revoked = Vec::new();
-        self.runner_contexts.lock().unwrap().retain(|id, context| {
-            let matches = context.executor_binding.as_ref().is_some_and(|binding| {
-                binding.request_id == request_id && binding.attempt_id == attempt_id
-            });
+        self.runner_contexts.lock().unwrap().retain(|id, entry| {
+            let matches = entry
+                .context
+                .executor_binding
+                .as_ref()
+                .is_some_and(|binding| {
+                    binding.request_id == request_id && binding.attempt_id == attempt_id
+                });
             if matches {
                 revoked.push(id.clone());
             }
@@ -1335,16 +1681,95 @@ impl Fleet {
         generation: u64,
     ) -> Vec<String> {
         let mut revoked = Vec::new();
-        self.runner_contexts.lock().unwrap().retain(|id, context| {
-            let matches = context.executor_binding.as_ref().is_some_and(|binding| {
-                binding.executor_id == executor_id && binding.generation == generation
-            });
+        self.runner_contexts.lock().unwrap().retain(|id, entry| {
+            let matches = entry
+                .context
+                .executor_binding
+                .as_ref()
+                .is_some_and(|binding| {
+                    binding.executor_id == executor_id && binding.generation == generation
+                });
             if matches {
                 revoked.push(id.clone());
             }
             !matches
         });
+        // A link that dies mid-stream never delivers the exits that would have
+        // drained its resident processes, so their scrubbers are dropped here
+        // rather than left to accumulate.
+        self.resident_output
+            .lock()
+            .unwrap()
+            .forget_executor(executor_id);
         revoked
+    }
+
+    /// Scrub one resident-process event, and drain the process when it exits.
+    ///
+    /// Returns what should reach subscribers: usually the one event, scrubbed;
+    /// on exit, the withheld tail of each of the process's streams *first*, so
+    /// the last bytes land in the scrollback the exit is about to seal. An
+    /// output event whose content was entirely withheld yields nothing at all,
+    /// since a chunk holding no bytes is not yet a chunk.
+    fn settle_resident_event(
+        &self,
+        executor_id: &str,
+        mut event: ResidentProcessEvent,
+    ) -> Vec<ResidentProcessEvent> {
+        let holder_key = event.holder.storage_key();
+        match &mut event.event {
+            ResidentProcessEventKind::Output { stream, data, .. } => {
+                let key = output_guard::resident_stream_key(
+                    executor_id,
+                    &holder_key,
+                    &event.process_key,
+                    event.process_generation,
+                    *stream,
+                );
+                let settled = self
+                    .resident_output
+                    .lock()
+                    .unwrap()
+                    .settle_bytes(&key, data);
+                if settled.is_empty() {
+                    return Vec::new();
+                }
+                *data = settled;
+                vec![event]
+            }
+            ResidentProcessEventKind::State {
+                status: cairn_common::executor_protocol::ResidentProcessStatus::Exited { .. },
+            } => {
+                let tails = output_guard::finish_resident_process(
+                    &self.resident_output,
+                    executor_id,
+                    &holder_key,
+                    &event.process_key,
+                    event.process_generation,
+                );
+                let mut sequence = u64::MAX - tails.len() as u64;
+                let mut settled: Vec<ResidentProcessEvent> = tails
+                    .into_iter()
+                    .map(|(stream, data)| {
+                        sequence += 1;
+                        ResidentProcessEvent {
+                            // The tail carries the exiting process's own
+                            // identity, so a consumer keyed on the process does
+                            // not have to special-case it.
+                            event: ResidentProcessEventKind::Output {
+                                sequence,
+                                stream,
+                                data,
+                            },
+                            ..event.clone()
+                        }
+                    })
+                    .collect();
+                settled.push(event);
+                settled
+            }
+            ResidentProcessEventKind::State { .. } => vec![event],
+        }
     }
 
     /// Whether a resident-process event still describes live work.
@@ -1397,6 +1822,30 @@ impl Fleet {
                     .get(&event.process_key)
                     .is_some_and(|process| process.generation > event.process_generation)
         })
+    }
+
+    fn residency_silence_diagnostic(&self, executor_id: &str, generation: u64) -> String {
+        let now = unix_time_ms();
+        let connections = self.connections.lock().unwrap();
+        let Some(entry) = connections
+            .get(executor_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return "residency operation lost its executor connection generation".into();
+        };
+        let pump_silence_ms = now.saturating_sub(entry.pump_tick.load(Ordering::Relaxed));
+        let report_silence_ms = now.saturating_sub(entry.last_progress_unix_ms);
+        if pump_silence_ms > EXECUTOR_PROGRESS_FRESHNESS_MS {
+            format!(
+                "runner socket pump stopped reporting residency progress ({pump_silence_ms}ms silent)"
+            )
+        } else if report_silence_ms > EXECUTOR_PROGRESS_FRESHNESS_MS {
+            format!(
+                "executor snapshot stream stopped reporting residency progress ({report_silence_ms}ms silent)"
+            )
+        } else {
+            "executor admission queue did not publish residency operation progress".into()
+        }
     }
 
     pub(crate) fn subscribe_resident_process_events(
@@ -1729,6 +2178,18 @@ impl Fleet {
         executor_build_id: Option<String>,
     ) -> u64 {
         let executor_id = advertisement.identity.executor_id.clone();
+        if let Some(policy) = self
+            .desired_runtime_policies
+            .lock()
+            .unwrap()
+            .get(&executor_id)
+            .cloned()
+        {
+            let _ = sender.send(ExecutorMessage::RuntimePolicyRequest {
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+                policy,
+            });
+        }
         let generation = {
             let mut generations = self.connection_generations.lock().unwrap();
             let generation = generations
@@ -2313,6 +2774,7 @@ impl Fleet {
                         return false;
                     }
                     let _ = self.revoke_runner_contexts_for_request(&key.0, &key.1);
+                    scrub_cell_outcome(&mut outcome);
                     if let CellOutcome::Completed { metadata, .. } = &mut outcome {
                         let canonical = self
                             .connections
@@ -2384,8 +2846,10 @@ impl Fleet {
             }
             ExecutorMessage::ResidentProcessEvent { event } => {
                 if self.resident_event_is_current(executor_id, generation, &event) {
-                    for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
-                        subscriber(event.clone());
+                    for event in self.settle_resident_event(executor_id, event) {
+                        for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
+                            subscriber(event.clone());
+                        }
                     }
                 }
                 false
@@ -2475,8 +2939,40 @@ impl Fleet {
                 active.executor_id = executor_id.to_string();
             }
         }
+        let placements = self.recent_placements.lock().unwrap();
+        let mut journaled = self.journaled_admission_parks.lock().unwrap();
+        let current_queue: HashSet<_> = snapshot
+            .queued_requests
+            .iter()
+            .map(|queued| (queued.request_id.clone(), queued.attempt_id.clone()))
+            .collect();
+        for queued in &entry.snapshot.queued_requests {
+            let key = (queued.request_id.clone(), queued.attempt_id.clone());
+            if !current_queue.contains(&key) {
+                journaled.remove(&key);
+            }
+        }
+        let mut newly_parked = Vec::new();
         for queued in &mut snapshot.queued_requests {
             queued.executor_id = executor_id.to_string();
+            let key = (queued.request_id.clone(), queued.attempt_id.clone());
+            let placement = placements.iter().rev().find(|decision| {
+                decision.request_id == queued.request_id && decision.attempt_id == queued.attempt_id
+            });
+            match placement {
+                Some(placement) if !journaled.contains(&key) => {
+                    newly_parked.push(AdmissionParkedEvidence {
+                        executor_id: executor_id.to_string(),
+                        executor_name: executor_public_name(entry),
+                        queued: queued.clone(),
+                        admission: health.admission.clone(),
+                        machine: health.machine.clone(),
+                        placement: placement.clone(),
+                    });
+                    journaled.insert(key);
+                }
+                _ => {}
+            }
             if queued.substrate_hold.is_none()
                 && missing_wait_reason_is_new(&entry.snapshot, queued)
             {
@@ -2485,6 +2981,26 @@ impl Fleet {
                     queued.request_id,
                     queued.attempt_id,
                 );
+            }
+        }
+        drop(journaled);
+        drop(placements);
+        for parked in newly_parked {
+            match serde_json::to_string(&parked) {
+                Ok(evidence) => log::warn!(
+                    target: "cairn::fleet::admission",
+                    "admission parked request_id={} attempt_id={} evidence={}",
+                    parked.queued.request_id,
+                    parked.queued.attempt_id,
+                    evidence,
+                ),
+                Err(error) => log::warn!(
+                    target: "cairn::fleet::admission",
+                    "admission parked request_id={} attempt_id={} serialization_error={}",
+                    parked.queued.request_id,
+                    parked.queued.attempt_id,
+                    error,
+                ),
             }
         }
         for execution in &mut snapshot.executing_requests {
@@ -2708,7 +3224,34 @@ impl Fleet {
                 .queued_requests
                 .iter()
                 .find(|queued| queued.request_id == request_id)
-                .and_then(|queued| queued.substrate_hold.clone())
+                .map(|queued| {
+                    queued.substrate_hold.clone().unwrap_or_else(|| {
+                        let queue_position = entry
+                            .snapshot
+                            .queued_requests
+                            .iter()
+                            .position(|candidate| candidate.request_id == request_id)
+                            .map(|position| position + 1);
+                        ExecutorSubstrateEvidence {
+                            state: ExecutorSubstrateState::CapacityBusy,
+                            since_unix_ms: queued.queued_at_unix_ms,
+                            last_progress_unix_ms: entry.last_progress_unix_ms,
+                            diagnostic: Some(
+                                "executor reported queue membership before its admission reason"
+                                    .into(),
+                            ),
+                            queue_depth: Some(entry.snapshot.queued_requests.len()),
+                            queue_position,
+                            active_cell_count: Some(entry.snapshot.executing_requests.len()),
+                            oldest_running_started_at_unix_ms: entry
+                                .snapshot
+                                .executing_requests
+                                .iter()
+                                .map(|request| request.started_at_unix_ms)
+                                .min(),
+                        }
+                    })
+                })
         })
     }
 
@@ -2906,6 +3449,8 @@ impl Fleet {
             } else {
                 cairn_common::executor_protocol::CellCompletionVerdict::Failed
             },
+            failure_output_tail: None,
+            transcript_event_uri: None,
             resource_reservation: None,
             learned_estimate: None,
             actuals: None,
@@ -3147,11 +3692,20 @@ impl Fleet {
                     .unwrap_or(1);
             }
         }
+        let placements = self.recent_placements.lock().unwrap();
         for queued in &mut aggregate.queued_requests {
             queued.subscriber_count = counts
                 .get(&(queued.request_id.clone(), queued.attempt_id.clone()))
                 .copied()
                 .unwrap_or(1);
+            queued.placement = placements
+                .iter()
+                .rev()
+                .find(|decision| {
+                    decision.request_id == queued.request_id
+                        && decision.attempt_id == queued.attempt_id
+                })
+                .map(queued_placement_evidence);
         }
         for completion in &mut aggregate.recent_completions {
             completion.subscriber_count = counts
@@ -3216,6 +3770,27 @@ impl Fleet {
 
     /// Keep one placement decision, evicting the oldest past the bound.
     fn record_placement_decision(&self, decision: PlacementDecision) {
+        for rejection in &decision.rejected {
+            // The in-memory ledger is deliberately bounded. Emit each rejection
+            // independently so the runner journal remains a durable witness,
+            // including the typed reason's capacity numbers.
+            match serde_json::to_string(rejection) {
+                Ok(rejection) => log::warn!(
+                    target: "cairn::fleet::placement",
+                    "placement rejection request_id={} attempt_id={} rejection={}",
+                    decision.request_id,
+                    decision.attempt_id,
+                    rejection
+                ),
+                Err(error) => log::warn!(
+                    target: "cairn::fleet::placement",
+                    "placement rejection request_id={} attempt_id={} serialization_error={}",
+                    decision.request_id,
+                    decision.attempt_id,
+                    error
+                ),
+            }
+        }
         let mut recent = self.recent_placements.lock().unwrap();
         if recent.len() >= RECENT_PLACEMENT_DECISIONS {
             recent.pop_front();
@@ -3331,6 +3906,17 @@ impl Fleet {
                 Err("executor drain-mode update timed out".into())
             }
         }
+    }
+
+    pub fn set_desired_executor_runtime_policy(
+        &self,
+        executor_id: &str,
+        policy: cairn_common::executor_protocol::ExecutorRuntimePolicy,
+    ) {
+        self.desired_runtime_policies
+            .lock()
+            .unwrap()
+            .insert(executor_id.to_string(), policy);
     }
 
     pub(crate) fn cancel_request(&self, request_id: &str) -> bool {
@@ -3902,15 +4488,17 @@ impl Fleet {
                 // and an untyped placement failure is a refusal by construction.
                 let substrate =
                     self.executor_deadline_evidence(&selected.executor_id, selected.generation);
+                let diagnostic =
+                    self.residency_silence_diagnostic(&selected.executor_id, selected.generation);
                 residency_core_failure(
                     ResidencyFailureKind::Admission,
-                    "residency operation stopped reporting progress",
+                    diagnostic.clone(),
                     Some(CellOutcome::Unavailable {
                         reason: CellUnavailableReason::Deadline {
                             host_pressure: None,
                             substrate: Some(substrate),
                         },
-                        diagnostic: "residency operation stopped reporting progress".into(),
+                        diagnostic,
                     }),
                 )
             }
@@ -4325,13 +4913,35 @@ impl Fleet {
     /// cadence. Checks run sequentially and every item runs even after a red, so
     /// one failing check never hides the verdicts behind it.
     fn check_process_batch(
-        items: Vec<ProcessBatchItem>,
+        mut items: Vec<ProcessBatchItem>,
         runner_context_id: Option<String>,
     ) -> ProcessBatch {
+        let mut files = Vec::new();
+        for item in &mut items {
+            // Zero is the executor protocol's unbounded-process sentinel. Check
+            // duration estimates inform placement, but elapsed time cannot turn a
+            // live check into a failure.
+            item.timeout_ms = 0;
+            if let Some(index) = item
+                .env
+                .iter()
+                .position(|(key, _)| key == "CAIRN_CHECK_CHANGED_FILES_CONTENT")
+            {
+                let (_, contents) = item.env.remove(index);
+                if files.is_empty() {
+                    files.push(ProcessBatchFile {
+                        env: "CAIRN_CHECK_CHANGED_FILES".to_string(),
+                        contents,
+                    });
+                }
+            }
+        }
         ProcessBatch {
+            files,
             sequential: true,
             stop_on_error: false,
             sandbox_mode: Self::CHECK_CADENCE_SANDBOX_MODE,
+            timeout_bases: Vec::new(),
             items,
             runner_context_id,
             execution_residency: None,
@@ -4418,17 +5028,24 @@ impl Fleet {
                 .iter()
                 .map(|item| item.result_identity.clone())
                 .collect();
+            let coalesced_output = output_guard::RelayedOutput::shared();
+            let flushed_context = run_context.clone();
             let runner_context_id = run_context.map(|run_context| {
                 let id = uuid::Uuid::new_v4().to_string();
                 self.runner_contexts.lock().unwrap().insert(
                     id.clone(),
-                    RunnerCallbackContext {
-                        request: None,
-                        run_context: Some(run_context),
-                        check_status_board: None,
-                        live_checkout: false,
-                        executor_binding: None,
-                    },
+                    RunnerContextEntry::new(
+                        &id,
+                        &request.request_id,
+                        RunnerCallbackContext {
+                            request: None,
+                            run_context: Some(run_context),
+                            check_status_board: None,
+                            live_checkout: false,
+                            executor_binding: None,
+                            output: coalesced_output.clone(),
+                        },
+                    ),
                 );
                 id
             });
@@ -4460,6 +5077,11 @@ impl Fleet {
                 };
                 pool.preparing_leaders.lock().unwrap().remove(&leader);
                 if let Some(id) = runner_context_id {
+                    output_guard::flush_batch_output(
+                        &orch,
+                        &coalesced_output,
+                        flushed_context.as_ref(),
+                    );
                     pool.runner_contexts.lock().unwrap().remove(&id);
                 }
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
@@ -4588,15 +5210,22 @@ impl Fleet {
         batch: ResolvedRunBatch,
     ) -> CellOutcome {
         let runner_context_id = uuid::Uuid::new_v4().to_string();
+        let output = output_guard::RelayedOutput::shared();
+        let run_context = batch.run_context.clone();
         self.runner_contexts.lock().unwrap().insert(
             runner_context_id.clone(),
-            RunnerCallbackContext {
-                request: Some(batch.request.clone()),
-                run_context: batch.run_context.clone(),
-                check_status_board: None,
-                live_checkout: runs_in_live_checkout(&request.repository),
-                executor_binding: None,
-            },
+            RunnerContextEntry::new(
+                &runner_context_id,
+                &format!("{}:{}", request.request_id, request.attempt_id),
+                RunnerCallbackContext {
+                    request: Some(batch.request.clone()),
+                    run_context: batch.run_context.clone(),
+                    check_status_board: None,
+                    live_checkout: runs_in_live_checkout(&request.repository),
+                    executor_binding: None,
+                    output: output.clone(),
+                },
+            ),
         );
         let sandbox_mode = Self::batch_sandbox_mode(
             crate::mcp::handlers::fence::resolve_run_fence(orch, &batch.request)
@@ -4619,6 +5248,7 @@ impl Fleet {
             }
         };
         let outcome = self.submit_execution(orch, request, Some(batch)).await;
+        output_guard::flush_batch_output(orch, &output, run_context.as_ref());
         self.runner_contexts
             .lock()
             .unwrap()
@@ -4645,18 +5275,26 @@ impl Fleet {
             );
         }
         let runner_context_id = uuid::Uuid::new_v4().to_string();
+        let output = output_guard::RelayedOutput::shared();
+        let flushed_context = run_context.clone();
         self.runner_contexts.lock().unwrap().insert(
             runner_context_id.clone(),
-            RunnerCallbackContext {
-                request: None,
-                run_context,
-                check_status_board,
-                live_checkout: false,
-                executor_binding: None,
-            },
+            RunnerContextEntry::new(
+                &runner_context_id,
+                &format!("{}:{}", request.request_id, request.attempt_id),
+                RunnerCallbackContext {
+                    request: None,
+                    run_context,
+                    check_status_board,
+                    live_checkout: false,
+                    executor_binding: None,
+                    output: output.clone(),
+                },
+            ),
         );
         let batch = Self::check_process_batch(items, Some(runner_context_id.clone()));
         let outcome = self.submit_execution(orch, request, Some(batch)).await;
+        output_guard::flush_batch_output(orch, &output, flushed_context.as_ref());
         self.runner_contexts
             .lock()
             .unwrap()
@@ -4679,12 +5317,21 @@ impl Fleet {
             .lock()
             .unwrap()
             .get(context_id)
-            .cloned()
+            .map(|entry| entry.context.clone())
         else {
             return RunnerCallbackResult::Failed {
                 diagnostic: "unknown or expired runner callback context".into(),
             };
         };
+        // Scrubbed before it is published, against this runner's registry rather
+        // than the executor's. See `output_guard` for why both passes exist and
+        // why neither subsumes the other. The withheld tail is released by
+        // `flush_batch_output` when the batch settles.
+        let payload = context
+            .output
+            .lock()
+            .unwrap()
+            .settle_text(stream_id, &payload);
         if let Some(run_context) = context.run_context {
             if let Some(board) = context.check_status_board {
                 if let Some(index) = stream_id
@@ -4695,15 +5342,19 @@ impl Fleet {
                     board.transition(index, "running", None);
                 }
             }
-            let _ = orch.services.emitter.emit(
-                "run-output",
-                serde_json::json!({
-                    "runId": run_context.run_id,
-                    "toolUseId": stream_id,
-                    "chunk": payload,
-                    "stream": "stdout",
-                }),
-            );
+            // A chunk that was entirely withheld is not a chunk yet. Publishing
+            // an empty one would render as a flicker with nothing behind it.
+            if !payload.is_empty() {
+                let _ = orch.services.emitter.emit(
+                    "run-output",
+                    serde_json::json!({
+                        "runId": run_context.run_id,
+                        "toolUseId": stream_id,
+                        "chunk": payload,
+                        "stream": "stdout",
+                    }),
+                );
+            }
         }
         RunnerCallbackResult::Completed
     }
@@ -4741,7 +5392,7 @@ impl Fleet {
             .lock()
             .unwrap()
             .get(context_id)
-            .cloned()
+            .map(|entry| entry.context.clone())
         else {
             return RunnerCallbackResult::Failed {
                 diagnostic: "unknown or expired runner callback context".into(),
@@ -4984,9 +5635,6 @@ impl Fleet {
         };
         let profile_context = ReservationPlan::profile_context(&selected);
         let batch_profile_identities = plan.batch_identities.clone();
-        // The winning candidate's estimate is the one that is submitted. It was
-        // resolved in this machine's own profile context during selection, so
-        // there is exactly one number and exactly one rationale behind it.
         if let Some(resolved) = reservation {
             request.resource_reservation = resolved.reservation;
             request.learned_estimate = resolved.learned_estimate;
@@ -5357,24 +6005,43 @@ impl Fleet {
                         .await
                 }
             };
+            let load = candidate_load(entry);
+            let contention = match &oracle.db {
+                Some(db) => {
+                    resource_profiles::resolve_contention(db.clone(), &context, &load, now).await
+                }
+                None => resource_profiles::contention_prior(&load),
+            };
             let prices = QueuePrices::resolve(&oracle, entry, &context, now).await;
             let queue = forecast_queue_wait(entry, &prices, request, now);
             let sync_cost = estimate(request, entry);
             sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
             predictions.insert(
                 entry.identity.executor_id.clone(),
-                placement_prediction(entry, warmth, queue, run, sync_cost),
+                placement_prediction_with_contention(
+                    entry, warmth, queue, run, contention, sync_cost,
+                ),
             );
         }
-        // Stage three: rank on when each machine is predicted to answer.
+        // Stage three: rank on when each machine is predicted to answer. Budget
+        // inspection and consumption share one short critical section, after all
+        // asynchronous prediction work, so concurrent waves cannot spend the
+        // same exploration slot.
+        let mut exploration_by_work_class = self.exploration_by_work_class.lock().unwrap();
+        let exploration = exploration_by_work_class
+            .entry(request.placement_work_class)
+            .or_default();
         let draft = rank_survey(
             request,
             survey,
-            &reservations,
-            &predictions,
-            &sync_costs,
-            policy,
-            now,
+            SurveyRankingContext {
+                reservations: &reservations,
+                predictions: &predictions,
+                sync_costs: &sync_costs,
+                policy,
+                now_unix_ms: now,
+                exploration,
+            },
         )
         .map_err(refuse)?;
         let Some((selected, selection)) = draft.selected else {
@@ -5397,6 +6064,13 @@ impl Fleet {
             // sender.
             return Ok(None);
         }
+        if request.placement_mobility.may_spill() && !placement_settled_by_caller(request) {
+            exploration.record(
+                (selection.reason == PlacementReason::BootstrapExploration)
+                    .then_some(selection.executor_id.as_str()),
+            );
+        }
+        drop(exploration_by_work_class);
         let reservation = reservations.remove(&selected.executor_id);
         let decision = placement_decision(
             request,
@@ -5787,7 +6461,14 @@ fn prior_predictions(
         sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
         predictions.insert(
             entry.identity.executor_id.clone(),
-            placement_prediction(entry, warmth, queue, run, sync_cost),
+            placement_prediction_with_contention(
+                entry,
+                warmth,
+                queue,
+                run,
+                resource_profiles::contention_prior(&candidate_load(entry)),
+                sync_cost,
+            ),
         );
     }
     (predictions, sync_costs)
@@ -5846,11 +6527,14 @@ fn choose_executor_with_policy(
     rank_survey(
         request,
         survey,
-        reservations,
-        &predictions,
-        &sync_costs,
-        policy,
-        now_unix_ms,
+        SurveyRankingContext {
+            reservations,
+            predictions: &predictions,
+            sync_costs: &sync_costs,
+            policy,
+            now_unix_ms,
+            exploration: &ExplorationState::default(),
+        },
     )
 }
 
@@ -6062,17 +6746,30 @@ fn untrusted_verdict_platform_diagnostic(
     )
 }
 
+struct SurveyRankingContext<'a> {
+    reservations: &'a HashMap<String, resource_profiles::ResolvedResourceProfile>,
+    predictions: &'a HashMap<String, PlacementPrediction>,
+    sync_costs: &'a HashMap<String, SyncCost>,
+    policy: &'a ActivePlacementPolicy,
+    now_unix_ms: u64,
+    exploration: &'a ExplorationState,
+}
+
 /// Rank what survived the survey, on the estimates and readings each machine
 /// carries.
 fn rank_survey(
     request: &CellRequest,
     survey: CandidateSurvey<'_>,
-    reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
-    predictions: &HashMap<String, PlacementPrediction>,
-    sync_costs: &HashMap<String, SyncCost>,
-    policy: &ActivePlacementPolicy,
-    now_unix_ms: u64,
+    context: SurveyRankingContext<'_>,
 ) -> Result<PlacementDraft, String> {
+    let SurveyRankingContext {
+        reservations,
+        predictions,
+        sync_costs,
+        policy,
+        now_unix_ms,
+        exploration,
+    } = context;
     let CandidateSurvey {
         usable,
         mut rejected,
@@ -6120,8 +6817,14 @@ fn rank_survey(
         })
         .collect();
 
-    let (winner, ranked, changed_earliest_winner) =
-        rank_candidates(&scored, settled, exercising_spill, request, policy);
+    let (winner, ranked, changed_earliest_winner, bootstrap_exploration) = rank_candidates(
+        &scored,
+        settled,
+        exercising_spill,
+        request,
+        policy,
+        exploration,
+    );
     let Some(winner) = winner else {
         // Every usable machine was measured-blind and none of them was a
         // machine policy is allowed to spill onto. Say so with the evidence.
@@ -6139,6 +6842,8 @@ fn rank_survey(
         PlacementReason::Pinned
     } else if winner.blindness.is_some() && !settled {
         PlacementReason::MeasuredBlindFleet
+    } else if bootstrap_exploration {
+        PlacementReason::BootstrapExploration
     } else if only_candidate {
         PlacementReason::OnlyCandidate
     } else if !targeted && !request.placement_mobility.may_spill() {
@@ -6307,7 +7012,7 @@ impl<'a> ScoredCandidate<'a> {
             prediction.queue = QueueForecast::Unknown {
                 reason: QueueUnknownReason::MeasuredCpuPressure,
             };
-            prediction.predicted_verdict_ms = prediction.run.predicted_ms;
+            prediction.predicted_verdict_ms = prediction.adjusted_run_ms;
         }
         let admission_accepts = !cpu_pressured
             && queue_depth < entry.health.applied_policy.maximum_queue_depth
@@ -6400,9 +7105,11 @@ fn rank_candidates<'a, 'b>(
     exercising_spill: bool,
     request: &CellRequest,
     policy: &ActivePlacementPolicy,
+    exploration: &ExplorationState,
 ) -> (
     Option<&'b ScoredCandidate<'a>>,
     Vec<&'b ScoredCandidate<'a>>,
+    bool,
     bool,
 ) {
     let hard_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
@@ -6458,10 +7165,61 @@ fn rank_candidates<'a, 'b>(
     baseline.sort_by(|a, b| hard_order(a, b).then_with(|| forecast_order(a, b)));
     let earliest = baseline.iter().copied().find(selectable);
     let Some(earliest) = earliest else {
-        return (None, baseline, false);
+        return (None, baseline, false, false);
     };
     if settled_by_caller || !exercising_spill {
-        return (Some(earliest), baseline, false);
+        return (Some(earliest), baseline, false, false);
+    }
+
+    // A prior is not evidence about a machine, and pure exploitation can never
+    // turn it into evidence. One in every four spill decisions for this work
+    // class may spend otherwise-idle, admission-ready capacity acquiring it. The
+    // other three decisions remain pure earliest-verdict placements, so a machine
+    // that repeatedly fails before completion or reports unusable measurements
+    // cannot monopolize work. Candidates rotate by their most recent exploration,
+    // which gives every fresh machine a bounded turn instead of retrying the first
+    // executor forever. Failed object transfer never reaches `observe_completed`,
+    // so those attempts consume budget but never become duration samples.
+    let exploration_due = exploration.decisions_since_exploration >= EXPLORATION_INTERVAL - 1;
+    let last_explored = |candidate: &&ScoredCandidate<'a>| {
+        exploration
+            .explored_executors
+            .iter()
+            .position(|executor_id| executor_id == &candidate.entry.identity.executor_id)
+    };
+    let exploration = exploration_due
+        .then(|| {
+            baseline
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    selectable(candidate)
+                        && candidate.misfit.is_none()
+                        && candidate.admission_accepts
+                        && candidate.prediction.queue.predicted_ms() == Some(0)
+                        && candidate.prediction.run.profile_key.is_some()
+                        && matches!(
+                            candidate.prediction.run.fallback,
+                            Some(
+                                DurationFallback::NoProfileRecorded
+                                    | DurationFallback::BelowConfidenceFloor
+                                    | DurationFallback::ProfileTooOld
+                            )
+                        )
+                })
+                .min_by(|a, b| match (last_explored(a), last_explored(b)) {
+                    (None, None) => forecast_order(a, b),
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(a_age), Some(b_age)) => {
+                        a_age.cmp(&b_age).then_with(|| forecast_order(a, b))
+                    }
+                })
+        })
+        .flatten();
+    if let Some(exploration) = exploration {
+        let changed = exploration.entry.identity.executor_id != earliest.entry.identity.executor_id;
+        return (Some(exploration), baseline, changed, true);
     }
 
     let deadline = earliest.prediction.predicted_verdict_ms.saturating_add(
@@ -6508,7 +7266,7 @@ fn rank_candidates<'a, 'b>(
     let changed = winner.is_some_and(|winner| {
         winner.entry.identity.executor_id != earliest.entry.identity.executor_id
     });
-    (winner, ranked, changed)
+    (winner, ranked, changed, false)
 }
 
 /// What this machine already holds for this request, read off the facts it
@@ -6843,11 +7601,12 @@ fn forecast_queue_wait(
 /// not summed as zero either: it contributes nothing to the number and says so
 /// on the record, so a machine whose queue could not be read never wins by
 /// looking empty.
-fn placement_prediction(
+fn placement_prediction_with_contention(
     entry: &ExecutorConnectionState,
     warmth: CacheWarmthEvidence,
     queue: QueueForecast,
     run: DurationEstimate,
+    contention: ContentionEstimate,
     sync_cost: SyncCost,
 ) -> PlacementPrediction {
     let preparation = match sync_cost {
@@ -6855,16 +7614,21 @@ fn placement_prediction(
         SyncCost::Known(bytes) => PreparationForecast::TransferPending { bytes },
         SyncCost::Unknown => PreparationForecast::Unknown,
     };
+    let base_run_ms = run.predicted_ms;
+    let adjusted_run_ms = contention.adjusted_ms(base_run_ms);
     PlacementPrediction {
         executor_name: executor_public_name(entry),
         executor_id: entry.identity.executor_id.clone(),
         predicted_verdict_ms: queue
             .predicted_ms()
             .unwrap_or(0)
-            .saturating_add(run.predicted_ms),
+            .saturating_add(adjusted_run_ms),
         queue,
         preparation,
         run,
+        base_run_ms,
+        adjusted_run_ms,
+        contention,
         warmth,
     }
 }
@@ -6884,7 +7648,7 @@ fn unpredicted_candidate(
         &entry.identity.executor_id,
         &entry.advertisement.capabilities,
     );
-    placement_prediction(
+    placement_prediction_with_contention(
         entry,
         CacheWarmthEvidence::Unknown {
             reason: WarmthUnknownReason::FactsStale,
@@ -6899,6 +7663,7 @@ fn unpredicted_candidate(
             ExecutionWarmth::Cold,
             DurationFallback::NoProfileStore,
         ),
+        resource_profiles::contention_prior(&candidate_load(entry)),
         sync_cost,
     )
 }
@@ -7282,6 +8047,7 @@ impl ReservationPlan {
                 learned_estimate: request.learned_estimate.clone(),
                 rationale: resource_profiles::declared_rationale(&context, self.stated.clone()),
                 duration: self.predict_duration(&context, duration_context).await,
+                item_durations: Vec::new(),
             };
         }
         // Whether the caller declared concurrency is decided here, before the
@@ -7297,11 +8063,18 @@ impl ReservationPlan {
                 self.request_identity.as_ref(),
                 &context,
                 prior,
+                capabilities.memory_budget_bytes,
                 duration_context,
             )
             .await
         } else {
-            self.resolve_batch(&context, prior, duration_context).await
+            self.resolve_batch(
+                &context,
+                prior,
+                capabilities.memory_budget_bytes,
+                duration_context,
+            )
+            .await
         };
         // Whole-machine demand is declared as saturation because the submitter
         // cannot know which executor would be chosen. Clamp it to this executor's
@@ -7396,10 +8169,12 @@ impl ReservationPlan {
         &self,
         context: &resource_profiles::ProfileContext,
         prior: ResourceReservation,
+        memory_budget_bytes: Option<u64>,
         duration_context: resource_profiles::DurationContext,
     ) -> resource_profiles::ResolvedResourceProfile {
         let mut reservation = ResourceReservation::default();
         let mut learned_estimates = Vec::with_capacity(self.batch_identities.len());
+        let mut item_durations = Vec::with_capacity(self.batch_identities.len());
         // No item has spoken yet, so there is no rationale to seed: an unconsulted
         // batch must not carry a stand-in explanation that could survive as one.
         let mut rationale: Option<ReservationRationale> = None;
@@ -7409,6 +8184,7 @@ impl ReservationPlan {
                 Some(identity),
                 context,
                 prior.clone(),
+                memory_budget_bytes,
                 duration_context,
             )
             .await;
@@ -7430,6 +8206,7 @@ impl ReservationPlan {
                 rationale = Some(item.rationale.clone());
             }
             learned_estimates.push(item.learned_estimate);
+            item_durations.push(item.duration);
         }
         resource_profiles::ResolvedResourceProfile {
             reservation,
@@ -7437,6 +8214,7 @@ impl ReservationPlan {
             rationale: rationale
                 .unwrap_or_else(|| resource_profiles::declared_rationale(context, prior)),
             duration: self.predict_batch_duration(context, duration_context).await,
+            item_durations,
         }
     }
 }
@@ -7673,7 +8451,10 @@ fn serialize_process_batch(
                 timeout,
                 stdin,
             } => (ProcessBatchExecution::Direct, program, args, stdin, timeout),
-            RunSpec::McpCall(_) | RunSpec::ReplSend { .. } => {
+            RunSpec::McpCall(_)
+            | RunSpec::ExecutorAction(_)
+            | RunSpec::ResponseCall { .. }
+            | RunSpec::ReplSend { .. } => {
                 return Err(format!(
                     "{header} is not process-backed and cannot use a build cell"
                 ))
@@ -7691,15 +8472,17 @@ fn serialize_process_batch(
             // ceiling, an explicit one is honored up to it. This layer used to
             // apply no bound of its own while the socket above it applied a
             // smaller one, which is how a suite's output was lost.
-            timeout_ms: crate::mcp::handlers::run::clamp_run_item_timeout_ms(timeout),
+            timeout_ms: crate::mcp::handlers::run::clamp_run_item_timeout_ms(timeout).into(),
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
         });
     }
     Ok(ProcessBatch {
+        files: Vec::new(),
         sequential: batch.originally_sequential,
         stop_on_error: batch.stop_on_error,
         sandbox_mode,
+        timeout_bases: Vec::new(),
         items,
         runner_context_id: Some(runner_context_id),
         execution_residency: batch.execution_residency,
@@ -7750,16 +8533,16 @@ fn request_watchdog_duration(
         Duration::from_secs(MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS * 2)
     };
     let execution = match batch {
-        None => Duration::from_millis(u64::from(request.timeout_ms)),
+        None => Duration::from_millis(request.timeout_ms),
         Some(batch) if batch.sequential => {
             batch.items.iter().fold(Duration::ZERO, |total, item| {
-                total.saturating_add(Duration::from_millis(u64::from(item.timeout_ms)))
+                total.saturating_add(Duration::from_millis(item.timeout_ms))
             })
         }
         Some(batch) => batch
             .items
             .iter()
-            .map(|item| Duration::from_millis(u64::from(item.timeout_ms)))
+            .map(|item| Duration::from_millis(item.timeout_ms))
             .max()
             .unwrap_or(Duration::ZERO),
     };
@@ -7813,6 +8596,71 @@ pub(crate) fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A machine's desktop configuration is keyed by the name it answers to, so
+    /// the two operations that change which names exist have to move it.
+    #[test]
+    fn desktop_configuration_follows_a_machine_through_rename_and_removal() {
+        let mut config = DesktopAutomationConfig {
+            enabled: true,
+            machines: HashMap::from([(
+                "bglab-win".to_string(),
+                MachineDesktopAutomation {
+                    enabled: None,
+                    binary: Some(r"C:\axon\axon-win.exe".to_string()),
+                },
+            )]),
+        };
+
+        config.rename_machine("BGLab Win", "bglab-windows");
+        assert_eq!(
+            config.resolve("bglab-windows", "windows").binary,
+            r"C:\axon\axon-win.exe",
+            "a renamed machine keeps the binary it was configured with"
+        );
+        assert!(
+            !config.machines.contains_key("bglab-win"),
+            "the old name is not left behind addressing nothing"
+        );
+
+        config.forget_machine("bglab-windows");
+        assert!(config.machines.is_empty());
+        assert_eq!(
+            config.resolve("bglab-windows", "windows").binary,
+            "axon-win.exe",
+            "a forgotten machine falls back to the platform default"
+        );
+    }
+
+    #[test]
+    fn desktop_automation_resolves_inheritance_binary_and_normalized_machine_name() {
+        let mut config = DesktopAutomationConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        config.machines.insert(
+            "bglab-win".into(),
+            MachineDesktopAutomation {
+                enabled: Some(true),
+                binary: Some(r"C:\\Axon\\axon.exe".into()),
+            },
+        );
+
+        assert_eq!(
+            config.resolve("BGLAB WIN", "windows"),
+            ResolvedDesktopAutomation {
+                enabled: true,
+                binary: r"C:\\Axon\\axon.exe".into(),
+            }
+        );
+        assert_eq!(
+            DesktopAutomationConfig::default().resolve("local", "linux"),
+            ResolvedDesktopAutomation {
+                enabled: true,
+                binary: "axon-linux".into(),
+            }
+        );
+    }
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
@@ -7836,18 +8684,23 @@ mod tests {
     fn insert_bound_relay_context(pool: &Fleet) {
         pool.runner_contexts.lock().unwrap().insert(
             "context".into(),
-            RunnerCallbackContext {
-                request: Some(relay_request(Some("run-1"))),
-                run_context: None,
-                check_status_board: None,
-                live_checkout: false,
-                executor_binding: Some(RunnerContextExecutorBinding {
-                    executor_id: "executor-1".into(),
-                    generation: 7,
-                    request_id: "request-1".into(),
-                    attempt_id: "attempt-1".into(),
-                }),
-            },
+            RunnerContextEntry::new(
+                "context",
+                "request-1:attempt-1",
+                RunnerCallbackContext {
+                    request: Some(relay_request(Some("run-1"))),
+                    run_context: None,
+                    check_status_board: None,
+                    live_checkout: false,
+                    executor_binding: Some(RunnerContextExecutorBinding {
+                        executor_id: "executor-1".into(),
+                        generation: 7,
+                        request_id: "request-1".into(),
+                        attempt_id: "attempt-1".into(),
+                    }),
+                    output: output_guard::RelayedOutput::shared(),
+                },
+            ),
         );
     }
 
@@ -8068,9 +8921,11 @@ mod tests {
         let injected = vec![("SCCACHE_SERVER_PORT".to_string(), "4227".to_string())];
         let batch = with_cell_client_env(
             ProcessBatch {
+                files: Vec::new(),
                 sequential: false,
                 stop_on_error: true,
                 sandbox_mode: ProcessSandboxMode::Unconfined,
+                timeout_bases: Vec::new(),
                 items: vec![
                     cache_batch_item(Vec::new()),
                     cache_batch_item(vec![(
@@ -9055,9 +9910,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(batch.items[0].timeout_ms, 3_000);
-        assert_eq!(batch.items[1].timeout_ms, ceiling);
+        assert_eq!(batch.items[1].timeout_ms, u64::from(ceiling));
         assert_eq!(batch.items[2].timeout_ms, 3_600_000);
-        assert_eq!(batch.items[3].timeout_ms, ceiling);
+        assert_eq!(batch.items[3].timeout_ms, u64::from(ceiling));
         assert_eq!(
             batch.items[0].env,
             [(
@@ -9705,6 +10560,33 @@ mod tests {
     }
 
     #[test]
+    fn check_batches_discard_declared_duration_kill_budgets() {
+        let item = |header: &str, timeout_ms| ProcessBatchItem {
+            header: header.into(),
+            stream_id: header.into(),
+            execution: ProcessBatchExecution::Direct,
+            program: "true".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            stdin: None,
+            timeout_ms,
+            command_resource_identity: None,
+            verdict_environment_names: Vec::new(),
+        };
+
+        let batch = Fleet::check_process_batch(
+            vec![item("learned", 180_000), item("unmeasured", 900_000)],
+            None,
+        );
+
+        assert!(
+            batch.items.iter().all(|item| item.timeout_ms == 0),
+            "configured and learned duration bounds both lose kill authority"
+        );
+        assert!(batch.timeout_bases.is_empty());
+    }
+
+    #[test]
     fn watchdog_covers_preparation_and_full_process_batch_budget() {
         let mut request = targeted_request(std::env::consts::OS);
         request.wait_horizon_unix_ms = unix_time_ms();
@@ -9718,9 +10600,11 @@ mod tests {
             population_source_root: None,
         };
         let batch = ProcessBatch {
+            files: Vec::new(),
             sequential: true,
             stop_on_error: false,
             sandbox_mode: ProcessSandboxMode::Unconfined,
+            timeout_bases: Vec::new(),
             items: vec![
                 ProcessBatchItem {
                     header: "one".into(),
@@ -9753,7 +10637,30 @@ mod tests {
 
         let budget = request_watchdog_duration(&request, Some(&batch), &config, true);
         assert!(budget >= Duration::from_millis(5_300));
-        assert!(budget > Duration::from_millis(u64::from(request.timeout_ms)));
+        assert!(budget > Duration::from_millis(request.timeout_ms));
+    }
+
+    #[test]
+    fn remote_watchdog_reserves_both_managed_object_transfer_deadlines() {
+        let mut request = targeted_request(std::env::consts::OS);
+        request.wait_horizon_unix_ms = unix_time_ms();
+        request.timeout_ms = 60_000;
+        let config = ExecutorConfig {
+            project_id: request.project_id.clone(),
+            project_key: "CAIRN".into(),
+            default_timeout_seconds: 60,
+            setup_commands: Vec::new(),
+            populate: Default::default(),
+            population_source_root: None,
+        };
+
+        let colocated = request_watchdog_duration(&request, None, &config, true);
+        let remote = request_watchdog_duration(&request, None, &config, false);
+        assert_eq!(
+            remote - colocated,
+            Duration::from_secs(MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS * 2),
+            "remote execution must reserve one whole-request deadline for fetch and one for upload"
+        );
     }
 
     /// An item that omits `timeout` now carries the six-hour ceiling as its
@@ -9767,7 +10674,7 @@ mod tests {
             Duration::from_millis(u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS));
         let mut request = targeted_request(std::env::consts::OS);
         request.wait_horizon_unix_ms = unix_time_ms();
-        request.timeout_ms = cairn_common::run_contract::RUN_BATCH_CEILING_MS;
+        request.timeout_ms = u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS);
         let config = ExecutorConfig {
             project_id: request.project_id.clone(),
             project_key: "CAIRN".into(),
@@ -9784,14 +10691,16 @@ mod tests {
             args: Vec::new(),
             env: Vec::new(),
             stdin: None,
-            timeout_ms: cairn_common::run_contract::RUN_BATCH_CEILING_MS,
+            timeout_ms: u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS),
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
         };
         let batch = |sequential: bool| ProcessBatch {
+            files: Vec::new(),
             sequential,
             stop_on_error: false,
             sandbox_mode: ProcessSandboxMode::Unconfined,
+            timeout_bases: Vec::new(),
             items: vec![item("one"), item("two")],
             runner_context_id: None,
             execution_residency: None,
@@ -10143,12 +11052,13 @@ mod tests {
         ];
 
         let request = spillable_request();
-        let (winner, _, _) = rank_candidates(
+        let (winner, _, _, _) = rank_candidates(
             &scored,
             false,
             true,
             &request,
             &ActivePlacementPolicy::default_profile(),
+            &ExplorationState::default(),
         );
         assert_eq!(
             winner
@@ -10159,6 +11069,297 @@ mod tests {
             known_id
         );
         assert_ne!(unknown_id, known_id);
+    }
+
+    #[test]
+    fn contention_can_make_an_idle_slower_machine_win() {
+        let (_, mut fast_busy) = fleet_entry("fast-busy", "linux", 0, &[]);
+        let (idle_id, mut slower_idle) = fleet_entry("slower-idle", "linux", 0, &[]);
+        measured(&mut fast_busy, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut slower_idle, 0.1, 8_000_000_000, 8_000_000_000);
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let queue = QueueForecast::Forecast {
+            predicted_ms: 0,
+            requests_ahead: 0,
+            running_ahead: 0,
+            fully_measured: true,
+            observed_at_unix_ms: NOW,
+        };
+        let mut fast_run = test_prior_duration();
+        fast_run.predicted_ms = 5_000;
+        let mut slower_run = test_prior_duration();
+        slower_run.predicted_ms = 9_000;
+        let busy = ContentionEstimate {
+            co_resident_compile_jobs: 2,
+            co_resident_light_jobs: 0,
+            multiplier_millis: 2_200,
+            source: cairn_common::executor_protocol::ContentionEvidence::Machine,
+            sample_count: 12,
+            fallback: None,
+        };
+        let idle = ContentionEstimate {
+            co_resident_compile_jobs: 0,
+            co_resident_light_jobs: 0,
+            multiplier_millis: 1_000,
+            source: cairn_common::executor_protocol::ContentionEvidence::Machine,
+            sample_count: 12,
+            fallback: None,
+        };
+        let predictions = [
+            placement_prediction_with_contention(
+                &fast_busy,
+                warmth.clone(),
+                queue.clone(),
+                fast_run,
+                busy,
+                SyncCost::Known(0),
+            ),
+            placement_prediction_with_contention(
+                &slower_idle,
+                warmth,
+                queue,
+                slower_run,
+                idle,
+                SyncCost::Known(0),
+            ),
+        ];
+        assert_eq!(predictions[0].predicted_verdict_ms, 11_000);
+        assert_eq!(predictions[1].predicted_verdict_ms, 9_000);
+        let scored = vec![
+            ScoredCandidate::new(
+                &fast_busy,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[0].clone(),
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &slower_idle,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[1].clone(),
+                NOW,
+            ),
+        ];
+        let request = spillable_request();
+        let (winner, _, _, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &ExplorationState::default(),
+        );
+        assert_eq!(winner.unwrap().entry.identity.executor_id, idle_id);
+    }
+
+    #[test]
+    fn idle_unmeasured_capacity_bootstraps_a_profile_before_pure_exploitation() {
+        let (favorite_id, mut favorite) = fleet_entry("favorite", "linux", 0, &[]);
+        let (fresh_id, mut fresh) = fleet_entry("fresh", "linux", 0, &[]);
+        measured(&mut favorite, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut fresh, 0.1, 8_000_000_000, 8_000_000_000);
+
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let mut learned = test_prior_duration();
+        learned.predicted_ms = 10_000;
+        learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
+        learned.sample_count = 20;
+        learned.fallback = None;
+        let favorite_prediction = placement_prediction(
+            &favorite,
+            warmth.clone(),
+            QueueForecast::Forecast {
+                predicted_ms: 0,
+                requests_ahead: 0,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+            },
+            learned,
+            SyncCost::Known(0),
+        );
+        let mut unmeasured = test_prior_duration();
+        unmeasured.profile_key = Some("check:rust".into());
+        unmeasured.fallback = Some(DurationFallback::NoProfileRecorded);
+        let fresh_prediction = placement_prediction(
+            &fresh,
+            warmth,
+            QueueForecast::Forecast {
+                predicted_ms: 0,
+                requests_ahead: 0,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+            },
+            unmeasured,
+            SyncCost::Known(0),
+        );
+        let scored = vec![
+            ScoredCandidate::new(
+                &favorite,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                favorite_prediction,
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &fresh,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                fresh_prediction,
+                NOW,
+            ),
+        ];
+        let request = spillable_request();
+
+        let (winner, _, changed, exploring) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &ExplorationState::default(),
+        );
+
+        assert_eq!(winner.unwrap().entry.identity.executor_id, fresh_id);
+        assert_ne!(favorite_id, fresh_id);
+        assert!(changed);
+        assert!(exploring);
+
+        let mut history = ExplorationState::default();
+        history.record(Some(&fresh_id));
+        let (winner, _, _, exploring) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &history,
+        );
+        assert_eq!(winner.unwrap().entry.identity.executor_id, favorite_id);
+        assert!(!exploring, "the next three waves preserve exploitation");
+
+        for _ in 0..3 {
+            history.record(None);
+        }
+        let (winner, _, _, exploring) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &history,
+        );
+        assert_eq!(winner.unwrap().entry.identity.executor_id, fresh_id);
+        assert!(exploring, "the fourth wave restores the exploration budget");
+    }
+
+    #[test]
+    fn other_work_classes_cannot_evict_an_exploration_cooldown() {
+        let mut states = HashMap::<PlacementWorkClass, ExplorationState>::new();
+        states
+            .entry(PlacementWorkClass::ReviewChecks)
+            .or_default()
+            .record(Some("fresh"));
+
+        for _ in 0..(RECENT_PLACEMENT_DECISIONS * 2) {
+            states
+                .entry(PlacementWorkClass::AgentSessions)
+                .or_default()
+                .record(None);
+        }
+
+        let review = states.get(&PlacementWorkClass::ReviewChecks).unwrap();
+        assert_eq!(review.decisions_since_exploration, 0);
+        assert_eq!(review.explored_executors, VecDeque::from(["fresh".into()]));
+    }
+
+    #[test]
+    fn bootstrap_never_queues_behind_work_on_an_unmeasured_machine() {
+        let (favorite_id, mut favorite) = fleet_entry("favorite", "linux", 0, &[]);
+        let (_fresh_id, mut fresh) = fleet_entry("fresh", "linux", 0, &[]);
+        measured(&mut favorite, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut fresh, 0.1, 8_000_000_000, 8_000_000_000);
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let mut learned = test_prior_duration();
+        learned.predicted_ms = 10_000;
+        learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
+        learned.sample_count = 20;
+        learned.fallback = None;
+        let favorite_prediction = placement_prediction(
+            &favorite,
+            warmth.clone(),
+            QueueForecast::Forecast {
+                predicted_ms: 0,
+                requests_ahead: 0,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+            },
+            learned,
+            SyncCost::Known(0),
+        );
+        let mut unmeasured = test_prior_duration();
+        unmeasured.profile_key = Some("check:rust".into());
+        unmeasured.fallback = Some(DurationFallback::NoProfileRecorded);
+        let fresh_prediction = placement_prediction(
+            &fresh,
+            warmth,
+            QueueForecast::Forecast {
+                predicted_ms: 1_000,
+                requests_ahead: 1,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+            },
+            unmeasured,
+            SyncCost::Known(0),
+        );
+        let scored = vec![
+            ScoredCandidate::new(
+                &favorite,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                favorite_prediction,
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &fresh,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                fresh_prediction,
+                NOW,
+            ),
+        ];
+        let request = spillable_request();
+
+        let (winner, _, _, exploring) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &ExplorationState::default(),
+        );
+
+        assert_eq!(winner.unwrap().entry.identity.executor_id, favorite_id);
+        assert!(!exploring);
     }
 
     fn chosen(draft: &PlacementDraft) -> &PlacementSelection {
@@ -10779,6 +11980,7 @@ mod tests {
 
         let demand = resource_profiles::ResolvedResourceProfile {
             duration: test_prior_duration(),
+            item_durations: Vec::new(),
             reservation: ResourceReservation {
                 memory_bytes: 2 * 1024 * 1024 * 1024,
                 disk_growth_bytes: 1024 * 1024 * 1024,
@@ -10808,6 +12010,58 @@ mod tests {
                 available_bytes: 512 * 1024 * 1024,
             }
         );
+    }
+
+    /// Memory pressure is transient capacity, not a structural placement fault.
+    /// When every measured candidate is short right now, placement still chooses
+    /// one so executor admission can retain and visibly park the request.
+    #[test]
+    fn an_all_memory_constrained_fleet_still_places_for_capacity_waiting() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(
+            &mut local,
+            0.50,
+            512 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
+        );
+        let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured(
+            &mut remote,
+            0.01,
+            768 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        let demand = resource_profiles::ResolvedResourceProfile {
+            duration: test_prior_duration(),
+            item_durations: Vec::new(),
+            reservation: ResourceReservation {
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                disk_growth_bytes: 1024 * 1024 * 1024,
+                concurrency_units: 1,
+                source: ResourceReservationSource::Learned,
+            },
+            learned_estimate: None,
+            rationale: unresolved_rationale(&ResourceReservation::default()),
+        };
+        let reservations = HashMap::from([
+            (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
+            ("bglab-ub".to_string(), demand),
+        ]);
+
+        let draft = choose_executor_with(
+            &connections,
+            &spillable_request(),
+            &reservations,
+            |_, _| SyncCost::Known(0),
+            NOW,
+        )
+        .expect("transient memory pressure must remain placeable for admission waiting");
+
+        assert!(matches!(
+            rejection_for(&draft, COLOCATED_EXECUTOR_ID),
+            PlacementRejectionReason::InsufficientMemory { .. }
+        ));
     }
 
     /// Equal verdict predictions fall through to transfer cost and then stable
@@ -12875,12 +14129,81 @@ mod tests {
                         active_cell_count: Some(2),
                         oldest_running_started_at_unix_ms: Some(now.saturating_sub(50)),
                     }),
+                    placement: None,
                 }],
                 ..FleetSnapshot::default()
             },
             ExecutorSubstrateReport::default(),
         );
         key
+    }
+
+    /// A runner can first see an executor queue after reconnect, before it has
+    /// reconstructed the matching placement ledger entry. That incomplete view
+    /// must not consume the one durable audit transition: later snapshots retry
+    /// the join and journal only once the complete refusal set exists.
+    #[test]
+    fn parked_admission_audit_retries_until_placement_is_complete() {
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        let identity = ("reconnected-park".to_string(), "attempt".to_string());
+        let (waiter, _receiver) = oneshot::channel();
+        register_held_subscriber(
+            &pool,
+            generation,
+            identity.clone(),
+            waiter,
+            ExecutorSubstrateState::CapacityBusy,
+        );
+        assert!(
+            !pool
+                .journaled_admission_parks
+                .lock()
+                .unwrap()
+                .contains(&identity),
+            "a reconnect snapshot without placement evidence must remain retryable"
+        );
+
+        let mut request = spillable_request();
+        request.request_id = identity.0.clone();
+        request.attempt_id = identity.1.clone();
+        let decision = placement_decision(
+            &request,
+            unix_time_ms(),
+            None,
+            PlacementOutcome::Refused {
+                diagnostic: "capacity held".into(),
+            },
+            vec![PlacementRejection {
+                executor_name: "remote".into(),
+                executor_id: "remote".into(),
+                reason: PlacementRejectionReason::NotColocated,
+                prediction: None,
+            }],
+        );
+        pool.record_placement_decision(decision);
+        let snapshot = pool
+            .connections
+            .lock()
+            .unwrap()
+            .get(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .snapshot
+            .clone();
+        pool.set_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            snapshot,
+            ExecutorSubstrateReport::default(),
+        );
+        assert!(
+            pool.journaled_admission_parks
+                .lock()
+                .unwrap()
+                .contains(&identity),
+            "the unchanged queue snapshot must retry and complete the audit join"
+        );
     }
 
     #[tokio::test]
@@ -13188,6 +14511,314 @@ mod tests {
                 )]),
             },
         }
+    }
+
+    // ── Ingested output is scrubbed against this runner's registry ─────────
+    //
+    // Terminals, REPLs, workflows and dev instances are all handed this runner's
+    // own `CAIRN_MCP_SECRET`, and the executor that runs them was never told
+    // what that value is. These cover the pass that closes that gap.
+
+    const RESIDENT_SECRET: &str = "resident-Qa9Zm2Xp7Lr4";
+
+    fn register_resident_secret(id: &str) -> crate::security::SecretGuard<'static> {
+        use crate::security::{registry, SecretCategory, SecretId, SecretMaterial};
+        registry()
+            .register(
+                SecretId::new(id),
+                SecretCategory::CallbackCredential,
+                "unit test",
+                SecretMaterial::from_string(RESIDENT_SECRET.to_string()),
+            )
+            .expect("registerable")
+    }
+
+    /// Collect what reaches resident-process subscribers, in order.
+    fn subscribed_events(pool: &Fleet) -> Arc<Mutex<Vec<ResidentProcessEvent>>> {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let captured = received.clone();
+        pool.subscribe_resident_process_events(move |event| {
+            captured.lock().unwrap().push(event);
+        });
+        received
+    }
+
+    fn resident_output_text(events: &[ResidentProcessEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match &event.event {
+                ResidentProcessEventKind::Output { data, .. } => {
+                    Some(String::from_utf8_lossy(data).into_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The split that a per-chunk pass cannot catch. Relayed output arrives in
+    /// frames whose boundaries fall wherever the executor's coalescer put them,
+    /// so the halves of one credential routinely land in two events.
+    #[test]
+    fn a_credential_split_across_two_resident_events_is_caught() {
+        let _guard = register_resident_secret("resident-split");
+        for at in 1..RESIDENT_SECRET.len() {
+            let pool = Fleet::default();
+            let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+            let generation = pool.attach_executor(executor_tx);
+            let received = subscribed_events(&pool);
+            let residency = fleet_residency(
+                ResidencyHolder::Service {
+                    service_id: "channel-imessage".into(),
+                },
+                None,
+            );
+            let output = |data: &[u8]| ResidentProcessEvent {
+                holder: residency.holder.clone(),
+                incarnation_id: residency.incarnation_id.clone(),
+                cell_epoch: 7,
+                process_key: "main".into(),
+                process_generation: 2,
+                event: ResidentProcessEventKind::Output {
+                    sequence: 1,
+                    stream: cairn_common::executor_protocol::ResidentProcessStream::Stdout,
+                    data: data.to_vec(),
+                },
+            };
+            let full = format!("env: {RESIDENT_SECRET}\n");
+            let (left, right) = full.split_at(at);
+            for chunk in [left, right] {
+                pool.handle_executor_message(
+                    COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::ResidentProcessEvent {
+                        event: output(chunk.as_bytes()),
+                    },
+                );
+            }
+            // The exit is what drains the stream, and asserting the total only
+            // after it is deliberate. How much a scrubber withholds mid-stream is
+            // a schedule, not a guarantee, and this registry is the process-wide
+            // one — any other test in this binary that materializes a callback
+            // credential adds needles to it and shifts that schedule. Pinning the
+            // schedule would make this test fail depending on what ran beside it;
+            // pinning the total is the property it is named for.
+            pool.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::ResidentProcessEvent {
+                    event: exited(&residency),
+                },
+            );
+            let seen = resident_output_text(&received.lock().unwrap());
+            assert!(
+                !seen.contains(RESIDENT_SECRET),
+                "leaked at split {at}: {seen}"
+            );
+            assert_eq!(seen, "env: [REDACTED]\n", "split {at}");
+        }
+    }
+
+    /// The exit event for the fixture's resident process.
+    fn exited(residency: &CellResidency) -> ResidentProcessEvent {
+        ResidentProcessEvent {
+            holder: residency.holder.clone(),
+            incarnation_id: residency.incarnation_id.clone(),
+            cell_epoch: 7,
+            process_key: "main".into(),
+            process_generation: 2,
+            event: ResidentProcessEventKind::State {
+                status: cairn_common::executor_protocol::ResidentProcessStatus::Exited {
+                    finished_at_unix_ms: 42,
+                    exit_code: Some(0),
+                    restartable: false,
+                    executor_lost: false,
+                },
+            },
+        }
+    }
+
+    /// The withheld tail has to reach the scrollback BEFORE the exit that seals
+    /// it. A terminal captures its output tail when it finalizes, so a tail
+    /// released after the exit event lands in a buffer nobody reads again.
+    #[test]
+    fn a_resident_exit_releases_the_withheld_tail_before_the_exit_itself() {
+        let _guard = register_resident_secret("resident-exit");
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        let received = subscribed_events(&pool);
+        let residency = fleet_residency(
+            ResidencyHolder::Service {
+                service_id: "channel-imessage".into(),
+            },
+            None,
+        );
+        let event = |kind| ResidentProcessEvent {
+            holder: residency.holder.clone(),
+            incarnation_id: residency.incarnation_id.clone(),
+            cell_epoch: 7,
+            process_key: "main".into(),
+            process_generation: 2,
+            event: kind,
+        };
+        // Ends on a genuine proper prefix of the registered credential, which is
+        // what the scrubber must withhold: at this moment those bytes are
+        // indistinguishable from the head of a value whose tail is in the next
+        // chunk. Chosen deliberately rather than relying on ordinary text
+        // happening to be withheld, so the test does not depend on what else
+        // this binary registered into the process-wide registry.
+        let head = &RESIDENT_SECRET[..8];
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::ResidentProcessEvent {
+                event: event(ResidentProcessEventKind::Output {
+                    sequence: 1,
+                    stream: cairn_common::executor_protocol::ResidentProcessStream::Stdout,
+                    data: format!("done {head}").into_bytes(),
+                }),
+            },
+        );
+        assert_eq!(
+            resident_output_text(&received.lock().unwrap()),
+            "done ",
+            "the unsettled tail must wait"
+        );
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::ResidentProcessEvent {
+                event: event(ResidentProcessEventKind::State {
+                    status: cairn_common::executor_protocol::ResidentProcessStatus::Exited {
+                        finished_at_unix_ms: 42,
+                        exit_code: Some(0),
+                        restartable: false,
+                        executor_lost: false,
+                    },
+                }),
+            },
+        );
+        let seen = received.lock().unwrap();
+        assert_eq!(
+            resident_output_text(&seen),
+            format!("done {head}"),
+            "the exit owes the stream its tail"
+        );
+        let last = seen.last().expect("an event");
+        assert!(
+            matches!(last.event, ResidentProcessEventKind::State { .. }),
+            "the tail must arrive before the exit, not after it"
+        );
+    }
+
+    /// The model-visible copy of a batch's output, and the diagnostics that
+    /// quote a failing command's output alongside it.
+    #[test]
+    fn a_terminal_outcome_is_scrubbed_before_its_waiter_sees_it() {
+        let _guard = register_resident_secret("resident-outcome");
+        let mut completed = CellOutcome::Completed {
+            request_id: "r".into(),
+            attempt_id: "a".into(),
+            exit_code: Some(0),
+            output: format!("CAIRN_MCP_SECRET={RESIDENT_SECRET}"),
+            timed_out: false,
+            metadata: CellExecutionMeta {
+                warmth: None,
+                load_context: None,
+                executor_id: "executor".into(),
+                executor_device_id: "device".into(),
+                executor_connection_generation: 1,
+                cell_id: "cell".into(),
+                cell_epoch: 1,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                duration_ms: None,
+                peak_rss_bytes: None,
+                peak_physical_footprint_bytes: None,
+                disk_delta_bytes: None,
+                measurement_quality: None,
+                environment_fingerprint: String::new(),
+                verdict_platform: None,
+                verdict_arch: None,
+                verdict_environment_hash: None,
+                toolchain_fingerprint: None,
+            },
+            mutation_delta: None,
+            sandbox_denials: Vec::new(),
+            tracked_modifications: None,
+        };
+        scrub_cell_outcome(&mut completed);
+        match &completed {
+            CellOutcome::Completed { output, .. } => {
+                assert_eq!(output, "CAIRN_MCP_SECRET=[REDACTED]");
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+
+        let mut unavailable = CellOutcome::Unavailable {
+            reason: CellUnavailableReason::Spawn,
+            diagnostic: format!("spawn failed: {RESIDENT_SECRET}"),
+        };
+        scrub_cell_outcome(&mut unavailable);
+        match &unavailable {
+            CellOutcome::Unavailable { diagnostic, .. } => {
+                assert_eq!(diagnostic, "spawn failed: [REDACTED]");
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    /// The capability lives exactly as long as the context that authorizes it.
+    ///
+    /// Every revocation path removes from `runner_contexts`, so this checks the
+    /// registration is released by the map entry going away rather than by any
+    /// one call site remembering to do it (CAIRN-3385).
+    #[test]
+    fn revoking_a_runner_context_unregisters_its_capability() {
+        use crate::security::registry;
+
+        let capability = "runner-context-capability-3824";
+        let label = "request-3824:attempt-3824";
+        // Matched by prefix: the id carries a process-local sequence so that two
+        // live contexts can never spell the same one and silently replace each
+        // other's registered forms.
+        let registered = |present: bool| {
+            let prefix = format!("batch-capability:{label}:");
+            assert_eq!(
+                registry()
+                    .metadata()
+                    .iter()
+                    .any(|entry| entry.id.as_str().starts_with(&prefix)),
+                present
+            );
+        };
+        let pool = Fleet::default();
+        pool.runner_contexts.lock().unwrap().insert(
+            capability.into(),
+            RunnerContextEntry::new(
+                capability,
+                label,
+                RunnerCallbackContext {
+                    request: None,
+                    run_context: None,
+                    check_status_board: None,
+                    live_checkout: false,
+                    executor_binding: Some(RunnerContextExecutorBinding {
+                        executor_id: "executor-3824".into(),
+                        generation: 1,
+                        request_id: "request-3824".into(),
+                        attempt_id: "attempt-3824".into(),
+                    }),
+                    output: output_guard::RelayedOutput::shared(),
+                },
+            ),
+        );
+        registered(true);
+        let mut sanitizer = crate::security::Sanitizer::exact();
+        assert_eq!(sanitizer.text(capability), "[REDACTED]");
+
+        pool.revoke_runner_contexts_for_request("request-3824", "attempt-3824");
+        registered(false);
     }
 
     /// An executor's snapshot of what it is running and its events about that

@@ -36,19 +36,107 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
+/// Where a redirect points.
+///
+/// A redirect target is not merely a URL. Providers routinely redirect to a
+/// *capability* URL whose query string carries a signature that is itself the
+/// entire authorization: GitHub's workflow-log download is exactly this,
+/// answering `/logs` with a redirect to blob storage bearing a `?sig=` token.
+/// Anyone holding that URL can fetch the object.
+///
+/// So this type refuses to render itself. It has no `Display`, and its `Debug`
+/// prints only the safe summary — because the ways a URL reaches observed
+/// output are mostly incidental rather than deliberate: a `{url}` interpolated
+/// into an error, a `{:?}` on the response it rode in on, a log line written
+/// while chasing something else. Code that needs to *send* the target asks for
+/// [`Self::as_str`]; code that needs to *describe* one gets scheme, host, and
+/// path, and never the query, fragment, or userinfo.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedirectTarget(String);
+
+impl RedirectTarget {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(url.into())
+    }
+
+    /// The complete target. The one way to the full URL, for sending it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Scheme, host, and path — enough to say where something went, with the
+    /// part that can be a credential dropped.
+    ///
+    /// A target that does not parse is described rather than quoted, since a
+    /// value that is not a URL is not one whose query can be separated out.
+    pub fn summary(&self) -> String {
+        match reqwest::Url::parse(&self.0) {
+            Ok(url) => format!(
+                "{}://{}{}",
+                url.scheme(),
+                url.host_str().unwrap_or("<no host>"),
+                url.path()
+            ),
+            Err(_) => "<unparseable redirect target>".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RedirectTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.summary())
+    }
+}
+
 /// HTTP response wrapper.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Where a redirect points, if this is one.
+    ///
+    /// Carried because this transport does not follow redirects itself (see
+    /// [`RealHttpClient::with_config`]), so a 3xx arrives here as an ordinary
+    /// response and the caller decides what to do about it. See
+    /// [`RedirectTarget`] for why it is not a `String`.
+    pub location: Option<RedirectTarget>,
 }
 
 type HttpResultFuture<'a> = Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + 'a>>;
 
 impl HttpResponse {
+    /// A response carrying no `Location`.
+    pub fn new(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body,
+            location: None,
+        }
+    }
+
+    /// A redirect to `location`.
+    pub fn redirect(status: u16, location: &str) -> Self {
+        Self {
+            status,
+            body: Vec::new(),
+            location: Some(RedirectTarget::new(location)),
+        }
+    }
+
     /// Check if status is 2xx.
     pub(crate) fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Where this response redirects to, if it is a redirect with a target.
+    ///
+    /// A 3xx without a `Location` is not actionable, so it is not a redirect as
+    /// far as any caller is concerned.
+    pub fn redirect_target(&self) -> Option<&RedirectTarget> {
+        match self.status {
+            301 | 302 | 303 | 307 | 308 => self.location.as_ref(),
+            _ => None,
+        }
     }
 
     /// Get body as string.
@@ -87,8 +175,13 @@ pub trait HttpClient: Send + Sync {
     fn delete(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_>;
 }
 
-#[derive(Clone, Copy)]
-enum HttpMethod {
+/// Which HTTP method a request uses.
+///
+/// Public because a caller that handles its own redirects has to be able to
+/// name the method it is repeating — and, for a 303 or a redirected POST, the
+/// different method it must switch to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
     Get,
     Post,
     Put,
@@ -97,7 +190,7 @@ enum HttpMethod {
 }
 
 impl HttpMethod {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
@@ -129,11 +222,33 @@ impl RealHttpClient {
         Self::with_config(HttpConfig::default())
     }
 
+    /// Build the client.
+    ///
+    /// # Why redirects are refused here
+    ///
+    /// This transport carries credentials. Following a redirect is the decision
+    /// to *resend* a request — headers included — to a URL the server picked,
+    /// and a transport is the wrong layer to make that decision, because it has
+    /// no idea which of the headers it was handed is a bearer token.
+    ///
+    /// It is tempting to rely on the HTTP library for this: reqwest does strip
+    /// sensitive headers when a redirect crosses to a different host. But that
+    /// check compares host and port, *not* scheme, so a same-host
+    /// `https://api.github.com` → `http://api.github.com` redirect keeps the
+    /// `Authorization` header and puts the bearer on the wire in cleartext. A
+    /// credential's containment must not rest on a dependency's heuristic that
+    /// no test here exercises.
+    ///
+    /// So a 3xx arrives at the caller as an ordinary response with its
+    /// `location` filled in, and the caller decides — see
+    /// `security::broker::github`, which revalidates every hop against the
+    /// lease's audience before resending, and drops the credential rather than
+    /// following one off GitHub.
     fn with_config(config: HttpConfig) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(config.timeout)
-                .redirect(reqwest::redirect::Policy::limited(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("Failed to create HTTP client"),
             config,
@@ -142,12 +257,21 @@ impl RealHttpClient {
 
     async fn to_response(resp: reqwest::Response) -> Result<HttpResponse, String> {
         let status = resp.status().as_u16();
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(RedirectTarget::new);
         let body = resp
             .bytes()
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?
             .to_vec();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            location,
+        })
     }
 
     /// Execute request with retry logic.
@@ -177,7 +301,11 @@ impl RealHttpClient {
                         tokio::time::sleep(backoff).await;
                         continue;
                     }
-                    return Err(format!("Request failed: {}", e));
+                    // A reqwest error renders the request URL, and after a
+                    // redirect that URL can be a capability carrying a signed
+                    // query. `without_url` is reqwest's own affordance for
+                    // exactly this, and the failure is still legible without it.
+                    return Err(format!("Request failed: {}", e.without_url()));
                 }
             }
         }
@@ -252,6 +380,38 @@ pub struct MockHttpClient {
     /// first GET returns `mergeable: null` and a later GET returns the computed
     /// value.
     sequences: std::sync::Mutex<Vec<(String, std::collections::VecDeque<HttpResponse>)>>,
+    /// Every request this mock was handed, in order.
+    requests: std::sync::Mutex<Vec<RecordedRequest>>,
+}
+
+/// One request a [`MockHttpClient`] received, headers included.
+///
+/// The headers are the point. A test that a credential reached the right place
+/// can be written against a URL, but a test that a credential did *not* reach
+/// somewhere can only be written if the transport remembers what it was handed
+/// — and until this existed, the mock discarded headers, which is precisely why
+/// nothing caught the transport resending an `Authorization` across a redirect.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    pub method: HttpMethod,
+    pub url: String,
+    pub headers: HeaderMap,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl RecordedRequest {
+    /// Whether this request carried any credential at all.
+    pub fn is_authenticated(&self) -> bool {
+        self.headers.contains_key(reqwest::header::AUTHORIZATION)
+    }
+
+    /// The `Authorization` value this request carried, if any.
+    pub fn authorization(&self) -> Option<&str> {
+        self.headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -260,7 +420,13 @@ impl MockHttpClient {
         Self {
             responses: std::sync::Mutex::new(Vec::new()),
             sequences: std::sync::Mutex::new(Vec::new()),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
     }
 
     /// Add a response for any request to URLs containing the pattern.
@@ -311,7 +477,17 @@ impl MockHttpClient {
         Err(format!("No mock response configured for URL: {}", url))
     }
 
-    fn response_future(&self, url: &str) -> HttpResultFuture<'_> {
+    fn response_future(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        headers: HeaderMap,
+    ) -> HttpResultFuture<'_> {
+        self.requests.lock().unwrap().push(RecordedRequest {
+            method,
+            url: url.to_string(),
+            headers,
+        });
         let result = self.find_response(url);
         Box::pin(async move { result })
     }
@@ -326,24 +502,24 @@ impl Default for MockHttpClient {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl HttpClient for MockHttpClient {
-    fn get(&self, url: &str, _headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(url)
+    fn get(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Get, url, headers)
     }
 
-    fn post(&self, url: &str, _body: Value, _headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(url)
+    fn post(&self, url: &str, _body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Post, url, headers)
     }
 
-    fn put(&self, url: &str, _body: Value, _headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(url)
+    fn put(&self, url: &str, _body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Put, url, headers)
     }
 
-    fn patch(&self, url: &str, _body: Value, _headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(url)
+    fn patch(&self, url: &str, _body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Patch, url, headers)
     }
 
-    fn delete(&self, url: &str, _headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(url)
+    fn delete(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Delete, url, headers)
     }
 }
 
@@ -357,138 +533,93 @@ mod tests {
 
     #[test]
     fn http_response_is_success_200() {
-        let resp = HttpResponse {
-            status: 200,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(200, vec![]);
         assert!(resp.is_success());
     }
 
     #[test]
     fn http_response_is_success_201() {
-        let resp = HttpResponse {
-            status: 201,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(201, vec![]);
         assert!(resp.is_success());
     }
 
     #[test]
     fn http_response_is_success_204() {
-        let resp = HttpResponse {
-            status: 204,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(204, vec![]);
         assert!(resp.is_success());
     }
 
     #[test]
     fn http_response_is_success_299() {
-        let resp = HttpResponse {
-            status: 299,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(299, vec![]);
         assert!(resp.is_success());
     }
 
     #[test]
     fn http_response_not_success_300() {
-        let resp = HttpResponse {
-            status: 300,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(300, vec![]);
         assert!(!resp.is_success());
     }
 
     #[test]
     fn http_response_not_success_400() {
-        let resp = HttpResponse {
-            status: 400,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(400, vec![]);
         assert!(!resp.is_success());
     }
 
     #[test]
     fn http_response_not_success_404() {
-        let resp = HttpResponse {
-            status: 404,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(404, vec![]);
         assert!(!resp.is_success());
     }
 
     #[test]
     fn http_response_not_success_500() {
-        let resp = HttpResponse {
-            status: 500,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(500, vec![]);
         assert!(!resp.is_success());
     }
 
     #[test]
     fn http_response_not_success_199() {
-        let resp = HttpResponse {
-            status: 199,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(199, vec![]);
         assert!(!resp.is_success());
     }
 
     #[test]
     fn http_response_text_simple() {
-        let resp = HttpResponse {
-            status: 200,
-            body: b"hello world".to_vec(),
-        };
+        let resp = HttpResponse::new(200, b"hello world".to_vec());
         assert_eq!(resp.text(), "hello world");
     }
 
     #[test]
     fn http_response_text_empty() {
-        let resp = HttpResponse {
-            status: 200,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(200, vec![]);
         assert_eq!(resp.text(), "");
     }
 
     #[test]
     fn http_response_text_unicode() {
-        let resp = HttpResponse {
-            status: 200,
-            body: "こんにちは".as_bytes().to_vec(),
-        };
+        let resp = HttpResponse::new(200, "こんにちは".as_bytes().to_vec());
         assert_eq!(resp.text(), "こんにちは");
     }
 
     #[test]
     fn http_response_json_object() {
-        let resp = HttpResponse {
-            status: 200,
-            body: br#"{"key": "value"}"#.to_vec(),
-        };
+        let resp = HttpResponse::new(200, br#"{"key": "value"}"#.to_vec());
         let parsed: serde_json::Value = resp.json().unwrap();
         assert_eq!(parsed["key"], "value");
     }
 
     #[test]
     fn http_response_json_array() {
-        let resp = HttpResponse {
-            status: 200,
-            body: br#"[1, 2, 3]"#.to_vec(),
-        };
+        let resp = HttpResponse::new(200, br#"[1, 2, 3]"#.to_vec());
         let parsed: Vec<i32> = resp.json().unwrap();
         assert_eq!(parsed, vec![1, 2, 3]);
     }
 
     #[test]
     fn http_response_json_nested() {
-        let resp = HttpResponse {
-            status: 200,
-            body: br#"{"user": {"name": "Alice", "age": 30}}"#.to_vec(),
-        };
+        let resp = HttpResponse::new(200, br#"{"user": {"name": "Alice", "age": 30}}"#.to_vec());
         let parsed: serde_json::Value = resp.json().unwrap();
         assert_eq!(parsed["user"]["name"], "Alice");
         assert_eq!(parsed["user"]["age"], 30);
@@ -496,10 +627,7 @@ mod tests {
 
     #[test]
     fn http_response_json_invalid() {
-        let resp = HttpResponse {
-            status: 200,
-            body: b"not valid json".to_vec(),
-        };
+        let resp = HttpResponse::new(200, b"not valid json".to_vec());
         let result: Result<serde_json::Value, _> = resp.json();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to parse JSON"));
@@ -507,10 +635,7 @@ mod tests {
 
     #[test]
     fn http_response_clone() {
-        let resp = HttpResponse {
-            status: 200,
-            body: b"data".to_vec(),
-        };
+        let resp = HttpResponse::new(200, b"data".to_vec());
         let cloned = resp.clone();
         assert_eq!(cloned.status, resp.status);
         assert_eq!(cloned.body, resp.body);

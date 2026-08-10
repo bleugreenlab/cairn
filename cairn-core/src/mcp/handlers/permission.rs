@@ -13,6 +13,7 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::models::{ExecutionSnapshot, Fence, TurnStartReason, TurnState, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use cairn_common::authorization::AuthorityLifetimeKind;
 use cairn_common::ids;
 use cairn_db::turso::params;
 
@@ -176,16 +177,20 @@ pub(crate) async fn await_permission_decision(
                 };
 
                 match issue_id_for_run_conn(conn, &run_id).await {
-                    Ok(Some(issue_id)) => {
-                        if let Err(e) = crate::transitions::outcome::recompute_issue_status_conn(
-                            conn, &issue_id,
-                        )
-                        .await
-                        {
-                            log::warn!("Failed to recompute issue status {}: {}", issue_id, e);
+                    Ok(issue_id) => {
+                        if let Some(ref job_id) = job_id {
+                            if let Err(e) =
+                                crate::transitions::outcome::recompute_job_owner_attention_conn(
+                                    conn,
+                                    job_id,
+                                    issue_id.as_deref(),
+                                )
+                                .await
+                            {
+                                log::warn!("Failed to recompute owner attention for {job_id}: {e}");
+                            }
                         }
                     }
-                    Ok(None) => {}
                     Err(e) => log::warn!("Failed to look up issue for run {}: {}", run_id, e),
                 }
 
@@ -445,6 +450,7 @@ async fn emit_permission_attention(
                 attention: issue_ctx.attention,
                 status: issue_ctx.status,
                 updated_at: issue_ctx.updated_at,
+                route_provenance: None,
             });
         }
     } else if let Some(issue_id) = ctx.issue_id.as_deref() {
@@ -543,11 +549,282 @@ pub enum PermissionDecision {
     Deny,
 }
 
-/// Whether an allow applies once or for the rest of the session.
+/// Whether a **containment** allow applies once or for the rest of the session.
+///
+/// This is the fence's concept: a `Session` answer inserts a concrete host path
+/// into an in-process grant set for as long as the app runs. It is NOT
+/// [`cairn_common::authorization::AuthorityLifetime`], which is a journaled,
+/// revocable binding of a named authority scope that survives a restart. The
+/// two travel together on [`PermissionAnswer`] and must not be substituted for
+/// each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionScope {
     Once,
     Session,
+}
+
+/// An answering surface that carries **no** authority-minting capability.
+///
+/// Every one of these is reachable without an operator: an agent can patch a
+/// node's `permissions` resource, a channel reply arrives from whoever is in
+/// the chat, and a remote intent is synced from another client. They are all
+/// legal ways to *deny* or *cancel* any prompt, and legal ways to allow a
+/// containment crossing, but none of them can approve an authority boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerSurface {
+    /// A `write` to a node's `permissions` resource — reachable by an agent.
+    ResourcePatch,
+    /// A reply in an external chat channel.
+    ChannelReply,
+    /// A remote intent synced from another client.
+    RemoteIntent,
+    /// An authenticated user whose role is below owner/admin, answering through
+    /// the invoke surface.
+    ///
+    /// They are a real, identified person and may answer anything a prompt
+    /// actually asks: deny or cancel any of them, allow a containment crossing.
+    /// What they do not carry is the capability to *mint authority*, so an
+    /// authority allow is refused by the resolver like any other non-operator
+    /// answer. Representing the role shortfall as a surface rather than as an
+    /// error is what keeps it from leaking into containment: the check lives
+    /// where authority is issued, not across the whole prompt surface.
+    NonOperatorInvoke,
+    /// An unauthenticated call to the local invoke surface: a runner with no
+    /// JWT key, reached without the desktop operator credential.
+    ///
+    /// This is not an identity and must never be described as one. Anything on
+    /// the machine that can open a loopback socket arrives here, including an
+    /// agent, which holds the runner URL in its own environment. It answers
+    /// containment prompts because local tooling and scripts legitimately do,
+    /// and it is journaled as itself so an audit can tell it apart from an
+    /// operator answer.
+    LocalInvoke,
+}
+
+impl AnswerSurface {
+    /// Stable issuer tag, recorded on anything this surface produces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnswerSurface::ResourcePatch => "resource_patch",
+            AnswerSurface::ChannelReply => "channel_reply",
+            AnswerSurface::RemoteIntent => "remote_intent",
+            AnswerSurface::NonOperatorInvoke => "non_operator_invoke",
+            AnswerSurface::LocalInvoke => "local_invoke",
+        }
+    }
+}
+
+/// How far an answer's claim to be the operator has actually been checked.
+///
+/// Closed on purpose, and the two variants are **not** equivalent. Adding one is
+/// a deliberate security review, not a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorTransport {
+    /// A JWT-authenticated operator with an owner or admin role. The identity
+    /// is a verified authentication result about a person.
+    AuthenticatedOperator,
+    /// The native desktop shell of this install, proven by the desktop operator
+    /// credential (`~/.cairn/operator_auth_secret`).
+    ///
+    /// This is a verified fact about a *process*, not about a person: it says
+    /// the answer came through the desktop app rather than from anything else
+    /// that can reach loopback. On a default install with no JWT key that is
+    /// exactly the distinction that was missing, and the identity it carries is
+    /// this machine's device id, which is what the rest of the system already
+    /// attributes local work to.
+    ///
+    /// What backs it is that the credential never enters an agent's
+    /// environment, is refused to agent reads and writes by
+    /// `authorization::protected`, and is denied to the executor sandbox. Those
+    /// are the properties that make this variant mean anything; see
+    /// `docs/authorization.md` for what they do and do not establish.
+    AuthenticatedDesktop,
+}
+
+impl OperatorTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OperatorTransport::AuthenticatedOperator => "authenticated_operator",
+            OperatorTransport::AuthenticatedDesktop => "authenticated_desktop",
+        }
+    }
+
+    /// The issuer this transport is journaled as. Both variants are real
+    /// verifications — one of a person, one of the desktop process — so both
+    /// are recorded as `operator_prompt`. An answer that verified neither never
+    /// becomes an [`OperatorApproval`] at all; it stays an [`AnswerSurface`]
+    /// and is journaled as the surface it actually came from.
+    pub fn issuer(self) -> &'static str {
+        match self {
+            OperatorTransport::AuthenticatedOperator | OperatorTransport::AuthenticatedDesktop => {
+                OPERATOR_PROMPT_ISSUER
+            }
+        }
+    }
+}
+
+/// Proof that an answer came from an **authenticated operator** over a trusted
+/// transport. Holding one is the capability to mint an authority grant.
+///
+/// The fields are private and the only way to build one is
+/// [`OperatorApproval::authenticated`], which takes an identity the caller
+/// resolved from its own authentication context plus a closed transport tag.
+/// Nothing an agent authors reaches it: not an `answered_by` string, not an
+/// approver field in a payload, not the requesting agent's identity, not the
+/// prompt's own contents. That is the point — "only an operator may expand
+/// workspace authority" has to be a property of the type that crosses the
+/// resolver boundary, not a string comparison somewhere inside it.
+///
+/// This is not a cryptographic capability, and in-process Rust cannot make it
+/// one: any code in the workspace could call the constructor. What it does
+/// guarantee is that doing so is a deliberate, greppable, reviewable act by a
+/// caller that must first name an operator identity and a transport — where the
+/// previous shape let any caller flip a `&'static str` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorApproval {
+    operator: String,
+    transport: OperatorTransport,
+}
+
+impl OperatorApproval {
+    /// Build an operator capability from an identity the caller **authenticated**.
+    ///
+    /// Fails closed on an identity that is missing or blank: a grant has to be
+    /// attributable to someone, and "approved by nobody in particular" is not an
+    /// audit trail. Callers that cannot establish who the operator is must
+    /// refuse the answer rather than pass a placeholder.
+    pub fn authenticated(
+        operator: impl Into<String>,
+        transport: OperatorTransport,
+    ) -> Result<Self, String> {
+        let operator = operator.into().trim().to_string();
+        if operator.is_empty() {
+            return Err(
+                "an authority approval requires an authenticated operator identity".to_string(),
+            );
+        }
+        Ok(Self {
+            operator,
+            transport,
+        })
+    }
+
+    /// The authenticated operator this approval is attributable to.
+    pub fn operator(&self) -> &str {
+        &self.operator
+    }
+
+    pub fn transport(&self) -> OperatorTransport {
+        self.transport
+    }
+}
+
+/// Who answered a permission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Answerer {
+    /// An authenticated operator. The only answerer that can mint authority.
+    Operator(OperatorApproval),
+    /// Any other surface. May deny or cancel anything, and may allow a
+    /// containment crossing, but never mints an authority grant.
+    Surface(AnswerSurface),
+}
+
+/// The issuer tag recorded for an operator answer.
+pub const OPERATOR_PROMPT_ISSUER: &str = "operator_prompt";
+
+/// What was answered on a permission request, and by whom.
+///
+/// One request row can be a fence crossing, a legacy tool prompt, or an
+/// authority request, so the answer carries both lifetime concepts and the
+/// resolver applies whichever the stored request actually is. Keeping them as
+/// separate fields — rather than one overloaded enum — is what stops a
+/// containment answer from being read as an authority grant.
+///
+/// The answerer is private and set at construction. Attribution is therefore
+/// derived from the capability the caller actually held, never from a field a
+/// caller could set to whatever it wanted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionAnswer {
+    pub decision: PermissionDecision,
+    /// Containment reuse, for a fence crossing or legacy tool prompt.
+    pub scope: PermissionScope,
+    /// Authority grant lifetime, for an authority request. `None` falls back to
+    /// a single use, which is the narrowest reading of an unspecified answer.
+    pub lifetime: Option<AuthorityLifetimeKind>,
+    /// Optional absolute expiry (unix seconds) for the minted grant.
+    pub expires_at: Option<i64>,
+    answerer: Answerer,
+}
+
+impl PermissionAnswer {
+    /// An answer from an authenticated operator.
+    pub fn from_operator(decision: PermissionDecision, approval: OperatorApproval) -> Self {
+        Self {
+            decision,
+            scope: PermissionScope::Once,
+            lifetime: None,
+            expires_at: None,
+            answerer: Answerer::Operator(approval),
+        }
+    }
+
+    /// An answer from a surface that holds no operator capability.
+    pub fn from_surface(decision: PermissionDecision, surface: AnswerSurface) -> Self {
+        Self {
+            decision,
+            scope: PermissionScope::Once,
+            lifetime: None,
+            expires_at: None,
+            answerer: Answerer::Surface(surface),
+        }
+    }
+
+    /// Set the **containment** reuse scope (fence crossing / legacy tool prompt).
+    pub fn with_containment_scope(mut self, scope: PermissionScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// Set the **authority** grant lifetime an allow would mint.
+    pub fn with_lifetime(mut self, lifetime: Option<AuthorityLifetimeKind>) -> Self {
+        self.lifetime = lifetime;
+        self
+    }
+
+    pub fn with_expiry(mut self, expires_at: Option<i64>) -> Self {
+        self.expires_at = expires_at;
+        self
+    }
+
+    /// The operator capability this answer carries, if any. An authority allow
+    /// is accepted only when this is `Some`.
+    pub fn operator_approval(&self) -> Option<&OperatorApproval> {
+        match &self.answerer {
+            Answerer::Operator(approval) => Some(approval),
+            Answerer::Surface(_) => None,
+        }
+    }
+
+    /// Stable issuer tag for the journal: the real answering surface, never a
+    /// relabelling. An agent's resource patch is recorded as `resource_patch`
+    /// even when it denies something an operator would also have denied.
+    pub fn issuer(&self) -> &'static str {
+        match &self.answerer {
+            Answerer::Operator(approval) => approval.transport().issuer(),
+            Answerer::Surface(surface) => surface.as_str(),
+        }
+    }
+
+    /// The approver a grant records. Only ever the authenticated operator
+    /// identity — a non-operator answer has no approver, rather than an
+    /// unverified name.
+    pub fn approver(&self) -> Option<&str> {
+        self.operator_approval().map(OperatorApproval::operator)
+    }
+
+    fn grant_lifetime(&self) -> AuthorityLifetimeKind {
+        self.lifetime.unwrap_or(AuthorityLifetimeKind::Once)
+    }
 }
 
 /// Result of resolving a permission request.
@@ -589,9 +866,9 @@ impl PermissionRequestRecord {
 /// request so the slow-path resume can re-dispatch it with the grant in place.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct CrossingDetail {
-    /// Crossing classification (read/write/shell). Unused at resolution time but
-    /// required so a legacy `tool_input` never parses as a crossing by accident.
-    #[allow(dead_code)]
+    /// Crossing classification. Required so a legacy `tool_input` never parses
+    /// as a crossing by accident, and read at resolution time to tell a
+    /// path-scoped crossing from a command-scoped escape.
     kind: String,
     /// The verb to re-dispatch: "read" | "write" | "run" (legacy "change"
     /// still accepted for crossings suspended before the verb rename).
@@ -609,14 +886,38 @@ struct CrossingDetail {
 }
 
 /// Parse a stored `tool_input` as a fence crossing. Returns `None` for a legacy
-/// tool prompt (whose `tool_input` lacks the verb/descriptor/request shape).
+/// tool prompt (whose `tool_input` lacks the verb/descriptor/request shape) and
+/// for an authority request (which carries no `descriptor`, by design).
 fn parse_crossing_detail(tool_input: &str) -> Option<CrossingDetail> {
     serde_json::from_str::<CrossingDetail>(tool_input).ok()
+}
+
+/// Test-visible probe proving the fence and authority stored shapes stay
+/// mutually exclusive.
+#[cfg(test)]
+pub(crate) fn parses_as_crossing(tool_input: &str) -> Option<String> {
+    parse_crossing_detail(tool_input).map(|detail| detail.descriptor)
 }
 
 impl CrossingDetail {
     fn is_terminal_origin(&self) -> bool {
         self.origin.as_deref() == Some("terminal")
+    }
+
+    /// Whether allowing this crossing re-executes the command **unsandboxed**.
+    ///
+    /// A path-scoped crossing widens one named path and the sandbox is still
+    /// constructed around the re-execution. Anything else has no path to widen
+    /// -- the kernel reported a blocked command without reporting what it
+    /// touched -- so the only way to let it proceed is to run it with no sandbox
+    /// at all.
+    ///
+    /// Asked as "is this a known path-scoped kind?" rather than "is this the
+    /// command kind?", so an unrecognized tag is an escape. See
+    /// [`fence::tag_is_path_scoped`] for the two ways an unrecognized tag
+    /// arrives.
+    fn is_unsandboxed_escape(&self) -> bool {
+        !crate::mcp::handlers::fence::tag_is_path_scoped(&self.kind)
     }
 }
 
@@ -642,7 +943,28 @@ pub struct PermissionResponseResume {
 /// for that agent to switch permission mode. The database is resolved from the
 /// request id so team executions update their synced replica rather than the
 /// private database.
-pub async fn allow_all_for_request(orch: &Orchestrator, request_id: &str) -> Result<(), String> {
+///
+/// # Why this takes an [`OperatorApproval`]
+///
+/// Turning off an agent's containment fence is a capability expansion, and it is
+/// the one that subsumes every other. `Fence::Allow` means
+/// [`sandbox_applies`](crate::services::sandbox::sandbox_applies) is false, so
+/// no sandbox policy is built at all: after this call the same live agent's next
+/// shell item runs unconfined, no kernel denial is produced, and every refusal
+/// keyed on a denial -- including the one protecting the desktop operator
+/// credential -- has nothing to fire on. An agent that could call this without a
+/// capability could therefore read the credential that approves authority, which
+/// would make the authority boundary a function of a switch the agent controls.
+///
+/// So the capability is required by the signature rather than checked by a
+/// caller, the same way [`PermissionAnswer::from_operator`] carries it across
+/// the resolver boundary. A surface answering a containment prompt with a plain
+/// `allow` is unaffected; only turning the fence off needs an operator.
+pub async fn allow_all_for_request(
+    orch: &Orchestrator,
+    request_id: &str,
+    approval: &OperatorApproval,
+) -> Result<(), String> {
     // A team execution's executions/jobs rows live in its synced replica, so the
     // snapshot read+write and the active-job lookup must target the owning
     // database (CAIRN-2227). Fail-closed (CAIRN-2170 class): an `allowAll` whose
@@ -650,6 +972,26 @@ pub async fn allow_all_for_request(orch: &Orchestrator, request_id: &str) -> Res
     let db = crate::execution::routing::owning_db_for_permission_request(&orch.db, request_id)
         .await
         .map_err(|e| e.to_string())?;
+
+    // "Allow all" is a containment decision, and an authority prompt is not a
+    // containment prompt. Flipping the fence here would answer a question the
+    // operator was not asked -- they were shown a named capability to approve,
+    // not a host path -- and it would leave the agent with an unlogged, blanket
+    // escape as a side effect of approving one MCP server. Refuse rather than
+    // silently doing the wrong half: the authority answer they want is a
+    // lifetime on the prompt itself, which is journaled and revocable.
+    if let Ok(record) = get_permission_request_record(&db, request_id).await {
+        if super::authority::parse_authority_detail(&record.tool_input).is_some() {
+            return Err(
+                "'Allow all' turns off this agent's containment fence, which is a different \
+                 decision from the authority this prompt is asking about. Approve the request \
+                 itself with a lifetime instead; a standing approval is listable and revocable \
+                 where a fence flip is neither."
+                    .to_string(),
+            );
+        }
+    }
+
     let target = load_permission_snapshot_target(&db, request_id).await?;
     let Some(mut snapshot) = target.snapshot else {
         return Err("Execution has no snapshot".to_string());
@@ -663,6 +1005,18 @@ pub async fn allow_all_for_request(orch: &Orchestrator, request_id: &str) -> Res
     })?;
     agent.fence = Some(Fence::Allow);
     let snapshot_json = snapshot.to_json()?;
+
+    // A fence flip is neither journaled nor revocable (which is why an authority
+    // prompt refuses it above), so the log line is the only record that it
+    // happened and who did it. Names the operator and the transport that was
+    // actually verified, never anything the payload claimed.
+    log::info!(
+        "permission {request_id}: operator {} ({}) turned off agent '{}' containment fence for execution {}",
+        approval.operator(),
+        approval.transport().as_str(),
+        target.agent_id,
+        target.execution_id,
+    );
 
     update_execution_snapshot(&db, &target.execution_id, &snapshot_json).await?;
     // Process-state propagation is host-local (live processes are keyed by
@@ -822,9 +1176,11 @@ async fn load_agent_job_sessions(
 pub async fn resolve_permission_request(
     orch: &Orchestrator,
     request_id: &str,
-    decision: PermissionDecision,
-    scope: PermissionScope,
+    answer: PermissionAnswer,
 ) -> Result<ResolveOutcome, String> {
+    let PermissionAnswer {
+        decision, scope, ..
+    } = answer;
     let now = chrono::Utc::now().timestamp() as i32;
     // Resolve the owning database ONCE (fail-closed, CAIRN-2227): a team
     // execution's permission_requests/runs/turns/issue rows live WHOLLY in its
@@ -843,6 +1199,64 @@ pub async fn resolve_permission_request(
         .map_err(|e| format!("Permission request not found: {}", e))?;
 
     let crossing = parse_crossing_detail(&record.tool_input);
+    let authority = super::authority::parse_authority_detail(&record.tool_input);
+
+    // Authority issuance is an operator capability, decided here from the
+    // STORED prompt type rather than from anything the answerer said about
+    // itself. The requester cannot approve its own escalation: allowing an
+    // authority request is what mints a workspace-wide grant, so an answer that
+    // carries no operator capability is refused before the row is touched.
+    //
+    // Refusing here, ahead of `record_permission_response`, is the whole point.
+    // A rejected self-approval must leave the request pending for the operator:
+    // it resolves nothing, mints nothing, wakes nothing, and re-dispatches
+    // nothing. Deny and cancel stay open to every surface — an agent recognizing
+    // that it should not be doing something is behavior worth keeping — and so
+    // does allowing a containment crossing, which is a different layer.
+    if let Some(detail) = authority.as_ref() {
+        if matches!(decision, PermissionDecision::Allow) && answer.operator_approval().is_none() {
+            return Err(format!(
+                "Refused: allowing this request mints a workspace authority grant, which only an \
+                 authenticated operator can do. This answer came from '{}', which may deny or \
+                 cancel the request but cannot approve it. The request is still pending for the \
+                 operator (scope: {}).",
+                answer.issuer(),
+                detail.scope_shorthand(),
+            ));
+        }
+    }
+
+    // The same capability, one layer down. Allowing a COMMAND-scoped crossing
+    // re-executes an agent-authored command with no sandbox at all, which is
+    // the state in which every path-based protection stops being constructed --
+    // including the one keeping this agent away from the credential that
+    // approves authority. That is an escape, not a containment answer, and it
+    // is the same act `allow_all_for_request` requires an operator for; the
+    // difference is that this one lasts for a command and that one lasts for
+    // the run.
+    //
+    // Path-scoped crossings stay open to every surface. They widen one named
+    // path, the sandbox is still built around the re-execution, and an agent
+    // recognizing that it needs one file outside its worktree is ordinary work.
+    if let Some(detail) = crossing.as_ref() {
+        if detail.is_unsandboxed_escape()
+            && matches!(decision, PermissionDecision::Allow)
+            && answer.operator_approval().is_none()
+        {
+            return Err(format!(
+                "Refused: this prompt names no host path to widen -- either the sandbox blocked a \
+                 command without reporting which path it touched, or the prompt was recorded by a \
+                 build whose crossing kind ('{}') this one does not recognize. Either way the only \
+                 way to let it proceed is to re-run the command with no sandbox at all, which is \
+                 an escape rather than one crossing, and only an operator can approve that. This \
+                 answer came from '{}', which may deny it, or allow a path-scoped crossing. The \
+                 request is still pending for the operator.",
+                detail.kind,
+                answer.issuer(),
+            ));
+        }
+    }
+
     let status = match decision {
         PermissionDecision::Allow => "allowed",
         PermissionDecision::Deny => "denied",
@@ -853,14 +1267,51 @@ pub async fn resolve_permission_request(
         (PermissionDecision::Allow, PermissionScope::Session) => "allow",
     };
 
-    let response_json = build_permission_response_json(&record, behavior, crossing.as_ref());
+    // An authority request answers with the same minimal `{behavior}` shape a
+    // fence crossing does: both re-drive the originating verb, so the waiting
+    // handler only needs to know allow from deny.
+    let structured = crossing.is_some() || authority.is_some();
+    let response_json = build_permission_response_json(&record, behavior, structured);
 
     let resume = record_permission_response(&owning_db, request_id, status, &response_json, now)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Session grant bookkeeping (only on allow + session).
-    if matches!(decision, PermissionDecision::Allow) && matches!(scope, PermissionScope::Session) {
+    // Mint the grant BEFORE any resume: the re-dispatched verb re-runs the same
+    // authorization check, so the grant has to already be on disk for it to find
+    // one. An approval that was not recorded is not an approval, so a minting
+    // failure turns the allow into a refusal the agent actually sees, rather
+    // than a silent re-prompt whose cause is only in the logs.
+    //
+    // Guarded on `duplicate` for the same reason the broadcast and the resume
+    // below are: a request that was already answered has already had its
+    // consequences. Without this, re-answering a completed authority prompt
+    // mints another grant every time — and for a standing lifetime each one is
+    // separately revocable, so revoking the grant an operator can see would
+    // leave its twins live. `record_permission_response` reports the duplicate
+    // rather than refusing, because a duplicate answer is an ordinary race (two
+    // windows, an inline waiter and a slow-path answer), so the caller is the
+    // one that has to know which effects are once-only.
+    let mut mint_failure: Option<String> = None;
+    if let Some(detail) = authority.as_ref() {
+        if matches!(decision, PermissionDecision::Allow) && !resume.duplicate {
+            if let Err(error) = mint_authority_grant(orch, &record, detail, &answer, &resume).await
+            {
+                log::warn!(
+                    "permission {request_id}: could not record the authority grant: {error}"
+                );
+                mint_failure = Some(error);
+            }
+        }
+    }
+
+    // Containment session bookkeeping (only on allow + session). Authority
+    // requests are excluded on purpose: their reuse is the journaled grant, not
+    // an in-process path or tool-name set.
+    if authority.is_none()
+        && matches!(decision, PermissionDecision::Allow)
+        && matches!(scope, PermissionScope::Session)
+    {
         match crossing.as_ref() {
             Some(detail) => {
                 if let Ok(mut allowed) = orch.session_allowed_crossings.lock() {
@@ -895,10 +1346,20 @@ pub async fn resolve_permission_request(
         .is_awaiting_host(&resume.run_id, resume.predecessor_turn_id.as_deref());
 
     // Broadcast: wakes a handler still in its inline wait (fast path).
+    //
+    // A grant that failed to persist rides along as `grantError` rather than
+    // flipping the answer to a deny. The operator DID allow it — recording the
+    // answer as a refusal would be a lie in the durable row — but the waiter has
+    // to learn that the approval did not take effect, or it would report
+    // "requires operator approval" a moment after the operator approved.
     if !resume.duplicate {
+        let broadcast_json = match mint_failure.as_deref() {
+            None => response_json.clone(),
+            Some(error) => with_grant_error(&response_json, error),
+        };
         let _ = orch
             .permission_responses
-            .send((request_id.to_string(), response_json.clone()));
+            .send((request_id.to_string(), broadcast_json));
     }
 
     let _ = orch.services.emitter.emit(
@@ -922,6 +1383,8 @@ pub async fn resolve_permission_request(
             &resume,
             &response_json,
             crossing.as_ref(),
+            authority.as_ref(),
+            mint_failure.as_deref(),
             decision,
             scope,
         )
@@ -968,8 +1431,7 @@ pub async fn answer_node_permission(
     exec_seq: i32,
     node_segment: &str,
     perm_segment: &str,
-    decision: PermissionDecision,
-    scope: PermissionScope,
+    answer: PermissionAnswer,
 ) -> Result<ResolveOutcome, String> {
     let request_id = lookup_permission_request_for_node(
         orch,
@@ -980,7 +1442,7 @@ pub async fn answer_node_permission(
         perm_segment,
     )
     .await?;
-    resolve_permission_request(orch, &request_id, decision, scope).await
+    resolve_permission_request(orch, &request_id, answer).await
 }
 
 async fn lookup_permission_request_for_node(
@@ -1048,9 +1510,9 @@ async fn lookup_permission_request_for_node(
 fn build_permission_response_json(
     record: &PermissionRequestRecord,
     behavior: &str,
-    crossing: Option<&CrossingDetail>,
+    structured: bool,
 ) -> String {
-    if crossing.is_some() {
+    if structured {
         return match behavior {
             "deny" => serde_json::json!({"behavior": "deny"}).to_string(),
             _ => serde_json::json!({"behavior": "allow"}).to_string(),
@@ -1071,6 +1533,24 @@ fn build_permission_response_json(
         allow_response(&original_input)
     }
 }
+
+/// Attach a grant-minting failure to a response the inline waiter will read.
+/// Falls back to a minimal object if the response is not JSON, so the waiter
+/// still learns the approval did not take effect.
+fn with_grant_error(response_json: &str, error: &str) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(response_json)
+        .unwrap_or_else(|_| serde_json::json!({"behavior": "allow"}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            GRANT_ERROR_KEY.to_string(),
+            serde_json::Value::String(error.to_string()),
+        );
+    }
+    value.to_string()
+}
+
+/// Key carrying a grant-minting failure on an otherwise-allowing response.
+pub(crate) const GRANT_ERROR_KEY: &str = "grantError";
 
 fn should_resume_permission_response(
     crossing: Option<&CrossingDetail>,
@@ -1097,6 +1577,8 @@ async fn resume_suspended_permission(
     resume: &PermissionResponseResume,
     response_json: &str,
     crossing: Option<&CrossingDetail>,
+    authority: Option<&super::authority::AuthorityPromptDetail>,
+    mint_failure: Option<&str>,
     decision: PermissionDecision,
     scope: PermissionScope,
 ) -> Result<(), String> {
@@ -1118,7 +1600,51 @@ async fn resume_suspended_permission(
         );
         return Ok(());
     };
-    let now = chrono::Utc::now().timestamp() as i32;
+
+    // An authority allow re-drives the verb with the minted grant already on
+    // disk, so the re-check finds it. Unlike a fence allow there is nothing
+    // transient to insert: the grant IS the durable record, which is exactly
+    // what makes it listable and revocable.
+    if let Some(detail) = authority {
+        // The operator allowed it but the grant did not persist, so there is no
+        // authority to re-dispatch under. Say that plainly instead of letting
+        // the re-check quietly re-prompt for the same thing.
+        if let Some(error) = mint_failure {
+            return finish_resume(
+                orch,
+                record,
+                resume,
+                session_id,
+                job_id,
+                format!(
+                    "Approval could not be recorded, so it did not take effect: {error}. \
+                     Nothing was changed; ask again."
+                ),
+                true,
+            );
+        }
+        let (content, is_error) = match decision {
+            PermissionDecision::Deny => (
+                format!(
+                    "Denied by operator: {} (scope: {})",
+                    detail.authority.summary,
+                    detail.scope_shorthand()
+                ),
+                true,
+            ),
+            PermissionDecision::Allow => {
+                let result = re_dispatch_request(orch, &detail.verb, &detail.request).await;
+                // Another ungranted boundary in the same batch re-suspended the
+                // run on a fresh request; that request's answer drives the next
+                // resume.
+                if has_pending_permission_request(owning_db, &resume.run_id).await {
+                    return Ok(());
+                }
+                (result, false)
+            }
+        };
+        return finish_resume(orch, record, resume, session_id, job_id, content, is_error);
+    }
 
     let (content, is_error) = match crossing {
         Some(detail) => match decision {
@@ -1159,6 +1685,22 @@ async fn resume_suspended_permission(
         None => (response_json.to_string(), false),
     };
 
+    finish_resume(orch, record, resume, session_id, job_id, content, is_error)
+}
+
+/// Attach the synthetic tool result to the call the agent is waiting on and
+/// continue the job. Shared by the fence, authority, and legacy-prompt resume
+/// paths so all three land the result identically.
+fn finish_resume(
+    orch: &Orchestrator,
+    record: &PermissionRequestRecord,
+    resume: &PermissionResponseResume,
+    session_id: &str,
+    job_id: &str,
+    content: String,
+    is_error: bool,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp() as i32;
     crate::execution::jobs::store_tool_result_event_with_turn(
         orch,
         &resume.run_id,
@@ -1183,6 +1725,96 @@ async fn resume_suspended_permission(
     )
     .map_err(|e| format!("Failed to resume after permission: {}", e))?;
     Ok(())
+}
+
+/// Mint the grant an allowed authority request earns.
+///
+/// The anchors come from the request row and the resume state, never from the
+/// answering surface: a `turn` grant anchors to the turn the run will CONTINUE
+/// in (an approval that expired the instant the agent resumed would authorize
+/// nothing), and a `session` grant anchors to the run's durable session so it
+/// survives a runner restart.
+async fn mint_authority_grant(
+    orch: &Orchestrator,
+    record: &PermissionRequestRecord,
+    detail: &super::authority::AuthorityPromptDetail,
+    answer: &PermissionAnswer,
+    resume: &PermissionResponseResume,
+) -> Result<(), String> {
+    // The operator approved exactly the mutation they were shown, so the grant
+    // is narrowed to that mode: approving "reconfigure linear" must not silently
+    // also approve removing it.
+    let mut constraints = vec![
+        cairn_common::authorization::AuthorityConstraint::MutationModes {
+            modes: vec![detail.authority.mutation],
+        },
+    ];
+
+    // An MCP write is additionally bound to the identity of the configuration
+    // the prompt described, so the approval covers that server and not merely
+    // its name. A prompt that reached the operator without one cannot be turned
+    // into a grant at all: minting an unbound grant would either authorize an
+    // arbitrary later command or (with the structural floor in
+    // `AuthorityConstraintSet::covers`) authorize nothing while looking valid.
+    if detail.authority.requires_mcp_config_binding() {
+        let Some(fingerprint) = detail.authority.facts.mcp_config.clone() else {
+            return Err(
+                "this MCP approval does not name the configuration it would authorize".to_string(),
+            );
+        };
+        constraints
+            .push(cairn_common::authorization::AuthorityConstraint::McpConfig { fingerprint });
+    }
+
+    let issue = crate::authorization::GrantIssue {
+        request: detail.authority.clone(),
+        principal: detail.principal.clone(),
+        audience: detail.audience.clone(),
+        lifetime: answer.grant_lifetime(),
+        request_id: Some(record.id.clone()),
+        turn_id: resume
+            .successor_turn_id
+            .clone()
+            .or_else(|| resume.predecessor_turn_id.clone()),
+        session_id: resume.session_id.clone(),
+        expires_at: answer.expires_at,
+        // Both the issuer and the approver come from the capability the
+        // answerer actually held, not from anything it claimed. Only an
+        // authenticated operator reaches a mint at all (see the resolver's
+        // authority check), so the approver here is always a real, trusted
+        // identity rather than a name someone typed.
+        provenance: cairn_common::authorization::AuthorityProvenance {
+            issuer: answer.issuer().to_string(),
+            approver: answer.approver().map(ToOwned::to_owned),
+            request_uri: Some(record.id.clone()),
+            node_uri: detail.principal.node_uri.clone(),
+            rationale: None,
+        },
+        constraints: cairn_common::authorization::AuthorityConstraintSet::new(constraints),
+    };
+    // Grants live in the private database on every path, so what enforcement
+    // reads is what the grant list shows and what revocation reaches.
+    //
+    // For a team run this is correct because an answer is only ever executed by
+    // the runner that OWNS the execution. A teammate's answer arrives as a
+    // remote intent, and `team_remote_intents` gates on
+    // `executions.runner_device_id` at three layers: the candidate scan joins on
+    // it, the claim UPDATE carries an EXISTS on it, and `verify_owner` re-checks
+    // after the claim to catch a reassignment landing in between. So the mint
+    // always happens on the runner that will re-dispatch the write, which is the
+    // one whose private database the re-check reads.
+    //
+    // Ownership CHANGING is not the hazard — it is a supported flow, and its
+    // outcome is the conservative one: the old owner's grant stays on the old
+    // machine and the run re-prompts on the new owner's, which is exactly right
+    // for a per-install grant, since the operator who now owns the execution is
+    // the one who should be asked. The hazard is an answer being executed
+    // anywhere OTHER than the owning runner, which is what those three layers
+    // prevent; defeating them would mint a grant on one machine while the run
+    // re-prompts forever on another.
+    crate::authorization::issue_grant(&orch.db.local, issue)
+        .await
+        .map(|_| ())
 }
 
 /// True if the run has a still-pending permission request — used to detect that
@@ -1212,14 +1844,19 @@ async fn has_pending_permission_request(db: &LocalDb, run_id: &str) -> bool {
 /// resolve a fenced `write` crossing, which re-enters `handle_write` here — an
 /// indirectly recursive async fn that must be heap-allocated.
 async fn re_dispatch_verb(orch: &Orchestrator, detail: &CrossingDetail) -> String {
-    match detail.verb.as_str() {
-        "read" => {
-            Box::pin(crate::mcp::handlers::read::handle_read_file(
-                orch,
-                &detail.request,
-            ))
-            .await
-        }
+    re_dispatch_request(orch, &detail.verb, &detail.request).await
+}
+
+/// Re-execute a verb from its stored request. Shared by the fence and authority
+/// resume paths: once the grant (of either kind) is in place, both simply
+/// re-drive the exact call the agent made.
+async fn re_dispatch_request(
+    orch: &Orchestrator,
+    verb: &str,
+    request: &McpCallbackRequest,
+) -> String {
+    match verb {
+        "read" => Box::pin(crate::mcp::handlers::read::handle_read_file(orch, request)).await,
         // A fenced target inside a batch suspends the whole `read_batch` call; on
         // allow we re-run the batch (idempotent reads) so the approved target now
         // resolves alongside the rest.
@@ -1227,7 +1864,7 @@ async fn re_dispatch_verb(orch: &Orchestrator, detail: &CrossingDetail) -> Strin
             let read_cursors = std::sync::Mutex::new(std::collections::HashMap::new());
             Box::pin(crate::mcp::handlers::read::handle_read_batch(
                 orch,
-                &detail.request,
+                request,
                 &read_cursors,
             ))
             .await
@@ -1235,17 +1872,10 @@ async fn re_dispatch_verb(orch: &Orchestrator, detail: &CrossingDetail) -> Strin
         // `write` is the current verb; `change` is the legacy name a crossing
         // suspended before the rename may still carry.
         "write" | "change" => {
-            Box::pin(crate::mcp::handlers::write::handle_write(
-                orch,
-                &detail.request,
-            ))
-            .await
+            Box::pin(crate::mcp::handlers::write::handle_write(orch, request)).await
         }
-        "run" => Box::pin(crate::mcp::handlers::run::handle_run(orch, &detail.request)).await,
-        other => format!(
-            "Cannot re-execute unknown verb '{}' after fence allow",
-            other
-        ),
+        "run" => Box::pin(crate::mcp::handlers::run::handle_run(orch, request)).await,
+        other => format!("Cannot re-execute unknown verb '{other}' after approval"),
     }
 }
 
@@ -1999,6 +2629,216 @@ mod tests {
             .unwrap();
     }
 
+    /// Overwrite the seeded prompt with a real crossing `tool_input`, exactly as
+    /// `raise_fence` stores one.
+    async fn store_crossing(orch: &Orchestrator, crossing: super::super::fence::Crossing) {
+        let tool_input = crossing.stored_tool_input_for_test().replace('\'', "''");
+        orch.db
+            .local
+            .execute_script(format!(
+                "UPDATE permission_requests SET tool_input = '{tool_input}' \
+                 WHERE id = 'perm-request-1'"
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn perm_status(orch: &Orchestrator) -> Option<String> {
+        orch.db
+            .local
+            .query_opt_text(
+                "SELECT status FROM permission_requests WHERE id = 'perm-request-1'",
+                (),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The property, asserted from the agent's side rather than at a boundary.
+    ///
+    /// An agent answers through its own `permissions` resource, which is an
+    /// [`AnswerSurface::ResourcePatch`]. It may allow a path-scoped crossing --
+    /// that widens one named path with the sandbox still built around the
+    /// re-execution. It may not allow a command-scoped one, because there is no
+    /// path to widen and the only way to let it proceed is to re-run the
+    /// agent-authored command with no sandbox at all, which is the state in
+    /// which every path-based protection stops being constructed.
+    ///
+    /// This is deliberately not a test about the invoke boundary. Closing one
+    /// switch there left two others open, because the boundary tests pinned the
+    /// gate rather than the property.
+    #[tokio::test]
+    async fn an_agent_cannot_self_approve_an_unsandboxed_command_escape() {
+        for scope in [PermissionScope::Once, PermissionScope::Session] {
+            let orch = test_orchestrator().await;
+            seed_allow_all_permission(&orch).await;
+            store_crossing(
+                &orch,
+                super::super::fence::Crossing::shell_command(
+                    "command blocked by the executor sandbox".to_string(),
+                    "cat ~/.cairn/operator_auth_secret",
+                ),
+            )
+            .await;
+
+            let refusal = resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                PermissionAnswer::from_surface(
+                    PermissionDecision::Allow,
+                    AnswerSurface::ResourcePatch,
+                )
+                .with_containment_scope(scope),
+            )
+            .await
+            .expect_err("an agent must not be able to lift its own sandbox");
+            assert!(
+                refusal.contains("no sandbox at all"),
+                "unexpected refusal: {refusal}"
+            );
+
+            assert_eq!(
+                perm_status(&orch).await.as_deref(),
+                Some("pending"),
+                "a refused escape records nothing and stays answerable"
+            );
+            assert!(
+                orch.session_allowed_crossings.lock().unwrap().is_empty(),
+                "a refused escape must not leave a session grant behind"
+            );
+        }
+    }
+
+    /// The operator can still allow it — through the desktop proxy or an
+    /// owner/admin JWT, both of which carry the capability.
+    #[tokio::test]
+    async fn an_operator_can_allow_an_unsandboxed_command_escape() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        store_crossing(
+            &orch,
+            super::super::fence::Crossing::shell_command(
+                "command blocked by the executor sandbox".to_string(),
+                "make install",
+            ),
+        )
+        .await;
+
+        let approval = OperatorApproval::authenticated(
+            "local:test-device",
+            OperatorTransport::AuthenticatedDesktop,
+        )
+        .expect("operator capability");
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_operator(PermissionDecision::Allow, approval),
+        )
+        .await
+        .expect("an operator may approve an escape");
+
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+    }
+
+    /// A path-scoped crossing stays self-approvable. Narrowing that too would
+    /// park ordinary work at the fence for no gain: the sandbox is still built,
+    /// and what is widened is the one path the prompt named.
+    #[tokio::test]
+    async fn an_agent_can_still_self_approve_a_path_scoped_crossing() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        store_crossing(
+            &orch,
+            super::super::fence::Crossing::shell_path(
+                std::path::Path::new("/tmp/outside.txt"),
+                "/tmp/outside.txt",
+            ),
+        )
+        .await;
+
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch),
+        )
+        .await
+        .expect("a path-scoped crossing stays answerable by the agent");
+
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+    }
+
+    /// A prompt written before the path/command kinds were split is treated as
+    /// an escape rather than as a crossing.
+    ///
+    /// Pending prompts are durable and nothing expires them, so an agent
+    /// suspended on a command crossing when the app is upgraded resumes
+    /// afterwards facing a row tagged with the old ambiguous kind. Reading that
+    /// as path-scoped would hand it the exact escape this gate exists to stop,
+    /// through the exact surface it holds, on the exact prompt it is waiting on.
+    #[tokio::test]
+    async fn a_legacy_crossing_tag_is_treated_as_an_escape() {
+        // The descriptor deliberately begins with `/`: a shape heuristic would
+        // read this as a path and fail open on precisely the dangerous case.
+        let legacy = serde_json::json!({
+            "kind": "shell_escape",
+            "verb": "run",
+            "descriptor": "/bin/cat /Users/x/.cairn/operator_auth_secret",
+            "summary": "command blocked by the executor sandbox",
+            "request": {
+                "cwd": "/wt", "run_id": "run-1", "tool": "run",
+                "tool_use_id": "tool-1", "payload": {}
+            }
+        })
+        .to_string()
+        .replace('\'', "''");
+
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        orch.db
+            .local
+            .execute_script(format!(
+                "UPDATE permission_requests SET tool_input = '{legacy}' \
+                 WHERE id = 'perm-request-1'"
+            ))
+            .await
+            .unwrap();
+
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch),
+        )
+        .await
+        .expect_err("a legacy command crossing must not be self-approvable");
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+    }
+
+    /// Denial stays open on an escape too: recognizing that something should not
+    /// happen is not a capability.
+    #[tokio::test]
+    async fn an_agent_can_still_deny_an_unsandboxed_command_escape() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        store_crossing(
+            &orch,
+            super::super::fence::Crossing::shell_command(
+                "command blocked by the executor sandbox".to_string(),
+                "cat /etc/shadow",
+            ),
+        )
+        .await;
+
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch),
+        )
+        .await
+        .expect("deny stays open to every surface");
+
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("denied"));
+    }
+
     fn codex_mcp_request_input() -> String {
         serde_json::json!({
             "serverName": "cairn",
@@ -2019,7 +2859,12 @@ mod tests {
         let orch = test_orchestrator().await;
         seed_allow_all_permission(&orch).await;
 
-        allow_all_for_request(&orch, "perm-request-1")
+        let approval = OperatorApproval::authenticated(
+            "local:test-device",
+            OperatorTransport::AuthenticatedDesktop,
+        )
+        .expect("operator capability");
+        allow_all_for_request(&orch, "perm-request-1", &approval)
             .await
             .unwrap();
 
@@ -2133,8 +2978,12 @@ mod tests {
 
     #[test]
     fn terminal_origin_permission_response_never_resumes_agent_turn() {
+        // `shell_command_escape`, matching what this fixture actually is: the
+        // descriptor is a normalized command, not a resolved path. It read
+        // `shell_escape` before the two kinds were split, which is a shape the
+        // system no longer writes.
         let detail = serde_json::json!({
-            "kind": "shell_escape",
+            "kind": "shell_command_escape",
             "verb": "run",
             "descriptor": "ps aux",
             "summary": "command blocked by the worktree sandbox: ps aux",
@@ -2164,6 +3013,22 @@ mod tests {
             &resume,
             false
         ));
+    }
+
+    #[test]
+    fn grant_error_rides_on_the_response_without_rewriting_the_answer() {
+        let augmented = with_grant_error(r#"{"behavior":"allow"}"#, "disk full");
+        let value: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        // The recorded decision stays truthful; only the failure is added.
+        assert_eq!(value["behavior"], "allow");
+        assert_eq!(value[GRANT_ERROR_KEY], "disk full");
+    }
+
+    #[test]
+    fn grant_error_survives_a_response_that_is_not_json() {
+        let augmented = with_grant_error("not json at all", "disk full");
+        let value: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        assert_eq!(value[GRANT_ERROR_KEY], "disk full");
     }
 
     #[test]

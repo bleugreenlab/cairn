@@ -261,6 +261,43 @@ pub(crate) fn branch_is_ancestor_of(
     .unwrap_or(false)
 }
 
+/// True when `commit` is an ancestor of (or equals) `branch`'s tip — that is,
+/// when the branch already carries that commit and a replay onto it would move
+/// nothing.
+///
+/// The mirror of [`branch_is_ancestor_of`], and it falls the same way on a
+/// resolve failure: `false`, meaning "not known to carry it". Callers use this
+/// to skip redundant work, so an unproven answer must send them down the
+/// replay path — a replay that turns out to be a no-op is harmless, while
+/// skipping one that was needed is the failure this exists to prevent.
+pub(crate) fn branch_carries_commit(jj: &JjEnv, store: &Path, branch: &str, commit: &str) -> bool {
+    // Fail closed on an empty coordinate rather than composing it into the
+    // revset. An empty `commit` would leave `::(bookmarks(...))` — every
+    // ancestor of the branch — which is non-empty for any branch that resolves
+    // and would report a carried base on the strength of nothing at all.
+    if branch.is_empty() || commit.is_empty() {
+        return false;
+    }
+    let branch_revset = format!("bookmarks(exact:{branch:?})");
+    let revset = format!("{commit}::({branch_revset})");
+    jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "commit_id",
+            "--ignore-working-copy",
+        ],
+        "jj carries-commit check",
+    )
+    .ok()
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
+}
+
 /// The change-id of a bookmark's tip over the store, or empty when the bookmark
 /// does not resolve. A jj *divergent* change's twins all share ONE change-id,
 /// and the bookmark points at exactly one of them, so this returns that shared

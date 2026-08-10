@@ -538,6 +538,13 @@ pub async fn pending_deliverable_live(
 /// are excluded by construction, so they never wake — they only ride along on a
 /// resume that happens for some other reason (drained by [`list_pending_live`]).
 pub async fn has_pending_waking_live(db: &LocalDb, recipient: &str) -> DbResult<bool> {
+    // A push queued before a thread was closed stays pending and auditable, but
+    // it is not a reason to resume the session: closure is what suspends
+    // delivery, and reopening is what restores it. Filtering at the resume gate
+    // rather than deleting the rows is what makes the transition reversible.
+    if crate::threads::is_dormant_thread_session(db, recipient).await {
+        return Ok(false);
+    }
     let pending = list_pending(db, recipient).await?;
     for push in pending {
         if push.wake == Wake::Passive {

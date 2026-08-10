@@ -28,6 +28,95 @@ struct ExecOutput {
     denial: Option<sandbox::SandboxDenial>,
 }
 
+/// The verbs a cached probe positively proves a machine has, if it proves any.
+///
+/// A failed probe and a machine nobody has probed yet both leave an empty
+/// catalog, and an empty catalog is not evidence of absence. Refusing a verb on
+/// it would tell an agent the machine cannot do something when the truth is that
+/// nobody could ask — which is exactly what a dropped link produces. Only a
+/// probe that came back with a real catalog can refute a verb.
+fn advertised_verbs(cached: &cairn_db::storage::ExecutorDesktopAutomation) -> Option<Vec<String>> {
+    if cached.probe_error.is_some() {
+        return None;
+    }
+    let tools =
+        serde_json::from_str::<Vec<crate::mcp::gateway::McpToolDef>>(&cached.verbs_json).ok()?;
+    if tools.is_empty() {
+        return None;
+    }
+    Some(tools.into_iter().map(|tool| tool.name).collect())
+}
+
+async fn run_executor_action(
+    orch: &Orchestrator,
+    header: String,
+    spec: super::types::ExecutorActionSpec,
+) -> ItemOutcome {
+    let Some(gateway) = orch.mcp_gateway() else {
+        return ItemOutcome::failed(header, "MCP gateway is not available in this host");
+    };
+    let config = crate::config::settings::load_fleet(&orch.config_dir);
+    let os = orch
+        .fleet
+        .inspect_executors(crate::fleet::unix_time_ms())
+        .into_iter()
+        .find(|executor| executor.name == spec.executor_name)
+        .map(|executor| executor.health.advertisement.capabilities.os)
+        .unwrap_or_default();
+    let desktop = config.desktop_automation.resolve(&spec.executor_name, &os);
+    if !desktop.enabled {
+        return ItemOutcome::failed(
+            header,
+            format!("Desktop automation is off for {}", spec.executor_name),
+        );
+    }
+    if let Ok(Some(cached)) =
+        cairn_db::storage::get_executor_desktop_automation(&orch.db.local, &spec.executor_name)
+            .await
+    {
+        if let Some(verbs) = advertised_verbs(&cached) {
+            if !verbs.iter().any(|verb| verb == &spec.action) {
+                return ItemOutcome::failed(header, format!(
+                    "{} does not advertise `{}`. Its desktop verbs are: {}. Read cairn://executors/{}.",
+                    spec.executor_name, spec.action, verbs.join(", "), spec.executor_name
+                ));
+            }
+        }
+    }
+    let facade =
+        crate::fleet::desktop::placed_desktop_facade(orch, &spec.executor_name, desktop.binary);
+    let timeout = super::clamp_host_item_timeout_ms(spec.timeout);
+    let outcome = gateway
+        .call_placed_tool_once(facade.clone(), &spec.action, spec.args, timeout)
+        .await;
+    if let Ok(catalog) = gateway.list_placed_tools(facade).await {
+        let state = cairn_db::storage::ExecutorDesktopAutomation {
+            executor_id: spec.executor_name.clone(),
+            probed_at: chrono::Utc::now().timestamp_millis(),
+            health_json: None,
+            verbs_json: serde_json::to_string(&catalog.tools).unwrap_or_else(|_| "[]".into()),
+            probe_error: None,
+        };
+        if let Err(error) =
+            cairn_db::storage::upsert_executor_desktop_automation(&orch.db.local, &state).await
+        {
+            tracing::warn!(machine = %spec.executor_name, %error, "could not cache desktop verb catalog");
+        }
+    }
+    match outcome {
+        Ok(McpCallOutcome::Complete(result)) => ItemOutcome {
+            header,
+            body: result.text,
+            succeeded: true,
+            suspended: false,
+            images: result.images,
+            tracked_modifications: None,
+        },
+        Ok(_) => ItemOutcome::failed(header, "Desktop verbs cannot suspend for follow-up input"),
+        Err(error) => ItemOutcome::failed(header, format!("{}: {error}", spec.executor_name)),
+    }
+}
+
 /// Maximum output buffer size (64KB)
 pub(crate) const MAX_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -122,6 +211,124 @@ pub(crate) async fn run_one(
                 None,
             )
         }
+        RunSpec::ExecutorAction(spec) => {
+            return run_executor_action(orch, header, *spec).await;
+        }
+        RunSpec::ResponseCall {
+            response_id,
+            project,
+            args,
+            timeout,
+        } => {
+            let explicit_project_id = if let Some(project) = project.as_deref() {
+                orch.db
+                    .local
+                    .query_text(
+                        "SELECT id FROM projects WHERE UPPER(key) = UPPER(?1) LIMIT 1",
+                        (project.to_string(),),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let project_path = if let Some(project) = project.as_deref() {
+                crate::mcp::handlers::skills_resources::project_path_by_key(orch, project)
+                    .await
+                    .ok()
+            } else if let Some(context) = run_context {
+                crate::mcp::handlers::run_context::project_path(&orch.db.local, &context.project_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(std::path::PathBuf::from)
+            } else {
+                None
+            };
+            let project_key = project
+                .clone()
+                .or_else(|| run_context.map(|context| context.project_key.clone()));
+            let caller = run_context.map_or_else(
+                || {
+                    explicit_project_id.map_or_else(
+                        || crate::responses::ResponseCaller::Internal {
+                            label: "run".into(),
+                        },
+                        |project_id| crate::responses::ResponseCaller::Agent {
+                            label: Some("run".into()),
+                            run_id: request
+                                .run_id
+                                .clone()
+                                .unwrap_or_else(|| "ambient-run".into()),
+                            project_id: Some(project_id),
+                            project_path: project_path.clone(),
+                        },
+                    )
+                },
+                |context| {
+                    if context.agent_config_id.as_deref() == Some("workflow") {
+                        crate::responses::ResponseCaller::Workflow {
+                            label: context.job_name.clone(),
+                            run_id: context.run_id.clone(),
+                            project_id: Some(context.project_id.clone()),
+                            project_path: project_path.clone(),
+                        }
+                    } else {
+                        crate::responses::ResponseCaller::Agent {
+                            label: context.job_name.clone(),
+                            run_id: context.run_id.clone(),
+                            project_id: Some(context.project_id.clone()),
+                            project_path: project_path.clone(),
+                        }
+                    }
+                },
+            );
+            let invocation = crate::responses::invoke(orch, &response_id, &args, caller);
+            return match tokio::time::timeout(
+                Duration::from_millis(
+                    super::clamp_host_item_timeout_ms(timeout)
+                        .unwrap_or(super::MAX_HOST_ITEM_TIMEOUT_MS) as u64,
+                ),
+                invocation,
+            )
+            .await
+            {
+                Err(_) => ItemOutcome::failed(header, "Response invocation timed out"),
+                Ok(Ok(outcome)) => {
+                    let invocation = project_key.as_deref().map_or_else(
+                        || format!("cairn://responses/{response_id}/history/{}", outcome.seq),
+                        |project| {
+                            format!(
+                                "cairn://p/{project}/responses/{response_id}/history/{}",
+                                outcome.seq
+                            )
+                        },
+                    );
+                    let cost = outcome
+                        .cost
+                        .map(|cost| format!(" · ${cost:.4}"))
+                        .unwrap_or_default();
+                    ItemOutcome {
+                        header: format!(
+                            "{invocation} [{} · {} · {:.1}s{}]",
+                            outcome.backend,
+                            outcome.model,
+                            outcome.latency_ms as f64 / 1000.0,
+                            cost
+                        ),
+                        body: outcome
+                            .parsed
+                            .map_or(outcome.text, |value| value.to_string()),
+                        succeeded: true,
+                        suspended: false,
+                        images: Vec::new(),
+                        tracked_modifications: None,
+                    }
+                }
+                Ok(Err(error)) => ItemOutcome::failed(header, error.to_string()),
+            };
+        }
         RunSpec::Script {
             program,
             args,
@@ -179,6 +386,14 @@ pub(crate) async fn run_one(
             let _ = denial;
             return ItemOutcome::failed(header, READ_ONLY_CHECKOUT_DENIAL);
         }
+        // A blocked touch of the workspace configuration document or the desktop
+        // operator credential is not an approvable crossing: allowing one
+        // re-executes this command with the sandbox switched off, which would
+        // let the access actually land on the strength of a prompt that only
+        // ever said "a file outside the project is being touched". That refusal
+        // now lives in `fence::raise_fence`, which both this site and the
+        // executor-relayed one in `fleet/mod.rs` reach, rather than here where
+        // only one of them would get it.
         if let Some((run_id, fence_mode)) = fence::resolve_run_fence(orch, request).await {
             let crossing = match &denial {
                 sandbox::SandboxDenial::Path { path, .. } => {
@@ -302,7 +517,7 @@ async fn run_mcp_call(
         .call_tool_once(
             &session_key,
             &credential_key,
-            &config,
+            &config.brokered(&credential_key, "mcp tool call"),
             &tool,
             args.clone(),
             None,
@@ -824,85 +1039,30 @@ async fn execute_process(
     let last_output_at: Option<Arc<Mutex<SystemTime>>> =
         run_context.map(|_| Arc::new(Mutex::new(SystemTime::now())));
 
-    // Read stdout in a thread
-    let stdout_handle = {
-        let content = stdout_content.clone();
-        let combined = combined_buffer.clone();
-        let last_ts = last_output_at.clone();
-        let emitter = services.emitter.clone();
-        let run_id = run_context.map(|r| r.run_id.clone());
-        let tool_id = tool_use_id.clone();
-
-        thread::spawn(move || {
-            if let Some(stdout) = stdout {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(Result::ok) {
-                    {
-                        let mut c = content.lock().unwrap();
-                        if !c.is_empty() {
-                            c.push('\n');
-                        }
-                        c.push_str(&line);
-                    }
-                    record_combined_output(&combined, &last_ts, &line);
-
-                    // Stream to frontend if we have run context
-                    if let Some(ref rid) = run_id {
-                        let _ = emitter.emit(
-                            "run-output",
-                            serde_json::to_value(RunOutputPayload {
-                                run_id: rid.clone(),
-                                tool_use_id: tool_id.clone(),
-                                chunk: format!("{}\n", line),
-                                stream: "stdout".to_string(),
-                            })
-                            .unwrap_or_default(),
-                        );
-                    }
-                }
-            }
-        })
-    };
-
-    // Read stderr in a thread
-    let stderr_handle = {
-        let content = stderr_content.clone();
-        let combined = combined_buffer.clone();
-        let last_ts = last_output_at.clone();
-        let emitter = services.emitter.clone();
-        let run_id = run_context.map(|r| r.run_id.clone());
-        let tool_id = tool_use_id.clone();
-
-        thread::spawn(move || {
-            if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    {
-                        let mut c = content.lock().unwrap();
-                        if !c.is_empty() {
-                            c.push('\n');
-                        }
-                        c.push_str(&line);
-                    }
-                    record_combined_output(&combined, &last_ts, &line);
-
-                    // Stream to frontend if we have run context
-                    if let Some(ref rid) = run_id {
-                        let _ = emitter.emit(
-                            "run-output",
-                            serde_json::to_value(RunOutputPayload {
-                                run_id: rid.clone(),
-                                tool_use_id: tool_id.clone(),
-                                chunk: format!("{}\n", line),
-                                stream: "stderr".to_string(),
-                            })
-                            .unwrap_or_default(),
-                        );
-                    }
-                }
-            }
-        })
-    };
+    let stdout_handle = drain_host_pipe(
+        stdout,
+        "stdout",
+        HostPipeSinks {
+            content: stdout_content.clone(),
+            combined: combined_buffer.clone(),
+            last_output_at: last_output_at.clone(),
+            emitter: services.emitter.clone(),
+            run_id: run_context.map(|r| r.run_id.clone()),
+            tool_use_id: tool_use_id.clone(),
+        },
+    );
+    let stderr_handle = drain_host_pipe(
+        stderr,
+        "stderr",
+        HostPipeSinks {
+            content: stderr_content.clone(),
+            combined: combined_buffer.clone(),
+            last_output_at: last_output_at.clone(),
+            emitter: services.emitter.clone(),
+            run_id: run_context.map(|r| r.run_id.clone()),
+            tool_use_id: tool_use_id.clone(),
+        },
+    );
 
     // Feed the child's stdin from a dedicated thread when the spec carries a
     // payload (only `uv run -`): write the whole script, flush, then drop the
@@ -964,8 +1124,8 @@ async fn execute_process(
         let denial = if let Some(_ctx) = run_context {
             if sandboxed {
                 let partial = {
-                    let o = stdout_content.lock().unwrap().clone();
-                    let e = stderr_content.lock().unwrap().clone();
+                    let o = captured(&stdout_content);
+                    let e = captured(&stderr_content);
                     match (o.is_empty(), e.is_empty()) {
                         (false, false) => format!("{o}\n{e}"),
                         (false, true) => o,
@@ -1009,8 +1169,8 @@ async fn execute_process(
             );
         }
 
-        let stdout_str = stdout_content.lock().unwrap().clone();
-        let stderr_str = stderr_content.lock().unwrap().clone();
+        let stdout_str = captured(&stdout_content);
+        let stderr_str = captured(&stderr_content);
         return Ok(ExecOutput {
             stdout: stdout_str,
             stderr: stderr_str,
@@ -1044,8 +1204,8 @@ async fn execute_process(
         );
     }
 
-    let stdout_str = stdout_content.lock().unwrap().clone();
-    let stderr_str = stderr_content.lock().unwrap().clone();
+    let stdout_str = captured(&stdout_content);
+    let stderr_str = captured(&stderr_content);
 
     // Detect a kernel sandbox denial so the caller can drive the worktree fence.
     let denial = if sandboxed {
@@ -1083,15 +1243,94 @@ async fn execute_process(
     })
 }
 
+/// Read back what a pipe reader captured.
+///
+/// The reader appends newline-terminated text, so the buffer carries a trailing
+/// terminator that the captured value never had; one is stripped here rather
+/// than by the reader, because the reader is mid-stream and cannot know which
+/// newline is the last one.
+fn captured(buffer: &Arc<Mutex<String>>) -> String {
+    let mut text = buffer.lock().unwrap().clone();
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    text
+}
+
+/// Everything one host pipe's output has to reach.
+struct HostPipeSinks {
+    content: Arc<Mutex<String>>,
+    combined: Option<Arc<Mutex<VecDeque<u8>>>>,
+    last_output_at: Option<Arc<Mutex<SystemTime>>>,
+    emitter: Arc<dyn crate::services::EventEmitter>,
+    run_id: Option<String>,
+    tool_use_id: String,
+}
+
+/// Drain one host process pipe into every sink that observes it.
+///
+/// The sinks are the point: the captured content becomes the item's result text,
+/// the combined buffer is what a promoted terminal adopts as its scrollback, and
+/// the live payload is what the UI renders as the command runs. They all read
+/// the *same* scrubbed text here, so they cannot fork into a raw and a redacted
+/// version of one command's output.
+///
+/// Reading is line-oriented because that is the shape both the capture and the
+/// live payload want, but scrubbing is not: one streaming scrubber spans the
+/// whole pipe, because a registered value containing a newline would otherwise
+/// straddle two lines and be invisible to a per-line pass. The scrubber releases
+/// on any byte outside the registered alphabet, so a newline-terminated line
+/// still goes out the moment it arrives.
+fn drain_host_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    stream: &'static str,
+    sinks: HostPipeSinks,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let Some(pipe) = pipe else { return };
+        let mut scrubber = crate::security::StreamingScrubber::new();
+        let publish = |settled: Vec<u8>| {
+            if settled.is_empty() {
+                return;
+            }
+            let text = String::from_utf8_lossy(&settled).into_owned();
+            sinks.content.lock().unwrap().push_str(&text);
+            record_combined_output(&sinks.combined, &sinks.last_output_at, &text);
+            if let Some(run_id) = sinks.run_id.as_ref() {
+                let _ = sinks.emitter.emit(
+                    "run-output",
+                    serde_json::to_value(RunOutputPayload {
+                        run_id: run_id.clone(),
+                        tool_use_id: sinks.tool_use_id.clone(),
+                        chunk: text,
+                        stream: stream.to_string(),
+                    })
+                    .unwrap_or_default(),
+                );
+            }
+        };
+        let reader = BufReader::new(pipe);
+        for line in reader.lines().map_while(Result::ok) {
+            // `lines()` strips the terminator, so it goes back on: the scrubber
+            // is scrubbing a stream, not a list of lines, and the separator is
+            // part of it.
+            publish(scrubber.push(format!("{line}\n").as_bytes()));
+        }
+        // End of pipe. A reader that returns without this drops whatever the
+        // scrubber was still withholding, which is the tail of the command's
+        // output.
+        publish(scrubber.flush());
+    })
+}
+
 fn record_combined_output(
     combined: &Option<Arc<Mutex<VecDeque<u8>>>>,
     last_output_at: &Option<Arc<Mutex<SystemTime>>>,
-    line: &str,
+    text: &str,
 ) {
     if let Some(cb) = combined {
         if let Ok(mut b) = cb.lock() {
-            b.extend(line.as_bytes());
-            b.push_back(b'\n');
+            b.extend(text.as_bytes());
             while b.len() > MAX_BUFFER_SIZE {
                 b.pop_front();
             }
@@ -1283,6 +1522,44 @@ mod tests {
                 "{key} must be stripped so a worktree command builds into its own target dir"
             );
         }
+    }
+
+    fn cached_desktop(
+        verbs_json: &str,
+        probe_error: Option<&str>,
+    ) -> cairn_db::storage::ExecutorDesktopAutomation {
+        cairn_db::storage::ExecutorDesktopAutomation {
+            executor_id: "bglab-win".into(),
+            probed_at: 0,
+            health_json: None,
+            verbs_json: verbs_json.into(),
+            probe_error: probe_error.map(str::to_string),
+        }
+    }
+
+    /// A real catalog is the only thing that may refute a verb. The other two
+    /// shapes are a machine whose probe failed and one nobody has probed, and
+    /// treating either as "advertises nothing" is how a dropped link turns into
+    /// a refusal claiming the verb does not exist.
+    #[test]
+    fn only_a_probed_catalog_can_refute_a_verb() {
+        let probed = cached_desktop(r#"[{"name":"look","input_schema":{}}]"#, None);
+        assert_eq!(
+            advertised_verbs(&probed),
+            Some(vec!["look".to_string()]),
+            "a probed catalog is evidence"
+        );
+
+        assert_eq!(
+            advertised_verbs(&cached_desktop("[]", Some("Transport closed"))),
+            None,
+            "a failed probe proves nothing about the machine's verbs"
+        );
+        assert_eq!(
+            advertised_verbs(&cached_desktop("[]", None)),
+            None,
+            "an empty catalog is not evidence of absence"
+        );
     }
 
     #[test]

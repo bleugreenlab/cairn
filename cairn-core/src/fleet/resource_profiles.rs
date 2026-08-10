@@ -1,8 +1,9 @@
 use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
-    CellCommandClass, CellExecutionMeta, CommandResourceIdentity, DurationEstimate,
-    DurationEvidence, DurationFallback, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality,
+    CellCommandClass, CellExecutionMeta, CommandResourceIdentity, ContentionEstimate,
+    ContentionEvidence, ContentionFallback, DurationEstimate, DurationEvidence, DurationFallback,
+    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality,
     ReservationFallback, ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS,
     DURATION_SAMPLE_WINDOW, MIN_CONFIDENT_DURATION_SAMPLES, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
@@ -13,6 +14,13 @@ const MIN_CONFIDENT_SAMPLES: u64 = MIN_CONFIDENT_RESERVATION_SAMPLES;
 const HEADROOM_NUMERATOR: u64 = 5;
 const HEADROOM_DENOMINATOR: u64 = 4;
 const HEADROOM_PERCENT: u32 = 25;
+const MIN_CONTENTION_SAMPLES: usize = 3;
+/// A command reservation must leave room for the operating system, executor,
+/// and measurement noise. Peaks at or above this share describe saturation.
+const MEMORY_QUARANTINE_NUMERATOR: u64 = 9;
+const MEMORY_QUARANTINE_DENOMINATOR: u64 = 10;
+const MEMORY_RESERVATION_CAP_NUMERATOR: u64 = 3;
+const MEMORY_RESERVATION_CAP_DENOMINATOR: u64 = 4;
 
 #[derive(Clone, Debug)]
 pub(super) struct ProfileContext {
@@ -20,6 +28,133 @@ pub(super) struct ProfileContext {
     pub os: String,
     pub arch: String,
     pub toolchain_fingerprint: String,
+}
+
+async fn load_contention_profile(
+    db: Arc<LocalDb>,
+    executor_class: &str,
+    load: &ExecutionLoadContext,
+) -> Result<Option<ContentionProfile>, String> {
+    let executor_class = executor_class.to_string();
+    let load = load.clone();
+    db.read(|conn| Box::pin(async move {
+        let mut rows = conn.query(
+            "SELECT sample_count, updated_at_unix_ms, recent_multiplier_millis FROM command_contention_profiles WHERE executor_class=?1 AND compile_jobs=?2 AND light_jobs=?3",
+            params![executor_class, load.co_resident_compile_jobs as i64, load.co_resident_light_jobs as i64],
+        ).await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(ContentionProfile {
+                sample_count: row.get::<i64>(0)? as u64,
+                updated_at_unix_ms: row.get::<i64>(1)? as u64,
+                recent_multiplier_millis: decode_window(&row.get::<String>(2)?),
+            })),
+            None => Ok(None),
+        }
+    })).await.map_err(|error| error.to_string())
+}
+
+async fn record_contention(
+    db: Arc<LocalDb>,
+    context: &ProfileContext,
+    load: &ExecutionLoadContext,
+    finished: u64,
+    multiplier_millis: u64,
+) -> Result<(), String> {
+    for key in [context.executor_class.clone(), "*".into()] {
+        let load = load.clone();
+        db.write(move |conn| {
+            let key = key.clone();
+            let load = load.clone();
+            Box::pin(async move {
+            let mut rows = conn.query(
+                "SELECT sample_count, recent_multiplier_millis FROM command_contention_profiles WHERE executor_class=?1 AND compile_jobs=?2 AND light_jobs=?3",
+                params![key.clone(), load.co_resident_compile_jobs as i64, load.co_resident_light_jobs as i64],
+            ).await?;
+            let (count, mut window) = match rows.next().await? {
+                Some(row) => (row.get::<i64>(0)? as u64, decode_window(&row.get::<String>(1)?)),
+                None => (0, Vec::new()),
+            };
+            window.push(multiplier_millis);
+            while window.len() > DURATION_SAMPLE_WINDOW { window.remove(0); }
+            let encoded = serde_json::to_string(&window).unwrap_or_else(|_| "[]".into());
+            conn.execute(
+                "INSERT INTO command_contention_profiles (executor_class, compile_jobs, light_jobs, sample_count, updated_at_unix_ms, recent_multiplier_millis) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(executor_class, compile_jobs, light_jobs) DO UPDATE SET sample_count=excluded.sample_count, updated_at_unix_ms=excluded.updated_at_unix_ms, recent_multiplier_millis=excluded.recent_multiplier_millis",
+                params![key, load.co_resident_compile_jobs as i64, load.co_resident_light_jobs as i64,
+                    count.saturating_add(1).min(10_000) as i64, finished as i64, encoded],
+            ).await?;
+            Ok(())
+            })
+        }).await.map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContentionProfile {
+    sample_count: u64,
+    updated_at_unix_ms: u64,
+    recent_multiplier_millis: Vec<u64>,
+}
+
+pub(super) fn contention_prior(load: &ExecutionLoadContext) -> ContentionEstimate {
+    ContentionEstimate {
+        co_resident_compile_jobs: load.co_resident_compile_jobs,
+        co_resident_light_jobs: load.co_resident_light_jobs,
+        multiplier_millis: 1_000_u32
+            .saturating_add(load.co_resident_compile_jobs.saturating_mul(600))
+            .saturating_add(load.co_resident_light_jobs.saturating_mul(100)),
+        source: ContentionEvidence::Prior,
+        sample_count: 0,
+        fallback: Some(ContentionFallback::NoGlobalCurve),
+    }
+}
+
+pub(super) async fn resolve_contention(
+    db: Arc<LocalDb>,
+    context: &ProfileContext,
+    load: &ExecutionLoadContext,
+    now_unix_ms: u64,
+) -> ContentionEstimate {
+    let mut lookup_failed = false;
+    for (key, source, fallback) in [
+        (
+            context.executor_class.as_str(),
+            ContentionEvidence::Machine,
+            None,
+        ),
+        (
+            "*",
+            ContentionEvidence::Global,
+            Some(ContentionFallback::NoMachineCurve),
+        ),
+    ] {
+        match load_contention_profile(db.clone(), key, load).await {
+            Ok(Some(profile))
+                if profile.recent_multiplier_millis.len() >= MIN_CONTENTION_SAMPLES
+                    && now_unix_ms.saturating_sub(profile.updated_at_unix_ms)
+                        <= DURATION_PROFILE_STALE_AFTER_MS =>
+            {
+                return ContentionEstimate {
+                    co_resident_compile_jobs: load.co_resident_compile_jobs,
+                    co_resident_light_jobs: load.co_resident_light_jobs,
+                    multiplier_millis: median_ms(&profile.recent_multiplier_millis)
+                        .clamp(1_000, u32::MAX as u64)
+                        as u32,
+                    source,
+                    sample_count: profile.sample_count,
+                    fallback,
+                };
+            }
+            Ok(_) => {}
+            Err(_) => lookup_failed = true,
+        }
+    }
+    let mut prior = contention_prior(load);
+    if lookup_failed {
+        prior.fallback = Some(ContentionFallback::ProfileLookupFailed);
+    }
+    prior
 }
 
 impl ProfileContext {
@@ -46,6 +181,8 @@ pub(super) struct ResolvedResourceProfile {
     /// against a duration, and it exists so placement can rank machines by when
     /// they would answer rather than by how unloaded they look.
     pub duration: DurationEstimate,
+    /// Per-item durations when this profile represents a process batch.
+    pub item_durations: Vec<DurationEstimate>,
 }
 
 /// The conservative safety prior for a work class that has never been measured
@@ -82,12 +219,19 @@ pub(super) fn cold_start_prior(
         CellCommandClass::Vitest => (GIB, GIB),
         CellCommandClass::Other => (512 * MIB, GIB),
     };
-    // A prior may never exceed what the machine has, or it could never be
-    // admitted at all: an unschedulable safety margin is not a safety margin.
-    let share = |budget: Option<u64>, floor: u64| budget.map_or(floor, |budget| floor.min(budget));
+    // Memory always leaves the same host reserve as learned demand. A small
+    // machine does not make the operating system and executor disappear.
+    let memory = capabilities.memory_budget_bytes.map_or(memory, |budget| {
+        let cap = budget.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
+            / MEMORY_RESERVATION_CAP_DENOMINATOR;
+        memory.min(cap)
+    });
+    let disk = capabilities
+        .disk_budget_bytes
+        .map_or(disk, |budget| disk.min(budget));
     ResourceReservation {
-        memory_bytes: share(capabilities.memory_budget_bytes, memory),
-        disk_growth_bytes: share(capabilities.disk_budget_bytes, disk),
+        memory_bytes: memory,
+        disk_growth_bytes: disk,
         // One unit is the cold-start prior for every class. Deriving more from a
         // CPU percentage would turn an observation about how hard a machine was
         // pushed into a claim about how many lanes this work needs, which is a
@@ -163,7 +307,7 @@ pub(super) async fn resolve_duration(
 ) -> DurationEstimate {
     let Some(identity) = identity else {
         return unmeasured_duration(
-            class,
+            CellCommandClass::Other,
             context,
             None,
             warmth,
@@ -257,6 +401,7 @@ pub(super) async fn resolve_reservation(
     identity: Option<&CommandResourceIdentity>,
     context: &ProfileContext,
     prior: ResourceReservation,
+    memory_budget_bytes: Option<u64>,
     duration_context: DurationContext,
 ) -> ResolvedResourceProfile {
     let duration = resolve_duration(
@@ -291,6 +436,7 @@ pub(super) async fn resolve_reservation(
             learned_estimate: None,
             rationale: rationale(Some(ReservationFallback::NoCommandIdentity), None),
             duration,
+            item_durations: Vec::new(),
         };
     };
     // A store that could not be read and a work class that has never run are
@@ -304,6 +450,7 @@ pub(super) async fn resolve_reservation(
                 learned_estimate: None,
                 rationale: rationale(Some(ReservationFallback::NoProfileRecorded), None),
                 duration,
+                item_durations: Vec::new(),
             }
         }
         Err(_) => {
@@ -312,12 +459,24 @@ pub(super) async fn resolve_reservation(
                 learned_estimate: None,
                 rationale: rationale(Some(ReservationFallback::ProfileLookupFailed), None),
                 duration,
+                item_durations: Vec::new(),
             }
         }
     };
     let below_floor = profile.sample_count < MIN_CONFIDENT_SAMPLES;
+    let memory_quarantined = memory_budget_bytes.is_some_and(|budget| {
+        profile.upper_peak_rss_bytes.is_some_and(|peak| {
+            peak.saturating_mul(MEMORY_QUARANTINE_DENOMINATOR)
+                >= budget.saturating_mul(MEMORY_QUARANTINE_NUMERATOR)
+        })
+    });
     ResolvedResourceProfile {
-        reservation: reservation_for_profile(&profile, prior.clone()),
+        reservation: reservation_for_profile(
+            &profile,
+            prior.clone(),
+            memory_budget_bytes,
+            memory_quarantined,
+        ),
         learned_estimate: Some(cairn_common::executor_protocol::LearnedResourceEstimate {
             sample_count: profile.sample_count,
             upper_duration_ms: profile.upper_duration_ms,
@@ -325,10 +484,15 @@ pub(super) async fn resolve_reservation(
             upper_disk_growth_bytes: profile.upper_disk_delta_bytes,
         }),
         rationale: rationale(
-            below_floor.then_some(ReservationFallback::BelowConfidenceFloor),
+            if memory_quarantined {
+                Some(ReservationFallback::MemoryObservationQuarantined)
+            } else {
+                below_floor.then_some(ReservationFallback::BelowConfidenceFloor)
+            },
             Some(&profile),
         ),
         duration,
+        item_durations: Vec::new(),
     }
 }
 
@@ -367,16 +531,48 @@ pub(super) async fn observe_completed(
     // not depend on knowing why — but it teaches the predictor nothing, because
     // filing it under a guessed warmth is how warm and cold runs contaminate each
     // other.
-    if let (Some(duration), Some(warmth)) = (duration, metadata.warmth) {
-        let _ = record_duration(
+    if let (Some(duration), Some(warmth), Some(load)) =
+        (duration, metadata.warmth, metadata.load_context.as_ref())
+    {
+        let idle = load.co_resident_compile_jobs == 0 && load.co_resident_light_jobs == 0;
+        let baseline = resolve_duration(
             db.clone(),
-            identity,
+            Some(identity),
             context,
             warmth,
+            CellCommandClass::Other,
             metadata.finished_at_unix_ms,
-            duration,
         )
         .await;
+        if idle {
+            let _ = record_duration(
+                db.clone(),
+                identity,
+                context,
+                warmth,
+                metadata.finished_at_unix_ms,
+                duration,
+            )
+            .await;
+            let _ = record_contention(
+                db.clone(),
+                context,
+                load,
+                metadata.finished_at_unix_ms,
+                1_000,
+            )
+            .await;
+        } else if baseline.is_learned() && baseline.predicted_ms > 0 {
+            let multiplier = duration.saturating_mul(1_000) / baseline.predicted_ms;
+            let _ = record_contention(
+                db.clone(),
+                context,
+                load,
+                metadata.finished_at_unix_ms,
+                multiplier.max(1_000),
+            )
+            .await;
+        }
     }
     let _ = update_profile(
         db,
@@ -393,15 +589,32 @@ pub(super) async fn observe_completed(
 fn reservation_for_profile(
     profile: &ResourceProfile,
     prior: ResourceReservation,
+    memory_budget_bytes: Option<u64>,
+    memory_quarantined: bool,
 ) -> ResourceReservation {
-    let learned_memory = profile.upper_peak_rss_bytes.map(with_headroom);
+    let learned_memory = (!memory_quarantined)
+        .then_some(profile.upper_peak_rss_bytes)
+        .flatten()
+        .map(with_headroom);
     let learned_disk = profile.upper_disk_delta_bytes.map(with_headroom);
     let (memory_bytes, disk_growth_bytes) = if profile.sample_count < MIN_CONFIDENT_SAMPLES {
+        // Thin evidence cannot justify predictive headroom, but it is still a
+        // measured high-water mark and admission must not ignore it. Preserve
+        // the larger of the prior and the raw observation until enough samples
+        // exist to apply the learned estimate with headroom.
         (
-            learned_memory.map_or(prior.memory_bytes, |value| prior.memory_bytes.max(value)),
-            learned_disk.map_or(prior.disk_growth_bytes, |value| {
-                prior.disk_growth_bytes.max(value)
-            }),
+            if memory_quarantined {
+                prior.memory_bytes
+            } else {
+                profile
+                    .upper_peak_rss_bytes
+                    .map_or(prior.memory_bytes, |value| prior.memory_bytes.max(value))
+            },
+            profile
+                .upper_disk_delta_bytes
+                .map_or(prior.disk_growth_bytes, |value| {
+                    prior.disk_growth_bytes.max(value)
+                }),
         )
     } else {
         (
@@ -409,6 +622,11 @@ fn reservation_for_profile(
             learned_disk.unwrap_or(prior.disk_growth_bytes),
         )
     };
+    let memory_bytes = memory_budget_bytes.map_or(memory_bytes, |budget| {
+        let cap = budget.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
+            / MEMORY_RESERVATION_CAP_DENOMINATOR;
+        memory_bytes.min(cap)
+    });
     ResourceReservation {
         memory_bytes,
         disk_growth_bytes,
@@ -663,7 +881,7 @@ mod tests {
             ..capabilities()
         };
         let prior = cold_start_prior(CellCommandClass::CargoTest, &small);
-        assert_eq!(prior.memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(prior.memory_bytes, 192 * 1024 * 1024);
         assert_eq!(prior.disk_growth_bytes, 512 * 1024 * 1024);
     }
 
@@ -686,6 +904,7 @@ mod tests {
             None,
             &context,
             prior.clone(),
+            None,
             test_duration_context(),
         )
         .await;
@@ -704,6 +923,7 @@ mod tests {
             Some(&identity),
             &context,
             prior.clone(),
+            None,
             test_duration_context(),
         )
         .await;
@@ -733,6 +953,7 @@ mod tests {
             Some(&identity),
             &context,
             prior.clone(),
+            None,
             test_duration_context(),
         )
         .await;
@@ -815,6 +1036,8 @@ mod tests {
                         upper_duration_ms: Some(480_000),
                     },
                     prior.clone(),
+                    None,
+                    false,
                 );
                 assert_eq!(
                     reservation.concurrency_units, concurrency_units,
@@ -824,11 +1047,11 @@ mod tests {
         }
     }
 
-    /// Under the confidence floor a learned number may only RAISE the safety
-    /// prior, never lower it: a thin profile makes admission more conservative,
-    /// which is the opposite of what an under-evidenced estimate used to do.
+    /// Under the confidence floor an observation raises the prior to its raw
+    /// high-water mark, but cannot add predictive headroom until enough samples
+    /// support that extrapolation.
     #[test]
-    fn a_thin_profile_may_only_raise_the_prior() {
+    fn a_thin_profile_uses_raw_high_water_without_headroom() {
         let prior = ResourceReservation {
             memory_bytes: 100,
             disk_growth_bytes: 200,
@@ -844,6 +1067,8 @@ mod tests {
                     upper_duration_ms: Some(3),
                 },
                 prior.clone(),
+                None,
+                false,
             );
             assert_eq!(smaller.memory_bytes, prior.memory_bytes);
             assert_eq!(smaller.disk_growth_bytes, prior.disk_growth_bytes);
@@ -856,9 +1081,11 @@ mod tests {
                     upper_duration_ms: Some(3),
                 },
                 prior.clone(),
+                None,
+                false,
             );
-            assert_eq!(larger.memory_bytes, with_headroom(1_000));
-            assert_eq!(larger.disk_growth_bytes, with_headroom(2_000));
+            assert_eq!(larger.memory_bytes, 1_000);
+            assert_eq!(larger.disk_growth_bytes, 2_000);
         }
     }
 
@@ -877,6 +1104,8 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
             },
+            None,
+            false,
         );
         assert_eq!(reservation.memory_bytes, 100);
         assert_eq!(reservation.disk_growth_bytes, 200);
@@ -892,6 +1121,8 @@ mod tests {
                 upper_duration_ms: Some(300),
             },
             ResourceReservation::default(),
+            None,
+            false,
         );
         assert_eq!(reservation.memory_bytes, 125);
         assert_eq!(reservation.disk_growth_bytes, 250);
@@ -920,6 +1151,7 @@ mod tests {
         };
         let metadata = CellExecutionMeta {
             warmth: None,
+            load_context: None,
             executor_id: "executor".into(),
             executor_device_id: "device".into(),
             executor_connection_generation: 1,
@@ -933,6 +1165,10 @@ mod tests {
             disk_delta_bytes: Some(20),
             measurement_quality: None,
             environment_fingerprint: String::new(),
+            verdict_platform: None,
+            verdict_arch: None,
+            verdict_environment_hash: None,
+            toolchain_fingerprint: None,
         };
         let (left, right) = tokio::join!(
             update_profile(
@@ -981,6 +1217,7 @@ mod tests {
         };
         let metadata = CellExecutionMeta {
             warmth: None,
+            load_context: None,
             executor_id: "executor".into(),
             executor_device_id: "device".into(),
             executor_connection_generation: 1,
@@ -1000,6 +1237,10 @@ mod tests {
                 disk_boundary: "unavailable".into(),
             }),
             environment_fingerprint: String::new(),
+            verdict_platform: None,
+            verdict_arch: None,
+            verdict_environment_hash: None,
+            toolchain_fingerprint: None,
         };
 
         observe_completed(db.clone(), Some(&identity), &context, &metadata).await;
@@ -1023,6 +1264,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
             },
+            None,
             test_duration_context(),
         )
         .await;
@@ -1030,6 +1272,83 @@ mod tests {
         let estimate = resolved.learned_estimate.unwrap();
         assert_eq!(estimate.upper_duration_ms, Some(10));
         assert_eq!(estimate.upper_disk_growth_bytes, None);
+    }
+
+    /// A peak that nearly equals the machine's entire budget describes host
+    /// saturation, not one command in isolation. The raw evidence stays visible
+    /// in the rationale while admission falls back to the platform prior.
+    #[tokio::test]
+    async fn a_near_machine_total_memory_peak_is_quarantined_with_a_labeled_prior() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let db = Arc::new(
+            crate::storage::migrated_test_db("resource-profile-memory-quarantine.db").await,
+        );
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "check:rust".into(),
+        };
+        let context = ProfileContext {
+            executor_class: "device:executor".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            toolchain_fingerprint: "rust".into(),
+        };
+        for finished in 1..=MIN_CONFIDENT_SAMPLES {
+            update_profile(
+                db.clone(),
+                &identity,
+                &context,
+                finished,
+                Some(99 * GIB),
+                Some(GIB),
+                Some(1_000),
+            )
+            .await
+            .unwrap();
+        }
+        let prior = ResourceReservation {
+            memory_bytes: 2 * GIB,
+            disk_growth_bytes: 4 * GIB,
+            concurrency_units: 1,
+            source: ResourceReservationSource::Unmeasured,
+        };
+        let resolved = resolve_reservation(
+            db,
+            Some(&identity),
+            &context,
+            prior.clone(),
+            Some(100 * GIB),
+            test_duration_context(),
+        )
+        .await;
+
+        assert_eq!(resolved.reservation.memory_bytes, prior.memory_bytes);
+        assert_eq!(
+            resolved.rationale.fallback,
+            Some(ReservationFallback::MemoryObservationQuarantined)
+        );
+        assert_eq!(resolved.rationale.upper_peak_rss_bytes, Some(99 * GIB));
+    }
+
+    #[test]
+    fn machine_memory_ceiling_never_yields_to_a_larger_prior() {
+        let resolved = reservation_for_profile(
+            &ResourceProfile {
+                sample_count: MIN_CONFIDENT_SAMPLES,
+                upper_peak_rss_bytes: Some(99),
+                upper_disk_delta_bytes: None,
+                upper_duration_ms: None,
+            },
+            ResourceReservation {
+                memory_bytes: 100,
+                disk_growth_bytes: 10,
+                concurrency_units: 1,
+                source: ResourceReservationSource::Unmeasured,
+            },
+            Some(100),
+            true,
+        );
+        assert_eq!(resolved.memory_bytes, 75);
     }
 
     fn duration_context() -> ProfileContext {
@@ -1056,6 +1375,7 @@ mod tests {
     ) -> CellExecutionMeta {
         CellExecutionMeta {
             warmth,
+            load_context: Some(ExecutionLoadContext::default()),
             environment_fingerprint: String::new(),
             executor_id: "executor".into(),
             executor_device_id: "device".into(),
@@ -1075,6 +1395,10 @@ mod tests {
                 memory_platform: Some("test".into()),
                 disk_boundary: "cell".into(),
             }),
+            verdict_platform: None,
+            verdict_arch: None,
+            verdict_environment_hash: None,
+            toolchain_fingerprint: None,
         }
     }
 
@@ -1426,5 +1750,48 @@ mod tests {
         assert!(decode_window("not json").is_empty());
         assert!(decode_window("").is_empty());
         assert_eq!(decode_window("[10,20,30]"), vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn contention_curve_falls_back_from_machine_to_global_to_labeled_prior() {
+        let db = Arc::new(crate::storage::migrated_test_db("contention-fallback.db").await);
+        let load = ExecutionLoadContext {
+            co_resident_compile_jobs: 2,
+            co_resident_light_jobs: 0,
+            cpu_utilization_millis: Some(700),
+        };
+        let target = duration_context();
+        assert_eq!(
+            resolve_contention(db.clone(), &target, &load, 10)
+                .await
+                .source,
+            ContentionEvidence::Prior
+        );
+
+        let other = ProfileContext {
+            executor_class: "other:executor".into(),
+            ..target.clone()
+        };
+        for finished in 1..=MIN_CONTENTION_SAMPLES as u64 {
+            record_contention(db.clone(), &other, &load, finished, 1_500)
+                .await
+                .unwrap();
+        }
+        let global = resolve_contention(db.clone(), &target, &load, 10).await;
+        assert_eq!(
+            (global.source, global.multiplier_millis),
+            (ContentionEvidence::Global, 1_500)
+        );
+
+        for finished in 4..=(3 + MIN_CONTENTION_SAMPLES as u64) {
+            record_contention(db.clone(), &target, &load, finished, 1_900)
+                .await
+                .unwrap();
+        }
+        let machine = resolve_contention(db, &target, &load, 10).await;
+        assert_eq!(
+            (machine.source, machine.multiplier_millis),
+            (ContentionEvidence::Machine, 1_900)
+        );
     }
 }

@@ -171,6 +171,7 @@ pub fn delete_agent(
     let path = config_dir.join("agents").join(format!("{}.md", id));
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("Failed to delete agent file: {}", e))?;
+        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Agent, id);
     }
 
     Ok(())

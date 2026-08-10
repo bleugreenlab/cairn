@@ -668,6 +668,74 @@ mod tests {
         .unwrap()
     }
 
+    async fn seed_parent_coordinator(db: &LocalDb, muted: bool) {
+        db.execute_script(
+            "INSERT INTO issues
+               (id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES
+               ('parent-issue', 'proj-pr-node', 1, 'Parent thread', 'active', 'active', 'none', 1, 1);
+             UPDATE issues SET parent_issue_id = 'parent-issue' WHERE id = 'issue-pr-node';
+             UPDATE merge_requests SET github_pr_number = 3023 WHERE id = 'mr-pr-node';
+             INSERT INTO jobs
+               (id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+             VALUES
+               ('parent-coordinator', 'proj-pr-node', 'parent-issue', 'running', 'parent-session', 2, 2);",
+        )
+        .await
+        .unwrap();
+        if muted {
+            db.execute(
+                "INSERT INTO wake_subscriptions
+                   (id, job_id, source_kind, source_ref, fact_kinds_json, state,
+                    created_by, created_at, updated_at, one_shot)
+                 VALUES
+                   ('muted-child', 'parent-coordinator', 'issue', 'cairn://p/PROJ/3',
+                    '[\"resolved\"]', 'muted', 'agent', 2, 2, 0)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_ui_merge_notifies_parent_and_mute_downgrades_to_digest() {
+        use crate::orchestrator::attention_delivery::render_push_resolved;
+        use crate::orchestrator::attention_push::{list_pending, Wake};
+
+        for muted in [false, true] {
+            let db = migrated_db().await;
+            seed_pr_node_merge_request_for_artifact_job(&db).await;
+            seed_parent_coordinator(&db, muted).await;
+            let orch = test_orchestrator(db, MockGitClient::new());
+
+            resolve_pr_node(
+                &orch,
+                "builder-job",
+                PrNodeResolution::Merge,
+                Some(PrResolutionAttribution::operator_ui()),
+            )
+            .await
+            .expect("the operator UI merge resolves the child");
+
+            let pushes = list_pending(&orch.db.local, "parent-coordinator")
+                .await
+                .unwrap();
+            assert_eq!(pushes.len(), 1, "muted={muted}");
+            assert_eq!(
+                pushes[0].wake,
+                if muted { Wake::Passive } else { Wake::Wake },
+                "muted={muted}"
+            );
+            let rendered = render_push_resolved(&orch, &pushes[0]).await;
+            assert!(rendered.contains("PROJ-3 \"Issue\" merged"), "{rendered}");
+            assert!(
+                rendered.contains("PR #3023, by operator (UI)"),
+                "{rendered}"
+            );
+        }
+    }
+
     /// The PR merge is the door CAIRN-3241 came through: the PR merged, the issue
     /// row flipped, and the builder went on running test suites against a merged
     /// issue — because this path resolved the issue directly instead of running

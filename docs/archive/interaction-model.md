@@ -1,6 +1,14 @@
 # Interaction Model
 
-> Historical note: parts of this document describe an older session model. The current `cairn-core` implementation uses `idle` runs plus warm-process retention rather than the older `paused`/kill-first framing. For the current code shape, see `docs/cairn-core-shape-map.md`, `docs/state-machines.md`, and `docs/execution-lifecycle-map.md`.
+> **ARCHIVED — describes a retired implementation.**
+>
+> This document is kept as design history: it records how Cairn was built at the
+> time it was written, and parts of it were already inaccurate when it was last
+> touched. It is not a description of the current system and must not be read as
+> one or updated to match one. Where it disagrees with the code, the code is
+> right.
+>
+> Current equivalents: `docs/sessions.md` for session and warm-process lifecycle, `docs/state-machines.md` for run/turn/job state, `docs/execution-lifecycle-map.md` for control flow, and `docs/backends.md` for the multi-backend model this document predates.
 
 This document describes how cairn-core, Claude CLI, and cairn-cmd work together — the session lifecycle, callback architecture, tool resolution, and process management.
 

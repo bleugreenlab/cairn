@@ -651,14 +651,14 @@ async fn issue_status(db: &LocalDb, issue_id: &str) -> String {
 }
 
 fn token_response() -> HttpResponse {
-    HttpResponse {
-        status: 201,
-        body: serde_json::to_vec(&serde_json::json!({
+    HttpResponse::new(
+        201,
+        serde_json::to_vec(&serde_json::json!({
             "token": "ghs_test",
             "expires_at": "2099-01-01T00:00:00Z"
         }))
         .unwrap(),
-    }
+    )
 }
 
 fn pr_response(state: &str, merged: bool) -> HttpResponse {
@@ -672,9 +672,9 @@ fn pr_response(state: &str, merged: bool) -> HttpResponse {
 /// exercise something OTHER than head divergence has to hand GitHub the commit
 /// the branch actually holds.
 fn pr_response_with_head(state: &str, merged: bool, head_sha: &str) -> HttpResponse {
-    HttpResponse {
-        status: 200,
-        body: serde_json::to_vec(&serde_json::json!({
+    HttpResponse::new(
+        200,
+        serde_json::to_vec(&serde_json::json!({
             "title": "My PR",
             "body": "A description",
             "state": state,
@@ -687,51 +687,48 @@ fn pr_response_with_head(state: &str, merged: bool, head_sha: &str) -> HttpRespo
             "head": { "sha": head_sha }
         }))
         .unwrap(),
-    }
+    )
 }
 
 fn empty_array_response() -> HttpResponse {
-    HttpResponse {
-        status: 200,
-        body: b"[]".to_vec(),
-    }
+    HttpResponse::new(200, b"[]".to_vec())
 }
 
 fn check_runs_response() -> HttpResponse {
-    HttpResponse {
-        status: 200,
-        body: serde_json::to_vec(&serde_json::json!({
+    HttpResponse::new(
+        200,
+        serde_json::to_vec(&serde_json::json!({
             "check_runs": [
                 { "name": "build", "status": "completed", "conclusion": "success",
                   "html_url": "https://example.com/1", "output": { "summary": null } }
             ]
         }))
         .unwrap(),
-    }
+    )
 }
 
 fn files_response() -> HttpResponse {
-    HttpResponse {
-        status: 200,
-        body: serde_json::to_vec(&serde_json::json!([
+    HttpResponse::new(
+        200,
+        serde_json::to_vec(&serde_json::json!([
             { "filename": "src/lib.rs", "status": "modified", "additions": 10,
               "deletions": 2, "changes": 12, "patch": "@@ -1 +1 @@\n-old\n+new" }
         ]))
         .unwrap(),
-    }
+    )
 }
 
 /// A GitHub PUT `/merge` response with the given status. 200 is the success
 /// shape; 405 is GitHub's "not mergeable" refusal.
 fn merge_response(status: u16) -> HttpResponse {
-    HttpResponse {
+    HttpResponse::new(
         status,
-        body: serde_json::to_vec(&serde_json::json!({
+        serde_json::to_vec(&serde_json::json!({
             "merged": status == 200,
             "message": "Pull Request is not mergeable"
         }))
         .unwrap(),
-    }
+    )
 }
 
 #[tokio::test]

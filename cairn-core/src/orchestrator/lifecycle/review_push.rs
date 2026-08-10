@@ -36,6 +36,78 @@ fn issue_for_attention_by_job(
     .flatten()
 }
 
+pub(crate) async fn record_bounded_rearm_lookup_failure(
+    orch: &Orchestrator,
+    job_id: &str,
+    diagnostic: &str,
+) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let job_id = job_id.to_string();
+    let output = format!("check wave preparation failed: {diagnostic}");
+    db.write(move |conn| {
+        let job_id = job_id.clone();
+        let output = output.clone();
+        Box::pin(async move {
+            conn.execute(
+                // Only INFRASTRUCTURE rows. `check_result_cache` holds two row
+                // families, and the other one is the hot projection of an
+                // immutable observation: repainting it would leave a row saying
+                // `infrastructure` over a `source_observation_id` that says
+                // `passed`, and would strip that green of reuse (the reusable
+                // lookup requires `failure_kind IS NULL`) until some later run
+                // healed it. Evidence is not ours to overwrite.
+                //
+                // Nothing is lost by the narrowing. This only ever runs for a job
+                // that `bounded_rearm_candidates` already selected, and that query
+                // selects on this same failure_kind set -- so the row carrying the
+                // streak this statement advances is always in scope.
+                "UPDATE check_result_cache
+                    SET passed=0, exit_code=-1, failure_kind='infrastructure',
+                        output_tail=?1, ran_at=(unixepoch() * 1000),
+                        infra_failure_streak=MIN(infra_failure_streak + 1, ?2)
+                  WHERE job_id=?3
+                    AND failure_kind IN ('capacity', 'infrastructure')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM check_result_cache newer
+                       WHERE newer.job_id=check_result_cache.job_id
+                         AND newer.check_name=check_result_cache.check_name
+                         AND (newer.ran_at > check_result_cache.ran_at
+                              OR (newer.ran_at = check_result_cache.ran_at
+                                  AND newer.rowid > check_result_cache.rowid))
+                    )",
+                (
+                    output.as_str(),
+                    crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                    job_id.as_str(),
+                ),
+            )
+            .await?;
+            Ok::<_, crate::storage::DbError>(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "check_result_cache", "action": "update"}),
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(super) struct BoundedRearmLookupError {
+    job_id: Option<String>,
+    message: String,
+}
+
+impl std::fmt::Display for BoundedRearmLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// Emit the typed attention event for a turn that just terminalized.
 /// - Issue reached a terminal status → `Resolved`
 /// - Issue still needs the driver (attention != None) → `AgentIdleWithWork`
@@ -95,6 +167,7 @@ pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
         attention: ctx.attention,
         status: ctx.status,
         updated_at: idle.updated_at,
+        route_provenance: None,
     });
     true
 }
@@ -225,6 +298,9 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     };
     let orch_clone = orch.clone();
     let job_id_owned = job_id.to_string();
+    let cancel_for_rearm = cancel.clone();
+    let orch_for_rearm = orch.clone();
+    let job_id_for_rearm = job_id.to_string();
     let orch_for_release = orch.clone();
     let job_id_for_release = job_id.to_string();
     detach_onto_runtime(
@@ -235,6 +311,11 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
                 cancel,
             )
             .await;
+            finish_superseded_turn_end_checks(
+                &orch_for_rearm,
+                &job_id_for_rearm,
+                cancel_for_rearm.is_cancelled(),
+            );
         },
         move || {
             // Runtime construction failed, so the future above never reached
@@ -244,6 +325,24 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
             orch_for_release.end_turn_end_checks(&job_id_for_release);
         },
     );
+}
+
+/// Replace a review wave that was cancelled after its tree became stale.
+///
+/// The old runner releases its single-flight slot before returning, so this is
+/// the first safe point at which a successor can claim it. The ordinary spawn
+/// gates remain authoritative: issue resolution and workspace reclamation stop
+/// the replacement, while a live turn suppresses it until that turn's own end.
+/// A dormant PR owner, however, has no future turn-end edge, so it must be armed
+/// here or a base advance leaves the node permanently verdictless.
+pub(super) fn finish_superseded_turn_end_checks(
+    orch: &Orchestrator,
+    job_id: &str,
+    previous_wave_was_cancelled: bool,
+) {
+    if previous_wave_was_cancelled {
+        spawn_turn_end_checks(orch, job_id);
+    }
 }
 
 /// Why this job's turn-end wave must not be armed, if it must not be.
@@ -512,15 +611,25 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) -> usize {
 /// deliberate pacing: recovery can free many stranded waves at once, and
 /// releasing all of them would recreate the contention that stranded them.
 ///
-/// The durable per-check infrastructure streak remains the retry authority. A
-/// candidate at the bound is excluded here, and the execution claim checks the
-/// same bound atomically before a command can run, so this cadence cannot open a
-/// path around the circuit breaker.
+/// The durable per-check infrastructure streak remains the hot-loop authority.
+/// A candidate at the bound waits for the cooldown below; only then does this
+/// paced cadence release suppression before going through the normal atomic
+/// execution claim again.
 pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
     let Some(job_id) = (match bounded_rearm_candidate_job(orch).await {
         Ok(candidate) => candidate,
         Err(error) => {
             log::warn!("review-checks bounded re-arm: candidate lookup failed: {error}");
+            let Some(job_id) = error.job_id.as_deref() else {
+                return false;
+            };
+            if let Err(record_error) =
+                record_bounded_rearm_lookup_failure(orch, job_id, &error.message).await
+            {
+                log::warn!(
+                    "review-checks bounded re-arm: failed to surface candidate lookup failure: {record_error}"
+                );
+            }
             return false;
         }
     }) else {
@@ -531,22 +640,72 @@ pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
         "review-checks bounded re-arm: re-spawning one dormant wave for job {}",
         &job_id[..job_id.len().min(8)]
     );
+    if let Err(error) = release_cooled_infrastructure_suppression(orch, &job_id).await {
+        log::warn!(
+            "review-checks bounded re-arm: failed to release cooled suppression for job {}: {error}",
+            &job_id[..job_id.len().min(8)]
+        );
+        return false;
+    }
     spawn_turn_end_checks(orch, &job_id);
     true
+}
+
+/// A dormant shipping branch must not remain permanently suppressed after the
+/// substrate recovers. The ordinary attempt bound still stops a hot failure
+/// loop; the maintenance cadence releases it only after this cooldown and still
+/// dispatches at most one wave per tick.
+const DORMANT_INFRA_RETRY_COOLDOWN_SECONDS: i64 = 5 * 60;
+
+pub(super) async fn release_cooled_infrastructure_suppression(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    db.execute(
+        "UPDATE check_result_cache
+            SET infra_failure_streak = 0, infra_escalated_at = NULL
+          WHERE job_id = ?1
+            AND failure_kind IN ('capacity', 'infrastructure')
+            AND infra_failure_streak >= ?2
+            AND ran_at <= (unixepoch() - ?3) * 1000",
+        (
+            job_id,
+            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+            DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+        ),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct BoundedRearmCandidate {
     pub(super) job_id: String,
-    tree_hash: String,
-    ran_at: i64,
+    pub(super) tree_hash: String,
+    pub(super) ran_at: i64,
 }
 
 pub(super) async fn bounded_rearm_candidate_job(
     orch: &Orchestrator,
-) -> Result<Option<String>, String> {
-    for candidate in bounded_rearm_candidates(&orch.db).await? {
-        if bounded_candidate_matches_current_tree(orch, &candidate).await? {
+) -> Result<Option<String>, BoundedRearmLookupError> {
+    let candidates = bounded_rearm_candidates(&orch.db)
+        .await
+        .map_err(|message| BoundedRearmLookupError {
+            job_id: None,
+            message,
+        })?;
+    for candidate in candidates {
+        let matches = bounded_candidate_matches_current_tree(orch, &candidate)
+            .await
+            .map_err(|message| BoundedRearmLookupError {
+                job_id: Some(candidate.job_id.clone()),
+                message,
+            })?;
+        if matches {
             return Ok(Some(candidate.job_id));
         }
     }
@@ -580,9 +739,23 @@ async fn bounded_rearm_candidates_in_db(
                        JOIN jobs j ON j.id = c.job_id
                        JOIN issues i ON i.id = j.issue_id
                       WHERE c.failure_kind IN ('capacity', 'infrastructure')
-                        AND c.infra_failure_streak < ?1
+                        AND (
+                          c.infra_failure_streak < ?1
+                          OR c.ran_at <= (unixepoch() - ?2) * 1000
+                        )
                         AND i.status NOT IN ('merged', 'closed')
-                        AND j.status IN ('idle', 'complete', 'failed', 'blocked')
+                        AND (
+                          SELECT t.state FROM turns t
+                           WHERE t.job_id = j.id
+                           ORDER BY t.sequence DESC
+                           LIMIT 1
+                        ) = 'complete'
+                        AND COALESCE((
+                          SELECT t.start_reason FROM turns t
+                           WHERE t.job_id = j.id
+                           ORDER BY t.created_at DESC, t.sequence DESC
+                           LIMIT 1
+                        ), '') != 'memory_review'
                         AND NOT EXISTS (
                           SELECT 1 FROM check_result_cache newer
                            WHERE newer.job_id = c.job_id
@@ -603,7 +776,10 @@ async fn bounded_rearm_candidates_in_db(
                           )
                         )
                       ORDER BY c.ran_at, j.id",
-                    (crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,),
+                    (
+                        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                        DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+                    ),
                 )
                 .await?;
             let mut candidates = Vec::new();
@@ -621,7 +797,7 @@ async fn bounded_rearm_candidates_in_db(
     .map_err(|error| error.to_string())
 }
 
-async fn bounded_candidate_matches_current_tree(
+pub(super) async fn bounded_candidate_matches_current_tree(
     orch: &Orchestrator,
     candidate: &BoundedRearmCandidate,
 ) -> Result<bool, String> {

@@ -48,6 +48,7 @@ fn ensure_agent_snapshot(
             }
         }
     }
+
     Ok(())
 }
 
@@ -76,21 +77,20 @@ fn schema_config_from_output_contract(contract: &DelegatedOutputContract) -> Sch
 /// The agent node a delegated packet materializes into.
 ///
 /// Its branch mode is [`BranchMode::Inherit`]: a delegated task continues the
-/// branch of the job that spawned it, so what it reads, builds, and tests is the
-/// parent's logical head at spawn time rather than the base branch the parent
-/// was originally cut from. Seeding is the delegation-edge half of the CAIRN-3278
-/// invariant — what you read is what you build — and it is what makes a task's
-/// tests exercise the parent's in-flight work instead of pre-change code.
+/// coordinate of the job that spawned it. For a branch-bearing parent that is
+/// the live logical head; for a deliberately branchless parent such as a thread,
+/// it is the live base ref without a branch invented for the child.
 ///
-/// The mode is the whole coordinate decision. `reparent_delegated_jobs` records
-/// the lineage inheritance depends on before the node can activate, and
-/// `prepare_job` re-resolves the parent's live bookmark at activation and
-/// persists the exact commit the child starts from.
+/// `reparent_delegated_jobs` records that lineage before activation, then
+/// `prepare_job` resolves the coordinate and persists the exact commit the child
+/// starts from. This preserves the CAIRN-3278 invariant — what you read is what
+/// you build — for builders with in-flight work while keeping read-only thread
+/// delegation on the project's base context.
 ///
-/// This emitted [`BranchMode::None`] until CAIRN-3309, contradicting every
-/// comment around it. That mode leaves `jobs.branch` NULL, and a job without a
-/// branch of its own reads and writes its `base_branch` — so every delegated
-/// task ran against `main` while its parent held unpushed commits.
+/// This emitted [`BranchMode::None`] until CAIRN-3309. That discarded lineage
+/// entirely, so every delegated task ran against `main` even when its parent held
+/// unpushed commits. Inheritance is what distinguishes that bug from intentional
+/// branchless lineage.
 fn delegated_agent_node(agent_id: String, packet: &DelegatedWorkPacket) -> RecipeNode {
     RecipeNode {
         id: agent_id,
@@ -376,10 +376,10 @@ fn assign_delegated_job_metadata(
 /// `prepare_job` resolves the parent branch's live bookmark at activation and
 /// overwrites it with the commit the child actually starts from.
 ///
-/// A parent with no branch is refused rather than silently re-parented onto the
-/// base branch: without a parent coordinate there is nothing for the child to
-/// inherit, and starting from base is precisely the failure this edge exists to
-/// prevent.
+/// A branch-bearing parent contributes its logical branch. A deliberately
+/// branchless parent contributes its base ref instead, so read-only nodes such
+/// as threads can delegate without inventing a writable branch. Activation
+/// distinguishes that valid branchless lineage from a vanished parent branch.
 ///
 /// `ordered_jobs` is `(job_id, recipe_node_id)` pre-sorted by packet order.
 pub(super) async fn reparent_delegated_jobs(
@@ -418,12 +418,7 @@ pub(super) async fn reparent_delegated_jobs(
                         packet.parent_job_id
                     ))
                 })?;
-                let parent_branch = parent_row.opt_text(0)?.ok_or_else(|| {
-                    DbError::Row(format!(
-                        "delegating parent job {} has no logical branch",
-                        packet.parent_job_id
-                    ))
-                })?;
+                let parent_branch = parent_row.opt_text(0)?;
                 let parent_base_commit = parent_row.opt_text(1)?;
                 let parent_base_branch = parent_row.opt_text(2)?;
 
@@ -476,7 +471,7 @@ pub(super) async fn reparent_delegated_jobs(
                          WHERE id = ?8",
                     params![
                         packet.parent_job_id.as_str(),
-                        parent_branch.as_str(),
+                        parent_branch.as_deref(),
                         parent_base_commit.as_deref(),
                         parent_base_branch.as_deref(),
                         packet.task_index,
@@ -600,6 +595,39 @@ mod tests {
         assert_eq!(coordinate.4, Some(7));
         assert_eq!(coordinate.5.as_deref(), Some("implement-child"));
         assert_eq!(coordinate.6.as_deref(), Some("tool-1"));
+    }
+
+    #[tokio::test]
+    async fn branchless_parent_delegates_on_its_base_coordinate() {
+        let db = test_db().await;
+        db.write(|conn| Box::pin(async move {
+            conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+            conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_commit, base_branch, uri_segment, node_name, created_at, updated_at) VALUES ('thread-job','e-1','i-1','p-1','running',NULL,'main-head','main','thread','Thread',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, recipe_node_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('child-job','e-1','i-1','p-1','delegated-agent','pending','child','Child',1,1)", ()).await?;
+            Ok::<_, DbError>(())
+        })).await.unwrap();
+
+        reparent_delegated_jobs(
+            &db,
+            vec![("child-job".into(), Some("delegated-agent".into()))],
+            vec![packet(
+                "packet-1",
+                "thread-job",
+                "Explore",
+                "delegated-agent",
+            )],
+        )
+        .await
+        .unwrap();
+
+        let coordinate = child_coordinate(&db, "child-job").await;
+        assert_eq!(coordinate.0.as_deref(), Some("thread-job"));
+        assert_eq!(coordinate.1, None, "a thread task must not invent a branch");
+        assert_eq!(coordinate.2.as_deref(), Some("main-head"));
+        assert_eq!(coordinate.3.as_deref(), Some("main"));
     }
 
     /// A task that delegates its own task. Nesting needs no special case, but it
@@ -819,6 +847,41 @@ mod tests {
             Some(fx.main_tip.as_str()),
             "starting from the base branch is the defect: the parent's work would be invisible"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_branchless_parents_task_starts_on_the_live_base_branch() {
+        let Some(fx) = parent_ahead_of_main() else {
+            eprintln!("skipping a_branchless_parents_task_starts_on_the_live_base_branch: no jj");
+            return;
+        };
+        let stale_recorded_base = fx.parent_head.clone();
+        let resolved_base = fx.main_tip.clone();
+
+        let (branch, base_commit) = select_job_coordinate(
+            &delegated_behavior(),
+            CoordinateRequest {
+                job_id: "child-job",
+                parent_job_id: Some("thread-job"),
+                existing_branch: None,
+                base_ref: "main",
+            },
+            &fx.jj,
+            &fx.store,
+            |_| {
+                Ok(ParentCoordinate {
+                    branch: None,
+                    recorded_base: Some(stale_recorded_base),
+                })
+            },
+            || unreachable!("a delegated task never mints a branch"),
+            move |revision| (revision == "main").then(|| resolved_base.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(branch, None, "the task preserves branchless lineage");
+        assert_eq!(base_commit.as_deref(), Some(fx.main_tip.as_str()));
     }
 
     /// The second form of the same defect: the parent's branch *name* is intact,

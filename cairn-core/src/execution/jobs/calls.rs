@@ -306,27 +306,18 @@ pub(crate) fn start_call_run(
     }
 }
 
-/// Resolve the backend name for admission the SAME way `start_agent_session`
-/// (`session.rs`) resolves it: the atomic `selection.backend` wins, then
-/// `backend_preference`, then model-derivation as a last resort. Keying
-/// admission on a divergent resolution (e.g. deriving from a concrete model
-/// string that disagrees with an explicit selection) would charge the wrong
-/// backend once real ceilings differ. `None` collapses to Claude in
-/// `backend_for_name`, matching session start.
+/// Resolve the backend name for admission through the SAME resolution
+/// `start_agent_session` (`session.rs`) spawns with
+/// ([`crate::backends::effective_backend_name`]). Keying admission on a
+/// divergent resolution would charge one backend while launching another once
+/// real ceilings differ. `None` collapses to Claude in `backend_for_name`,
+/// matching session start.
 fn admission_backend_name(prepared: &PreparedCallRun) -> Option<String> {
-    prepared
-        .agent_config
-        .selection
-        .as_ref()
-        .map(|s| s.backend.clone())
-        .or_else(|| prepared.agent_config.backend_preference.clone())
-        .or_else(|| {
-            prepared
-                .selected_model
-                .as_ref()
-                .and_then(|m| crate::backends::backend_for_model(m.as_str()))
-                .map(|s| s.to_string())
-        })
+    crate::backends::effective_backend_name(
+        prepared.agent_config.selection.as_ref(),
+        prepared.agent_config.backend_preference.as_deref(),
+        prepared.selected_model.as_ref().map(Model::as_str),
+    )
 }
 
 /// Opt-in (CAIRN-2550): when `route_calls_via_openrouter` is enabled, re-resolve a
@@ -980,28 +971,37 @@ mod admission_backend_tests {
         assert_eq!(admission_backend_name(&p).as_deref(), Some("openrouter"));
     }
 
-    /// With no selection, `backend_preference` is the next authority — ahead of
-    /// model-derivation.
+    /// `backend_preference` speaks for a call that has no model of its own.
     #[test]
-    fn backend_preference_used_when_no_selection() {
-        let p = prepared(None, Some("codex"), Some("sonnet"));
+    fn backend_preference_used_when_no_selection_or_model() {
+        let p = prepared(None, Some("codex"), None);
         assert_eq!(admission_backend_name(&p).as_deref(), Some("codex"));
     }
 
-    /// Model-derivation is the last resort when neither selection nor preference
-    /// is set.
+    /// A concrete model outranks a bare `backend_preference` that names a
+    /// different provider than the model resolves to. Admission has to charge
+    /// what the launch will spawn, and the launch spawns the model's provider —
+    /// a preference contradicting the model would otherwise charge Codex for a
+    /// process the Claude CLI runs.
     #[test]
-    fn model_derivation_is_last_resort() {
+    fn a_concrete_model_outranks_a_contradicting_preference() {
+        let p = prepared(None, Some("codex"), Some("sonnet"));
+        assert_eq!(admission_backend_name(&p).as_deref(), Some("claude"));
+    }
+
+    /// Model-derivation answers when neither selection nor preference is set.
+    #[test]
+    fn model_derivation_answers_a_bare_config() {
         let p = prepared(None, None, Some("gpt-5"));
         assert_eq!(admission_backend_name(&p).as_deref(), Some("codex"));
     }
 
-    /// A Claude model derives `None`, which collapses to Claude in
-    /// `backend_for_name` — the same fallback `start_agent_session` uses.
+    /// A Claude model names Claude outright rather than leaving it implied, so
+    /// admission and `start_agent_session` charge and launch the same provider.
     #[test]
-    fn claude_model_resolves_to_none_and_keys_claude() {
+    fn claude_model_keys_claude() {
         let p = prepared(None, None, Some("sonnet"));
-        assert_eq!(admission_backend_name(&p), None);
+        assert_eq!(admission_backend_name(&p).as_deref(), Some("claude"));
         assert_eq!(
             crate::backends::backend_for_name(admission_backend_name(&p).as_deref()).name(),
             "Claude"

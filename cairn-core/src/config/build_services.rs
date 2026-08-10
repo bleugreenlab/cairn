@@ -286,7 +286,10 @@ const CAIRN_SCCACHE_TEMP_DIR: &str = "{home}/.cache/sccache-cairn-tmp";
 /// The built-in default sccache build service, used when no `buildServices` are
 /// configured. The supervisor only launches it when `sccache` is on `PATH`, so
 /// it is a safe, zero-config default that fixes the cross-worktree sccache EPERM
-/// out of the box. Values use templates so they resolve per host.
+/// out of the box. The supervisor launches this machine-wide daemon unconfined:
+/// rustc runs inside the daemon and must be able to write into any client target
+/// directory, including an operator checkout outside Cairn's managed roots.
+/// Values use templates so they resolve per host.
 ///
 /// Port and cache dir deliberately DIVERGE from sccache's own defaults (4226,
 /// `$HOME/.cache/sccache`), which `scripts/cache-wrapper.sh` also falls back to
@@ -313,14 +316,14 @@ const CAIRN_SCCACHE_TEMP_DIR: &str = "{home}/.cache/sccache-cairn-tmp";
 /// compiles until the next runner restart. Like the cache size, the daemon reads
 /// it from this env map at launch; it is inert in client env.
 ///
-/// The daemon runs in the **foreground** as Cairn's supervised child rather than
-/// forking a detached server: `launch_env` sets `SCCACHE_START_SERVER=1` (route
+/// The daemon runs in the **foreground** rather than forking a detached server:
+/// on macOS launchd owns that foreground process outside the runner's inherited
+/// Seatbelt profile. `launch_env` sets `SCCACHE_START_SERVER=1` (route
 /// bare `sccache` to its in-process server) and `SCCACHE_NO_DAEMON=1` (skip the
-/// `daemonize()` fork). The launched process then *is* the server and stays in
-/// Cairn's process group, so a wedged server can be killed via its supervised
-/// child handle and relaunched — its port stays occupied and `sccache
-/// --stop-server` hangs against a wedged server, so a direct kill is the only
-/// recovery. `launch_env` also points `SCCACHE_ERROR_LOG` at a file under the
+/// `daemonize()` fork). The launched process then *is* the server, so Cairn can
+/// boot out and resubmit the launchd job to replace a wedged or stale definition;
+/// `sccache --stop-server` hangs against a wedged server and cannot provide that recovery. `launch_env` also
+/// points `SCCACHE_ERROR_LOG` at a file under the
 /// (sandbox-writable) state dir with a `warn`-level `SCCACHE_LOG`, so the next
 /// wedge/crash is diagnosable from disk, and pins `TMPDIR`/`TMP`/`TEMP` to
 /// [`CAIRN_SCCACHE_TEMP_DIR`] so the daemon never inherits a temp directory that
@@ -383,13 +386,11 @@ pub(crate) fn default_sccache_service() -> BuildServiceConfig {
     // Daemon-only launch env. These MUST NOT leak into client spawns, so they
     // live in launch_env, not env (see `merge_client_env`).
     let mut launch_env = HashMap::new();
-    // Run the server in the FOREGROUND as Cairn's supervised child instead of
+    // Run the server in the FOREGROUND under its lifecycle owner instead of
     // letting sccache fork a detached daemon: SCCACHE_START_SERVER=1 routes bare
     // `sccache` to its in-process server, and SCCACHE_NO_DAEMON=1 skips the
-    // daemonize() fork/setsid. The launched process then *is* the server, stays
-    // in Cairn's process group, and is killed reliably via the supervised child
-    // handle — the precondition for recovering a wedged server (whose port stays
-    // occupied and which `sccache --stop-server` can't stop, hanging too).
+    // daemonize() fork/setsid. The launched process then *is* the server; on
+    // macOS launchd owns and replaces it outside the runner's Seatbelt profile.
     launch_env.insert("SCCACHE_START_SERVER".to_string(), "1".to_string());
     launch_env.insert("SCCACHE_NO_DAEMON".to_string(), "1".to_string());
     // Redirect the foreground server's stderr to a file so the next wedge/crash

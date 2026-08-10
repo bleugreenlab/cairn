@@ -40,6 +40,14 @@ pub struct RunPayload {
     pub(crate) conflict_markers_reason: Option<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ExecutorActionSpec {
+    pub(super) executor_name: String,
+    pub(super) action: String,
+    pub(super) args: serde_json::Value,
+    pub(super) timeout: Option<u32>,
+}
+
 /// A single run invocation: exactly one of three kinds — a shell `command`, a
 /// `target` (a `cairn://skills/<id>/scripts/<name>` or `cairn://mcp/...` URI),
 /// or inline `code` (with a required `interpreter`). Inline code runs under the
@@ -196,6 +204,16 @@ pub(crate) enum RunSpec {
     /// Not a process exec — dispatched through the host `McpGateway`. Boxed
     /// because its config payload is far larger than the other variants.
     McpCall(Box<McpCallSpec>),
+    /// A machine-local RPC action addressed through an executor URI. This is a
+    /// host item, not a process exec and not a configured MCP server.
+    ExecutorAction(Box<ExecutorActionSpec>),
+    /// A named, tool-free Response completion executed on the host.
+    ResponseCall {
+        response_id: String,
+        project: Option<String>,
+        args: serde_json::Value,
+        timeout: Option<u32>,
+    },
     /// Inline `code` routed into a live stateful REPL session by slug, rather
     /// than a fresh process. Not a process exec — the code is written to the
     /// eval-server's persistent stdin and one framed response is awaited.
@@ -213,6 +231,11 @@ pub(crate) struct McpCallSpec {
     pub(super) credential_key: String,
     pub(super) tool: String,
     pub(super) args: serde_json::Value,
+    /// The server's **authored** configuration, `${VAR}` references intact.
+    /// Expanded through the credential broker immediately before the gateway
+    /// call, so a resolved credential exists for the duration of one call
+    /// rather than for the life of a batch that may also be cloned, suspended,
+    /// and persisted.
     pub(super) config: McpServerConfig,
     pub(super) timeout: Option<u32>,
 }
@@ -384,6 +407,10 @@ mod tests {
                 lines_deleted: 1,
             }),
             environment_fingerprint: String::new(),
+            verdict_platform: None,
+            verdict_arch: None,
+            verdict_environment_hash: None,
+            toolchain_fingerprint: None,
         };
 
         let encoded = serde_json::to_string(&vec![wire]).unwrap();

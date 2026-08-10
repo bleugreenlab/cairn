@@ -156,9 +156,14 @@ pub(super) fn execute_tool_call(
     // chat-completions tool result.
     let collapse_envelope = request.tool == "read_batch" || request.tool == "run";
     let read_cursors = Mutex::new(HashMap::new());
-    let mut output = run_db_blocking(|| async move {
+    let observed = run_db_blocking(|| async move {
         Ok(crate::dispatch::dispatch_tool(orch, &request, &read_cursors).await)
     })?;
+    // Unwrapping the final-response guard here is safe because everything below
+    // only *narrows* the already-sanitized value: `collapse_envelope_text` picks
+    // the text out of an envelope and drops the images. Nothing unsanitized is
+    // reintroduced between here and the model.
+    let mut output = observed.into_inner();
     if collapse_envelope {
         output.content = collapse_envelope_text(output.content);
     }

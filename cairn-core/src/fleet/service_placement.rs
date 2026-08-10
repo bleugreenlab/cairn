@@ -471,6 +471,64 @@ impl ServiceLease {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn write_input(
+        &self,
+        key: &str,
+        data: &[u8],
+    ) -> Result<(), ServicePlacementError> {
+        let generation = self
+            .routes
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|route| route.generation)
+            .filter(|generation| *generation != 0)
+            .ok_or_else(|| {
+                ServicePlacementError::Operation(format!(
+                    "desktop process `{key}` is not running on {}",
+                    self.executor_name
+                ))
+            })?;
+        let result = self
+            .orch
+            .fleet
+            .operate_residency(
+                &self.orch,
+                ResidencyOperation::WriteProcessInput {
+                    fence: self.current_fence(),
+                    process_key: key.to_string(),
+                    process_generation: generation,
+                    data: data.to_vec(),
+                },
+            )
+            .await;
+        match result {
+            ResidencyResult::State { .. } => Ok(()),
+            ResidencyResult::Failed {
+                kind: ResidencyFailureKind::StaleEpoch,
+                diagnostic,
+                ..
+            } => {
+                self.mark_process_down(key, None);
+                Err(ServicePlacementError::Operation(format!(
+                    "desktop process `{key}` on {} changed generation: {diagnostic}",
+                    self.executor_name
+                )))
+            }
+            ResidencyResult::Failed { diagnostic, .. } => {
+                Err(ServicePlacementError::Operation(format!(
+                    "could not write to desktop process `{key}` on {}: {diagnostic}",
+                    self.executor_name
+                )))
+            }
+            other => Err(ServicePlacementError::Operation(format!(
+                "unexpected input-write result for desktop process `{key}` on {}: {other:?}",
+                self.executor_name
+            ))),
+        }
+    }
+
     pub(crate) async fn stop_resident(&self, key: &str) -> Result<(), ServicePlacementError> {
         super::residency::stop(&self.orch, &self.current_fence(), key)
             .await
@@ -567,7 +625,7 @@ fn event_matches(event: &ResidentProcessEvent, fence: &ResidencyFence) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
@@ -585,7 +643,7 @@ mod tests {
     /// supervision and the real runner's event admission. What it does not
     /// reproduce is the skew between an executor's two streams: in process,
     /// every callback is synchronous and in order.
-    async fn attached_orchestrator() -> (Orchestrator, tempfile::TempDir) {
+    pub(crate) async fn attached_orchestrator() -> (Orchestrator, tempfile::TempDir) {
         let config = tempfile::tempdir().unwrap();
         let db = LocalDb::open(config.path().join("cairn.turso.db"))
             .await
@@ -712,6 +770,59 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&failed.stderr), "no chat");
         assert_eq!(failed.exit_code, Some(3));
 
+        lease.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resident_input_uses_the_started_process_generation() {
+        let (orch, _config) = attached_orchestrator().await;
+        let lease = acquire_service_lease(
+            &orch,
+            ServiceIdentity {
+                id: "desktop-automation",
+                label: "desktop automation",
+            },
+            LOCAL_EXECUTOR_NAME,
+            ResidencyFootprint {
+                memory_bytes: 0,
+                disk_growth_bytes: 0,
+            },
+            OwnerDeathPolicy {
+                heartbeat_timeout_ms: 30_000,
+                reclaim_grace_ms: 10_000,
+            },
+        )
+        .await
+        .unwrap();
+        let mut subscription = lease
+            .start_resident(
+                "facade",
+                "facade",
+                "/bin/sh",
+                vec!["-c".into(), "read line; printf '%s' \"$line\"".into()],
+            )
+            .await
+            .unwrap();
+
+        lease
+            .write_input("facade", b"generation-fenced\n")
+            .await
+            .unwrap();
+        let mut stdout = Vec::new();
+        while let Some(event) = subscription.recv().await {
+            match event.event {
+                ResidentProcessEventKind::Output {
+                    stream: ResidentProcessStream::Stdout,
+                    data,
+                    ..
+                } => stdout.extend(data),
+                ResidentProcessEventKind::State {
+                    status: ResidentProcessStatus::Exited { .. },
+                } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(stdout, b"generation-fenced");
         lease.release().await.unwrap();
     }
 

@@ -250,6 +250,7 @@ impl SandboxPolicy {
     /// covering a prefix of the checkout can never block the agent from reading
     /// its own source, and a read-only checkout stays fully readable while its
     /// writes are denied.
+    #[cfg(any(test, target_os = "macos"))]
     fn readable_paths(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.worktree.clone()];
         paths.extend(self.writable_extra.iter().cloned());

@@ -2,7 +2,15 @@ use std::path::Path;
 
 use crate::services::{FileSystem, GitClient};
 
-pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/workflows/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
+/// Allowlist for the workspace config repo. Everything a pack can install must
+/// appear here: an untracked file has no commit history, so the ownership oracle
+/// (`workspace::bundle::pack_file_is_user_owned`) fails safe to "user-owned" and
+/// the file can never be updated by a later pack version.
+///
+/// `packs/` holds each installed pack's lock and MCP definitions; `responses/`
+/// holds response templates, which the sync has always materialized but which
+/// were never tracked — leaving them permanently frozen on first install.
+pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/responses/\n!/workflows/\n!/packs/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
 
 pub(crate) fn ensure_workspace_repo(
     git: &dyn GitClient,
@@ -116,6 +124,10 @@ mod tests {
         assert!(WORKSPACE_GITIGNORE.contains("!/agents/"));
         assert!(WORKSPACE_GITIGNORE.contains("!/skills/"));
         assert!(WORKSPACE_GITIGNORE.contains("!/recipes/"));
+        // Everything a pack installs must be tracked, or its ownership can
+        // never be established and it freezes on first write.
+        assert!(WORKSPACE_GITIGNORE.contains("!/responses/"));
+        assert!(WORKSPACE_GITIGNORE.contains("!/packs/"));
         assert!(!WORKSPACE_GITIGNORE.contains("!worktrees"));
         assert!(!WORKSPACE_GITIGNORE.contains("!logs"));
         assert!(!WORKSPACE_GITIGNORE.contains("!mcp_auth_secret"));

@@ -75,7 +75,7 @@ pub(crate) fn persist_system_prompt_event(
             "segments": segment_map,
         })),
     };
-    let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+    let data = transcript_event.observed().to_event_json();
     let insert_result = run_db_blocking({
         let dbs = orch.db.clone();
         let event_id = event_id.clone();
@@ -210,6 +210,7 @@ struct SessionDbContext {
     /// living-doc targets for the prompt affordance. `None` for sub-agent task
     /// jobs with no recipe node.
     recipe_node_id: Option<String>,
+    available_threads: Vec<(String, Option<String>)>,
 }
 
 fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbContext, String> {
@@ -227,10 +228,6 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                                 COALESCE(runs.project_id, issues.project_id) AS project_id,
                                 projects.key,
                                 projects.repo_path,
-                                issues.number,
-                                jobs.uri_segment,
-                                executions.seq,
-                                parent_jobs.uri_segment AS parent_uri_segment,
                                 COALESCE(jobs.base_branch, projects.default_branch) AS effective_base_branch,
                                 runs.job_id,
                                 jobs.recipe_node_id
@@ -238,8 +235,6 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                          LEFT JOIN issues ON runs.issue_id = issues.id
                          LEFT JOIN projects ON COALESCE(runs.project_id, issues.project_id) = projects.id
                          LEFT JOIN jobs ON runs.job_id = jobs.id
-                         LEFT JOIN jobs AS parent_jobs ON jobs.parent_job_id = parent_jobs.id
-                         LEFT JOIN executions ON jobs.execution_id = executions.id
                          WHERE runs.id = ?1",
                         (run_id.as_str(),),
                     )
@@ -253,41 +248,33 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                 let project_id = row.opt_text(1)?;
                 let project_key = row.opt_text(2)?;
                 let project_path = row.opt_text(3)?.map(std::path::PathBuf::from);
-                let issue_number = row.opt_i64(4)?.map(|n| n as i32);
-                let uri_segment = row.opt_text(5)?;
-                let exec_seq = row.opt_i64(6)?.map(|n| n as i32);
-                // Present only for sub-agent task jobs; a top-level node has no parent.
-                let parent_uri_segment = row.opt_text(7)?;
-                let effective_base_branch = row.opt_text(8)?;
-                let job_id = row.opt_text(9)?;
-                let recipe_node_id = row.opt_text(10)?;
-
-                // All four components are required. A missing component means the run
-                // record is corrupt or incomplete — fail rather than produce a partial URI.
-                // A task job nests under its parent node (`.../{parent}/task/{segment}`);
-                // a top-level node is `.../{segment}`.
-                let home_uri = match (
-                    project_key.as_deref(),
-                    issue_number,
-                    exec_seq,
-                    uri_segment.as_deref(),
-                ) {
-                    (Some(key), Some(num), Some(seq), Some(segment)) => {
-                        cairn_common::uri::build_job_base_uri(
-                            key,
-                            num,
-                            seq,
-                            segment,
-                            parent_uri_segment.as_deref(),
-                        )
-                    }
-                    _ => {
-                        return Err(DbError::internal(format!(
-                            "Cannot build home URI for run {}: project_key={:?}, issue_number={:?}, exec_seq={:?}, uri_segment={:?}",
-                            run_id, project_key, issue_number, exec_seq, uri_segment
-                        )));
-                    }
+                let effective_base_branch = row.opt_text(4)?;
+                let job_id = row.opt_text(5)?;
+                let recipe_node_id = row.opt_text(6)?;
+                let home_uri = match job_id.as_deref() {
+                    Some(job_id) => crate::jobs::queries::home_uri_for_job_conn(conn, job_id)
+                        .await?
+                        .ok_or_else(|| DbError::internal(format!("Cannot build home URI for run {run_id}")))?,
+                    None => return Err(DbError::internal(format!("Run {run_id} has no job"))),
                 };
+
+                let mut available_threads = Vec::new();
+                if let Some(project_id) = project_id.as_deref() {
+                    let mut thread_rows = conn
+                        .query(
+                            // The injected Project Threads block names the threads
+                            // an agent may address, so it carries active threads
+                            // only. A closed thread leaves the block on the next
+                            // session built and returns to it on reopen.
+                            "SELECT name, jurisdiction FROM threads
+                             WHERE project_id = ?1 AND status = 'active' ORDER BY name",
+                            (project_id,),
+                        )
+                        .await?;
+                    while let Some(thread_row) = thread_rows.next().await? {
+                        available_threads.push((thread_row.text(0)?, thread_row.opt_text(1)?));
+                    }
+                }
 
                 Ok(SessionDbContext {
                     home_uri,
@@ -298,6 +285,7 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                     effective_base_branch,
                     job_id,
                     recipe_node_id,
+                    available_threads,
                 })
             })
         })
@@ -1143,7 +1131,7 @@ pub fn insert_error_event(
         raw: Some(serde_json::json!({"error": error_message})),
     };
 
-    let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+    let data = transcript_event.observed().to_event_json();
     let insert_result = run_db_blocking({
         let dbs = orch.db.clone();
         let event_id = event_id.clone();
@@ -1708,30 +1696,28 @@ pub fn start_agent_session(
             result
         };
 
+        let available_threads_for_prompt = db_context.available_threads.clone();
+
         // ================================================================
         // Backend selection (moved before tool resolution so the backend
         // can control which tools are allowed/disallowed).
         // ================================================================
 
-        // Resolve-early: the concrete backend comes from the AgentConfig's atomic
-        // selection. backend_preference and model-derivation are fallbacks only
-        // for configs that lack a resolved selection.
-        let agent_backend_name = agent_config.as_ref().and_then(|ac| {
-            ac.selection
-                .as_ref()
-                .map(|s| s.backend.clone())
-                .or_else(|| ac.backend_preference.clone())
-        });
-
         // Runtime model should already be resolved before session start.
         let resolved_model = model.clone();
 
-        let effective_backend_name = agent_backend_name.clone().or_else(|| {
-            resolved_model
+        // The provider that serves THIS model, resolved once for the whole
+        // system (`backends::effective_backend_name`). The model below is handed
+        // to the CLI verbatim, so the backend that receives it has to be the one
+        // the model resolves to; an agent default naming a different model does
+        // not get to reinterpret it (CAIRN-3798).
+        let effective_backend_name = backends::effective_backend_name(
+            agent_config.as_ref().and_then(|ac| ac.selection.as_ref()),
+            agent_config
                 .as_ref()
-                .and_then(|m| backends::backend_for_model(m.as_str()))
-                .map(|s| s.to_string())
-        });
+                .and_then(|ac| ac.backend_preference.as_deref()),
+            resolved_model.as_ref().map(Model::as_str),
+        );
 
         let backend = backends::backend_for_name(effective_backend_name.as_deref());
 
@@ -1824,6 +1810,29 @@ pub fn start_agent_session(
                 );
                 for (id, name, description) in &available_skills_for_prompt {
                     content.push_str(&format!("- **{}** (`{}`): {}\n", name, id, description));
+                }
+            }
+
+            if allowed.contains(&"mcp__cairn__read".to_string())
+                && !available_threads_for_prompt.is_empty()
+            {
+                if !content.is_empty() {
+                    content.push_str("\n\n");
+                }
+                content.push_str("## Project Threads\n\n");
+                let project_key = project_key.as_deref().unwrap_or("PROJECT");
+                content.push_str(&format!(
+                    "Read the full collection at cairn://p/{project_key}/threads. Threads in this project:\n\n"
+                ));
+                for (name, jurisdiction) in &available_threads_for_prompt {
+                    content.push_str(&format!(
+                        "- cairn://p/{project_key}/{}{}\n",
+                        name,
+                        jurisdiction
+                            .as_ref()
+                            .map(|value| format!(" — {value}"))
+                            .unwrap_or_default()
+                    ));
                 }
             }
 
@@ -2552,6 +2561,54 @@ mod tests {
         Orchestrator::builder(db_state, services, config_dir).build()
     }
 
+    /// The injected **Project Threads** block names the threads an agent may
+    /// address, so it is an active listing. A closed thread leaves it on the
+    /// next session built and returns to it on reopen — which is exactly how a
+    /// closed thread stops being offered as somewhere to send work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_prompt_thread_block_names_active_threads_only() {
+        let db = Arc::new(migrated_db().await);
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','default','P','PROJ','/tmp/p',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES('i','p',7,'An issue','active','active','none',1,1);
+             INSERT INTO executions(id, issue_id, project_id, recipe_id, status, started_at, seq)
+               VALUES('e','i','p','build','running',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+               VALUES('j','e','i','p','running','builder','builder',1,1);
+             INSERT INTO runs(id, project_id, job_id, issue_id, status, created_at, updated_at)
+               VALUES('run-threads','p','j','i','running',1,1);
+             INSERT INTO threads(id, project_id, name, jurisdiction, status, attention, created_at, updated_at)
+               VALUES('t-open','p','roadmap','Own the roadmap','active','none',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES('t-shut','p','retired-topic','closed','none',1,1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db.clone());
+
+        let names = |context: &SessionDbContext| {
+            context
+                .available_threads
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        let context = session_db_context(&orch, "run-threads").unwrap();
+        assert_eq!(names(&context), vec!["roadmap".to_string()]);
+
+        db.execute("UPDATE threads SET status='active' WHERE id='t-shut'", ())
+            .await
+            .unwrap();
+        let context = session_db_context(&orch, "run-threads").unwrap();
+        assert_eq!(
+            names(&context),
+            vec!["retired-topic".to_string(), "roadmap".to_string()],
+            "reopening returns the thread to the next session's block"
+        );
+    }
+
     async fn seed_run(db: &LocalDb, run_id: &str) {
         let run_id = run_id.to_string();
         db.write(|conn| {
@@ -2622,7 +2679,7 @@ mod tests {
                     queued_message_id: None,
                     raw: None,
                 };
-                let data = serde_json::to_string(&event).unwrap();
+                let data = event.observed().to_event_json();
                 crate::transcripts::stream_store::insert_event_conn(
                     conn,
                     &crate::transcripts::stream_store::EventInsert {

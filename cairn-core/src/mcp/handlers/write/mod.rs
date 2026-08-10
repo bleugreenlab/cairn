@@ -9,6 +9,7 @@ use self::file_mutations::{
     apply_logical_file_batch, apply_prepared_logical, finalize_file_commit,
     record_agent_file_change, reverted_file_changes, CommitOutcome, FileBatchSuccess,
 };
+pub(crate) use self::preview::build_current_event_uri;
 use self::preview::{handle_apply_change, preview_change};
 use self::types::{
     build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, ChangeFailure,
@@ -18,10 +19,23 @@ use super::target::{target_family, TargetFamily};
 use crate::mcp::types::{ChangeMode, ChangePayload, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::resources::mutations::{
-    blocking_append_kind, dispatch_resource_change, is_workspace_mcp_mutation,
-    is_workspace_settings_mutation, project_write_crossing_path, run_blocking_group,
-    validate_blocking_group, PromotedMemoryRef,
+    blocking_append_kind, dispatch_resource_change, project_write_crossing_path,
+    run_blocking_group, validate_blocking_group, PromotedMemoryRef,
 };
+use cairn_common::authorization::AuthorityRequest;
+
+/// A single-failure change report for an item refused before anything applied.
+fn deny_change(changes: &[crate::mcp::types::ChangeItem], index: usize, message: String) -> String {
+    let IndexedFailure { failure, .. } = *build_failure(index, &changes[index], message);
+    serde_json::to_string(&empty_change_report(
+        Vec::new(),
+        vec![failure],
+        None,
+        false,
+        false,
+    ))
+    .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
+}
 
 /// Build a single-failure change report carrying the rendered multi-error
 /// validation message. The validator reports every problem at once; this maps
@@ -183,18 +197,15 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     // A thread writes no tracked files. Asked ahead of the apply round-trip, the
     // preview path, and any mutation, because a thread runs ON the base branch:
     // the commit this batch would seal publishes to the project's default branch
-    // with no PR behind it. The same refusal answers the `run` verb. Only a batch
-    // that actually carries a `commit_msg` pays the lookup, so a resource-only
-    // write and an unauthenticated (user) write are untouched.
+    // with no PR behind it. `commit_posture_refusal` is the same gate the `run`
+    // verb takes, so the two commit-capable verbs cannot drift. Only a batch that
+    // actually carries a `commit_msg` pays the lookup, so a resource-only write
+    // and an unauthenticated (user) write are untouched.
     if payload.commit_msg.is_some() {
-        if let Ok((context, db)) =
-            crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await
+        if let Some(refusal) =
+            crate::mcp::handlers::run_context::commit_posture_refusal(&orch.db, request).await
         {
-            if let Some(refusal) =
-                crate::threads::commit_refusal_for_job(&db, &context.job_id).await
-            {
-                return refusal;
-            }
+            return refusal;
         }
     }
 
@@ -242,6 +253,23 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         request.cwd,
         payload.changes.len()
     );
+
+    // Resolve what this batch would actually DO, before any of it happens.
+    //
+    // Ahead of the fence on purpose. Whether a change may cross a filesystem
+    // boundary and whether it may rewrite this workspace's capability set are
+    // different questions with different answers, and asking them in this order
+    // means an agent under `fence: ask` is refused for the real reason instead
+    // of first being prompted about a host path it was never going to be
+    // allowed to write. It also means `fence: allow` skips nothing: containment
+    // policy relaxes containment, never authority.
+    let prepared =
+        crate::authorization::prepare::prepare_batch(orch, request, &payload.changes).await;
+    for (index, outcome) in &prepared {
+        if let crate::authorization::prepare::Prepared::Refused(message) = outcome {
+            return deny_change(&payload.changes, *index, message.clone());
+        }
+    }
 
     // Logical namespace fence (writes). Repository-relative names are always
     // handled by the runner logical-head transaction and never joined to cwd.
@@ -349,62 +377,82 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         }
     };
 
-    // Logical namespace fence for workspace configuration. These mutations edit
-    // files under ~/.cairn, so they are explicit host capabilities rather than
-    // logical project targets. They route through the same permission flow as an
-    // absolute file target. The crossing is raised before any change applies, so
-    // suspension leaves no partial side effects.
-    if let Some((index, _)) =
-        payload.changes.iter().enumerate().find(|(_, item)| {
-            is_workspace_mcp_mutation(item) || is_workspace_settings_mutation(item)
-        })
-    {
-        use crate::mcp::handlers::fence;
-        use crate::models::Fence;
-        let item = &payload.changes[index];
-        let deny = |msg: String| -> String {
-            let IndexedFailure { failure, .. } = *build_failure(index, item, msg);
-            serde_json::to_string(&empty_change_report(
-                Vec::new(),
-                vec![failure],
-                None,
-                false,
-                false,
-            ))
-            .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
-        };
-        match fence::resolve_run_fence(orch, request).await {
-            // Fence::Allow agents write anywhere — no fence.
-            Some((_, Fence::Allow)) => {}
-            Some((run_id, fence_mode @ (Fence::Ask | Fence::Deny))) => {
-                let settings_path = crate::config::settings::get_settings_path(&orch.config_dir);
-                match fence::raise_fence(
-                    orch,
-                    &run_id,
-                    fence_mode,
-                    request,
-                    fence::Crossing::write_outside(&settings_path),
-                )
-                .await
-                {
-                    fence::FenceDecision::Allow => {}
-                    fence::FenceDecision::Deny(msg) => return deny(msg),
-                    fence::FenceDecision::Suspended => {
-                        return "Change suspended pending logical namespace approval; resume \
-                            will continue once it is answered."
-                            .to_string();
-                    }
-                }
+    // Named authority boundaries for workspace configuration.
+    //
+    // A workspace settings write or a workspace MCP mutation changes what every
+    // FUTURE agent in this workspace can do, which is an authority question,
+    // not a containment one. This used to be gated by raising the fence on
+    // `~/.cairn/settings.yaml` as though it were an ordinary host path escape;
+    // that prompt could only say "a file outside the project is being written",
+    // when the thing the operator actually needed to decide was whether to hand
+    // over a capability. The authorization service names the scope instead, and
+    // the approval it produces is journaled, listable, and revocable.
+    //
+    // Raised before any change applies, so a suspend leaves no partial side
+    // effects. Each authority-bearing section or server is adjudicated in turn;
+    // a suspend re-drives the whole batch on resume, at which point the granted
+    // one passes and the next unapproved one prompts.
+    let authority_requests: Vec<(usize, Result<AuthorityRequest, String>)> = prepared
+        .into_iter()
+        .filter_map(|(index, outcome)| match outcome {
+            crate::authorization::prepare::Prepared::Authority(request) => {
+                Some((index, Ok(request)))
             }
-            // No authenticated run means there is no authority to adjudicate
-            // this explicit host write. Deny rather than silently write.
-            None => {
-                return deny(
-                    "Denied: a workspace-scope cairn://mcp write edits ~/.cairn/settings.yaml as an \
-                     explicit host capability and requires an authenticated run for logical namespace \
-                     adjudication. Use scope:\"project\" for the project's logical .cairn/config.yaml."
-                        .to_string(),
-                );
+            crate::authorization::prepare::Prepared::Invalid(error) => Some((index, Err(error))),
+            // Already returned above; nothing reaches here.
+            crate::authorization::prepare::Prepared::Refused(_) => None,
+        })
+        .collect();
+    if !authority_requests.is_empty() {
+        use crate::mcp::handlers::authority::{self, AuthorityGate};
+        let deny =
+            |index: usize, msg: String| -> String { deny_change(&payload.changes, index, msg) };
+        // An authenticated principal is the one hard requirement: a grant has to
+        // be attributable to someone, so a request with no resolvable run is
+        // refused rather than written.
+        let Some(actor) = crate::authorization::resolve_actor(orch, request).await else {
+            let index = authority_requests[0].0;
+            return deny(
+                index,
+                "Denied: changing workspace settings or workspace MCP servers is a named \
+                 authority boundary and requires an authenticated run to adjudicate. Use \
+                 scope:\"project\" for the project's own .cairn/config.yaml."
+                    .to_string(),
+            );
+        };
+        // The fence policy answers only "is there anyone to ask". An
+        // unresolvable policy is not evidence that nobody is there — a run
+        // without an execution snapshot still has an operator — so it defaults
+        // to asking. Hard-denying here would make the boundary unreachable for
+        // such a run even when it holds a standing grant, which is the opposite
+        // of what a grant is for.
+        let fence_mode = crate::mcp::handlers::fence::resolve_run_fence(orch, request)
+            .await
+            .map(|(_, mode)| mode)
+            .unwrap_or(crate::models::Fence::Ask);
+        for (index, authority_request) in authority_requests {
+            let authority_request = match authority_request {
+                Ok(request) => request,
+                // A target with no nameable place cannot be approved at all.
+                Err(error) => return deny(index, format!("Refused: {error}")),
+            };
+            match authority::raise_authority(
+                orch,
+                &actor,
+                fence_mode,
+                request,
+                "write",
+                &authority_request,
+            )
+            .await
+            {
+                AuthorityGate::Allow => {}
+                AuthorityGate::Deny(msg) => return deny(index, msg),
+                AuthorityGate::Suspended => {
+                    return "Change suspended pending authority approval; resume will continue \
+                        once it is answered."
+                        .to_string();
+                }
             }
         }
     }

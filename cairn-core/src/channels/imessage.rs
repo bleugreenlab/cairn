@@ -84,6 +84,13 @@ fn render_channel_text(markdown: &str) -> RenderedText {
     };
     let mut open_styles: Vec<(&'static str, usize)> = Vec::new();
     let mut link: Option<String> = None;
+    // The open list stack, each entry carrying the next ordinal for an ordered
+    // list and `None` for a bullet list. Numbering is load-bearing rather than
+    // decorative: the text floor for an ask is a numbered list whose closing line
+    // tells the operator to "reply with a number", and the reply parser maps that
+    // number back to an option by position. Rendering every item as a bullet took
+    // the numbers off the operator's screen while the parser still expected them.
+    let mut list_ordinals: Vec<Option<u64>> = Vec::new();
     let options = Options::ENABLE_STRIKETHROUGH;
 
     for event in Parser::new_ext(markdown, options) {
@@ -111,9 +118,35 @@ fn render_channel_text(markdown: &str) -> RenderedText {
                     rendered.text.push_str(&destination);
                 }
             }
-            Event::Start(Tag::Item) => rendered.text.push_str("- "),
+            Event::Start(Tag::List(first_ordinal)) => {
+                // A list always opens on its own line, including one nested
+                // inside an item, whose text would otherwise run into it.
+                if !rendered.text.is_empty() {
+                    ensure_newlines(&mut rendered.text, 1);
+                }
+                list_ordinals.push(first_ordinal);
+            }
+            Event::Start(Tag::Item) => {
+                let indent = "  ".repeat(list_ordinals.len().saturating_sub(1));
+                rendered.text.push_str(&indent);
+                match list_ordinals.last_mut() {
+                    Some(Some(ordinal)) => {
+                        rendered.text.push_str(&format!("{ordinal}. "));
+                        *ordinal += 1;
+                    }
+                    _ => rendered.text.push_str("- "),
+                }
+            }
             Event::End(TagEnd::Item) => ensure_newlines(&mut rendered.text, 1),
-            Event::End(TagEnd::List(_)) => ensure_newlines(&mut rendered.text, 2),
+            Event::End(TagEnd::List(_)) => {
+                list_ordinals.pop();
+                // A nested list ends inside its parent item, so it takes a line
+                // break; only the outermost list closes with a blank line.
+                ensure_newlines(
+                    &mut rendered.text,
+                    if list_ordinals.is_empty() { 2 } else { 1 },
+                );
+            }
             Event::End(TagEnd::Paragraph) | Event::End(TagEnd::CodeBlock) => {
                 ensure_newlines(&mut rendered.text, 2)
             }
@@ -352,22 +385,14 @@ impl PlacedProcessExecutor {
     }
 }
 
+fn placed_presence_fallback() -> OperatorPresence {
+    OperatorPresence::Away
+}
+
 #[async_trait]
 impl IMessageExecutor for PlacedProcessExecutor {
     async fn operator_presence(&self) -> Result<OperatorPresence, String> {
-        let output = self
-            .lease
-            .run_one_shot(
-                "/bin/sh",
-                vec!["-c".into(), OPERATOR_PRESENCE_SCRIPT.into()],
-                PLACED_COMMAND_TIMEOUT,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        if output.exit_code != Some(0) {
-            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-        }
-        parse_operator_presence(&String::from_utf8_lossy(&output.stdout))
+        Ok(placed_presence_fallback())
     }
 
     async fn shutdown(&self) {
@@ -1459,6 +1484,11 @@ mod tests {
     }
 
     #[test]
+    fn remotely_placed_channel_never_probes_its_executor_for_presence() {
+        assert_eq!(placed_presence_fallback(), OperatorPresence::Away);
+    }
+
+    #[test]
     fn presence_requires_recent_input_and_an_unlocked_screen() {
         assert_eq!(
             parse_operator_presence("0 0").unwrap(),
@@ -1491,6 +1521,36 @@ mod tests {
         assert_eq!(
             render_channel_text(markdown).text,
             "CAIRN-3550 stream update\n\nUse render_channel_text:\n\n- first item\n- cairn://p/CAIRN/3550\n\nReady."
+        );
+    }
+
+    /// The numbered floor is the operator's whole affordance for answering by
+    /// number, and the reply parser resolves a number back to an option by
+    /// position, so the ordinals have to survive rendering.
+    #[test]
+    fn channel_text_keeps_ordered_list_numbering_and_nests_under_a_bullet_list() {
+        assert_eq!(
+            render_channel_text(&crate::channels::render_text_floor(&OutboundAsk::Question {
+                prompt_id: "p".into(),
+                question_index: 0,
+                text: "Which path?".into(),
+                options: vec![
+                    super::super::AskOption {
+                        label: "Legacy".into(),
+                        description: None
+                    },
+                    super::super::AskOption {
+                        label: "New".into(),
+                        description: None
+                    },
+                ],
+            }))
+            .text,
+            "Which path?\n\n1. Legacy\n2. New\n\nReply to this message with a number or your answer."
+        );
+        assert_eq!(
+            render_channel_text("- outer\n  1. first\n  2. second\n- after").text,
+            "- outer\n  1. first\n  2. second\n- after"
         );
     }
 

@@ -28,6 +28,57 @@ pub(crate) fn jj_bin() -> Option<String> {
         .then_some(bin)
 }
 
+/// A managed jj store can be nested below the runner's ordinary Git checkout.
+/// The agent-only commit exists in jj's backing store, not in that ancestor
+/// checkout, so successful ancestor discovery must not select the wrong object
+/// database.
+#[test]
+#[serial_test::serial(jj)]
+fn logical_tree_hash_uses_jj_backend_for_agent_only_revision() {
+    let Some(bin) = jj_bin() else {
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let runner = TempDir::new().unwrap();
+    init_project(runner.path());
+    let backing = TempDir::new().unwrap();
+    init_project(backing.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = runner
+        .path()
+        .join("config")
+        .join("jj-stores")
+        .join("project");
+    ensure_project_store(&jj, &store, backing.path()).unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let workspace = workspaces.path().join("builder");
+    add_workspace(
+        &jj,
+        &store,
+        &workspace,
+        "agent/CAIRN-3604-builder-0",
+        "main",
+        None,
+    )
+    .unwrap();
+    std::fs::write(workspace.join("agent-only.rs"), "agent branch\n").unwrap();
+    seal(&jj, &workspace, "agent-only revision", None).unwrap();
+    let commit = head_commit(&jj, &workspace).unwrap();
+    assert!(
+        !crate::env::git()
+            .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .current_dir(runner.path())
+            .status()
+            .unwrap()
+            .success(),
+        "fixture requires the revision to be absent from the runner checkout"
+    );
+    assert_eq!(
+        logical_tree_hash(&jj, &store, &commit).unwrap(),
+        sealed_tree_hash(&jj, &workspace).unwrap()
+    );
+}
+
 /// A sanctioned replay must distinguish the original same-hunk conflict from a
 /// later tip commit that deliberately resolves it. The replay reapplies the
 /// lineage, restores the committed resolution only for the session's conflicting
@@ -1137,6 +1188,31 @@ fn sealed_tree_hash_is_content_addressed() {
     );
 }
 
+/// Manual checks may be requested from agent shells, whose checkouts are plain
+/// Git worktrees rather than jj workspaces. Content verification must use the
+/// repository coordinate's object store without asking the caller to own jj
+/// metadata.
+#[test]
+fn logical_tree_hash_accepts_plain_git_repository() {
+    let repo = TempDir::new().unwrap();
+    init_project(repo.path());
+    let commit = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    let expected_tree = git_stdout(repo.path(), &["rev-parse", "HEAD^{tree}"]);
+    let jj = JjEnv::resolve("jj-must-not-be-needed", repo.path());
+
+    assert_eq!(
+        logical_tree_hash(&jj, repo.path(), &commit).unwrap(),
+        expected_tree
+    );
+    assert_eq!(
+        tree_entries(&jj, repo.path(), &commit).unwrap(),
+        vec![(
+            "shared.rs".to_string(),
+            git_stdout(repo.path(), &["rev-parse", "HEAD:shared.rs"])
+        )]
+    );
+}
+
 /// `parse_ls_tree` extracts `(path, blob)` from `-z` records, ignores
 /// mode/type, tolerates a trailing NUL, and sorts by path. Pure — no jj
 /// binary needed.
@@ -2016,6 +2092,136 @@ fn conflicting_paths_survive_the_rollback_on_the_report() {
     );
 }
 
+/// The regression fence for the defect the three-way merge primitive exists to
+/// close, over a real store rather than in the abstract.
+///
+/// The shape is the one that produced it: a small conflict at the top of a file,
+/// and a block of incoming work further down that the branch never touched. A
+/// top-only resolution looks complete to the agent who wrote it, and
+/// `take-committed-tip` then restores the file WHOLE and the block simply
+/// vanishes — surfacing much later as a compile error about something nobody
+/// edited.
+///
+/// The arc asserted here is the whole remedy: the invariant sees the loss, the
+/// completion candidate carries both sides, committing it satisfies the
+/// invariant, and the replay then lands a file containing both.
+#[test]
+#[serial_test::serial(jj)]
+fn a_whole_file_restore_that_would_drop_incoming_work_is_detected_and_remediable() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping a_whole_file_restore_that_would_drop_incoming_work_is_detected_and_remediable: jj not resolvable"
+        );
+        return;
+    };
+    // The branch changes only the header. Main changes the header too (so the
+    // rebase genuinely conflicts) AND appends an unrelated block far away from
+    // it, which merges cleanly and is therefore invisible in the conflict.
+    const BASE: &str = "header\nbody-1\nbody-2\nbody-3\n";
+    const OURS: &str = "header-from-branch\nbody-1\nbody-2\nbody-3\n";
+    const THEIRS: &str =
+        "header-from-main\nbody-1\nbody-2\nbody-3\ntimeout_secs = 30\nretries = 3\n";
+
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let advance_main = |content: &str, message: &str| {
+        jj.run(&store, &["new", "main"], "new on main").unwrap();
+        std::fs::write(store.join("shared.rs"), content).unwrap();
+        jj.run(&store, &["describe", "-m", message], "describe main")
+            .unwrap();
+        jj.run(
+            &store,
+            &["bookmark", "set", "main", "-r", "@"],
+            "advance main",
+        )
+        .unwrap();
+    };
+
+    advance_main(BASE, "base content both sides fork from");
+
+    let branch = "agent/CAIRN-3627-builder-0";
+    let ws = wts.path().join("builder");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("shared.rs"), OURS).unwrap();
+    seal(&jj, &ws, "branch rewrites the header", None).unwrap();
+
+    advance_main(THEIRS, "main rewrites the header and appends config");
+
+    let RebaseOutcome::Conflicted { diagnostic } =
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap()
+    else {
+        panic!("precondition: the two header edits must conflict");
+    };
+    let paths = diagnostic.conflicting_paths();
+    assert_eq!(paths, vec!["shared.rs".to_string()]);
+    let (base, theirs) = (
+        diagnostic.base.clone().unwrap(),
+        diagnostic.theirs.clone().unwrap(),
+    );
+
+    // The branch's own tip, unchanged by the rolled-back rebase. Restoring
+    // `shared.rs` whole from it would keep the header resolution and throw the
+    // appended config away.
+    let unresolved_tip = bookmark_commit(&jj, &store, branch).unwrap();
+    let assessed = assess_paths(&jj, &store, &base, &unresolved_tip, &theirs, &paths);
+    let RestoreVerdict::Lossy(dropped) = &assessed[0].verdict else {
+        panic!(
+            "a whole-file restore that discards the appended config must be reported as lossy, \
+             got {:?}",
+            assessed[0].verdict
+        );
+    };
+    assert!(
+        dropped.diff.contains("+timeout_secs = 30") && dropped.diff.contains("+retries = 3"),
+        "the diff names exactly the incoming work the restore would drop: {}",
+        dropped.diff
+    );
+    assert_eq!(
+        dropped.candidate,
+        THEIRS.replace("header-from-main", "header-from-branch"),
+        "the candidate keeps the branch's header and carries main's appended config"
+    );
+
+    // The documented remedy: commit the candidate the resource hands over.
+    update_stale(&jj, &ws).unwrap();
+    std::fs::write(ws.join("shared.rs"), &dropped.candidate).unwrap();
+    seal(
+        &jj,
+        &ws,
+        "carry the incoming config alongside the resolution",
+        None,
+    )
+    .unwrap();
+
+    let resolved_tip = bookmark_commit(&jj, &store, branch).unwrap();
+    assert_eq!(
+        assess_paths(&jj, &store, &base, &resolved_tip, &theirs, &paths)[0].verdict,
+        RestoreVerdict::Lossless,
+        "once the tip carries both sides the whole-file restore is exactly right"
+    );
+
+    // And the replay that restore drives lands a file containing both sides.
+    let report =
+        reconcile_resolved_sibling_without_publication(&jj, &store, "main", branch, &paths)
+            .unwrap();
+    assert_eq!(report.rebased_clean, vec![branch.to_string()]);
+    let landed = String::from_utf8(file_show(&jj, &store, branch, "shared.rs").unwrap()).unwrap();
+    assert!(
+        landed.contains("header-from-branch"),
+        "the branch's resolution survives: {landed}"
+    );
+    assert!(
+        landed.contains("timeout_secs = 30") && landed.contains("retries = 3"),
+        "and the incoming work that used to vanish is still there: {landed}"
+    );
+}
+
 /// `conflicted_commits` enumerates each conflicted commit in a range with its
 /// conflicted file paths — store-side, no workspace — and reports nothing for
 /// a clean range. This is the detail the pre-flight diagnostic surfaces.
@@ -2823,6 +3029,78 @@ fn merge_into_bookmark_folds_child_and_refuses_backwards() {
         err.contains("not a descendant"),
         "the sanitized error names the real cause: {err}"
     );
+}
+
+/// `branch_carries_commit` decides whether a branch still owes a replay, and
+/// both of its consumers act on a `true` by doing nothing: the sessionless
+/// replay returns "nothing to replay", and `cairn:~/rebase` tells the agent
+/// nothing needs doing. A wrong `true` therefore reproduces the exact failure
+/// this probe exists to detect — a branch silently behind its base with an
+/// unmergeable PR and no signal anywhere — so the case that matters most is a
+/// sibling left behind by a base advance.
+#[test]
+#[serial_test::serial(jj)]
+fn branch_carries_commit_tracks_a_base_advance() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping branch_carries_commit_tracks_a_base_advance: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let lands = "agent/CAIRN-1-builder-0";
+    let stranded = "agent/CAIRN-2-builder-0";
+    let ws_lands = wts.path().join("lands");
+    let ws_stranded = wts.path().join("stranded");
+    add_workspace(&jj, &store, &ws_lands, lands, "main", None).unwrap();
+    add_workspace(&jj, &store, &ws_stranded, stranded, "main", None).unwrap();
+
+    let original_main = revset_commit(&jj, &store, "main").unwrap();
+    assert!(
+        branch_carries_commit(&jj, &store, stranded, &original_main),
+        "a branch cut from main carries main's tip before anything moves"
+    );
+
+    // Its own work does not cost it the base it already had.
+    std::fs::write(ws_stranded.join("mine.rs"), "my work\n").unwrap();
+    seal(&jj, &ws_stranded, "my work", None).unwrap();
+    assert!(
+        branch_carries_commit(&jj, &store, stranded, &original_main),
+        "committing on the branch keeps the base in its ancestry"
+    );
+
+    // A sibling lands and main advances. This is the state that must read as
+    // "behind": the branch is untouched, still green, and now unmergeable.
+    std::fs::write(ws_lands.join("theirs.rs"), "their work\n").unwrap();
+    seal(&jj, &ws_lands, "their work", None).unwrap();
+    merge_into_bookmark(&jj, &store, "main", lands).unwrap();
+    let advanced_main = revset_commit(&jj, &store, "main").unwrap();
+    assert_ne!(advanced_main, original_main, "main actually moved");
+
+    assert!(
+        !branch_carries_commit(&jj, &store, stranded, &advanced_main),
+        "the stranded branch does NOT carry the advanced base, and must not be told otherwise"
+    );
+    assert!(
+        branch_carries_commit(&jj, &store, lands, &advanced_main),
+        "the branch that landed does carry it"
+    );
+
+    // Fail closed rather than claiming a base is carried on an unresolvable
+    // input: the safe direction is to offer a replay that turns out redundant.
+    assert!(!branch_carries_commit(&jj, &store, "", &advanced_main));
+    assert!(!branch_carries_commit(
+        &jj,
+        &store,
+        "agent/nonexistent",
+        &advanced_main
+    ));
+    assert!(!branch_carries_commit(&jj, &store, stranded, ""));
 }
 
 /// `bookmark_landed_in` is the ancestor test the merge postcondition and the

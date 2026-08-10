@@ -1,7 +1,7 @@
 //! Programmatic execution start via an issue's executions collection.
 //!
-//! Appending `{recipe?, backend?}` to `cairn://p/PROJECT/NUMBER/executions`
-//! starts a new execution. This is the external-driver entry point: it shares
+//! Appending `{recipe?, backend?, branch?, overrides?}` to
+//! `cairn://p/PROJECT/NUMBER/executions` starts a new execution. This is the external-driver entry point: it shares
 //! the same start sequence as the user-facing Tauri command
 //! (`start_recipe_execution_and_advance`) and stamps `initiated_via="external"`
 //! attribution on the snapshot. Local-secret auth (which already gates every
@@ -56,6 +56,7 @@ pub(crate) async fn start_execution_from_collection(
     recipe: Option<&str>,
     backend: Option<&str>,
     branch_target: Option<crate::models::BranchTarget>,
+    overrides: Option<crate::models::LaunchDeltas>,
 ) -> Result<String, String> {
     // Route the issue lookup to the database that OWNS the project: a team
     // project's issue rows live wholly in its synced replica (CAIRN-2181), so
@@ -73,6 +74,7 @@ pub(crate) async fn start_execution_from_collection(
         backend,
         Some("external"),
         branch_target,
+        overrides.map(crate::models::LaunchCustomization::Deltas),
         crate::models::TriggerType::Manual,
     )?;
 
@@ -137,10 +139,10 @@ pub(crate) async fn edit_execution_agent(
 }
 
 /// Shallow-merge a partial agent-snapshot patch over the stored snapshot for one
-/// agent, then validate the result as a full `AgentSnapshot`. The stored base is
-/// taken through `config::snapshot_migrate::load` (migrate-on-read), so the patch
-/// merges onto the current-form representation. When the agent does not yet exist
-/// in the snapshot, the patch must itself be a complete snapshot.
+/// agent. The stored base is taken through `config::snapshot_migrate::load`
+/// (migrate-on-read), so the patch merges onto the current-form representation;
+/// the merge itself is the shared [`crate::models::merge_agent_patch`], so this
+/// door and the launch-delta door cannot drift apart in what a patch means.
 async fn merge_agent_snapshot(
     db: &LocalDb,
     execution_id: &str,
@@ -151,29 +153,17 @@ async fn merge_agent_snapshot(
         serde_json::Value::Object(map) => map,
         _ => return Err("payload.snapshot must be an object".to_string()),
     };
-
-    let merged = match load_agent_snapshot_value(db, execution_id, agent_id).await? {
-        Some(serde_json::Value::Object(mut base)) => {
-            for (key, value) in patch {
-                base.insert(key, value);
-            }
-            serde_json::Value::Object(base)
-        }
-        // New agent (or no base): the patch must itself be a complete snapshot.
-        _ => serde_json::Value::Object(patch),
-    };
-
-    serde_json::from_value::<AgentSnapshot>(merged)
-        .map_err(|e| format!("Invalid agent snapshot after merge: {e}"))
+    let base = load_agent_snapshot(db, execution_id, agent_id).await?;
+    crate::models::merge_agent_patch(base.as_ref(), &patch)
 }
 
-/// Load the stored snapshot for one agent as a JSON object (current-form, after
-/// migrate-on-read), or `None` when the execution/agent is absent.
-async fn load_agent_snapshot_value(
+/// Load the stored snapshot for one agent (current-form, after migrate-on-read),
+/// or `None` when the execution/agent is absent.
+async fn load_agent_snapshot(
     db: &LocalDb,
     execution_id: &str,
     agent_id: &str,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<AgentSnapshot>, String> {
     let json = db
         .query_opt_text(
             "SELECT snapshot FROM executions WHERE id = ?1",
@@ -185,12 +175,7 @@ async fn load_agent_snapshot_value(
         return Ok(None);
     };
     let snapshot = crate::config::snapshot_migrate::load(&json)?;
-    match snapshot.agents.get(agent_id) {
-        Some(agent) => Ok(Some(
-            serde_json::to_value(agent).map_err(|e| e.to_string())?,
-        )),
-        None => Ok(None),
-    }
+    Ok(snapshot.agents.get(agent_id).cloned())
 }
 
 /// Resolve `execution_id` for `(project_key, number, exec_seq)`.

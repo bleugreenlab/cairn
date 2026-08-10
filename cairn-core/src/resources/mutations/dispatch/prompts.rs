@@ -1,10 +1,74 @@
 //! Question / permission / task-append prompt dispatch, relocated from dispatch.rs.
 
 use super::super::{build_failure, payload_non_empty_str, payload_str, ResourceMutationResult};
+use crate::mcp::handlers::permission::{
+    AnswerSurface, PermissionAnswer, PermissionDecision, PermissionScope,
+};
 use crate::mcp::handlers::planning;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
+use cairn_common::authorization::AuthorityLifetimeKind;
 use cairn_common::uri::CairnResource;
+
+/// Parse a permission answer payload into the decision plus both lifetime
+/// concepts.
+///
+/// One resource addresses three kinds of pending request — a fence crossing, a
+/// legacy tool prompt, and an authority request — so the payload carries both
+/// lifetime keys and the resolver applies whichever the stored request actually
+/// is. They are separate keys, not one merged field, because they mean
+/// genuinely different things: `scope` reuses a concrete containment exception
+/// for this process, `lifetime` mints a journaled, revocable authority grant.
+///
+/// This resource is agent-reachable, so the answer it builds carries no
+/// operator capability. `lifetime` is still parsed and still validated here — a
+/// nonsense value is a payload error whoever sent it — but on an authority
+/// prompt the resolver refuses the allow outright, whichever lifetime was
+/// asked for. An agent approving its own escalation is the thing this whole
+/// path exists to prevent; denying and cancelling stay available.
+///
+/// Returns the parsed answer alongside the raw decision word for the summary.
+fn parse_permission_answer(
+    payload: &serde_json::Value,
+) -> Result<(PermissionAnswer, &'static str), String> {
+    let (decision, decision_word) = match payload_str(payload, "decision", &[])
+        .ok_or_else(|| "payload.decision is required (allow|deny)".to_string())?
+    {
+        "allow" => (PermissionDecision::Allow, "allow"),
+        "deny" => (PermissionDecision::Deny, "deny"),
+        other => {
+            return Err(format!(
+                "invalid decision '{other}'; expected allow or deny"
+            ))
+        }
+    };
+    let scope = match payload_str(payload, "scope", &[]).unwrap_or("once") {
+        "once" => PermissionScope::Once,
+        "session" => PermissionScope::Session,
+        other => return Err(format!("invalid scope '{other}'; expected once or session")),
+    };
+    let lifetime = match payload_str(payload, "lifetime", &[]) {
+        Some(raw) => Some(AuthorityLifetimeKind::parse(raw)?),
+        None => None,
+    };
+    let expires_at = match payload.get("expiresInSeconds") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let seconds = value
+                .as_i64()
+                .filter(|seconds| *seconds > 0)
+                .ok_or_else(|| "payload.expiresInSeconds must be a positive integer".to_string())?;
+            Some(chrono::Utc::now().timestamp() + seconds)
+        }
+    };
+    Ok((
+        PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
+            .with_containment_scope(scope)
+            .with_lifetime(lifetime)
+            .with_expiry(expires_at),
+        decision_word,
+    ))
+}
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
@@ -107,31 +171,8 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "permission answer requires payload"))?;
-            let decision_str = payload_str(payload, "decision", &[]).ok_or_else(|| {
-                build_failure(index, item, "payload.decision is required (allow|deny)")
-            })?;
-            let decision = match decision_str {
-                "allow" => crate::mcp::handlers::permission::PermissionDecision::Allow,
-                "deny" => crate::mcp::handlers::permission::PermissionDecision::Deny,
-                other => {
-                    return Err(build_failure(
-                        index,
-                        item,
-                        format!("invalid decision '{other}'; expected allow or deny"),
-                    ))
-                }
-            };
-            let scope = match payload_str(payload, "scope", &[]).unwrap_or("once") {
-                "once" => crate::mcp::handlers::permission::PermissionScope::Once,
-                "session" => crate::mcp::handlers::permission::PermissionScope::Session,
-                other => {
-                    return Err(build_failure(
-                        index,
-                        item,
-                        format!("invalid scope '{other}'; expected once or session"),
-                    ))
-                }
-            };
+            let (answer, decision_str) = parse_permission_answer(payload)
+                .map_err(|error| build_failure(index, item, error))?;
             if dry_run {
                 format!(
                     "Would answer permission {} for {}-{}/{}/{}",
@@ -139,7 +180,7 @@ pub(super) async fn dispatch(
                 )
             } else {
                 let outcome = crate::mcp::handlers::permission::answer_node_permission(
-                    orch, project, *number, *exec_seq, node_id, segment, decision, scope,
+                    orch, project, *number, *exec_seq, node_id, segment, answer,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -165,31 +206,8 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "permission answer requires payload"))?;
-            let decision_str = payload_str(payload, "decision", &[]).ok_or_else(|| {
-                build_failure(index, item, "payload.decision is required (allow|deny)")
-            })?;
-            let decision = match decision_str {
-                "allow" => crate::mcp::handlers::permission::PermissionDecision::Allow,
-                "deny" => crate::mcp::handlers::permission::PermissionDecision::Deny,
-                other => {
-                    return Err(build_failure(
-                        index,
-                        item,
-                        format!("invalid decision '{other}'; expected allow or deny"),
-                    ))
-                }
-            };
-            let scope = match payload_str(payload, "scope", &[]).unwrap_or("once") {
-                "once" => crate::mcp::handlers::permission::PermissionScope::Once,
-                "session" => crate::mcp::handlers::permission::PermissionScope::Session,
-                other => {
-                    return Err(build_failure(
-                        index,
-                        item,
-                        format!("invalid scope '{other}'; expected once or session"),
-                    ))
-                }
-            };
+            let (answer, decision_str) = parse_permission_answer(payload)
+                .map_err(|error| build_failure(index, item, error))?;
             if dry_run {
                 format!(
                     "Would answer permission {} for {}-{}/{}/{}/task/{}",
@@ -200,7 +218,7 @@ pub(super) async fn dispatch(
                 // `uri_segment`; for a sub-agent task that is the task segment,
                 // so the task name addresses the request directly (issue #143).
                 let outcome = crate::mcp::handlers::permission::answer_node_permission(
-                    orch, project, *number, *exec_seq, task_name, segment, decision, scope,
+                    orch, project, *number, *exec_seq, task_name, segment, answer,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;

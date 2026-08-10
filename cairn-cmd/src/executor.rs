@@ -1,11 +1,14 @@
 //! First-class remote executor lifecycle commands.
 //!
-//! This module deliberately contains no SSH or enrollment behavior. It is a
-//! typed client for the runner's invoke surface, which remains the sole owner of
-//! preflight, credentials, supervision, and teardown.
+//! The CLI verifies key-based SSH authentication and can help an interactive
+//! operator establish it. The runner remains the sole owner of enrollment,
+//! installation, supervision, and teardown.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
 
 #[derive(clap::Subcommand, Clone, Debug)]
 pub(crate) enum ExecutorCommand {
@@ -42,6 +45,237 @@ pub(crate) enum ExecutorCommand {
     Rename { name: String, new_name: String },
     /// List configured remote executors and their live fleet status.
     List,
+}
+
+#[derive(Debug, PartialEq)]
+enum SshProbeFailure {
+    Authentication,
+    WrongUser,
+    HostKey,
+    Unreachable,
+    Other,
+}
+
+fn ssh_target(request: &AddRequest) -> String {
+    format!("{}@{}", request.ssh_user, request.host)
+}
+
+fn ssh_copy_id_args(extra_ssh_args: &[String]) -> Vec<String> {
+    let mut copy_args = Vec::new();
+    let mut args = extra_ssh_args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-J" => {
+                copy_args.push("-o".into());
+                if let Some(jump_host) = args.next() {
+                    copy_args.push(format!("ProxyJump={jump_host}"));
+                }
+            }
+            "-4" => copy_args.extend(["-o".into(), "AddressFamily=inet".into()]),
+            "-6" => copy_args.extend(["-o".into(), "AddressFamily=inet6".into()]),
+            _ if arg.starts_with("-J") => {
+                copy_args.extend(["-o".into(), format!("ProxyJump={}", &arg[2..])]);
+            }
+            _ => copy_args.push(arg.clone()),
+        }
+    }
+
+    copy_args
+}
+
+fn shell_quote(argument: &str) -> String {
+    if argument
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "@%_+=:,./-".contains(character))
+    {
+        argument.to_owned()
+    } else {
+        format!("'{}'", argument.replace('\'', "'\\''"))
+    }
+}
+
+fn ssh_copy_id_command(request: &AddRequest) -> String {
+    std::iter::once("ssh-copy-id".to_string())
+        .chain(
+            ssh_copy_id_args(&request.extra_ssh_args)
+                .into_iter()
+                .map(|arg| shell_quote(&arg)),
+        )
+        .chain(std::iter::once(shell_quote(&ssh_target(request))))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ssh_copy_id_guidance(request: &AddRequest) -> String {
+    let target = ssh_target(request);
+    let copy_command = ssh_copy_id_command(request);
+    format!(
+        "SSH key authentication is not ready for {target}. Run `{copy_command}`, then re-run `cairn executor add {target}`. Verify the SSH username if the copy command rejects it."
+    )
+}
+
+fn classify_ssh_probe(output: &Output) -> SshProbeFailure {
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+    .to_ascii_lowercase();
+
+    if diagnostic.contains("remote host identification has changed")
+        || diagnostic.contains("host key verification failed")
+        || diagnostic.contains("host key mismatch")
+    {
+        SshProbeFailure::HostKey
+    } else if diagnostic.contains("invalid user")
+        || diagnostic.contains("illegal user")
+        || diagnostic.contains("unknown user")
+    {
+        SshProbeFailure::WrongUser
+    } else if diagnostic.contains("connection timed out")
+        || diagnostic.contains("operation timed out")
+        || diagnostic.contains("connection refused")
+        || diagnostic.contains("no route to host")
+        || diagnostic.contains("network is unreachable")
+        || diagnostic.contains("could not resolve hostname")
+        || diagnostic.contains("name or service not known")
+    {
+        SshProbeFailure::Unreachable
+    } else if diagnostic.contains("permission denied")
+        || diagnostic.contains("authentication failed")
+        || diagnostic.contains("no supported authentication methods")
+    {
+        SshProbeFailure::Authentication
+    } else {
+        SshProbeFailure::Other
+    }
+}
+
+fn run_ssh_probe(request: &AddRequest) -> Result<(), (SshProbeFailure, String)> {
+    let target = ssh_target(request);
+    let output = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        .args(&request.extra_ssh_args)
+        .arg("--")
+        .arg(&target)
+        .arg("true")
+        .output()
+        .map_err(|error| {
+            (
+                SshProbeFailure::Other,
+                format!("could not run the SSH authentication probe: {error}"),
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err((classify_ssh_probe(&output), diagnostic))
+}
+
+fn local_public_key_exists() -> bool {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let Some(ssh_dir) = home.map(|home| home.join(".ssh")) else {
+        return false;
+    };
+    std::fs::read_dir(ssh_dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("id_") && name.ends_with(".pub") && entry.path().is_file()
+        })
+    })
+}
+
+fn confirm(prompt: &str) -> Result<bool, String> {
+    eprint!("{prompt} [Y/n] ");
+    io::stderr().flush().map_err(|error| error.to_string())?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| error.to_string())?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes"
+    ))
+}
+
+fn prepare_ssh_auth(request: &AddRequest) -> Result<(), String> {
+    let Err((failure, diagnostic)) = run_ssh_probe(request) else {
+        return Ok(());
+    };
+    let target = ssh_target(request);
+    match failure {
+        SshProbeFailure::HostKey => Err(format!(
+            "SSH host-key verification failed for {target}. Resolve the host-key mismatch before enrollment. {diagnostic}"
+        )),
+        SshProbeFailure::WrongUser => Err(format!(
+            "SSH reports that `{}` is not a valid user on {}. Correct the user in the enrollment target. {diagnostic}",
+            request.ssh_user, request.host
+        )),
+        SshProbeFailure::Unreachable => Err(format!(
+            "SSH could not reach {} within 5 seconds. Check its address, network, and SSH service. {diagnostic}",
+            request.host
+        )),
+        SshProbeFailure::Other => Err(format!(
+            "SSH probe failed for {target}. {diagnostic}"
+        )),
+        SshProbeFailure::Authentication => {
+            if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+                return Err(ssh_copy_id_guidance(request));
+            }
+
+            eprintln!(
+                "SSH reached {}, but key authentication for `{}` was rejected. If that account does not exist on the host, re-run this command with the correct username.",
+                request.host, request.ssh_user
+            );
+            if !local_public_key_exists() {
+                if !confirm("No local SSH public key was found. Generate an Ed25519 key now?")? {
+                    return Err(format!(
+                        "No SSH key was generated. Create one with `ssh-keygen -t ed25519`, then {}",
+                        ssh_copy_id_guidance(request)
+                    ));
+                }
+                let status = Command::new("ssh-keygen")
+                    .args(["-t", "ed25519", "-N", ""])
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .map_err(|error| format!("could not run ssh-keygen: {error}"))?;
+                if !status.success() {
+                    return Err(format!("ssh-keygen exited with {status}"));
+                }
+            }
+
+            let copy_args = ssh_copy_id_args(&request.extra_ssh_args);
+            let copy_command = ssh_copy_id_command(request);
+            eprintln!("Running `{copy_command}`…");
+            let status = Command::new("ssh-copy-id")
+                .args(&copy_args)
+                .arg("--")
+                .arg(&target)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .map_err(|error| format!("could not run `{copy_command}`: {error}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "`{copy_command}` exited with {status}. Verify that `{}` is the correct remote user, then retry.",
+                    request.ssh_user
+                ));
+            }
+            run_ssh_probe(request).map_err(|(failure, diagnostic)| {
+                format!(
+                    "SSH authentication still failed after `{copy_command}` ({failure:?}). Verify the username and SSH options. {diagnostic}"
+                )
+            })
+        }
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -180,20 +414,28 @@ fn phase_label(phase: &str) -> &str {
 
 struct InvokeClient {
     base_url: String,
+    shares_callers_ssh_environment: bool,
     token: Option<String>,
     http: reqwest::Client,
 }
 
+fn shares_callers_ssh_environment(explicit_callback: Option<&str>) -> bool {
+    explicit_callback.is_none()
+}
+
 impl InvokeClient {
     fn from_environment() -> Self {
-        let callback = std::env::var("CAIRN_CALLBACK_URL")
-            .unwrap_or_else(|_| crate::cli::default_callback_url());
+        let explicit_callback = std::env::var("CAIRN_CALLBACK_URL").ok();
+        let shares_callers_ssh_environment =
+            shares_callers_ssh_environment(explicit_callback.as_deref());
+        let callback = explicit_callback.unwrap_or_else(crate::cli::default_callback_url);
         let mut parsed = url::Url::parse(&callback).expect("callback URL is valid");
         parsed.set_path("");
         parsed.set_query(None);
         parsed.set_fragment(None);
         Self {
             base_url: parsed.as_str().trim_end_matches('/').to_string(),
+            shares_callers_ssh_environment,
             token: std::env::var("CAIRN_MCP_SECRET")
                 .ok()
                 .or_else(cairn_common::auth::load_local_mcp_token),
@@ -230,7 +472,12 @@ fn parse_target(target: &str) -> Result<(String, String), String> {
     let (user, host) = target
         .split_once('@')
         .ok_or_else(|| "target must be user@host".to_string())?;
-    if user.is_empty() || host.is_empty() || host.contains('@') {
+    if user.is_empty()
+        || host.is_empty()
+        || host.contains('@')
+        || user.starts_with('-')
+        || host.starts_with('-')
+    {
         return Err("target must be user@host".into());
     }
     Ok((user.to_owned(), host.to_owned()))
@@ -274,6 +521,11 @@ pub(crate) async fn run(command: ExecutorCommand) -> bool {
                 Ok(request) => request,
                 Err(error) => return emit_error("add", &error),
             };
+            if client.shares_callers_ssh_environment {
+                if let Err(error) = prepare_ssh_auth(&request) {
+                    return emit_error("add", &error);
+                }
+            }
             match client
                 .invoke::<EnrollmentStarted>(
                     "add_remote_executor",
@@ -488,6 +740,97 @@ mod tests {
             ),
             "remote prerequisite preflight failed: binary missing"
         );
+    }
+
+    fn failed_ssh_output(stderr: &str) -> Output {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(255),
+            stdout: vec![],
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn ssh_probe_failures_keep_actionable_stages_distinct() {
+        assert_eq!(
+            classify_ssh_probe(&failed_ssh_output("Connection timed out")),
+            SshProbeFailure::Unreachable
+        );
+        assert_eq!(
+            classify_ssh_probe(&failed_ssh_output(
+                "REMOTE HOST IDENTIFICATION HAS CHANGED!"
+            )),
+            SshProbeFailure::HostKey
+        );
+        assert_eq!(
+            classify_ssh_probe(&failed_ssh_output("Invalid user deploy")),
+            SshProbeFailure::WrongUser
+        );
+        assert_eq!(
+            classify_ssh_probe(&failed_ssh_output("Permission denied (publickey).")),
+            SshProbeFailure::Authentication
+        );
+    }
+
+    #[test]
+    fn non_interactive_guidance_names_exact_copy_and_retry_commands() {
+        let request = add_request(ExecutorCommand::Add {
+            target: "dev@builder.local".into(),
+            binary_path: None,
+            remote_home: None,
+            executor_id: None,
+            device_id: None,
+            display_name: None,
+            projects: vec![],
+            tunnel_port: None,
+            extra_ssh_args: vec![],
+        })
+        .unwrap();
+        assert_eq!(ssh_copy_id_guidance(&request), "SSH key authentication is not ready for dev@builder.local. Run `ssh-copy-id dev@builder.local`, then re-run `cairn executor add dev@builder.local`. Verify the SSH username if the copy command rejects it.");
+    }
+
+    #[test]
+    fn copy_id_uses_the_same_custom_ssh_endpoint() {
+        let request = add_request(ExecutorCommand::Add {
+            target: "dev@builder.local".into(),
+            binary_path: None,
+            remote_home: None,
+            executor_id: None,
+            device_id: None,
+            display_name: None,
+            projects: vec![],
+            tunnel_port: None,
+            extra_ssh_args: vec!["-p".into(), "2222".into(), "-J".into(), "jump host".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            ssh_copy_id_command(&request),
+            "ssh-copy-id -p 2222 -o 'ProxyJump=jump host' dev@builder.local"
+        );
+    }
+
+    #[test]
+    fn rejects_targets_that_ssh_could_parse_as_options() {
+        assert_eq!(
+            parse_target("-oProxyCommand=payload@host"),
+            Err("target must be user@host".into())
+        );
+        assert_eq!(
+            parse_target("dev@-oProxyCommand=payload"),
+            Err("target must be user@host".into())
+        );
+    }
+
+    #[test]
+    fn explicit_callbacks_do_not_claim_the_callers_ssh_environment() {
+        assert!(shares_callers_ssh_environment(None));
+        assert!(!shares_callers_ssh_environment(Some(
+            "http://127.0.0.1:43850/api/mcp"
+        )));
     }
 
     #[test]

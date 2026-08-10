@@ -56,7 +56,12 @@ pub(super) fn route_wake_sync(
                     .block_on(async move { route_wake(&orch, event).await })
             })
             .join()
-            .map_err(|_| "Database task panicked".to_string())?
+            .map_err(|payload| {
+                format!(
+                    "Database task panicked: {}",
+                    crate::storage::panic_message(&*payload)
+                )
+            })?
     })
 }
 
@@ -185,6 +190,13 @@ async fn route_wake_to_subscription(
     event: &WakeEvent,
     subscription: WakeSubscription,
 ) -> Result<WakeRouteAction, String> {
+    // A closed thread's session is not a deliverable recipient. Dropping here,
+    // before the state match, is what keeps closure from consuming anything: a
+    // one-shot subscription is only spent by an action, so a terminal-exit watch
+    // held by a thread that was closed mid-wait survives to fire on reopen.
+    if recipient_is_dormant(orch, event, &subscription).await {
+        return Ok(WakeRouteAction::Dropped);
+    }
     let action = match subscription.state {
         WakeSubscriptionState::Active => {
             deliver_active_wake(orch, event, &subscription, None).await?;
@@ -217,6 +229,30 @@ async fn route_wake_to_subscription(
     }
 
     Ok(action)
+}
+
+/// The job this wake would actually reach, and whether it is dormant.
+///
+/// A targeted delivery names its recipient; a broadcast reaches the subscribing
+/// job. Both resolve through the one dormancy rule in
+/// [`crate::threads::is_dormant_thread_session`], which the direct parent-push
+/// path and turn admission take as well — so no two axes can disagree about
+/// whether a closed thread is listening.
+async fn recipient_is_dormant(
+    orch: &Orchestrator,
+    event: &WakeEvent,
+    subscription: &WakeSubscription,
+) -> bool {
+    let job_id = match &event.delivery {
+        WakeDelivery::Targeted {
+            subscriber_job_id, ..
+        }
+        | WakeDelivery::MessageDigest {
+            subscriber_job_id, ..
+        } => subscriber_job_id.as_str(),
+        WakeDelivery::Broadcast { .. } => subscription.job_id.as_str(),
+    };
+    crate::threads::is_dormant_thread_session(&orch.db.local, job_id).await
 }
 
 async fn consume_one_shot_subscription(

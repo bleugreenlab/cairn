@@ -6,6 +6,7 @@ use super::types::{
     PROJECT_SCOPE,
 };
 use crate::query::parse_query_params;
+use crate::thread_name::{validate_thread_name, RESERVED_PROJECT_SEGMENTS};
 
 fn valid_opaque_id(value: &str) -> bool {
     !value.is_empty()
@@ -44,6 +45,9 @@ pub fn parse_resource_uri(uri: &str) -> Result<Option<CairnResourceUri>, String>
         Some((identity, query)) => (identity, Some(query)),
         None => (uri, None),
     };
+    if identity.starts_with("cairn://p/") && identity.split('/').nth(4) == Some("t") {
+        return Err("thread /t/ aliases have been retired; use cairn://p/PROJECT/<name>".into());
+    }
     let Some(resource) = parse_uri(identity) else {
         return Ok(None);
     };
@@ -97,15 +101,29 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["dev", "pid"] => Some(CairnResource::DevPid),
         ["logs"] => Some(CairnResource::Logs),
         ["executors"] => Some(CairnResource::Executors),
+        ["grants"] => Some(CairnResource::Grants),
+        ["grants", id] => Some(CairnResource::Grant {
+            id: (*id).to_string(),
+        }),
         // Names are normalized on the way in so the address an agent reads out
         // of `cairn://executors` and the label an operator typed reach the same
         // machine.
         ["executors", name] => {
             cairn_executor_name(name).map(|name| CairnResource::Executor { name })
         }
+        ["executors", name, action] => {
+            cairn_executor_name(name).map(|name| CairnResource::ExecutorAction {
+                name,
+                action: (*action).to_string(),
+            })
+        }
         ["bug"] => Some(CairnResource::Bug),
         ["help"] => Some(CairnResource::Help),
         ["websearch"] => Some(CairnResource::WebSearch),
+        ["packs"] => Some(CairnResource::Packs),
+        ["packs", pack_id] => Some(CairnResource::Pack {
+            pack_id: pack_id.to_string(),
+        }),
         ["skills"] => Some(CairnResource::Skills),
         ["skills", skill_id, rest @ ..] => Some(CairnResource::Skill {
             skill_id: (*skill_id).to_string(),
@@ -208,6 +226,70 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 workflow_id: (*workflow_id).to_string(),
             })
         }
+        ["routes"] => Some(CairnResource::Routes),
+        ["routes", route_id] => Some(CairnResource::Route {
+            route_id: (*route_id).to_string(),
+        }),
+        ["routes", route_id, "history"] => Some(CairnResource::RouteHistory {
+            route_id: (*route_id).to_string(),
+        }),
+        ["routes", route_id, "history", seq] => Some(CairnResource::RouteHistoryEntry {
+            route_id: (*route_id).to_string(),
+            seq: seq.parse::<i64>().ok().filter(|x| *x > 0)?,
+        }),
+        [PROJECT_SCOPE, project, "routes"] => Some(CairnResource::ProjectRoutes {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "routes", route_id] => Some(CairnResource::ProjectRoute {
+            project: canonical_project(project),
+            route_id: (*route_id).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "routes", route_id, "history"] => {
+            Some(CairnResource::ProjectRouteHistory {
+                project: canonical_project(project),
+                route_id: (*route_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "routes", route_id, "history", seq] => {
+            Some(CairnResource::ProjectRouteHistoryEntry {
+                project: canonical_project(project),
+                route_id: (*route_id).to_string(),
+                seq: seq.parse::<i64>().ok().filter(|x| *x > 0)?,
+            })
+        }
+        ["responses"] => Some(CairnResource::Responses),
+        ["responses", response_id] => Some(CairnResource::Response {
+            response_id: (*response_id).to_string(),
+        }),
+        ["responses", response_id, "history"] => Some(CairnResource::ResponseHistory {
+            response_id: (*response_id).to_string(),
+        }),
+        ["responses", response_id, "history", seq] => Some(CairnResource::ResponseHistoryEntry {
+            response_id: (*response_id).to_string(),
+            seq: seq.parse::<i64>().ok().filter(|seq| *seq > 0)?,
+        }),
+        [PROJECT_SCOPE, project, "responses"] => Some(CairnResource::ProjectResponses {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "responses", response_id] => {
+            Some(CairnResource::ProjectResponse {
+                project: canonical_project(project),
+                response_id: (*response_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "responses", response_id, "history"] => {
+            Some(CairnResource::ProjectResponseHistory {
+                project: canonical_project(project),
+                response_id: (*response_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "responses", response_id, "history", seq] => {
+            Some(CairnResource::ProjectResponseHistoryEntry {
+                project: canonical_project(project),
+                response_id: (*response_id).to_string(),
+                seq: seq.parse::<i64>().ok().filter(|seq| *seq > 0)?,
+            })
+        }
         ["agents"] => Some(CairnResource::Agents),
         ["agents", agent_id] => Some(CairnResource::Agent {
             agent_id: (*agent_id).to_string(),
@@ -246,6 +328,9 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "issues"] => Some(CairnResource::ProjectIssues {
             project: canonical_project(project),
         }),
+        [PROJECT_SCOPE, project, "threads"] => Some(CairnResource::ProjectThreads {
+            project: canonical_project(project),
+        }),
         [PROJECT_SCOPE, project, "messages"] => Some(CairnResource::ProjectMessages {
             project: canonical_project(project),
         }),
@@ -275,13 +360,13 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             project: canonical_project(project),
             slug: DEFAULT_BROWSER_SLUG.to_string(),
         }),
-        // A thread addressed by name. Kept next to the issue arm because it
-        // names the same resource by an alias rather than by its number; the
-        // reader resolves the name to that number before anything else runs.
-        [PROJECT_SCOPE, project, "t", name] => Some(CairnResource::ThreadAlias {
-            project: canonical_project(project),
-            name: (*name).to_string(),
-        }),
+        [PROJECT_SCOPE, project, name, rest @ ..] if validate_thread_name(name).is_ok() => {
+            Some(CairnResource::Thread {
+                project: canonical_project(project),
+                name: (*name).to_string(),
+                path: rest.iter().map(|segment| (*segment).to_string()).collect(),
+            })
+        }
         [PROJECT_SCOPE, project, number] => Some(CairnResource::Issue {
             project: canonical_project(project),
             number: parse_positive_i32(number)?,
@@ -732,6 +817,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 exec_seq: parse_positive_i32(exec_seq)?,
                 node_id: (*node_id).to_string(),
                 name: Some((*name).to_string()),
+            })
+        }
+        [PROJECT_SCOPE, project, name, rest @ ..]
+            if !RESERVED_PROJECT_SEGMENTS.contains(name) && validate_thread_name(name).is_ok() =>
+        {
+            Some(CairnResource::Thread {
+                project: canonical_project(project),
+                name: (*name).to_string(),
+                path: rest.iter().map(|segment| (*segment).to_string()).collect(),
             })
         }
         _ => None,

@@ -125,6 +125,15 @@ fn should_walk_entry(entry_path: &Path, walk_root: &Path, deny_read: &[PathBuf])
 }
 
 /// Format search results as human-readable text for the agent.
+///
+/// Two sections, because search answers two different questions. Issues,
+/// comments, artifacts, and messages are documents: one row each, as before.
+/// Transcript results are HOTSPOTS — stretches of conversation, already merged
+/// by `cairn_core::search` — so they trail in their own section grouped under
+/// the issue they happened in, each row naming its node, how many matches the
+/// stretch holds, and the turn its excerpt came from. That is the shape an
+/// operator asking "where did we discuss x" is actually after, and it mirrors
+/// how the app's command palette splits the same results.
 pub(crate) fn format_search_results(
     results: &[crate::models::SearchResult],
     project_key: Option<&str>,
@@ -134,33 +143,102 @@ pub(crate) fn format_search_results(
     }
 
     let mut output = format!("Found {} result(s):\n\n", results.len());
+    let (transcripts, documents): (Vec<_>, Vec<_>) = results
+        .iter()
+        .enumerate()
+        .partition(|(_, result)| result.content_type == SearchContentType::Event);
 
-    for (i, result) in results.iter().enumerate() {
+    for (index, result) in documents {
         let type_label = match result.content_type {
             SearchContentType::Issue => "Issue",
             SearchContentType::Comment => "Comment",
             SearchContentType::Artifact => "Artifact",
-            SearchContentType::Event => "Event",
+            SearchContentType::Event => "Transcript",
             SearchContentType::Message => "Message",
         };
-
-        // Use the URI from the search result directly
-        let uri = if result.uri.is_empty() {
-            let key = project_key.unwrap_or("PROJECT");
-            match result.id.parse::<i32>() {
-                Ok(number) if number > 0 => cairn_common::uri::build_issue_uri(key, number),
-                _ => cairn_common::uri::build_project_uri(key),
-            }
-        } else {
-            result.uri.clone()
-        };
-
-        output.push_str(&format!("{}. [{}] {}\n", i + 1, type_label, result.title));
-        output.push_str(&format!("   URI: {}\n", uri));
+        output.push_str(&format!(
+            "{}. [{}] {}\n",
+            index + 1,
+            type_label,
+            result.title
+        ));
+        output.push_str(&format!("   URI: {}\n", result_uri(result, project_key)));
         output.push_str(&format!("   {}\n\n", result.snippet));
     }
 
+    if !transcripts.is_empty() {
+        output.push_str("Transcripts:\n\n");
+        for (header, rows) in group_by_issue(&transcripts, project_key) {
+            output.push_str(&format!("{header}\n"));
+            for (index, result) in rows {
+                output.push_str(&format!(
+                    "  {}. {}{}\n",
+                    index + 1,
+                    result.title,
+                    span_summary(result)
+                ));
+                output.push_str(&format!("     URI: {}\n", result_uri(result, project_key)));
+                output.push_str(&format!("     {}\n\n", result.snippet));
+            }
+        }
+    }
+
     output
+}
+
+/// The result's own URI, or a best-effort project/issue coordinate when a hit
+/// carried none.
+fn result_uri(result: &crate::models::SearchResult, project_key: Option<&str>) -> String {
+    if !result.uri.is_empty() {
+        return result.uri.clone();
+    }
+    let key = project_key.unwrap_or("PROJECT");
+    match result.id.parse::<i32>() {
+        Ok(number) if number > 0 => cairn_common::uri::build_issue_uri(key, number),
+        _ => cairn_common::uri::build_project_uri(key),
+    }
+}
+
+/// Bucket transcript rows under an issue heading, preserving rank order for both
+/// the headings and the rows inside them.
+#[allow(clippy::type_complexity)]
+fn group_by_issue<'a>(
+    rows: &[(usize, &'a crate::models::SearchResult)],
+    project_key: Option<&str>,
+) -> Vec<(String, Vec<(usize, &'a crate::models::SearchResult)>)> {
+    let mut groups: Vec<(String, Vec<(usize, &crate::models::SearchResult)>)> = Vec::new();
+    for (index, result) in rows {
+        let header = match (project_key, result.issue_number) {
+            (Some(key), Some(number)) => match result.issue_title.as_deref() {
+                Some(title) => format!("{key}-{number} {title}"),
+                None => format!("{key}-{number}"),
+            },
+            _ => "Project transcripts".to_string(),
+        };
+        match groups.iter_mut().find(|(existing, _)| existing == &header) {
+            Some((_, bucket)) => bucket.push((*index, result)),
+            None => groups.push((header, vec![(*index, result)])),
+        }
+    }
+    groups
+}
+
+/// A hotspot's density and reach: how many matches fell inside the stretch and
+/// which turns it covers. Empty when there is neither — "1 match" tells a reader
+/// nothing they cannot see.
+fn span_summary(result: &crate::models::SearchResult) -> String {
+    let turns = match (result.turn_start, result.turn_end) {
+        (Some(start), Some(end)) if start != end => Some(format!("turns {start}\u{2013}{end}")),
+        (Some(start), Some(_)) => Some(format!("turn {start}")),
+        _ => None,
+    };
+    let matches = (result.hit_count > 1).then(|| format!("{} matches", result.hit_count));
+    match (matches, turns) {
+        (Some(matches), Some(turns)) => format!(" \u{2014} {matches} in {turns}"),
+        (Some(matches), None) => format!(" \u{2014} {matches}"),
+        (None, Some(turns)) => format!(" \u{2014} {turns}"),
+        (None, None) => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,6 +1314,98 @@ fn grep_search_with_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn result(
+        content_type: SearchContentType,
+        title: &str,
+        uri: &str,
+        issue: Option<(i32, &str)>,
+        hit_count: usize,
+        turns: Option<(i32, i32)>,
+    ) -> crate::models::SearchResult {
+        crate::models::SearchResult {
+            id: title.to_string(),
+            content_type,
+            project_id: "project-1".to_string(),
+            issue_id: issue.map(|_| "issue-1".to_string()),
+            job_id: None,
+            title: title.to_string(),
+            snippet: "a <mark>needle</mark> in context".to_string(),
+            rank: 1.0,
+            created_at: 1,
+            uri: uri.to_string(),
+            issue_number: issue.map(|(number, _)| number),
+            issue_title: issue.map(|(_, title)| title.to_string()),
+            node_segment: None,
+            task_segment: None,
+            exec_seq: None,
+            hit_count,
+            turn_start: turns.map(|(start, _)| start),
+            turn_end: turns.map(|(_, end)| end),
+        }
+    }
+
+    #[test]
+    fn transcript_hotspots_render_grouped_under_their_issue() {
+        let results = vec![
+            result(
+                SearchContentType::Issue,
+                "Direct issue hit",
+                "cairn://p/PROJ/7",
+                None,
+                1,
+                None,
+            ),
+            result(
+                SearchContentType::Event,
+                "builder",
+                "cairn://p/PROJ/12/1/builder/chat/turn/5",
+                Some((12, "Hotspot issue")),
+                4,
+                Some((4, 6)),
+            ),
+            result(
+                SearchContentType::Event,
+                "review",
+                "cairn://p/PROJ/12/1/builder/task/review/chat/turn/2",
+                Some((12, "Hotspot issue")),
+                1,
+                Some((2, 2)),
+            ),
+        ];
+
+        let output = format_search_results(&results, Some("PROJ"));
+
+        assert!(output.starts_with("Found 3 result(s):"));
+        // Documents keep their flat row; transcripts trail in their own section.
+        assert!(output.contains("1. [Issue] Direct issue hit"));
+        let transcripts = output
+            .split_once("Transcripts:")
+            .expect("transcript section")
+            .1;
+        // One heading for the issue, both of its stretches beneath it.
+        assert_eq!(transcripts.matches("PROJ-12 Hotspot issue").count(), 1);
+        assert!(transcripts.contains("2. builder \u{2014} 4 matches in turns 4\u{2013}6"));
+        assert!(transcripts.contains("3. review \u{2014} turn 2"));
+        assert!(transcripts.contains("cairn://p/PROJ/12/1/builder/task/review/chat/turn/2"));
+    }
+
+    #[test]
+    fn a_single_untracked_transcript_hit_claims_no_span() {
+        let results = vec![result(
+            SearchContentType::Event,
+            "general",
+            "cairn://p/PROJ/general/chat",
+            None,
+            1,
+            None,
+        )];
+
+        let output = format_search_results(&results, Some("PROJ"));
+        assert!(output.contains("Project transcripts"));
+        assert!(output.contains("1. general\n"), "got: {output}");
+        assert!(!output.contains("1 matches"));
+    }
 
     #[test]
     fn native_grep_deadline_is_failure_not_partial_success() {

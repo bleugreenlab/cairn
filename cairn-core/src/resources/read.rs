@@ -6,7 +6,6 @@
 use super::check_results::read_project_check_results;
 use super::common::{
     affordance_for_kind, find_query_value, reject_query_params, resolve_home_relative_resource_uri,
-    resolve_thread_alias_resource_uri,
 };
 use super::diff::read_node_diff;
 use super::files::{read_issue_changed, read_issue_changed_projection};
@@ -77,6 +76,43 @@ pub(crate) struct RenderedResource {
     /// Image blocks (e.g. a browser screenshot) lifted into the read envelope
     /// alongside the text body. Empty for ordinary text resources.
     pub images: Vec<ImageBlock>,
+}
+
+fn desktop_health_ready(health: &serde_json::Value) -> bool {
+    health
+        .pointer("/daemon/ready")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| health.get("ready").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn desktop_health_reason(health: &serde_json::Value) -> Option<&str> {
+    health
+        .pointer("/daemon/reason")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| health.get("reason").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            health
+                .pointer("/session/reason")
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn desktop_reason_sentence(reason: &str) -> String {
+    match reason {
+        "no-graphical-session" => {
+            "No graphical session: the machine is at the login greeter.".into()
+        }
+        "no-interactive-session" => "No interactive session: no user is signed in.".into(),
+        "daemon-not-running" => "The desktop daemon is not running.".into(),
+        "permission-denied" | "accessibility-permission-denied" => {
+            "Desktop control permission has not been granted.".into()
+        }
+        other => format!(
+            "Desktop automation is degraded: {}.",
+            other.replace('-', " ")
+        ),
+    }
 }
 
 fn apply_line_char_offset(content: &str, line_offset: usize, char_offset: usize) -> String {
@@ -994,14 +1030,19 @@ pub(crate) async fn produce_cairn_resource(
             Err(error) => return RenderedResource::line(error, None, None, None),
         };
 
-    // A `/t/NAME` thread alias becomes its numbered issue URI here, before
-    // anything else parses or renders it: past this point a named read is
-    // indistinguishable from the numbered read it stands for. A name that names
-    // no thread, or more than one, refuses rather than resolving.
-    let identity = match resolve_thread_alias_resource_uri(&orch.db, &identity).await {
-        Ok(identity) => identity,
-        Err(error) => return RenderedResource::line(error, None, None, None),
+    let routed_for_alias = match identity
+        .strip_prefix("cairn://p/")
+        .and_then(|rest| rest.split('/').next())
+    {
+        Some(project) => orch.db.for_project(project).await,
+        None => orch.db.local.clone(),
     };
+    let (identity, migrated_annotation) =
+        match super::threads::resolve_migrated_thread_uri(&routed_for_alias, &identity).await {
+            Ok(Some((resolved, canonical))) => (resolved, Some(canonical)),
+            Ok(None) => (identity, None),
+            Err(error) => return RenderedResource::line(error, None, None, None),
+        };
 
     let resource = match parse_uri(&identity) {
         Some(r) => r,
@@ -1013,6 +1054,18 @@ pub(crate) async fn produce_cairn_resource(
                 None,
             )
         }
+    };
+
+    // A thread descendant IS a node-family resource. Normalizing here — before
+    // the affordance block is computed and before dispatch — is what makes every
+    // node renderer, contract entry, and affordance block apply to a thread
+    // unchanged, instead of the thread read path reimplementing each one and
+    // drifting from the write path's copy. This is the same call the write
+    // dispatcher makes, so the two can no longer disagree about what a thread
+    // sub-path means.
+    let resource = match super::delegate_thread_descendant(resource) {
+        Ok(resource) => resource,
+        Err(refusal) => return RenderedResource::line(refusal, None, None, None),
     };
 
     // `?wait` on a call/task-artifact URI: block until the delegated run behind
@@ -1352,6 +1405,11 @@ pub(crate) async fn produce_cairn_resource(
         strip_params(&split.params, &["offset", "limit"])
     };
     let mut content = render_resource_body(orch, request, &resource, body_params).await;
+    if let Some(canonical) = migrated_annotation {
+        content = format!("> This numeric address is retained for migrated history; this thread is now at {canonical}.
+
+{content}");
+    }
     if is_structured_raw_transcript {
         if let Some(char_offset) = view_char_offset {
             let line_offset = view_offset.unwrap_or(0).max(0) as usize;
@@ -1397,6 +1455,24 @@ async fn render_resource_body(
         // The fleet is machine-scoped, so both arms read the runner's cached
         // projection rather than any project's database. `captured_at` is taken
         // once so every age on the rendering is derived from one instant.
+        // Grants are workspace-scoped authorization state. They read from the
+        // private database: a team run's grants live in its own replica, but
+        // the workspace-level listing is the operator's own view of the
+        // authority they have handed out from this install.
+        CairnResource::Grants => match find_query_value(&params, "view") {
+            Some("decisions") => crate::resources::grants::read_decisions(&orch.db.local).await,
+            Some("leases") => crate::resources::grants::read_leases(),
+            None | Some("grants") => crate::resources::grants::read_grants(&orch.db.local).await,
+            Some(other) => {
+                format!(
+                    "Unknown view '{other}' for cairn://grants; expected grants, decisions, or \
+                     leases"
+                )
+            }
+        },
+        CairnResource::Grant { id } => {
+            crate::resources::grants::read_grant(&orch.db.local, &id).await
+        }
         CairnResource::Executors => match reject_query_params("executors", &params) {
             Some(error) => error,
             None => {
@@ -1414,31 +1490,68 @@ async fn render_resource_body(
                 )
             }
         },
-        CairnResource::Executor { name } => match reject_query_params("executor", &params) {
-            Some(error) => error,
-            None => {
+        CairnResource::Executor { name } => {
+            let unsupported = params
+                .iter()
+                .find(|param| !matches!(param.key.as_str(), "view" | "request"));
+            if let Some(param) = unsupported {
+                format!(
+                    "Unsupported query parameter for executor resources: {}",
+                    param.key
+                )
+            } else {
+                let view = find_query_value(&params, "view");
+                let request_id = find_query_value(&params, "request");
+                let projection_error = match (view, request_id) {
+                    (None, None) | (Some("placements"), None) | (Some("placement"), Some(_)) => {
+                        None
+                    }
+                    (None, Some(_)) => {
+                        Some("Executor request=<request-id> requires view=placement.")
+                    }
+                    (Some("placements"), Some(_)) => Some(
+                        "Executor view=placements does not accept request; use view=placement.",
+                    ),
+                    (Some("placement"), None) => {
+                        Some("Executor view=placement requires request=<request-id>.")
+                    }
+                    (Some(_), _) => {
+                        Some("Unsupported executor view. Expected placements or placement.")
+                    }
+                };
+                if let Some(error) = projection_error {
+                    return error.to_string();
+                }
                 let captured_at = crate::fleet::unix_time_ms();
                 let executors = orch.fleet.inspect_executors(captured_at);
                 let enrolled = orch.fleet.unattached_enrolled_remotes();
                 match executors.iter().find(|executor| executor.name == name) {
-                    Some(executor) => crate::resources::executors::render_executor(executor),
+                    Some(executor) => match (view, request_id) {
+                        (None, _) => {
+                            let mut rendered = crate::resources::executors::render_executor(executor);
+                            rendered.push_str(&render_desktop_automation(orch, &name).await);
+                            rendered
+                        }
+                        (Some("placements"), _) => crate::resources::executors::render_placements(executor),
+                        (Some("placement"), Some(request_id)) => {
+                            crate::resources::executors::render_placement(executor, request_id)
+                        }
+                        _ => unreachable!("executor projection was validated above"),
+                    },
                     // A name that addresses an enrolled machine addresses
                     // something real; answering "no such executor" for a machine
                     // whose link is down is the silent absence this resource
                     // exists to end.
                     None => match enrolled.iter().find(|remote| remote.name == name) {
-                        Some(remote) => {
-                            crate::resources::executors::render_enrolled_remote(remote, captured_at)
-                        }
+                        Some(_) if view.is_some() => format!("Placement history is unavailable for executor `{name}` because it is enrolled but not attached. Read cairn://executors/{name} for its link status."),
+                        Some(remote) => crate::resources::executors::render_enrolled_remote(remote, captured_at),
                         // An enrollment in flight has reserved this name and is
                         // minutes from holding a machine. Answering "unknown"
                         // for that window would make a working enrollment look
                         // like a typo.
                         None => match orch.fleet.management().operations().latest_for(&name) {
-                            Some(operation) => crate::resources::executors::render_enrollment(
-                                &operation,
-                                captured_at,
-                            ),
+                            Some(_) if view.is_some() => format!("Placement history is unavailable for executor `{name}` because its enrollment is still in progress. Read cairn://executors/{name} for enrollment status."),
+                            Some(operation) => crate::resources::executors::render_enrollment(&operation, captured_at),
                             None => crate::resources::executors::unknown_executor(
                                 &name, &executors, &enrolled,
                             ),
@@ -1446,7 +1559,14 @@ async fn render_resource_body(
                     },
                 }
             }
-        },
+        }
+        CairnResource::ExecutorAction { name, action } => {
+            if let Some(error) = reject_query_params("executor action", &params) {
+                error
+            } else {
+                render_executor_action_contract(orch, &name, &action).await
+            }
+        }
         CairnResource::Project { project } => {
             if find_query_value(&params, "search").is_some() {
                 read_project_search(orch, &project, &params).await
@@ -1459,6 +1579,18 @@ async fn render_resource_body(
         CairnResource::ProjectIssues { project } => {
             read_project_issues(db, &project, &params).await
         }
+        CairnResource::ProjectThreads { project } => {
+            if let Some(error) = reject_query_params("project threads", &params) {
+                error
+            } else {
+                super::threads::read_project_threads(db, &project).await
+            }
+        }
+        CairnResource::Thread {
+            project,
+            name,
+            path,
+        } => super::threads::read_thread(db, &project, &name, &path).await,
         CairnResource::ProjectCheckResults { project, revision } => {
             read_project_check_results(orch, request, &project, &revision, &params).await
         }
@@ -1481,12 +1613,6 @@ async fn render_resource_body(
             } else {
                 crate::resources::project::read_project_images(db, &project, issue).await
             }
-        }
-        // The single entry point into this renderer resolves a thread alias to
-        // its numbered issue URI before parsing, so by here the alias is always
-        // an `Issue`. Nothing addressable reaches this arm.
-        CairnResource::ThreadAlias { .. } => {
-            unreachable!("thread aliases are resolved to their issue URI before rendering")
         }
         CairnResource::Issue { project, number } => {
             if let Some(error) = reject_query_params("issue", &params) {
@@ -1979,6 +2105,22 @@ async fn render_resource_body(
                 .await
             }
         }
+        CairnResource::Packs => {
+            let state = find_query_value(&params, "state").map(str::to_string);
+            match state.as_deref() {
+                Some(value) if value != "installed" && value != "available" => {
+                    format!("Unsupported ?state={value} (installed | available)")
+                }
+                _ => super::packs::read_packs(&orch.config_dir, state.as_deref()),
+            }
+        }
+        CairnResource::Pack { pack_id } => {
+            if let Some(error) = reject_query_params("pack", &params) {
+                error
+            } else {
+                super::packs::read_pack(&orch.config_dir, &pack_id)
+            }
+        }
         CairnResource::Labels => {
             if let Some(error) = reject_query_params("labels", &params) {
                 error
@@ -2098,6 +2240,56 @@ async fn render_resource_body(
                 read_workflow(orch, request, &workflow_id, Some(&project)).await
             }
         }
+        CairnResource::Routes => super::routes::collection(orch, request, None, &params).await,
+        CairnResource::Route { route_id } => {
+            super::routes::member(orch, request, &route_id, None).await
+        }
+        CairnResource::RouteHistory { route_id } => {
+            super::routes::history(orch, &route_id, None).await
+        }
+        CairnResource::RouteHistoryEntry { route_id, seq } => {
+            super::routes::entry(orch, &route_id, seq, None).await
+        }
+        CairnResource::ProjectRoutes { project } => {
+            super::routes::collection(orch, request, Some(&project), &params).await
+        }
+        CairnResource::ProjectRoute { project, route_id } => {
+            super::routes::member(orch, request, &route_id, Some(&project)).await
+        }
+        CairnResource::ProjectRouteHistory { project, route_id } => {
+            super::routes::history(orch, &route_id, Some(&project)).await
+        }
+        CairnResource::ProjectRouteHistoryEntry {
+            project,
+            route_id,
+            seq,
+        } => super::routes::entry(orch, &route_id, seq, Some(&project)).await,
+        CairnResource::Responses => super::responses::collection(orch, request, None).await,
+        CairnResource::Response { response_id } => {
+            super::responses::member(orch, request, &response_id, None).await
+        }
+        CairnResource::ResponseHistory { response_id } => {
+            super::responses::history(orch, &response_id, None).await
+        }
+        CairnResource::ResponseHistoryEntry { response_id, seq } => {
+            super::responses::entry(orch, &response_id, seq, None).await
+        }
+        CairnResource::ProjectResponses { project } => {
+            super::responses::collection(orch, request, Some(&project)).await
+        }
+        CairnResource::ProjectResponse {
+            project,
+            response_id,
+        } => super::responses::member(orch, request, &response_id, Some(&project)).await,
+        CairnResource::ProjectResponseHistory {
+            project,
+            response_id,
+        } => super::responses::history(orch, &response_id, Some(&project)).await,
+        CairnResource::ProjectResponseHistoryEntry {
+            project,
+            response_id,
+            seq,
+        } => super::responses::entry(orch, &response_id, seq, Some(&project)).await,
         CairnResource::Agents => {
             if let Some(error) = reject_query_params("agents", &params) {
                 error
@@ -2304,11 +2496,95 @@ fn render_help(params: &[QueryParam]) -> String {
     }
 }
 
+async fn render_desktop_automation(orch: &Orchestrator, name: &str) -> String {
+    let config = crate::config::settings::load_fleet(&orch.config_dir);
+    let os = orch
+        .fleet
+        .inspect_executors(crate::fleet::unix_time_ms())
+        .into_iter()
+        .find(|executor| executor.name == name)
+        .map(|executor| executor.health.advertisement.capabilities.os)
+        .unwrap_or_default();
+    if !config.desktop_automation.resolve(name, &os).enabled {
+        return "\n## Desktop automation\n- Status: off\n- Desktop automation is disabled for this machine.\n".into();
+    }
+    let Ok(state) = cairn_db::storage::get_executor_desktop_automation(&orch.db.local, name).await
+    else {
+        return "\n## Desktop automation\n- Status: degraded\n- The cached desktop probe could not be read.\n".into();
+    };
+    let Some(state) = state else {
+        return "\n## Desktop automation\n- Status: absent\n- This machine has never been probed for desktop automation.\n".into();
+    };
+    if let Some(error) = state.probe_error {
+        return format!("\n## Desktop automation\n- Status: degraded\n- Probe failed: {error}\n- Probed at: {}\n", state.probed_at);
+    }
+    if let Some(health_json) = state.health_json.as_deref() {
+        match serde_json::from_str::<serde_json::Value>(health_json) {
+            Ok(health) if !desktop_health_ready(&health) => {
+                let reason = desktop_health_reason(&health)
+                    .map(desktop_reason_sentence)
+                    .unwrap_or_else(|| "the desktop daemon is not ready".into());
+                return format!("\n## Desktop automation\n- Status: degraded\n- {reason}\n- Probed at: {}\n", state.probed_at);
+            }
+            Err(_) => return format!("\n## Desktop automation\n- Status: degraded\n- The cached desktop health document is invalid.\n- Probed at: {}\n", state.probed_at),
+            _ => {}
+        }
+    }
+    let tools = serde_json::from_str::<Vec<crate::mcp::gateway::McpToolDef>>(&state.verbs_json)
+        .unwrap_or_default();
+    if tools.is_empty() {
+        return format!("\n## Desktop automation\n- Status: absent\n- The machine was probed and advertised no desktop verbs.\n- Probed at: {}\n", state.probed_at);
+    }
+    let mut out = format!(
+        "\n## Desktop automation\n- Status: available\n- Probed at: {}\n- Verbs:\n",
+        state.probed_at
+    );
+    for tool in tools {
+        out.push_str(&format!("  - cairn://executors/{name}/{}\n", tool.name));
+    }
+    out
+}
+
+async fn render_executor_action_contract(orch: &Orchestrator, name: &str, action: &str) -> String {
+    let Ok(Some(state)) =
+        cairn_db::storage::get_executor_desktop_automation(&orch.db.local, name).await
+    else {
+        return format!("Executor action `{action}` on `{name}` has no cached contract yet. Read cairn://executors/{name} for the machine's advertised actions.");
+    };
+    let tools = serde_json::from_str::<Vec<crate::mcp::gateway::McpToolDef>>(&state.verbs_json)
+        .unwrap_or_default();
+    let Some(tool) = tools.into_iter().find(|tool| tool.name == action) else {
+        return format!("`{name}` does not advertise `{action}`. Read cairn://executors/{name} for its cached desktop verbs.");
+    };
+    let description = tool
+        .description
+        .unwrap_or_else(|| "No description provided.".into());
+    let schema = serde_json::to_string_pretty(&tool.input_schema).unwrap_or_else(|_| "{}".into());
+    format!("# cairn://executors/{name}/{action}\n\n{description}\n\n## Input schema\n\n```json\n{schema}\n```\n\nRun with `{{target:\"cairn://executors/{name}/{action}\", payload:{{args_json:{{...}}}}}}`.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cairn_common::query::parse_query_params;
     use std::sync::Arc;
+
+    /// A degraded machine has to say which kind of nothing it is reporting, and
+    /// it has to say it in words rather than in the daemon's reason code.
+    #[test]
+    fn desktop_health_parsing_and_reason_rendering_are_human_readable() {
+        let ready = serde_json::json!({"daemon": {"ready": true}});
+        assert!(desktop_health_ready(&ready));
+        let degraded = serde_json::json!({"daemon": {"ready": false}, "session": {"reason": "no-graphical-session"}});
+        assert!(!desktop_health_ready(&degraded));
+        assert_eq!(
+            desktop_health_reason(&degraded),
+            Some("no-graphical-session")
+        );
+        let sentence = desktop_reason_sentence("no-graphical-session");
+        assert!(sentence.contains("login greeter"));
+        assert!(!sentence.contains("no-graphical-session"));
+    }
 
     fn db_params(query: &str) -> Vec<QueryParam> {
         parse_query_params(query).unwrap()
@@ -2324,108 +2600,6 @@ mod tests {
         assert_eq!(
             apply_line_char_offset(body, 1, 11),
             "{\"payload\":{\"content\":\"abcdef\"}}\n{\"content\":\"next\"}}"
-        );
-    }
-
-    /// An orchestrator over a migrated database holding one project, one thread
-    /// (`Design Review`, issue 12), and one ordinary issue that happens to carry
-    /// the same title.
-    async fn thread_alias_orch() -> (Orchestrator, tempfile::TempDir) {
-        use crate::db::DbState;
-        use crate::orchestrator::OrchestratorBuilder;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
-
-        let db_dir = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(db_dir.path().join("threads.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
-        local
-            .write(|conn| {
-                Box::pin(async move {
-                    conn.execute_batch(
-                        "
-                        INSERT INTO workspaces (id, name, created_at, updated_at)
-                        VALUES ('w-1', 'Workspace', 1, 1);
-                        INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                        VALUES ('p-1', 'w-1', 'Threads', 'THREADS', '/tmp/threads', 1, 1);
-                        INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at, kind)
-                        VALUES ('t-1', 'p-1', 12, 'Design Review', 'the thread body', 'backlog', 'backlog', 'none', 0, 1, 1, 'thread');
-                        INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at, kind)
-                        VALUES ('i-1', 'p-1', 13, 'Design Review', 'an ordinary issue', 'backlog', 'backlog', 'none', 0, 1, 1, 'issue');
-                        ",
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-
-        let search =
-            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
-        let db = Arc::new(DbState::new(Arc::new(local), search));
-        let worktree = tempfile::tempdir().unwrap();
-        let orch = OrchestratorBuilder::new(
-            db,
-            Arc::new(TestServicesBuilder::new().build()),
-            worktree.path().to_path_buf(),
-        )
-        .build();
-        (orch, db_dir)
-    }
-
-    async fn read_body(orch: &Orchestrator, uri: &str) -> String {
-        let request = McpCallbackRequest {
-            thread_id: None,
-            cwd: String::new(),
-            run_id: None,
-            tool: "read".to_string(),
-            payload: serde_json::json!({}),
-            tool_use_id: None,
-        };
-        produce_cairn_resource(orch, &request, uri).await.content
-    }
-
-    /// Reading a thread by name is reading the thread: byte-for-byte what the
-    /// numbered URI returns, with the numbered URI still the one the body names.
-    #[tokio::test]
-    async fn thread_alias_read_returns_the_numbered_issue_resource() {
-        let (orch, _dir) = thread_alias_orch().await;
-        let by_name = read_body(&orch, "cairn://p/THREADS/t/design-review").await;
-        let by_number = read_body(&orch, "cairn://p/THREADS/12").await;
-
-        assert_eq!(by_name, by_number);
-        assert!(by_name.contains("THREADS-12"), "{by_name}");
-        // The title as typed is normalized the same way the stored titles are,
-        // so a caller need not know the slug rule to use the name.
-        assert_eq!(
-            read_body(&orch, "cairn://p/THREADS/t/Design Review").await,
-            by_number
-        );
-        // The alias is accepted on input and never emitted: nothing the read
-        // renders addresses the thread by its name.
-        assert!(!by_name.contains("/t/design-review"), "{by_name}");
-    }
-
-    /// A name no thread answers to comes back as the read's body — naming the
-    /// project and the attempt, and pointing at the collection that lists the
-    /// threads — rather than as a bare unknown-URI error.
-    #[tokio::test]
-    async fn thread_alias_read_refuses_an_unknown_name() {
-        let (orch, _dir) = thread_alias_orch().await;
-        let body = read_body(&orch, "cairn://p/THREADS/t/standup").await;
-        assert!(
-            body.contains("No thread in THREADS is named 'standup'"),
-            "{body}"
-        );
-        assert!(
-            body.contains("cairn://p/THREADS/issues?kind=thread"),
-            "{body}"
         );
     }
 
@@ -3042,6 +3216,104 @@ line2', X'0001020AFF', 2.5),
         assert_eq!(matches, 1);
         assert!(rendered.contains("boom"));
         assert!(!rendered.contains("all good"));
+    }
+
+    /// End-to-end: reading a thread descendant through the real read router
+    /// returns the NODE family's content and, crucially, the node family's
+    /// affordance block — the thing acceptance criterion (d) asks for.
+    ///
+    /// The affordance is computed from the delegated kind for free because
+    /// normalization happens before the block is built. Before that, every thread
+    /// sub-resource got the generic thread block, which advertised only
+    /// patch/append/delete and said nothing about what the descendant accepts.
+    #[tokio::test]
+    async fn thread_descendants_read_with_their_node_familys_affordances() {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalDb::open(dir.path().join("thread-read.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        local
+            .execute_script(
+                "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+                 INSERT INTO threads (id, project_id, name, created_at, updated_at)
+                 VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);",
+            )
+            .await
+            .unwrap();
+        let job_id = crate::threads::ensure_thread_session(&local, "t-ux")
+            .await
+            .unwrap();
+        local
+            .execute(
+                r#"INSERT INTO artifacts (id, job_id, artifact_type, output_name, data, created_at, updated_at) VALUES ('a-arc', ?1, 'document', 'arc', '{"content":"The canonical arc"}', 3, 3)"#,
+                (job_id.as_str(),),
+            )
+            .await
+            .unwrap();
+        local
+            .execute(
+                "INSERT INTO jobs (id, parent_job_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('j-probe', ?1, 'p-thr', 'complete', 'probe', 'probe', 4, 5)",
+                (job_id.as_str(),),
+            )
+            .await
+            .unwrap();
+
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        };
+
+        // (b) the tasks collection reads as a collection, not as "no artifact
+        // 'tasks' found", and lists the spawned task.
+        let tasks = produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/tasks").await;
+        assert!(!tasks.content.contains("No artifact"), "{}", tasks.content);
+        assert!(tasks.content.contains("probe"), "{}", tasks.content);
+
+        // (c) the spawned task reads at a stable URI, with no 0/0 anywhere.
+        let task =
+            produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/task/probe").await;
+        assert!(task.content.contains("probe"), "{}", task.content);
+        for rendered in [&tasks, &task] {
+            assert!(!rendered.content.contains("/0/0/"), "{}", rendered.content);
+        }
+
+        // (d) the affordance block is the delegated kind's, so it advertises the
+        // mutations that descendant actually accepts.
+        let arc = produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/arc").await;
+        assert_eq!(arc.content.trim(), "The canonical arc");
+        let block = arc.affordance.map(|a| a.block).unwrap_or_default();
+        assert!(
+            block.contains("artifact") || block.contains("Artifact"),
+            "a thread's arc must carry the artifact affordance, got: {block}"
+        );
+
+        // A branch-shaped segment is refused with its reason rather than read as
+        // an artifact of that name.
+        let diff = produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/diff").await;
+        assert!(diff.content.contains("no branch"), "{}", diff.content);
     }
 
     /// End-to-end regression for the read router's param threading: a browser

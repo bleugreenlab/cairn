@@ -16,6 +16,19 @@ pub enum PatchEnvelopeFileChange {
     Delete { path: String },
 }
 
+impl PatchEnvelopeFileChange {
+    /// The file this section touches. An envelope carries its own paths, so a
+    /// caller inspecting what a batch would reach has to look inside it rather
+    /// than at the change item's target.
+    pub(crate) fn path(&self) -> &str {
+        match self {
+            PatchEnvelopeFileChange::Add { path, .. }
+            | PatchEnvelopeFileChange::Update { path, .. }
+            | PatchEnvelopeFileChange::Delete { path } => path,
+        }
+    }
+}
+
 /// Apply a unified diff to file content.
 /// The diff must be for a single file. Multi-file diffs are rejected.
 /// Returns the patched content on success.

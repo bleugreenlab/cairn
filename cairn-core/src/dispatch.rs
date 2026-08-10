@@ -1,4 +1,13 @@
 //! Shared tool dispatch for first-party MCP callback hosts.
+//!
+//! Two of the four typed secret crossings live here (CAIRN-3822). Inbound,
+//! [`crate::security::CheckedInvocation`] stands between a parsed request and
+//! every handler, so a model-originated call carrying a registered credential is
+//! refused before it can produce a side effect. Outbound, every result leaves as
+//! an [`crate::security::ObservedSafe`], so no return branch — success, handler
+//! error, refusal, duplicate stub, reminder — can skip sanitization.
+
+use crate::security::{CheckedInvocation, Crossing, ModelInvocation, ObservedSafe, Sanitize};
 
 /// A dispatched tool call's result: the handler's `content` plus any
 /// system-reminder bodies the augmentation layer collected for this run.
@@ -12,6 +21,29 @@
 pub struct DispatchOutput {
     pub content: String,
     pub reminders: Vec<String>,
+}
+
+impl Sanitize for DispatchOutput {
+    fn sanitize_observed(&mut self, sanitizer: &mut crate::security::Sanitizer<'_>) {
+        sanitizer.text_in_place(&mut self.content);
+        for reminder in &mut self.reminders {
+            sanitizer.text_in_place(reminder);
+        }
+    }
+}
+
+impl ModelInvocation for crate::mcp::types::McpCallbackRequest {
+    fn tool_name(&self) -> &str {
+        &self.tool
+    }
+
+    fn tool_input(&self) -> &serde_json::Value {
+        &self.payload
+    }
+
+    fn run_identity(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
 }
 
 pub(crate) fn is_standalone_cli(request: &crate::mcp::types::McpCallbackRequest) -> bool {
@@ -40,7 +72,7 @@ pub async fn dispatch_tool(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
     read_cursors: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
-) -> DispatchOutput {
+) -> ObservedSafe<DispatchOutput> {
     // Pooled Codex call (CAIRN-2549): one app-server hosts N call threads sharing
     // ONE `cairn-cmd` MCP subprocess, so the process-global `CAIRN_RUN_ID`
     // cannot attribute a tool call to the right run. Codex injects the
@@ -56,14 +88,43 @@ pub async fn dispatch_tool(
     // Codex call is judged on the run it actually belongs to, and BEFORE any
     // handler runs so a refusal costs no side effects.
     if let Some(refusal) = refuse_disowned_run(orch, request).await {
-        return refusal;
+        return ObservedSafe::observe(refusal, Crossing::FinalResponse);
     }
 
-    let content = dispatch_with_dedup(orch, request, read_cursors).await;
+    // Inbound crossing (CAIRN-3822). Placed after ownership fencing, which costs
+    // no side effects either, and before everything that does: dedup bookkeeping,
+    // continuation restoration, and every handler. Every authenticated dispatch
+    // entry reaches handlers through this one function, and the functions below
+    // it take only `CheckedInvocation`, so there is no second door.
+    let checked = match CheckedInvocation::from_model(request) {
+        Ok(checked) => checked,
+        Err(rejected) => {
+            return ObservedSafe::observe(
+                DispatchOutput {
+                    content: rejected.refusal(),
+                    reminders: Vec::new(),
+                },
+                Crossing::FinalResponse,
+            )
+        }
+    };
+
+    let content = dispatch_with_dedup(orch, &checked, read_cursors).await;
     let mut reminders = Vec::new();
     augment_with_queued_dms(orch, request, &mut reminders).await;
     augment_with_poll_nudge(orch, request, &mut reminders).await;
-    DispatchOutput { content, reminders }
+
+    // Final-response crossing. One construction point for every branch above, so
+    // a new return path cannot forget it: the signature will not allow a bare
+    // `DispatchOutput` out of this function.
+    let output = ObservedSafe::observe(
+        DispatchOutput { content, reminders },
+        Crossing::FinalResponse,
+    );
+    for report in output.reports(request.run_id.as_deref(), Some(&request.tool)) {
+        report.log();
+    }
+    output
 }
 
 /// Override a pooled Codex call's `run_id` from its `thread_id` (CAIRN-2549).
@@ -279,10 +340,11 @@ async fn load_run_ownership(db: &crate::storage::LocalDb, run_id: &str) -> Optio
 /// the correctness win outweighs the cost.
 async fn dispatch_with_dedup(
     orch: &crate::orchestrator::Orchestrator,
-    request: &crate::mcp::types::McpCallbackRequest,
+    checked: &CheckedInvocation<'_, crate::mcp::types::McpCallbackRequest>,
     read_cursors: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
 ) -> String {
-    let result = execute_tool(orch, request, read_cursors).await;
+    let request = checked.request();
+    let result = execute_tool(orch, checked, read_cursors).await;
 
     // The duplicate stub is guidance for an agent that already holds the prior
     // body in context. Standalone CLI stdout may be consumed by a polling program,
@@ -326,11 +388,16 @@ async fn dispatch_with_dedup(
 }
 
 /// Dispatch a tool call to the appropriate cairn-core handler.
+///
+/// Takes a [`CheckedInvocation`] rather than a request: this is the function that
+/// hands input to handlers, and the parameter type is what makes "was this input
+/// checked?" a compile-time question.
 async fn execute_tool(
     orch: &crate::orchestrator::Orchestrator,
-    request: &crate::mcp::types::McpCallbackRequest,
+    checked: &CheckedInvocation<'_, crate::mcp::types::McpCallbackRequest>,
     read_cursors: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
 ) -> String {
+    let request = checked.request();
     match request.tool.as_str() {
         // File and resource mutation tool
         "write" => crate::mcp::handlers::write::handle_write(orch, request).await,

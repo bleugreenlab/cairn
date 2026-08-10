@@ -16,21 +16,26 @@ mod browsers;
 mod bug;
 mod executions;
 mod executors;
+mod grants;
 mod issues;
 mod labels;
 mod mcp;
 mod memories;
 mod messages;
 mod nodes;
+mod packs;
 mod progress;
 mod projects;
 mod prompts;
 mod rebase;
 mod recipes;
 mod repls;
+mod responses;
+mod routes;
 mod settings;
 mod skills;
 mod terminals;
+mod threads;
 mod todos;
 mod wakes;
 
@@ -38,6 +43,8 @@ mod wakes;
 mod issue_mutation_tests;
 #[cfg(test)]
 mod resource_gate_tests;
+#[cfg(test)]
+mod thread_mutation_tests;
 
 use super::{
     build_failure, mode_name, target_resource_for_request, ResourceAppliedChange,
@@ -151,11 +158,15 @@ pub(crate) async fn dispatch_resource_change(
     gate_resource_change(index, item, &resource)?;
 
     // Optional structured echo of the post-mutation state, surfaced to UI
-    // renderers via the change result. Currently set only by the todos arms.
+    // renderers via the change result. Set by the issue, todos, and pack arms.
     let mut applied_data: Option<serde_json::Value> = None;
     let mut promoted_memory = None;
 
-    let summary = if let Some(summary) = issues::dispatch(
+    let summary = if let Some(summary) =
+        threads::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) = issues::dispatch(
         orch,
         request,
         index,
@@ -223,6 +234,22 @@ pub(crate) async fn dispatch_resource_change(
         labels::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
+    } else if let Some(summary) =
+        grants::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) = packs::dispatch(
+        orch,
+        request,
+        index,
+        item,
+        dry_run,
+        &resource,
+        &mut applied_data,
+    )
+    .await?
+    {
+        summary
     } else if let Some(summary) = todos::dispatch(
         orch,
         request,
@@ -253,6 +280,14 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         recipes::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        routes::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        responses::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else if let Some(summary) =

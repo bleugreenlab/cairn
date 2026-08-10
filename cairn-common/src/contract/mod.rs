@@ -19,6 +19,8 @@ mod jobs;
 mod nodes;
 mod projects;
 mod registry;
+mod responses;
+mod routes;
 mod specs;
 mod tasks;
 mod types;
@@ -52,6 +54,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::LOGS_CONTRACT,
     globals::EXECUTORS_CONTRACT,
     globals::EXECUTOR_CONTRACT,
+    globals::GRANTS_CONTRACT,
+    globals::GRANT_CONTRACT,
+    globals::EXECUTOR_ACTION_CONTRACT,
     globals::MCP_CONTRACT,
     globals::HELP_CONTRACT,
     globals::WEB_SEARCH_CONTRACT,
@@ -69,7 +74,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     projects::PROJECT_BROWSER_CONTRACT,
     projects::PROJECT_BROWSER_NETWORK_REQUEST_CONTRACT,
     issues::ISSUE_CONTRACT,
-    issues::THREAD_ALIAS_CONTRACT,
+    issues::PROJECT_THREADS_CONTRACT,
+    issues::THREAD_CONTRACT,
     issues::CHANGED_CONTRACT,
     issues::ISSUE_EXECUTIONS_CONTRACT,
     issues::ISSUE_EXECUTION_CONTRACT,
@@ -113,6 +119,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     jobs::TASK_PERMISSIONS_CONTRACT,
     jobs::TASK_PERMISSION_CONTRACT,
     workspace::BUG_CONTRACT,
+    workspace::PACKS_CONTRACT,
+    workspace::PACK_CONTRACT,
     workspace::SKILLS_CONTRACT,
     workspace::SKILL_CONTRACT,
     workspace::PROJECT_SKILLS_CONTRACT,
@@ -133,6 +141,22 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     registry::WORKFLOW_CONTRACT,
     registry::PROJECT_WORKFLOWS_CONTRACT,
     registry::PROJECT_WORKFLOW_CONTRACT,
+    routes::ROUTES_CONTRACT,
+    routes::ROUTE_CONTRACT,
+    routes::ROUTE_HISTORY_CONTRACT,
+    routes::ROUTE_HISTORY_ENTRY_CONTRACT,
+    routes::PROJECT_ROUTES_CONTRACT,
+    routes::PROJECT_ROUTE_CONTRACT,
+    routes::PROJECT_ROUTE_HISTORY_CONTRACT,
+    routes::PROJECT_ROUTE_HISTORY_ENTRY_CONTRACT,
+    responses::RESPONSES_CONTRACT,
+    responses::RESPONSE_CONTRACT,
+    responses::RESPONSE_HISTORY_CONTRACT,
+    responses::RESPONSE_HISTORY_ENTRY_CONTRACT,
+    responses::PROJECT_RESPONSES_CONTRACT,
+    responses::PROJECT_RESPONSE_CONTRACT,
+    responses::PROJECT_RESPONSE_HISTORY_CONTRACT,
+    responses::PROJECT_RESPONSE_HISTORY_ENTRY_CONTRACT,
     registry::AGENTS_CONTRACT,
     registry::AGENT_CONTRACT,
     registry::PROJECT_AGENTS_CONTRACT,
@@ -186,7 +210,13 @@ mod tests {
         let configurable: Vec<_> = configure.optional.iter().map(|key| key.key).collect();
         assert_eq!(
             configurable,
-            ["newName", "runtimePolicy", "draining", "expectedGeneration"],
+            [
+                "newName",
+                "runtimePolicy",
+                "draining",
+                "desktopAutomation",
+                "expectedGeneration"
+            ],
             "host, identity, paths, tunnel, and project membership stay unwritable"
         );
         assert!(mutation_spec(ResourceKind::Executor, ChangeMode::Delete).is_some());

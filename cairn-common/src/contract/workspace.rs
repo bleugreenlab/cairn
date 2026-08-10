@@ -24,6 +24,51 @@ pub(crate) const BUG_CONTRACT: ResourceContract =
         }],
     };
 
+pub(crate) const PACKS_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::Packs,
+        uri_template: "cairn://packs",
+        name: "Resource packs",
+        description: "Installable resource packs — everything the app ships plus everything installed, with per-pack state, contents, and user-modified items",
+        read_projections: &[ProjectionSpec {
+            key: "state",
+            values: "installed | available (default: every pack)",
+        }],
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        // Read-only. Installing a pack from a URL (CAIRN-3773) is not built yet,
+        // and an affordance block IS the contract an agent acts on — advertising
+        // a mutation that always errors would send every reader down it.
+        mutations: NO_MUTATIONS,
+    };
+
+pub(crate) const PACK_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::Pack,
+        uri_template: "cairn://packs/{pack_id}",
+        name: "Resource pack",
+        description: "One pack: its manifest, install state, per-item state, and any not-ready MCP servers",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[PACK_ACTION],
+                optional: &[],
+                label: "install, update, or restore pack",
+                example: "write({changes:[{target:\"cairn://packs/ID\",mode:\"patch\",payload:{action:\"install\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Delete,
+                required: &[],
+                optional: &[],
+                label: "uninstall pack (removes pack-owned items; keeps your edited ones)",
+                example: "write({changes:[{target:\"cairn://packs/ID\",mode:\"delete\"}]})",
+            },
+        ],
+    };
+
 pub(crate) const SKILLS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Skills,

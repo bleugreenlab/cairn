@@ -155,6 +155,7 @@ pub fn delete_recipe(
         if path.exists() {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("Failed to delete recipe file: {}", e))?;
+            super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Recipe, id);
             return Ok(());
         }
     }
@@ -455,75 +456,6 @@ edges: []
             ConfigResult::Ok(fr) => assert!(fr.recipe.is_system),
             ConfigResult::Err { error, .. } => panic!("Failed to load: {}", error),
         }
-    }
-
-    /// The bundled thread recipe, loaded exactly the way the app loads it. A
-    /// thread's identity is largely what this recipe OMITS — no terminal output
-    /// artifact and no `pr` node, so nothing gives it a completion to deliver —
-    /// so the omissions are asserted rather than only the parse. Nothing in the
-    /// recipe contract requires an output artifact; a trigger node is the only
-    /// structural requirement.
-    #[test]
-    fn bundled_thread_recipe_loads_with_no_output_artifact() {
-        let temp = tempdir().unwrap();
-        let config_dir = temp.path();
-        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
-        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
-        std::fs::write(
-            config_dir.join("recipes/thread.yaml"),
-            include_str!("../../../../recipes/thread.yaml"),
-        )
-        .unwrap();
-        std::fs::write(
-            config_dir.join("agents/thread.md"),
-            include_str!("../../../../agents/thread.md"),
-        )
-        .unwrap();
-
-        // get_recipe surfaces a validation failure as an Err, so loading at all
-        // is the assertion that the file is a valid recipe.
-        let loaded = get_recipe(config_dir, "thread", None)
-            .expect("the bundled thread recipe validates")
-            .expect("the bundled thread recipe is found by id");
-
-        assert!(
-            loaded.recipe.nodes.iter().all(|node| !matches!(
-                node.node_type,
-                crate::models::RecipeNodeType::Pr | crate::models::RecipeNodeType::Action
-            )),
-            "a thread has no terminal action node, so it never ships and never completes"
-        );
-        assert_eq!(
-            loaded.recipe.branch_targets,
-            vec![crate::models::BranchTarget::Base],
-            "a thread owns no branch, so `base` is the only posture its graph means anything under"
-        );
-
-        let arc = loaded
-            .recipe
-            .nodes
-            .iter()
-            .find_map(|node| node.artifact_config.as_ref())
-            .expect("the thread declares its arc artifact node");
-        assert_eq!(arc.name, "arc", "the agent addresses it as `cairn:~/arc`");
-        assert!(
-            arc.schema.is_some(),
-            "the arc carries a schema, which is what surfaces its fields to the agent"
-        );
-
-        let agent_id = loaded
-            .recipe
-            .nodes
-            .iter()
-            .find_map(|node| node.agent_config.as_ref()?.agent_config_id.clone())
-            .expect("the thread declares an agent node");
-        assert_eq!(agent_id, "thread");
-        assert!(
-            super::super::agents::get_agent(config_dir, &agent_id, None)
-                .unwrap()
-                .is_some(),
-            "the recipe names a bundled agent file that parses"
-        );
     }
 
     /// A recipe file with no `system:` key defaults to is_system == false, so

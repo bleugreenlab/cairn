@@ -108,6 +108,11 @@ fn pinned_jj_bin() -> &'static Path {
             std::io::copy(&mut source_file, &mut pinned_file).expect("snapshot jj executable");
             std::fs::set_permissions(&bin, source_permissions)
                 .expect("preserve jj executable permissions");
+            // Close the destination before executing it. Linux refuses to exec a
+            // file any process still holds open for writing (ETXTBSY, "Text file
+            // busy"), so leaving this handle in scope failed the probe — and with
+            // it every jj-backed test in the binary — on Linux executors.
+            drop(pinned_file);
             let probe = Command::new(&bin)
                 .arg("--version")
                 .output()

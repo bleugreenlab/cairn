@@ -71,20 +71,7 @@ async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String,
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT projects.key,
-                            issues.number,
-                            executions.seq,
-                            jobs.uri_segment,
-                            parent_jobs.uri_segment AS parent_uri_segment,
-                            jobs.agent_config_id
-                     FROM runs
-                     LEFT JOIN issues ON runs.issue_id = issues.id
-                     LEFT JOIN projects ON COALESCE(runs.project_id, issues.project_id) = projects.id
-                     LEFT JOIN jobs ON runs.job_id = jobs.id
-                     LEFT JOIN jobs AS parent_jobs ON jobs.parent_job_id = parent_jobs.id
-                     LEFT JOIN executions ON jobs.execution_id = executions.id
-                     WHERE runs.id = ?1
-                     LIMIT 1",
+                    "SELECT job_id FROM runs WHERE id = ?1 LIMIT 1",
                     (run_id.as_str(),),
                 )
                 .await?;
@@ -92,35 +79,10 @@ async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String,
             let Some(row) = rows.next().await? else {
                 return Err(DbError::Row(format!("No run found with id '{}'", run_id)));
             };
-            let project_key = row.opt_text(0)?;
-            let issue_number = row.opt_i64(1)?.map(|value| value as i32);
-            let exec_seq = row.opt_i64(2)?.map(|value| value as i32);
-            let uri_segment = row.opt_text(3)?;
-            let parent_uri_segment = row.opt_text(4)?;
-            let agent_config_id = row.opt_text(5)?;
-            // A workflow run is a child job (for the delegation tree) but is
-            // addressable as a NODE: build a node-shaped home (ignore the parent
-            // segment) so `cairn:~/calls`, `cairn:~/progress`, and the harness's
-            // output-artifact write resolve as node resources.
-            let parent_for_uri = if agent_config_id.as_deref() == Some("workflow") {
-                None
-            } else {
-                parent_uri_segment.as_deref()
-            };
-            match (
-                project_key.as_deref(),
-                issue_number,
-                exec_seq,
-                uri_segment.as_deref(),
-            ) {
-                (Some(key), Some(number), Some(seq), Some(segment)) => Ok(
-                    cairn_common::uri::build_job_base_uri(key, number, seq, segment, parent_for_uri),
-                ),
-                _ => Err(DbError::Row(format!(
-                    "Cannot build home URI for run {}: project_key={:?}, issue_number={:?}, exec_seq={:?}, uri_segment={:?}",
-                    run_id, project_key, issue_number, exec_seq, uri_segment
-                ))),
-            }
+            let job_id = row.text(0)?;
+            crate::jobs::queries::home_uri_for_job_conn(conn, &job_id)
+                .await?
+                .ok_or_else(|| DbError::Row(format!("Cannot build home URI for run {run_id}")))
         })
     })
     .await
@@ -137,7 +99,7 @@ pub(crate) async fn lookup_run_by_id(db: &LocalDb, run_id: &str) -> Result<RunCo
                     "
                     SELECT r.id, r.job_id, j.execution_id, j.recipe_node_id,
                            r.issue_id, i.number, j.project_id, p.key, j.node_name,
-                           e.seq
+                           e.seq, j.agent_config_id
                     FROM runs r
                     JOIN jobs j ON r.job_id = j.id
                     LEFT JOIN issues i ON r.issue_id = i.id
@@ -175,7 +137,54 @@ fn run_context_from_row(row: &cairn_db::turso::Row) -> DbResult<RunContext> {
         project_id: row.text(6)?,
         project_key: row.text(7)?,
         job_name,
+        agent_config_id: row.opt_text(10)?,
     })
+}
+
+/// Why an authenticated batch whose run cannot be resolved may not commit.
+///
+/// Phrased once, beside the gate that returns it, so both commit verbs answer a
+/// caller in the same words.
+fn unresolvable_identity_refusal(error: &str) -> String {
+    format!(
+        "Refusing to commit: this batch carries a run identity Cairn cannot resolve, so the \
+         posture that decides whether a commit may be taken — whether the job owns a branch of \
+         its own or is thread-owned and running directly on the project's base branch — is \
+         unknown. A commit is not taken on an unknown posture. Re-send the batch without \
+         commit_msg; reading, running commands, and scratch files are unaffected. ({error})"
+    )
+}
+
+/// The commit-posture gate both commit verbs take before they act on a
+/// `commit_msg` (CAIRN-3874).
+///
+/// One boundary asked by `write` and by `run`, because it protects one thing: a
+/// thread owns no branch, so a batch of its that carries a `commit_msg` seals
+/// onto the project's DEFAULT branch, with no pull request and no review
+/// surface. `jobs.thread_id` is the authoritative owner signal and
+/// [`crate::threads::commit_refusal_for_job`] is the one predicate that reads
+/// it; nothing here adds a second notion of what a thread is.
+///
+/// Fail-closed on IDENTITY, fail-open on ownership. A request carrying no run id
+/// is a user's own — the desktop app and an operator's `cairn write` carry no
+/// `CAIRN_RUN_ID` — so there is no agent posture to enforce and it passes
+/// untouched. A request that does claim a run identity has one that must
+/// resolve: while an unresolvable run was treated as ordinary, a job whose run
+/// row had gone missing was indistinguishable from an issue-owned one, and the
+/// refusal simply did not fire. A posture that cannot be established is not an
+/// allowance. Ownership itself keeps the safe direction it has always had: a
+/// resolvable job that is not thread-owned commits.
+pub(crate) async fn commit_posture_refusal(
+    dbs: &crate::db::DbState,
+    request: &CallbackRequest,
+) -> Option<String> {
+    if required_run_id(request).is_err() {
+        return None;
+    }
+    match lookup_run_routed(dbs, request).await {
+        Ok((context, db)) => crate::threads::commit_refusal_for_job(&db, &context.job_id).await,
+        Err(error) => Some(unresolvable_identity_refusal(&error)),
+    }
 }
 
 /// Resolve a project's DB id by key (uppercased).
@@ -218,6 +227,27 @@ mod tests {
             std::sync::Arc::new(db),
             std::sync::Arc::new(search),
         ))
+    }
+
+    #[tokio::test]
+    async fn thread_run_gets_the_canonical_thread_home() {
+        let dbs = local_dbs().await;
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at) VALUES ('t','p','design','active','none',1,1)",
+            "INSERT INTO jobs (id, thread_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment) VALUES ('j','t','p','thread','thread','running',1,1,'thread')",
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('r-thread','p','j','live',1,1)",
+        ] {
+            dbs.local.execute(sql, ()).await.unwrap();
+        }
+
+        assert_eq!(
+            lookup_home_uri_by_run_id(&dbs.local, "r-thread")
+                .await
+                .unwrap(),
+            "cairn://p/PRJ/design"
+        );
     }
 
     async fn seed_run(db: &LocalDb) {
@@ -326,6 +356,81 @@ mod tests {
             .expect("the authenticated run resolves regardless of cwd");
         assert_eq!(context.run_id, "r");
         assert_eq!(context.project_key, "PRJ");
+    }
+
+    /// The commit fence, at the predicate both verbs share.
+    ///
+    /// Ownership decides: the thread-owned run is refused with the posture and
+    /// with where the work belongs, and the ordinary issue run beside it in the
+    /// same database still commits. Asserting both directions is what keeps this
+    /// a fence rather than a blanket.
+    #[tokio::test]
+    async fn a_thread_owned_run_is_refused_a_commit_and_an_issue_run_is_not() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+        for sql in [
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at) VALUES ('t','p','design','active','none',1,1)",
+            "INSERT INTO jobs (id, thread_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment) VALUES ('j-t','t','p','thread','thread','running',1,1,'thread')",
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('r-thread','p','j-t','live',1,1)",
+        ] {
+            dbs.local.execute(sql, ()).await.unwrap();
+        }
+
+        let refusal = commit_posture_refusal(&dbs, &request_for_run("r-thread"))
+            .await
+            .expect("a thread-owned job may not commit");
+        assert!(
+            refusal.contains("thread-owned job") && refusal.contains("child issue"),
+            "the refusal must carry the posture and where the work belongs: {refusal}"
+        );
+
+        assert!(
+            commit_posture_refusal(&dbs, &request_for_run("r"))
+                .await
+                .is_none(),
+            "an ordinary issue job still commits"
+        );
+    }
+
+    /// A request with no run identity is a user's own and is not gated: the
+    /// desktop app and an operator shell carry no `CAIRN_RUN_ID`, and there is no
+    /// agent posture to enforce on them.
+    #[tokio::test]
+    async fn a_request_with_no_run_identity_is_not_gated() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+
+        for run_id in [None, Some(String::new())] {
+            let request = CallbackRequest {
+                cwd: "/tmp/wt".to_string(),
+                run_id,
+                ..Default::default()
+            };
+            assert!(
+                commit_posture_refusal(&dbs, &request).await.is_none(),
+                "an unauthenticated write is the user's own and commits as it always has"
+            );
+        }
+    }
+
+    /// An identity that does not resolve is an unknown posture, and an unknown
+    /// posture may not commit.
+    ///
+    /// This is the direction that matters: while it returned "allow", a job whose
+    /// run row had gone missing was indistinguishable from an issue-owned one, so
+    /// the fence simply did not fire (CAIRN-3874).
+    #[tokio::test]
+    async fn an_authenticated_request_whose_run_cannot_be_resolved_is_refused() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+
+        let refusal = commit_posture_refusal(&dbs, &request_for_run("ghost"))
+            .await
+            .expect("an unresolvable identity may not commit");
+        assert!(
+            refusal.contains("cannot resolve") && refusal.contains("ghost"),
+            "the refusal must say the posture is unknown and name the run: {refusal}"
+        );
     }
 
     #[tokio::test]

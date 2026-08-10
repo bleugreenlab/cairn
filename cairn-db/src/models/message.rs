@@ -47,6 +47,7 @@ impl DeliveryUrgency {
 pub enum ChannelType {
     Project,
     Issue,
+    Thread,
     Direct,
 }
 
@@ -55,6 +56,7 @@ impl std::fmt::Display for ChannelType {
         match self {
             ChannelType::Project => write!(f, "project"),
             ChannelType::Issue => write!(f, "issue"),
+            ChannelType::Thread => write!(f, "thread"),
             ChannelType::Direct => write!(f, "direct"),
         }
     }
@@ -67,6 +69,7 @@ impl std::str::FromStr for ChannelType {
         match s.to_lowercase().as_str() {
             "project" => Ok(ChannelType::Project),
             "issue" => Ok(ChannelType::Issue),
+            "thread" => Ok(ChannelType::Thread),
             "direct" => Ok(ChannelType::Direct),
             _ => Err(format!("Unknown channel type: {}", s)),
         }

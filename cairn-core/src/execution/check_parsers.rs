@@ -717,7 +717,7 @@ fn head_chars(s: &str, max: usize) -> String {
 }
 
 /// Keep the trailing `max` chars (char-boundary safe).
-fn tail_chars(s: &str, max: usize) -> String {
+pub(crate) fn tail_chars(s: &str, max: usize) -> String {
     let n = s.chars().count();
     if n <= max {
         return s.to_string();

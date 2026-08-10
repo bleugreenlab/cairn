@@ -310,11 +310,14 @@ pub struct ReplSession {
     /// row denies.
     pub generation: i64,
     fence: ResidencyFence,
-    /// The repository and logical branch this session's checkout must follow.
+    /// `(repository, logical branch)` this session's checkout must follow.
     /// Carried on the session, resolved once at spawn, so re-aligning before an
     /// eval costs a branch resolution and not a database read.
-    repo_path: std::path::PathBuf,
-    branch: String,
+    ///
+    /// Absent for a branchless owner — a thread session, which owns no branch by
+    /// construction and runs in the project's live checkout. Nothing there is
+    /// Cairn's to move, so such a session has nothing to re-align to.
+    managed_branch: Option<(std::path::PathBuf, String)>,
     process_key: String,
     process_generation: u64,
     responses: Mutex<mpsc::Receiver<String>>,
@@ -347,6 +350,14 @@ impl ReplSession {
     /// True while a send holds `send_lock` (an exchange is in flight).
     pub fn is_busy(&self) -> bool {
         self.send_lock.try_lock().is_err()
+    }
+
+    /// The logical branch this session's checkout follows, or `None` for a
+    /// branchless owner living in the project's live checkout.
+    pub fn managed_branch(&self) -> Option<&str> {
+        self.managed_branch
+            .as_ref()
+            .map(|(_, branch)| branch.as_str())
     }
 
     /// Allocate the next exchange sequence number.
@@ -505,6 +516,75 @@ impl ReplState {
     }
 }
 
+/// The sandbox a REPL's interpreter spawns under, in the two values the resident
+/// spec carries: the mode it declares, and the policy computed host-side when one
+/// applies.
+///
+/// Two things decide it, and they are separate questions. **Which checkout** the
+/// interpreter runs in follows the owner's branch: a REPL on a branch runs in the
+/// job's execution home, the agent's own writable checkout however little it looks
+/// like one on disk, while a branchless one runs in the project's live checkout,
+/// somebody else's working tree. The policy is built against that checkout rather
+/// than against the controller's scratch directory, so the read-only shape can
+/// drop any session grant that would otherwise reopen the live tree.
+///
+/// **Whether anything is enforced** follows the owner's fence, exactly as a
+/// terminal's does — and the fence belongs to the REPL's *owner*, not to whoever
+/// asked for it. A UI create carries no run context at all, so deriving the
+/// identity from the caller answered "nobody's agent operation", built no policy,
+/// and spawned the interpreter unconfined. Resolving the owner's own run here is
+/// what a terminal already does from its job row (`resolve_terminal_resource_target`
+/// reads the latest run alongside the branch), so a REPL and the terminal beside
+/// it in one cell are confined alike however each was opened.
+pub async fn repl_sandbox(
+    orch: &Orchestrator,
+    job_id: &str,
+    project_id: &str,
+    scratch_cwd: &str,
+    repo_path: &str,
+    managed_branch: Option<&str>,
+    run_context: Option<&RunContext>,
+) -> (
+    ProcessSandboxMode,
+    Option<crate::services::sandbox::SandboxPolicy>,
+) {
+    let (checkout_kind, policy_checkout) = match managed_branch {
+        Some(_) => (
+            crate::mcp::handlers::run::RunCheckout::AgentOwned,
+            scratch_cwd,
+        ),
+        None => (
+            crate::mcp::handlers::run::RunCheckout::ProjectLive,
+            repo_path,
+        ),
+    };
+    let fence_run_id = match run_context {
+        Some(ctx) => Some(ctx.run_id.clone()),
+        None => crate::jobs::queries::latest_run_id_for_job(&orch.db.local, job_id).await,
+    };
+    let policy = crate::mcp::handlers::run::build_run_sandbox_policy(
+        orch,
+        policy_checkout,
+        checkout_kind,
+        fence_run_id.as_deref(),
+        Some(project_id),
+        None,
+    )
+    .await
+    .map(|(policy, _)| policy);
+    // No policy means the owner's fence resolved to `allow`, or resolved to
+    // nothing at all: an unfenced spawn, declared as one rather than dressed up
+    // in a mode the executor would then have to invent a policy for.
+    let mode = match (policy.is_some(), checkout_kind) {
+        (false, _) => ProcessSandboxMode::Unconfined,
+        (true, crate::mcp::handlers::run::RunCheckout::AgentOwned) => ProcessSandboxMode::Confined,
+        (true, crate::mcp::handlers::run::RunCheckout::ProjectLive) => {
+            ProcessSandboxMode::ReadOnlyCheckout
+        }
+    };
+    (mode, policy)
+}
+
 /// Start an eval server in an executor residency.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_session(
@@ -524,15 +604,12 @@ pub async fn spawn_session(
         let row = rows.next().await?.ok_or_else(|| crate::storage::DbError::Row(format!("Job not found: {job}")))?;
         Ok((row.opt_text(0)?, row.opt_text(1)?, row.text(2)?))
     })).await.map_err(|e| e.to_string())?;
-    let branch = branch
-        .or(base_branch)
-        .ok_or_else(|| "REPL job has no logical branch".to_string())?;
-    let tip = crate::fleet::residency::resolve_logical_commit(
-        orch,
-        std::path::Path::new(&repo_path),
-        &branch,
-    )
-    .await?;
+    // A job with neither is branchless by construction rather than incomplete: a
+    // thread session is commit-fenced, owns no branch and no PR, and there is no
+    // managed checkout to resolve for it. Its REPL lives in the project's live
+    // checkout instead, exactly where its terminals already run, so the two share
+    // one environment.
+    let managed_branch = branch.or(base_branch);
 
     let (asset, body) = match interpreter {
         ReplLang::Python => ("repl/eval_server.py", PYTHON_EVAL_SERVER),
@@ -574,18 +651,16 @@ pub async fn spawn_session(
             )
         }
     };
-    let policy = crate::mcp::handlers::run::build_run_sandbox_policy(
+    let (sandbox_mode, policy) = repl_sandbox(
         orch,
+        job_id,
+        project_id,
         cwd,
-        // A REPL runs in the job's execution home, which is the agent's own
-        // writable checkout however little it looks like one on disk.
-        crate::mcp::handlers::run::RunCheckout::AgentOwned,
-        run_context.map(|c| c.run_id.as_str()),
-        Some(project_id),
-        None,
+        &repo_path,
+        managed_branch.as_deref(),
+        run_context,
     )
-    .await
-    .map(|(p, _)| p);
+    .await;
     let config = crate::mcp::handlers::run::build_agent_spawn_config(
         orch,
         cwd,
@@ -619,21 +694,55 @@ pub async fn spawn_session(
         .into_iter()
         .filter(|(k, _)| !matches!(k.as_str(), "CAIRN_WORKTREE" | "TMPDIR" | "TMP" | "TEMP"))
         .collect();
-    // A REPL is another long-lived process in the job's one execution home, so
+    // A REPL is another long-lived process in its owner's one execution home, so
     // its interpreter sees the same installed packages, the same `$TMPDIR`, and
-    // the same absolute paths as the job's run batches and terminals.
+    // the same absolute paths as that owner's run batches and terminals.
     let fleet_config = crate::config::settings::load_fleet(&orch.config_dir);
-    let fence = crate::fleet::residency::acquire_job_residency(
-        orch,
-        &orch.db.local,
-        job_id,
-        &tip,
-        crate::fleet::default_wait_horizon_unix_ms(&fleet_config),
-        crate::fleet::unix_time_ms(),
-    )
-    .await
-    .map_err(|refusal| refusal.diagnostic)?;
-    crate::fleet::residency::refresh(orch, &fence, &tip).await?;
+    let wait_horizon_unix_ms = crate::fleet::default_wait_horizon_unix_ms(&fleet_config);
+    let fence = match managed_branch.as_deref() {
+        Some(branch) => {
+            let tip = crate::fleet::residency::resolve_logical_commit(
+                orch,
+                std::path::Path::new(&repo_path),
+                branch,
+            )
+            .await?;
+            let fence = crate::fleet::residency::acquire_job_residency(
+                orch,
+                &orch.db.local,
+                job_id,
+                &tip,
+                wait_horizon_unix_ms,
+                crate::fleet::unix_time_ms(),
+            )
+            .await
+            .map_err(|refusal| refusal.diagnostic)?;
+            crate::fleet::residency::refresh(orch, &fence, &tip).await?;
+            fence
+        }
+        // The live checkout is externally owned and always at its own HEAD, so
+        // there is no checkout to force to a commit here and no refresh to send:
+        // a refresh would be Cairn moving somebody else's working tree.
+        None => {
+            let owner_ref = crate::fleet::residency::job_residence(&orch.db.local, job_id)
+                .await
+                .ok()
+                .map(|residence| residence.owner_ref);
+            let request = crate::fleet::residency::live_checkout_residency_request(
+                job_id,
+                project_id,
+                &repo_path,
+                owner_ref,
+                wait_horizon_unix_ms,
+            )
+            .await?;
+            let fence = crate::fleet::residency::acquire(orch, request)
+                .await
+                .map_err(|refusal| refusal.diagnostic)?;
+            let _ = crate::fleet::residency::renew(orch, &fence).await;
+            fence
+        }
+    };
 
     // Process keys are unique within the home, so a REPL names itself by slug
     // rather than claiming the one generic key.
@@ -708,11 +817,7 @@ pub async fn spawn_session(
                     cwd: String::new(),
                     cwd_root: ResidentProcessCwdRoot::Checkout,
                     env,
-                    sandbox_mode: if sandbox_policy.is_some() {
-                        ProcessSandboxMode::Confined
-                    } else {
-                        ProcessSandboxMode::Unconfined
-                    },
+                    sandbox_mode,
                     sandbox_policy,
                     runtime_assets: vec![ResidentRuntimeAsset {
                         path: asset.into(),
@@ -752,8 +857,9 @@ pub async fn spawn_session(
         project_id: record.project_id.clone(),
         generation: record.generation,
         fence: fence.clone(),
-        repo_path: std::path::PathBuf::from(&repo_path),
-        branch: branch.clone(),
+        managed_branch: managed_branch
+            .clone()
+            .map(|branch| (std::path::PathBuf::from(&repo_path), branch)),
         process_key: key,
         process_generation: generation,
         responses: Mutex::new(rx),
@@ -926,17 +1032,21 @@ pub async fn send_recorded(
     // Fails closed here, before any exchange row exists, for the same reason the
     // slug and language checks do: a precondition that predates the exchange
     // belongs in the caller's error, not in a phantom transcript card.
-    let tip =
-        crate::fleet::residency::resolve_logical_commit(orch, &session.repo_path, &session.branch)
-            .await?;
-    crate::fleet::residency::refresh(orch, &session.fence, &tip)
-        .await
-        .map_err(|error| {
-            format!(
-                "REPL '{slug}' was not sent code because its checkout could not be aligned to the \
-                 logical head {tip}: {error}"
-            )
-        })?;
+    //
+    // A branchless session has nothing to align: it lives in the project's live
+    // checkout, which is somebody else's working tree at whatever commit they
+    // have it on, and moving it would be Cairn editing their tree.
+    if let Some((repo_path, branch)) = session.managed_branch.as_ref() {
+        let tip = crate::fleet::residency::resolve_logical_commit(orch, repo_path, branch).await?;
+        crate::fleet::residency::refresh(orch, &session.fence, &tip)
+            .await
+            .map_err(|error| {
+                format!(
+                    "REPL '{slug}' was not sent code because its checkout could not be aligned to \
+                     the logical head {tip}: {error}"
+                )
+            })?;
+    }
 
     let seq = session.next_seq();
     let mut exchange = ReplExchange {
@@ -1163,9 +1273,13 @@ pub fn render_status(
     out
 }
 
-/// Resolve the top-level node job id for a `NodeRepl` URI's coordinates,
-/// mirroring the terminal target lookup. Used by read and delete to reach the
-/// registry key from URI coordinates.
+/// Resolve the job id a `NodeRepl` URI's coordinates address.
+///
+/// Owner-aware through the shared resolver, so a thread session's REPL resolves
+/// to its session job. This was a sixth issue-shaped copy of the coordinate
+/// query: `repl/<slug>` from a thread normalized, reached dispatch, and then
+/// failed here with a `0/0` placeholder in the error — exactly the leak the
+/// reserved coordinate exists to prevent.
 pub(crate) async fn resolve_node_repl_job_id(
     db: &crate::storage::LocalDb,
     project_key: &str,
@@ -1173,37 +1287,14 @@ pub(crate) async fn resolve_node_repl_job_id(
     exec_seq: i32,
     node_id: &str,
 ) -> Option<String> {
-    use crate::storage::RowExt;
-    let project_key = project_key.to_uppercase();
-    let node_id = node_id.to_string();
-    db.read(|conn| {
-        let project_key = project_key.clone();
-        let node_id = node_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "
-                    SELECT j.id
-                    FROM jobs j
-                    JOIN issues i ON j.issue_id = i.id
-                    JOIN projects p ON i.project_id = p.id
-                    JOIN executions e ON j.execution_id = e.id
-                    WHERE p.key = ?1
-                      AND i.number = ?2
-                      AND e.seq = ?3
-                      AND j.parent_job_id IS NULL
-                      AND j.uri_segment = ?4
-                    LIMIT 1
-                    ",
-                    (project_key.as_str(), number, exec_seq, node_id.as_str()),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => Ok(Some(row.text(0)?)),
-                None => Ok(None),
-            }
-        })
-    })
+    crate::jobs::queries::job_id_for_node_coordinate(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_id,
+        None,
+    )
     .await
     .ok()
     .flatten()

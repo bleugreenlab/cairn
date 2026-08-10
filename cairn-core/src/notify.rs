@@ -27,6 +27,23 @@ pub(crate) fn issue_db_change_ids(action: &str, issue_id: &str, project_id: Opti
     })
 }
 
+pub(crate) fn thread_db_change_ids(
+    action: &str,
+    thread_id: &str,
+    project_id: Option<&str>,
+) -> Value {
+    json!({
+        "table": "threads",
+        "action": action,
+        "threadId": thread_id,
+        "projectId": project_id,
+    })
+}
+
+pub(crate) fn thread_db_change(thread: &models::Thread, action: &str) -> Value {
+    thread_db_change_ids(action, &thread.id, Some(&thread.project_id))
+}
+
 pub(crate) fn issue_db_change(issue: &models::Issue, action: &str) -> Value {
     issue_db_change_ids(action, &issue.id, Some(&issue.project_id))
 }
@@ -390,6 +407,12 @@ impl Notifier {
             .emit("db-change", issue_db_change(issue, "update"));
     }
 
+    pub fn thread(&self, thread: &models::Thread) {
+        let _ = self
+            .emitter
+            .emit("db-change", thread_db_change(thread, "update"));
+    }
+
     pub fn job(&self, j: &models::Job) {
         // Route through the scoped builder so the precise job-list invalidation
         // carries the full id set (see [`job_db_change`]).
@@ -461,11 +484,11 @@ mod tests {
             merged_at: None,
             closed_at: None,
             parent_issue_id: None,
+            parent_thread_id: None,
             unmet_dependency_count: 0,
             depends_on: Vec::new(),
             unmet_depends_on: Vec::new(),
             labels: Vec::new(),
-            kind: models::IssueKind::Issue,
         }
     }
 

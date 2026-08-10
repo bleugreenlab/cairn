@@ -590,6 +590,84 @@ async fn wait_for_terminal_exit(db: &LocalDb, slug: &str) -> Option<i64> {
     panic!("terminal {slug} never finalized");
 }
 
+/// CAIRN-3824, end to end through a real PTY: a terminal that echoes a
+/// registered credential must not carry it in the exit tail it records.
+///
+/// Every layer between the shell and the assertion is the real one — a real PTY,
+/// the executor reader that scrubs it, the runner's resident-event ingestion,
+/// and the terminal finalize that captures the tail into the database. That is
+/// the point. The unit tests each prove one seam holds; this proves the seams
+/// are connected to each other, which is the failure a green unit suite hides.
+///
+/// Mutation-tested three ways, because a passing assertion here proves nothing
+/// on its own — the first version of it passed with a scrubber disabled, and it
+/// took disabling the *right* one to find out why. Bypassing the executor's PTY
+/// reader alone still passes: the runner's ingestion guard catches it. Bypassing
+/// the runner's ingestion alone still passes: the executor catches it. Bypassing
+/// both fails with the credential in the clear. That is what "double-guard"
+/// means here, stated as something checked rather than something asserted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_terminal_that_echoes_a_registered_credential_records_it_redacted() {
+    use cairn_core::security::{registry, SecretCategory, SecretId, SecretMaterial};
+
+    const CREDENTIAL: &str = "sk-live-terminal-Qa9Zm2Xp7Lr4";
+
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    seed_node(&db).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
+
+    let _guard = registry()
+        .register(
+            SecretId::new("terminal-e2e"),
+            SecretCategory::CallbackCredential,
+            "integration test",
+            SecretMaterial::from_string(CREDENTIAL.to_string()),
+        )
+        .expect("registerable");
+
+    change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/leaky",
+            "mode": "create",
+            "payload": {"command": format!("printf '%s\\n' 'token={CREDENTIAL}'")}
+        }]),
+        "r-secret",
+    )
+    .await;
+    wait_for_terminal_exit(&db, "leaky").await;
+
+    let tail = terminal_output_tail(&db, "leaky").await.unwrap_or_default();
+    assert!(
+        !tail.contains(CREDENTIAL),
+        "the credential reached the terminal's recorded output: {tail}"
+    );
+    assert!(
+        tail.contains("token=[REDACTED]"),
+        "the surrounding output must survive redaction intact: {tail}"
+    );
+}
+
+async fn terminal_output_tail(db: &LocalDb, slug: &str) -> Option<String> {
+    let slug = slug.to_string();
+    db.read(|conn| {
+        let slug = slug.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT output_tail FROM job_terminals WHERE slug = ?1",
+                    params![slug.as_str()],
+                )
+                .await?;
+            let row = rows.next().await?.expect("terminal row");
+            row.opt_text(0)
+        })
+    })
+    .await
+    .unwrap()
+}
+
 /// CAIRN-3153: an agent terminal *is* the command it was asked to run, so the
 /// command's own completion finalizes the terminal and carries its real status.
 ///

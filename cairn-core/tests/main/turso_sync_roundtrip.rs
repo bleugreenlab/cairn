@@ -937,7 +937,7 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
         None,
         None,
         None,
-        cairn_core::models::IssueKind::Issue,
+        None,
     )
     .await
     .expect("create issue must succeed (no `project not found`)");
@@ -1025,7 +1025,7 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
     // 3. MESSAGE append through the routed handler.
     messages::append_project_or_issue_message(
         &orch,
-        &request,
+        messages::MessageAuthor::Mcp(&request),
         "TEAMP",
         Some(number),
         "a routed message",
@@ -1763,8 +1763,20 @@ async fn routed_permission_response_resolves_to_team_replica_and_local_to_privat
 
     use cairn_core::internal::execution::routing;
     use cairn_core::internal::mcp::handlers::permission::{
-        resolve_permission_request, PermissionDecision, PermissionScope,
+        resolve_permission_request, OperatorApproval, OperatorTransport, PermissionAnswer,
+        PermissionDecision, PermissionScope,
     };
+
+    /// The operator capability the desktop adapter would have resolved from its
+    /// authentication context. Built here so the test drives the same path a
+    /// real answer takes.
+    fn operator() -> OperatorApproval {
+        OperatorApproval::authenticated(
+            "user:test-operator",
+            OperatorTransport::AuthenticatedOperator,
+        )
+        .expect("a named operator is a valid approval")
+    }
 
     let orch = orchestrator_over(dbs_a.clone(), &dir.path().join("config"));
 
@@ -1780,8 +1792,8 @@ async fn routed_permission_response_resolves_to_team_replica_and_local_to_privat
     resolve_permission_request(
         &orch,
         perm,
-        PermissionDecision::Allow,
-        PermissionScope::Once,
+        PermissionAnswer::from_operator(PermissionDecision::Allow, operator())
+            .with_containment_scope(PermissionScope::Once),
     )
     .await
     .expect("resolve the team permission request");
@@ -1866,8 +1878,8 @@ async fn routed_permission_response_resolves_to_team_replica_and_local_to_privat
     resolve_permission_request(
         &orch,
         "perm-local",
-        PermissionDecision::Allow,
-        PermissionScope::Once,
+        PermissionAnswer::from_operator(PermissionDecision::Allow, operator())
+            .with_containment_scope(PermissionScope::Once),
     )
     .await
     .expect("resolve the local permission request");

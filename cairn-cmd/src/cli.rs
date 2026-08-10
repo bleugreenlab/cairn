@@ -40,6 +40,7 @@ fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
             .unwrap_or("manual check observation failed")
             .to_string());
     }
+
     let observation = value
         .get("observation")
         .ok_or_else(|| "observation response did not contain an observation".to_string())?;
@@ -322,10 +323,18 @@ pub(crate) async fn run_cli_watch(issue_uri: String, since: Option<i64>) -> bool
     }
 }
 
-fn check_run_request(client: &CairnCmd, suite: String, branch: Option<String>) -> CallbackRequest {
+fn check_run_request(
+    client: &CairnCmd,
+    suite: String,
+    branch: Option<String>,
+    retry: bool,
+) -> CallbackRequest {
     let mut payload = serde_json::json!({ "suite": suite });
     if let Some(branch) = branch {
         payload["branch"] = serde_json::Value::String(branch);
+    }
+    if retry {
+        payload["retry"] = serde_json::Value::Bool(true);
     }
     CallbackRequest {
         thread_id: None,
@@ -379,9 +388,9 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| incomplete_check_result("the disposition"))?;
     let cache = if disposition == "cached" {
-        "cache hit: suite input tree, verdict environment, schema, and reusable green matched"
+        "cache hit: suite input tree, verdict environment, schema, and reusable verdict matched"
     } else {
-        "cache miss: no reusable green matched suite input tree, verdict environment, and schema"
+        "cache miss: no reusable verdict matched suite input tree, verdict environment, and schema"
     };
 
     // A run that produced no verdict is a fact about Cairn, never a red against
@@ -415,6 +424,9 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
         .get("passed")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| incomplete_check_result("the verdict"))?;
+    let not_recorded = result
+        .get("notRecorded")
+        .and_then(serde_json::Value::as_str);
     let observation = match result
         .get("observationRef")
         .and_then(serde_json::Value::as_str)
@@ -426,26 +438,34 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
                 .unwrap_or("time unavailable");
             format!("{suite}@{short_commit} · {ran_at} · {reference}")
         }
-        None => "Cairn recorded no observation for this run".to_string(),
+        None => {
+            let cause = not_recorded.ok_or_else(|| {
+                incomplete_check_result("the observation recording failure cause")
+            })?;
+            format!("Cairn recorded no observation for this run: {cause}")
+        }
     };
-    // Only a green is worth annotating: a red is never reusable evidence, and
-    // saying so on every red would bury the one case that surprises a reader — a
-    // pass another machine produced, which Cairn keeps but will not reuse.
+    // Recording failures are supplied by the producer that observed them. An
+    // empty fingerprint is not evidence of any particular failure mode. A cause
+    // already rendered beside a missing citation must not be repeated as a suffix.
     let reuse = match (
-        passed,
+        not_recorded,
         result
-            .get("reusable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        result
-            .get("environmentFingerprint")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .is_empty(),
+            .get("observationRef")
+            .and_then(serde_json::Value::as_str),
     ) {
-        (true, false, true) => " · another machine ran this, so Cairn will not reuse the verdict",
-        (true, false, false) => " · Cairn will not reuse this verdict",
-        _ => "",
+        (Some(reason), Some(_)) => format!(" · {reason}"),
+        (Some(_), None) => String::new(),
+        (None, _)
+            if passed
+                && !result
+                    .get("reusable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false) =>
+        {
+            " · Cairn will not reuse this verdict".to_string()
+        }
+        (None, _) => String::new(),
     };
     Ok((
         format!(
@@ -456,7 +476,11 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     ))
 }
 
-pub(crate) async fn run_cli_check(suites: Vec<String>, branch: Option<String>) -> bool {
+pub(crate) async fn run_cli_check(
+    suites: Vec<String>,
+    branch: Option<String>,
+    retry: bool,
+) -> bool {
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
@@ -465,7 +489,7 @@ pub(crate) async fn run_cli_check(suites: Vec<String>, branch: Option<String>) -
     let client = build_cli_client(callback_url);
     let requests = suites
         .into_iter()
-        .map(|suite| check_run_request(&client, suite, branch.clone()));
+        .map(|suite| check_run_request(&client, suite, branch.clone(), retry));
     let outcomes = futures::future::join_all(requests.map(|request| {
         let client = &client;
         async move { client.call_tauri_full(&request).await }
@@ -666,13 +690,30 @@ mod tests {
             vec![],
             None,
         );
-        let request = check_run_request(&client, "rust-tests".into(), None);
+        let request = check_run_request(&client, "rust-tests".into(), None, false);
         assert_eq!(request.tool, "check_run");
         assert_eq!(
             request.payload,
             serde_json::json!({ "suite": "rust-tests" })
         );
         assert_eq!(request.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn check_run_request_carries_explicit_retry() {
+        let client = CairnCmd::new_with_home_uri(
+            "http://localhost".into(),
+            "/repo".into(),
+            Some("run-1".into()),
+            None,
+            vec![],
+            None,
+        );
+        let request = check_run_request(&client, "rust-tests".into(), None, true);
+        assert_eq!(
+            request.payload,
+            serde_json::json!({ "suite": "rust-tests", "retry": true })
+        );
     }
 
     #[test]
@@ -731,7 +772,7 @@ mod tests {
         assert_eq!(
             rendered,
             (
-                "cache hit: suite input tree, verdict environment, schema, and reusable green matched\nrust-tests ✓ on 1234567890ab (cached) · rust-tests@1234567890ab · 2026-08-03 11:12 PDT · cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w".to_string(),
+                "cache hit: suite input tree, verdict environment, schema, and reusable verdict matched\nrust-tests ✓ on 1234567890ab (cached) · rust-tests@1234567890ab · 2026-08-03 11:12 PDT · cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w".to_string(),
                 true,
             )
         );
@@ -758,7 +799,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             summary,
-            "cache miss: no reusable green matched suite input tree, verdict environment, and schema\nrust-tests ✗ on 1234567890ab (fresh) · rust-tests@1234567890ab · 2026-08-03 11:12 PDT · cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w"
+            "cache miss: no reusable verdict matched suite input tree, verdict environment, and schema\nrust-tests ✗ on 1234567890ab (fresh) · rust-tests@1234567890ab · 2026-08-03 11:12 PDT · cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w"
         );
         assert!(
             !passed,
@@ -767,9 +808,8 @@ mod tests {
     }
 
     /// The specimen this rendering exists for: a check that ran on another
-    /// machine. Its verdict comes back like any other, keyed by an empty
-    /// environment fingerprint, and the reply says plainly that Cairn will not
-    /// reuse it.
+    /// machine. Its verdict comes back like any other, and the producer carries
+    /// the concrete reason it could not become reusable evidence.
     #[test]
     fn check_run_response_returns_a_remotely_executed_verdict() {
         let (summary, passed) = render_check_run_response(
@@ -782,6 +822,7 @@ mod tests {
                     "passed": true,
                     "reusable": false,
                     "environmentFingerprint": "",
+                    "notRecorded": "the selected legacy executor did not report a complete verdict environment identity",
                     "observationRef": "cairn://p/CAIRN/check-observations/782ri3MzIRCrS7e-3avq_w",
                     "ranAt": "2026-08-03 11:12 PDT"
                 }
@@ -793,7 +834,8 @@ mod tests {
         assert!(summary.contains("rust-tests ✓ on 1234567890ab (fresh) · rust-tests@1234567890ab"));
         assert!(!summary.contains("obs-remote"));
         assert!(
-            summary.contains("another machine ran this"),
+            summary
+                .contains("legacy executor did not report a complete verdict environment identity"),
             "an unreusable green must say why: {summary}"
         );
     }
@@ -878,7 +920,8 @@ mod tests {
                     "passed": true,
                     "reusable": false,
                     "environmentFingerprint": "",
-                    "observationId": null
+                    "observationId": null,
+                    "notRecorded": "the observation write failed: database is read-only"
                 }
             })
             .to_string(),
@@ -889,6 +932,103 @@ mod tests {
             summary.contains("recorded no observation"),
             "an unrecorded run must say so instead of failing: {summary}"
         );
+        assert!(summary.contains("observation write failed: database is read-only"));
+    }
+
+    #[test]
+    fn check_run_response_names_a_cited_red_non_reuse_cause() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-lint",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": false,
+                    "reusable": false,
+                    "environmentFingerprint": "",
+                    "observationRef": "cairn://p/CAIRN/check-observations/782ri3MzIRCrS7e-3avq_w",
+                    "ranAt": "2026-08-03 11:12 PDT",
+                    "notRecorded": "the selected legacy executor did not report a complete verdict environment identity"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!passed, "a cited remote red remains a red verdict");
+        assert!(summary.contains("cairn://p/CAIRN/check-observations/782ri3MzIRCrS7e-3avq_w"));
+        assert!(summary.contains(
+            "the selected legacy executor did not report a complete verdict environment identity"
+        ));
+    }
+
+    #[test]
+    fn check_run_response_names_a_red_observation_write_failure() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-lint",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": false,
+                    "reusable": false,
+                    "environmentFingerprint": "env-local",
+                    "observationId": null,
+                    "notRecorded": "the observation write failed: transaction conflict"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!passed, "an unrecorded red remains a red verdict");
+        assert!(summary.contains(
+            "Cairn recorded no observation for this run: the observation write failed: transaction conflict"
+        ));
+    }
+
+    #[test]
+    fn check_run_response_refuses_a_bare_missing_observation() {
+        let error = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-lint",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": false,
+                    "reusable": false,
+                    "environmentFingerprint": "env-local",
+                    "observationId": null
+                }
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("observation recording failure cause"));
+    }
+
+    #[test]
+    fn check_run_response_does_not_infer_a_reason_from_an_empty_fingerprint() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": true,
+                    "reusable": false,
+                    "environmentFingerprint": "",
+                    "observationRef": "cairn://p/CAIRN/check-observations/782ri3MzIRCrS7e-3avq_w"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(passed);
+        assert!(summary.contains("Cairn will not reuse this verdict"));
+        assert!(!summary.contains("another machine"));
     }
 
     #[test]
@@ -914,7 +1054,12 @@ mod tests {
             vec![],
             None,
         );
-        let request = check_run_request(&client, "rust-tests".into(), Some("main@origin".into()));
+        let request = check_run_request(
+            &client,
+            "rust-tests".into(),
+            Some("main@origin".into()),
+            false,
+        );
         assert_eq!(
             request.payload,
             serde_json::json!({

@@ -271,6 +271,7 @@ mod tests {
             attention: IssueAttention::NeedsAuthorization,
             status: IssueStatus::Waiting,
             updated_at: 2,
+            route_provenance: None,
         }
     }
 
@@ -318,6 +319,7 @@ mod tests {
             attention: IssueAttention::None,
             status: IssueStatus::Active,
             updated_at: 3,
+            route_provenance: None,
         };
         orch.emit_attention_event(event);
         wait_for_call(&called).await;

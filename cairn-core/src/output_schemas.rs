@@ -16,6 +16,7 @@ fn embedded_preset_schema(schema_name: &str) -> Option<&'static str> {
             "../../../resources/schemas/implementation.json"
         )),
         "return" => Some(include_str!("../../../resources/schemas/return.json")),
+        "arc" => Some(include_str!("../../../resources/schemas/arc.json")),
         _ => None,
     }
 }
@@ -29,6 +30,11 @@ pub(crate) const PRESET_SCHEMAS: &[&str] = &[
     "checklist",
     "implementation",
     "return",
+    // The thread's living arc. It is a structured artifact like its siblings —
+    // a thread's session job carries `arc` as its output contract, so a thread
+    // that never existed before the cutover resolves its schema here on the
+    // first `write cairn:~/arc` rather than being refused by name.
+    "arc",
 ];
 
 /// Check if a schema name is a preset
@@ -58,7 +64,11 @@ fn load_preset_schema(schema_dir: &Path, schema_name: &str) -> Result<serde_json
         .map_err(|e| format!("Failed to parse schema JSON from {:?}: {}", schema_path, e))
 }
 
-fn load_embedded_preset_schema(schema_name: &str) -> Result<serde_json::Value, String> {
+/// Parse a preset straight from the embedded registry, bypassing the host's
+/// schema directory. Callers that need a preset's shape as a value (rather than
+/// to validate against it) read it here so there is one definition of each
+/// preset's fields in the codebase.
+pub(crate) fn load_embedded_preset_schema(schema_name: &str) -> Result<serde_json::Value, String> {
     let content = embedded_preset_schema(schema_name)
         .ok_or_else(|| format!("Embedded preset schema '{}' is not available", schema_name))?;
     serde_json::from_str(content)
@@ -104,7 +114,29 @@ mod tests {
         assert!(is_preset_schema("checklist"));
         assert!(is_preset_schema("implementation"));
         assert!(is_preset_schema("return"));
+        assert!(is_preset_schema("arc"));
         assert!(!is_preset_schema("custom"));
         assert!(!is_preset_schema(""));
+    }
+
+    #[test]
+    fn every_listed_preset_resolves_from_the_embedded_registry() {
+        // The name list and the embedded registry are two halves of one answer.
+        // A name on the list with nothing behind it resolves to an error at
+        // write time, and a schema behind a name that is not listed is refused
+        // by name before it is ever read — which is exactly how a new thread
+        // came to be unable to create its arc.
+        for name in PRESET_SCHEMAS {
+            let schema = resolve_output_schema(
+                None,
+                &crate::models::OutputSchema::Preset((*name).to_string()),
+            )
+            .unwrap_or_else(|error| panic!("preset `{name}` does not resolve: {error}"));
+            let fields = schema
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .unwrap_or_else(|| panic!("preset `{name}` declares no properties"));
+            assert!(!fields.is_empty(), "preset `{name}` declares no fields");
+        }
     }
 }

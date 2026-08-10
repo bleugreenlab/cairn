@@ -7,11 +7,10 @@ use super::run::MAX_BUFFER_SIZE;
 use crate::services::{ensure_submitted_line, get_default_shell, LeaseTerminalBinding, PtySession};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::executor_protocol::{
-    CellOwnerRef, CellPriority, OwnerDeathPolicy, ProcessSandboxMode, RepositoryLocator,
-    ResidencyAcquireRequest, ResidencyFence, ResidencyFootprint, ResidencyHolder,
-    ResidencyOperation, ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind,
-    ResidentProcessIoMode, ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus,
-    ResidentPtySize, ResidentSandboxPolicy,
+    CellOwnerRef, ProcessSandboxMode, ResidencyAcquireRequest, ResidencyFence, ResidencyOperation,
+    ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode,
+    ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentPtySize,
+    ResidentSandboxPolicy,
 };
 use cairn_common::ids;
 use cairn_common::uri::CairnResource;
@@ -30,6 +29,84 @@ use crate::orchestrator::Orchestrator;
 pub struct PtyDataPayload {
     pub session_id: String,
     pub data: String,
+}
+
+/// Re-drive durable terminal-exit subscriptions whose terminal has already
+/// settled or disappeared. Normal PTY finalization routes immediately, but a
+/// runner restart can lose that edge while both the terminal row and subscription
+/// survive independently. Resolve by canonical resource identity: project
+/// terminals belong to a project row but are subscribed by the creating job.
+fn reconciled_terminal_tail(row: Option<&TerminalWakeRow>) -> Option<&str> {
+    match row {
+        Some(row) => row.output_tail.as_deref(),
+        None => Some("Cairn did not recover this terminal after runner shutdown."),
+    }
+}
+
+pub(crate) async fn reconcile_exited_terminal_wakes(orch: &Orchestrator) -> Result<usize, String> {
+    let uris = orch
+        .db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT DISTINCT source_ref FROM wake_subscriptions
+                         WHERE state = 'active' AND one_shot = 1
+                           AND source_kind = 'process'
+                           AND fact_kinds_json LIKE '%terminal_exit%'
+                           AND source_ref LIKE '%/terminal/%'",
+                        (),
+                    )
+                    .await?;
+                let mut uris = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    uris.push(row.text(0)?);
+                }
+                Ok(uris)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let mut routed = 0;
+    for uri in uris {
+        let Some(resource) = cairn_common::uri::parse_uri(&uri) else {
+            continue;
+        };
+        let slug = match &resource {
+            CairnResource::NodeTerminal { slug, .. }
+            | CairnResource::TaskTerminal { slug, .. }
+            | CairnResource::ProjectTerminal { slug, .. } => slug.clone(),
+            _ => continue,
+        };
+        let row = match resolve_terminal_resource_target(&orch.db.local, &resource).await {
+            Ok(target) => lookup_terminal_for_wake_target(&orch.db.local, &target)
+                .await
+                .map_err(|error| error.to_string())?,
+            // A deleted job/project is also a definitively absent terminal.
+            Err(_) => None,
+        };
+        if row.as_ref().is_some_and(|row| row.status != "exited") {
+            continue;
+        }
+
+        let runtime_secs = row
+            .as_ref()
+            .and_then(|row| row.exited_at.map(|exited| (exited - row.created_at).max(0)));
+        crate::orchestrator::wakes::route_terminal_exit_async(
+            orch,
+            &slug,
+            &uri,
+            row.as_ref().and_then(|row| row.exit_code),
+            runtime_secs,
+            reconciled_terminal_tail(row.as_ref()),
+        )
+        .await?;
+        routed += 1;
+    }
+
+    Ok(routed)
 }
 
 /// How a terminal's PTY runs the command it was created with.
@@ -391,9 +468,9 @@ async fn restart_terminal_process(
     let mut target = resolve_terminal_resource_target(&orch.db.local, &resource)
         .await
         .map_err(|error| error.to_string())?;
-    ensure_terminal_slug_available(&orch.db.local, &target)
-        .await
-        .map_err(|error| error.to_string())?;
+    // This is the fenced recovery of the row that already owns the slug, not a
+    // competing create. New terminal creation performs the live-slug admission
+    // check before it reaches this path.
     // Carrying the title forward is what keeps a restart honest: the re-inserted
     // row must make the same statement about itself as the one it replaces, or
     // the next recovery reclassifies an operator's terminal as a one-shot.
@@ -789,57 +866,40 @@ pub(crate) async fn stop_terminal_by_session(
     }
 }
 
+/// The terminal resource that a slug names beneath a job, for the UI's create
+/// path and for restart recovery.
+///
+/// Resolution is job → canonical home URI → the `terminal/<slug>` beneath it,
+/// which is literally the address an agent writes as `cairn:~/terminal/<slug>`.
+/// Both owners come out of [`crate::jobs::queries::home_uri_for_job`] — an issue
+/// node, a sub-agent task, and a thread session alike — so the UI path and the
+/// agent path converge on one resource for one terminal instead of two ways of
+/// naming it.
+///
+/// The issue-shaped query this replaced was one more copy of the job-coordinate
+/// lookup that `home_uri_for_job` exists to be, and it inner-joined `issues` and
+/// `executions`. A thread session job
+/// is NULL on both, so it was dropped by the join and reported as "Job not
+/// found": the + menu's Terminal (and any restart of an agent-made thread
+/// terminal) died there, while the agent's own create — which never ran this
+/// query — worked (CAIRN-3841).
 pub(crate) async fn terminal_resource_for_job(
     db: &LocalDb,
     job_id: &str,
     slug: String,
 ) -> Result<CairnResource, String> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        let slug = slug.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT p.key, i.number, e.seq, j.uri_segment, parent.uri_segment
-                     FROM jobs j
-                     JOIN projects p ON p.id = j.project_id
-                     JOIN issues i ON i.id = j.issue_id
-                     JOIN executions e ON e.id = j.execution_id
-                     LEFT JOIN jobs parent ON parent.id = j.parent_job_id
-                     WHERE j.id = ?1 LIMIT 1",
-                    (job_id.as_str(),),
-                )
-                .await?;
-            let row = rows
-                .next()
-                .await?
-                .ok_or_else(|| crate::storage::DbError::Row(format!("Job not found: {job_id}")))?;
-            let project = row.text(0)?;
-            let number = row.i64(1)? as i32;
-            let exec_seq = row.i64(2)? as i32;
-            let segment = row.text(3)?;
-            Ok(match row.opt_text(4)? {
-                Some(node_id) => CairnResource::TaskTerminal {
-                    project,
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name: segment,
-                    slug,
-                },
-                None => CairnResource::NodeTerminal {
-                    project,
-                    number,
-                    exec_seq,
-                    node_id: segment,
-                    slug,
-                },
-            })
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
+    let home = crate::jobs::queries::home_uri_for_job(db, job_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Job not found: {job_id}"))?;
+    let uri = format!("{home}/terminal/{slug}");
+    let resource = cairn_common::uri::parse_uri(&uri)
+        .ok_or_else(|| format!("Job {job_id} has no addressable terminal at {uri}"))?;
+    // A thread's home URI parses as a `Thread` with a `terminal/<slug>` path;
+    // delegation turns it into the node-family resource the rest of the terminal
+    // stack answers for. Every other owner is already node-family and passes
+    // through untouched.
+    crate::resources::delegate_thread_descendant(resource)
 }
 
 pub(crate) async fn terminal_resource_for_project(
@@ -1113,110 +1173,59 @@ async fn terminal_delivery_target(
 ///
 /// A terminal on a job's managed branch is not a separate execution surface: it
 /// is another process in that job's one execution environment, sharing the cell
-/// with the job's run batches and REPLs. A project terminal has no job, so it
-/// holds a residency of its own.
+/// with the job's run batches and REPLs. A branchless owner — a project terminal,
+/// which has no job at all, or a thread session, which has a job but no branch —
+/// holds a residency over the project's live checkout instead, shared with that
+/// owner's REPLs the same way.
 async fn terminal_residency_acquisition(
     orch: &Orchestrator,
     target: &TerminalResourceTarget,
 ) -> Result<ResidencyAcquireRequest, String> {
-    let owner_id = target
-        .job_id
-        .clone()
-        .unwrap_or_else(|| target.project_id.clone());
-    let branch = target.branch.clone();
-    let repo_path = target.repo_path.clone();
-    let project_id = target.project_id.clone();
-    let jj_binary_path = orch.jj_binary_path.clone();
-    let config_dir = orch.config_dir.clone();
-    let (repository, base_commit) = tokio::task::spawn_blocking(move || {
-        if let Some(branch) = branch {
-            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
-            let store = crate::jj::project_store_dir(&config_dir, std::path::Path::new(&repo_path));
-            let base_commit =
-                crate::jj::bookmark_commit(&jj, &store, &branch).ok_or_else(|| {
-                    format!("agent terminal branch `{branch}` does not resolve to a committed head")
-                })?;
-            Ok((
-                RepositoryLocator::ColocatedPath {
-                    project_id: project_id.clone(),
-                    repository_id: project_id.clone(),
-                    absolute_path: repo_path.clone(),
-                },
-                base_commit,
-            ))
-        } else {
-            let output = std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&repo_path)
-                .output()
-                .map_err(|error| format!("resolve project checkout head: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "resolve project checkout head: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-            Ok((
-                RepositoryLocator::ExistingCheckout {
-                    project_id: project_id.clone(),
-                    repository_id: project_id,
-                    absolute_path: repo_path,
-                },
-                String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            ))
-        }
-    })
-    .await
-    .map_err(|error| format!("terminal VCS resolution task failed: {error}"))??;
     // A terminal on a job's managed branch is not a separate execution surface:
     // it is another process in that job's one execution home, sharing the cell
     // with the job's run batches and REPLs. It therefore presents the same
     // declaration they do, built from the job row so every caller converges.
+    //
+    // A THREAD session takes the branchless path below instead,
+    // and that is deliberate rather than incidental: a thread is commit-fenced by
+    // construction and owns no branch, so there is no managed checkout to
+    // materialize. Its terminal therefore runs in the project's live checkout
+    // under a `ProjectTerminals` holder, like a project terminal — with two
+    // consequences worth knowing. What such a shell writes is not fenced to a
+    // worktree, and slug uniqueness is keyed per job
+    // (`ensure_terminal_slug_available`), so two threads can each hold a running
+    // `terminal/dev` in that one shared directory where two project terminals
+    // could not.
+    //
+    // Opening a terminal has no wait bound of its own beyond the machine-wide
+    // default: a cold cell legitimately takes minutes to provision, and a caller
+    // that gives up before then is reported by the liveness frame rather than
+    // inferred from a thirty-second clock.
     let fleet_config = crate::config::settings::load_fleet(&orch.config_dir);
-    if let (Some(job_id), true) = (target.job_id.as_deref(), target.branch.is_some()) {
+    let wait_horizon_unix_ms = crate::fleet::default_wait_horizon_unix_ms(&fleet_config);
+    if let (Some(job_id), Some(branch)) = (target.job_id.as_deref(), target.branch.as_deref()) {
+        let base_commit = resolve_terminal_branch_tip(orch, &target.repo_path, branch).await?;
         return crate::fleet::residency::job_residency_request(
             &orch.db.local,
             job_id,
             &base_commit,
-            crate::fleet::default_wait_horizon_unix_ms(&fleet_config),
+            wait_horizon_unix_ms,
             crate::fleet::unix_time_ms(),
         )
         .await;
     }
-    let disk_growth_bytes = if matches!(repository, RepositoryLocator::ExistingCheckout { .. }) {
-        0
-    } else {
-        1024 * 1024 * 1024
-    };
-    Ok(ResidencyAcquireRequest {
-        executor: None,
-        holder: ResidencyHolder::ProjectTerminals {
-            project_id: owner_id.clone(),
-        },
-        owner_ref: target.owner_ref.clone(),
-        selector: None,
-        repository,
-        initial_base_commit: base_commit,
-        // Project terminals hold a place to live in, not a workload. The
-        // footprint is the checkout and the resident shells' memory; the work
-        // those shells do is charged where it is admitted, which for an
-        // interactive shell is nowhere.
-        footprint: ResidencyFootprint {
-            memory_bytes: 64 * 1024 * 1024,
-            disk_growth_bytes,
-        },
-        death_policy: OwnerDeathPolicy {
-            heartbeat_timeout_ms: crate::terminal_host::TERMINAL_HEARTBEAT_TIMEOUT_MS,
-            reclaim_grace_ms: crate::terminal_host::TERMINAL_RECLAIM_GRACE_MS,
-        },
-        priority: CellPriority::AgentInteractive,
-        // Opening a terminal has no bound of its own beyond the machine-wide
-        // default: a cold cell legitimately takes minutes to provision, and a
-        // caller that gives up before then is reported by the liveness frame
-        // rather than inferred from a thirty-second clock.
-        wait_horizon_unix_ms: crate::fleet::default_wait_horizon_unix_ms(&fleet_config),
-        waiting_since_unix_ms: crate::fleet::unix_time_ms(),
-    })
+    let owner_id = target
+        .job_id
+        .clone()
+        .unwrap_or_else(|| target.project_id.clone());
+    crate::fleet::residency::live_checkout_residency_request(
+        &owner_id,
+        &target.project_id,
+        &target.repo_path,
+        target.owner_ref.clone(),
+        wait_horizon_unix_ms,
+    )
+    .await
 }
 
 /// PTY exit event payload (mirrors Tauri-side PtyExitPayload)
@@ -1235,6 +1244,21 @@ pub struct AgentTerminalCreatedPayload {
     pub session_id: String,
     pub command: String,
     pub description: Option<String>,
+}
+
+/// The issue coordinate a terminal's owner ref carries, or `None` for an owner
+/// that has no issue.
+///
+/// A thread session owns terminals exactly as an execution node does, but it
+/// hangs off no issue and no execution — its coordinate is the reserved
+/// `(0, 0, thread-name)` sentinel. `CellOwnerRef` makes both fields optional, so
+/// the honest answer is to omit them rather than let a `0` placeholder travel
+/// out to the executor and the UI as if it named issue zero.
+fn owner_issue_coordinate(number: i32, exec_seq: i32, node_id: &str) -> (Option<i32>, Option<i32>) {
+    match cairn_common::uri::NodeAddress::new(number, exec_seq, node_id) {
+        cairn_common::uri::NodeAddress::Thread { .. } => (None, None),
+        cairn_common::uri::NodeAddress::Node { .. } => (Some(number), Some(exec_seq)),
+    }
 }
 
 #[derive(Clone)]
@@ -1265,70 +1289,23 @@ async fn resolve_terminal_resource_target(
                     node_id,
                     slug,
                 } => {
-                    let job_id = find_terminal_target_job_id(conn, &project, number, exec_seq, &node_id)
-                        .await?
-                        .ok_or_else(|| {
-                            crate::storage::DbError::Row(format!(
-                                "No node job found for terminal target {project}-{number}/{exec_seq}/{node_id}"
-                            ))
-                        })?;
-                    let mut rows = conn
-                        .query(
-                            "
-                            SELECT j.project_id, r.id, j.branch, p.repo_path
-                            FROM jobs j
-                            JOIN projects p ON j.project_id = p.id
-                            LEFT JOIN runs r ON r.job_id = j.id
-                            WHERE j.id = ?1
-                            ORDER BY r.created_at DESC
-                            LIMIT 1
-                            ",
-                            (job_id.as_str(),),
-                        )
-                        .await?;
-                    let row = rows.next().await?.ok_or_else(|| {
-                        crate::storage::DbError::Row(format!("No job found for id {job_id}"))
-                    })?;
-                    Ok(TerminalResourceTarget {
-                        slug,
-                        job_id: Some(job_id.clone()),
-                        project_id: row.text(0)?,
-                        cwd: crate::scratch::ensure_job_scratch_dir(&job_id, None)
-                            .to_string_lossy()
-                            .into_owned(),
-                        run_id: row.opt_text(1)?,
-                        branch: row.opt_text(2)?,
-                        repo_path: row.text(3)?,
-                        owner_ref: Some(CellOwnerRef {
-                            project_id: row.text(0)?, project_key: Some(project.clone()),
-                            issue_number: Some(number), job_id: Some(job_id.clone()),
-                            execution_seq: Some(exec_seq), node_kind: Some(node_id),
-                        }),
-                        lease: None,
-                    })
-                }
-                CairnResource::TaskTerminal {
-                    project,
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name,
-                    slug,
-                } => {
-                    let job_id = find_task_terminal_target_job_id(
-                        conn,
-                        &project,
-                        number,
-                        exec_seq,
-                        &node_id,
-                        &task_name,
+                    let address = cairn_common::uri::build_node_terminal_uri(
+                        &project, number, exec_seq, &node_id, &slug,
+                    );
+                    let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
+                        conn, &project, number, exec_seq, &node_id, None,
                     )
                     .await?
                     .ok_or_else(|| {
                         crate::storage::DbError::Row(format!(
-                            "No task job found for terminal target {project}-{number}/{exec_seq}/{node_id}/task/{task_name}"
+                            "No job owns the terminal target {address}. {}",
+                            crate::resources::node_job_not_found_message(
+                                &project, number, exec_seq, &node_id
+                            )
                         ))
                     })?;
+                    let (issue_number, execution_seq) =
+                        owner_issue_coordinate(number, exec_seq, &node_id);
                     let mut rows = conn
                         .query(
                             "
@@ -1359,9 +1336,74 @@ async fn resolve_terminal_resource_target(
                         owner_ref: Some(CellOwnerRef {
                             project_id: row.text(0)?,
                             project_key: Some(project.clone()),
-                            issue_number: Some(number),
+                            issue_number,
                             job_id: Some(job_id.clone()),
-                            execution_seq: Some(exec_seq),
+                            execution_seq,
+                            node_kind: Some(node_id),
+                        }),
+                        lease: None,
+                    })
+                }
+                CairnResource::TaskTerminal {
+                    project,
+                    number,
+                    exec_seq,
+                    node_id,
+                    task_name,
+                    slug,
+                } => {
+                    let address = cairn_common::uri::build_task_terminal_uri(
+                        &project, number, exec_seq, &node_id, &task_name, &slug,
+                    );
+                    let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
+                        conn,
+                        &project,
+                        number,
+                        exec_seq,
+                        &node_id,
+                        Some(&task_name),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        crate::storage::DbError::Row(format!(
+                            "No job owns the terminal target {address}"
+                        ))
+                    })?;
+                    let (issue_number, execution_seq) =
+                        owner_issue_coordinate(number, exec_seq, &node_id);
+                    let mut rows = conn
+                        .query(
+                            "
+                            SELECT j.project_id, r.id, j.branch, p.repo_path
+                            FROM jobs j
+                            JOIN projects p ON j.project_id = p.id
+                            LEFT JOIN runs r ON r.job_id = j.id
+                            WHERE j.id = ?1
+                            ORDER BY r.created_at DESC
+                            LIMIT 1
+                            ",
+                            (job_id.as_str(),),
+                        )
+                        .await?;
+                    let row = rows.next().await?.ok_or_else(|| {
+                        crate::storage::DbError::Row(format!("No job found for id {job_id}"))
+                    })?;
+                    Ok(TerminalResourceTarget {
+                        slug,
+                        job_id: Some(job_id.clone()),
+                        project_id: row.text(0)?,
+                        cwd: crate::scratch::ensure_job_scratch_dir(&job_id, None)
+                            .to_string_lossy()
+                            .into_owned(),
+                        run_id: row.opt_text(1)?,
+                        branch: row.opt_text(2)?,
+                        repo_path: row.text(3)?,
+                        owner_ref: Some(CellOwnerRef {
+                            project_id: row.text(0)?,
+                            project_key: Some(project.clone()),
+                            issue_number,
+                            job_id: Some(job_id.clone()),
+                            execution_seq,
                             node_kind: Some(task_name),
                         }),
                         lease: None,
@@ -1415,8 +1457,8 @@ async fn ensure_terminal_slug_available(
             // post-exit reads and already-exited wake subscribes) and are
             // reclaimed on insert, so they must not block re-creating the slug.
             let exists = match job_id.as_deref() {
-                Some(job_id) => terminal_slug_running_for_job(conn, job_id, &slug).await?,
-                None => terminal_slug_running_for_project(conn, &project_id, &slug).await?,
+                Some(job_id) => terminal_slug_live_for_job(conn, job_id, &slug).await?,
+                None => terminal_slug_live_for_project(conn, &project_id, &slug).await?,
             };
             if exists {
                 return Err(crate::storage::DbError::Row(format!(
@@ -1516,112 +1558,10 @@ async fn insert_terminal_resource(
     .await
 }
 
-async fn find_terminal_target_job_id(
-    conn: &cairn_db::turso::Connection,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    node_id: &str,
-) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut issue_rows = conn
-        .query(
-            "
-            SELECT i.id
-            FROM issues i
-            JOIN projects p ON i.project_id = p.id
-            WHERE p.key = ?1 AND i.number = ?2
-            LIMIT 1
-            ",
-            (lookup_key.as_str(), issue_number),
-        )
-        .await?;
-
-    let Some(issue_row) = issue_rows.next().await? else {
-        return Ok(None);
-    };
-    let issue_id = issue_row.text(0)?;
-
-    let mut exec_rows = conn
-        .query(
-            "
-            SELECT id
-            FROM executions
-            WHERE issue_id = ?1 AND seq = ?2
-            LIMIT 1
-            ",
-            (issue_id.as_str(), exec_seq),
-        )
-        .await?;
-
-    let Some(exec_row) = exec_rows.next().await? else {
-        return Ok(None);
-    };
-    let exec_id = exec_row.text(0)?;
-
-    let mut exact_rows = conn
-        .query(
-            "
-            SELECT id
-            FROM jobs
-            WHERE issue_id = ?1
-              AND execution_id = ?2
-              AND parent_job_id IS NULL
-              AND uri_segment = ?3
-            LIMIT 1
-            ",
-            (issue_id.as_str(), exec_id.as_str(), node_id),
-        )
-        .await?;
-
-    if let Some(row) = exact_rows.next().await? {
-        return Ok(Some(row.text(0)?));
-    }
-
-    Ok(None)
-}
-
-async fn find_task_terminal_target_job_id(
-    conn: &cairn_db::turso::Connection,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    parent_node_id: &str,
-    task_name: &str,
-) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut rows = conn
-        .query(
-            "
-            SELECT child.id
-            FROM jobs parent
-            JOIN jobs child ON child.parent_job_id = parent.id
-            JOIN issues i ON parent.issue_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            JOIN executions e ON parent.execution_id = e.id
-            WHERE p.key = ?1
-              AND i.number = ?2
-              AND e.seq = ?3
-              AND parent.parent_job_id IS NULL
-              AND parent.uri_segment = ?4
-              AND child.uri_segment = ?5
-            LIMIT 1
-            ",
-            (
-                lookup_key.as_str(),
-                issue_number,
-                exec_seq,
-                parent_node_id,
-                task_name,
-            ),
-        )
-        .await?;
-    rows.next().await?.map(|row| row.text(0)).transpose()
-}
-
-/// Whether a *running* terminal with this slug exists in the job scope. Used by
-/// create-availability so a lingering exited row does not block re-use.
-async fn terminal_slug_running_for_job(
+/// Whether a live terminal with this slug exists in the job scope. Only a
+/// definitively exited row is reclaimable; recovering and closing rows still own
+/// their process or teardown fence.
+async fn terminal_slug_live_for_job(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     slug: &str,
@@ -1629,7 +1569,7 @@ async fn terminal_slug_running_for_job(
     let mut rows = conn
         .query(
             "SELECT COUNT(*) FROM job_terminals
-             WHERE job_id = ?1 AND slug = ?2 AND status = 'running'",
+             WHERE job_id = ?1 AND slug = ?2 AND status != 'exited'",
             (job_id, slug),
         )
         .await?;
@@ -1640,7 +1580,7 @@ async fn terminal_slug_running_for_job(
     Ok(row.i64(0)? > 0)
 }
 
-async fn terminal_slug_running_for_project(
+async fn terminal_slug_live_for_project(
     conn: &cairn_db::turso::Connection,
     project_id: &str,
     slug: &str,
@@ -1648,7 +1588,7 @@ async fn terminal_slug_running_for_project(
     let mut rows = conn
         .query(
             "SELECT COUNT(*) FROM job_terminals
-             WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2 AND status = 'running'",
+             WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2 AND status != 'exited'",
             (project_id, slug),
         )
         .await?;
@@ -1691,6 +1631,43 @@ pub(crate) async fn lookup_terminal_for_wake(
                     params![job_id.as_str(), slug.as_str()],
                 )
                 .await?;
+            terminal_wake_row_from_rows(&mut rows).await
+        })
+    })
+    .await
+}
+
+async fn lookup_terminal_for_wake_target(
+    db: &LocalDb,
+    target: &TerminalResourceTarget,
+) -> DbResult<Option<TerminalWakeRow>> {
+    let job_id = target.job_id.clone();
+    let project_id = target.project_id.clone();
+    let slug = target.slug.clone();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        let project_id = project_id.clone();
+        let slug = slug.clone();
+        Box::pin(async move {
+            let mut rows = match job_id.as_deref() {
+                Some(job_id) => {
+                    conn.query(
+                        "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
+                         FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
+                        params![job_id, slug.as_str()],
+                    )
+                    .await?
+                }
+                None => {
+                    conn.query(
+                        "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
+                         FROM job_terminals
+                         WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2 LIMIT 1",
+                        params![project_id.as_str(), slug.as_str()],
+                    )
+                    .await?
+                }
+            };
             terminal_wake_row_from_rows(&mut rows).await
         })
     })
@@ -2520,6 +2497,16 @@ async fn spawn_terminal_session(
         return Err(error);
     }
 
+    // Retire any durable exit subscription belonging to a previous incarnation
+    // before replacing its exited row. Otherwise slug reuse would attach the old
+    // one-shot wake to this new process.
+    if let Err(error) = reconcile_exited_terminal_wakes(orch).await {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(format!(
+            "Could not reconcile previous terminal wake: {error}"
+        ));
+    }
+
     // The durable binding must predate handler registration and StartProcess.
     // An executor may emit Exited before StartProcess returns; the finalizer
     // therefore needs a running row to transition before any event can arrive.
@@ -3307,8 +3294,8 @@ mod terminal_finalize_tests {
     use crate::storage::SearchIndex;
     use cairn_common::executor_protocol::{
         CellCheckoutKind, CellResidency, ExecutorMessage, ExecutorSubstrateReport, FleetSnapshot,
-        PersistentCellLifecycle, PersistentCellState, ResidencyFailureKind, ResidencyPhase,
-        ResidentProcess,
+        OwnerDeathPolicy, PersistentCellLifecycle, PersistentCellState, RepositoryLocator,
+        ResidencyFailureKind, ResidencyFootprint, ResidencyHolder, ResidencyPhase, ResidentProcess,
     };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
@@ -3356,6 +3343,200 @@ mod terminal_finalize_tests {
             owner_ref: Some(owner_ref),
             lease: None,
         }
+    }
+
+    /// A thread session owns terminals, and resolving one is what was broken:
+    /// `write cairn:~/terminal/smoke` from a thread reached a resolver with no
+    /// arm for an owner that has no issue, so the mutation was judged against the
+    /// thread resource itself and rejected.
+    ///
+    /// The target it resolves to must carry the SESSION's job (so the terminal is
+    /// owned by the thread, not orphaned), a real job-keyed working directory,
+    /// and an owner ref that omits the issue coordinate rather than reporting
+    /// issue zero.
+    #[tokio::test]
+    async fn a_thread_session_resolves_its_own_terminal_target() {
+        let db = crate::storage::migrated_test_db("term_thread_target.db").await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+             INSERT INTO threads (id, project_id, name, created_at, updated_at)
+             VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);",
+        )
+        .await
+        .unwrap();
+        let job_id = crate::threads::ensure_thread_session(&db, "t-ux")
+            .await
+            .unwrap();
+
+        let resource = cairn_common::uri::parse_uri("cairn://p/THR/thread-ux/terminal/smoke")
+            .and_then(|resource| crate::resources::delegate_thread_descendant(resource).ok())
+            .expect("a thread terminal path normalizes");
+        assert!(matches!(resource, CairnResource::NodeTerminal { .. }));
+
+        let target = resolve_terminal_resource_target(&db, &resource)
+            .await
+            .expect("a thread session's terminal target resolves");
+
+        assert_eq!(target.slug, "smoke");
+        assert_eq!(target.job_id.as_deref(), Some(job_id.as_str()));
+        // A thread session carries no branch, so its terminal takes the
+        // branchless residency path and ends up in the project's live checkout;
+        // `materialize_terminal_lease` overwrites this pre-lease cwd with the
+        // cell path, so what matters here is only that resolution produced a
+        // target at all.
+        assert!(target.branch.is_none(), "a thread session owns no branch");
+        let owner = target.owner_ref.expect("a thread terminal has an owner");
+        assert_eq!(owner.job_id.as_deref(), Some(job_id.as_str()));
+        assert_eq!(owner.node_kind.as_deref(), Some("thread-ux"));
+        assert_eq!(
+            (owner.issue_number, owner.execution_seq),
+            (None, None),
+            "a thread has no issue and no execution; the owner ref must say so \
+             rather than report zero"
+        );
+    }
+
+    /// A terminal addressed on a thread that has never run reports the thread,
+    /// not a missing node under issue zero.
+    #[tokio::test]
+    async fn a_dormant_threads_terminal_target_names_the_thread() {
+        let db = crate::storage::migrated_test_db("term_thread_dormant.db").await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+             INSERT INTO threads (id, project_id, name, created_at, updated_at)
+             VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);",
+        )
+        .await
+        .unwrap();
+        let resource = cairn_common::uri::parse_uri("cairn://p/THR/thread-ux/terminal/smoke")
+            .and_then(|resource| crate::resources::delegate_thread_descendant(resource).ok())
+            .unwrap();
+        let error = resolve_terminal_resource_target(&db, &resource)
+            .await
+            .err()
+            .expect("a thread with no session has no terminal target")
+            .to_string();
+        assert!(
+            error.contains("cairn://p/THR/thread-ux/terminal/smoke"),
+            "the message names the terminal that was addressed: {error}"
+        );
+        assert!(
+            error.contains("has no session yet"),
+            "the message names the reason in the owner's terms: {error}"
+        );
+        assert!(!error.contains("THR-0"), "{error}");
+    }
+
+    /// The UI's + menu resolves a terminal from the pane's JOB, and every owner
+    /// a pane can show must come out of it: an issue node, a sub-agent task
+    /// beneath one, and a thread session.
+    ///
+    /// The thread arm is the regression. A thread session job has NULL
+    /// `issue_id` and NULL `execution_id`, so the issue-shaped query this
+    /// resolution used to run dropped it and answered "Job not found" — the
+    /// frontend mutation rejected, the rejection was swallowed, and the menu
+    /// item did nothing at all (CAIRN-3841). The shape it must produce is the
+    /// reserved `(0, 0, thread-name)` coordinate, the very resource the thread's
+    /// own agent gets from `cairn:~/terminal/<slug>`, so both paths address one
+    /// terminal.
+    #[tokio::test]
+    async fn every_owner_of_a_pane_resolves_its_terminal_resource() {
+        let db = crate::storage::migrated_test_db("term_resource_for_job.db").await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+             INSERT INTO threads (id, project_id, name, created_at, updated_at)
+             VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i-9', 'p-thr', 9, 'Node work', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('e-9', 'build', 'i-9', 'p-thr', 'running', 1, 2);
+             INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+             VALUES ('j-node', 'e-9', 'i-9', 'p-thr', 'running', 'builder', 'Builder', 1, 1);
+             INSERT INTO jobs (id, parent_job_id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+             VALUES ('j-task', 'j-node', 'e-9', 'i-9', 'p-thr', 'running', 'probe', 'Explore', 2, 2);
+             INSERT INTO jobs (id, parent_job_id, execution_id, issue_id, project_id, agent_config_id, status, uri_segment, node_name, created_at, updated_at)
+             VALUES ('j-flow', 'j-node', 'e-9', 'i-9', 'p-thr', 'workflow', 'running', 'ship', 'Workflow', 3, 3);",
+        )
+        .await
+        .unwrap();
+        let session_job = crate::threads::ensure_thread_session(&db, "t-ux")
+            .await
+            .unwrap();
+
+        let node = terminal_resource_for_job(&db, "j-node", "smoke".to_string())
+            .await
+            .expect("an issue node resolves its terminal");
+        assert!(
+            matches!(
+                &node,
+                CairnResource::NodeTerminal { project, number: 9, exec_seq: 2, node_id, slug }
+                    if project == "THR" && node_id == "builder" && slug == "smoke"
+            ),
+            "{node:?}"
+        );
+
+        let task = terminal_resource_for_job(&db, "j-task", "smoke".to_string())
+            .await
+            .expect("a sub-agent task resolves its terminal");
+        assert!(
+            matches!(
+                &task,
+                CairnResource::TaskTerminal { project, number: 9, exec_seq: 2, node_id, task_name, slug }
+                    if project == "THR" && node_id == "builder" && task_name == "probe" && slug == "smoke"
+            ),
+            "{task:?}"
+        );
+
+        // A workflow is a child job for the delegation tree, yet it is addressed
+        // as a node by its own segment. This resolution now says so: deciding
+        // "task" from merely having a parent named a workflow's terminal one way
+        // here and another way in the workflow agent's own cairn:~/terminal.
+        // Both forms resolve back to this same job, and the terminal row is keyed
+        // by (job_id, slug), so what changes is only that one address is now the
+        // single one.
+        let workflow = terminal_resource_for_job(&db, "j-flow", "smoke".to_string())
+            .await
+            .expect("a workflow resolves its terminal");
+        assert!(
+            matches!(
+                &workflow,
+                CairnResource::NodeTerminal { project, number: 9, exec_seq: 2, node_id, slug }
+                    if project == "THR" && node_id == "ship" && slug == "smoke"
+            ),
+            "a workflow is a node by its own segment, not a task under its parent: {workflow:?}"
+        );
+
+        let thread = terminal_resource_for_job(&db, &session_job, "smoke".to_string())
+            .await
+            .expect("a thread session resolves its terminal instead of 'Job not found'");
+        assert!(
+            matches!(
+                &thread,
+                CairnResource::NodeTerminal { project, number: 0, exec_seq: 0, node_id, slug }
+                    if project == "THR" && node_id == "thread-ux" && slug == "smoke"
+            ),
+            "{thread:?}"
+        );
+        // The two creation paths must name the same terminal, or a UI create and
+        // an agent read would address different things.
+        assert_eq!(
+            thread.to_uri(),
+            "cairn://p/THR/thread-ux/terminal/smoke",
+            "the UI path lands on the address the agent writes"
+        );
+        // And it resolves back to the session that owns it.
+        let target = resolve_terminal_resource_target(&db, &thread)
+            .await
+            .expect("the resolved resource round-trips to its owning job");
+        assert_eq!(target.job_id.as_deref(), Some(session_job.as_str()));
+
+        let missing = terminal_resource_for_job(&db, "nope", "smoke".to_string())
+            .await
+            .expect_err("an unknown job is still an error");
+        assert!(missing.contains("nope"), "{missing}");
     }
 
     #[tokio::test]
@@ -5093,6 +5274,230 @@ mod terminal_finalize_tests {
         assert!(
             !subs.iter().any(|s| s.source_kind == "process"),
             "the routed exit must consume the newly persisted one-shot exit subscription"
+        );
+    }
+
+    /// A runner-local PTY cannot survive runner replacement. Its durable row and
+    /// one-shot exit subscription do survive, so startup must settle the row and
+    /// replay the exit fact rather than waiting for an event from a dead reader.
+    #[test]
+    fn startup_reconciles_subscribed_runner_local_terminal_exit() {
+        let db = block_on(crate::storage::migrated_test_db(
+            "term_startup_exit_reconcile.db",
+        ));
+        let orch = test_orchestrator(db);
+        block_on(seed(&orch.db.local));
+        block_on(seed_live_turn(&orch.db.local));
+
+        let uri = node_uri();
+        let row = block_on(lookup_terminal_for_wake(&orch.db.local, "j", "run-1"))
+            .unwrap()
+            .unwrap();
+        let outcome = block_on(subscribe_terminal_exit_wake_once(
+            &orch,
+            "j",
+            "run-1",
+            &uri,
+            Some(&row),
+            row.session_id.as_deref(),
+            "agent",
+        ))
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            TerminalWakeSubscriptionOutcome::ExitSubscribed
+        ));
+
+        assert!(block_on(crate::terminal_host::prepare_terminal_recovery(&orch)).unwrap() >= 1);
+        let terminal = block_on(lookup_terminal_for_wake(&orch.db.local, "j", "run-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, "exited");
+        assert!(terminal.exited_at.is_some());
+
+        let subs = block_on(crate::orchestrator::wakes::list_subscriptions_for_job(
+            &orch.db.local,
+            "j",
+        ))
+        .unwrap();
+        assert!(
+            !subs
+                .iter()
+                .any(|sub| sub.source_ref.as_deref() == Some(uri.as_str())),
+            "startup replay must consume the terminal's one-shot subscription"
+        );
+    }
+
+    #[test]
+    fn reconciliation_reason_distinguishes_silent_exit_from_missing_terminal() {
+        let silent_exit = TerminalWakeRow {
+            status: "exited".to_string(),
+            exit_code: Some(0),
+            created_at: 1,
+            exited_at: Some(2),
+            output_tail: None,
+            session_id: Some("silent".to_string()),
+        };
+        assert_eq!(reconciled_terminal_tail(Some(&silent_exit)), None);
+        assert_eq!(
+            reconciled_terminal_tail(None),
+            Some("Cairn did not recover this terminal after runner shutdown.")
+        );
+    }
+
+    /// Project terminals are owned by the project row but their exit wake belongs
+    /// to the creating agent job. Canonical-resource reconciliation must bridge
+    /// that ownership split after a runner restart.
+    #[test]
+    fn startup_reconciles_subscribed_project_terminal_exit() {
+        let db = block_on(crate::storage::migrated_test_db(
+            "term_project_startup_exit_reconcile.db",
+        ));
+        let orch = test_orchestrator(db);
+        block_on(seed(&orch.db.local));
+        block_on(seed_live_turn(&orch.db.local));
+        block_on(orch.db.local.execute(
+            "INSERT INTO job_terminals
+             (id, project_id, session_id, command, status, created_at, slug)
+             VALUES('project-term', 'p', 'project-session', 'watch', 'running', 20, 'watch')",
+            (),
+        ))
+        .unwrap();
+
+        let uri = "cairn://p/P/terminal/watch";
+        let facts = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
+        block_on(crate::orchestrator::wakes::subscribe_one_shot(
+            &orch.db.local,
+            "j",
+            "process",
+            Some(uri),
+            Some(&facts),
+            "agent",
+        ))
+        .unwrap();
+
+        block_on(crate::terminal_host::prepare_terminal_recovery(&orch)).unwrap();
+        let subs = block_on(crate::orchestrator::wakes::list_subscriptions_for_job(
+            &orch.db.local,
+            "j",
+        ))
+        .unwrap();
+        assert!(
+            !subs
+                .iter()
+                .any(|sub| sub.source_ref.as_deref() == Some(uri)),
+            "project-terminal startup exit must consume the creating job's wake"
+        );
+    }
+
+    /// A subscription can outlive terminal-row cleanup. Startup treats the absent
+    /// canonical target as not recovered and consumes the one-shot wake rather
+    /// than preserving a fact that can never arrive.
+    #[test]
+    fn startup_reconciles_terminal_subscription_with_no_row() {
+        let db = block_on(crate::storage::migrated_test_db(
+            "term_missing_startup_exit_reconcile.db",
+        ));
+        let orch = test_orchestrator(db);
+        block_on(seed(&orch.db.local));
+        block_on(seed_live_turn(&orch.db.local));
+
+        let uri = "cairn://p/P/7/2/builder/terminal/missing";
+        let facts = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
+        block_on(crate::orchestrator::wakes::subscribe_one_shot(
+            &orch.db.local,
+            "j",
+            "process",
+            Some(uri),
+            Some(&facts),
+            "agent",
+        ))
+        .unwrap();
+
+        assert_eq!(block_on(reconcile_exited_terminal_wakes(&orch)).unwrap(), 1);
+        let subs = block_on(crate::orchestrator::wakes::list_subscriptions_for_job(
+            &orch.db.local,
+            "j",
+        ))
+        .unwrap();
+        assert!(
+            !subs
+                .iter()
+                .any(|sub| sub.source_ref.as_deref() == Some(uri)),
+            "an absent terminal must not leave an immortal one-shot subscription"
+        );
+    }
+
+    /// Reusing a slug must not transfer a prior incarnation's wake to the new
+    /// process. Creation runs this reconciliation before replacing the exited row.
+    #[test]
+    fn terminal_slug_reuse_retires_previous_incarnation_wake() {
+        let db = block_on(crate::storage::migrated_test_db(
+            "term_slug_reuse_wake_reconcile.db",
+        ));
+        let orch = test_orchestrator(db);
+        block_on(seed(&orch.db.local));
+        block_on(seed_live_turn(&orch.db.local));
+
+        let uri = node_uri();
+        let resource = cairn_common::uri::parse_uri(&uri).unwrap();
+        let target = block_on(resolve_terminal_resource_target(&orch.db.local, &resource)).unwrap();
+        block_on(orch.db.local.execute(
+            "UPDATE job_terminals SET status='recovering' WHERE session_id='s1'",
+            (),
+        ))
+        .unwrap();
+        assert!(
+            block_on(ensure_terminal_slug_available(&orch.db.local, &target)).is_err(),
+            "a recovering terminal still owns its slug and recovery fence"
+        );
+
+        block_on(orch.db.local.execute(
+            "UPDATE job_terminals SET status='exited', exited_at=30 WHERE session_id='s1'",
+            (),
+        ))
+        .unwrap();
+        assert!(
+            block_on(ensure_terminal_slug_available(&orch.db.local, &target)).is_ok(),
+            "only an exited terminal releases its slug for replacement"
+        );
+
+        let facts = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
+        block_on(crate::orchestrator::wakes::subscribe_one_shot(
+            &orch.db.local,
+            "j",
+            "process",
+            Some(&uri),
+            Some(&facts),
+            "agent",
+        ))
+        .unwrap();
+        assert_eq!(block_on(reconcile_exited_terminal_wakes(&orch)).unwrap(), 1);
+
+        block_on(
+            orch.db
+                .local
+                .execute("DELETE FROM job_terminals WHERE session_id='s1'", ()),
+        )
+        .unwrap();
+        block_on(orch.db.local.execute(
+            "INSERT INTO job_terminals
+             (id, job_id, session_id, command, status, created_at, slug)
+             VALUES('replacement', 'j', 's2', 'new command', 'running', 40, 'run-1')",
+            (),
+        ))
+        .unwrap();
+
+        let subs = block_on(crate::orchestrator::wakes::list_subscriptions_for_job(
+            &orch.db.local,
+            "j",
+        ))
+        .unwrap();
+        assert!(
+            !subs
+                .iter()
+                .any(|sub| sub.source_ref.as_deref() == Some(uri.as_str())),
+            "the replacement process must not inherit the prior incarnation's wake"
         );
     }
 

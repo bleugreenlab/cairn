@@ -517,6 +517,38 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
 }
 
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
+    finalize_run_inner(orch, run_id, status, true);
+}
+
+/// Finalize a crashed turn that already has an automatic successor planned.
+/// The old turn is still interrupted and the run terminalized, but publishing a
+/// failed-agent attention between those two turns would turn recovery into a
+/// false operator alarm.
+pub(crate) fn finalize_run_for_recovery(orch: &Orchestrator, run_id: &str, status: RunStatus) {
+    finalize_run_inner(orch, run_id, status, false);
+}
+
+/// Restore the failure signal when successor launch fails after recovery-aware
+/// finalization suppressed it.
+pub(crate) fn report_recovery_launch_failure(orch: &Orchestrator, run_id: &str) {
+    emit_agent_terminal_attention_once(orch, run_id, "failed");
+}
+
+fn should_emit_terminal_failure_attention(
+    requested: bool,
+    had_active_turn: bool,
+    status: &RunStatus,
+    has_reseed_fallback: bool,
+) -> bool {
+    requested && had_active_turn && *status == RunStatus::Crashed && !has_reseed_fallback
+}
+
+fn finalize_run_inner(
+    orch: &Orchestrator,
+    run_id: &str,
+    status: RunStatus,
+    emit_terminal_failure_attention: bool,
+) {
     // Clean up system prompt temp file
     crate::orchestrator::session::cleanup_prompt_file(run_id);
 
@@ -688,7 +720,12 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     // only a legacy toast source for genuine crash paths that terminalize an
     // in-flight turn without reaching the idle boundary first. A crash we are
     // about to recover from is a self-healing event, not a failure to report.
-    if had_active_turn && status == RunStatus::Crashed && reseed_fallback.is_none() {
+    if should_emit_terminal_failure_attention(
+        emit_terminal_failure_attention,
+        had_active_turn,
+        &status,
+        reseed_fallback.is_some(),
+    ) {
         emit_agent_terminal_attention_once(orch, run_id, "failed");
     }
 
@@ -1033,6 +1070,54 @@ mod session_reseed_fallback_tests {
         // A distinct session identity — including the one a reseed rotates to —
         // gets its own attempt.
         assert!(claim_reseed_fallback(&attempted, "session-b"));
+    }
+}
+
+#[cfg(test)]
+mod recovery_finalization_tests {
+    use super::should_emit_terminal_failure_attention;
+    use crate::models::RunStatus;
+
+    #[test]
+    fn planned_recovery_suppresses_intermediate_failure_attention() {
+        assert!(!should_emit_terminal_failure_attention(
+            false,
+            true,
+            &RunStatus::Crashed,
+            false,
+        ));
+    }
+
+    #[test]
+    fn ordinary_or_failed_recovery_publishes_failure_attention() {
+        assert!(should_emit_terminal_failure_attention(
+            true,
+            true,
+            &RunStatus::Crashed,
+            false,
+        ));
+    }
+
+    #[test]
+    fn inactive_clean_or_reseeded_runs_do_not_publish_failure_attention() {
+        assert!(!should_emit_terminal_failure_attention(
+            true,
+            false,
+            &RunStatus::Crashed,
+            false,
+        ));
+        assert!(!should_emit_terminal_failure_attention(
+            true,
+            true,
+            &RunStatus::Exited,
+            false,
+        ));
+        assert!(!should_emit_terminal_failure_attention(
+            true,
+            true,
+            &RunStatus::Crashed,
+            true,
+        ));
     }
 }
 

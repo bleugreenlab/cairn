@@ -31,8 +31,10 @@ impl InputType {
     }
 }
 
-/// Supplies the device JWT for gateway auth. Returns `None` when no account is
-/// connected — callers treat that as "skip embedding" (colors stay neutral).
+/// Supplies the device JWT for gateway auth. Returns `None` when no token is
+/// available at all — callers treat that as "skip embedding" (colors stay
+/// neutral). An anonymous device token satisfies this, so a `Some` here means
+/// the gateway is reachable, not that an account is connected.
 pub type TokenProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 #[derive(Serialize)]
@@ -65,10 +67,23 @@ impl EmbeddingClient {
         }
     }
 
+    /// Whether a device token is available right now.
+    ///
+    /// Lets a caller skip expensive preparation for a call that would be
+    /// declined — the sweep would otherwise load and reconstruct a page of
+    /// turns on every pass just to be told there is no token.
+    pub fn has_token(&self) -> bool {
+        (self.token)().is_some()
+    }
+
     /// Embed `texts` through the gateway.
     ///
-    /// Returns `Ok(None)` when no account is connected (no device JWT), so the
-    /// caller can skip silently. Returns embeddings in input order otherwise.
+    /// Returns `Ok(None)` when there is no gateway token at all, so the caller
+    /// can skip silently. That is NOT the same as "no account connected": every
+    /// install registers an anonymous device token, so a token says nothing
+    /// about whether anyone signed in. Callers that need consent, rather than
+    /// mere reachability, must ask the account manager — see
+    /// `embeddings::turns::Scope`. Returns embeddings in input order otherwise.
     pub async fn embed(
         &self,
         texts: Vec<String>,

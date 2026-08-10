@@ -17,14 +17,43 @@ pub struct NewOutbound<'a> {
     pub created_at: i64,
 }
 
-pub async fn is_thread_followed(
+/// Claim the only provider attempt for an intent before crossing the external
+/// side-effect boundary. `failed` is the durable ambiguous-outcome state: if the
+/// process dies after the provider sends but before `mark_sent`, later sweeps do
+/// not put the same intent on the wire again.
+pub async fn begin_delivery(db: &LocalDb, id: &str) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound SET status = 'failed', last_error = 'delivery outcome unknown' WHERE id = ?1 AND status = 'pending'",
+        (id.to_string(),),
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
+pub async fn set_pending_route_submission(
     db: &LocalDb,
-    channel: &str,
-    thread_uri: &str,
+    id: &str,
+    submission_json: &str,
 ) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound SET options_json = ?2 WHERE id = ?1 AND kind = 'route' AND status = 'pending'",
+        params![id.to_string(), submission_json.to_string()],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
+/// The durable follow tables are named `channel_thread_follow` and
+/// `channel_thread_focus`, from before threads were an entity of their own. What
+/// they hold is a FOLLOW TARGET's URI — a thread or an issue node — so the Rust
+/// surface says target; the column names stay put because renaming private
+/// channel state buys nothing a comment cannot.
+pub async fn is_target_followed(db: &LocalDb, channel: &str, uri: &str) -> Result<bool, String> {
     db.query_opt_i64(
         "SELECT 1 FROM channel_thread_follow WHERE channel = ?1 AND thread_uri = ?2",
-        params![channel.to_string(), thread_uri.to_string()],
+        params![channel.to_string(), uri.to_string()],
     )
     .await
     .map(|value| value.is_some())
@@ -45,76 +74,128 @@ pub async fn claim_outbound_cleanup(
     ).await.map(|changed| changed == 1).map_err(|error| error.to_string())
 }
 
-pub async fn advance_thread_cursor(
+pub async fn advance_follow_cursor(
     db: &LocalDb,
     channel: &str,
-    thread_uri: &str,
+    uri: &str,
     cursor_rowid: i64,
 ) -> Result<(), String> {
     db.execute(
         "UPDATE channel_thread_follow SET cursor_rowid = MAX(cursor_rowid, ?3) WHERE channel = ?1 AND thread_uri = ?2",
-        params![channel.to_string(), thread_uri.to_string(), cursor_rowid.max(0)],
+        params![channel.to_string(), uri.to_string(), cursor_rowid.max(0)],
     ).await.map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadFollow {
-    pub thread_uri: String,
+pub struct Follow {
+    pub uri: String,
     pub followed_at: i64,
     pub cursor_rowid: i64,
 }
 
-pub async fn follow_thread(
+pub async fn follow_target(
     db: &LocalDb,
     channel: &str,
-    thread_uri: &str,
+    uri: &str,
     followed_at: i64,
     cursor_rowid: i64,
 ) -> Result<bool, String> {
     db.execute(
         "INSERT OR IGNORE INTO channel_thread_follow (channel, thread_uri, followed_at, cursor_rowid) VALUES (?1, ?2, ?3, ?4)",
-        params![channel.to_string(), thread_uri.to_string(), followed_at, cursor_rowid.max(0)],
+        params![channel.to_string(), uri.to_string(), followed_at, cursor_rowid.max(0)],
     )
     .await
     .map(|changed| changed == 1)
     .map_err(|error| error.to_string())
 }
 
-pub async fn unfollow_thread(
+/// Move a follow (and the focus, when it points there) onto the canonical URI
+/// for the same target, merging with a canonical row that already exists.
+///
+/// A follow's URI is its identity everywhere downstream: it is the primary key
+/// here, the poll's checkmark lookup, and the prefix of the `binding_ref` that
+/// makes stream delivery once-only. So an alias and its canonical form are two
+/// identities for one conversation — the poll shows the target unfollowed while
+/// it is streaming, following it again adds a second row, and every update then
+/// arrives twice under two distinct binding refs. Canonicalizing the row is what
+/// keeps one target to one identity.
+///
+/// The merged cursor is the LATER of the two. Events between the two cursors
+/// were already delivered under the row that had read further, so taking the
+/// maximum leaves no gap and repeats nothing; the earlier `followed_at` is kept
+/// because that is when the operator actually started following.
+pub async fn canonicalize_follow(
     db: &LocalDb,
     channel: &str,
-    thread_uri: &str,
-) -> Result<bool, String> {
+    from_uri: &str,
+    to_uri: &str,
+) -> Result<(), String> {
+    let channel = channel.to_string();
+    let from_uri = from_uri.to_string();
+    let to_uri = to_uri.to_string();
+    db.write(move |conn| {
+        let channel = channel.clone();
+        let from_uri = from_uri.clone();
+        let to_uri = to_uri.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO channel_thread_follow (channel, thread_uri, followed_at, cursor_rowid)
+                 SELECT ?1, ?3, followed_at, cursor_rowid FROM channel_thread_follow
+                 WHERE channel = ?1 AND thread_uri = ?2
+                 ON CONFLICT(channel, thread_uri) DO UPDATE SET
+                   cursor_rowid = MAX(cursor_rowid, excluded.cursor_rowid),
+                   followed_at = MIN(followed_at, excluded.followed_at)",
+                params![channel.as_str(), from_uri.as_str(), to_uri.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM channel_thread_follow WHERE channel = ?1 AND thread_uri = ?2",
+                params![channel.as_str(), from_uri.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "UPDATE channel_thread_focus SET thread_uri = ?3 WHERE channel = ?1 AND thread_uri = ?2",
+                params![channel.as_str(), from_uri.as_str(), to_uri.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub async fn unfollow_target(db: &LocalDb, channel: &str, uri: &str) -> Result<bool, String> {
     db.execute(
         "DELETE FROM channel_thread_follow WHERE channel = ?1 AND thread_uri = ?2",
-        params![channel.to_string(), thread_uri.to_string()],
+        params![channel.to_string(), uri.to_string()],
     )
     .await
     .map(|changed| changed == 1)
     .map_err(|error| error.to_string())
 }
 
-pub async fn list_thread_follows(db: &LocalDb, channel: &str) -> Result<Vec<ThreadFollow>, String> {
+pub async fn list_follows(db: &LocalDb, channel: &str) -> Result<Vec<Follow>, String> {
     db.query_all(
         "SELECT thread_uri, followed_at, cursor_rowid FROM channel_thread_follow WHERE channel = ?1 ORDER BY followed_at DESC",
         params![channel.to_string()],
-        |row| Ok(ThreadFollow { thread_uri: row.text(0)?, followed_at: row.i64(1)?, cursor_rowid: row.i64(2)? }),
+        |row| Ok(Follow { uri: row.text(0)?, followed_at: row.i64(1)?, cursor_rowid: row.i64(2)? }),
     ).await.map_err(|error| error.to_string())
 }
 
-pub async fn set_thread_focus(
+pub async fn set_focus(
     db: &LocalDb,
     channel: &str,
-    thread_uri: &str,
+    uri: &str,
     selected_at: i64,
 ) -> Result<(), String> {
     db.execute(
         "INSERT INTO channel_thread_focus (channel, thread_uri, selected_at) VALUES (?1, ?2, ?3) ON CONFLICT(channel) DO UPDATE SET thread_uri = excluded.thread_uri, selected_at = excluded.selected_at",
-        params![channel.to_string(), thread_uri.to_string(), selected_at],
+        params![channel.to_string(), uri.to_string(), selected_at],
     ).await.map(|_| ()).map_err(|error| error.to_string())
 }
 
-pub async fn get_thread_focus(db: &LocalDb, channel: &str) -> Result<Option<String>, String> {
+pub async fn get_focus(db: &LocalDb, channel: &str) -> Result<Option<String>, String> {
     db.query_opt(
         "SELECT thread_uri FROM channel_thread_focus WHERE channel = ?1",
         params![channel.to_string()],
@@ -451,13 +532,13 @@ mod tests {
         let db = migrated_test_db("channel-ledger-follow-state.db").await;
         let thread = "cairn://p/CAIRN/3404";
 
-        assert!(!is_thread_followed(&db, "imessage", thread).await.unwrap());
-        assert!(follow_thread(&db, "imessage", thread, 10, 20)
+        assert!(!is_target_followed(&db, "imessage", thread).await.unwrap());
+        assert!(follow_target(&db, "imessage", thread, 10, 20)
             .await
             .unwrap());
-        assert!(is_thread_followed(&db, "imessage", thread).await.unwrap());
-        assert!(unfollow_thread(&db, "imessage", thread).await.unwrap());
-        assert!(!is_thread_followed(&db, "imessage", thread).await.unwrap());
+        assert!(is_target_followed(&db, "imessage", thread).await.unwrap());
+        assert!(unfollow_target(&db, "imessage", thread).await.unwrap());
+        assert!(!is_target_followed(&db, "imessage", thread).await.unwrap());
     }
 
     fn intent<'a>(id: &'a str) -> NewOutbound<'a> {
@@ -623,21 +704,21 @@ mod tests {
     #[tokio::test]
     async fn thread_focus_tracks_the_most_recent_selection_and_follows_survive() {
         let db = migrated_test_db("channel-ledger-thread-focus.db").await;
-        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 10, 42)
+        assert!(follow_target(&db, "imessage", "cairn://p/CAIRN/1", 10, 42)
             .await
             .unwrap());
-        set_thread_focus(&db, "imessage", "cairn://p/CAIRN/1", 10)
+        set_focus(&db, "imessage", "cairn://p/CAIRN/1", 10)
             .await
             .unwrap();
-        set_thread_focus(&db, "imessage", "cairn://p/CAIRN/2", 11)
+        set_focus(&db, "imessage", "cairn://p/CAIRN/2", 11)
             .await
             .unwrap();
         assert_eq!(
-            get_thread_focus(&db, "imessage").await.unwrap().as_deref(),
+            get_focus(&db, "imessage").await.unwrap().as_deref(),
             Some("cairn://p/CAIRN/2")
         );
         assert_eq!(
-            list_thread_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
+            list_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
             42
         );
     }
@@ -645,16 +726,16 @@ mod tests {
     #[tokio::test]
     async fn restart_rebases_surviving_follow_to_the_current_live_edge() {
         let db = migrated_test_db("channel-ledger-thread-restart.db").await;
-        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 10, 5)
+        assert!(follow_target(&db, "imessage", "cairn://p/CAIRN/1", 10, 5)
             .await
             .unwrap());
 
-        advance_thread_cursor(&db, "imessage", "cairn://p/CAIRN/1", 99)
+        advance_follow_cursor(&db, "imessage", "cairn://p/CAIRN/1", 99)
             .await
             .unwrap();
 
         assert_eq!(
-            list_thread_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
+            list_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
             99,
             "events accumulated before the restarted session's live edge are skipped"
         );
@@ -663,17 +744,17 @@ mod tests {
     #[tokio::test]
     async fn refollow_starts_at_the_new_live_edge_instead_of_replaying_backlog() {
         let db = migrated_test_db("channel-ledger-thread-refollow.db").await;
-        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 10, 5)
+        assert!(follow_target(&db, "imessage", "cairn://p/CAIRN/1", 10, 5)
             .await
             .unwrap());
-        assert!(unfollow_thread(&db, "imessage", "cairn://p/CAIRN/1")
+        assert!(unfollow_target(&db, "imessage", "cairn://p/CAIRN/1")
             .await
             .unwrap());
-        assert!(follow_thread(&db, "imessage", "cairn://p/CAIRN/1", 20, 99)
+        assert!(follow_target(&db, "imessage", "cairn://p/CAIRN/1", 20, 99)
             .await
             .unwrap());
         assert_eq!(
-            list_thread_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
+            list_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
             99
         );
     }

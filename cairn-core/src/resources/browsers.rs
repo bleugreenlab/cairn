@@ -68,14 +68,19 @@ async fn resolve_browser_scope(
                     slug,
                     ..
                 } => {
-                    let job_id =
-                        find_node_job_id(conn, &project, number, exec_seq, &node_id)
-                            .await?
-                            .ok_or_else(|| {
-                                DbError::Row(format!(
-                                    "No node job found for browser target {project}-{number}/{exec_seq}/{node_id}"
-                                ))
-                            })?;
+                    let job_id = find_node_job_id(conn, &project, number, exec_seq, &node_id)
+                        .await?
+                        .ok_or_else(|| {
+                            DbError::Row(format!(
+                                "No job owns the browser target {}. {}",
+                                cairn_common::uri::build_node_browser_uri(
+                                    &project, number, exec_seq, &node_id, &slug
+                                ),
+                                crate::resources::node_job_not_found_message(
+                                    &project, number, exec_seq, &node_id
+                                )
+                            ))
+                        })?;
                     Ok((BrowserScope::Job(job_id), slug))
                 }
                 CairnResource::TaskBrowser {
@@ -95,15 +100,17 @@ async fn resolve_browser_scope(
                     slug,
                     ..
                 } => {
-                    let job_id = find_task_job_id(
-                        conn, &project, number, exec_seq, &node_id, &task_name,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        DbError::Row(format!(
-                            "No task job found for browser target {project}-{number}/{exec_seq}/{node_id}/task/{task_name}"
-                        ))
-                    })?;
+                    let job_id =
+                        find_task_job_id(conn, &project, number, exec_seq, &node_id, &task_name)
+                            .await?
+                            .ok_or_else(|| {
+                                DbError::Row(format!(
+                                    "No job owns the browser target {}",
+                                    cairn_common::uri::build_task_browser_uri(
+                                        &project, number, exec_seq, &node_id, &task_name, &slug
+                                    )
+                                ))
+                            })?;
                     Ok((BrowserScope::Job(job_id), slug))
                 }
                 CairnResource::ProjectBrowser { project, slug }
@@ -151,6 +158,9 @@ pub(crate) async fn resolve_browser_target(
     Ok((scope, slug))
 }
 
+/// A browser's owning job, by the coordinate that addresses it. Owner-aware
+/// through the shared resolver, so a thread session's browser resolves to the
+/// session job exactly as a node's resolves to the node job.
 async fn find_node_job_id(
     conn: &cairn_db::turso::Connection,
     project_key: &str,
@@ -158,26 +168,15 @@ async fn find_node_job_id(
     exec_seq: i32,
     node_id: &str,
 ) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut rows = conn
-        .query(
-            "
-            SELECT j.id
-            FROM jobs j
-            JOIN issues i ON j.issue_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            JOIN executions e ON j.execution_id = e.id
-            WHERE p.key = ?1
-              AND i.number = ?2
-              AND e.seq = ?3
-              AND j.parent_job_id IS NULL
-              AND j.uri_segment = ?4
-            LIMIT 1
-            ",
-            (lookup_key.as_str(), issue_number, exec_seq, node_id),
-        )
-        .await?;
-    rows.next().await?.map(|row| row.text(0)).transpose()
+    crate::jobs::queries::job_id_for_node_coordinate_conn(
+        conn,
+        project_key,
+        issue_number,
+        exec_seq,
+        node_id,
+        None,
+    )
+    .await
 }
 
 async fn find_task_job_id(
@@ -188,34 +187,15 @@ async fn find_task_job_id(
     parent_node_id: &str,
     task_name: &str,
 ) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut rows = conn
-        .query(
-            "
-            SELECT child.id
-            FROM jobs parent
-            JOIN jobs child ON child.parent_job_id = parent.id
-            JOIN issues i ON parent.issue_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            JOIN executions e ON parent.execution_id = e.id
-            WHERE p.key = ?1
-              AND i.number = ?2
-              AND e.seq = ?3
-              AND parent.parent_job_id IS NULL
-              AND parent.uri_segment = ?4
-              AND child.uri_segment = ?5
-            LIMIT 1
-            ",
-            (
-                lookup_key.as_str(),
-                issue_number,
-                exec_seq,
-                parent_node_id,
-                task_name,
-            ),
-        )
-        .await?;
-    rows.next().await?.map(|row| row.text(0)).transpose()
+    crate::jobs::queries::job_id_for_node_coordinate_conn(
+        conn,
+        project_key,
+        issue_number,
+        exec_seq,
+        parent_node_id,
+        Some(task_name),
+    )
+    .await
 }
 
 /// How a browser read should be rendered. The default is live page content

@@ -26,7 +26,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use base64::Engine;
-use cairn_common::read::ReadSegment;
+use cairn_common::read::{ImageBlock, ReadSegment};
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
@@ -56,31 +56,32 @@ impl ImageStore for ProjectStore {
     }
 }
 
-/// Whether any block in `segments` still needs promoting. Keeps a text-only batch
+/// Whether any block in one result still needs promoting. Keeps a text-only batch
 /// — the overwhelming majority — from paying a run lookup.
-fn has_promotable_images(segments: &[ReadSegment]) -> bool {
-    segments.iter().any(|segment| {
-        segment
-            .images
-            .iter()
-            .any(|image| image.uri.is_none() && !image.data.is_empty())
-    })
+fn has_promotable_images(images: &[ImageBlock]) -> bool {
+    images
+        .iter()
+        .any(|image| image.uri.is_none() && !image.data.is_empty())
 }
 
-/// Store every un-promoted image block in `segments`, record its durable URI,
-/// and cite every durable image address into the text half — the only half a
-/// transcript keeps.
-///
-/// Promotion is a no-op when the batch produced no un-promoted images or the
-/// request carries no authenticated run (an external/test caller has no project
-/// to store into); citation runs regardless, so an image read by its stored
-/// address still leaves its reference in the recorded text.
+/// Apply the shared image policy to every read segment.
 pub(crate) async fn promote_read_images(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     segments: &mut [ReadSegment],
 ) {
-    if has_promotable_images(segments) {
+    for segment in segments {
+        promote_images(orch, request, &mut segment.images, &mut segment.body).await;
+    }
+}
+
+pub(crate) async fn promote_images(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    images: &mut [ImageBlock],
+    body: &mut String,
+) {
+    if has_promotable_images(images) {
         match crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await {
             Ok((run, db)) => {
                 promote_with(
@@ -89,74 +90,62 @@ pub(crate) async fn promote_read_images(
                         scope: crate::images::ImageScope::new(run.project_id, run.project_key)
                             .in_issue(run.issue_number),
                     },
-                    segments,
+                    images,
+                    body,
                 )
                 .await;
             }
             Err(error) => {
-                log::debug!("read images were not promoted (no routed run): {error}");
+                log::debug!("images were not promoted (no routed run): {error}");
             }
         }
     }
 
-    cite_stored_images(segments);
+    cite_stored_images(images, body);
 }
 
-/// Append `![image](uri)` to a segment's body for every image block that
-/// carries a durable address, so the reference survives into the transcript's
-/// text half. Skips citations the body already carries.
-fn cite_stored_images(segments: &mut [ReadSegment]) {
-    for segment in segments.iter_mut() {
-        let citations: Vec<String> = segment
-            .images
-            .iter()
-            .filter_map(|image| image.uri.as_deref())
-            .map(|uri| format!("![image]({uri})"))
-            .collect();
-        for citation in citations {
-            if segment.body.contains(&citation) {
-                continue;
-            }
-            if !segment.body.is_empty() {
-                segment.body.push('\n');
-            }
-            segment.body.push_str(&citation);
-        }
-    }
-}
-
-async fn promote_with(store: &dyn ImageStore, segments: &mut [ReadSegment]) {
-    for segment in segments.iter_mut() {
-        let mut notes: Vec<String> = Vec::new();
-        for image in segment.images.iter_mut() {
-            if image.uri.is_some() || image.data.is_empty() {
-                continue;
-            }
-            let bytes = match base64::engine::general_purpose::STANDARD.decode(&image.data) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    notes.push(format!("[image not stored: malformed base64: {error}]"));
-                    continue;
-                }
-            };
-            match store.store(bytes).await {
-                Ok(uri) => image.uri = Some(uri),
-                Err(error) => notes.push(format!("[image not stored: {error}]")),
-            }
-        }
-        if notes.is_empty() {
+fn cite_stored_images(images: &[ImageBlock], body: &mut String) {
+    let citations: Vec<String> = images
+        .iter()
+        .filter_map(|image| image.uri.as_deref())
+        .map(|uri| format!("![image]({uri})"))
+        .collect();
+    for citation in citations {
+        if body.contains(&citation) {
             continue;
         }
-        log::warn!(
-            "read image promotion failed for {}: {}",
-            segment.meta.uri,
-            notes.join(" ")
-        );
-        for note in notes {
-            if !segment.body.is_empty() {
-                segment.body.push('\n');
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&citation);
+    }
+}
+
+async fn promote_with(store: &dyn ImageStore, images: &mut [ImageBlock], body: &mut String) {
+    let mut notes: Vec<String> = Vec::new();
+    for image in images {
+        if image.uri.is_some() || image.data.is_empty() {
+            continue;
+        }
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(&image.data) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                notes.push(format!("[image not stored: malformed base64: {error}]"));
+                continue;
             }
-            segment.body.push_str(&note);
+        };
+        match store.store(bytes).await {
+            Ok(uri) => image.uri = Some(uri),
+            Err(error) => notes.push(format!("[image not stored: {error}]")),
+        }
+    }
+    if !notes.is_empty() {
+        log::warn!("image promotion failed: {}", notes.join(" "));
+        for note in notes {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&note);
         }
     }
 }
@@ -219,8 +208,9 @@ mod tests {
     #[tokio::test]
     async fn promotes_each_block_and_leaves_the_body_alone() {
         let store = Fake::ok();
-        let mut segments = vec![image_segment("file:plot.png", &png_base64())];
-        promote_with(&store, &mut segments).await;
+        let mut segments = [image_segment("file:plot.png", &png_base64())];
+        let segment = &mut segments[0];
+        promote_with(&store, &mut segment.images, &mut segment.body).await;
 
         assert_eq!(segments[0].images[0].uri.as_deref(), Some(STORED));
         // The reference is composed by the renderer from the block, never spliced
@@ -231,21 +221,22 @@ mod tests {
 
     #[tokio::test]
     async fn text_only_batch_needs_no_promotion() {
-        let segments = vec![ReadSegment::text(
+        let segments = [ReadSegment::text(
             "fn main() {}",
             SegmentMeta::new("file:a.rs", SegmentKind::File, NaturalUnit::Line),
         )];
-        assert!(!has_promotable_images(&segments));
+        assert!(!has_promotable_images(&segments[0].images));
     }
 
     #[tokio::test]
     async fn an_already_promoted_block_is_not_stored_twice() {
-        let mut segments = vec![image_segment("file:plot.png", &png_base64())];
+        let mut segments = [image_segment("file:plot.png", &png_base64())];
         segments[0].images[0].uri = Some(STORED.to_string());
-        assert!(!has_promotable_images(&segments));
+        assert!(!has_promotable_images(&segments[0].images));
 
         let store = Fake::ok();
-        promote_with(&store, &mut segments).await;
+        let segment = &mut segments[0];
+        promote_with(&store, &mut segment.images, &mut segment.body).await;
         assert!(store.stored.lock().unwrap().is_empty());
     }
 
@@ -254,8 +245,9 @@ mod tests {
         // A blank image section with no explanation is the failure this module
         // exists to remove, so a refusal must say so where the user can read it.
         let store = Fake::failing("image exceeds the 5 MiB limit (6000000 bytes)");
-        let mut segments = vec![image_segment("file:huge.png", &png_base64())];
-        promote_with(&store, &mut segments).await;
+        let mut segments = [image_segment("file:huge.png", &png_base64())];
+        let segment = &mut segments[0];
+        promote_with(&store, &mut segment.images, &mut segment.body).await;
 
         assert!(segments[0].images[0].uri.is_none());
         assert_eq!(
@@ -267,8 +259,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_base64_is_reported_without_reaching_the_store() {
         let store = Fake::ok();
-        let mut segments = vec![image_segment("file:plot.png", "not base64!!")];
-        promote_with(&store, &mut segments).await;
+        let mut segments = [image_segment("file:plot.png", "not base64!!")];
+        let segment = &mut segments[0];
+        promote_with(&store, &mut segment.images, &mut segment.body).await;
 
         assert!(store.stored.lock().unwrap().is_empty());
         assert!(segments[0]
@@ -281,13 +274,30 @@ mod tests {
         // A browser screenshot carries a status banner; the note joins it rather
         // than replacing it.
         let store = Fake::failing("unsupported image format");
-        let mut segments = vec![image_segment("cairn:~/browser?screenshot", &png_base64())];
+        let mut segments = [image_segment("cairn:~/browser?screenshot", &png_base64())];
         segments[0].body = "Browser: https://example.com".to_string();
-        promote_with(&store, &mut segments).await;
+        let segment = &mut segments[0];
+        promote_with(&store, &mut segment.images, &mut segment.body).await;
 
         assert_eq!(
             segments[0].body,
             "Browser: https://example.com\n[image not stored: unsupported image format]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_outcome_image_is_promoted_and_cited_in_its_body() {
+        let store = Fake::ok();
+        let mut images = vec![ImageBlock::inline("image/png", png_base64())];
+        let mut body = "Axon captured the desktop".to_string();
+
+        promote_with(&store, &mut images, &mut body).await;
+        cite_stored_images(&images, &mut body);
+
+        assert_eq!(images[0].uri.as_deref(), Some(STORED));
+        assert_eq!(
+            body,
+            format!("Axon captured the desktop\n![image]({STORED})")
         );
     }
 }

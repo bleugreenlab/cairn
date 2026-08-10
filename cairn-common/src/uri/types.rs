@@ -16,7 +16,7 @@ pub const DEFAULT_BROWSER_SLUG: &str = "default";
 /// interpreted as a type-named artifact (`.../{node}/plan`). This is the single
 /// source of truth shared by the URI parser and cairn-cmd's `cairn:~/<name>`
 /// resolution so e.g. `cairn:~/chat` can never be misread as an artifact write.
-const RESERVED_NODE_SEGMENTS: &[&str] = &[
+pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "chat",
     "artifact",
     "changed",
@@ -28,6 +28,11 @@ const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "checks",
     "questions",
     "question",
+    // A sub-resource the parser handles with its own arms, ordered ahead of the
+    // artifact catch-all — so parsing was correct without it, and its absence
+    // here was invisible until a second reader consulted this list as the whole
+    // keyword set and let `permissions` through as an artifact type-name.
+    "permissions",
     "terminal",
     "repl",
     "browser",
@@ -41,7 +46,7 @@ const RESERVED_NODE_SEGMENTS: &[&str] = &[
 
 /// True when `segment` is a reserved node/task sub-resource keyword (see
 /// [`RESERVED_NODE_SEGMENTS`]) and therefore not a valid artifact type-name.
-pub(crate) fn is_reserved_node_segment(segment: &str) -> bool {
+pub fn is_reserved_node_segment(segment: &str) -> bool {
     RESERVED_NODE_SEGMENTS.contains(&segment)
 }
 
@@ -123,20 +128,14 @@ pub enum CairnResource {
         project: String,
         number: i32,
     },
-    /// A thread addressed by name: `cairn://p/{PROJECT}/t/{name}`.
-    ///
-    /// An alias, never an identity. The number is what a thread IS — numbers
-    /// are stable precisely because they are meaningless, so a name that moved
-    /// with a retitle would break every reference that had ever been written
-    /// down. This variant therefore exists only to be resolved into
-    /// [`Self::Issue`] on the way in: it is accepted on input, and nothing —
-    /// no rendered link, wake ref, or parent field — ever emits it.
-    ///
-    /// `name` is the segment exactly as written; the reader normalizes it (and
-    /// the candidate titles) into a slug when it resolves.
-    ThreadAlias {
+    ProjectThreads {
+        project: String,
+    },
+    /// A first-class thread and an optional session-relative sub-resource path.
+    Thread {
         project: String,
         name: String,
+        path: Vec<String>,
     },
     Node {
         project: String,
@@ -494,6 +493,12 @@ pub enum CairnResource {
         slug: String,
         request_id: String,
     },
+    /// Installable resource packs: everything shipped plus everything installed.
+    Packs,
+    /// One resource pack, available or installed.
+    Pack {
+        pack_id: String,
+    },
     /// Contextual skills collection (workspace + current project).
     Skills,
     /// Contextual skill package (resolves project-first, then workspace).
@@ -573,6 +578,69 @@ pub enum CairnResource {
         project: String,
         workflow_id: String,
     },
+    /// Contextual routes collection (workspace + current project).
+    Routes,
+    Route {
+        route_id: String,
+    },
+    RouteHistory {
+        route_id: String,
+    },
+    RouteHistoryEntry {
+        route_id: String,
+        seq: i64,
+    },
+    ProjectRoutes {
+        project: String,
+    },
+    ProjectRoute {
+        project: String,
+        route_id: String,
+    },
+    ProjectRouteHistory {
+        project: String,
+        route_id: String,
+    },
+    ProjectRouteHistoryEntry {
+        project: String,
+        route_id: String,
+        seq: i64,
+    },
+    /// Contextual responses collection (workspace + current project).
+    Responses,
+    /// A named response definition.
+    Response {
+        response_id: String,
+    },
+    /// Invocation history for a named response.
+    ResponseHistory {
+        response_id: String,
+    },
+    /// One durable response history entry.
+    ResponseHistoryEntry {
+        response_id: String,
+        seq: i64,
+    },
+    /// Explicit project responses collection.
+    ProjectResponses {
+        project: String,
+    },
+    /// Explicit project-scoped response definition.
+    ProjectResponse {
+        project: String,
+        response_id: String,
+    },
+    /// Explicit project response history entry history.
+    ProjectResponseHistory {
+        project: String,
+        response_id: String,
+    },
+    /// One explicit project response history entry.
+    ProjectResponseHistoryEntry {
+        project: String,
+        response_id: String,
+        seq: i64,
+    },
     /// Contextual agents collection (workspace + current project).
     Agents,
     /// A single agent addressed by id (resolves project-first, then workspace).
@@ -641,6 +709,18 @@ pub enum CairnResource {
     Executor {
         name: String,
     },
+    /// One machine-local action exposed by an enrolled executor.
+    ExecutorAction {
+        name: String,
+        action: String,
+    },
+    /// Every journaled authority grant in this workspace, plus the recent
+    /// authorization decisions that cite them.
+    Grants,
+    /// One authority grant by id, with the decisions it authorized.
+    Grant {
+        id: String,
+    },
     /// Global bug report sink.
     Bug,
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
@@ -682,7 +762,8 @@ impl CairnResource {
             Self::ProjectBrowser { .. } => ResourceKind::ProjectBrowser,
             Self::ProjectBrowserNetworkRequest { .. } => ResourceKind::ProjectBrowserNetworkRequest,
             Self::Issue { .. } => ResourceKind::Issue,
-            Self::ThreadAlias { .. } => ResourceKind::ThreadAlias,
+            Self::ProjectThreads { .. } => ResourceKind::ProjectThreads,
+            Self::Thread { .. } => ResourceKind::Thread,
             Self::Changed { .. } => ResourceKind::Changed,
             Self::IssueExecutions { .. } => ResourceKind::IssueExecutions,
             Self::IssueExecution { .. } => ResourceKind::IssueExecution,
@@ -732,10 +813,15 @@ impl CairnResource {
             Self::Logs => ResourceKind::Logs,
             Self::Executors => ResourceKind::Executors,
             Self::Executor { .. } => ResourceKind::Executor,
+            Self::ExecutorAction { .. } => ResourceKind::ExecutorAction,
+            Self::Grants => ResourceKind::Grants,
+            Self::Grant { .. } => ResourceKind::Grant,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,
             Self::Mcp { .. } => ResourceKind::Mcp,
+            Self::Packs => ResourceKind::Packs,
+            Self::Pack { .. } => ResourceKind::Pack,
             Self::Skills => ResourceKind::Skills,
             Self::Skill { .. } => ResourceKind::Skill,
             Self::ProjectSkills { .. } => ResourceKind::ProjectSkills,
@@ -754,6 +840,22 @@ impl CairnResource {
             Self::Workflow { .. } => ResourceKind::Workflow,
             Self::ProjectWorkflows { .. } => ResourceKind::ProjectWorkflows,
             Self::ProjectWorkflow { .. } => ResourceKind::ProjectWorkflow,
+            Self::Routes => ResourceKind::Routes,
+            Self::Route { .. } => ResourceKind::Route,
+            Self::RouteHistory { .. } => ResourceKind::RouteHistory,
+            Self::RouteHistoryEntry { .. } => ResourceKind::RouteHistoryEntry,
+            Self::ProjectRoutes { .. } => ResourceKind::ProjectRoutes,
+            Self::ProjectRoute { .. } => ResourceKind::ProjectRoute,
+            Self::ProjectRouteHistory { .. } => ResourceKind::ProjectRouteHistory,
+            Self::ProjectRouteHistoryEntry { .. } => ResourceKind::ProjectRouteHistoryEntry,
+            Self::Responses => ResourceKind::Responses,
+            Self::Response { .. } => ResourceKind::Response,
+            Self::ResponseHistory { .. } => ResourceKind::ResponseHistory,
+            Self::ResponseHistoryEntry { .. } => ResourceKind::ResponseHistoryEntry,
+            Self::ProjectResponses { .. } => ResourceKind::ProjectResponses,
+            Self::ProjectResponse { .. } => ResourceKind::ProjectResponse,
+            Self::ProjectResponseHistory { .. } => ResourceKind::ProjectResponseHistory,
+            Self::ProjectResponseHistoryEntry { .. } => ResourceKind::ProjectResponseHistoryEntry,
             Self::Agents => ResourceKind::Agents,
             Self::Agent { .. } => ResourceKind::Agent,
             Self::ProjectAgents { .. } => ResourceKind::ProjectAgents,

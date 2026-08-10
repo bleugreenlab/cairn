@@ -95,27 +95,6 @@ pub(crate) async fn resolve_home_relative_resource_uri(
     }
 }
 
-/// Resolve a thread alias target (`cairn://p/PROJECT/t/NAME`) to the canonical
-/// numbered issue URI it names. Every other URI passes through untouched.
-///
-/// Applied on the read path immediately after home-relative expansion, so
-/// everything downstream — the parsed resource, its affordance, the links its
-/// body renders — sees the numbered issue. That is what makes a named read
-/// return exactly what a numbered read returns, and what keeps the alias off
-/// every surface Cairn emits.
-pub(crate) async fn resolve_thread_alias_resource_uri(
-    dbs: &crate::db::DbState,
-    uri: &str,
-) -> Result<String, String> {
-    let Some(cairn_common::uri::CairnResource::ThreadAlias { project, name }) =
-        cairn_common::uri::parse_uri(uri)
-    else {
-        return Ok(uri.to_string());
-    };
-    let db = dbs.for_project(&project).await;
-    crate::issues::relations::resolve_thread_alias(&db, &project, &name).await
-}
-
 /// Home-relative suffixes that a delegated task resolves against its OWNING
 /// NODE rather than itself.
 ///
@@ -534,6 +513,10 @@ pub(super) fn artifact_affordance_with_schema(
             action_summary(patch)
         ));
     }
+    if addressed_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
+        sections.push_str("- [append one ruling](cairn:~/arc): required `ruling(object)` with text, status, rationale, and provenance; Cairn mints its stable slug. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling:{text:\"...\",status:\"accepted\",rationale:\"...\",provenance:[\"cairn://p/PROJECT/NUMBER\"]}}}]})\n");
+        sections.push_str("- [patch one ruling by slug](cairn:~/arc): required `ruling_slug(str)`, `patch(object)`; slug is immutable. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling_slug:\"no-budget-kills\",patch:{status:\"superseded\",rationale:\"...\"}}}]})\n");
+    }
     sections.push('\n');
 
     Some(format!("## {}\n\n{}", contract.name, sections))
@@ -605,6 +588,44 @@ pub(super) async fn get_todo_progress(
     (total > 0).then(|| format!("{completed}/{total} todos"))
 }
 
+/// What to say when a node coordinate resolves to no job, in the terms of
+/// whoever owns it.
+///
+/// A thread that has never run has no session job, which is not an error but a
+/// state: reads degrade to pointing at the thread overview rather than reporting
+/// a missing node under issue zero.
+pub(crate) fn node_job_not_found_message(
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+) -> String {
+    match cairn_common::uri::NodeAddress::new(number, exec_seq, node_name) {
+        cairn_common::uri::NodeAddress::Thread { name } => format!(
+            "Thread '{name}' has no session yet. Read {} for the thread overview.",
+            cairn_common::uri::build_thread_uri(project_key, name)
+        ),
+        cairn_common::uri::NodeAddress::Node { .. } => {
+            format!("Node '{node_name}' not found for issue {project_key}-{number}")
+        }
+    }
+}
+
+pub(super) async fn find_job_by_id(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Option<ResourceJob> {
+    let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1 LIMIT 1");
+    let mut rows = conn.query(sql.as_str(), params![job_id]).await.ok()?;
+    resource_job_from_row(&rows.next().await.ok()??).ok()
+}
+
+/// The job a node coordinate names, loaded read-only.
+///
+/// Owner-aware through `job_id_for_node_coordinate_conn`, so this resolves an
+/// execution node under an issue and a thread's session job through one call —
+/// and every collection built on it (tasks, questions, todos) works from a
+/// thread without knowing a thread exists.
 pub(crate) async fn connect_and_find_node_job(
     db: &LocalDb,
     project_key: &str,
@@ -613,15 +634,29 @@ pub(crate) async fn connect_and_find_node_job(
     node_name: &str,
 ) -> Result<(cairn_db::turso::Connection, ResourceJob), String> {
     let conn = connect_for_read(db).await?;
-    let (_, issue_id) = resolve_issue_id(&conn, project_key, number).await?;
-    let job = find_job_by_node_name(&conn, &issue_id, node_name, exec_seq)
+    // A node coordinate names an issue, so an unknown project key or a
+    // nonexistent issue is reported as itself rather than collapsed into "node
+    // not found", which would be false for the first and misleading for the
+    // second. A thread coordinate names no issue and goes straight to the job.
+    if let cairn_common::uri::NodeAddress::Node { .. } =
+        cairn_common::uri::NodeAddress::new(number, exec_seq, node_name)
+    {
+        resolve_issue_id(&conn, project_key, number).await?;
+    }
+    let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
+        &conn,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        None,
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| node_job_not_found_message(project_key, number, exec_seq, node_name))?;
+    let job = find_job_by_id(&conn, &job_id)
         .await
-        .ok_or_else(|| {
-            format!(
-                "Node '{}' not found for issue {}-{}",
-                node_name, project_key, number
-            )
-        })?;
+        .ok_or_else(|| node_job_not_found_message(project_key, number, exec_seq, node_name))?;
     Ok((conn, job))
 }
 
@@ -656,6 +691,9 @@ pub(super) async fn connect_and_find_task_job(
     node_name: &str,
     task_name: &str,
 ) -> Result<(cairn_db::turso::Connection, ResourceJob, ResourceJob), String> {
+    // The parent resolves first so a thread with no session reports that rather
+    // than reporting a missing task; from there a task is a child job by segment
+    // whichever kind of parent owns it.
     let (conn, parent_job) =
         connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await?;
     let task_job = find_task_by_name(&conn, &parent_job.id, task_name).await?;
@@ -1271,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn affordance_for_project_issues_kind_uses_templated_parent_link() {
+    fn project_issues_affordance_uses_templated_parent_link() {
         let output = affordance_for_kind(ResourceKind::ProjectIssues);
 
         assert!(output.starts_with("## Project issues\n"));

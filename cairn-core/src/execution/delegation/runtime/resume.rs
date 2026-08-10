@@ -8,8 +8,7 @@ use super::common::{
     ParentRunContext,
 };
 use super::results::{
-    compute_artifact_uri_for_child_job, latest_nonempty_artifact_content_arc,
-    latest_nonempty_assistant_content_arc,
+    latest_nonempty_artifact_content_arc, latest_nonempty_assistant_content_arc, task_artifact_uri,
 };
 use crate::orchestrator::attention_push::{
     latest_push_fingerprint, push_with_fingerprint, Boundary, Wake,
@@ -360,7 +359,7 @@ async fn notify_spawner_after_background_task_completion(
             {
                 crate::messages::delivery::node_uri_for_job(db, job_id).await
             }
-            Some(job_id) => compute_artifact_uri_for_child_job(db, job_id).await,
+            Some(job_id) => task_artifact_uri(db, job_id).await,
             None => None,
         }
     } else {

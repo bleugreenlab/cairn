@@ -9,13 +9,13 @@ mod artifact;
 mod common;
 mod context_tokens;
 mod docs;
-mod embedding;
 mod execution;
 mod files;
 mod github;
 mod issue;
 mod job;
 mod label;
+mod launch_deltas;
 mod memory;
 mod message;
 mod permissions;
@@ -29,6 +29,7 @@ mod search;
 mod session;
 mod skill;
 mod snapshot;
+mod thread;
 mod toolkit;
 mod trigger_event;
 mod turn;
@@ -67,10 +68,13 @@ pub use provider_usage::{
 
 // Issue types
 pub use issue::{
-    Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueKind,
-    IssueProgress, IssueStatus, UpdateIssue,
+    Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress,
+    IssueStatus, UpdateIssue,
 };
 pub use label::{CreateLabel, Label, UpdateLabel};
+
+// Thread types
+pub use thread::{CreateThread, Thread, ThreadStatus, UpdateThread};
 
 // Job types (replaces timeline_nodes)
 pub use job::{Job, JobStatus};
@@ -145,11 +149,14 @@ pub use workflow::{SaveWorkflowConfig, WorkflowConfig, WorkflowConfigDetail};
 
 // Execution snapshot types
 pub use snapshot::{
-    AgentSnapshot, DelegatedOutputContract, DelegatedOwnershipScope, DelegatedSessionMode,
-    DelegatedSessionStrategy, DelegatedStatus, DelegatedWorkPacket, DelegationOrigin,
-    ExecutionSnapshot, RecipeSnapshot, SkillSnapshot, SnapshotOverrides, SnapshotPresets,
-    TriggerContext,
+    merge_agent_patch, AgentSnapshot, DelegatedOutputContract, DelegatedOwnershipScope,
+    DelegatedSessionMode, DelegatedSessionStrategy, DelegatedStatus, DelegatedWorkPacket,
+    DelegationOrigin, ExecutionSnapshot, ModelRouting, ModelRoutingDecision, ModelRoutingSource,
+    RecipeSnapshot, SkillSnapshot, SnapshotOverrides, SnapshotPresets, TriggerContext,
 };
+
+// Launch-time snapshot deltas (the agent-side grammar for SnapshotOverrides)
+pub use launch_deltas::{LaunchCustomization, LaunchDeltas};
 
 // File browsing types
 pub use files::{detect_language, BranchInfo, FileContent};
@@ -158,7 +165,6 @@ pub use files::{detect_language, BranchInfo, FileContent};
 pub use message::{ChannelType, DeliveryUrgency, Message};
 
 // Embedding types
-pub use embedding::EventEmbedding;
 
 // Memory types
 pub use memory::{

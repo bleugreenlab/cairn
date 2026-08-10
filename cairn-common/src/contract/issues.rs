@@ -42,7 +42,7 @@ pub(crate) const ISSUE_CONTRACT: ResourceContract =
                     KeySpec::new(
                         "parent",
                         KeyType::Str,
-                        "canonical issue URI to adopt under (future executions branch from / merge to the parent's branch); null to orphan back to the base branch",
+                        "canonical issue URI or thread URI to adopt under: an issue parent also confers branch ancestry (future executions branch from / merge to its branch), a thread parent routes attention only and leaves the child on the base branch; null to orphan back to project-level routing and the base branch",
                     ),
                 ],
                 label: "patch issue",
@@ -65,19 +65,81 @@ pub(crate) const ISSUE_CONTRACT: ResourceContract =
         ],
     };
 
-pub(crate) const THREAD_ALIAS_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ThreadAlias,
-    uri_template: "cairn://p/{project}/t/{name}",
-    name: "Thread by name",
-    description: "Read a thread by name instead of by number. The name is the thread's title slugified: lowercased, with every run of characters outside a-z0-9 collapsed to a single '-' (the rule is ASCII-only, so 'Café Sync' is named 'caf-sync', and a title with no ASCII letters or digits has no name and is reachable only by its number). It resolves to the thread's issue resource and returns exactly what the numbered read returns, so a retitle moves the name while the number stays. Only threads answer here — an ordinary issue with the same slug is not addressable by name — and a name that matches no thread, or more than one, is refused rather than guessed. The alias is accepted on input only: every link Cairn emits, and every write, uses the numbered URI cairn://p/{project}/{number}. List the threads with cairn://p/{project}/issues?kind=thread.",
+pub(crate) const PROJECT_THREADS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectThreads,
+    uri_template: "cairn://p/{project}/threads",
+    name: "Project threads",
+    description: "First-class threads in this project, addressed by stable names",
     read_projections: NO_PROJECTIONS,
-    related: &[RelatedSpec {
-        label: "thread issue",
-        kind: ResourceKind::Issue,
-        actions: false,
-    }],
+    related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: NO_MUTATIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Append,
+        required: &[KeySpec::new(
+            "name",
+            KeyType::Str,
+            "the thread's one identifier: a stable non-numeric name",
+        )],
+        optional: &[KeySpec::new("jurisdiction", KeyType::Str, ""), CONTENT],
+        label: "create thread",
+        example: "write({changes:[{target:\"cairn://p/PROJECT/threads\",mode:\"append\",payload:{name:\"topic\"}}]})",
+    }],
+};
+
+pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Thread,
+    uri_template: "cairn://p/{project}/{name}",
+    name: "Thread",
+    // The descendants are named here rather than as `related` links because a
+    // link renders the TARGET contract's uri_template, and every one of these
+    // resolves to a node-family kind whose template spells an issue coordinate a
+    // thread does not have. Reading any of these addresses returns that family's
+    // own affordance block, so this line only has to say the addresses exist.
+    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /arc, /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols. Branch-shaped resources (diff, changed, checks, rebase) do not apply -- a thread session has no branch.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[],
+            optional: &[
+                KeySpec::new("jurisdiction", KeyType::Str, ""),
+                KeySpec::new(
+                    "status",
+                    KeyType::Str,
+                    "active | closed; closing makes the thread dormant (out of thread listings, refuses prompts and wakes) while keeping its transcript, children, and address — patch it back to active to reopen",
+                ),
+                KeySpec::new("definition", KeyType::Str, "thread definition JSON"),
+                KeySpec::new(
+                    "name",
+                    KeyType::Str,
+                    "the thread's one identifier; renaming re-points every link to it",
+                ),
+                KeySpec::new(
+                    "model",
+                    KeyType::Str,
+                    "model this thread's session runs on; effective next turn",
+                ),
+            ],
+            label: "patch thread",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NAME\",mode:\"patch\",payload:{status:\"closed\"}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Append,
+            required: &[CONTENT],
+            optional: &[],
+            label: "append thread message",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NAME\",mode:\"append\",payload:{content:\"...\"}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Delete,
+            required: &[],
+            optional: &[],
+            label: "delete thread",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NAME\",mode:\"delete\"}]})",
+        },
+    ],
 };
 
 pub(crate) const CHANGED_CONTRACT: ResourceContract = ResourceContract {
@@ -109,7 +171,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe, backend?, branch?} to start a new execution programmatically.",
+        description: "Executions for an issue. Append {recipe, backend?, branch?, overrides?} to start a new execution programmatically.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -131,9 +193,10 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                     KeyType::Str,
                     "new|base — where this execution's work lands; defaults to new (mint a branch and ship a PR). Only a recipe that declares the target accepts it",
                 ),
+                LAUNCH_OVERRIDES,
             ],
             label: "start execution",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"build\",backend:\"claude\"}}]})",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"planbuild\",overrides:{without:[\"review\"]}}}]})",
         }],
     };
 

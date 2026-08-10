@@ -28,7 +28,7 @@ pub(super) async fn dispatch(
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "wakes append requires payload"))?;
             let job_id = crate::resources::node::resolve_node_or_task_job_id(
-                &orch.db.local,
+                orch.db.for_project(project).await.as_ref(),
                 project,
                 *number,
                 *exec_seq,
@@ -63,7 +63,7 @@ pub(super) async fn dispatch(
                     )
                 } else {
                     let sub = crate::orchestrator::wakes::subscribe(
-                        &orch.db.local,
+                        orch.db.for_project(project).await.as_ref(),
                         &job_id,
                         &filter.kind,
                         filter.reference.as_deref(),
@@ -107,7 +107,7 @@ pub(super) async fn dispatch(
                     format!("Would mute wake: {} {:?}", filter.kind, filter.reference)
                 } else {
                     let sub = crate::orchestrator::wakes::mute(
-                        &orch.db.local,
+                        orch.db.for_project(project).await.as_ref(),
                         &job_id,
                         &filter.kind,
                         filter.reference.as_deref(),
@@ -160,7 +160,7 @@ pub(super) async fn dispatch(
             )
             .await?;
             let job_id = crate::resources::node::resolve_node_or_task_job_id(
-                &orch.db.local,
+                orch.db.for_project(project).await.as_ref(),
                 project,
                 *number,
                 *exec_seq,
@@ -173,7 +173,7 @@ pub(super) async fn dispatch(
                 format!("Would unmute wake: {} {:?}", filter.kind, filter.reference)
             } else {
                 let count = crate::orchestrator::wakes::unmute_matching(
-                    &orch.db.local,
+                    orch.db.for_project(project).await.as_ref(),
                     &job_id,
                     &filter.kind,
                     filter.reference.as_deref(),
@@ -206,7 +206,7 @@ pub(super) async fn dispatch(
                 "user"
             };
             let job_id = crate::resources::node::resolve_node_or_task_job_id(
-                &orch.db.local,
+                orch.db.for_project(project).await.as_ref(),
                 project,
                 *number,
                 *exec_seq,
@@ -222,7 +222,7 @@ pub(super) async fn dispatch(
                 )
             } else {
                 let count = crate::orchestrator::wakes::unsubscribe_matching(
-                    &orch.db.local,
+                    orch.db.for_project(project).await.as_ref(),
                     &job_id,
                     &filter.kind,
                     filter.reference.as_deref(),
@@ -474,14 +474,20 @@ async fn subscribe_terminal_wake(
         ));
     }
 
-    let row =
-        crate::mcp::handlers::terminal::lookup_terminal_for_wake(&orch.db.local, job_id, &slug)
-            .await
-            .map_err(|error| build_failure(index, item, error.to_string()))?;
+    let row = crate::mcp::handlers::terminal::lookup_terminal_for_wake(
+        orch.db.for_project(project).await.as_ref(),
+        job_id,
+        &slug,
+    )
+    .await
+    .map_err(|error| build_failure(index, item, error.to_string()))?;
     let Some(row) = row else {
-        let slugs = crate::mcp::handlers::terminal::list_job_terminal_slugs(&orch.db.local, job_id)
-            .await
-            .unwrap_or_default();
+        let slugs = crate::mcp::handlers::terminal::list_job_terminal_slugs(
+            orch.db.for_project(project).await.as_ref(),
+            job_id,
+        )
+        .await
+        .unwrap_or_default();
         let listed = if slugs.is_empty() {
             "no terminals exist in this scope".to_string()
         } else {

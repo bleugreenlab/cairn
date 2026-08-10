@@ -12,14 +12,6 @@ use super::crypto;
 use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 
-/// GitHub App credentials needed for API auth.
-#[derive(Debug, Clone)]
-pub struct GitHubAppCredentials {
-    pub(crate) app_id: i64,
-    pub(crate) private_key: String,
-    pub installation_id: i64,
-}
-
 /// GitHub credentials stored in DB.
 #[derive(Debug, Clone, Default)]
 pub struct GitHubCredentials {
@@ -230,20 +222,31 @@ pub async fn get_installation_for_owner(db: &LocalDb, owner: &str) -> Result<Opt
     .map_err(|e| e.to_string())
 }
 
-/// Get GitHub App credentials for a specific repository owner.
+/// The GitHub App's identity and signing key.
 ///
-/// Looks up the installation by owner first, falls back to default installation_id.
-pub async fn get_credentials_for_owner(
+/// The only read of the stored private key for authentication, and it exists to
+/// be that: `security::broker::github` signs with the key and drops it, and a
+/// source-structure test keeps this function's only caller inside the broker.
+/// The key is returned in a [`Zeroizing`] wrapper so the copy this read makes
+/// is wiped when the signing step is done with it.
+pub(crate) async fn app_signing_key(
     db: &LocalDb,
-    owner: &str,
-) -> Result<GitHubAppCredentials, String> {
+) -> Result<(i64, zeroize::Zeroizing<String>), String> {
     let creds = get_github_credentials(db).await?;
-
     let app_id = creds.app_id.ok_or("GitHub App ID not configured")?;
     let private_key = creds
         .private_key
         .ok_or("GitHub App private key not configured")?;
+    Ok((app_id, zeroize::Zeroizing::new(private_key)))
+}
 
+/// Which app and installation cover `owner`.
+///
+/// Non-secret: two identifiers. Looks up the installation by owner first, then
+/// falls back to the default installation.
+pub async fn installation_identity(db: &LocalDb, owner: &str) -> Result<(i64, i64), String> {
+    let creds = get_github_credentials(db).await?;
+    let app_id = creds.app_id.ok_or("GitHub App ID not configured")?;
     let installation_id = get_installation_for_owner(db, owner)
         .await?
         .or(creds.installation_id)
@@ -253,12 +256,7 @@ pub async fn get_credentials_for_owner(
                 owner
             )
         })?;
-
-    Ok(GitHubAppCredentials {
-        app_id,
-        private_key,
-        installation_id,
-    })
+    Ok((app_id, installation_id))
 }
 
 /// Get owner/repo from a repository path using git remote.

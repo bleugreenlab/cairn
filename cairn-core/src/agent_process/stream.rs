@@ -315,6 +315,43 @@ pub struct TranscriptEvent {
     pub raw: Option<Value>,
 }
 
+impl crate::security::ObservedSafe<TranscriptEvent> {
+    /// Serialize a sanitized transcript event for persistence and emission.
+    ///
+    /// This is the single point at which a transcript event becomes bytes, and
+    /// it exists only on the sanitized wrapper, so the durable row and the value
+    /// the frontend renders cannot fork into a raw and a scrubbed version.
+    ///
+    /// Fails closed. A serialization error yields a marker event rather than a
+    /// partial or fallback rendering, either of which could carry the very bytes
+    /// the crossing exists to remove.
+    pub fn to_event_json(&self) -> String {
+        match serde_json::to_string(&**self) {
+            Ok(json) => json,
+            Err(error) => {
+                log::error!("transcript event serialization failed: {error}");
+                let placeholder = TranscriptEvent {
+                    event_type: self.event_type.clone(),
+                    session_id: self.session_id.clone(),
+                    parent_tool_use_id: self.parent_tool_use_id.clone(),
+                    content: Some("[event omitted: serialization failed]".to_string()),
+                    thinking: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_uses: None,
+                    tool_use_id: None,
+                    tool_result: None,
+                    is_error: true,
+                    thinking_ms: None,
+                    queued_message_id: None,
+                    raw: None,
+                };
+                serde_json::to_string(&placeholder).unwrap_or_else(|_| String::from("{}"))
+            }
+        }
+    }
+}
+
 /// Strip fields we've already extracted from raw JSON to reduce storage.
 /// Returns None if only minimal boilerplate remains.
 fn strip_extracted_fields(mut raw: Value, event_type: &str) -> Option<Value> {
@@ -352,8 +389,51 @@ fn strip_extracted_fields(mut raw: Value, event_type: &str) -> Option<Value> {
     Some(raw)
 }
 
+impl crate::security::Sanitize for TranscriptEvent {
+    /// Sanitize every field that can carry backend-produced text.
+    ///
+    /// Identity fields (`event_type`, `session_id`, tool-use ids) are excluded:
+    /// they are Cairn-minted or protocol-fixed and cannot carry a credential,
+    /// and redacting one would corrupt transcript reconstruction. `raw` is
+    /// included because it is the residue of the backend's own JSON, which is
+    /// exactly where an un-extracted echo would hide.
+    fn sanitize_observed(&mut self, sanitizer: &mut crate::security::Sanitizer<'_>) {
+        sanitizer.opt_text_in_place(&mut self.content);
+        sanitizer.opt_text_in_place(&mut self.thinking);
+        sanitizer.opt_text_in_place(&mut self.tool_result);
+        if let Some(input) = self.tool_input.as_mut() {
+            sanitizer.json(input);
+        }
+        if let Some(uses) = self.tool_uses.as_mut() {
+            for use_info in uses.iter_mut() {
+                sanitizer.json(&mut use_info.input);
+            }
+        }
+        if let Some(raw) = self.raw.as_mut() {
+            sanitizer.json(raw);
+        }
+    }
+}
+
 impl TranscriptEvent {
-    pub(crate) fn from_claude_event(event: &ClaudeEvent, raw: Value) -> Self {
+    /// Carry this event across the transcript crossing (CAIRN-3822).
+    ///
+    /// The only way to obtain an [`ObservedSafe<TranscriptEvent>`], and therefore
+    /// the only way to reach [`ObservedSafe::to_event_json`] — which is in turn
+    /// the only way a transcript event becomes bytes.
+    pub fn observed(self) -> crate::security::ObservedSafe<Self> {
+        crate::security::ObservedSafe::observe(self, crate::security::Crossing::Transcript)
+    }
+
+    /// Convert a backend event, sanitizing it at the transcript crossing.
+    pub(crate) fn from_claude_event(
+        event: &ClaudeEvent,
+        raw: Value,
+    ) -> crate::security::ObservedSafe<Self> {
+        Self::from_claude_event_unchecked(event, raw).observed()
+    }
+
+    fn from_claude_event_unchecked(event: &ClaudeEvent, raw: Value) -> Self {
         match event {
             ClaudeEvent::System {
                 subtype,
@@ -968,7 +1048,7 @@ mod tests {
         let (event, raw) = parse_event(line).expect("assistant event parses");
         let transcript = TranscriptEvent::from_claude_event(&event, raw);
 
-        let uses = transcript.tool_uses.expect("tool use surfaced");
+        let uses = transcript.tool_uses.clone().expect("tool use surfaced");
         assert_eq!(uses[0].name, "mcp__cairn__read");
         let rejected = RejectedToolInput::detect(&uses[0].input).expect("marker survives parsing");
         assert_eq!(rejected.len, 87);
@@ -1173,7 +1253,7 @@ mod tests {
         assert_eq!(transcript.event_type, "assistant");
         assert_eq!(transcript.content, Some("Analyzing...".to_string()));
         assert!(transcript.tool_uses.is_some());
-        let tool_uses = transcript.tool_uses.unwrap();
+        let tool_uses = transcript.tool_uses.clone().unwrap();
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].name, "read_file");
         assert_eq!(transcript.tool_name, Some("read_file".to_string()));
@@ -1213,7 +1293,7 @@ mod tests {
         let (event, raw) = parse_event(json).unwrap();
         let transcript = TranscriptEvent::from_claude_event(&event, raw);
 
-        let tool_uses = transcript.tool_uses.unwrap();
+        let tool_uses = transcript.tool_uses.clone().unwrap();
         assert_eq!(tool_uses.len(), 2);
         // Multiple tools means legacy single-tool fields are None
         assert!(transcript.tool_name.is_none());

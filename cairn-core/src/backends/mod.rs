@@ -37,6 +37,72 @@ use crate::agent_process::process::BackendStdin;
 use crate::models::{Fence, Model};
 use crate::orchestrator::Orchestrator;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::time::Duration;
+
+/// One conversational message in a backend-neutral completion request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionMessage {
+    pub role: CompletionRole,
+    pub content: String,
+}
+
+/// A single model round-trip. Completion requests never expose tools or create a
+/// session, run, transcript, or branch.
+#[derive(Debug, Clone)]
+pub struct CompletionRequest {
+    pub system: Option<String>,
+    pub messages: Vec<CompletionMessage>,
+    pub model: String,
+    pub extras: Value,
+    pub output_schema: Option<Value>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionTokens {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionOutcome {
+    pub text: String,
+    pub parsed: Option<Value>,
+    pub model: String,
+    pub tokens: CompletionTokens,
+    pub cost: Option<f64>,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CompletionError {
+    #[error("backend does not support one-shot completions")]
+    BackendUnavailable,
+    #[error("completion timed out")]
+    Timeout,
+    #[error("completion request is invalid: {0}")]
+    InvalidRequest(String),
+    #[error("completion provider failed: {0}")]
+    Upstream(String),
+    #[error("completion response was invalid: {0}")]
+    InvalidResponse(String),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionShape {
+    InProcess,
+    PooledSessions,
+    DedicatedProcess,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStart {
@@ -175,6 +241,12 @@ pub struct DiscoveredModel {
     pub(crate) context_window: Option<i64>,
     #[serde(default)]
     pub(crate) canonical_slug: Option<String>,
+    /// Identity of every configured account whose host serves this model, in
+    /// account priority order. Providers that serve every model from a single
+    /// endpoint leave this empty; Ollama populates it so routing and the
+    /// settings inventory agree on which hosts have which models.
+    #[serde(default)]
+    pub(crate) serving_account_ids: Vec<String>,
     #[serde(default)]
     pub(crate) pricing: Option<DiscoveredModelPricing>,
     #[serde(default)]
@@ -377,6 +449,19 @@ pub trait AgentBackend: Send + Sync {
     /// Returns immediately — events flow through the Orchestrator's DB/emitter.
     fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String>;
 
+    /// Execute one tool-free request without creating agent/session state.
+    fn complete(
+        &self,
+        _request: CompletionRequest,
+        _orch: &Orchestrator,
+    ) -> Result<CompletionOutcome, CompletionError> {
+        Err(CompletionError::BackendUnavailable)
+    }
+
+    fn completion_shape(&self) -> CompletionShape {
+        CompletionShape::DedicatedProcess
+    }
+
     /// Whether this backend supports session resume (--resume)
     fn supports_resume(&self) -> bool;
 
@@ -425,6 +510,81 @@ pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
         Some("openrouter") => Box::new(openrouter::OpenRouterBackend),
         Some("ollama") => Box::new(ollama::OllamaBackend),
         _ => Box::new(claude::ClaudeBackend),
+    }
+}
+
+/// The provider [`backend_for_model`]'s `None` stands for.
+///
+/// This is the Claude FAMILY, not a configurable default, and the distinction
+/// matters: `backend_for_model` answers `None` for `opus`/`sonnet`/`haiku` and
+/// every other Claude tier alias, so substituting a workspace's configured
+/// `active_backend` here would route `opus` to whatever that workspace happens
+/// to have selected. `None` means "this name belongs to Claude", and the only
+/// honest way to spell it is `claude`.
+///
+/// The real limit this exposes is that inference from a bare model NAME cannot
+/// express a provider that lives only in configuration — an Ollama tag, a custom
+/// backend's model. Those are not representable as a job's persisted model
+/// string at all, which is why the surfaces that offer a model to run filter to
+/// what this resolution can honor (see `isRuntimeRepresentable`) rather than
+/// pretending the name carries the provider.
+pub(crate) const CLAUDE_FAMILY_BACKEND: &str = "claude";
+
+/// The backend a model will actually run on, spelled.
+///
+/// [`backend_for_model`] answers `None` for every Claude model, and
+/// [`backend_for_name`] then totalizes that `None` to Claude when the process is
+/// spawned. A *comparison* site cannot use the partial answer: `None` reads as
+/// "no opinion" there, so comparing against it can only ever detect a move
+/// toward an inferable provider (Claude -> Codex) and never the move back
+/// (Codex -> Claude), leaving the session recorded on a provider the process is
+/// not running. Anything deciding whether a session still matches its model must
+/// ask this, so the decision and the spawn resolve the same question one way.
+pub(crate) fn resolved_backend_for_model(model: &str) -> &'static str {
+    backend_for_model(model).unwrap_or(CLAUDE_FAMILY_BACKEND)
+}
+
+/// The backend a session will actually run on, given the agent's resolved
+/// selection and the model persisted on the job.
+///
+/// A model and the provider that serves it are ONE fact. Every site that needs
+/// the provider asks here — the spawn in `start_agent_session`, the rotation
+/// comparison in `continue_job_impl`, call admission, the session row a new job
+/// is created with — so none of them can answer differently from the process
+/// that actually starts.
+///
+/// `jobs.model` is a concrete model: written from the atomic selection the job
+/// launched with, rewritten only by an explicit model edit, and handed verbatim
+/// to the CLI at spawn. So when a model is present it decides the provider, with
+/// one exception — a selection naming that SAME model speaks for it, because an
+/// atomic `{ backend, model }` pair is the only thing able to name a provider a
+/// model name cannot carry (an Ollama tag, a custom backend; see
+/// [`CLAUDE_FAMILY_BACKEND`]).
+///
+/// The exception is deliberately narrow. An agent config resolved against
+/// configuration that has since moved — a retuned tier preset, a changed
+/// `active_backend` — carries a selection for a DIFFERENT model than the job
+/// persisted, and letting it name the provider splits the pair: that is
+/// CAIRN-3798, where live Claude `fable` threads were rotated onto Codex, which
+/// then rejected the model outright. An agent's default may choose a model for a
+/// job that has none; it may not reinterpret one the job already has.
+///
+/// With no job model the ladder is the agent's own: its atomic selection, then
+/// its authored `backend_preference`. `None` collapses to Claude in
+/// [`backend_for_name`].
+pub(crate) fn effective_backend_name(
+    selection: Option<&crate::models::ModelSelection>,
+    backend_preference: Option<&str>,
+    model: Option<&str>,
+) -> Option<String> {
+    let Some(model) = model else {
+        return selection
+            .map(|selection| selection.backend.clone())
+            .or_else(|| backend_preference.map(str::to_string));
+    };
+    match selection.filter(|selection| selection.model.as_str() == model) {
+        Some(selection) => Some(selection.backend.clone()),
+        None => Some(resolved_backend_for_model(model).to_string()),
     }
 }
 
@@ -531,6 +691,10 @@ pub(crate) mod tests {
         assert_eq!(backend.name(), "Claude");
         assert!(backend.supports_resume());
         assert!(backend.supports_warm_processes());
+        assert_eq!(
+            backend.completion_shape(),
+            CompletionShape::DedicatedProcess
+        );
         // Claude enforces a bounded ephemeral-call ceiling (CAIRN-2557): each
         // call is a dedicated ~450 MB `claude` process, so fan-out is capped at
         // a RAM-derived bound. The descriptor reports exactly the computed
@@ -806,6 +970,100 @@ pub(crate) mod tests {
     }
 
     // =========================================================================
+    // effective_backend_name
+    // =========================================================================
+
+    fn selection(backend: &str, model: &str) -> crate::models::ModelSelection {
+        crate::models::ModelSelection::new(backend, Model::new(model))
+    }
+
+    /// The CAIRN-3798 regression, stated as the resolution that produces it: a
+    /// thread persisted on `fable` whose agent default has since resolved to a
+    /// Codex model. The selection describes a different model, so it does not
+    /// get to name the provider for this one — `fable` runs on Claude, which is
+    /// what both the rotation check and the spawn must see.
+    #[test]
+    fn an_agent_default_never_reinterprets_the_job_model() {
+        assert_eq!(
+            effective_backend_name(
+                Some(&selection("codex", "gpt-5.6-sol")),
+                Some("codex"),
+                Some("fable")
+            )
+            .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            backend_for_name(
+                effective_backend_name(
+                    Some(&selection("codex", "gpt-5.6-sol")),
+                    Some("codex"),
+                    Some("fable")
+                )
+                .as_deref()
+            )
+            .name(),
+            "Claude"
+        );
+    }
+
+    /// The deliberate switch, which is the same question answered the other way:
+    /// the job's model IS the Codex one, so Codex is what serves it.
+    #[test]
+    fn an_explicit_codex_model_resolves_to_codex() {
+        assert_eq!(
+            effective_backend_name(
+                Some(&selection("claude", "fable")),
+                None,
+                Some("gpt-5.6-sol")
+            )
+            .as_deref(),
+            Some("codex")
+        );
+    }
+
+    /// A selection naming the job's own model is the atomic pair, and it is the
+    /// only authority that can spell a provider the model name cannot carry.
+    #[test]
+    fn a_matching_selection_speaks_for_its_model() {
+        assert_eq!(
+            effective_backend_name(
+                Some(&selection("ollama", "gemma4:e4b")),
+                None,
+                Some("gemma4:e4b")
+            )
+            .as_deref(),
+            Some("ollama")
+        );
+        // An OpenRouter reroute persists the OpenRouter model id, so the pair
+        // survives a restart rebuilt from `jobs.model` alone.
+        assert_eq!(
+            effective_backend_name(
+                Some(&selection("openrouter", "~anthropic/claude-sonnet-latest")),
+                None,
+                Some("~anthropic/claude-sonnet-latest")
+            )
+            .as_deref(),
+            Some("openrouter")
+        );
+    }
+
+    /// With no model persisted there is nothing to reinterpret, so the agent's
+    /// own ladder answers: its atomic selection, then its authored preference.
+    #[test]
+    fn without_a_job_model_the_agent_ladder_answers() {
+        assert_eq!(
+            effective_backend_name(Some(&selection("codex", "gpt-5.6-sol")), None, None).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            effective_backend_name(None, Some("codex"), None).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(effective_backend_name(None, None, None), None);
+    }
+
+    // =========================================================================
     // resolve_tools (backend-level)
     // =========================================================================
 
@@ -871,6 +1129,37 @@ pub(crate) mod tests {
         // longer auto-added — CAIRN-2505).
         assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
         assert!(!rt.allowed.contains(&"mcp__cairn__return".into()));
+    }
+
+    /// Every name on the roster, driven from the roster itself.
+    ///
+    /// Each entry is there because Claude Code declares that built-in to the
+    /// model unless `--disallowedTools` names it, so the guarantee has to hold
+    /// for the whole list rather than for whichever names a test once copied.
+    /// The roster is fed in as agent config too: a stale config listing
+    /// `TodoWrite` or `EnterPlanMode` must still be stripped from `allowed`
+    /// (native `TodoWrite` would silently store nothing) rather than honoured.
+    #[test]
+    fn claude_resolve_tools_blocks_every_always_disallowed_tool() {
+        let backend = claude::ClaudeBackend;
+        let agent_tools: Vec<String> = std::iter::once("Read".to_string())
+            .chain(
+                crate::models::ALWAYS_DISALLOWED_TOOLS
+                    .iter()
+                    .map(|t| t.to_string()),
+            )
+            .collect();
+        let rt = backend.resolve_tools(&agent_tools, &[]);
+        for tool in crate::models::ALWAYS_DISALLOWED_TOOLS {
+            assert!(
+                rt.disallowed.contains(&tool.to_string()),
+                "{tool} must be in Claude's disallowed list"
+            );
+            assert!(
+                !rt.allowed.contains(&tool.to_string()),
+                "{tool} must never be allowed, even when agent config lists it"
+            );
+        }
     }
 
     #[test]
@@ -963,85 +1252,6 @@ pub(crate) mod tests {
         assert!(
             !rt.allowed.contains(&"mcp__cairn__skill".into()),
             "skill tool was removed and must not be auto-added"
-        );
-    }
-
-    #[test]
-    fn claude_resolve_tools_blocks_always_disallowed() {
-        let backend = claude::ClaudeBackend;
-        // Even if agent config includes planning tools, they must be blocked
-        let rt = backend.resolve_tools(
-            &["Read".into(), "EnterPlanMode".into(), "ExitPlanMode".into()],
-            &[],
-        );
-        assert!(
-            rt.disallowed.contains(&"EnterPlanMode".into()),
-            "EnterPlanMode must be disallowed"
-        );
-        assert!(
-            rt.disallowed.contains(&"ExitPlanMode".into()),
-            "ExitPlanMode must be disallowed"
-        );
-        assert!(
-            !rt.allowed.contains(&"EnterPlanMode".into()),
-            "EnterPlanMode must not be in allowed"
-        );
-        assert!(
-            !rt.allowed.contains(&"ExitPlanMode".into()),
-            "ExitPlanMode must not be in allowed"
-        );
-    }
-
-    #[test]
-    fn claude_resolve_tools_blocks_host_harness_tools() {
-        let backend = claude::ClaudeBackend;
-        // Claude Code (the host harness) declares its built-in tools to the
-        // model unless they are named in --disallowedTools. None has a Cairn
-        // equivalent, so even if an agent config lists one it must be stripped
-        // from `allowed` and present in `disallowed`.
-        let harness_tools = [
-            "CronCreate",
-            "CronDelete",
-            "CronList",
-            "ScheduleWakeup",
-            "RemoteTrigger",
-            "EnterWorktree",
-            "ExitWorktree",
-            "ListMcpResourcesTool",
-            "ReadMcpResourceTool",
-            "Monitor",
-            "TaskStop",
-            "PushNotification",
-            "DesignSync",
-        ];
-        let agent_tools: Vec<String> = harness_tools.iter().map(|t| t.to_string()).collect();
-        let rt = backend.resolve_tools(&agent_tools, &[]);
-        for tool in harness_tools {
-            assert!(
-                rt.disallowed.contains(&tool.to_string()),
-                "{tool} must be disallowed"
-            );
-            assert!(
-                !rt.allowed.contains(&tool.to_string()),
-                "{tool} must not be in allowed"
-            );
-        }
-    }
-
-    #[test]
-    fn claude_resolve_tools_blocks_native_todo_write() {
-        let backend = claude::ClaudeBackend;
-        // Agents previously carried `TodoWrite`; todos now go through `write`.
-        // Native TodoWrite must be disallowed, never silently enabled (it would
-        // store nothing).
-        let rt = backend.resolve_tools(&["Read".into(), "TodoWrite".into()], &[]);
-        assert!(
-            rt.disallowed.contains(&"TodoWrite".into()),
-            "TodoWrite must be disallowed"
-        );
-        assert!(
-            !rt.allowed.contains(&"TodoWrite".into()),
-            "TodoWrite must not be in allowed"
         );
     }
 

@@ -1,5 +1,4 @@
 use crate::issues::crud;
-use crate::models::IssueKind;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use crate::transitions::Resolution;
@@ -156,29 +155,6 @@ pub async fn check_resolution(
         // holds for the whole surface: a caller that pre-checks gets the same
         // refusal it would have gotten later, before it has written anything.
         _ => return Err(unsettable_status_refusal(status)),
-    }
-
-    // A thread has no branch and never opens a pull request, so `merged` names
-    // an event that cannot happen to it. This is refused for BOTH actors and
-    // ahead of the open-PR redirect below: the redirect points a caller at a PR
-    // to merge instead, and for a thread there is no such PR to point at.
-    // `closed` stays available — a thread that has run its course is closed,
-    // not merged.
-    if status == "merged" {
-        let owning_db = crud::owning_db_for_issue(&orch.db, id)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(identity) = crud::identity(&owning_db, id)
-            .await
-            .map_err(|e| format!("Failed to resolve issue kind: {e}"))?
-        {
-            if identity.kind == IssueKind::Thread {
-                return Err(ResolutionRefusal::Rejected(format!(
-                    "Refusing to mark {}-{} merged: it is a thread. A thread owns no branch and never opens a pull request, so there is nothing to merge — its children merge to the project's base branch on their own. Close it instead with status: \"closed\" when it has run its course.",
-                    identity.project_key, identity.number
-                )));
-            }
-        }
     }
 
     // `merged` while a PR is still OPEN would record a resolution WITHOUT
@@ -794,58 +770,6 @@ mod tests {
         .await
         .expect("backlog is settable")
         .is_empty());
-    }
-
-    /// A thread never opens a pull request, so `merged` names an event that
-    /// cannot happen to it. The refusal says which thread and what to do
-    /// instead; `closed` stays available, and an ordinary issue is untouched by
-    /// the rule.
-    #[tokio::test]
-    async fn a_thread_refuses_merged_and_still_closes() {
-        let orch = orch_with_queued_job().await;
-        orch.db
-            .local
-            .execute(
-                "INSERT INTO issues(id, project_id, number, title, status, progress, attention, kind, created_at, updated_at)
-                 VALUES('thread-1', 'p-1', 2, 'Thread', 'active', 'active', 'none', 'thread', 1, 1)",
-                (),
-            )
-            .await
-            .unwrap();
-
-        let refusal = check_resolution(
-            &orch,
-            "thread-1",
-            "merged",
-            ResolutionActor::User,
-            Confirmation::Given,
-        )
-        .await
-        .expect_err("a thread has nothing to merge");
-        let text = refusal.to_string();
-        assert!(text.contains("PROJ-2"), "names the thread: {text}");
-        assert!(text.contains("thread"), "says why: {text}");
-        assert!(text.contains("closed"), "names the lever instead: {text}");
-
-        check_resolution(
-            &orch,
-            "thread-1",
-            "closed",
-            ResolutionActor::Agent,
-            Confirmation::Given,
-        )
-        .await
-        .expect("a thread that has run its course closes");
-
-        check_resolution(
-            &orch,
-            "issue-1",
-            "merged",
-            ResolutionActor::User,
-            Confirmation::Given,
-        )
-        .await
-        .expect("an ordinary issue still merges");
     }
 
     #[tokio::test]

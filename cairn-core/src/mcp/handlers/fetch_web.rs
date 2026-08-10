@@ -7,15 +7,14 @@
 //! - **Regular** (the default, depending on nothing): an async reqwest GET,
 //!   content-type aware — `text/html` is converted via `htmd`, while JSON / text
 //!   / markdown pass through unchanged.
-//! - **Jina / Firecrawl**: a reqwest request to the provider's endpoint with an
-//!   API key from the OS keychain, normalized to markdown.
+//! - **Jina / Firecrawl**: provider API-key requests normalized to markdown.
+//! - **Cloudflare**: Browser Run with a refreshed provider OAuth token.
 //! - **bmd**: calls bmd's `fetch` tool through the host MCP gateway, reusing the
 //!   OAuth connection the user established for the bmd MCP server. No pasteable
 //!   key — auth rides on the existing MCP connection.
 //!
 //! PDF targets are handled by [`super::pdf`], not here.
 
-use crate::config::mcp_servers::McpServerConfig;
 use crate::config::web_fetch::{self, ActiveFetch, FetchProviderId};
 use crate::mcp::gateway::McpGateway;
 use crate::orchestrator::Orchestrator;
@@ -32,6 +31,7 @@ pub(crate) async fn read_fetch_markdown(
         ActiveFetch::Provider { id, options } => match id {
             FetchProviderId::Jina => jina_fetch(target).await,
             FetchProviderId::Firecrawl => firecrawl_fetch(target, &options).await,
+            FetchProviderId::Cloudflare => cloudflare_fetch(target, &options).await,
             FetchProviderId::Bmd => bmd_fetch(orch, target).await,
         },
     }
@@ -57,7 +57,7 @@ async fn jina_fetch(target: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
-        .header("Authorization", format!("Bearer {key}"))
+        .header("Authorization", format!("Bearer {}", key.expose()))
         .header("X-Return-Format", "markdown")
         .send()
         .await
@@ -87,7 +87,7 @@ async fn firecrawl_fetch(
     let client = reqwest::Client::new();
     let resp = client
         .post("https://api.firecrawl.dev/v1/scrape")
-        .header("Authorization", format!("Bearer {key}"))
+        .header("Authorization", format!("Bearer {}", key.expose()))
         .header("Content-Type", "application/json")
         .body(body.to_string())
         .send()
@@ -124,6 +124,153 @@ struct FirecrawlData {
     markdown: Option<String>,
 }
 
+/// Cloudflare Browser Run: POST to the markdown Quick Action and select either
+/// the Kitesurf isolate browser or full Chromium through the query string.
+async fn cloudflare_fetch(
+    target: &str,
+    options: &HashMap<String, serde_yaml::Value>,
+) -> Result<String, String> {
+    // Brokered: the response body below is returned to the agent verbatim on
+    // failure, and Cloudflare's error envelope quotes the request it rejected.
+    let Some(token) =
+        crate::security::broker::mcp_oauth_token("web-fetch/cloudflare", "cloudflare web fetch")
+            .await
+    else {
+        return Ok(
+            "Cloudflare web fetch is not authorized. Connect it in Settings → Web Services."
+                .to_string(),
+        );
+    };
+    let Some(request) = cloudflare_request(target, options) else {
+        return Ok(cloudflare_setup_message());
+    };
+    let response = reqwest::Client::new()
+        .post(&request.url)
+        .bearer_auth(token.expose())
+        .json(&request.body)
+        .send()
+        .await
+        .map_err(|error| {
+            format!("Failed to fetch `{target}` via Cloudflare Browser Run: {error}")
+        })?;
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let text = response.text().await.map_err(|error| {
+        format!("Failed to read Cloudflare Browser Run response for `{target}`: {error}")
+    })?;
+
+    if !status.is_success() {
+        let detail = cloudflare_error_message(&text).unwrap_or_else(|| {
+            text.chars()
+                .take(200)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        });
+        let retry = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            retry_after
+                .map(|value| format!(" Retry-After: {value}."))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" — {detail}")
+        };
+        return Err(format!(
+            "Cloudflare Browser Run fetch of `{target}` failed: HTTP {}{detail}.{retry}",
+            status.as_u16()
+        ));
+    }
+
+    parse_cloudflare_response(&text, target)
+}
+
+struct CloudflareRequest {
+    url: String,
+    body: serde_json::Value,
+}
+
+fn cloudflare_request(
+    target: &str,
+    options: &HashMap<String, serde_yaml::Value>,
+) -> Option<CloudflareRequest> {
+    let account_id = options
+        .get("accountId")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let browser = options
+        .get("browser")
+        .and_then(|value| value.as_str())
+        .unwrap_or("kitesurf");
+    let wait_until = options
+        .get("waitUntil")
+        .and_then(|value| value.as_str())
+        .unwrap_or("load");
+    let mut body = serde_json::json!({ "url": target });
+    if wait_until == "networkidle0" {
+        body["gotoOptions"] = serde_json::json!({ "waitUntil": "networkidle0" });
+    }
+    Some(CloudflareRequest {
+        url: format!(
+            "https://api.cloudflare.com/client/v4/accounts/{account_id}/browser-rendering/markdown?browser={browser}"
+        ),
+        body,
+    })
+}
+
+#[derive(Deserialize)]
+struct CloudflareResponse {
+    success: bool,
+    result: Option<String>,
+    #[serde(default)]
+    errors: Vec<CloudflareError>,
+}
+
+#[derive(Deserialize)]
+struct CloudflareError {
+    message: Option<String>,
+}
+
+fn parse_cloudflare_response(text: &str, target: &str) -> Result<String, String> {
+    let response: CloudflareResponse = serde_json::from_str(text).map_err(|error| {
+        format!("Cloudflare Browser Run returned an unexpected response for `{target}`: {error}")
+    })?;
+    if !response.success {
+        let detail = response
+            .errors
+            .iter()
+            .find_map(|error| error.message.as_deref())
+            .unwrap_or("the request was unsuccessful");
+        return Err(format!(
+            "Cloudflare Browser Run fetch of `{target}` failed: {detail}"
+        ));
+    }
+    response
+        .result
+        .ok_or_else(|| format!("Cloudflare Browser Run returned no markdown for `{target}`."))
+}
+
+fn cloudflare_error_message(text: &str) -> Option<String> {
+    serde_json::from_str::<CloudflareResponse>(text)
+        .ok()?
+        .errors
+        .into_iter()
+        .find_map(|error| error.message)
+}
+
+fn cloudflare_setup_message() -> String {
+    "The Cloudflare Browser Run web-fetch provider is missing its account ID. Set your Cloudflare account ID in Settings → Web Services."
+        .to_string()
+}
+
 /// bmd: call bmd's `fetch` tool through the host MCP gateway, reusing the OAuth
 /// connection established for the configured bmd MCP server.
 pub(crate) async fn bmd_fetch(orch: &Orchestrator, source: &str) -> Result<String, String> {
@@ -138,7 +285,7 @@ pub(crate) async fn bmd_fetch(orch: &Orchestrator, source: &str) -> Result<Strin
         return Ok(bmd_setup_message());
     };
     let credential_key = crate::config::secrets::credential_key("bmd", None);
-    let expanded = config.expanded(&credential_key);
+    let expanded = config.brokered(&credential_key, "bmd web fetch");
     bmd_fetch_via(gateway.as_ref(), &expanded, &credential_key, source).await
 }
 
@@ -146,7 +293,7 @@ pub(crate) async fn bmd_fetch(orch: &Orchestrator, source: &str) -> Result<Strin
 /// against a mock gateway.
 async fn bmd_fetch_via(
     gateway: &dyn McpGateway,
-    config: &McpServerConfig,
+    config: &crate::security::BrokeredMcpConfig,
     credential_key: &str,
     source: &str,
 ) -> Result<String, String> {
@@ -170,11 +317,15 @@ fn bmd_setup_message() -> String {
         .to_string()
 }
 
-/// The keychain API key for an `ApiKey` provider, if set and non-empty.
-fn provider_key(id: FetchProviderId) -> Option<String> {
+/// The stored API key for an `ApiKey` provider, if set and non-empty.
+///
+/// Brokered, so the key is registered for scrubbing before it reaches an
+/// `Authorization` header. A fetch provider returns page content the agent
+/// reads directly; an error body that quotes the rejected key would otherwise
+/// surface it verbatim.
+fn provider_key(id: FetchProviderId) -> Option<crate::security::BrokeredSecret> {
     let var = id.auth().secret_var()?;
-    let key = crate::config::secrets::credential_key(id.as_str(), None);
-    crate::config::secrets::get_secret(&key, var).filter(|k| !k.trim().is_empty())
+    crate::security::broker::web_provider_key(id.as_str(), var, "web fetch request")
 }
 
 fn missing_key_message(id: FetchProviderId) -> String {
@@ -304,7 +455,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
         ) -> Result<McpToolCatalog, String> {
             Ok(McpToolCatalog::default())
         }
@@ -312,7 +463,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
         ) -> Result<Vec<McpResourceDef>, String> {
             Ok(vec![])
         }
@@ -320,7 +471,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &McpServerConfig,
+            _: &crate::security::BrokeredMcpConfig,
             _: &str,
         ) -> Result<String, String> {
             Ok(String::new())
@@ -329,7 +480,7 @@ mod tests {
             &self,
             _session: &str,
             _server: &str,
-            _config: &McpServerConfig,
+            _config: &crate::security::BrokeredMcpConfig,
             tool: &str,
             args: serde_json::Value,
             _timeout: Option<u32>,
@@ -344,17 +495,12 @@ mod tests {
         async fn close_session(&self, _: &str) {}
     }
 
-    fn bmd_config() -> McpServerConfig {
-        McpServerConfig {
-            transport: "http".into(),
-            command: None,
-            args: vec![],
-            env: HashMap::new(),
-            url: Some("https://bmd.example/mcp".into()),
-            headers: HashMap::new(),
-            enabled: true,
-            oauth: None,
-        }
+    fn bmd_config() -> crate::security::BrokeredMcpConfig {
+        let authored: crate::config::mcp_servers::McpServerConfig = serde_json::from_value(
+            serde_json::json!({"type": "http", "url": "https://bmd.example/mcp"}),
+        )
+        .unwrap();
+        authored.brokered("bmd", "test")
     }
 
     #[tokio::test]
@@ -408,5 +554,53 @@ mod tests {
         assert_eq!(json, "{\"a\":1}");
         let text = convert_body("text/plain", "# already md".to_string());
         assert_eq!(text, "# already md");
+    }
+
+    #[test]
+    fn cloudflare_request_builds_kitesurf_and_chromium_variants() {
+        let kitesurf = HashMap::from([
+            ("accountId".to_string(), "account-123".into()),
+            ("browser".to_string(), "kitesurf".into()),
+            ("waitUntil".to_string(), "networkidle0".into()),
+        ]);
+        let request = cloudflare_request("https://example.com", &kitesurf).unwrap();
+        assert_eq!(
+            request.url,
+            "https://api.cloudflare.com/client/v4/accounts/account-123/browser-rendering/markdown?browser=kitesurf"
+        );
+        assert_eq!(request.body["url"], "https://example.com");
+        assert_eq!(request.body["gotoOptions"]["waitUntil"], "networkidle0");
+
+        let chromium = HashMap::from([
+            ("accountId".to_string(), "account-123".into()),
+            ("browser".to_string(), "chromium".into()),
+            ("waitUntil".to_string(), "load".into()),
+        ]);
+        let request = cloudflare_request("https://example.com", &chromium).unwrap();
+        assert!(request.url.ends_with("?browser=chromium"));
+        assert!(request.body.get("gotoOptions").is_none());
+    }
+
+    #[test]
+    fn cloudflare_response_parses_success_and_errors() {
+        assert_eq!(
+            parse_cloudflare_response(
+                r##"{"success":true,"result":"# Rendered","errors":[]}"##,
+                "https://example.com"
+            )
+            .unwrap(),
+            "# Rendered"
+        );
+        let error = parse_cloudflare_response(
+            r#"{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}"#,
+            "https://example.com",
+        )
+        .unwrap_err();
+        assert!(error.contains("Authentication error"), "{error}");
+
+        let error =
+            parse_cloudflare_response(r#"{"success":true,"errors":[]}"#, "https://example.com")
+                .unwrap_err();
+        assert!(error.contains("returned no markdown"), "{error}");
     }
 }

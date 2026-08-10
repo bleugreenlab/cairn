@@ -136,9 +136,7 @@ fn parse_query(params: &[QueryParam]) -> Result<CheckResultsQuery, String> {
             );
         }
     }
-    let environment_fingerprint = if environment == "current" {
-        String::new()
-    } else if environment == "unfingerprinted" {
+    let environment_fingerprint = if matches!(environment.as_str(), "current" | "unfingerprinted") {
         String::new()
     } else {
         environment.clone()
@@ -242,10 +240,6 @@ pub(super) async fn read_project_check_results(
 /// transcript turns — so its instants render on the host clock with the clock
 /// named. A bare epoch integer told the reader nothing; an unlabelled stamp
 /// would have invited them to read it on the wrong clock.
-fn seconds_stamp(timestamp: i64) -> String {
-    crate::clock::stamp_with_seconds(timestamp).unwrap_or_else(|| timestamp.to_string())
-}
-
 fn millis_stamp(millis: i64) -> String {
     crate::clock::stamp_millis_with_seconds(millis).unwrap_or_else(|| millis.to_string())
 }
@@ -319,11 +313,8 @@ fn render_observation(
             "- Parser/schema: {}/{}",
             observation.parser_version, observation.result_schema_version
         ),
-        format!(
-            "- Evaluated at: {}",
-            seconds_stamp(observation.evaluated_at)
-        ),
-        format!("- Ran at: {}", seconds_stamp(observation.ran_at)),
+        format!("- Evaluated at: {}", millis_stamp(observation.evaluated_at)),
+        format!("- Ran at: {}", millis_stamp(observation.ran_at)),
         format!("- Duration: {} ms", observation.duration_ms),
         format!("- Cadence: {}", observation.cadence),
     ];
@@ -569,7 +560,7 @@ mod tests {
             source_defined_by_commit_sha: Some("source-commit".into()),
             evaluated_tree_hash: "target-tree".into(),
             evaluated_input_hash: "target-input".into(),
-            evaluated_at: 200,
+            evaluated_at: 1_754_246_321_000,
             observation_id: "obs-1".into(),
             project_id: "project-1".into(),
             source_commit_sha: "source-commit".into(),
@@ -585,7 +576,7 @@ mod tests {
             non_reusable_reason: Some("red verdict".into()),
             parser_version: 2,
             result_schema_version: 1,
-            ran_at: 100,
+            ran_at: 1_754_246_320_000,
             duration_ms: 50,
             job_id: Some("job-1".into()),
             run_id: Some("run-1".into()),
@@ -644,6 +635,8 @@ mod tests {
             "Defined by commit: target-commit",
             "Source commit: source-commit",
             "Source defined by commit: source-commit",
+            "Evaluated at: 2025-",
+            "Ran at: 2025-",
             "Non-authoritative reason: red verdict",
             "1 passed, 1 failed, 0 skipped",
             "crate::passes",

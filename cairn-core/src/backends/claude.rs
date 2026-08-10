@@ -34,16 +34,80 @@ use crate::transcripts::stream_store::{
 };
 use cairn_common::ids;
 use cairn_db::turso::params;
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::{AgentBackend, BackendFailure, DiscoveredModel, ResolvedTools, SessionConfig};
 
 const CLAUDE_BACKEND_NAME: &str = "Claude";
 const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 512;
+const CLAUDE_TURN_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CLAUDE_TURN_WATCHDOG_POLL: Duration = Duration::from_secs(1);
+
+/// Bounds a provider turn that has started but emits no further protocol
+/// progress. Tool calls are excluded: their host-owned execution has its own
+/// deadlines and may legitimately remain silent for much longer than a model
+/// inference. This specifically covers a resumed Claude process that accepts a
+/// launch but never emits even an init/result event (CAIRN-3561).
+#[derive(Debug)]
+struct ClaudeTurnProgressWatchdog {
+    active_turn_id: Option<String>,
+    last_forward_progress_at: Instant,
+    timeout: Duration,
+    pending_tool_count: usize,
+    fired: bool,
+}
+
+impl ClaudeTurnProgressWatchdog {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            active_turn_id: None,
+            last_forward_progress_at: Instant::now(),
+            timeout,
+            pending_tool_count: 0,
+            fired: false,
+        }
+    }
+
+    fn observe_turn(&mut self, turn_id: Option<&str>, now: Instant) {
+        if self.active_turn_id.as_deref() != turn_id {
+            self.active_turn_id = turn_id.map(str::to_owned);
+            self.last_forward_progress_at = now;
+            self.pending_tool_count = 0;
+            self.fired = false;
+        }
+    }
+
+    fn record_forward_progress(&mut self, now: Instant) {
+        if self.active_turn_id.is_some() {
+            self.last_forward_progress_at = now;
+        }
+    }
+
+    fn set_pending_tool_count(&mut self, count: usize) {
+        self.pending_tool_count = count;
+    }
+
+    fn expired(&mut self, now: Instant) -> Option<String> {
+        if self.fired || self.pending_tool_count > 0 {
+            return None;
+        }
+        let turn_id = self.active_turn_id.as_ref()?;
+        if now.duration_since(self.last_forward_progress_at) < self.timeout {
+            return None;
+        }
+        self.fired = true;
+        Some(turn_id.clone())
+    }
+}
 
 /// Estimated resident memory of a single ephemeral (`cairn:~/calls`) `claude`
 /// process. Claude is permanently CLI-bound, so each call is a dedicated
@@ -152,8 +216,61 @@ mod tests {
     use super::{
         build_claude_context_snapshot, claude_context_used_tokens, parse_thinking_tokens_estimate,
         should_confirm_backend_id_after_init, terminal_result_error_message, ClaudeBackend,
+        ClaudeTurnProgressWatchdog,
     };
     use crate::agent_process::stream::{parse_event, ClaudeEvent, Usage};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn silent_resumed_turn_expires_at_the_bounded_window() {
+        let timeout = Duration::from_secs(10);
+        let started = Instant::now();
+        let mut watchdog = ClaudeTurnProgressWatchdog::new(timeout);
+        watchdog.observe_turn(Some("wait-resolved-turn"), started);
+
+        assert_eq!(
+            watchdog.expired(started + timeout - Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            watchdog.expired(started + timeout),
+            Some("wait-resolved-turn".to_string())
+        );
+        assert_eq!(watchdog.expired(started + timeout * 2), None);
+    }
+
+    #[test]
+    fn provider_progress_and_new_turn_reset_the_silence_window() {
+        let timeout = Duration::from_secs(10);
+        let started = Instant::now();
+        let mut watchdog = ClaudeTurnProgressWatchdog::new(timeout);
+        watchdog.observe_turn(Some("turn-1"), started);
+        watchdog.record_forward_progress(started + Duration::from_secs(8));
+        assert_eq!(watchdog.expired(started + Duration::from_secs(12)), None);
+
+        watchdog.observe_turn(Some("turn-2"), started + Duration::from_secs(15));
+        assert_eq!(watchdog.expired(started + Duration::from_secs(20)), None);
+        assert_eq!(
+            watchdog.expired(started + Duration::from_secs(25)),
+            Some("turn-2".to_string())
+        );
+    }
+
+    #[test]
+    fn outstanding_tool_call_disarms_provider_silence_detection() {
+        let timeout = Duration::from_secs(10);
+        let started = Instant::now();
+        let mut watchdog = ClaudeTurnProgressWatchdog::new(timeout);
+        watchdog.observe_turn(Some("turn-1"), started);
+        watchdog.set_pending_tool_count(1);
+        assert_eq!(watchdog.expired(started + Duration::from_secs(60)), None);
+
+        watchdog.set_pending_tool_count(0);
+        assert_eq!(
+            watchdog.expired(started + Duration::from_secs(60)),
+            Some("turn-1".to_string())
+        );
+    }
 
     #[test]
     fn terminal_api_refusal_is_named_even_when_cli_calls_it_success() {
@@ -1028,6 +1145,11 @@ impl AgentBackend for ClaudeBackend {
             .collect();
         disallowed.extend(agent_disallowed.iter().cloned());
 
+        // Built-ins caught escaping an earlier session in this process. A CLI
+        // update can add a built-in that predates no list; quarantining what was
+        // actually observed keeps it off every later session.
+        disallowed.extend(toolkits::quarantined_tools());
+
         disallowed.sort();
         disallowed.dedup();
 
@@ -1203,15 +1325,37 @@ impl AgentBackend for ClaudeBackend {
                 .env("GIT_COMMITTER_NAME", &user.name)
                 .env("GIT_COMMITTER_EMAIL", &user.email);
 
-            // Forward Claude auth token for remote/headless sessions
+            // Forward Claude auth token for remote/headless sessions.
+            //
+            // The CLI reads its credential from this environment, so the
+            // plaintext is unavoidable; what the broker adds is that the value
+            // is a registered scrub target before it is injected, and that the
+            // injection appears in the lease inventory. A `ConfigDir` is a path
+            // rather than a credential and deliberately does not go through it —
+            // registering an ordinary path is the over-registration failure the
+            // broker exists to avoid.
+            let backend_account = user.email.as_str();
+            const ANTHROPIC_PROVIDER: &str = "anthropic";
             match &user.claude_auth {
                 Some(crate::identity::ClaudeAuth::OAuthToken(token)) => {
-                    log::info!("Setting CLAUDE_CODE_OAUTH_TOKEN (len={})", token.len());
-                    spawn_config = spawn_config.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+                    let leased = crate::security::broker::backend::agent_credential(
+                        ANTHROPIC_PROVIDER,
+                        backend_account,
+                        crate::security::broker::backend::CLAUDE_ROLE,
+                        token,
+                    )?;
+                    log::info!("Setting CLAUDE_CODE_OAUTH_TOKEN (len={})", leased.len());
+                    spawn_config = spawn_config.env("CLAUDE_CODE_OAUTH_TOKEN", &leased);
                 }
                 Some(crate::identity::ClaudeAuth::ApiKey(key)) => {
-                    log::info!("Setting ANTHROPIC_API_KEY (len={})", key.len());
-                    spawn_config = spawn_config.env("ANTHROPIC_API_KEY", key);
+                    let leased = crate::security::broker::backend::agent_credential(
+                        ANTHROPIC_PROVIDER,
+                        backend_account,
+                        crate::security::broker::backend::CLAUDE_ROLE,
+                        key,
+                    )?;
+                    log::info!("Setting ANTHROPIC_API_KEY (len={})", leased.len());
+                    spawn_config = spawn_config.env("ANTHROPIC_API_KEY", &leased);
                 }
                 Some(crate::identity::ClaudeAuth::ConfigDir(path)) => {
                     crate::identity::claude_profile::provision_profile(path)?;
@@ -1483,6 +1627,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
                 ClaudeContextOptIn::default(),
             )),
             canonical_slug: None,
+            serving_account_ids: Vec::new(),
             pricing: None,
             supported_parameters: Vec::new(),
             router: false,
@@ -1502,6 +1647,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
                 ClaudeContextOptIn::default(),
             )),
             canonical_slug: None,
+            serving_account_ids: Vec::new(),
             pricing: None,
             supported_parameters: Vec::new(),
             router: false,
@@ -1518,6 +1664,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
             supported_reasoning_efforts: vec![],
             context_window: Some(claude_context_window("opus", ClaudeContextOptIn::default())),
             canonical_slug: None,
+            serving_account_ids: Vec::new(),
             pricing: None,
             supported_parameters: Vec::new(),
             router: false,
@@ -1537,6 +1684,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
                 ClaudeContextOptIn::default(),
             )),
             canonical_slug: None,
+            serving_account_ids: Vec::new(),
             pricing: None,
             supported_parameters: Vec::new(),
             router: false,
@@ -1581,6 +1729,106 @@ impl ClaudeBackend {
         let mut pending_delta_usage: Option<Usage> = None;
         let mut pending_final_assistant_event: Option<TranscriptEvent> = None;
         let mut backend_id_confirmed = !confirm_backend_id_after_init;
+        let mut pending_tool_ids = HashSet::<String>::new();
+        let progress_watchdog = Arc::new(Mutex::new(ClaudeTurnProgressWatchdog::new(
+            CLAUDE_TURN_NO_PROGRESS_TIMEOUT,
+        )));
+        if let Ok(mut watchdog) = progress_watchdog.lock() {
+            let current_turn = orch.process_state.get_current_turn_id(run_id);
+            watchdog.observe_turn(current_turn.as_deref(), Instant::now());
+        }
+        let watchdog_alive = Arc::new(AtomicBool::new(true));
+        {
+            let watchdog = progress_watchdog.clone();
+            let alive = watchdog_alive.clone();
+            let orch = orch.clone();
+            let run_id = run_id.to_string();
+            let session_id = session_id.clone();
+            let watchdog_run_db = run_db.clone();
+            thread::spawn(move || {
+                while alive.load(Ordering::Acquire) {
+                    thread::sleep(CLAUDE_TURN_WATCHDOG_POLL);
+                    if !alive.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let current_turn = orch.process_state.get_current_turn_id(&run_id);
+                    let expired_turn = watchdog.lock().ok().and_then(|mut guard| {
+                        let now = Instant::now();
+                        guard.observe_turn(current_turn.as_deref(), now);
+                        guard.expired(now)
+                    });
+                    let Some(turn_id) = expired_turn else {
+                        continue;
+                    };
+                    log::error!(
+                        "Claude turn {turn_id} for run {} made no forward progress for {:?}; aborting silent provider process",
+                        &run_id[..run_id.len().min(8)],
+                        CLAUDE_TURN_NO_PROGRESS_TIMEOUT
+                    );
+                    let diagnosis = format!(
+                        "Claude produced no provider progress for {} seconds after the turn started. Cairn detected the wedged process and is attempting recovery.",
+                        CLAUDE_TURN_NO_PROGRESS_TIMEOUT.as_secs()
+                    );
+                    insert_error_event(&orch, &run_id, session_id.as_deref(), &diagnosis);
+                    let (job_id, _) = run_job_execution(&watchdog_run_db, &run_id);
+                    let Some(job_id) = job_id else {
+                        let failure = "Cairn could not identify the job for the silent Claude turn, so automatic recovery was not possible.";
+                        insert_error_event(&orch, &run_id, session_id.as_deref(), failure);
+                        let _ = crate::orchestrator::lifecycle::kill_session_with_reason(
+                            &orch, &run_id, "crash",
+                        );
+                        break;
+                    };
+                    if let Err(error) = crate::orchestrator::lifecycle::kill_session_with_reason(
+                        &orch,
+                        &run_id,
+                        crate::orchestrator::lifecycle::PROVIDER_SILENCE_RECOVERY_EXIT_REASON,
+                    ) {
+                        let failure = format!(
+                            "Cairn could not stop the silent Claude turn for recovery: {error}"
+                        );
+                        insert_error_event(&orch, &run_id, session_id.as_deref(), &failure);
+                        crate::orchestrator::lifecycle::report_recovery_launch_failure(
+                            &orch, &run_id,
+                        );
+                        break;
+                    }
+                    let recovery_prompt = format!(
+                        "{diagnosis} Continue from the completed tool result already present in the transcript."
+                    );
+                    match crate::execution::jobs::continue_job_impl(
+                        &orch,
+                        &job_id,
+                        Some(&recovery_prompt),
+                        None,
+                        Some(crate::execution::jobs::ResumeContext {
+                            suppress_user_event: true,
+                            ..Default::default()
+                        }),
+                    ) {
+                        Ok(_) => insert_error_event(
+                            &orch,
+                            &run_id,
+                            session_id.as_deref(),
+                            "Cairn started a recovery turn after the silent Claude continuation.",
+                        ),
+                        Err(error) => {
+                            let failure = format!(
+                                "Cairn could not start the recovery turn after aborting the silent Claude continuation: {error}"
+                            );
+                            log::error!(
+                                "Failed to self-resume silent Claude turn {turn_id} for job {job_id}: {error}"
+                            );
+                            insert_error_event(&orch, &run_id, session_id.as_deref(), &failure);
+                            crate::orchestrator::lifecycle::report_recovery_launch_failure(
+                                &orch, &run_id,
+                            );
+                        }
+                    }
+                    break;
+                }
+            });
+        }
 
         // Grab the terminal_tool_called flag for this process.
         // When set, we stop storing events — the session is complete.
@@ -1653,6 +1901,12 @@ impl ClaudeBackend {
                         first_event_logged = true;
                     }
                     last_event_kind = claude_event_kind(&event);
+                    if let Ok(mut watchdog) = progress_watchdog.lock() {
+                        let now = Instant::now();
+                        let current_turn = orch.process_state.get_current_turn_id(run_id);
+                        watchdog.observe_turn(current_turn.as_deref(), now);
+                        watchdog.record_forward_progress(now);
+                    }
                     // A terminal Result seen at any point means the turn completed;
                     // capture it before any branch so a later EOF finalizes Exited.
                     if matches!(&event, ClaudeEvent::Result { .. }) {
@@ -1715,6 +1969,36 @@ impl ClaudeBackend {
                                 } else {
                                     backend_id_confirmed = true;
                                 }
+                            }
+                        }
+                    }
+
+                    // The `init` event reports the tools the CLI actually
+                    // declared to the model, which is the only direct evidence
+                    // of what `--disallowedTools` failed to suppress.
+                    if let ClaudeEvent::System { subtype, data, .. } = &event {
+                        if subtype == "init" {
+                            let declared: Vec<String> = data
+                                .get("tools")
+                                .and_then(|t| t.as_array())
+                                .map(|tools| {
+                                    tools
+                                        .iter()
+                                        .filter_map(|t| t.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let leaked =
+                                crate::agent_process::toolkits::record_declared_surface(&declared);
+                            if !leaked.is_empty() {
+                                log::warn!(
+                                    "Claude CLI declared {} tool(s) outside Cairn's MCP surface: {}. \
+                                     Quarantined for later sessions in this process; add them to \
+                                     ALWAYS_DISALLOWED_TOOLS (cairn-db models/toolkit.rs) to keep \
+                                     them off the first session after a restart.",
+                                    leaked.len(),
+                                    leaked.join(", "),
+                                );
                             }
                         }
                     }
@@ -2152,6 +2436,17 @@ impl ClaudeBackend {
                     }
 
                     let transcript_event = TranscriptEvent::from_claude_event(&event, raw.clone());
+                    if let Some(tool_uses) = transcript_event.tool_uses.as_ref() {
+                        pending_tool_ids.extend(tool_uses.iter().map(|tool| tool.id.clone()));
+                    }
+                    if transcript_event.event_type == "tool_result" {
+                        if let Some(tool_use_id) = transcript_event.tool_use_id.as_ref() {
+                            pending_tool_ids.remove(tool_use_id);
+                        }
+                    }
+                    if let Ok(mut watchdog) = progress_watchdog.lock() {
+                        watchdog.set_pending_tool_count(pending_tool_ids.len());
+                    }
 
                     // Handle Assistant events during streaming
                     let is_assistant = matches!(&event, ClaudeEvent::Assistant { .. });
@@ -2195,7 +2490,7 @@ impl ClaudeBackend {
                                 run_id,
                                 session_id.as_deref(),
                                 &mut streaming_state,
-                                Some(transcript_event.clone()),
+                                Some((*transcript_event).clone()),
                                 counts,
                             );
                         } else {
@@ -2207,7 +2502,8 @@ impl ClaudeBackend {
                             match pending_final_assistant_event.as_mut() {
                                 Some(parked) => merge_pending_assistant(parked, &transcript_event),
                                 None => {
-                                    pending_final_assistant_event = Some(transcript_event.clone())
+                                    pending_final_assistant_event =
+                                        Some((*transcript_event).clone())
                                 }
                             }
                         }
@@ -2275,7 +2571,7 @@ impl ClaudeBackend {
                         let now = chrono::Utc::now().timestamp() as i32;
                         let event_id = ids::mint_child(run_id);
                         let event_type = transcript_event.event_type.clone();
-                        let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+                        let data = transcript_event.to_event_json();
 
                         let event_counts = TokenCounts::default();
 
@@ -2527,6 +2823,7 @@ impl ClaudeBackend {
             }
         }
 
+        watchdog_alive.store(false, Ordering::Release);
         let mut parse_summary =
             crate::resume_timing::ResumeTimingEvent::new("claude_stream_parse_summary");
         parse_summary.run_id = Some(run_id);

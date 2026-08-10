@@ -10,6 +10,7 @@ pub mod client;
 pub mod position;
 pub mod queries;
 pub mod resource_text;
+pub mod turns;
 pub mod vector;
 pub mod vibes;
 mod worker;

@@ -38,6 +38,8 @@ pub fn split_target_query(target: &str) -> Result<SplitTargetQuery, String> {
 /// `&` that immediately precedes a recognized key token is `%26`.
 const KNOWN_QUERY_KEYS: &[&str] = &[
     "view",
+    "projection",
+    "request",
     "file",
     "grep",
     "glob",

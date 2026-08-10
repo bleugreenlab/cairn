@@ -20,6 +20,7 @@ mod merge;
 mod publish;
 mod reconcile;
 mod seal;
+mod three_way;
 mod workspace;
 mod worktree;
 
@@ -36,6 +37,7 @@ pub use merge::*;
 pub use publish::*;
 pub use reconcile::*;
 pub use seal::*;
+pub use three_way::*;
 pub use workspace::*;
 pub use worktree::*;
 

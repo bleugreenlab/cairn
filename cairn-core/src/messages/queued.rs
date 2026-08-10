@@ -87,7 +87,22 @@ pub(crate) async fn enqueue_async(
     content: &str,
     delivery: Delivery,
 ) -> Result<QueuedMessage, String> {
-    record_operator_message(db, job_id, content, delivery, None).await
+    record_operator_message(db, job_id, content, delivery, None, None).await
+}
+
+pub fn enqueue_idempotent(
+    db: &LocalDb,
+    job_id: &str,
+    content: &str,
+    delivery: Delivery,
+    request_id: &str,
+) -> Result<QueuedMessage, String> {
+    let job_id = job_id.to_string();
+    let content = content.to_string();
+    let request_id = request_id.to_string();
+    run_db_blocking(move || async move {
+        record_operator_message(db, &job_id, &content, delivery, None, Some(request_id)).await
+    })
 }
 
 /// Record operator text that reached an **idle** job directly: the resume it
@@ -123,7 +138,7 @@ pub(crate) async fn record_direct_delivery_async(
     content: &str,
 ) -> Result<QueuedMessage, String> {
     let now = chrono::Utc::now().timestamp();
-    record_operator_message(db, job_id, content, Delivery::Queue, Some(now)).await
+    record_operator_message(db, job_id, content, Delivery::Queue, Some(now), None).await
 }
 
 /// Insert one operator message for a job — pending, or already delivered — and
@@ -134,9 +149,10 @@ async fn record_operator_message(
     content: &str,
     delivery: Delivery,
     delivered_at: Option<i64>,
+    request_id: Option<String>,
 ) -> Result<QueuedMessage, String> {
     let timing_started = std::time::Instant::now();
-    let id = ids::mint_child(job_id);
+    let id = request_id.unwrap_or_else(|| ids::mint_child(job_id));
     let job_id = job_id.to_string();
     let content = content.to_string();
     let now = chrono::Utc::now().timestamp();
@@ -147,6 +163,21 @@ async fn record_operator_message(
             let job_id = job_id.clone();
             let content = content.clone();
             Box::pin(async move {
+                let sql = format!("SELECT {SELECT_COLUMNS} FROM queued_messages WHERE id = ?1");
+                let mut rows = conn.query(&sql, params![id.as_str()]).await?;
+                if let Some(row) = rows.next().await? {
+                    let existing = message_from_row(&row)?;
+                    if existing.job_id != job_id
+                        || existing.content != content
+                        || existing.delivery != delivery
+                    {
+                        return Err(crate::storage::DbError::Row(
+                            "queued-message request id was reused for different content"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok((existing, false));
+                }
                 conn.execute(
                     "INSERT INTO queued_messages
                  (id, job_id, content, delivery, created_at, delivered_at)
@@ -161,14 +192,17 @@ async fn record_operator_message(
                     ],
                 )
                 .await?;
-                Ok(QueuedMessage {
-                    id,
-                    job_id,
-                    content,
-                    delivery,
-                    created_at: now,
-                    delivered_at,
-                })
+                Ok((
+                    QueuedMessage {
+                        id,
+                        job_id,
+                        content,
+                        delivery,
+                        created_at: now,
+                        delivered_at,
+                    },
+                    true,
+                ))
             })
         })
         .await
@@ -179,8 +213,8 @@ async fn record_operator_message(
     // node's issue their passive catch-up copy (CAIRN-3342); without it the
     // operator is the one participant whose interventions a coordinator never
     // sees. Best-effort — a failure here must not lose the operator's message.
-    if recorded.is_ok() {
-        if let Ok(message) = &recorded {
+    if let Ok((message, inserted)) = &recorded {
+        if *inserted {
             let mut event = crate::resume_timing::ResumeTimingEvent::new("queue_enqueue_end")
                 .elapsed(timing_started);
             event.job_id = Some(&message.job_id);
@@ -189,15 +223,16 @@ async fn record_operator_message(
             event.count = Some(1);
             event.bytes = Some(message.content.len());
             event.emit();
-        }
-        if let Err(error) =
-            crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(db, &job_id)
-                .await
-        {
-            log::warn!("catch-up push creation for an operator message failed: {error}");
+            if let Err(error) =
+                crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(db, &job_id)
+                    .await
+            {
+                log::warn!("catch-up push creation for an operator message failed: {error}");
+            }
         }
     }
-    recorded
+
+    recorded.map(|(message, _)| message)
 }
 
 /// Pending (undelivered) queued messages for a job, oldest first.
@@ -500,6 +535,20 @@ mod tests {
         assert_eq!(pending[0].content, "first");
         assert_eq!(pending[1].content, "second");
         assert_eq!(pending[1].delivery, Delivery::Steer);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_id_is_idempotent_without_conflating_equal_content() {
+        let db = migrated_db().await;
+        let first =
+            enqueue_idempotent(&db, "job-a", "retry me", Delivery::Queue, "request-1").unwrap();
+        let retry =
+            enqueue_idempotent(&db, "job-a", "retry me", Delivery::Queue, "request-1").unwrap();
+        enqueue_idempotent(&db, "job-a", "retry me", Delivery::Queue, "request-2").unwrap();
+
+        assert_eq!(retry.id, first.id);
+        let pending = list_pending_for_job_async(&db, "job-a").await.unwrap();
+        assert_eq!(pending.len(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

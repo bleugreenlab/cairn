@@ -74,7 +74,7 @@ pub(crate) async fn handle_mcp_read(
                 &session_key,
                 &server,
                 &credential_key,
-                &config.expanded(&credential_key),
+                &config.brokered(&credential_key, "describe mcp server"),
                 project_path.as_deref(),
                 &project_servers,
             )
@@ -91,7 +91,7 @@ pub(crate) async fn handle_mcp_read(
                 .read_resource(
                     &session_key,
                     &credential_key,
-                    &config.expanded(&credential_key),
+                    &config.brokered(&credential_key, "read mcp resource"),
                     &uri,
                 )
                 .await
@@ -136,8 +136,9 @@ async fn list_servers(
     let mut out = String::from("# Configured MCP servers\n");
     for name in names {
         let credential_key = mcp_credential_key(name, project_path, project_servers);
-        let config = servers[name].expanded(&credential_key);
-        out.push_str(&format!("\n## {name} ({})\n", config.transport));
+        let authored = &servers[name];
+        let config = authored.brokered(&credential_key, "list mcp tools");
+        out.push_str(&format!("\n## {name} ({})\n", authored.transport));
         match cached_or_refresh_tools(
             gateway,
             config_dir,
@@ -178,7 +179,7 @@ async fn cached_or_refresh_tools(
     session_key: &str,
     server: &str,
     credential_key: &str,
-    config: &McpServerConfig,
+    config: &crate::security::BrokeredMcpConfig,
     project_path: Option<&std::path::Path>,
     project_servers: &HashMap<String, McpServerConfig>,
 ) -> Result<Vec<McpToolDef>, String> {
@@ -222,11 +223,11 @@ async fn describe_server(
     session_key: &str,
     server: &str,
     credential_key: &str,
-    config: &McpServerConfig,
+    config: &crate::security::BrokeredMcpConfig,
     project_path: Option<&std::path::Path>,
     project_servers: &HashMap<String, McpServerConfig>,
 ) -> String {
-    let mut out = format!("# MCP server: {server} ({})\n", config.transport);
+    let mut out = format!("# MCP server: {server} ({})\n", config.transport());
 
     out.push_str("\n## Tools\n");
     match cached_or_refresh_tools(
@@ -539,6 +540,7 @@ mod tests {
                 headers: HashMap::new(),
                 enabled: true,
                 oauth: None,
+                secrets: Vec::new(),
             },
         );
         servers.insert(
@@ -552,6 +554,7 @@ mod tests {
                 headers: HashMap::new(),
                 enabled: true,
                 oauth: None,
+                secrets: Vec::new(),
             },
         );
 
@@ -599,6 +602,7 @@ mod tests {
                 headers: HashMap::new(),
                 enabled: true,
                 oauth: None,
+                secrets: Vec::new(),
             },
         );
         let mut catalogs = HashMap::new();

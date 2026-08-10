@@ -1,9 +1,7 @@
-use cairn_db::turso::params;
-
 use crate::messages::{db as msg_db, queued::DeliveryUrgency};
 use crate::models::ChannelType;
 use crate::orchestrator::{attention_push, Orchestrator};
-use crate::storage::{run_db_blocking, DbResult, LocalDb, RowExt};
+use crate::storage::{run_db_blocking, LocalDb};
 
 fn persist_system_direct(
     orch: &Orchestrator,
@@ -37,59 +35,22 @@ fn persist_system_direct(
     Ok(msg.id)
 }
 
+/// The job a child issue's attention belongs to: its validated spawning node,
+/// whoever currently drives the parent issue, or its parent thread's live
+/// session. One rule, defined once in
+/// [`crate::orchestrator::wakes::coordinating_job_for_child`], so the direct
+/// parent-push path and the subscription path can never disagree about who owns
+/// a child.
 pub(crate) fn load_parent_job(
     db: &LocalDb,
     child_issue_id: &str,
 ) -> Result<Option<String>, String> {
     let child_issue_id = child_issue_id.to_string();
     run_db_blocking(move || async move {
-        db.read(|conn| {
+        db.write(|conn| {
             let child_issue_id = child_issue_id.clone();
             Box::pin(async move {
-                let mut issue_rows = conn
-                    .query(
-                        "SELECT parent_job_id, parent_issue_id FROM issues WHERE id = ?1 LIMIT 1",
-                        params![child_issue_id.as_str()],
-                    )
-                    .await?;
-                let Some(issue_row) = issue_rows.next().await? else {
-                    return Ok(None);
-                };
-                let spawning_job_id = issue_row.opt_text(0)?;
-                let parent_issue_id = issue_row.opt_text(1)?;
-
-                // Preferred: the exact job that spawned this child issue, as
-                // long as it is still a resumable wake target.
-                if let Some(job_id) = spawning_job_id {
-                    if let Some(resolved) = resumable_job(conn, &job_id).await? {
-                        return Ok(Some(resolved));
-                    }
-                }
-
-                // Fallback for child issues with no recorded spawner (legacy
-                // rows, human-linked sub-issues): the coordinator / recipe-root
-                // job on the parent issue. `parent_job_id IS NULL` excludes
-                // delegated sub-task jobs, which share the coordinator's
-                // issue_id and would otherwise win the recency ordering.
-                let Some(parent_issue_id) = parent_issue_id else {
-                    return Ok(None);
-                };
-                let mut job_rows = conn
-                    .query(
-                        "
-                        SELECT id
-                        FROM jobs
-                        WHERE issue_id = ?1
-                          AND parent_job_id IS NULL
-                          AND status != 'failed'
-                          AND current_session_id IS NOT NULL
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        ",
-                        params![parent_issue_id.as_str()],
-                    )
-                    .await?;
-                crate::storage::next_text(&mut job_rows, 0).await
+                crate::orchestrator::wakes::coordinating_job_for_child(conn, &child_issue_id).await
             })
         })
         .await
@@ -109,6 +70,9 @@ pub(crate) async fn queue_passive_parent_push(
     let Some(parent_job_id) = load_parent_job(db, child_issue_id)? else {
         return Ok(false);
     };
+    if crate::threads::is_dormant_thread_session(db, &parent_job_id).await {
+        return Ok(false);
+    }
     let latest = attention_push::latest_push_fingerprint(db, &parent_job_id, key)
         .await
         .map_err(|error| error.to_string())?;
@@ -129,24 +93,6 @@ pub(crate) async fn queue_passive_parent_push(
     Ok(true)
 }
 
-/// Return `job_id` if it is a resumable wake target (exists, not failed, has a
-/// session to resume); otherwise `None`, so the caller falls back to
-/// issue-level resolution.
-async fn resumable_job(
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-) -> DbResult<Option<String>> {
-    let mut rows = conn
-        .query(
-            "SELECT id FROM jobs
-             WHERE id = ?1 AND status != 'failed' AND current_session_id IS NOT NULL
-             LIMIT 1",
-            params![job_id],
-        )
-        .await?;
-    crate::storage::next_text(&mut rows, 0).await
-}
-
 pub(crate) fn queue_or_resume_parent(
     orch: &Orchestrator,
     parent_job_id: &str,
@@ -163,6 +109,17 @@ pub(crate) fn queue_or_resume_parent(
         }
     })
     .unwrap_or_else(|_| orch.db.local.clone());
+    // The direct parent-push path takes the same eligibility rule the
+    // subscription path does. Checked before anything is persisted, so a closed
+    // thread accrues no direct message and no push it would have to be dug out of
+    // on reopen.
+    if crate::threads::is_dormant_thread_session_sync(&owning, parent_job_id) {
+        log::debug!(
+            "skipped attention for job {}: its thread is closed",
+            &parent_job_id[..parent_job_id.len().min(8)]
+        );
+        return;
+    }
     if let Some(recipient_run_id) =
         crate::messages::delivery::latest_run_for_job(&owning, parent_job_id)
     {
@@ -235,7 +192,8 @@ pub(crate) fn queue_or_resume_parent(
 mod tests {
 
     use super::*;
-    use crate::storage::LocalDb;
+    use crate::storage::{LocalDb, RowExt};
+    use cairn_db::turso::params;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("parent-wake.db").await
@@ -328,6 +286,60 @@ mod tests {
         assert_eq!(row, ("passive".to_string(), "state-b".to_string(), 1));
     }
 
+    /// The direct parent-push path takes the same recipient rule the
+    /// subscription path does. Nothing is persisted for a closed thread, so
+    /// reopening does not surface a backlog of pushes queued while it was
+    /// dormant.
+    #[tokio::test]
+    async fn a_closed_parent_thread_takes_no_passive_push_and_reopening_restores_it() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "complete").await;
+        db.execute_script(
+            "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES('t','p','general','closed','none',1,1);
+             INSERT INTO jobs(id, thread_id, project_id, status, node_name, uri_segment,
+                              current_session_id, created_at, updated_at)
+               VALUES('thread-job','t','p','idle','thread','thread','session-thread',3,3);
+             UPDATE issues SET parent_issue_id = NULL, parent_thread_id = 't' WHERE id = 'child';",
+        )
+        .await
+        .unwrap();
+
+        let push = || {
+            queue_passive_parent_push(
+                &db,
+                "child",
+                "cairn://p/PROJ/2/1/builder/checks",
+                "turn-checks-infrastructure:child",
+                "state-a",
+            )
+        };
+        assert!(!push().await.unwrap(), "a closed thread takes no push");
+        assert_eq!(
+            db.query_one("SELECT COUNT(*) FROM attention_pushes", (), |row| row
+                .i64(0))
+                .await
+                .unwrap(),
+            0,
+            "and nothing is persisted for it to find on reopen"
+        );
+
+        db.execute("UPDATE threads SET status='active' WHERE id='t'", ())
+            .await
+            .unwrap();
+        assert!(push().await.unwrap(), "reopening restores the push path");
+        assert_eq!(
+            db.query_one(
+                "SELECT recipient FROM attention_pushes LIMIT 1",
+                (),
+                |row| row.text(0)
+            )
+            .await
+            .unwrap(),
+            "thread-job"
+        );
+    }
+
     #[tokio::test]
     async fn load_parent_job_includes_completed_parent_jobs() {
         let db = migrated_db().await;
@@ -392,6 +404,35 @@ mod tests {
         assert_eq!(
             load_parent_job(&db, "child").unwrap().as_deref(),
             Some("parent-job"),
+        );
+    }
+
+    /// A spawner that is still perfectly resumable but whose execution has been
+    /// superseded is no longer the wake target: the node driving the parent's
+    /// current execution is. Resumability alone — all this path used to check —
+    /// keeps a retired coordinator receiving children it no longer owns.
+    #[tokio::test]
+    async fn load_parent_job_drops_a_spawner_whose_execution_was_superseded() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "idle").await;
+        db.execute_script(
+            "
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e1', 'r', 'parent', 'p', 'complete', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e2', 'r', 'parent', 'p', 'running', 10, 2);
+            UPDATE jobs SET execution_id = 'e1' WHERE id = 'parent-job';
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, status, current_session_id, started_at, created_at, updated_at)
+              VALUES('parent-job-2', 'p', 'parent', 'e2', 'running', 'session-2', 11, 10, 10);
+            UPDATE issues SET parent_job_id = 'parent-job' WHERE id = 'child';
+            ",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_parent_job(&db, "child").unwrap().as_deref(),
+            Some("parent-job-2"),
         );
     }
 

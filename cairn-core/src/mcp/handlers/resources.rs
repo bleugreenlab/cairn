@@ -53,108 +53,6 @@ pub struct ReadResourcePayload {
     uri: String,
 }
 
-async fn find_terminal_target_job_id(
-    conn: &cairn_db::turso::Connection,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    node_id: &str,
-) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut issue_rows = conn
-        .query(
-            "
-            SELECT i.id
-            FROM issues i
-            JOIN projects p ON i.project_id = p.id
-            WHERE p.key = ?1 AND i.number = ?2
-            LIMIT 1
-            ",
-            params![lookup_key.as_str(), issue_number],
-        )
-        .await?;
-
-    let Some(issue_row) = issue_rows.next().await? else {
-        return Ok(None);
-    };
-    let issue_id = issue_row.text(0)?;
-
-    let mut exec_rows = conn
-        .query(
-            "
-            SELECT id
-            FROM executions
-            WHERE issue_id = ?1 AND seq = ?2
-            LIMIT 1
-            ",
-            params![issue_id.as_str(), exec_seq],
-        )
-        .await?;
-
-    let Some(exec_row) = exec_rows.next().await? else {
-        return Ok(None);
-    };
-    let exec_id = exec_row.text(0)?;
-
-    let mut exact_rows = conn
-        .query(
-            "
-            SELECT id
-            FROM jobs
-            WHERE issue_id = ?1
-              AND execution_id = ?2
-              AND parent_job_id IS NULL
-              AND uri_segment = ?3
-            LIMIT 1
-            ",
-            params![issue_id.as_str(), exec_id.as_str(), node_id],
-        )
-        .await?;
-    if let Some(row) = exact_rows.next().await? {
-        return Ok(Some(row.text(0)?));
-    }
-
-    Ok(None)
-}
-
-async fn find_task_terminal_target_job_id(
-    conn: &cairn_db::turso::Connection,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    parent_node_id: &str,
-    task_name: &str,
-) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut rows = conn
-        .query(
-            "
-            SELECT child.id
-            FROM jobs parent
-            JOIN jobs child ON child.parent_job_id = parent.id
-            JOIN issues i ON parent.issue_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            JOIN executions e ON parent.execution_id = e.id
-            WHERE p.key = ?1
-              AND i.number = ?2
-              AND e.seq = ?3
-              AND parent.parent_job_id IS NULL
-              AND parent.uri_segment = ?4
-              AND child.uri_segment = ?5
-            LIMIT 1
-            ",
-            params![
-                lookup_key.as_str(),
-                issue_number,
-                exec_seq,
-                parent_node_id,
-                task_name
-            ],
-        )
-        .await?;
-    rows.next().await?.map(|row| row.text(0)).transpose()
-}
-
 /// Handle read_resource request - returns terminal output for a given URI.
 ///
 /// Reads are idempotent by default: a plain read returns the full buffer and
@@ -183,6 +81,12 @@ pub(crate) async fn handle_read_resource(
     let info = match lookup_terminal_info(&orch.db.local, &parsed).await {
         Ok(Some(info)) => info,
         Ok(None) => {
+            // A dormant thread has no session job, so listing its slugs would
+            // report an empty scope rather than the reason it is empty. Every
+            // other owner keeps the terminal-shaped answer below.
+            if let Some(reason) = thread_without_session_reason(&orch.db.local, &parsed).await {
+                return terminal_error_json(reason);
+            }
             let slugs = list_terminal_slugs_in_scope(&orch.db.local, &parsed)
                 .await
                 .unwrap_or_default();
@@ -245,6 +149,44 @@ pub(crate) async fn handle_read_resource(
         idle_secs,
     })
     .unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Why a THREAD's terminal lookup found nothing, when the reason is that the
+/// thread has never run rather than that the slug is unknown.
+///
+/// Scoped to threads deliberately. For a node, "Terminal 'ci' not found" plus
+/// the slugs in scope is the established and more useful answer even when the
+/// node job itself is missing — a terminal read should report about terminals.
+/// A dormant thread is the case that answer cannot serve: it has no session job,
+/// so the slug list is empty and says nothing about why.
+///
+/// `None` means the URI is not thread-owned, or the thread has a session.
+async fn thread_without_session_reason(db: &LocalDb, parsed: &ParsedTerminalUri) -> Option<String> {
+    let (number, exec_seq, node_id) = (
+        parsed.issue_number?,
+        parsed.exec_seq?,
+        parsed.node_id.as_deref()?,
+    );
+    if !matches!(
+        cairn_common::uri::NodeAddress::new(number, exec_seq, node_id),
+        cairn_common::uri::NodeAddress::Thread { .. }
+    ) {
+        return None;
+    }
+    let session = crate::jobs::queries::job_id_for_node_coordinate(
+        db,
+        &parsed.project_key,
+        number,
+        exec_seq,
+        node_id,
+        None,
+    )
+    .await
+    .ok()
+    .flatten();
+    session.is_none().then(|| {
+        crate::resources::node_job_not_found_message(&parsed.project_key, number, exec_seq, node_id)
+    })
 }
 
 fn terminal_error_json(message: String) -> String {
@@ -389,20 +331,18 @@ async fn lookup_terminal_info(
                 else {
                     return Ok(None);
                 };
-                let job_id = if let Some(task_name) = task_name.as_deref() {
-                    find_task_terminal_target_job_id(
-                        conn,
-                        &project_key,
-                        issue_number,
-                        exec_seq,
-                        node_id,
-                        task_name,
-                    )
-                    .await?
-                } else {
-                    find_terminal_target_job_id(conn, &project_key, issue_number, exec_seq, node_id)
-                        .await?
-                };
+                // Owner-aware through the shared resolver: the reserved thread
+                // coordinate resolves to the session (or its task) job here
+                // exactly as an issue coordinate resolves to a node job.
+                let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
+                    conn,
+                    &project_key,
+                    issue_number,
+                    exec_seq,
+                    node_id,
+                    task_name.as_deref(),
+                )
+                .await?;
                 let Some(job_id) = job_id else {
                     return Ok(None);
                 };
@@ -469,24 +409,24 @@ async fn list_terminal_slugs_in_scope(
                 )
                 .await?
             } else {
-                let (Some(issue_number), Some(exec_seq), Some(node_id)) =
-                    (issue_number, exec_seq, node_id.as_deref())
-                else {
-                    return Ok(Vec::new());
-                };
-                let job_id = if let Some(task_name) = task_name.as_deref() {
-                    find_task_terminal_target_job_id(
+                let job_id = {
+                    let (Some(issue_number), Some(exec_seq), Some(node_id)) =
+                        (issue_number, exec_seq, node_id.as_deref())
+                    else {
+                        return Ok(Vec::new());
+                    };
+                    // The same owner-aware resolver the lookup uses, so the
+                    // slug list a not-found message offers is scoped to the
+                    // very job the read looked in.
+                    crate::jobs::queries::job_id_for_node_coordinate_conn(
                         conn,
                         &project_key,
                         issue_number,
                         exec_seq,
                         node_id,
-                        task_name,
+                        task_name.as_deref(),
                     )
                     .await?
-                } else {
-                    find_terminal_target_job_id(conn, &project_key, issue_number, exec_seq, node_id)
-                        .await?
                 };
                 let Some(job_id) = job_id else {
                     return Ok(Vec::new());
@@ -624,8 +564,15 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
         }
     }
 
-    let resource =
-        parse_uri(&split.identity).ok_or_else(|| terminal_shape_error(&split.identity))?;
+    // Normalize a thread descendant onto its node family FIRST, so this surface
+    // reads the same map the read and write dispatchers do. Without it the
+    // terminal route carried its own thread-path interpreter, which knew only
+    // the session-level `terminal/<slug>` shape — so a thread TASK could create
+    // a terminal (the write path resolves it) and then not read it back.
+    let resource = parse_uri(&split.identity)
+        .map(crate::resources::delegate_thread_descendant)
+        .transpose()?
+        .ok_or_else(|| terminal_shape_error(&split.identity))?;
     let anchor_uri = resource.to_uri();
     match resource {
         CairnResource::NodeTerminal {
@@ -1003,6 +950,36 @@ mod tests {
         );
     }
 
+    /// A thread's terminal parses at BOTH levels, and arrives here already
+    /// normalized onto the node family at the reserved coordinate.
+    ///
+    /// The task level is the regression: this surface used to carry its own
+    /// thread-path interpreter that knew only `["terminal", slug]`, so a
+    /// thread-spawned task could create a terminal the write path resolved and
+    /// then be told its own URI was not a terminal shape.
+    #[test]
+    fn a_threads_terminal_parses_at_both_levels() {
+        let session = parse_terminal_uri("cairn://p/THR/design-review/terminal/dev").unwrap();
+        assert_eq!(session.slug, "dev");
+        assert_eq!(session.node_id.as_deref(), Some("design-review"));
+        assert_eq!(session.task_name, None);
+        assert_eq!((session.issue_number, session.exec_seq), (Some(0), Some(0)));
+        assert_eq!(
+            session.anchor_uri, "cairn://p/THR/design-review/terminal/dev",
+            "the anchor renders the thread address, never a 0/0 placeholder"
+        );
+
+        let task =
+            parse_terminal_uri("cairn://p/THR/design-review/task/probe/terminal/build").unwrap();
+        assert_eq!(task.slug, "build");
+        assert_eq!(task.node_id.as_deref(), Some("design-review"));
+        assert_eq!(task.task_name.as_deref(), Some("probe"));
+        assert_eq!(
+            task.anchor_uri,
+            "cairn://p/THR/design-review/task/probe/terminal/build"
+        );
+    }
+
     #[test]
     fn parse_rejects_unknown_param_naming_it() {
         let err = parse_terminal_uri("cairn://p/CAIRN/terminal/ci?bogus=1").unwrap_err();
@@ -1273,6 +1250,109 @@ mod tests {
              VALUES ('term-1', NULL, 'proj-t', NULL, 'sess-1', 'sleep 1', 'running', 1, 'ci')",
         )
         .await;
+    }
+
+    /// A thread with a live session owning a terminal at each level, plus a
+    /// second, dormant thread that has never run.
+    async fn seed_thread_terminals(orch: &Orchestrator) {
+        exec(
+            orch,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-th', 'default', 'TH', 'TH', '/tmp/repo', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('thr-ux', 'proj-th', 'thread-ux', 'active', 'none', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('thr-quiet', 'proj-th', 'dormant', 'active', 'none', 1, 1)",
+        )
+        .await;
+        // The session job's shape is what makes it a session: no parent, the
+        // reserved 'thread' segment, and no issue at all.
+        exec(
+            orch,
+            "INSERT INTO jobs (id, project_id, thread_id, uri_segment, status, created_at, updated_at)
+             VALUES ('sess-th', 'proj-th', 'thr-ux', 'thread', 'running', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO jobs (id, project_id, parent_job_id, uri_segment, status, created_at, updated_at)
+             VALUES ('task-th', 'proj-th', 'sess-th', 'probe', 'running', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug, output_tail)
+             VALUES ('term-sess-th', 'sess-th', NULL, NULL, 'sess-id-th', 'echo ok', 'exited', 1, 'smoke2', 'thread-output')",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug, output_tail)
+             VALUES ('term-task-th', 'task-th', NULL, NULL, 'task-id-th', 'echo ok', 'exited', 1, 'build', 'task-output')",
+        )
+        .await;
+    }
+
+    /// Regression for CAIRN-3805: a terminal a thread session creates read back
+    /// as not-found, because this surface resolved the coordinate with its own
+    /// issue-shaped copy of the resolver and the reserved thread coordinate
+    /// `(0, 0, name)` has no issue row to walk. Creation used the shared
+    /// owner-aware resolver all along, so write and read disagreed.
+    #[tokio::test]
+    async fn a_threads_terminal_reads_back_at_both_levels() {
+        let orch = seeded_orch().await;
+        seed_thread_terminals(&orch).await;
+
+        let session = read_terminal(&orch, "cairn://p/TH/thread-ux/terminal/smoke2").await;
+        assert_eq!(session.status, "exited", "{}", session.output);
+        assert!(
+            session.output.contains("thread-output"),
+            "{}",
+            session.output
+        );
+
+        let task = read_terminal(&orch, "cairn://p/TH/thread-ux/task/probe/terminal/build").await;
+        assert_eq!(task.status, "exited", "{}", task.output);
+        assert!(task.output.contains("task-output"), "{}", task.output);
+        assert!(!task.output.contains("thread-output"), "{}", task.output);
+    }
+
+    /// The not-found path is scoped by the same resolver, so a wrong slug on a
+    /// live thread names that thread's terminals instead of claiming the scope
+    /// is empty — and a thread that has never run says so rather than reporting
+    /// an empty terminal scope.
+    #[tokio::test]
+    async fn a_threads_missing_slug_lists_its_own_terminals() {
+        let orch = seeded_orch().await;
+        seed_thread_terminals(&orch).await;
+
+        let missing = read_terminal(&orch, "cairn://p/TH/thread-ux/terminal/nope").await;
+        assert_eq!(missing.status, "error");
+        assert!(
+            missing
+                .output
+                .contains("Existing terminals in this scope: smoke2."),
+            "{}",
+            missing.output
+        );
+
+        let dormant = read_terminal(&orch, "cairn://p/TH/dormant/terminal/smoke2").await;
+        assert_eq!(dormant.status, "error");
+        assert!(
+            dormant.output.contains("has no session yet"),
+            "{}",
+            dormant.output
+        );
     }
 
     #[tokio::test]

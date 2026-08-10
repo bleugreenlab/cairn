@@ -50,13 +50,19 @@ mod cli_parse_tests {
     fn check_run_accepts_one_or_more_suites_and_optional_branch() {
         let current = Args::try_parse_from(["cairn", "check", "run", "rust-tests"]).unwrap();
         let Some(Command::Check {
-            command: CheckCommand::Run { suites, branch },
+            command:
+                CheckCommand::Run {
+                    suites,
+                    branch,
+                    retry,
+                },
         }) = current.command
         else {
             panic!("expected check run")
         };
         assert_eq!(suites, ["rust-tests"]);
         assert_eq!(branch, None);
+        assert!(!retry);
 
         let explicit = Args::try_parse_from([
             "cairn",
@@ -69,13 +75,32 @@ mod cli_parse_tests {
         ])
         .unwrap();
         let Some(Command::Check {
-            command: CheckCommand::Run { suites, branch },
+            command:
+                CheckCommand::Run {
+                    suites,
+                    branch,
+                    retry,
+                },
         }) = explicit.command
         else {
             panic!("expected check run")
         };
         assert_eq!(suites, ["rust-tests", "lint"]);
         assert_eq!(branch.as_deref(), Some("main"));
+        assert!(!retry);
+    }
+
+    #[test]
+    fn check_run_accepts_retry() {
+        let args =
+            Args::try_parse_from(["cairn", "check", "run", "rust-tests", "--retry"]).unwrap();
+        let Some(Command::Check {
+            command: CheckCommand::Run { retry, .. },
+        }) = args.command
+        else {
+            panic!("expected check run")
+        };
+        assert!(retry);
     }
 
     #[test]
@@ -187,6 +212,9 @@ enum CheckCommand {
         /// Optional branch or revision. Defaults to the current logical head.
         #[arg(long)]
         branch: Option<String>,
+        /// Force a fresh execution even when an exact reusable verdict exists.
+        #[arg(long)]
+        retry: bool,
     },
 }
 
@@ -219,6 +247,7 @@ async fn async_main() -> Result<()> {
         stderr: !is_cli,
         level: None,
         stderr_level: None,
+        retention_days: None,
     })
     .expect("Failed to initialize logging");
 
@@ -234,9 +263,14 @@ async fn async_main() -> Result<()> {
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Check {
-            command: CheckCommand::Run { suites, branch },
+            command:
+                CheckCommand::Run {
+                    suites,
+                    branch,
+                    retry,
+                },
         }) => {
-            let ok = run_cli_check(suites.clone(), branch.clone()).await;
+            let ok = run_cli_check(suites.clone(), branch.clone(), *retry).await;
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Executor { command }) => {

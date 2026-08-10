@@ -4,8 +4,8 @@
 //! GitHub API fetching, and CI log extraction.
 
 use crate::github::api;
-use crate::github::credentials::GitHubAppCredentials;
 use crate::models::{Check, CheckState, ChecksStatus, MergeableState, PrState, ReviewDecision};
+use crate::security::broker::github::InstallationAuthority;
 use crate::services::{GitClient, HttpClient};
 use std::path::Path;
 use std::time::Duration;
@@ -137,14 +137,14 @@ const MERGEABILITY_POLL_BACKOFF: Duration = Duration::from_millis(600);
 /// null-window `UNKNOWN` that would otherwise stick in the cache.
 pub(crate) async fn fetch_pr_via_api(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     pr_number: i32,
 ) -> Result<ParsedPrDetails, String> {
     fetch_pr_via_api_with_backoff(
         http,
-        creds,
+        auth,
         owner,
         repo,
         pr_number,
@@ -155,13 +155,13 @@ pub(crate) async fn fetch_pr_via_api(
 
 async fn fetch_pr_via_api_with_backoff(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     pr_number: i32,
     backoff: Duration,
 ) -> Result<ParsedPrDetails, String> {
-    let mut pr = api::fetch_pr(http, creds, owner, repo, pr_number).await?;
+    let mut pr = api::fetch_pr(http, auth, owner, repo, pr_number).await?;
 
     // GitHub returns `mergeable: null` for an open PR while it computes the merge
     // check in the background. Re-poll until it settles or the attempt budget is
@@ -171,14 +171,14 @@ async fn fetch_pr_via_api_with_backoff(
             break;
         }
         tokio::time::sleep(backoff).await;
-        pr = api::fetch_pr(http, creds, owner, repo, pr_number).await?;
+        pr = api::fetch_pr(http, auth, owner, repo, pr_number).await?;
     }
 
     let state = compute_pr_state(pr.merged, &pr.state);
     let mergeable = compute_mergeable_state(pr.mergeable, pr.mergeable_state.as_deref());
 
     // Fetch reviews to determine review decision
-    let reviews = api::fetch_reviews(http, creds, owner, repo, pr_number)
+    let reviews = api::fetch_reviews(http, auth, owner, repo, pr_number)
         .await
         .unwrap_or_default();
 
@@ -200,12 +200,12 @@ async fn fetch_pr_via_api_with_backoff(
 /// Fetch check runs for a commit and convert to domain Check model.
 pub(crate) async fn fetch_checks_via_api(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     sha: &str,
 ) -> Result<Vec<Check>, String> {
-    let check_runs = api::fetch_check_runs(http, creds, owner, repo, sha).await?;
+    let check_runs = api::fetch_check_runs(http, auth, owner, repo, sha).await?;
 
     Ok(check_runs
         .check_runs
@@ -234,13 +234,13 @@ pub(crate) async fn fetch_checks_via_api(
 /// Fetch the name of the failed step from job details via REST API.
 pub async fn fetch_failed_step_via_api(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     run_id: i64,
     job_name: &str,
 ) -> Result<String, String> {
-    let jobs_response = api::fetch_run_jobs(http, creds, owner, repo, run_id).await?;
+    let jobs_response = api::fetch_run_jobs(http, auth, owner, repo, run_id).await?;
 
     let job = jobs_response
         .jobs
@@ -266,13 +266,13 @@ pub async fn fetch_failed_step_via_api(
 /// Returns `(log_excerpt, full_log_available)`.
 pub async fn fetch_failure_logs_via_api(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     run_id: i64,
     job_name: &str,
 ) -> Result<(String, bool), String> {
-    let logs_data = api::fetch_run_logs(http, creds, owner, repo, run_id).await?;
+    let logs_data = api::fetch_run_logs(http, auth, owner, repo, run_id).await?;
 
     let cursor = std::io::Cursor::new(logs_data);
     let mut archive =
@@ -914,7 +914,6 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_checks_via_api_maps_states_correctly() {
-        use crate::github::credentials::GitHubAppCredentials;
         use crate::services::{testing::MockHttpClient, HttpResponse};
 
         let token_body = serde_json::json!({
@@ -934,25 +933,15 @@ mod tests {
         let http = MockHttpClient::new()
             .respond_to(
                 "access_tokens",
-                HttpResponse {
-                    status: 201,
-                    body: serde_json::to_vec(&token_body).unwrap(),
-                },
+                HttpResponse::new(201, serde_json::to_vec(&token_body).unwrap()),
             )
             .respond_to(
                 "check-runs",
-                HttpResponse {
-                    status: 200,
-                    body: serde_json::to_vec(&checks_body).unwrap(),
-                },
+                HttpResponse::new(200, serde_json::to_vec(&checks_body).unwrap()),
             );
-        let creds = GitHubAppCredentials {
-            app_id: 12345,
-            private_key: include_str!("../../tests/fixtures/test_rsa_key.pem").to_string(),
-            installation_id: 99999,
-        };
+        let auth = mergeability_poll_authority();
 
-        let checks = fetch_checks_via_api(&http, &creds, "owner", "repo", "sha123")
+        let checks = fetch_checks_via_api(&http, &auth, "owner", "repo", "sha123")
             .await
             .unwrap();
         assert_eq!(checks.len(), 6);
@@ -967,12 +956,13 @@ mod tests {
 
     // ── fetch_pr_via_api: mergeability poll ─────────────────────
 
-    fn mergeability_poll_creds() -> crate::github::credentials::GitHubAppCredentials {
-        crate::github::credentials::GitHubAppCredentials {
-            app_id: 12345,
-            private_key: include_str!("../../tests/fixtures/test_rsa_key.pem").to_string(),
-            installation_id: 99999,
-        }
+    fn mergeability_poll_authority() -> InstallationAuthority {
+        crate::security::broker::github::installation_authority_from_key(
+            12345,
+            99999,
+            include_str!("../../tests/fixtures/test_rsa_key.pem"),
+        )
+        .unwrap()
     }
 
     fn pr_response(
@@ -991,10 +981,7 @@ mod tests {
             "merged": false,
             "head": { "sha": "headsha" }
         });
-        crate::services::HttpResponse {
-            status: 200,
-            body: serde_json::to_vec(&body).unwrap(),
-        }
+        crate::services::HttpResponse::new(200, serde_json::to_vec(&body).unwrap())
     }
 
     fn token_response() -> crate::services::HttpResponse {
@@ -1002,17 +989,11 @@ mod tests {
             "token": "ghs_test",
             "expires_at": "2099-01-01T00:00:00Z"
         });
-        crate::services::HttpResponse {
-            status: 201,
-            body: serde_json::to_vec(&token_body).unwrap(),
-        }
+        crate::services::HttpResponse::new(201, serde_json::to_vec(&token_body).unwrap())
     }
 
     fn empty_reviews_response() -> crate::services::HttpResponse {
-        crate::services::HttpResponse {
-            status: 200,
-            body: serde_json::to_vec(&serde_json::json!([])).unwrap(),
-        }
+        crate::services::HttpResponse::new(200, serde_json::to_vec(&serde_json::json!([])).unwrap())
     }
 
     #[tokio::test]
@@ -1032,9 +1013,9 @@ mod tests {
                 ],
             );
 
-        let creds = mergeability_poll_creds();
+        let auth = mergeability_poll_authority();
         let parsed =
-            fetch_pr_via_api_with_backoff(&http, &creds, "owner", "repo", 7, Duration::ZERO)
+            fetch_pr_via_api_with_backoff(&http, &auth, "owner", "repo", 7, Duration::ZERO)
                 .await
                 .unwrap();
 
@@ -1055,9 +1036,9 @@ mod tests {
                 pr_response(serde_json::Value::Null, serde_json::json!("unknown")),
             );
 
-        let creds = mergeability_poll_creds();
+        let auth = mergeability_poll_authority();
         let parsed =
-            fetch_pr_via_api_with_backoff(&http, &creds, "owner", "repo", 9, Duration::ZERO)
+            fetch_pr_via_api_with_backoff(&http, &auth, "owner", "repo", 9, Duration::ZERO)
                 .await
                 .unwrap();
 

@@ -4,7 +4,7 @@ Agent orchestration engine in Rust.
 
 ## Crates
 
-**cairn-core** — Orchestration engine. Recipe-based DAG execution, Claude process management, Turso-backed database operations, configuration resolution, memory system, and all business logic.
+**cairn-core** — Orchestration engine. Recipe-based DAG execution, agent backend process management, Turso-backed database operations, configuration resolution, memory capture, and all business logic.
 
 **cairn-common** — Shared types. `cairn://` URI parser and serializer, authentication, and the callback protocol types that connect cairn-cmd to cairn-core.
 
@@ -18,10 +18,22 @@ cargo build
 
 ## Documentation
 
-- [URI System](docs/uri-system.md) — `cairn://` resource addressing
-- [Execution Engine](docs/dag-engine.md) — recipes, DAG advancement, executor expansion
-- [Interaction Model](docs/interaction-model.md) — session lifecycle, callback architecture, process management
-- [Memory System](docs/memory-system.md) — trigger-based knowledge surfacing
+Engineering documentation for the system lives in the repository's top-level
+`docs/` directory, which is the current source of truth. The most relevant here:
+
+- [State machines](../../docs/state-machines.md) — run, turn, job, execution, and issue status
+- [Execution lifecycle map](../../docs/execution-lifecycle-map.md) — the full control-flow map
+- [Recipe execution](../../docs/recipe-execution.md) — recipes, node types, and DAG advancement
+- [Sessions](../../docs/sessions.md) — session lifecycle and warm-process retention
+- [Backends](../../docs/backends.md) — Claude, Codex, and OpenRouter process management
+- [Memories](../../docs/memories.md) — the memory capture and triage ledger
+
+This crate keeps one document of its own:
+
+- [URI System](docs/uri-system.md) — `cairn://` resource addressing and parser internals
+
+[`docs/archive/`](docs/archive) holds superseded design documents. They are kept
+for history, are labeled as retired, and are not current guidance.
 
 ## License
 

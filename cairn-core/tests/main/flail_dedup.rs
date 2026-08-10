@@ -36,8 +36,14 @@ async fn dispatch_does_not_dedup_cli_read_after_agent_read() {
     let mut cli_request = agent_request.clone();
     cli_request.payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
 
-    let first = dispatch_tool(&orch, &agent_request, &cursors).await.content;
-    let cli_poll = dispatch_tool(&orch, &cli_request, &cursors).await.content;
+    let first = dispatch_tool(&orch, &agent_request, &cursors)
+        .await
+        .into_inner()
+        .content;
+    let cli_poll = dispatch_tool(&orch, &cli_request, &cursors)
+        .await
+        .into_inner()
+        .content;
 
     assert!(!first.starts_with("[duplicate call]"));
     assert_eq!(
@@ -78,14 +84,20 @@ async fn dispatch_dedups_identical_read_within_turn() {
     let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent-xyz");
 
     // First call executes the handler (not a stub).
-    let first = dispatch_tool(&orch, &request, &cursors).await.content;
+    let first = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(
         !first.starts_with("[duplicate call]"),
         "first call must execute, got stub: {first}"
     );
 
     // Identical second call short-circuits to the stub.
-    let second = dispatch_tool(&orch, &request, &cursors).await.content;
+    let second = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(
         second.starts_with("[duplicate call]"),
         "duplicate read must return the stub, got: {second}"
@@ -107,10 +119,16 @@ async fn dispatch_does_not_dedup_different_slice() {
     let base = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent?offset=0");
     let other = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent?offset=100");
 
-    let first = dispatch_tool(&orch, &base, &cursors).await.content;
+    let first = dispatch_tool(&orch, &base, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(!first.starts_with("[duplicate call]"));
     // A different slice is a different call -> executes, never stubbed.
-    let second = dispatch_tool(&orch, &other, &cursors).await.content;
+    let second = dispatch_tool(&orch, &other, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(
         !second.starts_with("[duplicate call]"),
         "a different slice must not be deduped, got: {second}"
@@ -130,8 +148,14 @@ async fn dispatch_never_dedups_write() {
         tool_use_id: None,
     };
 
-    let first = dispatch_tool(&orch, &request, &cursors).await.content;
-    let second = dispatch_tool(&orch, &request, &cursors).await.content;
+    let first = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
+    let second = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(!first.starts_with("[duplicate call]"));
     assert!(
         !second.starts_with("[duplicate call]"),
@@ -152,7 +176,10 @@ async fn dispatch_refetches_when_content_changed() {
     std::fs::write(&path, "before").unwrap();
     let request = read_request("run-1", &format!("file:{}", path.display()));
 
-    let first = dispatch_tool(&orch, &request, &cursors).await.content;
+    let first = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(!first.starts_with("[duplicate call]"));
     assert!(
         first.contains("before"),
@@ -160,7 +187,10 @@ async fn dispatch_refetches_when_content_changed() {
     );
 
     // Identical call, file unchanged -> duplicate stub.
-    let unchanged = dispatch_tool(&orch, &request, &cursors).await.content;
+    let unchanged = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(
         unchanged.starts_with("[duplicate call]"),
         "unchanged content must dedup: {unchanged}"
@@ -168,7 +198,10 @@ async fn dispatch_refetches_when_content_changed() {
 
     // Mutate the file; the same call must now re-fetch the fresh content.
     std::fs::write(&path, "after").unwrap();
-    let changed = dispatch_tool(&orch, &request, &cursors).await.content;
+    let changed = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(
         !changed.starts_with("[duplicate call]"),
         "changed content must re-fetch, not stub: {changed}"
@@ -194,8 +227,14 @@ async fn dispatch_never_dedups_read_resource_terminal_poll() {
         tool_use_id: None,
     };
 
-    let first = dispatch_tool(&orch, &request, &cursors).await.content;
-    let second = dispatch_tool(&orch, &request, &cursors).await.content;
+    let first = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
+    let second = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(!first.starts_with("[duplicate call]"));
     assert!(
         !second.starts_with("[duplicate call]"),
@@ -211,8 +250,14 @@ async fn dispatch_passes_through_read_without_active_turn() {
     let cursors = Mutex::new(HashMap::new());
     let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent");
 
-    let first = dispatch_tool(&orch, &request, &cursors).await.content;
-    let second = dispatch_tool(&orch, &request, &cursors).await.content;
+    let first = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
+    let second = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(!first.starts_with("[duplicate call]"));
     assert!(
         !second.starts_with("[duplicate call]"),
@@ -225,8 +270,14 @@ async fn dispatch_resets_dedup_on_turn_change() {
     let (_temp, orch, cursors) = active_turn_fixture().await;
     let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent");
 
-    let _first = dispatch_tool(&orch, &request, &cursors).await.content;
-    let dup = dispatch_tool(&orch, &request, &cursors).await.content;
+    let _first = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
+    let dup = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(
         dup.starts_with("[duplicate call]"),
         "second call should stub: {dup}"
@@ -234,7 +285,10 @@ async fn dispatch_resets_dedup_on_turn_change() {
 
     // A new turn wipes the seen-set: the same read executes again.
     orch.process_state.begin_turn("run-1", "turn-2");
-    let after = dispatch_tool(&orch, &request, &cursors).await.content;
+    let after = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(
         !after.starts_with("[duplicate call]"),
         "a new turn must reset the seen-set: {after}"
@@ -246,15 +300,24 @@ async fn dispatch_nudges_on_third_identical_read() {
     let (_temp, orch, cursors) = active_turn_fixture().await;
     let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent");
 
-    let _first = dispatch_tool(&orch, &request, &cursors).await.content;
-    let second = dispatch_tool(&orch, &request, &cursors).await.content;
+    let _first = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
+    let second = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(second.contains("call #2"));
     assert!(
         !second.contains("retry loop"),
         "no nudge below threshold: {second}"
     );
 
-    let third = dispatch_tool(&orch, &request, &cursors).await.content;
+    let third = dispatch_tool(&orch, &request, &cursors)
+        .await
+        .into_inner()
+        .content;
     assert!(third.contains("call #3"));
     assert!(
         third.contains("retry loop"),

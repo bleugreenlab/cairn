@@ -335,7 +335,7 @@ async fn spawn_triage_for_scope_inner(
             None,
             None,
             None,
-            crate::models::IssueKind::Issue,
+            None,
         )
         .await?;
 
@@ -375,6 +375,7 @@ async fn spawn_triage_for_scope_inner(
             &target.project_key,
             outcome.number,
             Some(MEMORY_TRIAGE_RECIPE),
+            None,
             None,
             None,
         )
@@ -572,12 +573,12 @@ mod tests {
         std::fs::create_dir_all(project_dir.join(".cairn/agents")).unwrap();
         std::fs::write(
             config_dir.join("recipes/memory-triage.yaml"),
-            include_str!("../../../../recipes/memory-triage.yaml"),
+            include_str!("../../../../packs/core/recipes/memory-triage.yaml"),
         )
         .unwrap();
         std::fs::write(
             config_dir.join("agents/integrator.md"),
-            include_str!("../../../../agents/integrator.md"),
+            include_str!("../../../../packs/core/agents/integrator.md"),
         )
         .unwrap();
 

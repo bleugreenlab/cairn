@@ -2,6 +2,62 @@ use super::*;
 use crate::contract::ResourceKind;
 use crate::query::QueryParam;
 
+/// The reserved thread coordinate renders at the thread's own address, and it
+/// reaches every node and task sub-resource because they all compose from
+/// `build_node_uri`.
+#[test]
+fn the_thread_coordinate_renders_as_a_thread_address() {
+    assert_eq!(
+        build_node_uri("CAIRN", 0, 0, "thread-ux"),
+        "cairn://p/CAIRN/thread-ux"
+    );
+    assert_eq!(
+        build_node_artifact_uri_named("CAIRN", 0, 0, "thread-ux", Some("arc")),
+        "cairn://p/CAIRN/thread-ux/arc"
+    );
+    assert_eq!(
+        build_node_terminal_uri("CAIRN", 0, 0, "thread-ux", "smoke"),
+        "cairn://p/CAIRN/thread-ux/terminal/smoke"
+    );
+    assert_eq!(
+        build_task_chat_uri("CAIRN", 0, 0, "thread-ux", "probe"),
+        "cairn://p/CAIRN/thread-ux/task/probe/chat"
+    );
+    // The task home a delegated child reports is the same address its own
+    // sub-resources hang off.
+    assert_eq!(
+        build_job_base_uri("CAIRN", 0, 0, "probe", Some("thread-ux")),
+        build_thread_task_uri("CAIRN", "thread-ux", "probe")
+    );
+    // An ordinary node coordinate is untouched.
+    assert_eq!(
+        build_node_uri("CAIRN", 12, 1, "builder"),
+        "cairn://p/CAIRN/12/1/builder"
+    );
+}
+
+/// The `(0, 0)` sentinel is only safe because no URI can spell it: every numeric
+/// segment of a node URI parses through `parse_positive_i32`. If that ever
+/// loosened, a real URI could collide with a thread's internal coordinate.
+#[test]
+fn thread_coordinate_is_unspellable() {
+    for uri in [
+        "cairn://p/CAIRN/0/0/builder",
+        "cairn://p/CAIRN/0/0/builder/todos",
+        "cairn://p/CAIRN/0/1/builder",
+        "cairn://p/CAIRN/1/0/builder",
+    ] {
+        assert!(
+            !matches!(parse_uri(uri), Some(CairnResource::Node { .. })),
+            "{uri} must not parse as a node coordinate"
+        );
+    }
+    assert_eq!(
+        NodeAddress::new(0, 0, "thread-ux"),
+        NodeAddress::Thread { name: "thread-ux" }
+    );
+}
+
 #[test]
 fn parses_symbol_resources_all_forms() {
     assert_eq!(
@@ -49,6 +105,26 @@ fn parses_symbol_resources_all_forms() {
             symbol: Some("build_widget".to_string()),
         })
     );
+}
+
+#[test]
+fn an_executor_action_normalizes_only_the_machine_name() {
+    let expected = CairnResource::ExecutorAction {
+        name: "bglab-ub".to_string(),
+        action: "Look_Now".to_string(),
+    };
+    for uri in [
+        "cairn://executors/bglab-ub/Look_Now",
+        "cairn://executors/BGLab_UB/Look_Now",
+    ] {
+        assert_eq!(parse_uri(uri), Some(expected.clone()), "{uri}");
+    }
+    assert_eq!(expected.to_uri(), "cairn://executors/bglab-ub/Look_Now");
+    assert_eq!(expected.kind(), ResourceKind::ExecutorAction);
+    assert_eq!(expected.project(), None);
+    assert_eq!(expected.to_route(), None);
+    assert_eq!(parse_uri("cairn://executors/bglab-ub/"), None);
+    assert_eq!(parse_uri("cairn://executors/---/look"), None);
 }
 
 #[test]
@@ -709,45 +785,76 @@ fn parses_issue_executions_collection() {
     );
 }
 
-/// The `/t/` segment names a thread by name. The parser only recognizes the
-/// shape; which thread it names (or that none does) is a lookup the reader
-/// performs, so the parsed name is the raw segment and the alias reports no
-/// issue number of its own.
 #[test]
-fn parses_thread_alias_by_name() {
-    let alias = parse_uri("cairn://p/cairn/t/design-review").unwrap();
+fn parses_first_class_thread_resources() {
+    let collection = parse_uri("cairn://p/cairn/threads").unwrap();
     assert_eq!(
-        alias,
-        CairnResource::ThreadAlias {
-            project: "CAIRN".to_string(),
-            name: "design-review".to_string(),
+        collection,
+        CairnResource::ProjectThreads {
+            project: "CAIRN".into()
         }
     );
-    assert_eq!(alias.kind(), ResourceKind::ThreadAlias);
-    assert_eq!(alias.project(), Some("CAIRN"));
-    assert_eq!(alias.project_key(), Some("CAIRN"));
-    assert_eq!(alias.issue_number(), None);
-    // No frontend route: the alias resolves to a number before anything
-    // navigates, and the issue owns that route.
-    assert_eq!(alias.to_route(), None);
-    assert_eq!(alias.to_uri(), "cairn://p/CAIRN/t/design-review");
-    assert_eq!(
-        build_thread_alias_uri("cairn", "design-review"),
-        "cairn://p/CAIRN/t/design-review"
-    );
+    assert_eq!(collection.kind(), ResourceKind::ProjectThreads);
+    assert_eq!(collection.to_uri(), "cairn://p/CAIRN/threads");
 
-    // The alias occupies exactly one shape. A numbered issue URI is untouched
-    // by it, and neither a bare `/t` nor a sub-resource under a name parses.
-    assert_eq!(
-        parse_uri("cairn://p/CAIRN/12"),
-        Some(CairnResource::Issue {
-            project: "CAIRN".to_string(),
-            number: 12,
-        })
-    );
-    assert_eq!(parse_uri("cairn://p/CAIRN/t"), None);
-    assert_eq!(parse_uri("cairn://p/CAIRN/t/"), None);
-    assert_eq!(parse_uri("cairn://p/CAIRN/t/design-review/messages"), None);
+    for (uri, path) in [
+        ("cairn://p/cairn/design-review", vec![]),
+        ("cairn://p/cairn/design-review/chat", vec!["chat"]),
+        (
+            "cairn://p/cairn/design-review/chat/raw",
+            vec!["chat", "raw"],
+        ),
+        (
+            "cairn://p/cairn/design-review/chat/turn/2",
+            vec!["chat", "turn", "2"],
+        ),
+        ("cairn://p/cairn/design-review/messages", vec!["messages"]),
+        (
+            "cairn://p/cairn/design-review/terminal/dev",
+            vec!["terminal", "dev"],
+        ),
+        (
+            "cairn://p/cairn/design-review/repl/analysis",
+            vec!["repl", "analysis"],
+        ),
+        ("cairn://p/cairn/design-review/wakes", vec!["wakes"]),
+        ("cairn://p/cairn/design-review/memories", vec!["memories"]),
+        ("cairn://p/cairn/design-review/arc", vec!["arc"]),
+    ] {
+        let resource = parse_uri(uri).unwrap();
+        assert_eq!(
+            resource,
+            CairnResource::Thread {
+                project: "CAIRN".into(),
+                name: "design-review".into(),
+                path: path.into_iter().map(str::to_string).collect(),
+            }
+        );
+        assert_eq!(parse_uri(&resource.to_uri()), Some(resource));
+    }
+}
+
+#[test]
+fn numeric_and_reserved_segments_do_not_parse_as_thread_names() {
+    assert!(matches!(
+        parse_uri("cairn://p/CAIRN/3404"),
+        Some(CairnResource::Issue { number: 3404, .. })
+    ));
+    for reserved in crate::thread_name::RESERVED_PROJECT_SEGMENTS {
+        let uri = format!("cairn://p/CAIRN/{reserved}");
+        assert!(
+            !matches!(parse_uri(&uri), Some(CairnResource::Thread { .. })),
+            "{reserved}"
+        );
+    }
+}
+
+#[test]
+fn retired_thread_alias_has_a_helpful_error() {
+    assert_eq!(parse_uri("cairn://p/CAIRN/t/design-review"), None);
+    let error = parse_resource_uri("cairn://p/CAIRN/t/design-review").unwrap_err();
+    assert!(error.contains("retired"), "{error}");
+    assert!(error.contains("cairn://p/PROJECT/<name>"), "{error}");
 }
 
 #[test]
@@ -880,9 +987,13 @@ fn round_trips_every_resource_family() {
             project: "CAIRN".to_string(),
             number: 1,
         },
-        CairnResource::ThreadAlias {
+        CairnResource::ProjectThreads {
+            project: "CAIRN".to_string(),
+        },
+        CairnResource::Thread {
             project: "CAIRN".to_string(),
             name: "design-review".to_string(),
+            path: vec!["chat".to_string()],
         },
         CairnResource::ProjectMessages {
             project: "CAIRN".to_string(),
@@ -1600,6 +1711,71 @@ mod node_rebase_uri {
         assert!(
             !matches!(resource, CairnResource::NodeArtifact { .. }),
             "got {resource:?}"
+        );
+    }
+}
+
+#[test]
+fn response_uri_family_round_trips() {
+    let cases = [
+        "cairn://responses",
+        "cairn://responses/conveyor",
+        "cairn://responses/conveyor/history",
+        "cairn://responses/conveyor/history/7",
+        "cairn://p/CAIRN/responses",
+        "cairn://p/CAIRN/responses/conveyor",
+        "cairn://p/CAIRN/responses/conveyor/history",
+        "cairn://p/CAIRN/responses/conveyor/history/7",
+    ];
+    for uri in cases {
+        let parsed = parse_uri(uri).unwrap_or_else(|| panic!("failed to parse {uri}"));
+        assert_eq!(parsed.to_uri(), uri);
+    }
+    assert!(parse_uri("cairn://responses/x/history/0").is_none());
+    assert!(parse_uri("cairn://responses/x/history/nope").is_none());
+}
+
+#[test]
+fn route_uri_family_round_trips() {
+    let cases = [
+        build_routes_uri(),
+        build_route_uri("notify-away"),
+        build_route_history_uri("notify-away"),
+        build_route_history_entry_uri("notify-away", 7),
+        build_project_routes_uri("CAIRN"),
+        build_project_route_uri("CAIRN", "notify-away"),
+        build_project_route_history_uri("CAIRN", "notify-away"),
+        build_project_route_history_entry_uri("CAIRN", "notify-away", 7),
+    ];
+    for uri in cases {
+        let parsed = parse_uri(&uri).unwrap_or_else(|| panic!("failed to parse {uri}"));
+        assert_eq!(parsed.to_uri(), uri);
+    }
+    assert!(parse_uri("cairn://routes/x/history/0").is_none());
+}
+
+#[test]
+fn project_parser_literals_are_reserved_thread_names() {
+    for literal in [
+        "actions",
+        "agents",
+        "browser",
+        "images",
+        "issues",
+        "messages",
+        "recipes",
+        "references",
+        "responses",
+        "routes",
+        "settings",
+        "skills",
+        "symbols",
+        "threads",
+        "workflows",
+    ] {
+        assert!(
+            crate::thread_name::RESERVED_PROJECT_SEGMENTS.contains(&literal),
+            "project parser literal must be reserved for thread names: {literal}"
         );
     }
 }

@@ -12,13 +12,14 @@ use crate::config::build_services::BuildServiceConfig;
 use crate::config::keybinds::KeySequence;
 use crate::config::settings;
 use crate::identity::{ApiProvider, ProviderAuth};
-use crate::mcp::types::{ChangeItem, ChangeMode};
+use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::models::UpdateSettings;
 use crate::orchestrator::Orchestrator;
+use cairn_common::authorization::AuthorityRequest;
 use cairn_common::uri::{parse_uri, CairnResource};
 
 /// Scalar/app-pref + backend keys that route to `orch.update_settings`.
-const PREF_KEYS: &[&str] = &[
+pub(crate) const PREF_KEYS: &[&str] = &[
     "maxThinkingTokens",
     "mergeType",
     "orphanCleanupDays",
@@ -28,6 +29,7 @@ const PREF_KEYS: &[&str] = &[
     "transcriptTextSize",
     "transcriptDensity",
     "logLevel",
+    "logRetentionDays",
     "memoryReviewEnabled",
     "memoryTriageEnabled",
     "maxOpenTriageIssuesPerScope",
@@ -44,13 +46,49 @@ const PREF_KEYS: &[&str] = &[
 ];
 
 /// Section objects that route to dedicated stores.
-const SECTION_KEYS: &[&str] = &["gitIdentities", "accounts", "keybinds", "buildServices"];
+pub(crate) const SECTION_KEYS: &[&str] =
+    &["gitIdentities", "accounts", "keybinds", "buildServices"];
 
-/// True when `item` is a `cairn://settings` patch: an out-of-worktree write to
-/// `~/.cairn` that the worktree fence must gate, mirroring workspace MCP writes.
+/// True when `item` is a `cairn://settings` patch.
 pub(crate) fn is_workspace_settings_mutation(item: &ChangeItem) -> bool {
     item.mode == ChangeMode::Patch
         && matches!(parse_uri(&item.target), Some(CairnResource::Settings))
+}
+
+/// The authority scopes a `cairn://settings` patch normalizes to — one per
+/// section the payload actually touches.
+///
+/// A patch is not one scope: writing `keybinds` and `backends` in the same call
+/// changes two different things, one of which is a capability and one of which
+/// is a preference. Naming them separately is what lets the operator approve
+/// exactly the section that matters instead of a whole undifferentiated
+/// "settings write".
+pub(crate) fn workspace_settings_authority(
+    item: &ChangeItem,
+) -> Vec<Result<AuthorityRequest, String>> {
+    if !is_workspace_settings_mutation(item) {
+        return Vec::new();
+    }
+    let Some(sections) = item.payload.as_ref().and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    // A key this surface will reject is not a boundary to approve. Validating
+    // first means a typo'd section is refused outright instead of raising an
+    // authority card the operator must answer before dispatch rejects the write
+    // anyway.
+    if let Err(error) = validate_settings_keys(sections.keys().map(String::as_str)) {
+        return vec![Err(error)];
+    }
+    sections
+        .keys()
+        .map(|section| {
+            crate::authorization::normalize::workspace_settings_write(
+                crate::authorization::WORKSPACE_ID,
+                section,
+            )
+            .map_err(|error| error.0)
+        })
+        .collect()
 }
 
 /// Reject out-of-scope and unknown top-level settings keys before any section
@@ -76,6 +114,58 @@ fn validate_settings_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<(),
                     SECTION_KEYS.join(", ")
                 ))
             }
+        }
+    }
+    Ok(())
+}
+
+/// Authorize every section a patch touches, immediately before it applies.
+///
+/// Sections that policy calls ordinary preferences resolve to `Direct` and cost
+/// nothing here — no grant query, no journal row — so a keybind change stays as
+/// cheap as it was.
+async fn authorize_settings_sections<'a>(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    sections: impl Iterator<Item = &'a str>,
+) -> Result<(), String> {
+    let requests = sections
+        .map(|section| {
+            crate::authorization::normalize::workspace_settings_write(
+                crate::authorization::WORKSPACE_ID,
+                section,
+            )
+            .map_err(|error| format!("Refused: {}", error.0))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // Skip actor resolution entirely when nothing here is a boundary, so an
+    // ordinary preference write never touches the authorization tables.
+    if requests.iter().all(|authority| {
+        matches!(
+            crate::authorization::policy::classify(&authority.scope, false),
+            cairn_common::authorization::AuthorityPolicy::Direct
+        )
+    }) {
+        return Ok(());
+    }
+
+    let Some(actor) = crate::authorization::resolve_actor(orch, request).await else {
+        return Err(
+            "Denied: changing capability-bearing workspace settings requires an authenticated \
+             run to authorize"
+                .to_string(),
+        );
+    };
+    for authority in requests {
+        let decision = crate::authorization::authorize(&actor, &authority).await?;
+        if !decision.is_allowed() {
+            return Err(crate::authorization::refusal_message(
+                &authority,
+                decision.reason().unwrap_or(
+                    cairn_common::authorization::AuthorityReason::WorkspaceSettingsCapability,
+                ),
+            ));
         }
     }
     Ok(())
@@ -142,6 +232,7 @@ fn parse_auth(auth_type: &str, auth_value: Option<String>) -> Result<ProviderAut
 
 pub(super) async fn apply_settings_patch(
     orch: &Orchestrator,
+    request: &McpCallbackRequest,
     payload: &Value,
     dry_run: bool,
 ) -> Result<String, String> {
@@ -152,6 +243,16 @@ pub(super) async fn apply_settings_patch(
     // Validate keys up front so a typo or an out-of-scope write fails before any
     // section applies.
     validate_settings_keys(obj.keys().map(String::as_str))?;
+
+    // The final authorization check, immediately before anything persists. The
+    // write handler's gate decided whether to prompt; this decides whether THIS
+    // write may land, re-matching against live grants and atomically consuming a
+    // once-grant. Every section is checked, so a patch mixing a preference with
+    // a capability cannot smuggle the capability through on the preference's
+    // back.
+    if !dry_run {
+        authorize_settings_sections(orch, request, obj.keys().map(String::as_str)).await?;
+    }
 
     let mut summary: Vec<String> = Vec::new();
 
@@ -418,6 +519,49 @@ mod tests {
         let error = validate(&["bogusKey"]).unwrap_err();
         assert!(error.contains("unknown settings key 'bogusKey'"), "{error}");
         assert!(error.contains("mergeType"), "{error}");
+    }
+
+    #[test]
+    fn every_writable_settings_key_is_classified_by_authorization_policy() {
+        // The policy allowlist fails closed on an unknown section, so an
+        // unclassified key would start prompting on every write rather than
+        // failing loudly. Pin the two lists together here instead, so adding a
+        // settings key forces a deliberate answer to "is this a capability?".
+        for key in PREF_KEYS.iter().chain(SECTION_KEYS.iter()) {
+            assert!(
+                crate::authorization::policy::settings_section_is_classified(key),
+                "settings key '{key}' is writable via cairn://settings but is not classified in \
+                 authorization::policy. Add it to CAPABILITY_BEARING_SETTINGS if it grants \
+                 capability, credentials, executable reach, or an outward-facing identity to \
+                 every future agent; otherwise add it to LOCAL_PREFERENCE_SETTINGS."
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_patch_names_one_scope_per_section_it_touches() {
+        let item = ChangeItem {
+            target: "cairn://settings".to_string(),
+            mode: ChangeMode::Patch,
+            payload: Some(serde_json::json!({"keybinds": {}, "backends": {}})),
+        };
+        let scopes: Vec<String> = workspace_settings_authority(&item)
+            .into_iter()
+            .map(|request| request.unwrap().scope.shorthand())
+            .collect();
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.contains(&"workspace/default/settings/backends:write".to_string()));
+        assert!(scopes.contains(&"workspace/default/settings/keybinds:write".to_string()));
+    }
+
+    #[test]
+    fn a_non_settings_item_names_no_authority_scope() {
+        let item = ChangeItem {
+            target: "cairn://labels".to_string(),
+            mode: ChangeMode::Patch,
+            payload: Some(serde_json::json!({"backends": {}})),
+        };
+        assert!(workspace_settings_authority(&item).is_empty());
     }
 
     #[test]

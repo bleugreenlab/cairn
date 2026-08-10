@@ -12,10 +12,24 @@ impl Orchestrator {
         settings::load_settings(&self.config_dir)
     }
 
-    /// The OS-sandbox read denylist for executor cells (configured
-    /// `sandboxDenyRead` or the narrow built-in default: external secret stores).
+    /// The OS-sandbox read denylist for executor cells: the configured
+    /// `sandboxDenyRead` (or the narrow built-in default of external secret
+    /// stores), plus the desktop operator credential.
+    ///
+    /// The credential is appended unconditionally rather than added to the
+    /// default list, because the default list is *replaced* wholesale when
+    /// `sandboxDenyRead` is configured. A denylist entry an operator can
+    /// remove by editing settings would be one an agent could remove by
+    /// getting one settings write approved, which is the reverse of the
+    /// dependency this credential is supposed to have.
     pub(crate) fn sandbox_deny_read(&self) -> Vec<std::path::PathBuf> {
-        settings::load_sandbox_deny_read(&self.config_dir)
+        let mut paths = settings::load_sandbox_deny_read(&self.config_dir);
+        let credential =
+            crate::authorization::protected::operator_credential_path(&self.config_dir);
+        if !paths.contains(&credential) {
+            paths.push(credential);
+        }
+        paths
     }
 
     /// Update settings with partial input.

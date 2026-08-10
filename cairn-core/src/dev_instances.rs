@@ -89,6 +89,208 @@ pub(crate) async fn sync_live_branch_instances(
     failures
 }
 
+fn orphan_dev_runner_candidates(
+    processes: Vec<DevRunnerProcess>,
+    terminal: &HashSet<String>,
+    protected: &HashSet<String>,
+    current_pid: u32,
+) -> Vec<DevRunnerProcess> {
+    processes
+        .into_iter()
+        .filter(|process| {
+            process.pid != current_pid
+                && terminal.contains(&process.branch_key)
+                && !protected.contains(&process.branch_key)
+        })
+        .collect()
+}
+
+/// Reconcile development runners which predate executor-owned process
+/// supervision. These processes are not represented by a residency after their
+/// launcher and executor disappear, so the residency sweep above cannot see
+/// them. The branch-keyed target path is their remaining durable identity.
+///
+/// A branch is protected whenever any database still describes non-terminal
+/// work on it, or the connected executor reports a live dev residency for it.
+/// Protection wins over terminal ownership so a held cell can never be reaped
+/// because another replica has an older terminal record for the same branch.
+#[cfg(unix)]
+pub async fn sweep_terminal_dev_runners(orch: &Orchestrator) -> Result<usize, String> {
+    let mut terminal = HashSet::new();
+    let mut protected = HashSet::new();
+    let mut job_branches = std::collections::HashMap::new();
+    for db in orch.db.all_dbs().await {
+        let rows: Vec<(String, String, String)> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT j.id, j.branch, i.status
+                             FROM jobs j
+                             JOIN issues i ON i.id = j.issue_id
+                             WHERE j.branch IS NOT NULL AND j.branch != ''",
+                            (),
+                        )
+                        .await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push((row.text(0)?, row.text(1)?, row.text(2)?));
+                    }
+                    Ok(out)
+                })
+            })
+            .await
+            .map_err(|error| format!("load dev-runner owners: {error}"))?;
+        for (job_id, branch, status) in rows {
+            let key = stable_branch_key(&branch);
+            job_branches.insert(job_id, key.clone());
+            if matches!(status.as_str(), "merged" | "closed") {
+                terminal.insert(key);
+            } else {
+                protected.insert(key);
+            }
+        }
+    }
+    for cell in orch.fleet.snapshot().cells {
+        if let Some(residency) = cell.residency {
+            match residency.holder {
+                ResidencyHolder::DevInstance { .. } => {
+                    if let Some(selector) = residency.selector {
+                        protected.insert(stable_branch_key(&selector));
+                    }
+                }
+                ResidencyHolder::Job { job_id } => {
+                    if let Some(key) = job_branches.get(&job_id) {
+                        protected.insert(key.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let candidates = orphan_dev_runner_candidates(
+        dev_runner_processes()?,
+        &terminal,
+        &protected,
+        std::process::id(),
+    );
+    let mut reaped = 0;
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        let pid = candidate.pid;
+        let key = &candidate.branch_key;
+        if !dev_runner_identity_is_current(&candidate)? {
+            reaped += 1;
+            continue;
+        }
+        match nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ESRCH) => {
+                reaped += 1;
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!("stop orphan dev runner {pid} ({key}): {error}"));
+                continue;
+            }
+        }
+        for _ in 0..50 {
+            if !dev_runner_identity_is_current(&candidate)? {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if dev_runner_identity_is_current(&candidate)? {
+            failures.push(format!(
+                "orphan dev runner {pid} ({key}) remained alive after SIGTERM"
+            ));
+            continue;
+        }
+        reaped += 1;
+    }
+    if failures.is_empty() {
+        Ok(reaped)
+    } else {
+        Err(format!(
+            "legacy dev-runner sweep was not fully verified (reaped {reaped}): {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn sweep_terminal_dev_runners(_orch: &Orchestrator) -> Result<usize, String> {
+    Ok(0)
+}
+
+#[cfg(unix)]
+fn dev_runner_identity_is_current(candidate: &DevRunnerProcess) -> Result<bool, String> {
+    Ok(dev_runner_processes()?
+        .into_iter()
+        .any(|process| process == *candidate))
+}
+
+#[cfg(unix)]
+fn dev_runner_processes() -> Result<Vec<DevRunnerProcess>, String> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,lstart=,command="])
+        .output()
+        .map_err(|error| format!("enumerate development runners: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "enumerate development runners: ps exited with {}",
+            output.status
+        ));
+    }
+    Ok(parse_dev_runner_processes(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DevRunnerProcess {
+    pid: u32,
+    started_at: String,
+    branch_key: String,
+}
+
+fn parse_dev_runner_processes(output: &str) -> Vec<DevRunnerProcess> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let started_at = (0..5)
+                .map(|_| fields.next())
+                .collect::<Option<Vec<_>>>()?
+                .join(" ");
+            let executable = fields.next()?;
+            (fields.next() == Some("run")).then_some(())?;
+            let components: Vec<_> = Path::new(executable).components().collect();
+            let branch = components.windows(3).find_map(|parts| {
+                (parts[0].as_os_str() == ".cairn-dev-target" && parts[1].as_os_str() == "branches")
+                    .then(|| parts[2].as_os_str().to_string_lossy().into_owned())
+            })?;
+            let target = components.windows(2).any(|parts| {
+                parts[0].as_os_str() == branch.as_str() && parts[1].as_os_str() == "target"
+            });
+            (target
+                && Path::new(executable)
+                    .file_name()
+                    .is_some_and(|name| name == "cairn-runner"))
+            .then_some(DevRunnerProcess {
+                pid,
+                started_at,
+                branch_key: branch,
+            })
+        })
+        .collect()
+}
+
 /// Reconcile dev residencies left behind by issues that reached a terminal
 /// state before deterministic teardown was introduced.
 pub async fn sweep_terminal_issue_instances(orch: &Orchestrator) -> Result<usize, String> {
@@ -1322,6 +1524,46 @@ mod tests {
     use crate::services::testing::{MockGitClient, TestServicesBuilder};
     use crate::services::RealGitClient;
     use crate::storage::{LocalDb, SearchIndex};
+
+    #[test]
+    fn legacy_dev_runner_discovery_is_narrow_and_hold_aware() {
+        let processes = parse_dev_runner_processes(
+            " 12 Fri Aug  7 16:00:00 2026 /Users/a/.cairn-dev-target/branches/agent-cairn-1-builder-0/target/debug/cairn-runner run\n\
+             13 Fri Aug  7 16:01:00 2026 /Users/a/.cairn-dev-target/branches/agent-cairn-2-builder-0/target/release/cairn-runner run\n\
+             14 Fri Aug  7 16:02:00 2026 /repo/target/debug/cairn-runner run\n\
+             15 Fri Aug  7 16:03:00 2026 /Users/a/.cairn-dev-target/branches/agent-cairn-3-builder-0/target/debug/cairn-runner serve\n",
+        );
+        assert_eq!(
+            processes,
+            vec![
+                DevRunnerProcess {
+                    pid: 12,
+                    started_at: "Fri Aug 7 16:00:00 2026".into(),
+                    branch_key: "agent-cairn-1-builder-0".into(),
+                },
+                DevRunnerProcess {
+                    pid: 13,
+                    started_at: "Fri Aug 7 16:01:00 2026".into(),
+                    branch_key: "agent-cairn-2-builder-0".into(),
+                }
+            ]
+        );
+
+        let terminal = HashSet::from([
+            "agent-cairn-1-builder-0".into(),
+            "agent-cairn-2-builder-0".into(),
+        ]);
+        let protected = HashSet::from(["agent-cairn-2-builder-0".into()]);
+        assert_eq!(
+            orphan_dev_runner_candidates(processes, &terminal, &protected, 99),
+            vec![DevRunnerProcess {
+                pid: 12,
+                started_at: "Fri Aug 7 16:00:00 2026".into(),
+                branch_key: "agent-cairn-1-builder-0".into(),
+            }],
+            "a live residency or non-terminal job protects its branch even when another replica calls it terminal"
+        );
+    }
 
     /// A cell as the fleet snapshot reports one, carrying only what claiming a
     /// checkout depends on.

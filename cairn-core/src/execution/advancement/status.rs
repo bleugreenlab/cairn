@@ -54,6 +54,9 @@ pub(super) async fn transition_job_to_running_conn(
         }
     } else if let Some(issue_id) = job.issue_id.as_deref() {
         crate::transitions::outcome::recompute_issue_status_conn(conn, issue_id).await?;
+    } else {
+        crate::transitions::outcome::recompute_job_owner_attention_conn(conn, &job.id, None)
+            .await?;
     }
 
     Ok(())

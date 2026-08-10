@@ -52,14 +52,35 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
         "jj log -r @-",
     )
 }
-/// The git directory backing the shared jj store. `ensure_project_store` points
-/// the store's git backend at the project's existing `.git` via
-/// `jj git init --git-repo`, and `jj git root` reports that path from any
-/// workspace off the store. This is the bridge that lets Cairn read genuine git
-/// objects (e.g. a sealed commit's tree) for content jj's template layer cannot
-/// expose.
+/// The Git object store reachable from a repository coordinate.
+///
+/// Durable project coordinates can name either the runner's ordinary Git
+/// checkout or one of its jj stores. A jj coordinate is authoritative about its
+/// backing object database: the store may live below an unrelated Git checkout,
+/// in which case `git rev-parse` would successfully discover the ancestor's
+/// object database while silently choosing the wrong store. Plain-Git
+/// coordinates remain independent of jj.
 fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
-    jj.run(ws, &["git", "root"], "jj git root")
+    if is_jj_dir(ws) {
+        return jj.run(ws, &["git", "root"], "jj git root");
+    }
+    let out = bounded_command_output(
+        crate::env::git()
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(ws),
+        JJ_DEFAULT_TIMEOUT,
+        "git rev-parse --absolute-git-dir",
+    )?;
+    if out.status.success() {
+        let git_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !git_dir.is_empty() {
+            return Ok(git_dir);
+        }
+    }
+    Err(format!(
+        "git rev-parse --absolute-git-dir failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
 }
 
 /// Stable identity for the sealed tree content at `@-`.

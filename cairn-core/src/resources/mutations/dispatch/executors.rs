@@ -24,6 +24,8 @@ struct ConfigureRequest {
     #[serde(alias = "runtime_policy")]
     runtime_policy: Option<cairn_common::executor_protocol::ExecutorRuntimePolicy>,
     draining: Option<bool>,
+    #[serde(alias = "desktop_automation")]
+    desktop_automation: Option<bool>,
     #[serde(alias = "expected_generation")]
     expected_generation: Option<u64>,
 }
@@ -97,17 +99,18 @@ pub(super) async fn dispatch(
                     build_failure(
                         index,
                         item,
-                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, and expectedGeneration."),
+                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, desktopAutomation, and expectedGeneration."),
                     )
                 })?;
             if request.new_name.is_none()
                 && request.runtime_policy.is_none()
                 && request.draining.is_none()
+                && request.desktop_automation.is_none()
             {
                 return Err(build_failure(
                     index,
                     item,
-                    "a patch changes newName, runtimePolicy, or draining; none was supplied",
+                    "a patch changes newName, runtimePolicy, draining, or desktopAutomation; none was supplied",
                 ));
             }
             // Resolve first, so an unknown machine is refused identically whether
@@ -127,6 +130,12 @@ pub(super) async fn dispatch(
                 if let Some(new_name) = &request.new_name {
                     planned.push(format!("rename {name} to {new_name}"));
                 }
+                if let Some(enabled) = request.desktop_automation {
+                    planned.push(format!(
+                        "turn desktop automation {}",
+                        if enabled { "on" } else { "off" }
+                    ));
+                }
                 if request.runtime_policy.is_some() {
                     planned.push("apply a runtime policy".to_string());
                 }
@@ -140,6 +149,33 @@ pub(super) async fn dispatch(
                 format!("Would {}", planned.join(", "))
             } else {
                 let mut applied = Vec::new();
+                if let Some(enabled) = request.desktop_automation {
+                    let mut fleet = crate::config::settings::load_fleet(orch.mcp_auth.config_dir());
+                    let public_name =
+                        cairn_common::executor_protocol::normalize_executor_name(name).ok_or_else(
+                            || build_failure(index, item, "executor name has no public form"),
+                        )?;
+                    fleet
+                        .desktop_automation
+                        .machines
+                        .entry(public_name)
+                        .or_default()
+                        .enabled = Some(enabled);
+                    crate::config::settings::set_fleet(orch.mcp_auth.config_dir(), &fleet)
+                        .map_err(|error| build_failure(index, item, error))?;
+                    if enabled {
+                        let orch = orch.clone();
+                        tokio::spawn(async move {
+                            crate::fleet::desktop::probe_attached_desktops(&orch).await;
+                        });
+                    } else if let Some(gateway) = orch.mcp_gateway() {
+                        gateway.close_placed(name).await;
+                    }
+                    applied.push(format!(
+                        "desktop automation {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    ));
+                }
                 if let Some(policy) = request.runtime_policy {
                     management::set_runtime_policy(
                         orch,

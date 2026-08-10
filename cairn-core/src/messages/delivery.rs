@@ -16,6 +16,67 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 
+/// Append a message to a first-class thread and route the same user wake used by
+/// issue-channel delivery to its live session. Threads with no session yet
+/// acquire one before the message is made visible.
+///
+/// This is the one funnel every prompt to a thread arrives through — the
+/// resource append, desktop and operator delivery, and follow-channel routing —
+/// so it is where a closed thread refuses. The refusal is taken before anything
+/// is written: a prompt to a closed thread leaves no message row, no session, no
+/// wake, and no push, rather than a half-delivered message nobody will read.
+pub async fn append_thread_message(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    thread_id: &str,
+    sender_run_id: Option<&str>,
+    sender_name: &str,
+    content: &str,
+) -> Result<String, String> {
+    if content.is_empty() {
+        return Err("Message content cannot be empty".into());
+    }
+    if !crate::threads::thread_is_active(db, thread_id).await? {
+        return Err(format!(
+            "Thread is closed and cannot receive messages: {thread_id}. Reopen it to resume the conversation."
+        ));
+    }
+    let job_id = crate::threads::ensure_thread_session(db, thread_id).await?;
+    let message = crate::messages::db::insert_message(
+        db,
+        &crate::models::ChannelType::Thread,
+        Some(thread_id),
+        sender_run_id,
+        sender_name,
+        None,
+        content,
+    )?;
+    use crate::orchestrator::wakes::{WakeDelivery, WakeEvent, WakeSource};
+    crate::orchestrator::wakes::route_wake(
+        orch,
+        WakeEvent {
+            source: WakeSource::User,
+            fact_kind: "message".to_string(),
+            detail_uri: None,
+            delivery: WakeDelivery::Targeted {
+                subscriber_job_id: job_id,
+                message: content.to_string(),
+            },
+            urgency: DeliveryUrgency::Steer,
+        },
+    )
+    .await?;
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table":"messages", "action":"insert", "threadId":thread_id}),
+    );
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table":"threads", "action":"update", "threadId":thread_id}),
+    );
+    Ok(message.id)
+}
+
 /// Look up the most recent run id for a job. Used by callers that have a job
 /// id (PR conflict resolution, wake delivery, etc.) and need to address the
 /// recipient by run id for direct-message delivery.
@@ -601,6 +662,14 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
     .ok()
     .flatten()?;
 
+    // A closed thread's session is not resumable by anything queued for it —
+    // pushes, queued user messages, or notices. Taken here, at the one gate the
+    // idle flush consults, so every queued reason to resume is covered by one
+    // check rather than each mechanism carrying its own.
+    if crate::threads::is_dormant_thread_session_sync(db, &job_id) {
+        return None;
+    }
+
     // Passive side-channel notices no longer wake an idle job; they ride along
     // with the next agent-bound payload.
     let notice_count = 0;
@@ -800,10 +869,140 @@ pub fn nudge_job_for_urgency(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DbState;
+    use crate::services::testing::{RecordingProcessSpawner, TestServicesBuilder};
+    use crate::storage::SearchIndex;
     use cairn_db::turso::params;
+    use std::sync::Arc;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("delivery-flush.db").await
+    }
+
+    /// Delivering to a thread rouses its session, so the orchestrator needs a
+    /// spawner that accepts the launch; these tests assert what is persisted,
+    /// not process mechanics.
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        let db_state = Arc::new(DbState::new(
+            Arc::new(db),
+            Arc::new(SearchIndex::open_or_create(config_dir.join("search-index.db")).unwrap()),
+        ));
+        let services = Arc::new(
+            TestServicesBuilder::new()
+                .with_process(RecordingProcessSpawner::new().clone())
+                .build(),
+        );
+        Orchestrator::builder(db_state, services, config_dir).build()
+    }
+
+    /// A thread with a live session job and a run, so both the prompt path and
+    /// the queued-push resume gate have something real to address.
+    async fn seed_thread_session_run(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-1','default','Test Project','PROJ','/tmp/test-repo',1,1);
+             INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('thread-1','proj-1','general','active','none',1,1);
+             INSERT INTO jobs (id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+               VALUES ('job-thread','thread-1','proj-1','thread','thread','idle',1,1);
+             INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('run-1','proj-1','job-thread','live',1,1);",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn set_thread_status(db: &LocalDb, status: &str) {
+        db.execute(
+            "UPDATE threads SET status = ?1 WHERE id = 'thread-1'",
+            params![status],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn count(db: &LocalDb, sql: &str) -> i64 {
+        db.query_one(sql, (), |row| row.i64(0)).await.unwrap()
+    }
+
+    /// A prompt to a closed thread fails whole: no message row, no session, no
+    /// wake, no push. A half-delivered message nobody will read is worse than a
+    /// refusal, because the sender believes it landed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_thread_refuses_a_prompt_atomically_and_reopening_restores_it() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_thread_session_run(&db).await;
+        set_thread_status(&db, "closed").await;
+
+        let refused =
+            append_thread_message(&orch, &db, "thread-1", None, "external", "still there?")
+                .await
+                .expect_err("a closed thread takes no prompts");
+        assert!(
+            refused.contains("closed") && refused.contains("Reopen"),
+            "the refusal says what happened and how to undo it: {refused}"
+        );
+
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM messages").await, 0);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM attention_pushes").await, 0);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM jobs").await,
+            1,
+            "a refused prompt establishes no session"
+        );
+
+        set_thread_status(&db, "active").await;
+        append_thread_message(&orch, &db, "thread-1", None, "external", "still there?")
+            .await
+            .expect("reopening restores delivery");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM messages WHERE channel_type='thread' AND channel_id='thread-1'"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// A push queued before closure stays on the books and stays undelivered.
+    /// Suspending delivery rather than deleting the row is what makes the
+    /// transition reversible: reopening restores the resume without anything
+    /// having to be reconstructed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_push_cannot_resume_a_closed_thread_until_it_reopens() {
+        let db = migrated_db().await;
+        seed_thread_session_run(&db).await;
+        seed_waking_push(&db, "job-thread").await;
+        set_head_turn(&db, "job-thread", "complete", None).await;
+
+        assert!(
+            collect_pending_for_flush(&db, "run-1").is_some(),
+            "an active thread resumes for a pending rousing push"
+        );
+
+        set_thread_status(&db, "closed").await;
+        assert!(
+            collect_pending_for_flush(&db, "run-1").is_none(),
+            "a closed thread is not resumed by anything queued for it"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM attention_pushes WHERE delivered_event_id IS NULL"
+            )
+            .await,
+            1,
+            "the push is suspended, not discarded"
+        );
+
+        set_thread_status(&db, "active").await;
+        assert!(
+            collect_pending_for_flush(&db, "run-1").is_some(),
+            "reopening makes the same push deliverable again"
+        );
     }
 
     /// Seed the minimal project/issue/execution/job/run graph so

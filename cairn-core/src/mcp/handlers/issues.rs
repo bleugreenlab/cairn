@@ -8,7 +8,7 @@ use super::ProjectContext;
 use crate::issues::relations;
 use crate::labels::attach;
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{Issue, IssueAttention, IssueKind, IssueProgress, IssueStatus, Label};
+use crate::models::{Issue, IssueAttention, IssueProgress, IssueStatus, Label};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 // ============================================================================
@@ -23,6 +23,11 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 pub struct CreateExecutionSpec {
     pub(crate) recipe: Option<String>,
     pub(crate) backend: Option<String>,
+    /// Ad-hoc adjustments to the recipe this launch freezes — the same grammar
+    /// the executions-collection append takes, so "create a child and skip its
+    /// review" is one call rather than a create, a start, and a patch that
+    /// arrives after the jobs are already minted.
+    pub(crate) overrides: Option<crate::models::LaunchDeltas>,
 }
 
 /// Persist a new issue and emit the standard side effects (embed, sync,
@@ -37,7 +42,7 @@ async fn insert_issue_with_context(
     description: Option<String>,
     parent_uri: Option<String>,
     labels: Option<Vec<String>>,
-    kind: IssueKind,
+    caller_run_id: Option<String>,
 ) -> Result<Issue, String> {
     let services = &orch.services;
     let embed_text = description.clone().unwrap_or_default();
@@ -52,15 +57,15 @@ async fn insert_issue_with_context(
         description,
         parent_uri,
         labels,
-        kind,
+        caller_run_id,
     )
     .await
     .map_err(|e| format!("Failed to create issue: {}", e))?;
 
-    // Nothing is minted here for child attention. A parented child's attention
-    // is routed to whichever node is driving the parent issue at the moment the
-    // fact occurs, derived live from `parent_issue_id`
-    // (`wakes::coordinating_job_for_child_issue`).
+    // No subscription row is minted here. `create_issue_row` records WHICH node
+    // filed the child (`issues.parent_job_id`); who that child's facts reach is
+    // resolved live on every wake, from that record plus the current parent edge
+    // (`wakes::coordinating_job_for_child`).
     let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
     orch.enqueue_resource_embed(&issue_uri, embed_text);
 
@@ -104,8 +109,8 @@ fn emit_labels_created(orch: &Orchestrator, created: &[Label]) {
 
 fn created_issue_summary(ctx: &ProjectContext, issue: &Issue) -> String {
     format!(
-        "Created {} {}-{}: \"{}\"",
-        issue.kind, ctx.project_key, issue.number, issue.title
+        "Created issue {}-{}: \"{}\"",
+        ctx.project_key, issue.number, issue.title
     )
 }
 
@@ -130,7 +135,7 @@ pub async fn create_issue_in_project(
     labels: Option<Vec<String>>,
     execution: Option<CreateExecutionSpec>,
     parent_uri: Option<String>,
-    kind: IssueKind,
+    caller_run_id: Option<String>,
 ) -> Result<CreatedIssueOutcome, String> {
     let owning_db = orch.db.for_project(project_key).await;
     let ctx = lookup_project_by_key(&owning_db, project_key).await?;
@@ -142,7 +147,7 @@ pub async fn create_issue_in_project(
         description,
         parent_uri,
         labels,
-        kind,
+        caller_run_id,
     )
     .await?;
     let summary = created_issue_summary(&ctx, &issue);
@@ -166,6 +171,7 @@ pub async fn create_issue_in_project(
             spec.recipe.as_deref(),
             spec.backend.as_deref(),
             None,
+            spec.overrides,
         )
         .await
         {
@@ -256,6 +262,251 @@ async fn lookup_project_context(
     }
 }
 
+/// The node a run acts for: the run's job, walked up `jobs.parent_job_id` past
+/// **delegated task** jobs only. Returns `None` when the run has no job.
+///
+/// `parent_job_id` carries two different relationships, and only one of them is
+/// a change of owner. A delegated sub-task hangs off the node that spawned it
+/// and is ephemeral — it runs once, returns its result, and is never resumed —
+/// so a child issue it files belongs to the node it acted for, not to itself
+/// (CAIRN-1302). A `branchMode: inherit` agent node carries the same edge for an
+/// entirely different reason: to share its upstream's branch and worktree. It is
+/// a first-class node of the recipe with its own session and lifecycle, so a
+/// child IT files belongs to IT — walking past it would hand a live coordinator's
+/// children to the planner upstream of it, which is the CAIRN-3712 failure again.
+///
+/// The execution snapshot draws exactly this distinction already:
+/// `delegated_packets[].materialized_node_ids` records which node ids a
+/// delegation created. Anything not named there is an authored recipe node.
+/// When the answer cannot be established — no snapshot, no recipe node id, an
+/// unparseable snapshot — the walk continues, preserving the older behavior for
+/// rows that predate the distinction.
+async fn owning_node_job_for_run(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT job_id FROM runs WHERE id = ?1 LIMIT 1",
+            params![run_id],
+        )
+        .await?;
+    let Some(mut job_id) = (match rows.next().await? {
+        Some(row) => row.opt_text(0)?,
+        None => None,
+    }) else {
+        return Ok(None);
+    };
+
+    // Bounded by tree depth; the guard defends against a cycle in malformed data
+    // rather than ever being hit in practice.
+    for _ in 0..64 {
+        let mut prows = conn
+            .query(
+                "SELECT parent_job_id, execution_id, recipe_node_id FROM jobs WHERE id = ?1 LIMIT 1",
+                params![job_id.as_str()],
+            )
+            .await?;
+        let Some(row) = prows.next().await? else {
+            break;
+        };
+        let Some(parent_job_id) = row.opt_text(0)? else {
+            break;
+        };
+        if !is_delegated_task_node(
+            conn,
+            row.opt_text(1)?.as_deref(),
+            row.opt_text(2)?.as_deref(),
+        )
+        .await?
+        {
+            break;
+        }
+        job_id = parent_job_id;
+    }
+    Ok(Some(job_id))
+}
+
+/// Whether `recipe_node_id` was materialized by a delegation in `execution_id`'s
+/// snapshot, rather than authored as a node of the recipe. `true` when it cannot
+/// be decided, so an undecidable job is walked past exactly as it always was.
+async fn is_delegated_task_node(
+    conn: &cairn_db::turso::Connection,
+    execution_id: Option<&str>,
+    recipe_node_id: Option<&str>,
+) -> DbResult<bool> {
+    let (Some(execution_id), Some(recipe_node_id)) = (execution_id, recipe_node_id) else {
+        return Ok(true);
+    };
+    let mut rows = conn
+        .query(
+            "SELECT snapshot FROM executions WHERE id = ?1 LIMIT 1",
+            params![execution_id],
+        )
+        .await?;
+    let snapshot = match rows.next().await? {
+        Some(row) => row.opt_text(0)?,
+        None => None,
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(true);
+    };
+    let Ok(snapshot) = serde_json::from_str::<crate::models::ExecutionSnapshot>(&snapshot) else {
+        return Ok(true);
+    };
+    Ok(snapshot.delegated_packets.iter().any(|packet| {
+        packet
+            .materialized_node_ids
+            .iter()
+            .any(|node_id| node_id == recipe_node_id)
+    }))
+}
+
+/// The thread a run acts for, when it acts for one.
+///
+/// Starts from the run's owning node ([`owning_node_job_for_run`]), so a
+/// sub-agent a thread session delegated resolves to the thread it was acting
+/// for, while an authored node keeps its own identity. `jobs.thread_id` is the
+/// single durable record of that ownership (`threads::job_owner`); the
+/// transport-level `McpCallbackRequest.thread_id` is a backend session
+/// identifier and names no Cairn thread.
+///
+/// Scoped to `project_id` because the answer becomes a parent edge, and a
+/// cross-project parent is refused everywhere else it can be asked for
+/// (`resolve_parent_edge`) — a thread agent filing into another project's
+/// issues gets no inferred parent rather than an edge that routes attention out
+/// of the project owning the work.
+///
+/// Fail-soft like the `parent_job_id` lookup beside it: a run whose job rows
+/// live in another database (an agent filing into a team replica, CAIRN-2181)
+/// resolves to `None`, leaving the issue unparented rather than failing.
+async fn owning_thread_for_run(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    run_id: &str,
+) -> DbResult<Option<String>> {
+    let Some(job_id) = owning_node_job_for_run(conn, run_id).await? else {
+        return Ok(None);
+    };
+    let mut rows = conn
+        .query(
+            "SELECT t.id
+             FROM jobs j
+             JOIN threads t ON t.id = j.thread_id
+             WHERE j.id = ?1 AND t.project_id = ?2
+             LIMIT 1",
+            params![job_id.as_str(), project_id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => row.opt_text(0),
+        None => Ok(None),
+    }
+}
+
+/// The parent an issue hangs from: exactly one of another issue or a thread.
+///
+/// The `issues` table holds these as two nullable columns, but they are one
+/// relationship carrying two different meanings. An issue parent routes
+/// attention AND derives branches — the child branches from, and merges into,
+/// the parent's integration branch. A thread parent takes only the routing
+/// meaning: a thread owns no branch, so its children base off the project
+/// (`relations::resolve_parent_branch`). Which of the two a URI names is settled
+/// once, here, so create and patch cannot drift apart on the answer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ParentEdge {
+    Issue(String),
+    Thread(String),
+}
+
+/// The canonical form of a parent URI, or a message naming what is accepted.
+///
+/// Syntax only: existence, same-project, and cycle checks belong to
+/// [`resolve_parent_edge`], which runs them inside the write transaction. A
+/// numeric address stays an issue address here — a number vacated by the thread
+/// cutover resolves to its thread at the database, where the issue row's
+/// absence is knowable.
+pub(crate) fn canonicalize_parent_uri(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    // `cairn:~/` is home-relative to the node doing the writing, so it can never
+    // name the intended parent from any session but that node's own. Naming the
+    // mis-resolution beats resolving it somewhere surprising.
+    if trimmed.starts_with("cairn:~") {
+        return Err(format!(
+            "payload.parent must be the parent's canonical URI; cairn:~/ resolves to the node making this write, not the parent: {trimmed}"
+        ));
+    }
+    match cairn_common::uri::parse_uri(trimmed) {
+        Some(cairn_common::uri::CairnResource::Issue { project, number }) => {
+            Ok(cairn_common::uri::build_issue_uri(&project, number))
+        }
+        Some(cairn_common::uri::CairnResource::Thread {
+            project,
+            name,
+            path,
+        }) if path.is_empty() => Ok(cairn_common::uri::build_thread_uri(&project, &name)),
+        _ => Err(format!(
+            "payload.parent must be a canonical issue URI like cairn://p/CAIRN/123 or a canonical thread URI like cairn://p/CAIRN/thread-name: {trimmed}"
+        )),
+    }
+}
+
+/// Resolve `parent_uri` to the edge it names, inside the caller's transaction.
+///
+/// An issue address that has an issue row is an issue parent. Everything else
+/// falls through to thread resolution, which takes both canonical thread names
+/// and the numeric aliases the thread cutover vacated
+/// (`threads::resolve_parent_thread_uri_conn`).
+async fn resolve_parent_edge(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    parent_uri: &str,
+) -> DbResult<ParentEdge> {
+    let resolved_issue = match cairn_common::uri::parse_uri(parent_uri) {
+        Some(cairn_common::uri::CairnResource::Issue { .. }) => {
+            relations::resolve_issue_uri(conn, parent_uri).await?
+        }
+        _ => None,
+    };
+    if let Some(resolved) = resolved_issue {
+        // Same-project: a cross-project issue parent would branch from another
+        // repo, and a cross-project thread would route attention out of the
+        // project that owns the work.
+        let mut project_rows = conn
+            .query(
+                "SELECT project_id FROM issues WHERE id = ?1 LIMIT 1",
+                params![resolved.issue_id.as_str()],
+            )
+            .await?;
+        let parent_project_id = project_rows
+            .next()
+            .await?
+            .ok_or_else(|| DbError::Row(parent_not_found(parent_uri)))?
+            .text(0)?;
+        if parent_project_id != project_id {
+            return Err(DbError::Row(same_project_required(parent_uri)));
+        }
+        return Ok(ParentEdge::Issue(resolved.issue_id));
+    }
+    if let Some((thread_id, thread_project_id, _)) =
+        crate::threads::resolve_parent_thread_uri_conn(conn, parent_uri).await?
+    {
+        if thread_project_id != project_id {
+            return Err(DbError::Row(same_project_required(parent_uri)));
+        }
+        return Ok(ParentEdge::Thread(thread_id));
+    }
+    Err(DbError::Row(parent_not_found(parent_uri)))
+}
+
+fn parent_not_found(parent_uri: &str) -> String {
+    format!("parent issue or thread not found: {parent_uri}")
+}
+
+fn same_project_required(parent_uri: &str) -> String {
+    format!("parent issue or thread must be in the same project: {parent_uri}")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_issue_row(
     db: &LocalDb,
@@ -264,7 +515,7 @@ async fn create_issue_row(
     description: Option<String>,
     parent_uri: Option<String>,
     labels: Option<Vec<String>>,
-    kind: IssueKind,
+    caller_run_id: Option<String>,
 ) -> DbResult<(Issue, Vec<Label>)> {
     let project_id = project_id.to_string();
     db.write(|conn| {
@@ -273,30 +524,46 @@ async fn create_issue_row(
         let description = description.clone();
         let parent_uri = parent_uri.clone();
         let labels = labels.clone();
+        let caller_run_id = caller_run_id.clone();
         Box::pin(async move {
-            let parent_issue_id = if let Some(parent_uri) = parent_uri.as_deref() {
-                let resolved = relations::resolve_issue_uri(conn, parent_uri)
-                    .await?
-                    .ok_or_else(|| DbError::Row(format!("parent issue not found: {parent_uri}")))?;
-                let mut project_rows = conn
-                    .query(
-                        "SELECT project_id FROM issues WHERE id = ?1 LIMIT 1",
-                        params![resolved.issue_id.as_str()],
-                    )
-                    .await?;
-                let parent_project_id = project_rows
-                    .next()
-                    .await?
-                    .ok_or_else(|| DbError::Row(format!("parent issue not found: {parent_uri}")))?
-                    .text(0)?;
-                if parent_project_id != project_id {
-                    return Err(DbError::Row(format!(
-                        "parent issue must be in the same project: {parent_uri}"
-                    )));
+            let (parent_issue_id, parent_thread_id) = match parent_uri.as_deref() {
+                Some(parent_uri) => {
+                    match resolve_parent_edge(conn, &project_id, parent_uri).await? {
+                        ParentEdge::Issue(issue_id) => (Some(issue_id), None),
+                        ParentEdge::Thread(thread_id) => (None, Some(thread_id)),
+                    }
                 }
-                Some(resolved.issue_id)
-            } else {
-                None
+                // No parent named: an issue an agent files while acting for a
+                // thread belongs to that thread. The thread is where the work
+                // was decided on, so it is where the issue's attention has to
+                // return — an unparented issue routes nowhere and the thread
+                // loses sight of what it just asked for. A caller that wants
+                // something else says so, and says it in the same key that
+                // names any other parent.
+                None => match caller_run_id.as_deref() {
+                    Some(run_id) => (None, owning_thread_for_run(conn, &project_id, run_id).await?),
+                    None => (None, None),
+                },
+            };
+
+            // Record the node that filed this child — the caller's owning node,
+            // walking past delegated tasks only: a delegated sub-task is acting
+            // for the node that spawned it, so the child belongs to that node,
+            // while an authored node that merely inherits a branch owns what it
+            // files itself. Whether this record still
+            // NAMES the recipient is re-decided on every wake
+            // (`wakes::coordinating_job_for_child`) — it is a durable fact about
+            // who filed the child, not a cached route.
+            //
+            // content→execution boundary (CAIRN-2181): this reads runs/jobs from
+            // whatever DB the insert targets. A user-driven create carries no
+            // caller_run_id so it never fires; an agent filing a child into a
+            // team project hits an empty runs table in the replica and degrades
+            // to NULL (routing falls back to the parent's current driver) —
+            // cross-DB job resolution is execution-slice work for CAIRN-2182.
+            let parent_job_id = match (parent_issue_id.as_deref(), caller_run_id.as_deref()) {
+                (Some(_), Some(run_id)) => owning_node_job_for_run(conn, run_id).await?,
+                _ => None,
             };
 
             let mut rows = conn
@@ -323,9 +590,10 @@ async fn create_issue_row(
                 "
                 INSERT INTO issues (
                     id, project_id, number, title, description, status, progress,
-                    attention, priority, created_at, updated_at, model, parent_issue_id, kind
+                    attention, priority, created_at, updated_at, model, parent_issue_id,
+                    parent_job_id, parent_thread_id
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, NULL, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, NULL, ?7, ?8, ?9)
                 ",
                 params![
                     id.as_str(),
@@ -335,7 +603,8 @@ async fn create_issue_row(
                     description.as_deref(),
                     now,
                     parent_issue_id.as_deref(),
-                    kind.to_string()
+                    parent_job_id.as_deref(),
+                    parent_thread_id.as_deref()
                 ],
             )
             .await?;
@@ -367,11 +636,11 @@ async fn create_issue_row(
                     merged_at: None,
                     closed_at: None,
                     parent_issue_id,
+                    parent_thread_id,
                     unmet_dependency_count: 0,
                     depends_on: Vec::new(),
                     unmet_depends_on: Vec::new(),
                     labels: Vec::new(),
-                    kind,
                 });
             Ok((issue, created_labels))
         })
@@ -393,9 +662,10 @@ pub(crate) struct IssuePatchFields {
     /// issue with live work is refused and names this key (CAIRN-3212).
     pub(crate) confirm: bool,
     /// Re-parenting. `None` leaves parent untouched; `Some(None)` orphans the
-    /// issue (clears parent); `Some(Some(uri))` adopts under the given canonical
-    /// issue URI. The URI is resolved to an issue id, validated same-project, and
-    /// checked for parent-chain cycles inside the update transaction.
+    /// issue (clears both parent columns); `Some(Some(uri))` adopts under the
+    /// given canonical issue or thread URI. The URI is resolved to the edge it
+    /// names, validated same-project, and — for an issue parent — checked for
+    /// parent-chain cycles inside the update transaction.
     pub(crate) parent: Option<Option<String>>,
 }
 
@@ -458,56 +728,56 @@ async fn update_issue_row(
             match parent {
                 // Parent left untouched.
                 None => {}
-                // Orphan: clear the parent edge. With no parent issue there is
-                // no coordinator to derive, so the child's attention stops
-                // routing anywhere but its own watchers.
+                // Orphan: clear the parent edge, whichever kind it was. With no
+                // parent there is no coordinator to derive, so the child's
+                // attention stops routing anywhere but its own watchers.
                 Some(None) => {
                     conn.execute(
-                        "UPDATE issues SET parent_issue_id = NULL, updated_at = ?1 WHERE id = ?2",
+                        "UPDATE issues
+                         SET parent_issue_id = NULL, parent_thread_id = NULL, updated_at = ?1
+                         WHERE id = ?2",
                         params![now, issue_id.as_str()],
                     )
                     .await?;
                 }
+                // Adoption re-points the child's attention by itself: the
+                // recipient is whoever drives the parent when a child fact next
+                // occurs, so there is nothing to record here. The two columns
+                // are one edge, so each branch sets its own and clears the other.
                 Some(Some(parent_uri)) => {
-                    let resolved = relations::resolve_issue_uri(conn, &parent_uri)
-                        .await?
-                        .ok_or_else(|| {
-                            DbError::Row(format!("parent issue not found: {parent_uri}"))
-                        })?;
-                    if resolved.issue_id == issue_id {
-                        return Err(DbError::Row("an issue cannot be its own parent".into()));
+                    match resolve_parent_edge(conn, &project_id, &parent_uri).await? {
+                        ParentEdge::Issue(parent_issue_id) => {
+                            if parent_issue_id == issue_id {
+                                return Err(DbError::Row(
+                                    "an issue cannot be its own parent".into(),
+                                ));
+                            }
+                            relations::validate_no_parent_cycle(conn, &issue_id, &parent_issue_id)
+                                .await
+                                .map_err(DbError::Row)?;
+                            conn.execute(
+                                "UPDATE issues
+                                 SET parent_issue_id = ?1, parent_thread_id = NULL, updated_at = ?2
+                                 WHERE id = ?3",
+                                params![parent_issue_id.as_str(), now, issue_id.as_str()],
+                            )
+                            .await?;
+                        }
+                        // A thread confers no branch and cannot close a cycle in
+                        // the issue parent chain, so neither check applies; the
+                        // stale `parent_job_id` of a previous issue parent stays
+                        // inert, since routing only consults it alongside a
+                        // parent issue it belongs to.
+                        ParentEdge::Thread(thread_id) => {
+                            conn.execute(
+                                "UPDATE issues
+                                 SET parent_thread_id = ?1, parent_issue_id = NULL, updated_at = ?2
+                                 WHERE id = ?3",
+                                params![thread_id.as_str(), now, issue_id.as_str()],
+                            )
+                            .await?;
+                        }
                     }
-                    // Same-project: a cross-project parent would branch from
-                    // another repo. Mirrors the create path's guard.
-                    let mut project_rows = conn
-                        .query(
-                            "SELECT project_id FROM issues WHERE id = ?1 LIMIT 1",
-                            params![resolved.issue_id.as_str()],
-                        )
-                        .await?;
-                    let parent_project_id = project_rows
-                        .next()
-                        .await?
-                        .ok_or_else(|| {
-                            DbError::Row(format!("parent issue not found: {parent_uri}"))
-                        })?
-                        .text(0)?;
-                    if parent_project_id != project_id {
-                        return Err(DbError::Row(format!(
-                            "parent issue must be in the same project: {parent_uri}"
-                        )));
-                    }
-                    relations::validate_no_parent_cycle(conn, &issue_id, &resolved.issue_id)
-                        .await
-                        .map_err(DbError::Row)?;
-                    // Adopting an issue re-points its attention by itself: the
-                    // recipient is whoever drives this parent when a child fact
-                    // next occurs, so there is nothing to record here.
-                    conn.execute(
-                        "UPDATE issues SET parent_issue_id = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![resolved.issue_id.as_str(), now, issue_id.as_str()],
-                    )
-                    .await?;
                 }
             }
 
@@ -705,6 +975,10 @@ mod tests {
 
     /// Adopting and orphaning an issue moves its attention with the parent edge
     /// alone — no subscription row is minted, reconciled, or left behind.
+    ///
+    /// Adoption is not creation, so nothing records `coord` as the child's
+    /// spawner; it receives the child by being the node currently driving the
+    /// parent, which is what the `started_at` stamp makes it.
     #[tokio::test]
     async fn parent_patch_repoints_child_attention_without_minting_rows() {
         let db = migrated_db().await;
@@ -718,11 +992,11 @@ mod tests {
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
              VALUES('child', 'p2', 2, 'Child', 'active', 'active', 'none', 1, 1);
             INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-             VALUES('coord', 'p2', 'parent', 'running', 's-coord', 1, 1);
+             VALUES('manual', 'p2', 'parent', 'running', 's-manual', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, started_at, created_at, updated_at)
+             VALUES('coord', 'p2', 'parent', 'running', 's-coord', 2, 2, 2);
             INSERT INTO runs(id, job_id, status, created_at, updated_at)
              VALUES('run-coord', 'coord', 'running', 1, 1);
-            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-             VALUES('manual', 'p2', 'parent', 'running', 's-manual', 1, 1);
             INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state, created_by, created_at, updated_at, one_shot)
              VALUES('manual-sub', 'manual', 'issue', 'cairn://p/PROJ/2', 'active', 'agent', 1, 1, 0);
             ",
@@ -794,6 +1068,262 @@ mod tests {
         );
     }
 
+    /// The node a child issue was filed by, as recorded at creation.
+    async fn spawning_node(db: &LocalDb, issue_id: &str) -> Option<String> {
+        let issue_id = issue_id.to_string();
+        db.read(|conn| {
+            let issue_id = issue_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT parent_job_id FROM issues WHERE id = ?1",
+                        params![issue_id.as_str()],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => row.opt_text(0),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A minimal execution snapshot whose one delegation materialized
+    /// `delegated-node`. Every other node id in this execution is authored.
+    fn snapshot_with_delegated_node() -> String {
+        serde_json::json!({
+            "recipe": {"id":"r","name":"R","description":null,"trigger":"manual","nodes":[],"edges":[]},
+            "agents": {},
+            "skills": {},
+            "triggerContext": {"issueId":"parent","projectId":"p","triggerType":"manual"},
+            "delegatedPackets": [{
+                "id": "packet-1",
+                "parentJobId": "coordinator",
+                "origin": "task_tool",
+                "title": "Explore",
+                "problemStatement": "x",
+                "agentConfigId": "Explore",
+                "ownership": {"cwd": "/tmp"},
+                "outputContract": {"schemaType": "return"},
+                "status": "running",
+                "materializedNodeIds": ["delegated-node"],
+                "createdAt": 0
+            }],
+            "createdAt": 0
+        })
+        .to_string()
+    }
+
+    /// A `plan>coordinator` execution whose Coordinator is wired
+    /// `branchMode: inherit`, so it carries `parent_job_id` pointing at the
+    /// Planner exactly as a delegated sub-task would — plus a real delegated task
+    /// under the Coordinator, so both meanings of that edge are present at once.
+    async fn seed_inherit_mode_graph(db: &LocalDb) {
+        let snapshot = snapshot_with_delegated_node();
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
+              VALUES('p','w','Project','PROJ','/tmp/repo',2,1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('parent','p',1,'Parent','active','active','none',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+        db.write(move |conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+                     VALUES('e1','r','parent','p','running',1,1,?1)",
+                    params![snapshot.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, recipe_node_id, node_name, status, current_session_id, created_at, updated_at)
+              VALUES('planner','p','parent','e1','planner-1','Planner','complete','s-planner',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, recipe_node_id, node_name, parent_job_id, status, current_session_id, created_at, updated_at)
+              VALUES('coordinator','p','parent','e1','coordinator-1','Coordinator','planner','running','s-coord',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, recipe_node_id, node_name, parent_job_id, status, current_session_id, created_at, updated_at)
+              VALUES('subtask','p','parent','e1','delegated-node','Explore','coordinator','complete','s-subtask',2,2);
+            INSERT INTO runs(id, project_id, job_id, issue_id, status, created_at, updated_at)
+              VALUES('run-coordinator','p','coordinator','parent','live',1,1);
+            INSERT INTO runs(id, project_id, job_id, issue_id, status, created_at, updated_at)
+              VALUES('run-subtask','p','subtask','parent','live',2,2);
+            ",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A coordinator wired `branchMode: inherit` owns the children it files. That
+    /// node carries `parent_job_id` to share its upstream's branch, not because
+    /// anything delegated it; treating the edge as delegation would stamp the
+    /// Planner and reproduce CAIRN-3712 on a graph shape recipes can express.
+    #[tokio::test]
+    async fn an_inherit_mode_node_owns_the_child_it_files() {
+        let db = migrated_db().await;
+        seed_inherit_mode_graph(&db).await;
+        let orch = test_orchestrator(db);
+
+        let outcome = create_issue_in_project(
+            &orch,
+            "PROJ",
+            "Child".to_string(),
+            None,
+            None,
+            None,
+            Some("cairn://p/PROJ/1".to_string()),
+            Some("run-coordinator".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            spawning_node(&orch.db.local, &outcome.issue_id)
+                .await
+                .as_deref(),
+            Some("coordinator"),
+            "an inherited branch is not a change of owner"
+        );
+    }
+
+    /// The same graph from the other side: a delegated task under that
+    /// inherit-mode coordinator is walked past, and the walk stops at the
+    /// coordinator rather than continuing up its branch-inheritance edge.
+    #[tokio::test]
+    async fn a_delegated_task_files_for_its_node_and_no_further() {
+        let db = migrated_db().await;
+        seed_inherit_mode_graph(&db).await;
+        let orch = test_orchestrator(db);
+
+        let outcome = create_issue_in_project(
+            &orch,
+            "PROJ",
+            "Child".to_string(),
+            None,
+            None,
+            None,
+            Some("cairn://p/PROJ/1".to_string()),
+            Some("run-subtask".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            spawning_node(&orch.db.local, &outcome.issue_id)
+                .await
+                .as_deref(),
+            Some("coordinator"),
+        );
+    }
+
+    /// A child issue filed by an agent records the node that filed it — walking a
+    /// delegated sub-task up to the node it is working for, since the sub-task
+    /// acts on that node's behalf and the child's attention belongs there. This
+    /// fixture carries no execution snapshot, so it also pins the undecidable
+    /// case: with nothing to distinguish the edge, the walk continues.
+    #[tokio::test]
+    async fn creating_a_child_records_the_node_that_filed_it() {
+        let db = migrated_db().await;
+        seed_jobs(&db).await;
+        db.execute_script(
+            "
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('parent', 'p', 1, 'Parent', 'active', 'active', 'none', 1, 1);
+            UPDATE projects SET next_issue_number = 2 WHERE id = 'p';
+            UPDATE jobs SET issue_id = 'parent' WHERE id IN ('coord', 'subtask');
+            ",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        let outcome = create_issue_in_project(
+            &orch,
+            "PROJ",
+            "Child".to_string(),
+            None,
+            None,
+            None,
+            Some("cairn://p/PROJ/1".to_string()),
+            Some("run-subtask".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            spawning_node(&orch.db.local, &outcome.issue_id)
+                .await
+                .as_deref(),
+            Some("coord"),
+            "a sub-task files on behalf of the node that delegated to it"
+        );
+    }
+
+    /// Nothing is recorded without both halves of the fact: a human create has no
+    /// filing node, and an unparented issue has no parent whose attention it
+    /// could belong to. Both leave the routing to the live derivation.
+    #[tokio::test]
+    async fn a_create_with_no_run_or_no_parent_records_no_spawner() {
+        let db = migrated_db().await;
+        seed_jobs(&db).await;
+        db.execute_script(
+            "
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('parent', 'p', 1, 'Parent', 'active', 'active', 'none', 1, 1);
+            UPDATE projects SET next_issue_number = 2 WHERE id = 'p';
+            UPDATE jobs SET issue_id = 'parent' WHERE id IN ('coord', 'subtask');
+            ",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        let by_human = create_issue_in_project(
+            &orch,
+            "PROJ",
+            "Human child".to_string(),
+            None,
+            None,
+            None,
+            Some("cairn://p/PROJ/1".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            spawning_node(&orch.db.local, &by_human.issue_id).await,
+            None
+        );
+
+        let unparented = create_issue_in_project(
+            &orch,
+            "PROJ",
+            "Root issue".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some("run-coord".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            spawning_node(&orch.db.local, &unparented.issue_id).await,
+            None
+        );
+    }
+
     /// A local project (no team route) still creates its issue in the PRIVATE
     /// database: with no route registered, `for_project` returns `local`, so the
     /// owning-DB routing (CAIRN-2181) is a strict no-op for local-only installs.
@@ -811,7 +1341,7 @@ mod tests {
             None,
             None,
             None,
-            IssueKind::Issue,
+            None,
         )
         .await
         .unwrap();

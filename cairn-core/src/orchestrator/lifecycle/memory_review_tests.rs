@@ -25,12 +25,12 @@ fn test_orchestrator(db: LocalDb) -> crate::orchestrator::Orchestrator {
     std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
     std::fs::write(
         config_dir.join("recipes/memory-triage.yaml"),
-        include_str!("../../../../../recipes/memory-triage.yaml"),
+        include_str!("../../../../../packs/core/recipes/memory-triage.yaml"),
     )
     .unwrap();
     std::fs::write(
         config_dir.join("agents/integrator.md"),
-        include_str!("../../../../../agents/integrator.md"),
+        include_str!("../../../../../packs/core/agents/integrator.md"),
     )
     .unwrap();
     let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());

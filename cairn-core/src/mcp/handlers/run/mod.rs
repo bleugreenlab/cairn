@@ -31,6 +31,7 @@ pub use types::{
 };
 
 use crate::mcp::vcs::{acquire_store_lock, STORE_LOCK_TIMEOUT};
+use crate::storage::RowExt;
 use commit_barrier::{run_commit_barrier, CommitBarrierOutcome};
 use std::path::Path;
 
@@ -58,6 +59,54 @@ pub(crate) fn envelope_reports_run_failure(text: &str) -> bool {
     RUN_FAILURE_OPENINGS
         .iter()
         .any(|opening| text.starts_with(opening))
+}
+
+async fn run_transcript_event_uri(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    context: &crate::mcp::handlers::RunContext,
+    transport_tool_use_id: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let tool_use_id = match transport_tool_use_id {
+        Some(id) => id.to_string(),
+        None => {
+            let turn_id =
+                super::durable_suspend::suspending_turn_id(orch, db, &context.run_id).await?;
+            match claim_batch_tool_use_id(db, &context.run_id, &turn_id, payload).await {
+                Claim::One(id) => id,
+                Claim::None | Claim::Ambiguous(_) => return None,
+            }
+        }
+    };
+    let run_id = context.run_id.clone();
+    let sequence = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT sequence, data FROM events WHERE run_id = ?1 AND event_type = 'assistant' ORDER BY sequence DESC LIMIT 8",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                let mut matched = None;
+                while let Some(row) = rows.next().await? {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.text(1)?) else { continue };
+                    let contains = value.get("toolUses").and_then(|value| value.as_array()).is_some_and(|tools| {
+                        tools.iter().any(|tool| tool.get("id").or_else(|| tool.get("toolUseId")).and_then(|value| value.as_str()) == Some(tool_use_id.as_str()))
+                    });
+                    if contains {
+                        if matched.is_some() { return Ok(None); }
+                        matched = Some(row.i64(0)? as i32);
+                    }
+                }
+                Ok(matched)
+            })
+        })
+        .await
+        .ok()
+        .flatten()?;
+    super::write::build_current_event_uri(db, &context.run_id, sequence).await
 }
 
 /// A failure of the run itself rather than of a command inside it.
@@ -1488,7 +1537,13 @@ fn build_slot_command_parts(
                     .collect::<Vec<_>>()
                     .join(" "),
             ),
-            Ok(RunSpec::McpCall(_) | RunSpec::ReplSend { .. }) | Err(_) => None,
+            Ok(
+                RunSpec::McpCall(_)
+                | RunSpec::ExecutorAction(_)
+                | RunSpec::ResponseCall { .. }
+                | RunSpec::ReplSend { .. },
+            )
+            | Err(_) => None,
         })
         .collect::<Vec<_>>()
         .join(" && ");
@@ -1649,6 +1704,13 @@ fn apply_run_item_timeouts(resolved: &mut [(String, Result<RunSpec, String>)]) {
     for (_, spec) in resolved {
         if let Ok(RunSpec::Shell { timeout, .. } | RunSpec::Script { timeout, .. }) = spec {
             *timeout = Some(clamp_run_item_timeout_ms(*timeout));
+        } else if let Ok(RunSpec::ResponseCall { timeout, .. }) = spec {
+            *timeout =
+                Some(clamp_host_item_timeout_ms(*timeout).unwrap_or(MAX_HOST_ITEM_TIMEOUT_MS));
+        } else if let Ok(RunSpec::ExecutorAction(action)) = spec {
+            action.timeout = Some(
+                clamp_host_item_timeout_ms(action.timeout).unwrap_or(MAX_HOST_ITEM_TIMEOUT_MS),
+            );
         }
     }
 }
@@ -1714,15 +1776,11 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // starts a workflow node and durably suspends the caller. A refusal placed
     // after item-specific dispatch is not fail-closed, however early it looks in
     // the executing path. Only a batch that actually carries a `commit_msg` pays
-    // the lookup, and an unresolvable run is treated as ordinary — the same
-    // shape, and the same safe direction, as the `write` verb's door.
+    // the lookup, and the gate itself is the one the `write` verb takes, so the
+    // two commit-capable verbs answer to a single predicate.
     if commit_present {
-        if let Ok((context, db)) = super::run_context::lookup_run_routed(&orch.db, request).await {
-            if let Some(refusal) =
-                crate::threads::commit_refusal_for_job(&db, &context.job_id).await
-            {
-                return run_envelope(refusal, Vec::new());
-            }
+        if let Some(refusal) = super::run_context::commit_posture_refusal(&orch.db, request).await {
+            return run_envelope(refusal, Vec::new());
         }
     }
 
@@ -1810,6 +1868,19 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         }
     } else {
         (None, None)
+    };
+    let transcript_event_uri = match (run_context.as_ref(), run_db.as_deref()) {
+        (Some(context), Some(db)) => {
+            run_transcript_event_uri(
+                orch,
+                db,
+                context,
+                request.tool_use_id.as_deref(),
+                &request.payload,
+            )
+            .await
+        }
+        _ => None,
     };
 
     let branch_target = if let Some(branch) = payload.branch.as_deref() {
@@ -1937,21 +2008,26 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     let has_process = resolved
         .iter()
         .any(|(_, spec)| matches!(spec, Ok(RunSpec::Shell { .. } | RunSpec::Script { .. })));
-    let has_mcp = resolved
+    let has_host_rpc = resolved
         .iter()
-        .any(|(_, spec)| matches!(spec, Ok(RunSpec::McpCall(_))));
+        .any(|(_, spec)| matches!(spec, Ok(RunSpec::McpCall(_) | RunSpec::ExecutorAction(_))));
+    let has_response = resolved
+        .iter()
+        .any(|(_, spec)| matches!(spec, Ok(RunSpec::ResponseCall { .. })));
     let has_repl = resolved
         .iter()
         .any(|(_, spec)| matches!(spec, Ok(RunSpec::ReplSend { .. })));
-    if usize::from(has_process) + usize::from(has_mcp) + usize::from(has_repl) > 1 {
+    if usize::from(has_process) + usize::from(has_host_rpc || has_response) + usize::from(has_repl)
+        > 1
+    {
         return run_envelope(
-            "A run batch may not mix tree-bound shell/script items with MCP gateway or REPL items. Split them into separate run calls.".to_string(),
+            "A run batch may not mix tree-bound shell/script items with host RPC or REPL items. Split them into separate run calls.".to_string(),
             Vec::new(),
         );
     }
     if branch_target.is_some() && !has_process {
         return run_envelope(
-            "The branch option applies only to tree-bound shell or script batches; MCP gateway and REPL batches run on the host.".to_string(),
+            "The branch option applies only to tree-bound shell or script batches; gateway, executor-action, and REPL batches run on the host.".to_string(),
             Vec::new(),
         );
     }
@@ -1962,7 +2038,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         && !has_process
     {
         return run_envelope(
-            "The executor option applies only to tree-bound shell or script batches; MCP gateway and REPL batches run on the host. Split the host-bound item into a run call without executor.".to_string(),
+            "The executor option applies only to tree-bound shell or script batches; gateway, executor-action, and REPL batches run on the host. An executor-action target already names its machine; split the host-bound item into a run call without executor.".to_string(),
             Vec::new(),
         );
     }
@@ -2091,7 +2167,14 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     logical_resolution
                         .as_ref()
                         .map(|resolution| resolution.rev.as_str()),
-                ),
+                )
+                .into_iter()
+                .chain(
+                    transcript_event_uri
+                        .clone()
+                        .map(|uri| ("CAIRN_TRANSCRIPT_EVENT_URI".into(), uri)),
+                )
+                .collect(),
                 priority: CellPriority::AgentInteractive,
                 // Computed once, below, and carried unchanged by every
                 // presentation. Refreshing it per attempt would make the number
@@ -2099,7 +2182,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 // the horizon exists to remove.
                 wait_horizon_unix_ms: batch_wait_horizon_unix_ms(&payload, sequential),
                 waiting_since_unix_ms: crate::fleet::unix_time_ms(),
-                timeout_ms: batch_execution_budget_ms(&resolved, sequential),
+                timeout_ms: batch_execution_budget_ms(&resolved, sequential).into(),
                 mutation_policy,
                 requesting_job_id: run_context.as_ref().map(|ctx| ctx.job_id.clone()),
                 // Placement is settled by the lease when there is one; the
@@ -2395,7 +2478,7 @@ impl BatchResidence {
         }
     }
 
-    fn note(self, selector: Option<&ExecutorSelector>, commit: Option<&str>) -> Option<String> {
+    fn note(self, selector: Option<&ExecutorSelector>, _commit: Option<&str>) -> Option<String> {
         if self != Self::Detached {
             return None;
         }
@@ -2405,11 +2488,7 @@ impl BatchResidence {
             .as_deref()
             .map(|name| format!("**{name}**"))
             .unwrap_or_else(|| format!("an executor matching **{}**", selector.describe()));
-        let commit = commit.unwrap_or("the branch head");
-        let short = &commit[..commit.len().min(7)];
-        Some(format!(
-            "Ran on {destination} in a fresh checkout at {short} — not this job's working tree, so build caches and ignored files were absent and nothing outside the published commit was kept."
-        ))
+        Some(format!("Ran on {destination}"))
     }
 }
 
@@ -3117,13 +3196,22 @@ async fn settle_routed_run_batch(
 async fn settle_run_batch(
     orch: &Orchestrator,
     s: &RunBatchSettlement,
-    outcomes: Vec<ItemOutcome>,
+    mut outcomes: Vec<ItemOutcome>,
     routed_delta: Option<Box<crate::fleet::MutationDelta>>,
     routed_tracked_modifications: Option<
         cairn_common::executor_protocol::TrackedModificationEvidence,
     >,
     publication_request: Option<&CellRequest>,
 ) -> SettledRunBatch {
+    for outcome in &mut outcomes {
+        crate::mcp::handlers::durable_images::promote_images(
+            orch,
+            &s.request,
+            &mut outcome.images,
+            &mut outcome.body,
+        )
+        .await;
+    }
     let mut result = compose_run_output(&outcomes);
 
     if s.discards_tracked_changes {
@@ -3563,7 +3651,7 @@ mod tests {
     /// pinned to a remote machine ran locally and said nothing. It now refuses,
     /// naming both machines.
     #[test]
-    fn detached_residence_note_names_the_cold_checkout() {
+    fn detached_residence_note_is_compact_and_home_is_silent() {
         let selector = ExecutorSelector {
             name: Some("bglab-ub".into()),
             ..ExecutorSelector::default()
@@ -3571,9 +3659,7 @@ mod tests {
         let note = BatchResidence::Detached
             .note(Some(&selector), Some("abcdef012345"))
             .unwrap();
-        assert!(note.contains("bglab-ub"), "{note}");
-        assert!(note.contains("abcdef0"), "{note}");
-        assert!(note.contains("fresh checkout"), "{note}");
+        assert_eq!(note, "Ran on **bglab-ub**");
         assert!(BatchResidence::Home
             .note(Some(&selector), Some("abcdef0"))
             .is_none());
@@ -3679,6 +3765,40 @@ mod tests {
         // `None` is preserved, not filled: "runs to completion" is a promise only
         // the suspendable path can keep, and these items have their own defaults.
         assert_eq!(clamp_host_item_timeout_ms(None), None);
+
+        let mut executor_action = vec![(
+            "executor action".into(),
+            Ok(RunSpec::ExecutorAction(Box::new(
+                super::types::ExecutorActionSpec {
+                    executor_name: "local".into(),
+                    action: "look".into(),
+                    args: serde_json::json!({}),
+                    timeout: Some(u32::MAX),
+                },
+            ))),
+        )];
+        apply_run_item_timeouts(&mut executor_action);
+        assert!(matches!(
+            &executor_action[0].1,
+            Ok(RunSpec::ExecutorAction(spec))
+                if spec.timeout == Some(MAX_HOST_ITEM_TIMEOUT_MS)
+        ));
+
+        let mut resolved = vec![(
+            "response".into(),
+            Ok(RunSpec::ResponseCall {
+                response_id: "test".into(),
+                project: None,
+                args: serde_json::json!({}),
+                timeout: None,
+            }),
+        )];
+        apply_run_item_timeouts(&mut resolved);
+        assert!(matches!(
+            &resolved[0].1,
+            Ok(RunSpec::ResponseCall { timeout: Some(timeout), .. })
+                if *timeout == MAX_HOST_ITEM_TIMEOUT_MS
+        ));
     }
 
     /// `CellRequest.timeout_ms` is the request's own bound. Sequential items add

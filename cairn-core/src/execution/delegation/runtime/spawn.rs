@@ -21,7 +21,7 @@ use super::common::{
     persist_call_packet, persist_task_packet, project_repo_path, select_optional_text,
     wait_for_packet_run_materialization, ParentRunContext,
 };
-use super::results::{build_task_callback_response, compute_artifact_uri};
+use super::results::{build_task_callback_response, task_artifact_uri};
 use super::resume::{
     prepare_parent_for_delegated_wait, schedule_deferred_parent_suspend_for_delegated_wait,
 };
@@ -558,7 +558,7 @@ async fn background_call_response_with_memos(
         lines.push(format!("{CALL_MEMO_RESULT_PREFIX} {encoded}"));
     }
     for task in materialized {
-        let uri = compute_artifact_uri(&db, parent_ctx, &task.job_id).await;
+        let uri = task_artifact_uri(&db, &task.job_id).await;
         lines.push(format!(
             "- {} ({})",
             uri.unwrap_or_else(|| "<artifact pending>".to_string()),
@@ -621,7 +621,7 @@ async fn background_task_response(
     let mut lines = Vec::with_capacity(materialized.len());
     let mut last_uri = None;
     for task in materialized {
-        let uri = compute_artifact_uri(&db, parent_ctx, &task.job_id).await;
+        let uri = task_artifact_uri(&db, &task.job_id).await;
         if uri.is_some() {
             last_uri = uri.clone();
         }
@@ -682,7 +682,7 @@ async fn wait_for_tasks_completion(
         };
         match tokio::time::timeout(INLINE_TASK_WAIT_BUDGET, completion_wait).await {
             Ok(Ok(())) => {}
-            _ => return suspend_parent_for_tasks(orch, parent_ctx, &materialized),
+            _ => return suspend_parent_for_tasks(orch, parent_ctx, &materialized).await,
         }
     }
 
@@ -692,7 +692,7 @@ async fn wait_for_tasks_completion(
 /// Yield the parent turn once and schedule the durable suspend for a task batch.
 /// The real combined results are delivered on resume via
 /// `resume_suspended_parent_after_task_completion`.
-fn suspend_parent_for_tasks(
+async fn suspend_parent_for_tasks(
     orch: &Orchestrator,
     parent_ctx: &ParentRunContext,
     materialized: &[MaterializedTask],
@@ -712,10 +712,30 @@ fn suspend_parent_for_tasks(
             first.job_id.clone(),
         );
     }
-    let summary = if materialized.len() == 1 {
-        format!("Delegated task '{}'", materialized[0].description)
+    // Name the address each task was actually minted at. A task's slug is
+    // derived from its description rather than being the description
+    // (`derive_unique_task_slug` takes the first two words), so a caller holding
+    // only what it wrote cannot predict it — and could not address the task it
+    // had just spawned. The marker stays last: it is the hand-off the agent and
+    // the transcript both key on.
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
+    let mut homes = Vec::with_capacity(materialized.len());
+    for task in materialized {
+        if let Ok(Some(home)) = crate::jobs::queries::home_uri_for_job(&db, &task.job_id).await {
+            homes.push(home);
+        }
+    }
+    let at = if homes.is_empty() {
+        String::new()
     } else {
-        format!("{} delegated tasks", materialized.len())
+        format!(" ({})", homes.join(", "))
+    };
+    let summary = if materialized.len() == 1 {
+        format!("Delegated task '{}'{at}", materialized[0].description)
+    } else {
+        format!("{} delegated tasks{at}", materialized.len())
     };
     CallbackResponse {
         result: format!("{summary} {DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX}"),
@@ -888,7 +908,6 @@ async fn build_tasks_response(
         let task = &materialized[0];
         return build_task_callback_response(
             &db,
-            parent_ctx,
             &task.run_id,
             &task.job_id,
             &task.agent_config,
@@ -902,7 +921,6 @@ async fn build_tasks_response(
     for (index, task) in materialized.iter().enumerate() {
         let response = build_task_callback_response(
             &db,
-            parent_ctx,
             &task.run_id,
             &task.job_id,
             &task.agent_config,

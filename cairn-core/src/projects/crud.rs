@@ -25,44 +25,84 @@ pub async fn create(
             let project_dir = base.join(input.key.to_lowercase());
             std::fs::create_dir_all(&project_dir)?;
 
-            if !project_dir.join(".git").exists() {
-                run_git(&["init"], &project_dir)?;
-                run_git(
-                    &["commit", "--allow-empty", "-m", "Initial commit"],
-                    &project_dir,
-                )?;
-            }
-
             input.repo_path = project_dir.to_string_lossy().to_string();
         }
     }
 
-    let mut db_project = create_db(db, clock, &input).await?;
+    let detected_branch = if input.repo_path.is_empty() {
+        None
+    } else {
+        let repo_path = Path::new(&input.repo_path);
+        if repo_path.exists() {
+            if repo_path.join(".git").exists() {
+                detect_default_branch(repo_path)
+            } else {
+                Some("main".to_string())
+            }
+        } else {
+            None
+        }
+    };
+
+    // Establish that the row can be inserted before mutating a user-selected
+    // folder. The detected branch is part of that same insert, so creation
+    // cannot fail later with a durable row left behind.
+    let db_project = create_db_with_default_branch(
+        db,
+        clock,
+        &input,
+        detected_branch.as_deref().unwrap_or("main"),
+    )
+    .await?;
 
     if !input.repo_path.is_empty() {
         let repo_path = Path::new(&input.repo_path);
         if repo_path.exists() {
-            // Persist the repository's actual default branch so worktrees are
-            // based on the correct ref. Without this every project defaults to
-            // "main", which fails for repos whose trunk is e.g. "staging".
-            if let Some(branch) = detect_default_branch(repo_path) {
-                match set_default_branch_db(db, &db_project.id, &branch).await {
-                    Ok(()) => db_project.default_branch = Some(branch),
-                    Err(e) => log::warn!("Failed to persist detected default branch: {}", e),
+            if let Err(error) = ensure_project_repository(repo_path) {
+                if let Err(rollback_error) = delete_db(db, &db_project.id).await {
+                    return Err(CairnError::Internal(format!(
+                        "{error}; additionally failed to roll back project row: {rollback_error}"
+                    )));
                 }
-            }
-            if let Err(e) =
-                crate::config::project_settings::create_default_project_config(repo_path)
-            {
-                log::warn!("Failed to create project config: {}", e);
-            }
-            if let Err(e) = ensure_initial_commit(repo_path) {
-                log::warn!("Failed to ensure initial project commit: {}", e);
+                return Err(error);
             }
         }
     }
 
     Ok(db_project)
+}
+
+/// Repair project rows created before repository bootstrapping was enforced.
+pub(crate) async fn reconcile_project_repositories(db: &LocalDb) {
+    let projects = match list_db(db).await {
+        Ok(projects) => projects,
+        Err(e) => {
+            log::warn!("repository repair: failed to load projects: {e}");
+            return;
+        }
+    };
+
+    for project in projects {
+        if project.repo_path.is_empty() || project.is_workspace != 0 {
+            continue;
+        }
+        let repo_path = Path::new(&project.repo_path);
+        if !repo_path.exists() || repo_path.join(".git").exists() {
+            continue;
+        }
+        match ensure_project_repository(repo_path) {
+            Ok(()) => log::info!(
+                "repository repair: initialized project {} at {}",
+                project.id,
+                repo_path.display()
+            ),
+            Err(e) => log::warn!(
+                "repository repair: failed to initialize project {} at {}: {e}",
+                project.id,
+                repo_path.display()
+            ),
+        }
+    }
 }
 
 /// The single repository answer for project-scoped Git and GitHub operations.
@@ -142,6 +182,19 @@ fn validate_project_checkout(path: &Path, config_dir: &Path) -> Result<(), Cairn
         )));
     }
     Ok(())
+}
+
+/// Make the selected folder a self-contained project repository with a usable HEAD.
+fn ensure_project_repository(repo_path: &Path) -> Result<(), CairnError> {
+    if !repo_path.join(".git").exists() {
+        // Inspect the selected root rather than rev-parse: a folder nested in a
+        // parent repository is still its own Cairn project boundary.
+        run_git(&["init", "-b", "main"], repo_path)?;
+    }
+
+    crate::config::project_settings::create_default_project_config(repo_path)
+        .map_err(CairnError::Internal)?;
+    ensure_initial_commit(repo_path)
 }
 
 /// Ensure a local project repository has at least one commit so git worktrees can branch from it.
@@ -302,6 +355,15 @@ pub async fn create_db(
     clock: &dyn Clock,
     input: &CreateProject,
 ) -> Result<DbProject, CairnError> {
+    create_db_with_default_branch(db, clock, input, "main").await
+}
+
+async fn create_db_with_default_branch(
+    db: &LocalDb,
+    clock: &dyn Clock,
+    input: &CreateProject,
+    default_branch: &str,
+) -> Result<DbProject, CairnError> {
     let now = clock.now() as i32;
     let id = input.id.clone().unwrap_or_else(|| {
         let scope = match &input.team_id {
@@ -317,6 +379,7 @@ pub async fn create_db(
     // one-repository-per-project creation flow initially assigns the project UUID.
     let repository_id = id.clone();
     let team_id = input.team_id.clone();
+    let default_branch = default_branch.to_string();
 
     db.write(|conn| {
         let id = id.clone();
@@ -325,6 +388,7 @@ pub async fn create_db(
         let repo_path = repo_path.clone();
         let team_id = team_id.clone();
         let repository_id = repository_id.clone();
+        let default_branch = default_branch.clone();
         Box::pin(async move {
             match team_id {
                 // Team replica: `projects` re-roots at `team_id` (NOT NULL FK to
@@ -336,7 +400,7 @@ pub async fn create_db(
                             default_branch, next_issue_number, created_at, updated_at,
                             is_workspace
                          )
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 1, 'main', 1, ?7, ?8, 0)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 1, ?7, 1, ?8, ?9, 0)",
                         (
                             id.as_str(),
                             team_id.as_str(),
@@ -344,6 +408,7 @@ pub async fn create_db(
                             key.as_str(),
                             repo_path.as_str(),
                             repository_id.as_str(),
+                            default_branch.as_str(),
                             now,
                             now,
                         ),
@@ -358,13 +423,14 @@ pub async fn create_db(
                             default_branch, next_issue_number, created_at, updated_at,
                             is_workspace
                          )
-                         VALUES (?1, 'default', ?2, ?3, ?4, ?5, '', 1, 'main', 1, ?6, ?7, 0)",
+                         VALUES (?1, 'default', ?2, ?3, ?4, ?5, '', 1, ?6, 1, ?7, ?8, 0)",
                         (
                             id.as_str(),
                             name.as_str(),
                             key.as_str(),
                             repo_path.as_str(),
                             repository_id.as_str(),
+                            default_branch.as_str(),
                             now,
                             now,
                         ),
@@ -976,6 +1042,298 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn create_non_git_folder_commits_contents_and_config_on_main() {
+        let db = migrated_db().await;
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join("notes.txt"), "ship me\n").unwrap();
+
+        let project = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("plain-folder".to_string()),
+                name: "Plain Folder".to_string(),
+                key: "PLAIN".to_string(),
+                repo_path: repo.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(repo.path().join(".git").exists());
+        assert_eq!(
+            git_stdout(repo.path(), &["branch", "--show-current"]),
+            "main"
+        );
+        let committed = git_stdout(repo.path(), &["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(committed.lines().any(|path| path == "notes.txt"));
+        assert!(committed.lines().any(|path| path == ".cairn/config.yaml"));
+        assert_eq!(project.default_branch.as_deref(), Some("main"));
+        assert_eq!(
+            get_db(&db, "plain-folder")
+                .await
+                .unwrap()
+                .unwrap()
+                .default_branch
+                .as_deref(),
+            Some("main")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_healthy_repository_preserves_head_and_branch() {
+        let db = migrated_db().await;
+        let repo = tempdir().unwrap();
+        run_git(&["init", "-q", "-b", "trunk"], repo.path()).unwrap();
+        crate::config::project_settings::create_default_project_config(repo.path()).unwrap();
+        std::fs::write(repo.path().join("file.txt"), "existing\n").unwrap();
+        run_git(&["add", "-A"], repo.path()).unwrap();
+        run_git(
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@local.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "existing",
+            ],
+            repo.path(),
+        )
+        .unwrap();
+        let head_before = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+
+        let project = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("healthy".to_string()),
+                name: "Healthy".to_string(),
+                key: "HEALTHY".to_string(),
+                repo_path: repo.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(project.default_branch.as_deref(), Some("trunk"));
+    }
+
+    #[tokio::test]
+    async fn create_nested_folder_initializes_repository_at_selected_root() {
+        let db = migrated_db().await;
+        let parent = tempdir().unwrap();
+        run_git(&["init", "-q", "-b", "parent"], parent.path()).unwrap();
+        let nested = parent.path().join("selected");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("nested.txt"), "nested\n").unwrap();
+
+        create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("nested".to_string()),
+                name: "Nested".to_string(),
+                key: "NESTED".to_string(),
+                repo_path: nested.to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(nested.join(".git").exists());
+        assert_eq!(git_stdout(&nested, &["branch", "--show-current"]), "main");
+        assert!(
+            git_stdout(&nested, &["ls-tree", "-r", "--name-only", "HEAD"])
+                .lines()
+                .any(|path| path == "nested.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_repository_failure_does_not_insert_project_row() {
+        let db = migrated_db().await;
+        let root = tempdir().unwrap();
+        let not_a_directory = root.path().join("file");
+        std::fs::write(&not_a_directory, "not a directory").unwrap();
+
+        let result = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("broken".to_string()),
+                name: "Broken".to_string(),
+                key: "BROKEN".to_string(),
+                repo_path: not_a_directory.to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(get_db(&db, "broken").await.unwrap().is_none());
+    }
+
+    async fn insert_duplicate_project(db: &LocalDb, id: &str) {
+        create_db(
+            db,
+            &FixedClock,
+            &CreateProject {
+                id: Some(id.to_string()),
+                name: "Existing".to_string(),
+                key: format!("{id}-existing"),
+                repo_path: String::new(),
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_create_does_not_mutate_plain_folder() {
+        let db = migrated_db().await;
+        insert_duplicate_project(&db, "duplicate-plain").await;
+        let folder = tempdir().unwrap();
+        std::fs::write(folder.path().join("notes.txt"), "unchanged\n").unwrap();
+
+        let result = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("duplicate-plain".to_string()),
+                name: "Duplicate".to_string(),
+                key: "DUPLICATE".to_string(),
+                repo_path: folder.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!folder.path().join(".git").exists());
+        assert!(!folder.path().join(".cairn").exists());
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join("notes.txt")).unwrap(),
+            "unchanged\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_create_does_not_mutate_existing_repository() {
+        let db = migrated_db().await;
+        insert_duplicate_project(&db, "duplicate-repo").await;
+        let repo = tempdir().unwrap();
+        run_git(&["init", "-q", "-b", "trunk"], repo.path()).unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "unchanged\n").unwrap();
+        run_git(&["add", "-A"], repo.path()).unwrap();
+        run_git(
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@local.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "existing",
+            ],
+            repo.path(),
+        )
+        .unwrap();
+        let head_before = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+
+        let result = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("duplicate-repo".to_string()),
+                name: "Duplicate".to_string(),
+                key: "DUPREPO".to_string(),
+                repo_path: repo.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head_before);
+        assert!(git_stdout(repo.path(), &["status", "--porcelain"]).is_empty());
+        assert!(!repo.path().join(".cairn").exists());
+    }
+
+    #[tokio::test]
+    async fn reconcile_project_repositories_repairs_existing_plain_folder() {
+        let db = migrated_db().await;
+        let repo = tempdir().unwrap();
+        std::fs::write(repo.path().join("legacy.txt"), "legacy\n").unwrap();
+        create_db(
+            &db,
+            &FixedClock,
+            &CreateProject {
+                id: Some("legacy".to_string()),
+                name: "Legacy".to_string(),
+                key: "LEGACY".to_string(),
+                repo_path: repo.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        reconcile_project_repositories(&db).await;
+        let head = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        reconcile_project_repositories(&db).await;
+
+        assert!(repo.path().join(".git").exists());
+        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head);
+        assert!(
+            git_stdout(repo.path(), &["ls-tree", "-r", "--name-only", "HEAD"])
+                .lines()
+                .any(|path| path == "legacy.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_project_repositories_skips_workspace_project() {
+        let db = migrated_db().await;
+        let workspace = tempdir().unwrap();
+        seed_workspace_project_db(&db, &FixedClock, workspace.path())
+            .await
+            .unwrap();
+
+        reconcile_project_repositories(&db).await;
+
+        assert!(!workspace.path().join(".git").exists());
     }
 
     #[test]

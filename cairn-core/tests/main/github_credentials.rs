@@ -70,18 +70,16 @@ async fn github_credentials_use_owner_installation_before_default() {
         Some(200)
     );
     assert_eq!(
-        credentials::get_credentials_for_owner(&db, "bleugreenlab")
+        credentials::installation_identity(&db, "bleugreenlab")
             .await
-            .unwrap()
-            .installation_id,
-        200
+            .unwrap(),
+        (42, 200)
     );
     assert_eq!(
-        credentials::get_credentials_for_owner(&db, "fallback-owner")
+        credentials::installation_identity(&db, "fallback-owner")
             .await
-            .unwrap()
-            .installation_id,
-        100
+            .unwrap(),
+        (42, 100)
     );
 }
 
@@ -103,7 +101,7 @@ async fn github_credentials_report_missing_required_fields() {
     .await
     .unwrap();
 
-    let err = credentials::get_credentials_for_owner(&db, "owner")
+    let err = credentials::installation_identity(&db, "owner")
         .await
         .unwrap_err();
     assert!(err.contains("GitHub App ID not configured"));

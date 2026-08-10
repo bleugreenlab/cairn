@@ -458,6 +458,7 @@ mod tests {
             timed_out: false,
             metadata: CellExecutionMeta {
                 warmth: None,
+                load_context: None,
                 executor_id: "e".into(),
                 executor_device_id: "d".into(),
                 executor_connection_generation: 1,
@@ -471,6 +472,10 @@ mod tests {
                 disk_delta_bytes: None,
                 measurement_quality: None,
                 environment_fingerprint: String::new(),
+                verdict_platform: None,
+                verdict_arch: None,
+                toolchain_fingerprint: None,
+                verdict_environment_hash: None,
             },
             mutation_delta: None,
             sandbox_denials: vec![],

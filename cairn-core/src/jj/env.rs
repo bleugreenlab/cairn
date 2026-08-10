@@ -263,7 +263,16 @@ impl JjEnv {
     }
 
     /// Run a jj command, returning raw stdout bytes or a contextual error.
-    fn run_bytes(&self, cwd: &Path, args: &[&str], ctx: &str) -> Result<Vec<u8>, String> {
+    ///
+    /// The untrimmed form, exposed for `jj file show`: file content's leading
+    /// and trailing bytes are part of the file, and a merge that quietly rewrote
+    /// them would be worse than no merge at all.
+    pub(crate) fn run_bytes(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        ctx: &str,
+    ) -> Result<Vec<u8>, String> {
         self.run_bytes_with_timeout(cwd, args, ctx, JJ_DEFAULT_TIMEOUT)
     }
 

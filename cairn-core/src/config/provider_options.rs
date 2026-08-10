@@ -3,7 +3,7 @@
 //! Web fetch ([`super::web_fetch`]), web search ([`super::web_search`]), and PDF
 //! ([`super::pdf`]) all present per-provider options to the settings UI through
 //! one model: a [`ProviderOption`] carries a key, a label, and an
-//! [`OptionControl`] (select / number / bool) that drives how the UI renders and
+//! [`OptionControl`] (text / select / number / bool) that drives how the UI renders and
 //! how [`validate_options`] checks a submitted value. Keeping this in one module
 //! means the three services validate and render options identically, and the
 //! frontend mirrors a single `OptionControl` type.
@@ -24,6 +24,10 @@ pub struct Choice {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum OptionControl {
+    Text {
+        default: String,
+        placeholder: String,
+    },
     Select {
         choices: Vec<Choice>,
         default: String,
@@ -48,6 +52,18 @@ pub struct ProviderOption {
 }
 
 impl ProviderOption {
+    /// A free-text option.
+    pub(crate) fn text(key: &str, label: &str, default: &str, placeholder: &str) -> Self {
+        ProviderOption {
+            key: key.to_string(),
+            label: label.to_string(),
+            control: OptionControl::Text {
+                default: default.to_string(),
+                placeholder: placeholder.to_string(),
+            },
+        }
+    }
+
     /// A single-choice dropdown option.
     pub(crate) fn select(key: &str, label: &str, choices: &[(&str, &str)], default: &str) -> Self {
         ProviderOption {
@@ -100,6 +116,16 @@ pub(crate) fn validate_options(
             .find(|o| &o.key == key)
             .ok_or_else(|| format!("Unknown option `{key}` for {context}"))?;
         match &opt.control {
+            OptionControl::Text { .. } => {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| format!("Option `{key}` must be a string"))?;
+                if text != text.trim() {
+                    return Err(format!(
+                        "Option `{key}` must not have leading or trailing whitespace"
+                    ));
+                }
+            }
             OptionControl::Select { choices, .. } => {
                 let s = value
                     .as_str()
@@ -147,6 +173,7 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_and_bad_values() {
         let descriptors = vec![
+            ProviderOption::text("account", "Account", "", "Account ID"),
             ProviderOption::select("mode", "Mode", &[("a", "A"), ("b", "B")], "a"),
             ProviderOption::number("count", "Count", 1.0, 10.0, 5.0),
             ProviderOption::bool("flag", "Flag", true),
@@ -155,8 +182,15 @@ mod tests {
         assert!(validate_options(&descriptors, &opts(&[("mode", "c".into())]), "x").is_err());
         assert!(validate_options(&descriptors, &opts(&[("count", 99.into())]), "x").is_err());
         assert!(validate_options(&descriptors, &opts(&[("flag", "yes".into())]), "x").is_err());
+        assert!(validate_options(&descriptors, &opts(&[("account", 1.into())]), "x").is_err());
+        assert!(
+            validate_options(&descriptors, &opts(&[("account", " padded ".into())]), "x").is_err()
+        );
         assert!(validate_options(&descriptors, &opts(&[("mode", "b".into())]), "x").is_ok());
         assert!(validate_options(&descriptors, &opts(&[("count", 7.into())]), "x").is_ok());
         assert!(validate_options(&descriptors, &opts(&[("flag", true.into())]), "x").is_ok());
+        assert!(
+            validate_options(&descriptors, &opts(&[("account", "abc123".into())]), "x").is_ok()
+        );
     }
 }

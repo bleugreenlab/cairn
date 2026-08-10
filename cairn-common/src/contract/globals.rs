@@ -22,6 +22,17 @@ pub(crate) const DB_CONTRACT: ResourceContract =
         mutations: NO_MUTATIONS,
     };
 
+pub(crate) const EXECUTOR_ACTION_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ExecutorAction,
+    uri_template: "cairn://executors/{name}/{action}",
+    name: "Executor action",
+    description: "One machine-local action from an executor's cached tool catalog. Read the URI for its description and input schema; invoke it through run with payload.args_json containing an object of named arguments.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const DEV_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Dev,
@@ -82,6 +93,49 @@ pub(crate) const LOGS_CONTRACT: ResourceContract =
         mutations: NO_MUTATIONS,
     };
 
+const GRANT_REVOKE: KeySpec = KeySpec::new(
+    "revoke",
+    KeyType::Bool,
+    "must be true; takes effect on the next authorization check",
+);
+
+const GRANT_REVOKED_BY: KeySpec = KeySpec::new(
+    "revokedBy",
+    KeyType::Str,
+    "who revoked it, recorded on the grant",
+);
+
+pub(crate) const GRANTS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Grants,
+    uri_template: "cairn://grants",
+    name: "Authority grants",
+    description: "Every journaled authority grant in this workspace: the normalized scope it covers (place plus action, e.g. workspace/default/tool/mcp/linear:write), its constraints, who it was issued to, its lifetime and status, and where it came from. A grant is what an operator's approval of a named authority boundary produces — installing or reconfiguring a workspace MCP server, or writing a capability-bearing workspace settings section. Ordinary project work needs no grant and appears nowhere here. Read cairn://grants/<id> for one grant and every decision that cited it; ?view=decisions lists the recent authorization journal instead of the grants, and ?view=leases lists the credential leases currently out — what a grant authorized, actually in someone's hands, with the destination it is bound to and when it expires. This is authorization, not containment: the logical namespace fence still owns host-path and sandbox crossings, and no grant here relaxes one.",
+    read_projections: &[ProjectionSpec {
+        key: "view",
+        values: "grants (default) | decisions — the authorization journal | leases — live credential leases",
+    }],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const GRANT_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Grant,
+    uri_template: "cairn://grants/{id}",
+    name: "Authority grant",
+    description: "One journaled authority grant: its normalized scope, typed constraints, principal, audience, lifetime and status, provenance, and every authorization decision that cited it. Patch with revoke:true to revoke it; revocation is recorded with the revoker and takes effect on the very next authorization check, so a standing grant stops authorizing immediately rather than at the end of some window. A grant is never deleted — the journal that cites it has to stay readable.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[GRANT_REVOKE],
+        optional: &[GRANT_REVOKED_BY],
+        label: "revoke a grant",
+        example: r#"write({changes:[{target:"cairn://grants/GRANT_ID",mode:"patch",payload:{revoke:true}}]})"#,
+    }],
+};
+
 pub(crate) const EXECUTORS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Executors,
@@ -116,8 +170,11 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
         kind: ResourceKind::Executor,
         uri_template: "cairn://executors/{name}",
         name: "Executor",
-        description: "One enrolled machine in full: identity and platform, link/build/protocol state, advertised toolchains, the placement telemetry it last measured (each reading with its own collection time, or a named gap where there is none), admission and queue state, and the cells and work resident on it. This is what to read before deciding a batch belongs somewhere specific, and what makes a placement refusal legible afterwards. write patches this machine: newName moves its public address (configuration, enrollment claim, and supervision together), runtimePolicy and draining are live generation-fenced controls that need the expectedGeneration you read here. Draining is what disabling a machine means — it refuses new admissions and leaves resident work alone. delete removes the machine and revokes its enrollment; it is refused while any work or residency remains, so drain first and remove once the counts reach zero. A machine that is enrolled but not attached holds nothing, so its removal completes from registry state even when its host cannot be reached, and says so.",
-        read_projections: NO_PROJECTIONS,
+        description: "Compact operational status for one enrolled machine: identity and platform, link/build/protocol state, timestamped placement telemetry, admission and queue state, and occupancy. Placement history is drillable rather than inline: ?view=placements lists informative decisions and collapses routine forced placements; ?view=placement&request=<request-id> renders one complete decision including every passed-over candidate prediction. write patches this machine: newName moves its public address (configuration, enrollment claim, and supervision together), runtimePolicy and draining are live generation-fenced controls that need the expectedGeneration you read here. Draining is what disabling a machine means — it refuses new admissions and leaves resident work alone. delete removes the machine and revokes its enrollment; it is refused while any work or residency remains, so drain first and remove once the counts reach zero. A machine that is enrolled but not attached holds nothing, so its removal completes from registry state even when its host cannot be reached, and says so.",
+        read_projections: &[
+            ProjectionSpec { key: "view", values: "placements (compact decision list) | placement (one full decision; requires request)" },
+            ProjectionSpec { key: "request", values: "request id from view=placements; valid with view=placement" },
+        ],
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[
@@ -128,6 +185,7 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
                     EXECUTOR_NEW_NAME,
                     EXECUTOR_RUNTIME_POLICY,
                     EXECUTOR_DRAINING,
+                    EXECUTOR_DESKTOP_AUTOMATION,
                     EXECUTOR_EXPECTED_GENERATION,
                 ],
                 label: "configure an enrolled machine",

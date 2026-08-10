@@ -412,7 +412,12 @@ where
             .block_on(future)
     })
     .join()
-    .map_err(|_| "Query database task panicked".to_string())?
+    .map_err(|payload| {
+        format!(
+            "Query database task panicked: {}",
+            crate::storage::panic_message(&*payload)
+        )
+    })?
 }
 
 async fn load_jobs(db: &LocalDb, column: &'static str, value: &str) -> Result<Vec<DbJob>, String> {

@@ -7,7 +7,7 @@
 //! `execution::advancement::recompute`); these two functions are the upper
 //! projections that slot above it.
 
-use crate::models::{IssueAttention, IssueKind, IssueProgress};
+use crate::models::{IssueAttention, IssueProgress};
 use crate::storage::{DbError, DbResult, RowExt};
 use cairn_db::turso::params;
 
@@ -85,6 +85,74 @@ pub(crate) async fn recompute_execution_status_conn(
     Ok(())
 }
 
+pub async fn recompute_job_owner_attention_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    issue_id: Option<&str>,
+) -> DbResult<()> {
+    let mut rows = conn
+        .query("SELECT thread_id FROM jobs WHERE id = ?1", (job_id,))
+        .await?;
+    if let Some(thread_id) = rows
+        .next()
+        .await?
+        .map(|row| row.opt_text(0))
+        .transpose()?
+        .flatten()
+    {
+        recompute_thread_attention_conn(conn, &thread_id).await
+    } else if let Some(issue_id) = issue_id {
+        recompute_issue_status_conn(conn, issue_id).await
+    } else {
+        Ok(())
+    }
+}
+
+/// Project human attention for a first-class thread. Rest is silent; only a
+/// pending question, permission request, or approval asks for attention.
+pub async fn recompute_thread_attention_conn(
+    conn: &cairn_db::turso::Connection,
+    thread_id: &str,
+) -> DbResult<()> {
+    let attention = if count(
+        conn,
+        "SELECT COUNT(*) FROM prompts p JOIN runs r ON p.run_id = r.id JOIN jobs j ON r.job_id = j.id WHERE j.thread_id = ?1 AND p.response IS NULL",
+        thread_id,
+    )
+    .await? > 0
+    {
+        IssueAttention::NeedsInput
+    } else if count(
+        conn,
+        "SELECT COUNT(*) FROM permission_requests pr JOIN runs r ON pr.run_id = r.id JOIN jobs j ON r.job_id = j.id WHERE j.thread_id = ?1 AND pr.status = 'pending'",
+        thread_id,
+    )
+    .await? > 0
+    {
+        IssueAttention::NeedsAuthorization
+    } else if count(
+        conn,
+        "SELECT COUNT(*) FROM jobs WHERE thread_id = ?1 AND status = 'blocked'",
+        thread_id,
+    )
+    .await? > 0
+    {
+        IssueAttention::NeedsApproval
+    } else {
+        IssueAttention::None
+    };
+    conn.execute(
+        "UPDATE threads SET attention = ?1, updated_at = ?2 WHERE id = ?3",
+        params![
+            attention.to_string(),
+            chrono::Utc::now().timestamp(),
+            thread_id
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn recompute_issue_status_conn(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
@@ -149,20 +217,13 @@ async fn issue_progress_attention(
 ) -> DbResult<Option<(IssueProgress, IssueAttention)>> {
     let mut issue_rows = conn
         .query(
-            "SELECT merged_at, closed_at, kind FROM issues WHERE id = ?1",
+            "SELECT merged_at, closed_at FROM issues WHERE id = ?1",
             (issue_id,),
         )
         .await?;
     let Some(issue_row) = issue_rows.next().await? else {
         return Ok(None);
     };
-
-    // An unparseable kind reads as the default (`issue`), the same answer the
-    // column default gives a row written before the discriminator existed.
-    let kind = issue_row
-        .opt_text(2)?
-        .and_then(|kind| kind.parse::<IssueKind>().ok())
-        .unwrap_or_default();
 
     let progress = if issue_row.opt_i64(0)?.is_some() {
         IssueProgress::Merged
@@ -234,8 +295,7 @@ async fn issue_progress_attention(
         > 0
     {
         IssueAttention::NeedsApproval
-    } else if kind.idle_session_needs_attention()
-        && issue_count(
+    } else if issue_count(
             conn,
             issue_id,
             // A long-running agent node resting Idle keeps the issue in
@@ -243,15 +303,10 @@ async fn issue_progress_attention(
             // the human-decision attentions so a real prompt/permission/approval
             // wins.
             //
-            // The kind gate short-circuits the query for a thread: rest is a
-            // thread's normal state rather than stalled work, so a resting
-            // thread projects `None` and reads `active`. Only this resting arm
-            // is gated — the human-decision arms above are the same channel for
-            // both kinds.
             "SELECT COUNT(*) FROM jobs WHERE issue_id = ?1 AND status = 'idle'",
         )
         .await?
-            > 0
+        > 0
     {
         IssueAttention::Idle
     } else {
@@ -345,20 +400,16 @@ mod tests {
         );
     }
 
-    /// Seed a project plus one row in `issues` of `kind`, carrying a running
-    /// execution and a single job in `job_status`.
-    ///
-    /// A thread does run branchless executions, but driving one to rest would
-    /// mean running an agent, so the resting session is fixtured directly.
-    async fn seed_issue_with_job(db: &LocalDb, kind: &str, job_status: &str) {
+    /// Seed a project plus an issue carrying a running execution and one job.
+    async fn seed_issue_with_job(db: &LocalDb, job_status: &str) {
         db.execute_script(&format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at)
               VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
               VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
-            INSERT INTO issues(id, project_id, number, title, status, progress, attention, kind, created_at, updated_at)
-              VALUES('i', 'p', 1, 'Issue', 'active', 'active', 'none', '{kind}', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('i', 'p', 1, 'Issue', 'active', 'active', 'none', 1, 1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
               VALUES('e', 'recipe', 'i', 'p', 'running', 1, 1);
             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
@@ -380,7 +431,7 @@ mod tests {
         // A long-running coordinator resting Idle keeps its issue in `waiting`
         // with the dedicated `idle` attention — non-terminal, resumable.
         let db = migrated_db().await;
-        seed_issue_with_job(&db, "issue", "idle").await;
+        seed_issue_with_job(&db, "idle").await;
 
         recompute(&db).await;
 
@@ -391,64 +442,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_session_leaves_a_thread_at_rest_rather_than_waiting() {
-        // Rest is a thread's normal state, not stalled work asking for eyes: the
-        // same idle session that holds an issue in `waiting` leaves a thread
-        // reading `active` with no attention, so it never ranks among
-        // attention-needing work.
-        let db = migrated_db().await;
-        seed_issue_with_job(&db, "thread", "idle").await;
-
-        recompute(&db).await;
-
-        assert_eq!(
-            issue_status_attention(&db).await,
-            ("active".to_string(), "none".to_string())
-        );
-    }
-
-    #[tokio::test]
     async fn a_thread_needing_a_human_decision_surfaces_like_any_issue() {
         // Only the resting presentation is gated. A blocked job is a pending
         // human decision, and it reaches the same attention on a thread as on an
         // issue — one channel, not a thread-specific one.
-        for kind in ["issue", "thread"] {
+        {
             let db = migrated_db().await;
-            seed_issue_with_job(&db, kind, "blocked").await;
+            seed_issue_with_job(&db, "blocked").await;
 
             recompute(&db).await;
 
             assert_eq!(
                 issue_status_attention(&db).await,
                 ("waiting".to_string(), "needs_approval".to_string()),
-                "{kind} with a blocked job must need approval"
+                "a blocked issue job must need approval"
             );
         }
     }
 
     #[tokio::test]
-    async fn an_unanswered_question_outranks_rest_on_a_thread() {
-        // A resting thread that has asked something is not at rest for the
-        // reader's purposes: the human-decision attention wins over the idle
-        // session exactly as it does on an issue.
+    async fn idle_thread_is_silent_and_questions_surface() {
         let db = migrated_db().await;
-        seed_issue_with_job(&db, "thread", "idle").await;
         db.execute_script(
-            "
-            INSERT INTO runs(id, job_id, issue_id, project_id, status, created_at, updated_at)
-              VALUES('r', 'j', 'i', 'p', 'live', 1, 1);
-            INSERT INTO prompts(id, run_id, questions, response, created_at)
-              VALUES('q', 'r', '[]', NULL, 1);
-            ",
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','PROJ','/tmp/p',1,1);
+             INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('th','p','topic','active','none',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES('j','th','p','idle','thread','thread',1,1);
+             INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at) VALUES('r','j','p','live',1,1);"
+        ).await.unwrap();
+        db.write(|conn| Box::pin(async move { recompute_thread_attention_conn(conn, "th").await }))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.query_opt_text("SELECT attention FROM threads WHERE id='th'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("none")
+        );
+        db.execute(
+            "INSERT INTO prompts(id,run_id,questions,created_at) VALUES('q','r','[]',1)",
+            (),
         )
         .await
         .unwrap();
-
-        recompute(&db).await;
-
+        db.write(|conn| Box::pin(async move { recompute_thread_attention_conn(conn, "th").await }))
+            .await
+            .unwrap();
         assert_eq!(
-            issue_status_attention(&db).await,
-            ("waiting".to_string(), "needs_input".to_string())
+            db.query_opt_text("SELECT attention FROM threads WHERE id='th'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("needs_input")
         );
     }
 

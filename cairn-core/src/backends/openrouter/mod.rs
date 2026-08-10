@@ -19,8 +19,9 @@ pub use usage::collect_openrouter_usage_snapshot;
 
 use crate::agent_process::process::BackendStdin;
 use crate::backends::{
-    AgentBackend, DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor,
-    ProviderOptionKey, ResolvedTools, SessionConfig,
+    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionRole,
+    CompletionShape, CompletionTokens, DiscoveredModel, OptionChoice, OptionKind,
+    ProviderOptionDescriptor, ProviderOptionKey, ResolvedTools, SessionConfig,
 };
 use crate::identity::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
@@ -52,6 +53,83 @@ pub(crate) fn openrouter_api_key(orch: &Orchestrator) -> Option<String> {
 impl AgentBackend for OpenRouterBackend {
     fn name(&self) -> &str {
         OPENROUTER_BACKEND_NAME
+    }
+
+    fn complete(
+        &self,
+        request: CompletionRequest,
+        orch: &Orchestrator,
+    ) -> Result<CompletionOutcome, CompletionError> {
+        use crate::backends::openai_compat::http::{post_chat_completion, Endpoint};
+        use serde_json::json;
+        use std::time::Instant;
+
+        if request.messages.is_empty() {
+            return Err(CompletionError::InvalidRequest(
+                "at least one message is required".to_string(),
+            ));
+        }
+        let api_key = openrouter_api_key(orch).ok_or(CompletionError::BackendUnavailable)?;
+        let requested_model = request.model.clone();
+        let mut messages = Vec::with_capacity(request.messages.len() + 1);
+        if let Some(system) = request.system {
+            messages.push(json!({"role": "system", "content": system}));
+        }
+        messages.extend(request.messages.into_iter().map(|message| {
+            let role = match message.role {
+                CompletionRole::User => "user",
+                CompletionRole::Assistant => "assistant",
+            };
+            json!({"role": role, "content": message.content})
+        }));
+        let mut body = json!({
+            "model": requested_model,
+            "messages": messages,
+            "stream": false,
+            "provider": {"require_parameters": true},
+        });
+        if let Some(extras) = request.extras.as_object() {
+            body.as_object_mut()
+                .expect("completion body is an object")
+                .extend(extras.clone());
+        } else if !request.extras.is_null() {
+            return Err(CompletionError::InvalidRequest(
+                "extras must be an object or null".to_string(),
+            ));
+        }
+        http::apply_output_schema(&mut body, request.output_schema.as_ref());
+        let endpoint = Endpoint {
+            provider_name: OPENROUTER_BACKEND_NAME,
+            backend_key: OPENROUTER_BACKEND_KEY,
+            chat_url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            headers: http::openrouter_headers(&api_key).map_err(CompletionError::InvalidRequest)?,
+            extra_body: None,
+        };
+        let started = Instant::now();
+        let response = post_chat_completion(&endpoint, body, request.timeout)?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_ref())
+            .and_then(|content| content.as_text())
+            .ok_or_else(|| CompletionError::InvalidResponse("missing text choice".to_string()))?
+            .to_string();
+        let usage = response.usage.as_ref();
+        Ok(CompletionOutcome {
+            text,
+            parsed: None,
+            model: response.model.unwrap_or(request.model),
+            tokens: CompletionTokens {
+                input: usage.and_then(|usage| usage.prompt_tokens.map(|value| value as u64)),
+                output: usage.and_then(|usage| usage.completion_tokens.map(|value| value as u64)),
+            },
+            cost: usage.and_then(|usage| usage.cost),
+            latency_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+
+    fn completion_shape(&self) -> CompletionShape {
+        CompletionShape::InProcess
     }
 
     fn is_available(&self) -> Result<(), String> {

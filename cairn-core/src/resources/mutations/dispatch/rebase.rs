@@ -52,6 +52,20 @@ pub(super) async fn dispatch(
                     "payload.resolution must be 'take-committed-tip' when provided",
                 ));
             }
+            // The documented escape from the loss guard. It only means anything
+            // alongside the resolution whose whole-file restore does the
+            // dropping, so a request carrying it without one is confused about
+            // what it is asking for and is told so rather than obeyed.
+            let drop_incoming_reason = payload_non_empty_str(payload, "drop_incoming_reason", &[]);
+            if drop_incoming_reason.is_some() && resolution.is_none() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload.drop_incoming_reason only applies to \
+                     resolution:'take-committed-tip', which is what discards incoming hunks; a \
+                     plain replay drops nothing",
+                ));
+            }
 
             let db = orch.db.for_project(project).await;
             let (conn, job) = crate::resources::connect_and_find_node_job(
@@ -80,6 +94,7 @@ pub(super) async fn dispatch(
                     &branch,
                     fingerprint,
                     resolution.is_some(),
+                    drop_incoming_reason,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?

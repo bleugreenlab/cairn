@@ -183,6 +183,8 @@ pub struct Settings {
     /// File-log verbosity level (default `standard`; `verbose` opts into full
     /// debug + profiler logging). Takes effect on the next app start.
     pub log_level: LogLevel,
+    /// Number of days to retain daily JSONL logs (minimum one).
+    pub log_retention_days: u64,
     /// Flat monthly subscription fee per backend, in USD. Empty = every backend
     /// is metered (no subscription normalization). Drives effective-cost
     /// analytics; OpenRouter is always metered regardless of this map.
@@ -252,6 +254,8 @@ pub struct UpdateSettings {
     pub external_replies: Option<ExternalReplyMode>,
     /// File-log verbosity level.
     pub log_level: Option<LogLevel>,
+    /// Number of days to retain daily JSONL logs.
+    pub log_retention_days: Option<u64>,
     /// Flat monthly subscription fee per backend, in USD (replaces the whole map).
     pub subscription_fees: Option<HashMap<String, f64>>,
     /// OpenRouter provider-routing controls (replaces the whole object).

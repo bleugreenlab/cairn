@@ -3,12 +3,13 @@
 
 use crate::execution::teardown::{cleanup_issue_jobs, TeardownReason, TeardownScope};
 use crate::github::api;
-use crate::github::credentials::{get_credentials_for_owner, get_owner_repo};
+use crate::github::credentials::get_owner_repo;
 use crate::orchestrator::Orchestrator;
 use crate::pr_data::helpers::{
     assert_main_checkout_clean_for_default_merge, local_pr_files,
     reconcile_main_checkout_after_merge,
 };
+use crate::security::broker::github::installation_authority;
 use crate::storage::LocalDb;
 use cairn_db::turso::params;
 use std::path::Path;
@@ -232,10 +233,10 @@ pub async fn reconcile_after_merge(
     // 2. Capture file changes for issue history.
     if let Some(pr_number) = pr_number {
         match get_owner_repo(&repo_path) {
-            Ok((owner, repo)) => match get_credentials_for_owner(&orch.db.local, &owner).await {
-                Ok(creds) => {
+            Ok((owner, repo)) => match installation_authority(&orch.db.local, &owner).await {
+                Ok(auth) => {
                     let http = &*orch.services.http;
-                    match api::fetch_pr_files(http, &creds, &owner, &repo, pr_number).await {
+                    match api::fetch_pr_files(http, &auth, &owner, &repo, pr_number).await {
                         Ok(files) => {
                             if let Some(file_change_job_id) = file_change_job_id.as_deref() {
                                 let count = files.len();
@@ -462,12 +463,12 @@ async fn merge_remote_pr_via_github(
     let method = merge_method.unwrap_or_else(|| "squash".to_string());
 
     let (owner, repo) = get_owner_repo(&repo_path)?;
-    let creds = get_credentials_for_owner(&orch.db.local, &owner).await?;
+    let auth = installation_authority(&orch.db.local, &owner).await?;
     let http = &*orch.services.http;
 
     // FAIL-CLOSED: on any failure, surface it and mark/advance NOTHING locally.
     let github_started = std::time::Instant::now();
-    api::merge_pr(http, &creds, &owner, &repo, pr_number, &method)
+    api::merge_pr(http, &auth, &owner, &repo, pr_number, &method)
         .await
         .map_err(|e| map_github_merge_error(&source_branch, &target_branch, e))?;
     log::info!(
@@ -500,7 +501,7 @@ async fn merge_remote_pr_via_github(
 
     // BEST-EFFORT: delete the merged source branch on GitHub. Nothing downstream
     // depends on it.
-    if let Err(e) = api::delete_branch(http, &creds, &owner, &repo, &source_branch).await {
+    if let Err(e) = api::delete_branch(http, &auth, &owner, &repo, &source_branch).await {
         log::warn!("Best-effort delete of merged source branch {source_branch} failed: {e}");
     }
 
@@ -706,6 +707,7 @@ pub async fn merge_pr_for_job(
                 job_id,
                 crate::fleet::CellPriority::ReviewCheck,
                 crate::execution::checks::ReviewTreeCheckScope::Gates,
+                None,
             )
             .await
             {

@@ -33,6 +33,223 @@ pub async fn append_issue_comment(
     .await
 }
 
+fn apply_arc_ruling_patch(
+    mut base: serde_json::Value,
+    operation: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let operation_keys = operation
+        .as_object()
+        .ok_or_else(|| "Arc ruling operation payload must be an object".to_string())?;
+    let expected: &[&str] = if operation.get("ruling").is_some() {
+        &["ruling"]
+    } else {
+        &["ruling_slug", "patch"]
+    };
+    let unexpected: Vec<&str> = operation_keys
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !expected.contains(key))
+        .collect();
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "Arc ruling operation cannot be mixed with other fields ({}); submit them in a separate patch",
+            unexpected.join(", ")
+        ));
+    }
+
+    let root = base
+        .as_object_mut()
+        .ok_or_else(|| "The existing arc must be an object".to_string())?;
+    let rulings = root
+        .entry("rulings")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "The arc's `rulings` field must be an array".to_string())?;
+    mint_missing_ruling_slugs(rulings)?;
+    match (operation.get("ruling"), operation.get("ruling_slug")) {
+        (Some(ruling), None) => {
+            let mut ruling = ruling
+                .as_object()
+                .cloned()
+                .ok_or_else(|| "payload.ruling must be an object".to_string())?;
+            for field in ["text", "status", "rationale", "provenance"] {
+                if !ruling.contains_key(field) {
+                    return Err(format!("payload.ruling requires `{field}`"));
+                }
+            }
+            let text = ruling["text"]
+                .as_str()
+                .ok_or_else(|| "payload.ruling.text must be a string".to_string())?;
+            let slug = unique_ruling_slug(text, rulings);
+            ruling.insert("slug".to_string(), serde_json::Value::String(slug));
+            rulings.push(serde_json::Value::Object(ruling));
+        }
+        (None, Some(slug)) => {
+            let slug = slug
+                .as_str()
+                .ok_or_else(|| "payload.ruling_slug must be a string".to_string())?;
+            let patch = operation
+                .get("patch")
+                .and_then(|value| value.as_object())
+                .ok_or_else(|| {
+                    "payload.patch must be an object when patching a ruling".to_string()
+                })?;
+            if patch.is_empty() {
+                return Err("payload.patch must change at least one ruling field".to_string());
+            }
+            if patch.contains_key("slug") {
+                return Err("A ruling slug is stable and cannot be changed".to_string());
+            }
+            let ruling = rulings
+                .iter_mut()
+                .find(|ruling| ruling.get("slug").and_then(|value| value.as_str()) == Some(slug))
+                .ok_or_else(|| format!("No ruling has slug `{slug}`"))?
+                .as_object_mut()
+                .expect("minting rejects non-object rulings");
+            for (key, value) in patch {
+                if !["text", "status", "rationale", "provenance"].contains(&key.as_str()) {
+                    return Err(format!("Ruling patch field `{key}` is not supported"));
+                }
+                ruling.insert(key.clone(), value.clone());
+            }
+        }
+        _ => return Err("Use exactly one of payload.ruling or payload.ruling_slug".to_string()),
+    }
+    Ok(base)
+}
+
+fn apply_arc_field_patch(
+    mut base: serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let existing = base
+        .get_mut("rulings")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "The arc's existing `rulings` field must be an array".to_string())?;
+    mint_missing_ruling_slugs(existing)?;
+    let mut replacement = patch
+        .get("rulings")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| "payload.rulings must be an array".to_string())?;
+
+    let existing_slugs: std::collections::HashSet<String> = existing
+        .iter()
+        .filter_map(|ruling| ruling.get("slug").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut used = std::collections::HashSet::new();
+    for index in 0..replacement.len() {
+        let object = replacement[index]
+            .as_object()
+            .ok_or_else(|| format!("Replacement ruling {} must be an object", index + 1))?;
+        let supplied = object
+            .get("slug")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let text = object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let preserved = existing
+            .iter()
+            .find(|prior| {
+                prior.get("text").and_then(serde_json::Value::as_str) == Some(text.as_str())
+                    && prior
+                        .get("slug")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|slug| !used.contains(slug))
+            })
+            .and_then(|prior| prior.get("slug"))
+            .and_then(serde_json::Value::as_str);
+        let slug = match (supplied, preserved) {
+            (Some(supplied), _) => supplied,
+            (None, Some(expected)) => expected.to_string(),
+            (None, None) if existing_slugs.iter().any(|slug| !used.contains(slug)) => {
+                return Err(format!(
+                    "Replacement ruling {} changed or reordered an existing decision; include its stable `slug` explicitly",
+                    index + 1
+                ))
+            }
+            (None, None) => unique_ruling_slug(&text, &replacement),
+        };
+        if !used.insert(slug.clone()) {
+            return Err(format!("Ruling slug `{slug}` appears more than once"));
+        }
+        replacement[index]
+            .as_object_mut()
+            .expect("replacement ruling was validated above")
+            .insert("slug".to_string(), serde_json::Value::String(slug));
+    }
+    let mut merged = merge_artifact_payload(base, patch);
+    merged["rulings"] = serde_json::Value::Array(replacement);
+    Ok(merged)
+}
+
+fn mint_missing_ruling_slugs(rulings: &mut [serde_json::Value]) -> Result<(), String> {
+    for index in 0..rulings.len() {
+        if rulings[index]
+            .get("slug")
+            .and_then(|value| value.as_str())
+            .is_some()
+        {
+            continue;
+        }
+        let text = rulings[index]
+            .get("text")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "Legacy ruling {} has no string `text` to derive a slug from",
+                    index + 1
+                )
+            })?;
+        let slug = unique_ruling_slug(text, rulings);
+        rulings[index]
+            .as_object_mut()
+            .ok_or_else(|| format!("Legacy ruling {} must be an object", index + 1))?
+            .insert("slug".to_string(), serde_json::Value::String(slug));
+    }
+    Ok(())
+}
+
+fn unique_ruling_slug(text: &str, rulings: &[serde_json::Value]) -> String {
+    let base = ruling_slug(text);
+    let exists = |candidate: &str| {
+        rulings
+            .iter()
+            .any(|ruling| ruling.get("slug").and_then(|value| value.as_str()) == Some(candidate))
+    };
+    if !exists(&base) {
+        return base;
+    }
+    (2..)
+        .map(|suffix| format!("{base}-{suffix}"))
+        .find(|candidate| !exists(candidate))
+        .expect("an unbounded numeric suffix always finds a slug")
+}
+
+fn ruling_slug(text: &str) -> String {
+    let mut slug = String::new();
+    for character in text.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "ruling".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
 pub(crate) async fn append_issue_comment_for_remote_intent(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -247,6 +464,15 @@ async fn load_job_output_contract(
     serde_json::from_str(&json).ok()
 }
 
+/// Whether `job_id` is thread-owned, read from the one canonical ownership
+/// answer (`jobs.thread_id`) rather than from a second signal that could drift.
+async fn job_is_thread_owned(orch: &Orchestrator, job_id: &str) -> bool {
+    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
+        return false;
+    };
+    crate::threads::job_owner(&db, job_id).await == crate::threads::JobOwner::Thread
+}
+
 pub(crate) async fn resolve_artifact_contract(
     orch: &Orchestrator,
     job_id: &str,
@@ -286,10 +512,20 @@ pub(crate) async fn resolve_artifact_contract(
             .iter()
             .find(|t| t.artifact_name.as_deref() == Some(name))
     });
-    let is_ctx_self = ctx_self_target.is_some();
+    // A thread's arc is a living document, not a deliverable: the thread writes
+    // and rewrites it as decisions happen, and the role contract is that doing
+    // so never ends its turn. A thread session job has no recipe node to declare
+    // a `context-self` port, so its OWNERSHIP is what marks the arc as one. The
+    // arc still validates against its schema and still auto-confirms; what it
+    // must never do is arm the turn-ending handoff a terminal artifact arms.
+    let is_thread_arc = artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME)
+        && terminal_name.as_deref() == Some(crate::threads::ARC_ARTIFACT_NAME)
+        && job_is_thread_owned(orch, job_id).await;
+    let is_ctx_self = ctx_self_target.is_some() || is_thread_arc;
     let terminal_has_schema = terminal_schema.is_some();
     let (confirm_policy, validation_schema) = match ctx_self_target {
         Some(target) => (ConfirmPolicy::Auto, Some(target.schema.clone())),
+        None if is_thread_arc => (ConfirmPolicy::Auto, terminal_schema),
         None => (terminal_policy, terminal_schema),
     };
 
@@ -381,8 +617,26 @@ pub(crate) async fn write_artifact_change(
     let latest = load_latest_artifact(orch, &job_id, &output_name).await;
     let prior_confirmed = latest.as_ref().map(|(_, confirmed)| *confirmed);
 
+    let is_arc_ruling_operation = is_patch
+        && artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME)
+        && (payload.get("ruling").is_some() || payload.get("ruling_slug").is_some());
     let mut effective_payload = match (is_patch, &latest) {
+        (true, Some((base, _))) if is_arc_ruling_operation => {
+            apply_arc_ruling_patch(base.clone(), payload)?
+        }
+        (true, Some((base, _)))
+            if artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME)
+                && payload.get("rulings").is_some() =>
+        {
+            apply_arc_field_patch(base.clone(), payload)?
+        }
         (true, Some((base, _))) => apply_artifact_patch(base.clone(), payload)?,
+        (true, None) if is_arc_ruling_operation => {
+            return Err(
+                "Arc ruling operations require an existing arc; create `cairn:~/arc` first"
+                    .to_string(),
+            )
+        }
         (true, None) if is_text_replacement_patch(payload) => {
             return Err(
                 "Artifact text replacement patch requires an existing artifact to edit".to_string(),
@@ -404,7 +658,7 @@ pub(crate) async fn write_artifact_change(
         // merging it verbatim silently corrupts the stored data (CAIRN-3283).
         // Checked against the submitted payload rather than the merged result so
         // an artifact already carrying stray keys stays editable.
-        if !is_text_replacement_patch(payload) {
+        if !is_text_replacement_patch(payload) && !is_arc_ruling_operation {
             reject_undeclared_artifact_keys(&schema_value, payload)?;
         }
         validate_against_schema(&schema_value, &effective_payload)?;
@@ -516,23 +770,30 @@ pub(crate) async fn write_artifact_change(
     );
 
     // Build the canonical artifact URI and embed its prose for corpus recall.
-    let artifact_uri = if let Some(task_name) = task_name {
-        cairn_common::uri::build_task_artifact_uri_named(
+    //
+    // An artifact lives at its producing job's home plus the addressed name, so
+    // deriving it from the one canonical home resolution keeps every owner shape
+    // right without a per-shape builder here. A thread reached this through the
+    // internal `(0, 0, name)` node coordinate, which rebuilt as the unaddressable
+    // `cairn://p/KEY/0/0/{thread}/arc` and taught agents a URI that does not
+    // resolve.
+    let artifact_uri = match crate::jobs::queries::home_uri_for_job(&db, &job_id).await {
+        Ok(Some(home)) => format!("{home}/{}", artifact_name.unwrap_or("artifact")),
+        _ if task_name.is_some() => cairn_common::uri::build_task_artifact_uri_named(
             project_key,
             number,
             exec_seq,
             node_name,
-            task_name,
+            task_name.unwrap_or_default(),
             artifact_name,
-        )
-    } else {
-        cairn_common::uri::build_node_artifact_uri_named(
+        ),
+        _ => cairn_common::uri::build_node_artifact_uri_named(
             project_key,
             number,
             exec_seq,
             node_name,
             artifact_name,
-        )
+        ),
     };
     let text = crate::embeddings::artifact_embed_text(&stored.artifact_type, &effective_payload)
         .unwrap_or_default();
@@ -575,6 +836,7 @@ pub(crate) async fn write_artifact_change(
             attention: issue_ctx.attention,
             status: issue_ctx.status,
             updated_at: issue_ctx.updated_at,
+            route_provenance: None,
         });
     }
 
@@ -1340,12 +1602,106 @@ async fn job_node_execution(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_artifact_patch, merge_artifact_payload, reject_undeclared_artifact_keys,
-        resolve_confirmed, should_arm_output_artifact_interrupt, terminal_handoff_suffix,
-        validate_against_schema,
+        apply_arc_field_patch, apply_arc_ruling_patch, apply_artifact_patch,
+        merge_artifact_payload, reject_undeclared_artifact_keys, resolve_confirmed,
+        should_arm_output_artifact_interrupt, terminal_handoff_suffix, validate_against_schema,
     };
     use crate::models::ConfirmPolicy;
     use serde_json::json;
+
+    #[test]
+    fn arc_ruling_append_mints_legacy_slugs_and_preserves_other_fields() {
+        let base = json!({
+            "current_intent": "Durable direction",
+            "working": "A then B",
+            "rulings": [{
+                "text": "No budget kills", "status": "accepted",
+                "rationale": "Budgets degrade quality", "provenance": ["cairn://p/CAIRN/3404"]
+            }]
+        });
+        let patched = apply_arc_ruling_patch(
+            base,
+            &json!({"ruling": {
+                "text": "No budget kills", "status": "rejected",
+                "rationale": "A distinct later ruling", "provenance": ["cairn://p/CAIRN/3700"]
+            }}),
+        )
+        .unwrap();
+
+        assert_eq!(patched["current_intent"], "Durable direction");
+        assert_eq!(patched["working"], "A then B");
+        assert_eq!(patched["rulings"][0]["slug"], "no-budget-kills");
+        assert_eq!(patched["rulings"][1]["slug"], "no-budget-kills-2");
+    }
+
+    #[test]
+    fn arc_ruling_patch_updates_only_the_addressed_ruling() {
+        let base = json!({"current_intent": "Direction", "rulings": [
+            {"slug": "keep", "text": "Keep", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
+            {"slug": "replace", "text": "Replace", "status": "accepted", "rationale": "old", "provenance": ["cairn://p/P/2"]}
+        ]});
+        let patched = apply_arc_ruling_patch(
+            base,
+            &json!({
+                "ruling_slug": "replace",
+                "patch": {"status": "superseded", "rationale": "new"}
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(patched["rulings"][0]["status"], "accepted");
+        assert_eq!(patched["rulings"][1]["status"], "superseded");
+        assert_eq!(patched["rulings"][1]["rationale"], "new");
+        assert_eq!(patched["rulings"][1]["slug"], "replace");
+    }
+
+    #[test]
+    fn arc_ruling_operations_reject_mixed_fields() {
+        let error = apply_arc_ruling_patch(
+            json!({"current_intent": "Direction", "rulings": []}),
+            &json!({"ruling": {
+                "text": "X", "status": "accepted", "rationale": "Y", "provenance": ["cairn://p/P/1"]
+            }, "working": "silently lost before this guard"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot be mixed"), "{error}");
+    }
+
+    #[test]
+    fn whole_array_replacement_preserves_exact_matches_and_rejects_duplicates() {
+        let base = json!({"current_intent": "Direction", "rulings": [
+            {"slug": "one", "text": "One", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
+            {"slug": "two", "text": "Two", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/2"]}
+        ]});
+        let patched = apply_arc_field_patch(base.clone(), &json!({"rulings": [
+            {"text": "Two", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/2"]},
+            {"text": "One", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/1"]}
+        ]})).unwrap();
+        assert_eq!(patched["rulings"][0]["slug"], "two");
+        assert_eq!(patched["rulings"][1]["slug"], "one");
+
+        let error = apply_arc_field_patch(base, &json!({"rulings": [
+            {"slug": "same", "text": "New one", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
+            {"slug": "same", "text": "New two", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/2"]}
+        ]})).unwrap_err();
+        assert!(error.contains("appears more than once"), "{error}");
+    }
+
+    #[test]
+    fn whole_array_reorder_plus_edit_requires_explicit_slugs() {
+        let base = json!({"current_intent": "Direction", "rulings": [
+            {"slug": "a", "text": "A", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
+            {"slug": "b", "text": "B", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/2"]}
+        ]});
+        let error = apply_arc_field_patch(base, &json!({"rulings": [
+            {"text": "B revised", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/2"]},
+            {"text": "A revised", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/1"]}
+        ]})).unwrap_err();
+        assert!(
+            error.contains("include its stable `slug` explicitly"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn persisted_output_contract_drives_validation() {

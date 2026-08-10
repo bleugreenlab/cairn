@@ -33,7 +33,18 @@ pub(crate) fn clamp_compact_threshold(value: f64) -> f64 {
     if !value.is_finite() {
         return DEFAULT_THREAD_COMPACT_THRESHOLD;
     }
+
     value.clamp(0.1, 1.0)
+}
+
+/// Number of days to retain JSONL logs. Invalid zero values heal to one day;
+/// an absent setting uses the shared seven-day default.
+pub fn load_log_retention_days(config_dir: &std::path::Path) -> u64 {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.log_retention_days)
+        .unwrap_or(cairn_common::logging::DEFAULT_LOG_RETENTION_DAYS)
+        .max(1)
 }
 
 /// Custom deserializer for max_thinking_tokens to distinguish between:
@@ -133,6 +144,9 @@ pub struct SettingsFile {
     /// is the opt-in full-debug + profiler level (today's behavior).
     #[serde(default)]
     log_level: Option<LogLevel>,
+    /// Age-based retention for shared JSONL logs.
+    #[serde(default)]
+    log_retention_days: Option<u64>,
     /// Whether end-of-job memory review prompts are enabled.
     #[serde(default)]
     memory_review_enabled: Option<bool>,
@@ -377,6 +391,10 @@ impl SettingsFile {
                 .clone()
                 .unwrap_or(ExternalReplyMode::Watchers),
             log_level: self.log_level.unwrap_or(LogLevel::Standard),
+            log_retention_days: self
+                .log_retention_days
+                .unwrap_or(cairn_common::logging::DEFAULT_LOG_RETENTION_DAYS)
+                .max(1),
             subscription_fees: self.subscription_fees.clone().unwrap_or_default(),
             openrouter_routing: self.openrouter_routing.clone().unwrap_or_default(),
             route_calls_via_openrouter: self.route_calls_via_openrouter.unwrap_or(false),
@@ -403,6 +421,7 @@ impl SettingsFile {
             transcript_text_size: Some(settings.transcript_text_size),
             transcript_density: Some(settings.transcript_density),
             log_level: Some(settings.log_level),
+            log_retention_days: Some(settings.log_retention_days.max(1)),
             memory_review_enabled: Some(settings.memory_review_enabled),
             memory_triage_enabled: Some(settings.memory_triage_enabled),
             max_open_triage_issues_per_scope: Some(
@@ -446,6 +465,19 @@ impl SettingsFile {
 /// Get the path to the settings file
 pub(crate) fn get_settings_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join("settings.yaml")
+}
+
+/// Modification stamp of the settings file — `(mtime, len)`, or `None` when it
+/// is absent or unreadable.
+///
+/// Caches that derive a value from settings key on this rather than subscribing
+/// to in-process saves: the config directory is git-backed
+/// (`commit_and_maybe_push`) and is also edited by hand, so a save hook would
+/// miss the changes that arrive from outside this process. One `stat` is cheap
+/// next to reading and YAML-parsing the whole file.
+pub fn settings_file_stamp(config_dir: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let metadata = std::fs::metadata(get_settings_path(config_dir)).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
@@ -876,6 +908,9 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.log_level {
         current.log_level = value;
+    }
+    if let Some(value) = input.log_retention_days {
+        current.log_retention_days = value.max(1);
     }
     if let Some(value) = input.openrouter_routing {
         current.openrouter_routing = value;
@@ -1976,6 +2011,19 @@ thinkingDisplayMode: full
         assert_eq!(settings.log_level, LogLevel::Verbose);
         let restored = SettingsFile::from_settings(&settings).to_settings();
         assert_eq!(restored.log_level, LogLevel::Verbose);
+    }
+
+    #[test]
+    fn test_log_retention_days_defaults_and_clamps_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_log_retention_days(dir.path()),
+            cairn_common::logging::DEFAULT_LOG_RETENTION_DAYS
+        );
+        std::fs::write(dir.path().join("settings.yaml"), "logRetentionDays: 0\n").unwrap();
+        assert_eq!(load_log_retention_days(dir.path()), 1);
+        std::fs::write(dir.path().join("settings.yaml"), "logRetentionDays: 3\n").unwrap();
+        assert_eq!(load_log_retention_days(dir.path()), 3);
     }
 
     #[test]

@@ -158,6 +158,38 @@ pub async fn list_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<Artifact
     .map_err(|e| db_error("Failed to list artifacts for issue", e))
 }
 
+/// The latest artifact per (job, output name) for every job a thread owns — its
+/// session's `arc` and whatever its tasks returned.
+///
+/// The issue-scoped sibling above is the same query under the other owner
+/// column; a thread's jobs carry no `issue_id`, so it could never see them.
+pub async fn list_for_thread(db: &LocalDb, thread_id: &str) -> Result<Vec<Artifact>, String> {
+    let thread_id = thread_id.to_string();
+    db.query_all(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM (
+                SELECT
+                    a.id, a.job_id, a.artifact_type, a.schema_version, a.data,
+                    a.version, a.parent_version_id, a.output_name, a.created_at,
+                    a.updated_at, a.seen_at, a.confirmed,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY a.job_id, a.output_name
+                        ORDER BY a.version DESC
+                    ) AS artifact_rank
+                FROM artifacts a
+                INNER JOIN jobs j ON j.id = a.job_id
+                WHERE j.thread_id = ?1
+             ) ranked_artifacts
+             WHERE artifact_rank = 1"
+        ),
+        params![thread_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to list artifacts for thread", e))
+}
+
 /// Raw stored `data` JSON of a node-less call's CONTRACTED return artifact.
 ///
 /// The return artifact IS an ephemeral call's completion contract, so the two
@@ -369,5 +401,57 @@ mod latest_recency_tests {
         let latest = get_latest(&db, "j").await.unwrap().expect("an artifact");
         assert_eq!(latest.output_name.as_deref(), Some("plan"));
         assert_eq!(latest.version, 3);
+    }
+
+    /// A thread's artifacts are reachable by the thread, not by an issue: its
+    /// jobs carry no `issue_id`, so the issue-scoped listing could never see the
+    /// session's `arc` or what its tasks returned.
+    #[tokio::test]
+    async fn thread_listing_returns_the_latest_per_name_for_every_job_the_thread_owns() {
+        let db = crate::storage::migrated_test_db("artifacts-for-thread.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1);
+             INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('th','p','roadmap','active','none',1,1);
+             INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('other','p','neighbour','active','none',1,1);
+             INSERT INTO jobs (id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('session','th','p','idle','thread','thread',1,1);
+             INSERT INTO jobs (id,thread_id,parent_job_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('task','th','session','p','complete','survey','Survey',1,1);
+             INSERT INTO jobs (id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('elsewhere','other','p','idle','thread','thread',1,1);",
+        )
+        .await
+        .unwrap();
+        let insert = |id: &'static str, job: &'static str, name: &'static str, version: i64| {
+            let db = &db;
+            async move {
+                db.execute(
+                    "INSERT INTO artifacts (id,job_id,artifact_type,schema_version,data,version,output_name,created_at,updated_at,confirmed)
+                     VALUES (?1,?2,'arc',1,'{}',?3,?4,1,1,1)",
+                    params![id, job, version, name],
+                )
+                .await
+                .unwrap();
+            }
+        };
+        insert("arc-v1", "session", "arc", 1).await;
+        insert("arc-v2", "session", "arc", 2).await;
+        insert("task-return", "task", "return", 1).await;
+        insert("elsewhere-arc", "elsewhere", "arc", 1).await;
+
+        let mut listed: Vec<(String, String)> = list_for_thread(&db, "th")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|artifact| (artifact.id, artifact.job_id.unwrap_or_default()))
+            .collect();
+        listed.sort();
+
+        assert_eq!(
+            listed,
+            vec![
+                ("arc-v2".to_string(), "session".to_string()),
+                ("task-return".to_string(), "task".to_string()),
+            ],
+            "the latest arc plus the task's return, and nothing from another thread"
+        );
     }
 }

@@ -232,7 +232,7 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
     read_projections: &[
         ProjectionSpec {
             key: "view",
-            values: "base-ours|base-theirs (absent = session summary)",
+            values: "merged|base-ours|base-theirs (absent = session summary)",
         },
         ProjectionSpec {
             key: "file",
@@ -252,7 +252,11 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
     mutations: &[MutationSpec {
         mode: ChangeMode::Patch,
         required: &[REBASE_ACTION],
-        optional: &[REBASE_FINGERPRINT, REBASE_RESOLUTION],
+        optional: &[
+            REBASE_FINGERPRINT,
+            REBASE_RESOLUTION,
+            REBASE_DROP_INCOMING_REASON,
+        ],
         label: "ask the store to replay this branch onto its base",
         example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]})",
     }],

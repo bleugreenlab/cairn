@@ -1275,6 +1275,7 @@ pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Resu
                     attention: ctx.attention,
                     status: ctx.status,
                     updated_at: ctx.updated_at,
+                    route_provenance: None,
                 });
             }
         }
@@ -1704,6 +1705,7 @@ mod artifact_present_tests {
         };
         serde_json::to_string(&ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe".to_string(),
                 name: "Recipe".to_string(),
@@ -1753,6 +1755,7 @@ mod artifact_present_tests {
         };
         serde_json::to_string(&ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe".to_string(),
                 name: "Recipe".to_string(),
@@ -1786,6 +1789,7 @@ mod artifact_present_tests {
             .into_recipe(Some("default".to_string()), None);
         ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: recipe.id.clone(),
                 name: recipe.name.clone(),
@@ -1879,21 +1883,27 @@ mod artifact_present_tests {
         let shipping: &[(&str, &str)] = &[
             (
                 "planbuild",
-                include_str!("../../../../../recipes/planbuild.yaml"),
+                include_str!("../../../../../packs/core/recipes/planbuild.yaml"),
             ),
-            ("build", include_str!("../../../../../recipes/build.yaml")),
+            (
+                "build",
+                include_str!("../../../../../packs/core/recipes/build.yaml"),
+            ),
             (
                 "coordinator",
-                include_str!("../../../../../recipes/coordinator.yaml"),
+                include_str!("../../../../../packs/core/recipes/coordinator.yaml"),
             ),
             (
                 "task-list",
-                include_str!("../../../../../recipes/task-list.yaml"),
+                include_str!("../../../../../packs/core/recipes/task-list.yaml"),
             ),
-            ("setup", include_str!("../../../../../recipes/setup.yaml")),
+            (
+                "setup",
+                include_str!("../../../../../packs/core/recipes/setup.yaml"),
+            ),
             (
                 "memory-triage",
-                include_str!("../../../../../recipes/memory-triage.yaml"),
+                include_str!("../../../../../packs/core/recipes/memory-triage.yaml"),
             ),
         ];
         for (name, yaml) in shipping {
@@ -1904,8 +1914,9 @@ mod artifact_present_tests {
         // shape: the transform prunes its `pr` node, leaving no terminal action
         // node, so its `coordinator` agent node is the single node that derives
         // long-running (the board artifact and trigger nodes do not).
-        let mut standing =
-            snapshot_from_yaml(include_str!("../../../../../recipes/coordinator.yaml"));
+        let mut standing = snapshot_from_yaml(include_str!(
+            "../../../../../packs/core/recipes/coordinator.yaml"
+        ));
         crate::execution::branch_target::apply_branch_target(
             &mut standing,
             Some(crate::models::BranchTarget::Base),
@@ -1916,17 +1927,6 @@ mod artifact_present_tests {
         )
         .unwrap();
         assert_recipe_derivation(&db, "coordinator (base)", standing, Some("coordinator")).await;
-
-        // The thread recipe is that same standing shape without needing the
-        // transform: it ships no `pr` node at all, so its agent derives
-        // long-running under either branch target.
-        assert_recipe_derivation(
-            &db,
-            "thread",
-            snapshot_from_yaml(include_str!("../../../../../recipes/thread.yaml")),
-            Some("thread"),
-        )
-        .await;
     }
 
     #[tokio::test]
@@ -2333,6 +2333,7 @@ mod port_gate_tests {
     fn snapshot_json() -> String {
         let snap = ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),
@@ -2493,6 +2494,7 @@ mod port_gate_tests {
         let artifact_name = contract.artifact_name();
         let mut snap = ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "R".to_string(),

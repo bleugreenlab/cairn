@@ -10,6 +10,7 @@ pub mod action_configs;
 pub mod action_runs;
 pub mod archival;
 pub mod artifacts;
+pub mod authorization;
 pub mod browser_network;
 pub mod browsers;
 pub mod channels;
@@ -42,6 +43,7 @@ pub use backends::SessionStart;
 
 pub mod condition;
 pub mod dispatch;
+pub mod security;
 pub mod transitions;
 
 // ── Stable data/config surface ─────────────────────────
@@ -64,6 +66,8 @@ pub mod identity;
 pub use cairn_db::models;
 pub mod output_schemas;
 pub mod references;
+pub mod responses;
+pub mod routes;
 pub mod skills;
 pub mod system_prompt;
 pub mod transcripts;

@@ -54,22 +54,77 @@ pub(crate) async fn resolve_run_fence(
 
 /// What kind of boundary crossing was detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrossingKind {
+pub(crate) enum CrossingKind {
     SensitiveHostRead,
     ExternalHostWrite,
-    ShellEscape,
+    /// A shell command referencing a resolved path outside the projection.
+    ShellPathCrossing,
+    /// A shell command the kernel blocked without reporting which path it
+    /// touched. Separated from [`CrossingKind::ShellPathCrossing`] because
+    /// allowing it re-executes with no sandbox rather than widening a named
+    /// path.
+    ShellCommandEscape,
 }
 
 impl CrossingKind {
     /// Stable tag stored in the request `tool_input` (so a legacy tool prompt's
     /// `tool_input` never parses as a crossing by accident).
-    fn tag(self) -> &'static str {
+    pub(crate) fn tag(self) -> &'static str {
         match self {
             CrossingKind::SensitiveHostRead => "sensitive_host_read",
             CrossingKind::ExternalHostWrite => "external_host_write",
-            CrossingKind::ShellEscape => "shell_escape",
+            CrossingKind::ShellPathCrossing => "shell_path_crossing",
+            CrossingKind::ShellCommandEscape => "shell_command_escape",
         }
     }
+
+    /// Every kind, so a tag can be resolved back to one. A new variant that is
+    /// not listed here fails [`every_kind_is_registered`], which is the test
+    /// that keeps [`tag_is_path_scoped`] from silently defaulting it.
+    const ALL: [CrossingKind; 4] = [
+        CrossingKind::SensitiveHostRead,
+        CrossingKind::ExternalHostWrite,
+        CrossingKind::ShellPathCrossing,
+        CrossingKind::ShellCommandEscape,
+    ];
+
+    /// Whether this kind's descriptor is a resolved host path, and therefore
+    /// whether allowing it widens one named path rather than removing the
+    /// sandbox.
+    ///
+    /// Exhaustive on purpose: adding a variant is a compile error here, which
+    /// forces the question "does allowing this remove containment?" to be
+    /// answered rather than inherited.
+    fn is_path_scoped(self) -> bool {
+        match self {
+            CrossingKind::SensitiveHostRead
+            | CrossingKind::ExternalHostWrite
+            | CrossingKind::ShellPathCrossing => true,
+            CrossingKind::ShellCommandEscape => false,
+        }
+    }
+}
+
+/// Whether a **stored** crossing tag is one of the known path-scoped kinds.
+///
+/// Deliberately a positive test against a closed set, so an unrecognized tag is
+/// treated as an escape. That covers two cases that would otherwise fail open,
+/// in the one direction a security gate may fail:
+///
+/// - a row written by a build BEFORE the path/command split, which tagged both
+///   shell crossings `shell_escape`. Pending prompts are durable and nothing
+///   expires them, so an agent suspended on a command crossing across an
+///   upgrade would otherwise resume able to self-approve its own escape. A
+///   descriptor-shape heuristic was considered and rejected: a normalized
+///   command can begin with `/` (`/bin/cat /etc/shadow`), so it would read as a
+///   path in exactly the case that matters. This over-restricts a legacy
+///   path-scoped shell crossing to an operator for the life of that one pending
+///   row, which is the acceptable direction;
+/// - a kind added later whose author did not think about this gate.
+pub(crate) fn tag_is_path_scoped(tag: &str) -> bool {
+    CrossingKind::ALL
+        .iter()
+        .any(|kind| kind.tag() == tag && kind.is_path_scoped())
 }
 
 /// A detected boundary crossing awaiting a fence decision.
@@ -114,22 +169,61 @@ impl Crossing {
     /// command bytes.
     pub fn shell_path(resolved: &Path, token: &str) -> Self {
         Crossing {
-            kind: CrossingKind::ShellEscape,
+            kind: CrossingKind::ShellPathCrossing,
             verb: "run",
             descriptor: resolved.display().to_string(),
             summary: format!("command references an external host path: {token}"),
         }
     }
 
-    /// Shell crossing with no path (privilege escalation). The descriptor is the
-    /// normalized command.
+    /// Shell crossing with no recovered path. The descriptor is the normalized
+    /// command.
+    ///
+    /// Its own kind, because allowing it is a different act from allowing the
+    /// others. They widen one named path and the sandbox is still constructed;
+    /// this one re-executes an agent-authored command with **no sandbox at
+    /// all**, because there is no path to widen. That distinction has to be
+    /// visible in the stored prompt rather than inferred later from a
+    /// descriptor's shape, so the resolver can require an operator for it.
     pub(crate) fn shell_command(summary: String, command: &str) -> Self {
         Crossing {
-            kind: CrossingKind::ShellEscape,
+            kind: CrossingKind::ShellCommandEscape,
             verb: "run",
             descriptor: normalize_command_for_descriptor(command),
             summary,
         }
+    }
+
+    /// The exact `tool_input` [`raise_fence`] would store for this crossing.
+    ///
+    /// Exists so a resolution test can seed a REAL stored prompt rather than a
+    /// hand-written JSON blob that could drift from what the fence actually
+    /// writes — which is how a test comes to assert something about a shape
+    /// that no longer occurs.
+    #[cfg(test)]
+    pub(crate) fn stored_tool_input_for_test(&self) -> String {
+        serde_json::json!({
+            "kind": self.kind.tag(),
+            "verb": self.verb,
+            "descriptor": self.descriptor,
+            "summary": self.summary,
+            "request": McpCallbackRequest {
+                thread_id: None,
+                cwd: "/wt".to_string(),
+                run_id: Some("run-1".to_string()),
+                tool: self.verb.to_string(),
+                tool_use_id: Some("tool-1".to_string()),
+                payload: serde_json::json!({}),
+            },
+        })
+        .to_string()
+    }
+
+    /// The host path this crossing names, or `None` for a command-scoped one.
+    fn host_path(&self) -> Option<&Path> {
+        self.kind
+            .is_path_scoped()
+            .then(|| Path::new(self.descriptor.as_str()))
     }
 }
 
@@ -157,6 +251,28 @@ pub async fn raise_fence(
     request: &McpCallbackRequest,
     crossing: Crossing,
 ) -> FenceDecision {
+    // A crossing that names a protected host path is refused outright, ahead of
+    // the fence policy and ahead of the session-grant short circuit.
+    //
+    // This lives here rather than at a caller because there are two structurally
+    // identical adjudication sites -- the in-runner one in `run/process.rs` and
+    // the executor-relayed one in `fleet/mod.rs` -- and a rule attached to
+    // either can be missed by the other, or by a third added later. Both reach
+    // this function, so this is the invariant's real home.
+    //
+    // It does not consult `fence`, for the same reason
+    // `authorization::protected` does not: containment decides whether a process
+    // may cross a filesystem boundary, while this decides whether the
+    // workspace's own capability set -- or the credential that approves changes
+    // to it -- may be reached at all.
+    if let Some(path) = crossing.host_path() {
+        if let Some(refusal) =
+            crate::authorization::protected::denied_path_refusal(&orch.config_dir, path)
+        {
+            return FenceDecision::Deny(refusal.to_string());
+        }
+    }
+
     match fence {
         Fence::Allow => FenceDecision::Allow,
         Fence::Deny => FenceDecision::Deny(format!(
@@ -233,18 +349,64 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// `tag_is_path_scoped` resolves a stored tag through `ALL`, so a variant
+    /// missing from that list would silently be treated as an escape. Cheap to
+    /// state, and the alternative is a gate that quietly over-restricts.
+    #[test]
+    fn every_kind_is_registered() {
+        for kind in [
+            CrossingKind::SensitiveHostRead,
+            CrossingKind::ExternalHostWrite,
+            CrossingKind::ShellPathCrossing,
+            CrossingKind::ShellCommandEscape,
+        ] {
+            assert!(
+                CrossingKind::ALL.contains(&kind),
+                "{kind:?} is missing from CrossingKind::ALL"
+            );
+            assert_eq!(
+                tag_is_path_scoped(kind.tag()),
+                kind.is_path_scoped(),
+                "{kind:?} resolves to a different answer through its stored tag"
+            );
+        }
+    }
+
+    /// The gate fails closed on a tag it does not recognize — a row written
+    /// before the path/command kinds were split, and anything a later change
+    /// adds without considering it.
+    #[test]
+    fn an_unrecognized_tag_is_not_path_scoped() {
+        for legacy in ["shell_escape", "something_added_later", ""] {
+            assert!(
+                !tag_is_path_scoped(legacy),
+                "'{legacy}' must not be treated as a path-scoped crossing"
+            );
+        }
+    }
+
     #[test]
     fn shell_path_crossing_keys_on_resolved_path() {
         let c = Crossing::shell_path(Path::new("/etc/hosts"), "/etc/hosts");
-        assert_eq!(c.kind, CrossingKind::ShellEscape);
+        assert_eq!(c.kind, CrossingKind::ShellPathCrossing);
         assert_eq!(c.verb, "run");
         assert_eq!(c.descriptor, "/etc/hosts");
     }
 
+    /// A command-scoped escape is its own kind, and that is load-bearing: the
+    /// resolver reads the stored kind to decide whether allowing this crossing
+    /// requires an operator, because allowing it re-executes with no sandbox
+    /// where a path-scoped crossing only widens the path it names.
     #[test]
     fn shell_command_crossing_normalizes_descriptor() {
         let c = Crossing::shell_command("blocked".to_string(), "sudo   rm  -rf /");
-        assert_eq!(c.kind, CrossingKind::ShellEscape);
+        assert_eq!(c.kind, CrossingKind::ShellCommandEscape);
+        assert_ne!(
+            c.kind,
+            Crossing::shell_path(Path::new("/etc/hosts"), "/etc/hosts").kind,
+            "a command escape and a path crossing must not share a kind"
+        );
+        assert!(c.host_path().is_none(), "it names no path to widen");
         assert_eq!(
             c.descriptor,
             normalize_command_for_descriptor("sudo rm -rf /")

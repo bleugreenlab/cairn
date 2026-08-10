@@ -20,7 +20,7 @@ pub(crate) async fn read_node_memories_collection(
     node_id: &str,
 ) -> String {
     let db = orch.db.for_project(project).await;
-    let job_id = match crate::resources::node::resolve_node_or_task_job_id(
+    let job_id = match crate::resources::node::resolve_node_or_task_job_id_for_read(
         &db, project, number, exec_seq, node_id, None,
     )
     .await
@@ -28,21 +28,28 @@ pub(crate) async fn read_node_memories_collection(
         Ok(job_id) => job_id,
         Err(error) => return error,
     };
-    let memories = match crate::memories::db::load_memories_for_job(&db, &job_id).await {
+    let uri = format!("cairn://p/{project}/{number}/{exec_seq}/{node_id}/memories");
+    render_job_memories(&db, node_id, &uri, &job_id).await
+}
+
+pub(crate) async fn render_job_memories(
+    db: &crate::storage::LocalDb,
+    label: &str,
+    base_uri: &str,
+    job_id: &str,
+) -> String {
+    let memories = match crate::memories::db::load_memories_for_job(db, job_id).await {
         Ok(memories) => memories,
         Err(error) => return format!("Error listing node memories: {error}"),
     };
 
-    let mut out = format!(
-        "# Memories — {node_id}\n\n{} memory(ies)\n\n",
-        memories.len()
-    );
+    let mut out = format!("# Memories — {label}\n\n{} memory(ies)\n\n", memories.len());
     if memories.is_empty() {
         out.push_str("No memories captured for this node.\n\n");
     } else {
         for memory in &memories {
             let seq = memory.node_seq.unwrap_or_default() as i32;
-            let uri = build_node_memory_uri(project, number, exec_seq, node_id, seq);
+            let uri = format!("{base_uri}/{seq}");
             out.push_str(&format!(
                 "- [{}]({}) [{}; {}]\n",
                 memory_label(memory, &uri),
@@ -54,6 +61,22 @@ pub(crate) async fn read_node_memories_collection(
         out.push('\n');
     }
 
+    out
+}
+
+fn render_memory(memory: &Memory, uri: &str) -> String {
+    let title = memory.name.as_deref().unwrap_or(uri);
+    let mut out = format!(
+        "# Memory `{title}`\n\n`{uri}`\n\n[{}: {}]\n\n",
+        memory.scope, memory.scope_value
+    );
+    out.push_str(&memory.content);
+    out.push_str("\n\n## provenance\n");
+    out.push_str(&format!("- status: {}\n", memory.status));
+    if let Some(provenance) = &memory.provenance_uri {
+        out.push_str(&format!("- provenance turn: {provenance}\n"));
+    }
+    out.push('\n');
     out
 }
 
@@ -80,17 +103,5 @@ pub(crate) async fn read_node_memory(
         Err(_) => return format!("Memory not found at {node_id}/memories/{memory_seq}"),
     };
     let uri = build_node_memory_uri(project, number, exec_seq, node_id, memory_seq);
-    let title = memory.name.as_deref().unwrap_or(&uri);
-    let mut out = format!(
-        "# Memory `{title}`\n\n`{uri}`\n\n[{}: {}]\n\n",
-        memory.scope, memory.scope_value
-    );
-    out.push_str(&memory.content);
-    out.push_str("\n\n## provenance\n");
-    out.push_str(&format!("- status: {}\n", memory.status));
-    if let Some(provenance) = &memory.provenance_uri {
-        out.push_str(&format!("- provenance turn: {provenance}\n"));
-    }
-    out.push('\n');
-    out
+    render_memory(&memory, &uri)
 }

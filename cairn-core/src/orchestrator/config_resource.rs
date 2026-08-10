@@ -134,12 +134,12 @@ impl Orchestrator {
     /// a path-LESS `project_routes` stub, so until this runs the middle config
     /// layer is always absent (the route has no `local_repo_path`). This seeds a
     /// remoteless git repo at `<config_dir>/teams/<team>/workspace` — an exact
-    /// twin of `~/.cairn` via [`sync_workspace_bundle`] — then fills that route's
+    /// twin of `~/.cairn` via [`sync_workspace_packs`] — then fills that route's
     /// clone path under the team-scoped [`team_workspace_key`]. Idempotent: a
     /// re-run only re-syncs the bundle and re-asserts the same route.
     ///
     /// `resource_dir` is the app bundle's resource directory, the same bundle
-    /// source the personal `sync_workspace_bundle` copies from. The DB-owning
+    /// source the personal `sync_workspace_packs` copies from. The DB-owning
     /// runner has no `resource_dir` of its own, so the desktop — which alone
     /// resolves it — supplies it (a real local path both same-machine processes
     /// read). Requires the team replica to be open (the `is_workspace` row lives
@@ -154,7 +154,7 @@ impl Orchestrator {
 
         // Seed the remoteless bundle twin BEFORE recording the route, so a
         // resolved clone path always points at an initialized repo.
-        crate::workspace::bundle::sync_workspace_bundle(
+        crate::workspace::bundle::sync_workspace_packs(
             &crate::services::RealGitClient,
             &crate::services::RealFileSystem,
             resource_dir,
@@ -1044,6 +1044,27 @@ pub(crate) fn emit_config_change<R: ConfigResource>(orch: &Orchestrator, action:
     );
 }
 
+impl Orchestrator {
+    /// Announce that the resolved resource-pack registry changed.
+    ///
+    /// A pack install, update, restore, uninstall, or single-item removal moves
+    /// content across every list a pack can contribute to — agents, skills,
+    /// recipes, workflows, responses, and the MCP registry — none of which are
+    /// database rows, so none of them produce a `db-change`. Without this one
+    /// signal a settings screen keeps showing the pre-change workspace until the
+    /// app restarts, which is exactly what CAIRN-3819 recorded happening live.
+    ///
+    /// Callers emit only after the filesystem, lock, and Git work has
+    /// succeeded: an event for a workspace that did not move is a refetch that
+    /// can only confuse.
+    pub fn emit_pack_registry_change(&self) {
+        let _ = self
+            .services
+            .emitter
+            .emit("config-changed", serde_json::json!({"entity_type": "pack"}));
+    }
+}
+
 pub(crate) fn emit_db_change<R: ConfigResource>(orch: &Orchestrator, action: &str) {
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -1445,6 +1466,30 @@ mod tests {
         );
     }
 
+    /// An app-bundle resource directory in the shipped PACK layout: one default
+    /// pack carrying `files`, keyed by workspace-relative path.
+    ///
+    /// Resources are discovered per pack, so a flat `resources/agents/` tree —
+    /// which is what the app shipped before packs — declares no pack at all and
+    /// seeds nothing. Building the fixture through the same layout production
+    /// ships is what keeps these tests honest about what a team clone receives.
+    fn shipped_resource_dir(root: &std::path::Path, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let resource_dir = root.join("resources");
+        let core = resource_dir.join("packs").join("core");
+        std::fs::create_dir_all(&core).unwrap();
+        std::fs::write(
+            core.join("cairn-pack.yaml"),
+            "cairnVersion: 1\nid: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
+        )
+        .unwrap();
+        for (relative, body) in files {
+            let path = core.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        resource_dir
+    }
+
     /// Phase 2 activation, end-to-end: `ensure_team_workspace` materializes the
     /// remoteless bundle twin, records the clone path under the team-scoped
     /// route key, and only THEN does the read-path `team_workspace_path` resolve
@@ -1463,13 +1508,13 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
 
         // A minimal app-bundle resource dir with one bundled agent to seed.
-        let resource_dir = temp.path().join("resources");
-        std::fs::create_dir_all(resource_dir.join("agents")).unwrap();
-        std::fs::write(
-            resource_dir.join("agents").join("example.md"),
-            "---\nname: example\ndescription: Bundled\ntools:\n  - Read\n---\n\nPrompt.\n",
-        )
-        .unwrap();
+        let resource_dir = shipped_resource_dir(
+            temp.path(),
+            &[(
+                "agents/example.md",
+                "---\nname: example\ndescription: Bundled\ntools:\n  - Read\n---\n\nPrompt.\n",
+            )],
+        );
 
         let local = Arc::new(crate::storage::migrated_test_db("tws-ensure-local.db").await);
         let team = Arc::new(crate::storage::migrated_test_db("tws-ensure-team.db").await);
@@ -1573,8 +1618,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config_dir = temp.path().join("cairn-home");
         std::fs::create_dir_all(config_dir.join("agents")).unwrap();
-        let resource_dir = temp.path().join("resources");
-        std::fs::create_dir_all(resource_dir.join("agents")).unwrap();
+        let resource_dir = shipped_resource_dir(temp.path(), &[]);
 
         let local = Arc::new(crate::storage::migrated_test_db("tws-author-local.db").await);
         let team = Arc::new(crate::storage::migrated_test_db("tws-author-team.db").await);
@@ -1729,8 +1773,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config_dir = temp.path().join("cairn-home");
         std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
-        let resource_dir = temp.path().join("resources");
-        std::fs::create_dir_all(resource_dir.join("recipes")).unwrap();
+        let resource_dir = shipped_resource_dir(temp.path(), &[]);
 
         let local = Arc::new(crate::storage::migrated_test_db("tws-recipe-local.db").await);
         let team = Arc::new(crate::storage::migrated_test_db("tws-recipe-team.db").await);

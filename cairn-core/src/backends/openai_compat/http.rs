@@ -22,6 +22,52 @@ pub(crate) struct Endpoint {
     pub(crate) extra_body: Option<Value>,
 }
 
+pub(crate) fn post_chat_completion(
+    endpoint: &Endpoint,
+    mut body: Value,
+    timeout: Duration,
+) -> Result<ChatResponse, crate::backends::CompletionError> {
+    use crate::backends::CompletionError;
+    if let Some(extra) = &endpoint.extra_body {
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            body.extend(extra.clone());
+        }
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| CompletionError::Upstream(error.to_string()))?;
+    let response = client
+        .post(&endpoint.chat_url)
+        .headers(
+            endpoint
+                .header_map()
+                .map_err(CompletionError::InvalidRequest)?,
+        )
+        .json(&body)
+        .send()
+        .map_err(|error| {
+            if error.is_timeout() {
+                CompletionError::Timeout
+            } else {
+                CompletionError::Upstream(error.to_string())
+            }
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().unwrap_or_default();
+        return Err(CompletionError::Upstream(format!(
+            "{} chat completion returned HTTP {}: {}",
+            endpoint.provider_name,
+            status.as_u16(),
+            text
+        )));
+    }
+    response
+        .json()
+        .map_err(|error| CompletionError::InvalidResponse(error.to_string()))
+}
+
 impl Endpoint {
     fn header_map(&self) -> Result<HeaderMap, String> {
         let mut map = HeaderMap::new();

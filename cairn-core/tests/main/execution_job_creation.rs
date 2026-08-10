@@ -8,9 +8,10 @@ use std::sync::Arc;
 use cairn_core::internal::execution::creation::create_jobs_for_execution;
 use cairn_core::internal::storage::LocalDb;
 use cairn_core::models::{
-    AgentGitConfig, AgentNodeConfig, BranchMode, ExecutionSnapshot, Job, JobStatus, NodePosition,
-    RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger,
-    TriggerContext, TriggerType,
+    AgentGitConfig, AgentNodeConfig, BranchMode, DelegatedOutputContract, DelegatedOwnershipScope,
+    DelegatedSessionStrategy, DelegatedStatus, DelegatedWorkPacket, DelegationOrigin,
+    ExecutionSnapshot, Job, JobStatus, NodePosition, OutputSchema, RecipeEdge, RecipeEdgeType,
+    RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
 };
 use cairn_db::turso::params;
 
@@ -119,6 +120,112 @@ fn node_ids(jobs: &[Job]) -> HashSet<String> {
     jobs.iter()
         .filter_map(|job| job.recipe_node_id.clone())
         .collect()
+}
+
+/// The packet a thread's session writes when it delegates a task, already
+/// materialized onto `agent_node_id` — the state the DAG expander leaves behind
+/// just before job creation runs.
+fn delegated_packet(parent_job_id: &str, agent_node_id: &str) -> DelegatedWorkPacket {
+    DelegatedWorkPacket {
+        id: "packet-1".to_string(),
+        parent_job_id: parent_job_id.to_string(),
+        parent_turn_id: None,
+        parent_tool_use_id: Some("tool-1".to_string()),
+        origin: DelegationOrigin::TaskTool,
+        title: "Survey".to_string(),
+        problem_statement: "Look into it".to_string(),
+        agent_config_id: "Explore".to_string(),
+        ownership: DelegatedOwnershipScope {
+            cwd: "/scratch".to_string(),
+            fence: None,
+            sandbox: None,
+            on_escape: None,
+        },
+        session: DelegatedSessionStrategy::default(),
+        acceptance: vec![],
+        output_contract: DelegatedOutputContract {
+            schema_type: OutputSchema::Preset("return".to_string()),
+            tool_name: None,
+            description: None,
+        },
+        status: DelegatedStatus::Materialized,
+        materialized_node_ids: vec![agent_node_id.to_string()],
+        result_artifact_job_id: None,
+        task_index: Some(0),
+        tier_override: None,
+        backend_preference: None,
+        background: false,
+        created_at: 1,
+    }
+}
+
+/// A task delegated by a thread's session belongs to that thread, and the proof
+/// is the query the thread pane actually consumes.
+///
+/// `list_jobs_for_thread` selects on `jobs.thread_id` alone, so a task created
+/// without it is not merely mislabeled — it cannot appear in the thread's task
+/// rollup, cannot be opened as a tab, and contributes nothing to the thread's
+/// status or artifacts. Nothing stamped that column for a delegated child
+/// (CAIRN-3861), and asserting on the INSERT alone would not have caught it:
+/// the delegating parent is named by the packet, not by the execution graph the
+/// insert derives its `parent_job_id` from.
+#[tokio::test]
+async fn a_task_delegated_by_a_thread_session_is_listed_under_that_thread() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "JCT").await;
+    let execution_id = "execution-thread";
+    let agent_node_id = "delegated-packet-1-agent";
+
+    // The thread and its branchless session job, exactly as `ensure_thread_session`
+    // mints them: no execution, no issue, the reserved `thread` segment.
+    db.execute(
+        "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+         VALUES ('th', ?1, 'general', 'active', 'none', 1, 1)",
+        params![project_id.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO jobs (id, thread_id, project_id, status, uri_segment, node_name,
+                           created_at, updated_at)
+         VALUES ('j-session', 'th', ?1, 'idle', 'thread', 'Thread', 1, 1)",
+        params![project_id.as_str()],
+    )
+    .await
+    .unwrap();
+
+    // Delegation books its packets in a synthetic, issue-less execution whose
+    // graph holds only the materialized task — the session owns no node in it.
+    let mut snapshot = snapshot(
+        &project_id,
+        vec![
+            node("delegated-packet-1-trigger", RecipeNodeType::Trigger, None),
+            node(agent_node_id, RecipeNodeType::Agent, Some("Explore")),
+        ],
+        vec![control_edge(
+            "edge-1",
+            "delegated-packet-1-trigger",
+            agent_node_id,
+        )],
+    );
+    snapshot.delegated_packets = vec![delegated_packet("j-session", agent_node_id)];
+    insert_execution(&db, execution_id, &snapshot).await;
+
+    let jobs = create_jobs_for_execution(db.clone(), execution_id).unwrap();
+    let task = jobs
+        .iter()
+        .find(|job| job.recipe_node_id.as_deref() == Some(agent_node_id))
+        .expect("the delegated agent node materializes a job");
+
+    let listed = cairn_core::internal::jobs::queries::list_jobs_for_thread(&db, "th")
+        .await
+        .unwrap();
+    assert!(
+        listed.iter().any(|job| job.id == task.id),
+        "the thread's own pane cannot see the task it spawned: {:?}",
+        listed.iter().map(|job| job.id.as_str()).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

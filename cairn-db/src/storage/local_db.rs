@@ -1,3 +1,4 @@
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5,10 +6,12 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
+use futures_util::FutureExt;
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use turso::{params::IntoParams, Builder, Connection, Row};
 
+use super::blocking::panic_message;
 use super::content_store::{ContentStore, PrivateContentStore, TeamReplicaContext};
 use super::{DbError, DbResult, RowExt};
 use crate::storage::TeamId;
@@ -61,6 +64,34 @@ pub fn install_crypto_provider() {
 /// dropped. Warm connections are the point of the pool, so the cap only needs to
 /// cover the realistic peak of *simultaneous* transactions.
 const MAX_IDLE_CONNECTIONS: usize = 32;
+
+/// Per-connection page cache ceiling, as a negative `PRAGMA cache_size` (KiB).
+///
+/// The engine's default is `-2000` — two megabytes, a few hundred pages. The MVCC
+/// checkpoint walks the b-tree applying every row in the logical log while holding
+/// a cursor per b-tree, and a cursor pins the pages it is parked on, so a schema
+/// with a few hundred b-trees puts real pressure on a cache that small.
+///
+/// This began as a correctness floor. On the engine revision pinned through August
+/// 2026 the checkpoint reached a page the cache could not admit, gave up, and
+/// reported that as `Busy` — indistinguishable from contention, and reported
+/// against a database nothing else was touching. Worse, the failure was not safe:
+/// the checkpoint had already published a b-tree root page the rollback then took
+/// back, so later reads of that table ran off the end of the file (CAIRN-3838).
+///
+/// Neither is true on the current pin. A cache that cannot admit a page spills and
+/// then force-inserts past its nominal capacity instead of failing, and root-map
+/// mutations are staged until the pager commit. What remains is a working-set
+/// target: a checkpoint with room to work spills far less, and a checkpoint that
+/// cannot finish promptly is a logical log that does not truncate. Measured against
+/// a copy of a 9.2 GB database carrying a 136 MB logical log, 16 MB completed and
+/// reset the log to 98 bytes where the 2 MB default did not; 64 MB is that with 4x
+/// headroom.
+///
+/// It is a ceiling rather than a reservation, so a connection that never
+/// checkpoints does not pay it, and the cost is bounded by the pool's
+/// [`MAX_IDLE_CONNECTIONS`] plus whatever transactions are genuinely in flight.
+const PAGE_CACHE_LIMIT: i32 = -65536;
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -379,8 +410,10 @@ impl LocalDb {
         };
         conn.busy_timeout(self.retry.busy_timeout)?;
         // Set once, at creation: a pooled connection keeps its pragmas across
-        // checkouts, so re-issuing this per checkout would be pure round-trip.
+        // checkouts, so re-issuing these per checkout would be pure round-trip.
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+        conn.execute(&format!("PRAGMA cache_size = {PAGE_CACHE_LIMIT}"), ())
+            .await?;
         Ok(conn)
     }
 
@@ -815,6 +848,43 @@ struct TxAttempt<T> {
     reusable: bool,
 }
 
+/// Run the statement that ends a transaction, containing a panic raised inside
+/// the database engine.
+///
+/// Turso checks pager invariants with assertions rather than errors, and
+/// `ROLLBACK` is where they are checked: `rollback_tx` asserts that a
+/// non-writing transaction left no dirty pages behind. A connection can fail
+/// that assertion through no fault of the statement running on it. In the
+/// episode that motivated this, the assertion fired on connections doing
+/// ordinary reads, in a process where every MVCC auto-checkpoint had been
+/// failing for days (CAIRN-3838); the route from that failure to this assertion
+/// has not been pinned down, and the reproduction on that issue reaches
+/// different bounds checks first. What the assertion establishes either way is
+/// local and sufficient: this connection's pager is not in the state the engine
+/// expects, so it is unfit to hand to the next caller.
+///
+/// Letting that panic unwind spends a user's action on a pooled connection's
+/// private corruption — the failure the caller sees has nothing to do with what
+/// it asked for. Containing it here turns the panic into what it actually is:
+/// evidence that this connection's transaction state is unknown, which is
+/// already the pool's condition for retiring one ([`TxAttempt::reusable`]). The
+/// connection is dropped either way; only the caller's fate differs.
+async fn end_tx(conn: &Connection, sql: &'static str) -> DbResult<()> {
+    match AssertUnwindSafe(conn.execute(sql, ())).catch_unwind().await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(payload) => {
+            let message = panic_message(&*payload);
+            log::error!(
+                "{sql} panicked inside the database engine ({message}); retiring this connection"
+            );
+            Err(DbError::internal(format!(
+                "{sql} panicked inside the database engine: {message}"
+            )))
+        }
+    }
+}
+
 async fn run_tx<T>(
     conn: &Connection,
     begin_sql: &str,
@@ -831,21 +901,21 @@ async fn run_tx<T>(
     }
 
     match f(conn).await {
-        Ok(value) => match conn.execute("COMMIT", ()).await {
-            Ok(_) => TxAttempt {
+        Ok(value) => match end_tx(conn, "COMMIT").await {
+            Ok(()) => TxAttempt {
                 result: Ok(value),
                 reusable: true,
             },
             Err(error) => {
-                let reusable = conn.execute("ROLLBACK", ()).await.is_ok();
+                let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
                 TxAttempt {
-                    result: Err(error.into()),
+                    result: Err(error),
                     reusable,
                 }
             }
         },
         Err(error) => {
-            let reusable = conn.execute("ROLLBACK", ()).await.is_ok();
+            let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
             TxAttempt {
                 result: Err(error),
                 reusable,
@@ -867,18 +937,28 @@ async fn run_read_tx<T>(
     }
 
     match f(conn).await {
-        Ok(value) => match conn.execute("ROLLBACK", ()).await {
-            Ok(_) => TxAttempt {
+        Ok(value) => {
+            // A read transaction's teardown cannot invalidate what it already
+            // read: the rows came from one consistent snapshot, and rolling a
+            // read transaction back discards nothing. So a `ROLLBACK` that
+            // fails — or that panics on an engine assertion (see [`end_tx`]) —
+            // condemns the connection and nothing else, and the value it
+            // produced is returned rather than thrown away with it. Reporting
+            // the teardown instead would fail a read that had already
+            // succeeded, on grounds the caller can neither see nor act on.
+            let outcome = end_tx(conn, "ROLLBACK").await;
+            if let Err(error) = &outcome {
+                log::warn!(
+                    "read transaction completed but its ROLLBACK failed ({error}); returning the value and retiring this connection"
+                );
+            }
+            TxAttempt {
                 result: Ok(value),
-                reusable: true,
-            },
-            Err(error) => TxAttempt {
-                result: Err(error.into()),
-                reusable: false,
-            },
-        },
+                reusable: outcome.is_ok(),
+            }
+        }
         Err(error) => {
-            let reusable = conn.execute("ROLLBACK", ()).await.is_ok();
+            let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
             TxAttempt {
                 result: Err(error),
                 reusable,
@@ -1021,6 +1101,81 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    /// Every connection must carry the page cache ceiling, not just the one
+    /// that happened to configure the database: any connection can be the one
+    /// that commits, and committing is what runs the checkpoint whose working
+    /// set the default 2 MB cannot hold. A pooled connection and a fresh one
+    /// both have to be covered, so this asserts on both.
+    #[tokio::test]
+    async fn every_connection_carries_the_page_cache_ceiling() {
+        let db = test_db().await.unwrap();
+
+        assert_eq!(
+            query_i64(&db, "PRAGMA cache_size").await.unwrap(),
+            PAGE_CACHE_LIMIT as i64,
+            "a pooled connection must raise the cache ceiling above the engine default"
+        );
+
+        // The raw out-of-pool escape hatch takes the same configuration.
+        let direct = db.connect().await.unwrap();
+        let mut rows = direct.query("PRAGMA cache_size", ()).await.unwrap();
+        let value = rows.next().await.unwrap().unwrap().i64(0).unwrap();
+        assert_eq!(
+            value, PAGE_CACHE_LIMIT as i64,
+            "a connection opened outside the pool must be configured too"
+        );
+    }
+
+    /// A read that finished must not be failed by its own teardown. The engine
+    /// can refuse or blow up on the terminal `ROLLBACK` for reasons private to
+    /// the connection — page state wrecked by a failed auto-checkpoint is the one
+    /// that reached users, surfacing as "Database task panicked" on every session
+    /// resume (CAIRN-3838). Rolling a read transaction back discards nothing, so
+    /// the only thing that failure establishes is that the connection is unfit to
+    /// reuse.
+    ///
+    /// The closure ends its own transaction, so the outer `ROLLBACK` arrives
+    /// with nothing to roll back and fails — the same teardown-failed shape,
+    /// reachable without a corrupt pager.
+    #[tokio::test]
+    async fn a_completed_read_survives_a_failing_teardown_and_retires_its_connection() {
+        let db = test_db().await.unwrap();
+        db.execute("INSERT INTO counters(id, value) VALUES ('read', 5)", ())
+            .await
+            .unwrap();
+        let before = db.connections_created.load(Ordering::Relaxed);
+
+        let value = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query("SELECT value FROM counters WHERE id = 'read'", ())
+                        .await?;
+                    let value = rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| DbError::Row("missing value row".to_string()))?
+                        .i64(0)?;
+                    drop(rows);
+                    conn.execute("ROLLBACK", ()).await?;
+                    Ok(value)
+                })
+            })
+            .await
+            .expect("a completed read must return its value even when teardown fails");
+        assert_eq!(value, 5);
+
+        // The connection's transaction state is unknown, so it is retired
+        // rather than handed to the next caller's BEGIN.
+        db.execute("INSERT INTO counters(id, value) VALUES ('after', 1)", ())
+            .await
+            .unwrap();
+        assert!(
+            db.connections_created.load(Ordering::Relaxed) > before,
+            "a connection whose teardown failed must be retired, not reused"
         );
     }
 

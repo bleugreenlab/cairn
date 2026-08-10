@@ -12,6 +12,63 @@
 //! Both `ClaudeBackend` and `CodexBackend` call [`resolve_tools`] from their
 //! `resolve_tools()` implementations.
 
+use std::collections::BTreeSet;
+use std::sync::{Mutex, OnceLock};
+
+/// Does this declared tool name sit outside Cairn's surface?
+///
+/// Every tool Cairn offers is an MCP tool: the three verbs (`mcp__cairn__*`),
+/// the corpus tools, and any external server reached through the `cairn://mcp`
+/// gateway. Nothing legitimate is a bare name, so a bare name in a live
+/// session's declared surface is a host-harness built-in that escaped
+/// `--disallowedTools`. That invariant is the durable check; the roster in
+/// [`crate::models::ALWAYS_DISALLOWED_TOOLS`] is only the list of escapees
+/// already known by name.
+fn is_native_leak(tool: &str) -> bool {
+    !tool.starts_with("mcp__")
+}
+
+/// Built-ins seen leaking into a live session's declared tool surface.
+///
+/// The CLI declares each of its built-ins unless the name appears in
+/// `--disallowedTools`, and that flag is fixed when the process spawns — so a
+/// leak is only observable after the fact, from the session's `init` event.
+/// Quarantining the name here disallows it for every later session in this
+/// process, which contains the leak without waiting for a release. It is a
+/// stopgap, not a second source of truth: the warning names the escapee so it
+/// can be folded into `ALWAYS_DISALLOWED_TOOLS`, which is what closes the hole
+/// for the first session after every restart.
+static QUARANTINED_TOOLS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn quarantine() -> &'static Mutex<BTreeSet<String>> {
+    QUARANTINED_TOOLS.get_or_init(Mutex::default)
+}
+
+/// Record the tool surface a session actually declared, returning the leaked
+/// names not already quarantined.
+///
+/// Returning only the newly-seen names keeps the caller's warning to once per
+/// escapee per process rather than once per session.
+pub(crate) fn record_declared_surface(declared: &[String]) -> Vec<String> {
+    let leaks = declared.iter().filter(|t| is_native_leak(t));
+    let mut quarantined = quarantine().lock().unwrap_or_else(|e| e.into_inner());
+    leaks
+        .filter(|t| quarantined.insert((*t).clone()))
+        .cloned()
+        .collect()
+}
+
+/// Names observed leaking earlier in this process, unioned into the disallow
+/// list of every session spawned afterwards.
+pub(crate) fn quarantined_tools() -> Vec<String> {
+    quarantine()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
 /// Map a friendly native tool name to its canonical Cairn verb.
 ///
 /// Only the three working verbs have aliases. Canonical Cairn names (and any
@@ -98,6 +155,49 @@ pub(crate) fn ensure_core_verbs(allowed: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_bare_names_count_as_leaks() {
+        // Everything Cairn offers is an MCP tool, whatever the server.
+        assert!(!is_native_leak("mcp__cairn__read"));
+        assert!(!is_native_leak("mcp__cairn__create_pr"));
+        assert!(!is_native_leak("mcp__axon__look"));
+        // A bare name can only have come from the host harness.
+        assert!(is_native_leak("ListAgents"));
+        assert!(is_native_leak("SendMessage"));
+    }
+
+    #[test]
+    fn declared_surface_reports_each_leak_once_and_quarantines_it() {
+        // Names unique to this test: the quarantine is process-global, so a
+        // real tool name here would bleed into sibling tests.
+        let declared = vec![
+            "mcp__cairn__read".to_string(),
+            "LeakOnceProbeA".to_string(),
+            "LeakOnceProbeB".to_string(),
+        ];
+
+        let first = record_declared_surface(&declared);
+        assert_eq!(
+            first,
+            vec!["LeakOnceProbeA".to_string(), "LeakOnceProbeB".to_string()],
+            "every bare name is reported the first time it is seen"
+        );
+
+        // A second session declaring the same surface warns about nothing new.
+        assert!(
+            record_declared_surface(&declared).is_empty(),
+            "an already-quarantined leak must not warn again"
+        );
+
+        let quarantined = quarantined_tools();
+        assert!(quarantined.contains(&"LeakOnceProbeA".to_string()));
+        assert!(quarantined.contains(&"LeakOnceProbeB".to_string()));
+        assert!(
+            !quarantined.contains(&"mcp__cairn__read".to_string()),
+            "Cairn's own tools must never be quarantined"
+        );
+    }
 
     #[test]
     fn read_aliases_to_cairn_read() {

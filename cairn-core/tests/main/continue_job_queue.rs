@@ -9,7 +9,9 @@
 //! resume branch stays covered by `continue_job_impl`'s own paths.
 
 use crate::common;
-use cairn_core::internal::execution::jobs::continue_job_or_enqueue;
+use cairn_core::internal::execution::jobs::{
+    continue_job_or_enqueue, continue_job_or_enqueue_with_before_resume_for_test,
+};
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 
@@ -73,6 +75,54 @@ async fn seed_job(db: &LocalDb, turn_state: &str) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn settling_boundary_queues_instead_of_leaving_a_delivered_orphan() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    seed_job(&orch.db.local, "completed").await;
+    let db = orch.db.local.clone();
+
+    continue_job_or_enqueue_with_before_resume_for_test(
+        &orch,
+        "job-1",
+        Some("boundary message"),
+        "boundary-request",
+        move || {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        db.execute("UPDATE turns SET state = 'running' WHERE id = 'turn-1'", ()),
+                    )
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        },
+    )
+    .expect("a turn winning after classification must convert the send to queue");
+    continue_job_or_enqueue_with_before_resume_for_test(
+        &orch,
+        "job-1",
+        Some("boundary message"),
+        "boundary-request",
+        || {},
+    )
+    .expect("retrying the raced operation must return the original queue row");
+
+    assert_eq!(
+        queued_rows(&orch.db.local, "job-1").await,
+        vec![("boundary message".to_string(), "queue".to_string())],
+        "the same operation id must produce exactly one pending row"
+    );
+    assert_eq!(
+        recorded_rows(&orch.db.local, "job-1").await,
+        vec![("boundary message".to_string(), false)],
+        "the raced message remains claimable rather than stamped delivered"
+    );
 }
 
 /// COUNT(*) FROM turns for the job. The queue path must not create a successor
@@ -214,8 +264,14 @@ async fn a_queued_operator_message_leaves_the_watching_coordinator_a_passive_cat
     seed_job(&orch.db.local, "running").await;
     seed_coordinating_parent(&orch.db.local).await;
 
-    continue_job_or_enqueue(&orch, "job-1", Some("also ship the trusted producer"), None)
-        .expect("queued send must return Ok");
+    continue_job_or_enqueue(
+        &orch,
+        "job-1",
+        Some("also ship the trusted producer"),
+        None,
+        None,
+    )
+    .expect("queued send must return Ok");
 
     assert_eq!(
         catchup_pushes(&orch.db.local, "coordinator").await,
@@ -235,7 +291,7 @@ async fn continue_job_or_enqueue_queues_when_head_turn_running() {
     let before_turns = turn_count(&orch.db.local, "job-1").await;
 
     // A racy send against a running head turn queues instead of 500ing.
-    continue_job_or_enqueue(&orch, "job-1", Some("ping"), None)
+    continue_job_or_enqueue(&orch, "job-1", Some("ping"), None, None)
         .expect("queued send must return Ok, not the active-turn error");
 
     assert_eq!(
@@ -257,7 +313,7 @@ async fn continue_job_or_enqueue_queues_when_head_turn_pending() {
     let (_temp, orch) = common::test_orchestrator().await;
     seed_job(&orch.db.local, "pending").await;
 
-    continue_job_or_enqueue(&orch, "job-1", Some("ping"), None)
+    continue_job_or_enqueue(&orch, "job-1", Some("ping"), None, None)
         .expect("queued send must return Ok, not the active-turn error");
 
     assert_eq!(
@@ -267,45 +323,25 @@ async fn continue_job_or_enqueue_queues_when_head_turn_pending() {
     );
 }
 
-/// CAIRN-3390: an idle child takes the operator's text straight into the resume,
-/// so the queue never sees it and the only trace left behind is a `user`
-/// transcript event — the same slot the job's launch prompt and every
-/// machinery-delivered payload land in. The send is recorded here regardless,
-/// stamped delivered on arrival, so the record of what the operator said to this
-/// job stays complete for the watchers' catch-up digest. Being already delivered
-/// is what keeps it inert: no claim path, and no pending surface, can see it.
+/// A direct idle send is recorded as delivered only after the authoritative
+/// continuation path has accepted it. This fixture has no runnable worktree, so
+/// the continuation fails and must not leave a delivered-only orphan behind.
 #[tokio::test(flavor = "current_thread")]
-async fn an_idle_child_send_is_recorded_delivered_and_never_claimed() {
+async fn a_rejected_idle_send_is_not_stamped_delivered() {
     let (_temp, orch) = common::test_orchestrator().await;
     seed_job(&orch.db.local, "completed").await;
-    seed_coordinating_parent(&orch.db.local).await;
     let before_turns = turn_count(&orch.db.local, "job-1").await;
 
-    // The resume itself fails for lack of a real worktree/process; the record is
-    // written before it, and must survive that.
-    let _ = continue_job_or_enqueue(&orch, "job-1", Some("^"), None);
+    assert!(continue_job_or_enqueue(&orch, "job-1", Some("^"), None, None).is_err());
 
-    assert_eq!(
-        recorded_rows(&orch.db.local, "job-1").await,
-        vec![("^".to_string(), true)],
-        "the operator's send is recorded, already delivered"
-    );
     assert!(
-        cairn_core::messages::queued::list_pending_for_job(&orch.db.local, "job-1")
-            .unwrap()
-            .is_empty(),
-        "a delivered-on-arrival row is not pending work: the composer strip, the \
-         claim paths, and edit/delete all pass over it"
+        recorded_rows(&orch.db.local, "job-1").await.is_empty(),
+        "a failed direct dispatch must not claim that the message was delivered"
     );
     assert_eq!(
         turn_count(&orch.db.local, "job-1").await,
         before_turns,
-        "recording the send must not create a turn of its own"
-    );
-    assert_eq!(
-        catchup_pushes(&orch.db.local, "coordinator").await,
-        vec![("catchup:job-1".to_string(), "passive".to_string())],
-        "the coordinator still hears about an operator message to an idle child"
+        "a rejected dispatch must not create a turn"
     );
 }
 
@@ -317,8 +353,8 @@ async fn continue_job_or_enqueue_empty_message_does_not_queue() {
     // Whitespace-only and absent messages have nothing to enqueue, so they fall
     // straight through to continue_job_impl (which errors here for lack of a real
     // worktree/process). Neither must leave a queued row behind.
-    let _ = continue_job_or_enqueue(&orch, "job-1", Some("   "), None);
-    let _ = continue_job_or_enqueue(&orch, "job-1", None, None);
+    let _ = continue_job_or_enqueue(&orch, "job-1", Some("   "), None, None);
+    let _ = continue_job_or_enqueue(&orch, "job-1", None, None, None);
 
     assert!(
         queued_rows(&orch.db.local, "job-1").await.is_empty(),

@@ -120,17 +120,43 @@ pub async fn allocate_top_level_segment(
     Ok(next_available_segment(base_segment, &reserved))
 }
 
+/// Allocate a sub-agent task's segment, deduped across everything its ADDRESS
+/// could collide with.
+///
+/// For a task under an issue node that is its parent job: the address is
+/// `.../{exec}/{node}/task/{segment}`, and the node is in it, so siblings under
+/// one parent are the whole namespace.
+///
+/// For a task under a THREAD the address is `.../{thread}/task/{segment}` — it
+/// names the thread, never the session job that spawned the task. A thread mints
+/// a fresh session whenever its previous one goes terminal
+/// (`ensure_thread_session_conn`), so deduping per parent would let two sessions
+/// of one thread each hand out the same segment from a description they both
+/// slugify the same way, and two distinct jobs would answer to one URI. Whichever
+/// resolved would take the other's artifact writes, todos, and messages.
+/// Uniqueness therefore has to be scoped the way the address is: across every
+/// task of every session of that thread.
 pub async fn allocate_child_task_segment(
     conn: &cairn_db::turso::Connection,
     parent_job_id: &str,
     base_segment: &str,
 ) -> DbResult<String> {
+    // The thread arm contributes nothing when the parent is an ordinary node:
+    // its `thread_id` is NULL, and `session.thread_id = NULL` is never true.
     let reserved = existing_segments(
         conn,
-        "SELECT uri_segment
-         FROM jobs
-         WHERE parent_job_id = ?1
-           AND uri_segment IS NOT NULL",
+        "SELECT task.uri_segment
+         FROM jobs task
+         LEFT JOIN jobs session ON session.id = task.parent_job_id
+         WHERE task.uri_segment IS NOT NULL
+           AND (
+             task.parent_job_id = ?1
+             OR (
+               session.parent_job_id IS NULL
+               AND session.uri_segment = 'thread'
+               AND session.thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
+             )
+           )",
         parent_job_id,
     )
     .await?;
@@ -278,5 +304,102 @@ mod tests {
 
         assert_eq!(seg, "pr-2");
         assert_eq!(seg2, "pr-3");
+    }
+
+    /// Two sessions of one thread cannot hand out the same task segment.
+    ///
+    /// A thread task is addressed `.../{thread}/task/{segment}` — the session it
+    /// hangs off is not in the URI. A thread mints a fresh session whenever its
+    /// previous one goes terminal, so deduping per parent job would let the
+    /// second session reissue a segment the first already used (recurring thread
+    /// work reuses descriptions, and segments are description slugs). Two jobs
+    /// would then answer to one address, and whichever resolved would take the
+    /// other's artifact writes, todos, and messages.
+    ///
+    /// An issue node's tasks are unaffected: the node IS in their address, so
+    /// their namespace stays the parent job.
+    #[tokio::test]
+    async fn a_thread_task_segment_is_unique_across_every_session_of_the_thread() {
+        use crate::storage::{DbError, LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("thread-seg.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        let (across_sessions, under_a_node) = db
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'W', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                         VALUES ('p', 'w', 'N', 'K', '/tmp', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+                         VALUES ('th', 'p', 'general', 'active', 'none', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    // The thread's first session went terminal, so a second was
+                    // minted alongside it — the shape `general` is in today.
+                    conn.execute(
+                        "INSERT INTO jobs (id, thread_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+                         VALUES ('s1', 'th', 'p', 'complete', 'thread', 'Thread', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO jobs (id, thread_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+                         VALUES ('s2', 'th', 'p', 'idle', 'thread', 'Thread', 2, 2)",
+                        (),
+                    )
+                    .await?;
+                    // The first session already spawned `survey`, which now owns
+                    // cairn://p/K/general/task/survey.
+                    conn.execute(
+                        "INSERT INTO jobs (id, parent_job_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+                         VALUES ('t1', 's1', 'p', 'complete', 'survey', 'Explore', 3, 3)",
+                        (),
+                    )
+                    .await?;
+
+                    // The SECOND session spawns a task from the same description.
+                    let across_sessions = allocate_child_task_segment(conn, "s2", "survey").await?;
+
+                    // An ordinary issue node with a `survey` task of its own must
+                    // not be pulled into the thread's namespace.
+                    conn.execute(
+                        "INSERT INTO jobs (id, project_id, status, uri_segment, node_name, created_at, updated_at)
+                         VALUES ('node', 'p', 'running', 'builder', 'Builder', 4, 4)",
+                        (),
+                    )
+                    .await?;
+                    let under_a_node = allocate_child_task_segment(conn, "node", "survey").await?;
+
+                    Ok::<_, DbError>((across_sessions, under_a_node))
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            across_sessions, "survey-2",
+            "a second session must not reissue a segment the thread's address already resolves"
+        );
+        assert_eq!(
+            under_a_node, "survey",
+            "an issue node's task namespace is its own parent job, and stays that way"
+        );
     }
 }

@@ -47,15 +47,20 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
         ActiveSearch::Provider { id, options } => (id, options),
     };
 
-    let api_key = match crate::config::secrets::get_secret(
-        &crate::config::secrets::credential_key(id.as_str(), None),
+    // Through the broker, so the key is a scrub target before it is put in a
+    // header or a request body. A search provider echoes the query back and can
+    // echo an authorization failure back with it; without registration, a
+    // provider that quotes the offending key in its error body would put it
+    // straight into the tool result the agent reads.
+    let Some(api_key) = crate::security::broker::web_provider_key(
+        id.as_str(),
         id.secret_var(),
-    ) {
-        Some(k) if !k.trim().is_empty() => k,
-        _ => return Ok(missing_key_message(id)),
+        "web search request",
+    ) else {
+        return Ok(missing_key_message(id));
     };
 
-    let prepared = build_request(id, query, &options, &api_key);
+    let prepared = build_request(id, query, &options, api_key.expose());
     let client = reqwest::Client::new();
     let resp = send(&client, &prepared)
         .send()

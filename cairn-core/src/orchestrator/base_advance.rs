@@ -27,7 +27,7 @@ use crate::messages::queued::DeliveryUrgency;
 use crate::models::ExecutionSnapshot;
 use crate::orchestrator::conflict_session::{
     close_open_sessions_for_branch, record_conflict_session, record_marker_state,
-    supersede_stale_sessions, IncomingIdentity, MarkerState,
+    supersede_stale_sessions, IncomingIdentity, MarkerState, ReplayDecision,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -198,6 +198,9 @@ struct MergedJob {
     id: String,
     project_id: String,
     issue_id: Option<String>,
+    /// The branch that just merged, and is about to be deleted. Anything cut
+    /// from it is stranded the moment it goes.
+    branch: Option<String>,
     base_branch: Option<String>,
 }
 
@@ -824,6 +827,31 @@ async fn reconcile_jj_downstream(
         );
     }
 
+    // Anything cut FROM the branch that just merged loses its base the moment
+    // that branch is deleted. Re-point it before the sibling set is read, so
+    // those children inherit this advance in the same pass instead of being
+    // stranded by it.
+    if let Some(merged_branch) = merged_job
+        .branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty() && *branch != base_branch)
+    {
+        if let Err(error) = repoint_children_of_merged_branch(
+            db,
+            &merged_job.project_id,
+            merged_branch,
+            base_branch,
+        )
+        .await
+        {
+            log::warn!(
+                "merged job {}: could not re-point work cut from `{merged_branch}` onto \
+                 `{base_branch}`: {error}",
+                merged_job.id
+            );
+        }
+    }
+
     let siblings =
         load_sibling_jobs(db, &merged_job.project_id, base_branch, &merged_job.id).await?;
     if siblings.is_empty() {
@@ -1209,6 +1237,9 @@ struct ReconcileClaim {
 
 const RECONCILE_LEASE_SECONDS: i64 = 600;
 
+/// How often the durable sweep revisits queued reconcile work.
+pub(crate) const RECONCILE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn release_reconcile_claim(db: &LocalDb, claim: &ReconcileClaim) {
     if let Err(error) = db
         .execute(
@@ -1401,6 +1432,23 @@ async fn execute_durable_reconcile_work(
 
 fn first_claim_this_sweep(claimed: &mut HashSet<String>, intent_id: &str) -> bool {
     claimed.insert(intent_id.to_owned())
+}
+
+/// Run one sweep pass so that a panic inside it becomes a value here instead of
+/// unwinding the caller.
+///
+/// The sweep loop is the only thing that ever revisits deferred reconcile work,
+/// so its liveness is the liveness of the whole recovery path, and a panic that
+/// escapes into the loop retires that path for the lifetime of the process
+/// without a log line. Joining a child task converts the panic into an `Err` the
+/// loop can report and continue past.
+pub(crate) async fn supervised_sweep_pass<F>(pass: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(pass)
+        .await
+        .map_err(|error| format!("sweep pass did not complete: {error}"))
 }
 
 pub(crate) async fn sweep_reconcile_intents(orch: &Orchestrator) {
@@ -1893,6 +1941,16 @@ async fn reconcile_base_advance(
 /// classification. Resolving the conflicting files with ordinary writes fixes the
 /// branch's content; its ancestry is still rooted at the old base, because the
 /// rebase was rolled back and nothing replays it afterwards.
+///
+/// An open conflict session is NOT a precondition. A session is the artifact of
+/// an advance that was attempted and hit a conflict, so requiring one made the
+/// remedy reachable only in the case where the automatic path had already got
+/// far enough to describe the problem — and unreachable in the case that needs
+/// it most, where the advance never ran at all and the branch sits silently
+/// behind its base with an unmergeable PR. Without a session this replays the
+/// branch onto its base as recorded on the job; if that replay conflicts, the
+/// reconcile worker opens the session on the way through, which is how a branch
+/// the automatic path skipped gets one.
 pub(crate) async fn request_branch_replay(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -1900,18 +1958,35 @@ pub(crate) async fn request_branch_replay(
     branch: &str,
     expected_fingerprint: Option<&str>,
     take_committed_tip: bool,
+    drop_incoming_reason: Option<&str>,
 ) -> Result<String, String> {
-    let session = crate::orchestrator::conflict_session::load_active_session(db, branch)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "There is no open rebase session for `{branch}`, so there is nothing to replay."
-            )
-        })?;
+    let session = crate::orchestrator::conflict_session::load_active_session(db, branch).await?;
+
+    // Both of these name a session's own artifacts. A request carrying one
+    // without a session describes a world that does not exist, so it is answered
+    // with which artifact is missing rather than accepted and quietly
+    // reinterpreted as something else.
+    if session.is_none() {
+        if expected_fingerprint.is_some() {
+            return Err(format!(
+                "`{branch}` has no open rebase session, so there are no session coordinates for a \
+                 fingerprint to pin. Request the replay without one."
+            ));
+        }
+        if take_committed_tip {
+            return Err(format!(
+                "`resolution:\"take-committed-tip\"` restores an open session's CONFLICTING paths \
+                 from your branch's committed tip, and `{branch}` has no open session, so there \
+                 is no such set of paths. Request a plain `{{action:\"replay\"}}`: it moves your \
+                 branch onto the current base without taking content from either side."
+            ));
+        }
+    }
+
     // A request quoting coordinates that have since moved was composed against a
     // view of the world that no longer holds. Refuse and hand back the current
     // one rather than acting on the stale intent.
-    if let Some(expected) = expected_fingerprint {
+    if let (Some(session), Some(expected)) = (session.as_ref(), expected_fingerprint) {
         let current = session.fingerprint();
         if expected != current {
             return Err(format!(
@@ -1921,34 +1996,126 @@ pub(crate) async fn request_branch_replay(
         }
     }
 
+    // `take-committed-tip` restores each conflicting path WHOLE from the
+    // branch's committed tip, so every incoming hunk in such a file that lives
+    // OUTSIDE the region the agent resolved is discarded along with it. Refuse
+    // rather than warn: this request is asynchronous and it lands on branch
+    // ancestry, so a warning is read after a compiler finds the damage rather
+    // than before it is done. The refusal is not a dead end — it hands back the
+    // exact content that makes the same request correct.
+    let mut caveats: Vec<String> = Vec::new();
+    if let Some(session) = session.as_ref().filter(|_| take_committed_tip) {
+        // Read-only, and deliberately outside the store lock: every object it
+        // reads is immutable, and the one mutable thing (the bookmark) is
+        // re-resolved by the replay itself. Holding the lock across dozens of
+        // subprocess reads would stall the reconcile worker to no purpose.
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = Path::new(&session.store_path);
+        // EXHAUSTIVE, not the read path's capped form. The restore covers every
+        // conflicting path, so the decision has to as well; assessing a prefix
+        // and accepting on its silence is the same silent loss wearing a guard's
+        // clothes.
+        //
+        // The decision is a total match on a typed outcome rather than an
+        // `if let`. Every way of NOT having a proof — base drift aside — has to
+        // reach a refusal, and an `Option` here is what let "could not check"
+        // fall through as "nothing to report" twice over.
+        let proof = crate::orchestrator::conflict_session::assess_session_tip_exhaustively(
+            &jj, store, session,
+        );
+        match crate::orchestrator::conflict_session::decide_replay(&proof, drop_incoming_reason) {
+            ReplayDecision::Proceed => {}
+            ReplayDecision::Refuse(refusal) => return Err(refusal),
+            ReplayDecision::ProceedOnStatedReason(caveat) => {
+                log::warn!(
+                    "replay request for `{branch}`: proceeding with an unproven \
+                     take-committed-tip restore on the requester's stated reason. {caveat}"
+                );
+                caveats.push(caveat);
+            }
+        }
+    }
+
     let project = load_replay_project(db, job_id).await?;
-    let base_branch = if session.incoming.base_branch.is_empty() {
-        session.target_branch.clone()
-    } else {
-        session.incoming.base_branch.clone()
-    };
     let siblings = vec![SiblingJob {
         id: job_id.to_string(),
         branch: Some(branch.to_string()),
         base_commit: project.base_commit.clone(),
     }];
 
-    // Resolve the CURRENT head of the base, not the destination this session was
-    // opened against: the request is to land on the base as it is now.
+    // With a session, the base it recorded; without one, the base the job was
+    // cut from; and if that name is gone from the store, whatever this work is
+    // still going to merge into. Resolve the CURRENT head of it, not the
+    // destination this session was opened against: the request is to land on the
+    // base as it is now.
+    let session_base = session.as_ref().map(|session| {
+        if session.incoming.base_branch.is_empty() {
+            session.target_branch.as_str()
+        } else {
+            session.incoming.base_branch.as_str()
+        }
+    });
+    let candidates = crate::orchestrator::replay_base::load_base_candidates_for_job(db, job_id)
+        .await?
+        .recorded_from_session(session_base);
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&project.repo_path));
-    let destination = {
+    let resolved = {
         let guard = orch
             .acquire_jj_store_lock(&store, format!("replay request for {branch}"))
             .await;
         let _phase = guard.phase(format!("resolve replay destination branch={branch}"));
-        crate::jj::revset_commit(&jj, &store, &base_branch)
-            .ok_or_else(|| format!("Base `{base_branch}` did not resolve to a commit."))?
+        crate::orchestrator::replay_base::resolve_base(&jj, &store, branch, &candidates)
+            .map_err(|error| error.to_string())?
+    };
+    let base_branch = resolved.branch.clone();
+    let destination = resolved.commit.clone();
+
+    // The recorded name has been proven gone, so it is corrected here rather
+    // than at whatever surface next trips over it — and before the
+    // already-carried early return, because a branch that needs no replay still
+    // needs a base it can be diffed and merged against. The preamble goes out
+    // with EVERY answer for the same reason: an agent told only "nothing to
+    // replay" learns nothing about the base that just changed underneath it.
+    let mut preamble = String::new();
+    if let Some(superseded) = resolved.superseded.as_deref() {
+        crate::orchestrator::replay_base::repoint_recorded_base(db, job_id, &base_branch).await;
+        preamble = format!(
+            "The base `{superseded}` this branch recorded no longer exists in the store — the \
+             usual cause is that its parent merged and the branch was deleted with it. So it is \
+             measured against `{base_branch}`, {}, and the recorded base has been re-pointed \
+             there so the surfaces that read it agree.\n\n",
+            resolved.source.describe()
+        );
+    }
+
+    // Only for a sessionless request. A session exists precisely because a
+    // rebase was attempted and rolled back, so its branch is behind by
+    // construction; a bare request is the one that can arrive with nothing to
+    // do, and saying so beats queueing a no-op the requester then waits on.
+    if session.is_none() && crate::jj::branch_carries_commit(&jj, &store, branch, &destination) {
+        return Ok(format!(
+            "{preamble}`{branch}` already carries `{base_branch}` at `{destination}` in its \
+             ancestry, so there is nothing to replay. If its pull request still reports a \
+             conflict, that is a different problem from a stale base — file it rather than \
+             replaying again."
+        ));
+    }
+
+    let incoming = match session.as_ref() {
+        Some(session) => session.incoming.clone(),
+        // A bare request vouches for the base it is landing on and nothing else:
+        // no PR and no issue carried the advance, because as far as this branch
+        // is concerned no advance was ever announced.
+        None => IncomingIdentity {
+            base_branch: base_branch.clone(),
+            ..IncomingIdentity::default()
+        },
     };
     let notes = BaseAdvanceNotes {
-        conflict: build_jj_conflict_note(&base_branch, session.incoming.pr_number, None),
-        clean: build_jj_clean_note(&base_branch, session.incoming.pr_number, None),
-        incoming: session.incoming.clone(),
+        conflict: build_jj_conflict_note(&base_branch, incoming.pr_number, None),
+        clean: build_jj_clean_note(&base_branch, incoming.pr_number, None),
+        incoming,
     };
     let label = if take_committed_tip {
         format!("resolved replay requested for {branch}")
@@ -1966,7 +2133,11 @@ pub(crate) async fn request_branch_replay(
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs((RECONCILE_LEASE_SECONDS + 30) as u64);
     let mut reopen_destination = destination.clone();
+    // Every destination this request was re-aimed at, so the summary can name a
+    // race instead of leaving it to look like a failed resolution.
+    let mut retargets: Vec<(String, String)> = Vec::new();
     loop {
+        let attempted_destination = reopen_destination.clone();
         reopen_reconcile_intent(db, &store, &base_branch, &reopen_destination, branch).await?;
         let outcome = reconcile_base_advance(
             orch,
@@ -1987,16 +2158,65 @@ pub(crate) async fn request_branch_replay(
             "Replay reconciliation returned no accepted branch and no coalesced destination."
                 .to_string()
         })?;
+        if reopen_destination != attempted_destination {
+            // Another merge landed on the base while this request sat in the
+            // queue, so it was re-aimed. Named explicitly because the resulting
+            // page churn reads exactly like a failed resolution otherwise, and
+            // an agent who cannot tell them apart re-does content work that was
+            // already correct.
+            retargets.push((attempted_destination, reopen_destination.clone()));
+        }
         wait_for_reconcile_slot(db, &store, &base_branch, &reopen_destination, deadline).await?;
     }
 
-    Ok(format!(
-        "Queued a store-side replay of `{branch}` onto `{base_branch}` at `{destination}`. The \
-         durable reconcile worker performs it under the store lock; nothing runs in your slot. A \
-         clean replay publishes your branch, refreshes your checkout, and closes this session. A \
-         replay that still conflicts leaves your branch untouched and refreshes cairn:~/rebase \
-         with fresh coordinates."
-    ))
+    // The request itself is the one fact nothing else records, and without it a
+    // read of cairn:~/rebase looks identical before and after asking. A
+    // sessionless request has no item row to carry the timestamp yet; the
+    // reconcile pass it just queued writes one.
+    if let Some(session) = session.as_ref() {
+        mark_replay_requested(db, &session.intent_id, branch).await;
+    }
+
+    let mut summary = preamble;
+    if let (Some(first), Some(last)) = (retargets.first(), retargets.last()) {
+        let (from, to) = (&first.0, &last.1);
+        summary.push_str(&format!(
+            "The replay target advanced while your request was queued, from `{from}` to `{to}`, so \
+             it was re-aimed at the current base. This is a race with another merge landing, not a \
+             failed resolution — your content resolution still stands.\n\n"
+        ));
+    }
+    summary.push_str(&format!(
+        "Queued a store-side replay of `{branch}` onto `{base_branch}` at `{}`. The durable \
+         reconcile worker performs it under the store lock; nothing runs in your slot. A clean \
+         replay publishes your branch, refreshes your checkout, and closes this session. A replay \
+         that still conflicts leaves your branch untouched and refreshes cairn:~/rebase with fresh \
+         coordinates.",
+        reopen_destination
+    ));
+    for caveat in &caveats {
+        summary.push_str("\n\n⚠️ ");
+        summary.push_str(caveat);
+    }
+    Ok(summary)
+}
+
+/// Record that an agent asked for a replay, so the resource can say one is
+/// outstanding. Advisory: a failure here must not fail a request the reconcile
+/// worker has already accepted.
+async fn mark_replay_requested(db: &LocalDb, intent_id: &str, bookmark: &str) {
+    if let Err(error) = db
+        .execute(
+            "UPDATE jj_reconcile_items SET replay_requested_at = ?3
+             WHERE intent_id = ?1 AND bookmark = ?2",
+            // Unix seconds, matching every other timestamp on this table so the
+            // resource can render it with the same `clock::stamp`.
+            params![intent_id, bookmark, chrono::Utc::now().timestamp()],
+        )
+        .await
+    {
+        log::warn!("replay request for `{bookmark}`: could not record the request time: {error}");
+    }
 }
 
 struct ReplayProject {
@@ -2241,6 +2461,32 @@ async fn execute_reconcile_claim(
                     "jj base advance ({label}): deferred {branch} at the mutation boundary for an in-flight run batch"
                 );
                 drop(guard);
+                // Record the deferral rather than only counting it. A deferred
+                // branch owes a rebase that has not been attempted, which is a
+                // different state from both "rebased" and "never advanced" and
+                // is the one an agent is least able to infer: no bookmark moved,
+                // no note was sent, and cairn:~/rebase would otherwise report a
+                // branch that had never met a base advance at all. The row is
+                // what lets the resource say an advance is owed, and it survives
+                // a restart that loses this pass.
+                persist_reconcile_item(
+                    db,
+                    ReconcileItemUpdate {
+                        intent_id,
+                        bookmark: branch,
+                        observed_tip: current_tip.as_deref(),
+                        status: "pending",
+                        failure_kind: None,
+                        outcome_kind: Some("deferred"),
+                        fingerprint: None,
+                        diagnostic: Some(
+                            "deferred at the mutation boundary: this branch had a run batch in \
+                             flight, so its rebase was not attempted. It stays queued for the \
+                             durable sweep.",
+                        ),
+                    },
+                )
+                .await?;
                 any_branch_deferred = true;
                 continue;
             }
@@ -3412,7 +3658,7 @@ async fn load_job_by_id_conn(
 ) -> DbResult<Option<MergedJob>> {
     let mut rows = conn
         .query(
-            "SELECT id, project_id, issue_id, base_branch
+            "SELECT id, project_id, issue_id, branch, base_branch
              FROM jobs
              WHERE id = ?1",
             params![job_id],
@@ -3425,7 +3671,8 @@ async fn load_job_by_id_conn(
                 id: row.text(0)?,
                 project_id: row.text(1)?,
                 issue_id: row.opt_text(2)?,
-                base_branch: row.opt_text(3)?,
+                branch: row.opt_text(3)?,
+                base_branch: row.opt_text(4)?,
             })
         })
         .transpose()
@@ -3480,7 +3727,7 @@ async fn find_context_source_job(
             }) {
                 let mut rows = conn
                     .query(
-                        "SELECT id, project_id, issue_id, base_branch
+                        "SELECT id, project_id, issue_id, branch, base_branch
                              FROM jobs
                              WHERE execution_id = ?1
                                AND recipe_node_id = ?2
@@ -3496,7 +3743,8 @@ async fn find_context_source_job(
                         id: row.text(0)?,
                         project_id: row.text(1)?,
                         issue_id: row.opt_text(2)?,
-                        base_branch: row.opt_text(3)?,
+                        branch: row.opt_text(3)?,
+                        base_branch: row.opt_text(4)?,
                     }));
                 }
             }
@@ -3517,7 +3765,7 @@ async fn latest_complete_implementation_job(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, project_id, issue_id, base_branch
+                    "SELECT id, project_id, issue_id, branch, base_branch
                          FROM jobs
                          WHERE execution_id = ?1
                            AND branch IS NOT NULL
@@ -3534,7 +3782,8 @@ async fn latest_complete_implementation_job(
                         id: row.text(0)?,
                         project_id: row.text(1)?,
                         issue_id: row.opt_text(2)?,
-                        base_branch: row.opt_text(3)?,
+                        branch: row.opt_text(3)?,
+                        base_branch: row.opt_text(4)?,
                     })
                 })
                 .transpose()
@@ -3569,6 +3818,80 @@ async fn load_execution_snapshot_conn(
 /// **completed** sibling that still has an **open** PR (`merge_requests.status`
 /// not merged/closed): a child whose build job finished but whose PR is awaiting
 /// merge is exactly the sibling that must auto-rebase onto the advanced base.
+/// A job that can still act on the base it records: it is not on a resolved
+/// issue, and it is either still running or still holding an open pull request.
+///
+/// Shared by the sibling selection and the child re-point, because the two have
+/// to name one population. Every branch that inherits a base advance is a branch
+/// whose recorded base must survive that advance, and a predicate written twice
+/// is a population that eventually differs.
+const LIVE_JOB_PREDICATE: &str = "NOT EXISTS (
+              SELECT 1 FROM issues i
+               WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed')
+            )
+            AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
+                  OR EXISTS (
+                    SELECT 1 FROM merge_requests mr
+                     WHERE mr.source_branch = j.branch
+                       AND mr.project_id = j.project_id
+                       AND mr.status NOT IN ('merged', 'closed')
+                  ) )";
+
+/// Re-point everything cut from a branch that has just merged.
+///
+/// A child issue's execution records its parent's integration branch in
+/// `jobs.base_branch`, and merging the parent deletes that branch. From that
+/// moment the record names nothing, and it is the name through which the child's
+/// diff range, its pull request's target, the next base advance, and the replay
+/// that would rescue it all resolve. What the parent merged INTO is where those
+/// children were always going — it is what GitHub itself retargets their open
+/// pull requests onto — and it is knowable at exactly this moment rather than
+/// reconstructable later from a name that no longer resolves.
+///
+/// Both records that hold it are corrected, because both are read: the job's
+/// base branch, and the target of any open pull request still naming the merged
+/// branch. The jobs re-pointed here land in the same pass's sibling set, so they
+/// inherit this advance rather than being stranded by it.
+async fn repoint_children_of_merged_branch(
+    db: &LocalDb,
+    project_id: &str,
+    merged_branch: &str,
+    new_base: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    // The update target is not aliased: the liveness predicate is evaluated in a
+    // subselect that owns the `j` alias, which keeps one predicate usable from
+    // both a SELECT and an UPDATE.
+    let jobs_sql = format!(
+        "UPDATE jobs SET base_branch = ?3, updated_at = ?4
+          WHERE id IN (
+            SELECT j.id FROM jobs j
+             WHERE j.project_id = ?1 AND j.base_branch = ?2 AND {LIVE_JOB_PREDICATE}
+          )"
+    );
+    let jobs = db
+        .execute(&jobs_sql, params![project_id, merged_branch, new_base, now])
+        .await
+        .map_err(|error| format!("re-point jobs cut from `{merged_branch}`: {error}"))?;
+    let pull_requests = db
+        .execute(
+            "UPDATE merge_requests SET target_branch = ?3, updated_at = ?4
+              WHERE project_id = ?1 AND target_branch = ?2
+                AND status NOT IN ('merged', 'closed')",
+            params![project_id, merged_branch, new_base, now],
+        )
+        .await
+        .map_err(|error| format!("re-target pull requests aimed at `{merged_branch}`: {error}"))?;
+
+    if jobs > 0 || pull_requests > 0 {
+        log::info!(
+            "merged branch `{merged_branch}` was folded into `{new_base}`: re-pointed {jobs} job(s) \
+             and {pull_requests} open pull request(s) that were cut from it"
+        );
+    }
+    Ok(())
+}
+
 async fn load_sibling_jobs(
     db: &LocalDb,
     project_id: &str,
@@ -3578,29 +3901,23 @@ async fn load_sibling_jobs(
     let project_id = project_id.to_string();
     let base_branch = base_branch.to_string();
     let merged_job_id = merged_job_id.to_string();
+    let sql = format!(
+        "SELECT j.id, j.branch, j.base_commit
+           FROM jobs j
+          WHERE j.project_id = ?1
+            AND j.base_branch = ?2
+            AND j.id != ?3
+            AND {LIVE_JOB_PREDICATE}"
+    );
     db.read(|conn| {
         let project_id = project_id.clone();
         let base_branch = base_branch.clone();
         let merged_job_id = merged_job_id.clone();
+        let sql = sql.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.id, j.branch, j.base_commit
-                         FROM jobs j
-                         WHERE j.project_id = ?1
-                           AND j.base_branch = ?2
-                           AND j.id != ?3
-                           AND NOT EXISTS (
-                             SELECT 1 FROM issues i
-                             WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed')
-                           )
-                           AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
-                                 OR EXISTS (
-                                   SELECT 1 FROM merge_requests mr
-                                   WHERE mr.source_branch = j.branch
-                                     AND mr.project_id = j.project_id
-                                     AND mr.status NOT IN ('merged', 'closed')
-                                 ) )",
+                    &sql,
                     params![
                         project_id.as_str(),
                         base_branch.as_str(),
@@ -3939,6 +4256,323 @@ mod tests {
         assert!(jobs_have_inflight_run_batches(&db, &[sibling])
             .await
             .unwrap());
+    }
+
+    /// The sweep is the only mechanism that revisits a deferred base advance, so
+    /// a pass that panics must cost one cycle and not the loop. Before this was
+    /// supervised, a single panic retired the sweep for the lifetime of the
+    /// process: work queued for retry was never claimed again, and the branches
+    /// waiting on it sat silently behind their base.
+    #[tokio::test]
+    async fn a_panicking_sweep_pass_does_not_retire_the_loop() {
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for attempt in 0..3 {
+            let counter = passes.clone();
+            let outcome = supervised_sweep_pass(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    panic!("dirty pages should be empty for read txn");
+                }
+            })
+            .await;
+            assert_eq!(
+                outcome.is_err(),
+                attempt == 0,
+                "the panicking pass reports, and only it reports"
+            );
+        }
+        assert_eq!(
+            passes.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every pass after the panic still ran"
+        );
+    }
+
+    /// A branch deferred at the mutation boundary owes a rebase nobody has
+    /// attempted. That is neither "done" nor "never advanced", and the resume
+    /// and delivery passes must both leave it alone so the next sweep picks it
+    /// up rather than treating it as serviced.
+    #[tokio::test]
+    async fn a_deferred_sibling_stays_queued_rather_than_reading_as_serviced() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let claim =
+            claim_reconcile_intent(&db, "/repo", Path::new("/store"), "main", "dest-a", "test")
+                .await
+                .unwrap()
+                .unwrap();
+
+        persist_reconcile_item(
+            &db,
+            ReconcileItemUpdate {
+                intent_id: &claim.id,
+                bookmark: "agent/overlap",
+                observed_tip: Some("tip-a"),
+                status: "pending",
+                failure_kind: None,
+                outcome_kind: Some("deferred"),
+                fingerprint: None,
+                diagnostic: Some("deferred at the mutation boundary"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let progress = reconcile_item_status(&db, &claim.id, "agent/overlap")
+            .await
+            .unwrap()
+            .expect("the deferral is recorded rather than left invisible");
+        assert_eq!(progress.status, "pending");
+        assert_eq!(progress.outcome_kind.as_deref(), Some("deferred"));
+        assert!(
+            !progress.notification_sent,
+            "nothing was delivered, because nothing was attempted"
+        );
+
+        // Delivery only closes out graph movement and suppression. A deferral is
+        // neither, so it must survive untouched.
+        mark_reconcile_delivered(&db, &claim.id).await.unwrap();
+        let after = reconcile_item_status(&db, &claim.id, "agent/overlap")
+            .await
+            .unwrap()
+            .expect("the deferral survives the delivery pass");
+        assert_eq!(after.status, "pending");
+        assert!(!after.notification_sent);
+    }
+
+    /// The refusal that used to greet every sessionless replay is gone, but the
+    /// two payload keys that only mean something ALONGSIDE a session must still
+    /// be refused, and each must say which artifact is missing rather than
+    /// silently doing a different thing.
+    ///
+    /// `take-committed-tip` matters most: it restores a session's CONFLICTING
+    /// paths from the branch tip, so with no session there is no such set, and
+    /// accepting it would mean choosing some other set on the requester's
+    /// behalf.
+    #[tokio::test]
+    async fn a_sessionless_replay_refuses_the_keys_that_need_a_session() {
+        let db = Arc::new(migrated_db().await);
+        seed_base_advance_fixture(&db).await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root,
+        )
+        .build();
+
+        let fingerprinted = request_branch_replay(
+            &orch,
+            &db,
+            "job-clean",
+            "agent/clean",
+            Some("base:ours:theirs"),
+            false,
+            None,
+        )
+        .await
+        .expect_err("a fingerprint pins session coordinates that do not exist");
+        assert!(
+            fingerprinted.contains("no open rebase session")
+                && fingerprinted.contains("without one"),
+            "the refusal names the missing artifact and the way forward: {fingerprinted}"
+        );
+
+        let restored =
+            request_branch_replay(&orch, &db, "job-clean", "agent/clean", None, true, None)
+                .await
+                .expect_err("there is no set of conflicting paths to restore");
+        assert!(
+            restored.contains("CONFLICTING paths") && restored.contains("Request a plain"),
+            "the refusal explains the scope it cannot resolve and offers the plain replay: \
+             {restored}"
+        );
+    }
+
+    /// A job with no base branch has nothing to be replayed onto, and that is a
+    /// different answer from "no session" — it must not fall through to a
+    /// destination resolved from an empty string.
+    #[tokio::test]
+    async fn a_sessionless_replay_needs_a_base_branch_to_land_on() {
+        let db = Arc::new(migrated_db().await);
+        seed_base_advance_fixture(&db).await;
+        db.execute(
+            "UPDATE jobs SET base_branch = NULL WHERE id = 'job-clean'",
+            (),
+        )
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root,
+        )
+        .build();
+
+        let error =
+            request_branch_replay(&orch, &db, "job-clean", "agent/clean", None, false, None)
+                .await
+                .expect_err("a branch with no base has no destination");
+        assert!(
+            error.contains("no base branch recorded"),
+            "the refusal names the missing base rather than a resolution failure: {error}"
+        );
+    }
+
+    /// Read one text column keyed by id.
+    async fn text_field(db: &LocalDb, sql: &'static str, id: &str) -> Option<String> {
+        let id = id.to_string();
+        db.read(move |conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(sql, params![id]).await?;
+                match rows.next().await? {
+                    Some(row) => row.opt_text(0),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    const JOB_BASE: &str = "SELECT base_branch FROM jobs WHERE id = ?1";
+    const MR_TARGET: &str = "SELECT target_branch FROM merge_requests WHERE id = ?1";
+
+    /// A child issue's branch is cut from its parent's, and the parent's merge
+    /// deletes that branch. Re-pointing is what keeps the child placeable
+    /// afterwards, so it has to reach BOTH records that hold the dead name and
+    /// leave the child in the same pass's sibling set — which is how it inherits
+    /// the advance instead of being stranded by it.
+    #[tokio::test]
+    async fn merging_a_parent_re_points_the_work_cut_from_its_branch() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        db.execute_script(
+            "
+            INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+              VALUES ('issue-child', 'proj-1', 5, 'Child', 'active', 1, 1);
+            INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES ('exec-5', 'recipe-default', 'issue-child', 'proj-1', 'running', 1, 1);
+            INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+              VALUES ('job-child', 'exec-5', 'node', 'issue-child', 'proj-1', 'running', 'agent/child', 'agent/merged', 1, 1);
+            INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+              VALUES ('mr-child', 'job-child', 'proj-1', 'issue-child', 'PR', 'agent/child', 'agent/merged', 'open', 1, 1);
+            INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+              VALUES ('issue-done', 'proj-1', 6, 'Done', 'merged', 1, 1);
+            INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES ('exec-6', 'recipe-default', 'issue-done', 'proj-1', 'complete', 1, 1);
+            INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+              VALUES ('job-done', 'exec-6', 'node', 'issue-done', 'proj-1', 'complete', 'agent/done', 'agent/merged', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        repoint_children_of_merged_branch(&db, "proj-1", "agent/merged", "integration")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            text_field(&db, JOB_BASE, "job-child").await.as_deref(),
+            Some("integration"),
+            "the child is cut from what its parent merged into"
+        );
+        assert_eq!(
+            text_field(&db, MR_TARGET, "mr-child").await.as_deref(),
+            Some("integration"),
+            "the open pull request follows, so nothing later tries to merge into a deleted branch"
+        );
+        assert_eq!(
+            text_field(&db, JOB_BASE, "job-done").await.as_deref(),
+            Some("agent/merged"),
+            "work that resolved alongside its parent keeps the record of where it was cut from"
+        );
+
+        let siblings = load_sibling_jobs(&db, "proj-1", "integration", "job-merged")
+            .await
+            .unwrap();
+        assert!(
+            siblings.iter().any(|sibling| sibling.id == "job-child"),
+            "the re-pointed child joins this same advance rather than waiting for the next one"
+        );
+    }
+
+    /// End to end over a real store: a branch whose recorded base was deleted
+    /// when its parent merged asks for a replay and gets an answer — the base
+    /// it is actually measured against, and a corrected record — instead of the
+    /// resolution error that used to be the end of the road.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_replay_after_its_parent_merged_lands_on_the_surviving_base() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            eprintln!(
+                "skipping a_replay_after_its_parent_merged_lands_on_the_surviving_base: no jj"
+            );
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        crate::jj::tests::init_project(project.path());
+        crate::jj::tests::git(project.path(), &["checkout", "-q", "-b", "agent/child"]);
+        std::fs::write(project.path().join("child.rs"), "child\n").unwrap();
+        crate::jj::tests::git(project.path(), &["add", "-A"]);
+        crate::jj::tests::git(project.path(), &["commit", "-q", "-m", "child"]);
+        crate::jj::tests::git(project.path(), &["checkout", "-q", "main"]);
+
+        let db = Arc::new(migrated_db().await);
+        db.execute_script(&format!(
+            "
+            INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+              VALUES ('proj-1', 'default', 'Project', 'PROJ', '{repo}', 'main', 1, 1);
+            INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+              VALUES ('issue-child', 'proj-1', 1, 'Child', 'active', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, status, branch, base_branch, created_at, updated_at)
+              VALUES ('job-child', 'proj-1', 'issue-child', 'running', 'agent/child', 'agent/deleted-parent', 1, 1);
+            ",
+            repo = project.path().display()
+        ))
+        .await
+        .unwrap();
+
+        let root = home.path().to_path_buf();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root.clone(),
+        )
+        .jj_binary_path(bin.clone())
+        .build();
+        let jj = crate::jj::JjEnv::resolve(&bin, &root);
+        let store = crate::jj::project_store_dir(&root, project.path());
+        crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
+
+        let summary =
+            request_branch_replay(&orch, &db, "job-child", "agent/child", None, false, None)
+                .await
+                .expect("a deleted base is not a dead end");
+
+        assert!(
+            summary.contains("agent/deleted-parent")
+                && summary.contains("no longer exists")
+                && summary.contains("`main`"),
+            "the answer names the base that vanished and the one it is measured against: {summary}"
+        );
+        assert_eq!(
+            text_field(&db, JOB_BASE, "job-child").await.as_deref(),
+            Some("main"),
+            "the correction is durable, so the next surface to ask gets the same answer"
+        );
     }
 
     #[tokio::test]

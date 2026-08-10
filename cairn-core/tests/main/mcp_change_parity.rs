@@ -50,7 +50,10 @@ fn sample_uri(contract: &ResourceContract) -> String {
         .replace("{exec}", "1")
         .replace("{node}", "builder")
         .replace("{slug}", "dev")
-        .replace("{name}", "Explore")
+        // Lowercase: `{name}` also renders the THREAD template
+        // (cairn://p/{project}/{name}), and thread names are validated
+        // lowercase — an uppercase sample would fail the parse sanity check.
+        .replace("{name}", "explore")
         .replace("{turn}", "1")
         .replace("{run_seq}", "1")
         .replace("{event_seq}", "2")
@@ -69,6 +72,7 @@ fn payload_for(spec: &MutationSpec) -> serde_json::Value {
             KeyType::Int => json!(1),
             KeyType::Array => json!([]),
             KeyType::Object => json!({}),
+            KeyType::Any => serde_json::Value::Null,
         };
         map.insert(key.key.to_string(), value);
     }

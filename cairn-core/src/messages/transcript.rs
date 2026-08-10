@@ -60,7 +60,7 @@ pub(crate) async fn insert_attention_push_events(
         queued_message_id: None,
         raw: Some(serde_json::json!({ "attention_push_ids": push_ids })),
     };
-    let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+    let data = transcript_event.observed().to_event_json();
 
     if let Err(error) = insert_system_event(
         &db,
@@ -113,7 +113,7 @@ pub(crate) fn insert_system_message_sync(
         queued_message_id: None,
         raw: Some(raw),
     };
-    let data = serde_json::to_string(&event).map_err(|error| error.to_string())?;
+    let data = event.observed().to_event_json();
     insert_system_event_sync(
         &db,
         &orch.services.emitter,
@@ -149,7 +149,7 @@ pub(crate) async fn insert_queued_user_events(
             &msg.id,
             &msg.content,
         );
-        let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+        let data = transcript_event.observed().to_event_json();
 
         if let Err(error) = insert_user_event(
             &db,
@@ -213,7 +213,7 @@ pub(crate) async fn insert_side_channel_events(
                 "channel_type": notice.channel_type(),
             })),
         };
-        let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+        let data = transcript_event.observed().to_event_json();
 
         if let Err(error) = insert_system_event(
             &db,
@@ -278,7 +278,7 @@ pub(crate) fn insert_side_channel_events_sync(
                 "channel_type": notice.channel_type(),
             })),
         };
-        let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+        let data = transcript_event.observed().to_event_json();
         insert_system_event_sync(
             &db,
             &orch.services.emitter,

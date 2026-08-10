@@ -4,6 +4,143 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 
 use super::types::*;
 
+#[derive(Clone, Debug)]
+struct DerivedThreadScope {
+    source_ref: String,
+    fact_kinds: Vec<String>,
+}
+
+pub(crate) async fn seed_default_job_subscriptions_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    for source_kind in ["user", "peer"] {
+        conn.execute(
+            "INSERT OR IGNORE INTO wake_subscriptions
+             (id, job_id, source_kind, source_ref, fact_kinds_json, state,
+              created_by, created_at, updated_at, one_shot)
+             VALUES (?1, ?2, ?3, NULL, NULL, 'active', 'system', ?4, ?4, 0)",
+            params![uuid::Uuid::new_v4().to_string(), job_id, source_kind, now],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn rebuild_derived_thread_subscriptions_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    triggers: &[crate::routes::TriggerClause],
+) -> DbResult<()> {
+    let scopes = compile_derived_thread_scopes(triggers).map_err(crate::storage::DbError::Row)?;
+    conn.execute(
+        "DELETE FROM wake_subscriptions WHERE job_id = ?1 AND id LIKE 'derived:thread:%'",
+        params![job_id],
+    )
+    .await?;
+    let now = chrono::Utc::now().timestamp();
+    for scope in scopes {
+        let id = format!("{DERIVED_THREAD_ID_PREFIX}{}", uuid::Uuid::new_v4());
+        let fact_kinds_json = serde_json::to_string(&scope.fact_kinds)
+            .map_err(|error| crate::storage::DbError::Row(error.to_string()))?;
+        // Persisted provenance cannot use created_by=derived: the shipped,
+        // team-synced table constrains that field to agent/user/system and cannot
+        // be destructively rebuilt without breaking sync triggers. The reserved
+        // ID namespace is therefore the durable ownership marker; system
+        // preserves default-row matching precedence.
+        conn.execute(
+            "INSERT INTO wake_subscriptions
+             (id, job_id, source_kind, source_ref, fact_kinds_json, state,
+              created_by, created_at, updated_at, one_shot)
+             VALUES (?1, ?2, 'issue', ?3, ?4, 'active', 'system', ?5, ?5, 0)",
+            params![
+                id.as_str(),
+                job_id,
+                scope.source_ref.as_str(),
+                fact_kinds_json.as_str(),
+                now
+            ],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(super) const DERIVED_THREAD_ID_PREFIX: &str = "derived:thread:";
+
+/// Rebuild the durable index for a thread definition's standing triggers.
+///
+/// Route predicates are richer than wake rows. Compile only predicates whose
+/// meaning the current wake schema can preserve exactly; rejecting an
+/// unrepresentable clause is safer than waking a thread for facts it did not
+/// select.
+pub(crate) fn validate_derived_thread_triggers(
+    triggers: &[crate::routes::TriggerClause],
+) -> Result<(), String> {
+    compile_derived_thread_scopes(triggers).map(|_| ())
+}
+
+fn compile_derived_thread_scopes(
+    triggers: &[crate::routes::TriggerClause],
+) -> Result<Vec<DerivedThreadScope>, String> {
+    let mut scopes = Vec::new();
+    for clause in triggers {
+        let fact = clause.get("fact").and_then(serde_json::Value::as_str);
+        if fact != Some("attention") {
+            return Err(format!(
+                "thread trigger fact '{}' is not backed by wake subscriptions",
+                fact.unwrap_or("<missing>")
+            ));
+        }
+        let source_ref = clause
+            .get("detailUri")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                matches!(
+                    cairn_common::uri::parse_uri(value),
+                    Some(cairn_common::uri::CairnResource::Issue { .. })
+                )
+            })
+            .ok_or_else(|| {
+                "thread attention triggers require an exact canonical issue detailUri".to_string()
+            })?;
+        let statuses = clause
+            .get("status")
+            .map(|value| match value {
+                serde_json::Value::String(value) => vec![value.as_str()],
+                serde_json::Value::Array(values) => values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        let statuses = statuses
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if statuses != std::collections::BTreeSet::from(["closed", "failed", "merged"])
+            || clause
+                .keys()
+                .any(|key| !matches!(key.as_str(), "fact" | "detailUri" | "status"))
+        {
+            return Err(
+                "thread attention triggers currently require exact detailUri and all terminal statuses (merged, closed, and failed)"
+                    .to_string(),
+            );
+        }
+        scopes.push(DerivedThreadScope {
+            source_ref: source_ref.to_string(),
+            fact_kinds: vec!["resolved".to_string()],
+        });
+    }
+    scopes.sort_by(|left, right| left.source_ref.cmp(&right.source_ref));
+    scopes.dedup_by(|left, right| {
+        left.source_ref == right.source_ref && left.fact_kinds == right.fact_kinds
+    });
+    Ok(scopes)
+}
+
 pub async fn list_subscriptions_for_job(
     db: &LocalDb,
     job_id: &str,

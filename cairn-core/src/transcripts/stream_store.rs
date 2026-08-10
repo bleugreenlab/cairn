@@ -145,24 +145,24 @@ impl StreamAccumulator {
     /// Append content tokens: grow the string, bump the scalar length, buffer a
     /// chunk for the next flush. Empty deltas are ignored.
     pub fn push_content(&mut self, text: &str) {
+        let text = scrub_delta(text);
         if text.is_empty() {
             return;
         }
-        self.content.push_str(text);
+        self.content.push_str(&text);
         self.content_len += text.chars().count() as i32;
-        self.pending
-            .push(StreamChunkInput::content(text.to_string()));
+        self.pending.push(StreamChunkInput::content(text));
     }
 
     /// Append thinking tokens. See [`StreamAccumulator::push_content`].
     pub fn push_thinking(&mut self, text: &str) {
+        let text = scrub_delta(text);
         if text.is_empty() {
             return;
         }
-        self.thinking.push_str(text);
+        self.thinking.push_str(&text);
         self.thinking_len += text.chars().count() as i32;
-        self.pending
-            .push(StreamChunkInput::thinking(text.to_string()));
+        self.pending.push(StreamChunkInput::thinking(text));
     }
 
     pub fn content_is_empty(&self) -> bool {
@@ -218,6 +218,48 @@ impl StreamAccumulator {
     }
 }
 
+/// The live-event crossing for streamed model output (CAIRN-3822).
+///
+/// This is the one place a streamed delta enters the accumulator, and everything
+/// downstream reads from that accumulation: the buffered DB chunks, the
+/// reconstructed stream, and the `streaming-update` payload the frontend renders.
+/// Scrubbing here therefore gives persistence and emission the same value, which
+/// is the property that keeps a raw and a sanitized copy from forking.
+///
+/// Exact registered values only, and no cross-delta buffering. A credential
+/// wholly inside one delta is removed from both the live render and the chunk
+/// row; one split across two deltas is still removed from the durable transcript
+/// event, which is sanitized as a whole at the transcript crossing, but can
+/// briefly render in the live stream. Closing that last gap means giving the
+/// accumulator a `StreamingScrubber` with an explicit end-of-stream flush, which
+/// belongs with the rest of the streaming work in CAIRN-3824: without a flush on
+/// every finalize path, the withheld suffix would silently truncate a message.
+fn scrub_delta(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    // Lock-free fast path: this runs once per streamed token, and building a
+    // sanitizer costs a lock read, an `Arc` clone, and an allocation. With
+    // nothing registered there is nothing to do.
+    if crate::security::registry().is_empty() {
+        return text.to_string();
+    }
+    let mut sanitizer = crate::security::Sanitizer::exact();
+    if sanitizer.is_noop() {
+        return text.to_string();
+    }
+    let scrubbed = sanitizer.text(text).into_owned();
+    for report in crate::security::DetectionReport::from_detections(
+        sanitizer.detections(),
+        crate::security::Crossing::LiveEvent,
+        None,
+        None,
+    ) {
+        report.log();
+    }
+    scrubbed
+}
+
 /// Return the scalar tail of `s` after `emitted` scalar values, or `None` if no
 /// new scalars are present. Slices on a `char_indices` boundary so multibyte
 /// scalars (accents, emoji) are never split.
@@ -261,7 +303,7 @@ impl ActiveMessageStream {
     }
 
     pub fn to_streaming_event_json(&self) -> String {
-        serde_json::to_string(&TranscriptEvent {
+        TranscriptEvent {
             event_type: "assistant:streaming".to_string(),
             session_id: self.stream.session_id.clone(),
             parent_tool_use_id: None,
@@ -284,8 +326,9 @@ impl ActiveMessageStream {
             thinking_ms: None,
             queued_message_id: None,
             raw: None,
-        })
-        .unwrap_or_default()
+        }
+        .observed()
+        .to_event_json()
     }
 }
 
@@ -912,8 +955,12 @@ pub fn finalize_stream(
                         final_event.session_id = stream.session_id.clone();
                     }
 
-                    let data_json = serde_json::to_string(&final_event)
-                        .map_err(|e| DbError::internal(e.to_string()))?;
+                    // Transcript crossing. The streamed content merged in above
+                    // came from chunks that were already scrubbed on the way in;
+                    // sanitizing again here is idempotent and covers a
+                    // caller-supplied final event that never passed a chunk.
+                    let final_event = final_event.observed();
+                    let data_json = final_event.to_event_json();
                     let event_id = stream
                         .final_event_id
                         .clone()
@@ -987,7 +1034,7 @@ pub fn finalize_stream(
                         sequence: stream.sequence,
                         created_at: stream.created_at,
                         turn_id: stream.turn_id,
-                        event_type: final_event.event_type,
+                        event_type: final_event.event_type.clone(),
                         data_json,
                         // Filled below from the PRIVATE outbox enqueue; empty until then.
                         outbox_entries: Vec::new(),

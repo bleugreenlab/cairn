@@ -131,6 +131,7 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
             .unwrap_or_default(),
         context_window,
         canonical_slug: model.canonical_slug,
+        serving_account_ids: Vec::new(),
         pricing: model.pricing.map(|pricing| DiscoveredModelPricing {
             prompt: pricing.prompt,
             completion: pricing.completion,

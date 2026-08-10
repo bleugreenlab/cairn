@@ -39,6 +39,47 @@ async fn sender_name_for_run(db: &LocalDb, run_ctx: &super::RunContext) -> Resul
     }
 }
 
+/// The recipient job behind a thread coordinate: the thread's own session, or a
+/// task it spawned when one is named.
+async fn find_thread_recipient_job(
+    db: &LocalDb,
+    project_key: &str,
+    thread_name: &str,
+    task_name: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    let job_id = crate::resources::resolve_node_or_task_job_id(
+        db,
+        project_key,
+        0,
+        0,
+        thread_name,
+        task_name,
+    )
+    .await?;
+    db.read(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| row.text(0).map(|run_id| (job_id, run_id)))
+                .transpose()
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub enum MessageAuthor<'a> {
+    Mcp(&'a McpCallbackRequest),
+    Route(&'a str),
+}
+
 async fn ensure_issue_accepts_messages(
     db: &LocalDb,
     project_key: &str,
@@ -261,9 +302,31 @@ async fn find_recipient_job(
     .map_err(|e| e.to_string())
 }
 
-pub async fn append_project_or_issue_message(
+pub async fn append_thread_message(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
+    project_key: &str,
+    thread_id: &str,
+    content: &str,
+) -> Result<String, String> {
+    let owning_db = orch.db.for_project(project_key).await;
+    let content =
+        crate::durable_content::normalize_text(orch, request, project_key, content).await?;
+    let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;
+    crate::messages::delivery::append_thread_message(
+        orch,
+        &owning_db,
+        thread_id,
+        sender_run_id.as_deref(),
+        &sender_name,
+        &content,
+    )
+    .await
+}
+
+pub async fn append_project_or_issue_message(
+    orch: &Orchestrator,
+    author: MessageAuthor<'_>,
     project_key: &str,
     issue_number: Option<i32>,
     content: &str,
@@ -280,12 +343,22 @@ pub async fn append_project_or_issue_message(
     if let Some(number) = issue_number {
         ensure_issue_accepts_messages(&owning_db, project_key, number).await?;
     }
-    let content =
-        crate::durable_content::normalize_text(orch, request, project_key, content).await?;
+    let (content, sender_run_id, sender_name, exclude_job_id) = match author {
+        MessageAuthor::Mcp(request) => {
+            let content =
+                crate::durable_content::normalize_text(orch, request, project_key, content).await?;
+            let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;
+            let exclude_job_id = super::run_context::lookup_run(&orch.db.local, request)
+                .await
+                .ok()
+                .map(|ctx| ctx.job_id);
+            (content, sender_run_id, sender_name, exclude_job_id)
+        }
+        MessageAuthor::Route(route_id) => {
+            (content.to_string(), None, format!("route:{route_id}"), None)
+        }
+    };
     let channel_id = resolve_channel_id(&owning_db, project_key, issue_number).await?;
-    // content→execution boundary (CAIRN-2181): sender/run resolution is job-keyed
-    // and stays private until CAIRN-2182.
-    let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;
 
     let (channel_type, success_message) = match issue_number {
         Some(number) => (
@@ -323,10 +396,6 @@ pub async fn append_project_or_issue_message(
     );
 
     if let Some(number) = issue_number {
-        let exclude_job_id = super::run_context::lookup_run(&orch.db.local, request)
-            .await
-            .ok()
-            .map(|ctx| ctx.job_id);
         let source = if sender_run_id.is_some() {
             "agent"
         } else {
@@ -430,26 +499,45 @@ pub async fn append_direct_message_with_urgency(
         Some(task) => format!("{}/{}", node_name, task),
         None => node_name.to_string(),
     };
+    // The reserved (0, 0) coordinate names a thread rather than an issue node.
+    // Whether it names the thread's session or a task beneath it is the same
+    // distinction `task_name` draws everywhere else, so both arms are "thread":
+    // reading only the session out of this coordinate sent a message addressed to
+    // a thread's task looking for issue 0 (CAIRN-3755).
+    let is_thread = issue_number == 0 && exec_seq == 0;
 
     // Echo the canonical URI the caller addressed in any not-found error so a
     // wrong-URI miss is debuggable without rebuilding the URI by hand. For
     // sub-task targets (task_name = Some), the addressed URI is
     // .../{exec}/{node}/task/{task}; for top-level nodes it's .../{exec}/{node}.
-    let (addressed_uri, scope_hint) = match task_name {
-        Some(task) => (
-            build_job_base_uri(project_key, issue_number, exec_seq, task, Some(node_name)),
-            format!(
-                "no sub-task with uri_segment '{}' under parent '{}' in execution {}",
-                task, node_name, exec_seq
+    let (addressed_uri, scope_hint) = if is_thread {
+        match task_name {
+            Some(task) => (
+                cairn_common::uri::build_thread_task_uri(project_key, node_name, task),
+                format!("no task '{task}' under thread '{node_name}'"),
             ),
-        ),
-        None => (
-            build_node_uri(project_key, issue_number, exec_seq, node_name),
-            format!(
-                "no top-level node with uri_segment '{}' in execution {}",
-                node_name, exec_seq
+            None => (
+                format!("cairn://p/{project_key}/{node_name}"),
+                format!("no thread session for '{node_name}'"),
             ),
-        ),
+        }
+    } else {
+        match task_name {
+            Some(task) => (
+                build_job_base_uri(project_key, issue_number, exec_seq, task, Some(node_name)),
+                format!(
+                    "no sub-task with uri_segment '{}' under parent '{}' in execution {}",
+                    task, node_name, exec_seq
+                ),
+            ),
+            None => (
+                build_node_uri(project_key, issue_number, exec_seq, node_name),
+                format!(
+                    "no top-level node with uri_segment '{}' in execution {}",
+                    node_name, exec_seq
+                ),
+            ),
+        }
     };
 
     // Direct-message routing (CAIRN-2598): the recipient job, its wake
@@ -459,20 +547,27 @@ pub async fn append_direct_message_with_urgency(
     // resolution stays job-keyed against the private DB, as on the project/issue
     // message path.
     let owning_db = orch.db.for_project(project_key).await;
-    ensure_issue_accepts_messages(&owning_db, project_key, issue_number).await?;
+    if !is_thread {
+        ensure_issue_accepts_messages(&owning_db, project_key, issue_number).await?;
+    }
     let content =
         crate::durable_content::normalize_text(orch, request, project_key, content).await?;
     let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;
-    let (job_id, recipient_run_id) = find_recipient_job(
-        &owning_db,
-        project_key,
-        issue_number,
-        exec_seq,
-        node_name,
-        task_name,
-    )
-    .await?
-    .ok_or_else(|| format!("{} not found ({}).", addressed_uri, scope_hint))?;
+    let recipient = if is_thread {
+        find_thread_recipient_job(&owning_db, project_key, node_name, task_name).await?
+    } else {
+        find_recipient_job(
+            &owning_db,
+            project_key,
+            issue_number,
+            exec_seq,
+            node_name,
+            task_name,
+        )
+        .await?
+    };
+    let (job_id, recipient_run_id) =
+        recipient.ok_or_else(|| format!("{} not found ({}).", addressed_uri, scope_hint))?;
 
     crate::orchestrator::wakes::seed_default_job_subscriptions(&owning_db, &job_id).await?;
 

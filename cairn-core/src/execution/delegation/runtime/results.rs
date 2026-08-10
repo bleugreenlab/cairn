@@ -1,278 +1,159 @@
-use crate::models::{AgentConfig, ExecutionSnapshot};
-use crate::storage::{DbResult, LocalDb, RowExt};
+use crate::models::{AgentConfig, JobStatus};
+use crate::storage::{LocalDb, RowExt};
 use cairn_common::protocol::CallbackResponse;
-use cairn_common::uri::build_task_artifact_uri;
 
-use super::common::{select_optional_i64, select_optional_text, ParentRunContext};
+use super::common::select_optional_text;
+
+/// How a delegated child settled, as its own job reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// Neither the job nor its run reached a terminal state. The child is still
+    /// working (or something dropped it); there is nothing to report as a result.
+    Unsettled,
+}
+
+/// Decide a delegated child's outcome from its job status, with its run status
+/// as a fallback only.
+///
+/// The job is the authority, matching what the resume path and
+/// `refresh_packet_state` already key on. `runs.status` cannot be that
+/// authority: a child that finishes through the `return` tool is transitioned
+/// *warm* and its process is deliberately retained (CAIRN-1576), so it never
+/// reaches the process exit that would advance its run past `live`. Gating on
+/// the run therefore reported every fast, warm-completing child as "unknown
+/// status" and discarded the artifact it had already written.
+///
+/// The terminal set is [`JobStatus::is_terminal`]'s, reached by parsing rather
+/// than by re-spelling it here, so the two cannot drift.
+///
+/// The run still answers for a child whose job row says nothing terminal — a run
+/// that crashed before its job was ever recomputed.
+fn classify_task_outcome(job_status: Option<&str>, run_status: Option<&str>) -> TaskOutcome {
+    let job_status = job_status.and_then(|status| status.parse::<JobStatus>().ok());
+    if let Some(status) = job_status.filter(JobStatus::is_terminal) {
+        return match status {
+            JobStatus::Complete => TaskOutcome::Succeeded,
+            JobStatus::Cancelled => TaskOutcome::Cancelled,
+            // `is_terminal` admits exactly Complete, Failed, and Cancelled.
+            _ => TaskOutcome::Failed,
+        };
+    }
+    match run_status {
+        Some("complete") | Some("completed") | Some("exited") => TaskOutcome::Succeeded,
+        Some("failed") | Some("crashed") => TaskOutcome::Failed,
+        _ => TaskOutcome::Unsettled,
+    }
+}
 
 pub(super) async fn build_task_callback_response(
     db: &LocalDb,
-    parent_ctx: &ParentRunContext,
     run_id: &str,
     node_id: &str,
     agent_config: &AgentConfig,
     task_description: &str,
     expected_artifact_type: &str,
 ) -> CallbackResponse {
-    let final_status = select_optional_text(db, "SELECT status FROM runs WHERE id = ?1", run_id)
+    let job_status = select_optional_text(db, "SELECT status FROM jobs WHERE id = ?1", node_id)
         .await
         .ok()
         .flatten();
+    let run_status = select_optional_text(db, "SELECT status FROM runs WHERE id = ?1", run_id)
+        .await
+        .ok()
+        .flatten();
+    let outcome = classify_task_outcome(job_status.as_deref(), run_status.as_deref());
 
-    match final_status.as_deref() {
-        Some("complete") | Some("completed") | Some("exited") => {
-            let result =
-                match latest_nonempty_artifact_content(db, node_id, Some(expected_artifact_type))
-                    .await
-                {
-                    Some(content) => content,
-                    None => match latest_nonempty_artifact_content(db, node_id, None).await {
-                        Some(content) => content,
-                        None => latest_nonempty_assistant_content(db, run_id)
-                            .await
-                            .unwrap_or_else(|| "Task completed.".to_string()),
-                    },
-                };
+    // A written artifact is a real result whatever the child's status says, so
+    // it is looked up before the outcome is branched on rather than inside the
+    // success arm. A child that produced its output and then failed still has
+    // something the caller can read, and its address is always worth naming.
+    let artifact =
+        match latest_nonempty_artifact_content(db, node_id, Some(expected_artifact_type)).await {
+            Some(content) => Some(content),
+            None => latest_nonempty_artifact_content(db, node_id, None).await,
+        };
+    let artifact_uri = task_artifact_uri(db, node_id).await;
 
-            let artifact_uri = compute_artifact_uri(db, parent_ctx, node_id).await;
-
-            CallbackResponse {
-                result,
-                artifact_uri,
-                ..Default::default()
-            }
-        }
-        Some("failed") | Some("crashed") => CallbackResponse {
-            result: format!(
-                "Agent '{}' failed.\n\nTask: {}\n\nThe agent encountered an error.",
-                agent_config.name, task_description
-            ),
-            ..Default::default()
-        },
-        _ => CallbackResponse {
-            result: format!(
-                "Agent '{}' finished with unknown status.\n\nTask: {}",
-                agent_config.name, task_description
-            ),
-            ..Default::default()
-        },
-    }
-}
-
-/// The task artifact URI for a delegated child job, derived entirely from the
-/// child's own job row. The background-completion push uses this for a
-/// single-task batch, where there is no live `ParentRunContext` in hand (the
-/// finalize path holds only the settled child job id). It reconstructs the
-/// minimal context [`compute_artifact_uri`] reads — project key, issue number,
-/// and execution seq — and delegates, so both paths build the same URI.
-pub(super) async fn compute_artifact_uri_for_child_job(
-    db: &LocalDb,
-    child_job_id: &str,
-) -> Option<String> {
-    let (project_key, issue_number, exec_seq) = job_context_fields(db, child_job_id).await?;
-    // Only project_key / issue_number / exec_seq are read by
-    // `compute_artifact_uri`; the remaining fields are inert placeholders.
-    let parent_ctx = ParentRunContext {
-        run_id: String::new(),
-        job_id: String::new(),
-        execution_id: None,
-        exec_seq: Some(exec_seq),
-        issue_id: None,
-        issue_number: Some(issue_number),
-        project_id: String::new(),
-        project_key,
-    };
-    compute_artifact_uri(db, &parent_ctx, child_job_id).await
-}
-
-/// `(project_key, issue_number, exec_seq)` for a job, joining issue, project, and
-/// execution. `exec_seq` defaults to 1 when the job has no execution.
-async fn job_context_fields(db: &LocalDb, job_id: &str) -> Option<(String, i32, i32)> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT p.key, i.number, COALESCE(e.seq, 1)
-                     FROM jobs j
-                     JOIN issues i ON i.id = j.issue_id
-                     JOIN projects p ON p.id = i.project_id
-                     LEFT JOIN executions e ON e.id = j.execution_id
-                     WHERE j.id = ?1 LIMIT 1",
-                    (job_id.as_str(),),
-                )
-                .await?;
-            rows.next()
-                .await?
-                .map(|row| Ok((row.text(0)?, row.i64(1)? as i32, row.i64(2)? as i32)))
-                .transpose()
-        })
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-pub(super) async fn compute_artifact_uri(
-    db: &LocalDb,
-    parent_ctx: &ParentRunContext,
-    task_job_id: &str,
-) -> Option<String> {
-    let issue_number = parent_ctx.issue_number?;
-    let exec_seq = if let Some(exec_seq) = parent_ctx.exec_seq {
-        exec_seq
-    } else {
-        let execution_id = parent_ctx.execution_id.as_deref()?;
-        select_optional_i64(db, "SELECT seq FROM executions WHERE id = ?1", execution_id)
+    let result = match (outcome, artifact) {
+        (TaskOutcome::Succeeded, Some(content)) => content,
+        (TaskOutcome::Succeeded, None) => latest_nonempty_assistant_content(db, run_id)
             .await
-            .ok()
-            .flatten()? as i32
+            .unwrap_or_else(|| "Task completed.".to_string()),
+        (TaskOutcome::Failed, artifact) => failure_text(
+            agent_config,
+            task_description,
+            "failed",
+            "The agent encountered an error.",
+            artifact.as_deref(),
+        ),
+        (TaskOutcome::Cancelled, artifact) => failure_text(
+            agent_config,
+            task_description,
+            "was cancelled",
+            "The task was stopped before it finished.",
+            artifact.as_deref(),
+        ),
+        // A child that has written an artifact but not settled is most often a
+        // `blocked` checkpoint awaiting approval. Report what it wrote — it is
+        // real — but never let it read as the task's final answer.
+        (TaskOutcome::Unsettled, Some(content)) => format!(
+            "Agent '{}' has not settled yet (job: {}, run: {}). What it has written so far:\n\n{}",
+            agent_config.name,
+            job_status.as_deref().unwrap_or("unknown"),
+            run_status.as_deref().unwrap_or("unknown"),
+            content
+        ),
+        (TaskOutcome::Unsettled, None) => format!(
+            "Agent '{}' has not settled (job: {}, run: {}).\n\nTask: {}",
+            agent_config.name,
+            job_status.as_deref().unwrap_or("unknown"),
+            run_status.as_deref().unwrap_or("unknown"),
+            task_description
+        ),
     };
 
-    let parent_job_id = select_optional_text(
-        db,
-        "SELECT parent_job_id FROM jobs WHERE id = ?1",
-        task_job_id,
-    )
-    .await
-    .ok()
-    .flatten()?;
-    let parent_segment = node_uri_segment_for_job(db, &parent_job_id).await?;
-    let task_segment = task_uri_segment_for_job(db, task_job_id).await?;
-
-    Some(build_task_artifact_uri(
-        &parent_ctx.project_key,
-        issue_number,
-        exec_seq,
-        &parent_segment,
-        &task_segment,
-    ))
+    CallbackResponse {
+        result,
+        artifact_uri,
+        ..Default::default()
+    }
 }
 
-async fn job_uri_fields(
-    db: &LocalDb,
-    job_id: &str,
-) -> DbResult<
-    Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )>,
-> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "
-                    SELECT uri_segment, recipe_node_id, node_name, agent_config_id, execution_id
-                    FROM jobs
-                    WHERE id = ?1
-                    LIMIT 1
-                    ",
-                    (job_id.as_str(),),
-                )
-                .await?;
-            rows.next()
-                .await?
-                .map(|row| {
-                    Ok((
-                        row.opt_text(0)?,
-                        row.opt_text(1)?,
-                        row.opt_text(2)?,
-                        row.opt_text(3)?,
-                        row.opt_text(4)?,
-                    ))
-                })
-                .transpose()
-        })
-    })
-    .await
+/// A failure report that still carries whatever the child managed to produce.
+fn failure_text(
+    agent_config: &AgentConfig,
+    task_description: &str,
+    verb: &str,
+    detail: &str,
+    artifact: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "Agent '{}' {verb}.\n\nTask: {}\n\n{detail}",
+        agent_config.name, task_description
+    );
+    if let Some(artifact) = artifact {
+        text.push_str(&format!("\n\nPartial result it had written:\n\n{artifact}"));
+    }
+    text
 }
 
-async fn load_execution_snapshot(db: &LocalDb, execution_id: &str) -> Option<ExecutionSnapshot> {
-    select_optional_text(
-        db,
-        "SELECT snapshot FROM executions WHERE id = ?1",
-        execution_id,
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|json| serde_json::from_str(&json).ok())
-}
-
-async fn node_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
-    let (uri_segment, recipe_node_id, node_name, agent_config_id, execution_id) =
-        job_uri_fields(db, job_id).await.ok().flatten()?;
-    if uri_segment
-        .as_deref()
-        .is_some_and(|segment| !segment.is_empty())
-    {
-        return uri_segment;
-    }
-
-    let resolved_name = match node_name {
-        Some(name) => Some(name),
-        None => match (execution_id.as_deref(), recipe_node_id.as_deref()) {
-            (Some(eid), Some(rid)) => load_execution_snapshot(db, eid).await.and_then(|snapshot| {
-                snapshot
-                    .recipe
-                    .nodes
-                    .iter()
-                    .find(|node| node.id == rid)
-                    .map(|node| node.name.clone())
-            }),
-            _ => None,
-        },
-    };
-
-    if let Some(name) = resolved_name.as_deref() {
-        let slug = crate::config::slugify_resource_segment(name);
-        if !slug.is_empty() {
-            return Some(slug);
-        }
-    }
-
-    if let Some(rid) = recipe_node_id.as_deref().filter(|id| !id.is_empty()) {
-        return Some(rid.to_string());
-    }
-
-    agent_config_id
-        .as_deref()
-        .map(crate::config::slugify_resource_segment)
-        .filter(|slug| !slug.is_empty())
-}
-
-async fn task_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
-    let (uri_segment, _recipe_node_id, node_name, agent_config_id, _execution_id) =
-        job_uri_fields(db, job_id).await.ok().flatten()?;
-    if uri_segment
-        .as_deref()
-        .is_some_and(|segment| !segment.is_empty())
-    {
-        return uri_segment;
-    }
-
-    if let Some(slug) = node_name
-        .as_deref()
-        .map(crate::config::slugify_resource_segment)
-        .filter(|slug| !slug.is_empty())
-    {
-        return Some(slug);
-    }
-
-    if let Some(slug) = agent_config_id
-        .as_deref()
-        .map(crate::config::slugify_resource_segment)
-        .filter(|slug| !slug.is_empty())
-    {
-        return Some(slug);
-    }
-
-    Some("task".to_string())
+/// The artifact URI for a delegated child job, derived from the child's own
+/// canonical home.
+///
+/// An artifact lives at its producing job's home plus its name, so this is that
+/// one resolution plus `/artifact` rather than a second coordinate rebuild. The
+/// rebuild it replaces started from the parent's issue number, which a thread
+/// does not have: every task a thread spawned reported no URI at all, leaving
+/// the caller unable to address the task it had just minted.
+pub(super) async fn task_artifact_uri(db: &LocalDb, task_job_id: &str) -> Option<String> {
+    let home = crate::jobs::queries::home_uri_for_job(db, task_job_id)
+        .await
+        .ok()
+        .flatten()?;
+    Some(format!("{home}/artifact"))
 }
 
 fn normalize_result_text(text: String) -> Option<String> {
@@ -399,6 +280,166 @@ pub(super) async fn latest_nonempty_assistant_content_arc(
     run_id: String,
 ) -> Option<String> {
     latest_nonempty_assistant_content(&db, &run_id).await
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::{classify_task_outcome, TaskOutcome};
+
+    /// The bug, at its smallest: a warm-completing child's job says `complete`
+    /// while its run is still `live`, because the process is retained and never
+    /// exits. The job decides.
+    #[test]
+    fn a_complete_job_with_a_live_run_succeeded() {
+        assert_eq!(
+            classify_task_outcome(Some("complete"), Some("live")),
+            TaskOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn job_status_outranks_run_status() {
+        assert_eq!(
+            classify_task_outcome(Some("failed"), Some("exited")),
+            TaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_task_outcome(Some("cancelled"), Some("live")),
+            TaskOutcome::Cancelled
+        );
+    }
+
+    /// A run that crashed before its job was ever recomputed still answers.
+    #[test]
+    fn run_status_answers_when_the_job_says_nothing_terminal() {
+        assert_eq!(
+            classify_task_outcome(Some("running"), Some("crashed")),
+            TaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_task_outcome(None, Some("exited")),
+            TaskOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn neither_terminal_is_unsettled() {
+        assert_eq!(
+            classify_task_outcome(Some("running"), Some("live")),
+            TaskOutcome::Unsettled
+        );
+    }
+}
+
+#[cfg(test)]
+mod callback_response_tests {
+    use super::build_task_callback_response;
+    use crate::models::AgentConfig;
+    use crate::storage::LocalDb;
+
+    fn agent() -> AgentConfig {
+        AgentConfig {
+            id: "explore".to_string(),
+            name: "Explore".to_string(),
+            description: String::new(),
+            prompt: String::new(),
+            tools: Vec::new(),
+            tier: None,
+            workspace_id: None,
+            project_id: None,
+            created_at: 0,
+            updated_at: 0,
+            disallowed_tools: None,
+            skills: None,
+            fence: None,
+            backend_preference: None,
+            icon: None,
+            selection: None,
+            extras: None,
+        }
+    }
+
+    /// Seed the exact live state the "unknown status" reports came from: the
+    /// child job is `complete` and its artifact is written, while its run row
+    /// is still `live` because the warm process never exited.
+    async fn warm_completed_child() -> LocalDb {
+        let db = crate::storage::migrated_test_db("delegated-result.db").await;
+        db.execute_script(
+            r#"INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p1', 'default', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at)
+               VALUES ('i1', 'p1', 7, 'Parent issue', '', 'active', 'active', 'none', 0, 1, 1);
+               INSERT INTO jobs (id, project_id, issue_id, status, node_name, uri_segment, created_at, updated_at)
+               VALUES ('j-parent', 'p1', 'i1', 'running', 'builder', 'builder', 1, 1);
+               INSERT INTO jobs (id, parent_job_id, project_id, issue_id, status, node_name, uri_segment, created_at, updated_at)
+               VALUES ('j-task', 'j-parent', 'p1', 'i1', 'complete', 'probe', 'probe', 2, 2);
+               INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('r-task', 'j-task', 'i1', 'live', 2, 2);
+               INSERT INTO artifacts (id, job_id, artifact_type, output_name, data, created_at, updated_at)
+               VALUES ('a-task', 'j-task', 'return', 'return', '{"content":"the explored answer"}', 3, 3);"#,
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    /// The child completed and wrote its artifact; the caller must receive that
+    /// artifact and an address for it, not "finished with unknown status" and
+    /// no URI. This test fails against the run-status gate it replaced.
+    #[tokio::test]
+    async fn a_warm_completed_child_returns_its_artifact_and_uri() {
+        let db = warm_completed_child().await;
+        let response =
+            build_task_callback_response(&db, "r-task", "j-task", &agent(), "explore it", "return")
+                .await;
+        assert_eq!(response.result, "the explored answer");
+        assert_eq!(
+            response.artifact_uri.as_deref(),
+            Some("cairn://p/CAIRN/7/1/builder/task/probe/artifact")
+        );
+        assert!(!response.result.contains("unknown status"));
+    }
+
+    /// A child that produced output and then failed still has a readable result,
+    /// and its address is named either way.
+    #[tokio::test]
+    async fn a_failed_child_still_names_what_it_wrote() {
+        let db = warm_completed_child().await;
+        db.execute("UPDATE jobs SET status = 'failed' WHERE id = 'j-task'", ())
+            .await
+            .unwrap();
+        let response =
+            build_task_callback_response(&db, "r-task", "j-task", &agent(), "explore it", "return")
+                .await;
+        assert!(response.result.contains("failed"), "{}", response.result);
+        assert!(
+            response.result.contains("the explored answer"),
+            "{}",
+            response.result
+        );
+        assert!(response.artifact_uri.is_some());
+    }
+
+    /// With nothing terminal and nothing written, the report names the two
+    /// statuses it actually saw instead of the opaque "unknown status".
+    #[tokio::test]
+    async fn an_unsettled_child_with_no_artifact_reports_both_statuses() {
+        let db = warm_completed_child().await;
+        db.execute("UPDATE jobs SET status = 'running' WHERE id = 'j-task'", ())
+            .await
+            .unwrap();
+        db.execute("DELETE FROM artifacts WHERE job_id = 'j-task'", ())
+            .await
+            .unwrap();
+        let response =
+            build_task_callback_response(&db, "r-task", "j-task", &agent(), "explore it", "return")
+                .await;
+        assert!(
+            response.result.contains("job: running") && response.result.contains("run: live"),
+            "{}",
+            response.result
+        );
+    }
 }
 
 #[cfg(test)]

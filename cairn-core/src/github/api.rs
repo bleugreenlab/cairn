@@ -1,48 +1,25 @@
 //! GitHub REST API client — shared between Tauri and cairn-server.
 //!
-//! Contains the subset of GitHub API operations needed by cairn-core:
-//! - Repo URL parsing
-//! - PR merge
-//! - Branch deletion
-//! - Auth header generation (JWT + installation tokens)
+//! Contains the subset of GitHub API operations needed by cairn-core: repo URL
+//! parsing, PR reads and merges, branch deletion, and workflow log retrieval.
+//!
+//! It holds no credential and never sees one. Every operation takes an
+//! authority — an [`AppAuthority`] or an [`InstallationAuthority`] minted by
+//! `security::broker::github` — and asks *it* to send the request, so the URL
+//! and the credential are bound in one call and no header ever comes back here.
+//! Signing the app JWT and exchanging it for an installation token used to live
+//! in this file, which is how a model-callable handler came to pass an RSA
+//! private key around by reference.
 
-use super::credentials::GitHubAppCredentials;
+use crate::security::broker::github::{AppAuthority, InstallationAuthority, API_BASE};
 use crate::services::{HttpClient, HttpResponse};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::process::Command;
-use std::sync::{LazyLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-const GITHUB_API_BASE: &str = "https://api.github.com";
-
-/// Cached installation token with expiry.
-struct CachedToken {
-    token: String,
-    expires_at: u64,
-}
-
-fn app_auth_headers(app_id: i64, private_key: &str) -> Result<HeaderMap, String> {
-    let jwt = generate_app_jwt(app_id, private_key)?;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {jwt}")).map_err(|e| e.to_string())?,
-    );
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/vnd.github+json"),
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static("Cairn"));
-    headers.insert(
-        "X-GitHub-Api-Version",
-        HeaderValue::from_static("2022-11-28"),
-    );
-    Ok(headers)
-}
+// Named as it always was at the call sites below; the constant itself now lives
+// beside the broker that authenticates against it.
+use API_BASE as GITHUB_API_BASE;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct AppInstallation {
@@ -60,15 +37,14 @@ pub struct AppInstallationAccount {
 /// List the installations currently authorized for this GitHub App.
 pub async fn list_app_installations(
     http: &dyn HttpClient,
-    app_id: i64,
-    private_key: &str,
+    app: &AppAuthority,
 ) -> Result<Vec<AppInstallation>, String> {
     let mut installations = Vec::new();
     for page in 1.. {
-        let resp = http
+        let resp = app
             .get(
+                http,
                 &format!("{GITHUB_API_BASE}/app/installations?per_page=100&page={page}"),
-                app_auth_headers(app_id, private_key)?,
             )
             .await?;
         ensure_github_api_success(&resp)?;
@@ -85,153 +61,24 @@ pub async fn list_app_installations(
 /// Revoke exactly one GitHub App installation.
 pub async fn revoke_app_installation(
     http: &dyn HttpClient,
-    app_id: i64,
-    private_key: &str,
+    app: &AppAuthority,
     installation_id: i64,
 ) -> Result<(), String> {
-    let resp = http
+    let resp = app
         .delete(
+            http,
             &format!("{GITHUB_API_BASE}/app/installations/{installation_id}"),
-            app_auth_headers(app_id, private_key)?,
         )
         .await?;
     ensure_github_api_success(&resp)
 }
 
-/// Global token cache keyed by installation_id.
-static TOKEN_CACHE: LazyLock<RwLock<HashMap<i64, CachedToken>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-// ── JWT ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct JwtClaims {
-    iat: u64,
-    exp: u64,
-    iss: i64,
-}
-
-fn generate_app_jwt(app_id: i64, private_key: &str) -> Result<String, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
-
-    let claims = JwtClaims {
-        iat: now - 60,
-        exp: now + 10 * 60,
-        iss: app_id,
-    };
-
-    let key = EncodingKey::from_rsa_pem(private_key.as_bytes())
-        .map_err(|e| format!("Invalid private key: {}", e))?;
-
-    encode(&Header::new(Algorithm::RS256), &claims, &key)
-        .map_err(|e| format!("Failed to generate JWT: {}", e))
-}
-
-// ── Token management ────────────────────────────────────────────
-
-#[derive(Debug, serde::Deserialize)]
-struct InstallationTokenResponse {
-    token: String,
-    expires_at: String,
-}
-
-async fn get_installation_token(
-    http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
-) -> Result<String, String> {
-    // Check cache
-    {
-        let cache = TOKEN_CACHE.read().map_err(|e| e.to_string())?;
-        if let Some(cached) = cache.get(&creds.installation_id) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs();
-            if cached.expires_at > now + 300 {
-                return Ok(cached.token.clone());
-            }
-        }
-    }
-
-    let jwt = generate_app_jwt(creds.app_id, &creds.private_key)?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", jwt)).map_err(|e| e.to_string())?,
-    );
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/vnd.github+json"),
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static("Cairn"));
-    headers.insert(
-        "X-GitHub-Api-Version",
-        HeaderValue::from_static("2022-11-28"),
-    );
-
-    let url = format!(
-        "{}/app/installations/{}/access_tokens",
-        GITHUB_API_BASE, creds.installation_id
-    );
-
-    let resp = http.post(&url, serde_json::json!({}), headers).await?;
-
-    if !resp.is_success() {
-        return Err(format!(
-            "GitHub API error: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    let token_resp: InstallationTokenResponse = resp.json()?;
-
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&token_resp.expires_at)
-        .map(|dt| dt.timestamp() as u64)
-        .unwrap_or(0);
-
-    {
-        let mut cache = TOKEN_CACHE.write().map_err(|e| e.to_string())?;
-        cache.insert(
-            creds.installation_id,
-            CachedToken {
-                token: token_resp.token.clone(),
-                expires_at,
-            },
-        );
-    }
-
-    Ok(token_resp.token)
-}
-
-/// Create authenticated headers for GitHub API requests.
-async fn auth_headers(
-    http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
-) -> Result<HeaderMap, String> {
-    let token = get_installation_token(http, creds).await?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| e.to_string())?,
-    );
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/vnd.github+json"),
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static("Cairn"));
-    headers.insert(
-        "X-GitHub-Api-Version",
-        HeaderValue::from_static("2022-11-28"),
-    );
-
-    Ok(headers)
-}
+// Authentication — signing the app JWT, exchanging it for an installation
+// token, and holding that token between calls — lives in
+// `security::broker::github`. It used to live here, which is how a
+// model-callable handler came to pass an RSA private key around by reference,
+// and how minted tokens came to sit in a process-global cache nothing could
+// revoke.
 
 // ── Rate limit ──────────────────────────────────────────────────
 
@@ -275,21 +122,20 @@ fn ensure_github_api_success(resp: &HttpResponse) -> Result<(), String> {
 
 async fn github_get_response(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     url: &str,
 ) -> Result<HttpResponse, String> {
-    let headers = auth_headers(http, creds).await?;
-    let resp = http.get(url, headers).await?;
+    let resp = auth.get(http, url).await?;
     ensure_github_api_success(&resp)?;
     Ok(resp)
 }
 
 async fn github_get_json<T: DeserializeOwned>(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     url: &str,
 ) -> Result<T, String> {
-    github_get_response(http, creds, url).await?.json()
+    github_get_response(http, auth, url).await?.json()
 }
 
 // ── API Response Types ──────────────────────────────────────────
@@ -417,20 +263,19 @@ pub(crate) fn get_repo_remote(repo_path: &str) -> Result<String, String> {
 /// Merge a PR via REST API.
 pub(crate) async fn merge_pr(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     pr_number: i32,
     merge_method: &str,
 ) -> Result<(), String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/pulls/{}/merge",
         GITHUB_API_BASE, owner, repo, pr_number
     );
 
     let body = serde_json::json!({ "merge_method": merge_method });
-    let resp = http.put(&url, body, headers).await?;
+    let resp = auth.put(http, &url, body).await?;
 
     check_rate_limit(&resp)?;
 
@@ -448,18 +293,17 @@ pub(crate) async fn merge_pr(
 /// Delete a branch via REST API.
 pub(crate) async fn delete_branch(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     branch: &str,
 ) -> Result<(), String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/git/refs/heads/{}",
         GITHUB_API_BASE, owner, repo, branch
     );
 
-    let resp = http.delete(&url, headers).await?;
+    let resp = auth.delete(http, &url).await?;
 
     check_rate_limit(&resp)?;
 
@@ -478,13 +322,13 @@ pub(crate) async fn delete_branch(
 /// Delete remote branches via GitHub API (non-fatal, logs warnings).
 pub(crate) async fn delete_remote_branches(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     branches: &[String],
 ) {
     for branch in branches {
-        match delete_branch(http, creds, owner, repo, branch).await {
+        match delete_branch(http, auth, owner, repo, branch).await {
             Ok(()) => log::info!("Deleted remote branch: {}", branch),
             Err(e) => log::warn!("Failed to delete remote branch {}: {}", branch, e),
         }
@@ -496,7 +340,7 @@ pub(crate) async fn delete_remote_branches(
 /// Fetch PR details via REST API.
 pub(crate) async fn fetch_pr(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     pr_number: i32,
@@ -505,13 +349,13 @@ pub(crate) async fn fetch_pr(
         "{}/repos/{}/{}/pulls/{}",
         GITHUB_API_BASE, owner, repo, pr_number
     );
-    github_get_json(http, creds, &url).await
+    github_get_json(http, auth, &url).await
 }
 
 /// Fetch check runs for a commit via REST API.
 pub(crate) async fn fetch_check_runs(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     sha: &str,
@@ -520,13 +364,13 @@ pub(crate) async fn fetch_check_runs(
         "{}/repos/{}/{}/commits/{}/check-runs",
         GITHUB_API_BASE, owner, repo, sha
     );
-    github_get_json(http, creds, &url).await
+    github_get_json(http, auth, &url).await
 }
 
 /// Fetch PR reviews via REST API.
 pub(crate) async fn fetch_reviews(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     pr_number: i32,
@@ -535,13 +379,13 @@ pub(crate) async fn fetch_reviews(
         "{}/repos/{}/{}/pulls/{}/reviews",
         GITHUB_API_BASE, owner, repo, pr_number
     );
-    github_get_json(http, creds, &url).await
+    github_get_json(http, auth, &url).await
 }
 
 /// Fetch PR files (changed files with diffs) via REST API.
 pub async fn fetch_pr_files(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     pr_number: i32,
@@ -550,7 +394,7 @@ pub async fn fetch_pr_files(
         "{}/repos/{}/{}/pulls/{}/files",
         GITHUB_API_BASE, owner, repo, pr_number
     );
-    github_get_json(http, creds, &url).await
+    github_get_json(http, auth, &url).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -566,19 +410,18 @@ pub struct PrCommitDetails {
 /// Close a PR via REST API.
 pub(crate) async fn close_pr(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     pr_number: i32,
 ) -> Result<(), String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/pulls/{}",
         GITHUB_API_BASE, owner, repo, pr_number
     );
 
     let body = serde_json::json!({ "state": "closed" });
-    let resp = http.patch(&url, body, headers).await?;
+    let resp = auth.patch(http, &url, body).await?;
     check_rate_limit(&resp)?;
 
     if !resp.is_success() {
@@ -595,7 +438,7 @@ pub(crate) async fn close_pr(
 /// Fetch workflow run jobs via REST API.
 pub(crate) async fn fetch_run_jobs(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     run_id: i64,
@@ -604,25 +447,24 @@ pub(crate) async fn fetch_run_jobs(
         "{}/repos/{}/{}/actions/runs/{}/jobs",
         GITHUB_API_BASE, owner, repo, run_id
     );
-    github_get_json(http, creds, &url).await
+    github_get_json(http, auth, &url).await
 }
 
 /// Fetch workflow run logs via REST API. Returns the raw log content as bytes.
 pub(crate) async fn fetch_run_logs(
     http: &dyn HttpClient,
-    creds: &GitHubAppCredentials,
+    auth: &InstallationAuthority,
     owner: &str,
     repo: &str,
     run_id: i64,
 ) -> Result<Vec<u8>, String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/actions/runs/{}/logs",
         GITHUB_API_BASE, owner, repo, run_id
     );
     log::info!("Fetching workflow logs from: {}", url);
 
-    let resp = http.get(&url, headers).await?;
+    let resp = auth.get(http, &url).await?;
     log::info!("Logs response status: {}", resp.status);
     check_rate_limit(&resp)?;
 
@@ -642,12 +484,9 @@ pub(crate) async fn fetch_run_logs(
 /// Requires App-level JWT authentication (not installation token).
 pub async fn update_app_webhook_url(
     http: &dyn HttpClient,
-    app_id: i64,
-    private_key: &str,
+    app: &AppAuthority,
     new_webhook_url: &str,
 ) -> Result<(), String> {
-    let headers = app_auth_headers(app_id, private_key)?;
-
     let url = format!("{}/app/hook/config", GITHUB_API_BASE);
 
     let body = serde_json::json!({
@@ -655,7 +494,7 @@ pub async fn update_app_webhook_url(
         "content_type": "json"
     });
 
-    let resp = http.patch(&url, body, headers).await?;
+    let resp = app.patch(http, &url, body).await?;
     check_rate_limit(&resp)?;
 
     if !resp.is_success() {
@@ -683,18 +522,11 @@ mod tests {
         ]);
         let http = MockHttpClient::new().respond_to(
             "/app/installations?",
-            HttpResponse {
-                status: 200,
-                body: serde_json::to_vec(&body).unwrap(),
-            },
+            HttpResponse::new(200, serde_json::to_vec(&body).unwrap()),
         );
-        let installations = list_app_installations(
-            &http,
-            12345,
-            include_str!("../../tests/fixtures/test_rsa_key.pem"),
-        )
-        .await
-        .unwrap();
+        let installations = list_app_installations(&http, &test_app_authority())
+            .await
+            .unwrap();
         assert_eq!(installations[0].id, 42);
         assert_eq!(installations[0].account.login, "Acme");
         assert_eq!(installations[0].account.account_type, "Organization");
@@ -704,19 +536,11 @@ mod tests {
     async fn scoped_revocation_reports_github_failure() {
         let http = MockHttpClient::new().respond_to(
             "/app/installations/42",
-            HttpResponse {
-                status: 403,
-                body: br#"{"message":"forbidden"}"#.to_vec(),
-            },
+            HttpResponse::new(403, br#"{"message":"forbidden"}"#.to_vec()),
         );
-        let error = revoke_app_installation(
-            &http,
-            12345,
-            include_str!("../../tests/fixtures/test_rsa_key.pem"),
-            42,
-        )
-        .await
-        .unwrap_err();
+        let error = revoke_app_installation(&http, &test_app_authority(), 42)
+            .await
+            .unwrap_err();
         assert!(error.contains("403"));
     }
 
@@ -781,10 +605,7 @@ mod tests {
         let body = serde_json::json!({
             "message": "API rate limit exceeded for installation ID 12345."
         });
-        let resp = HttpResponse {
-            status: 429,
-            body: serde_json::to_vec(&body).unwrap(),
-        };
+        let resp = HttpResponse::new(429, serde_json::to_vec(&body).unwrap());
         assert_eq!(parse_rate_limit_error(&resp), Some(60));
     }
 
@@ -793,19 +614,13 @@ mod tests {
         let body = serde_json::json!({
             "message": "Not Found"
         });
-        let resp = HttpResponse {
-            status: 404,
-            body: serde_json::to_vec(&body).unwrap(),
-        };
+        let resp = HttpResponse::new(404, serde_json::to_vec(&body).unwrap());
         assert_eq!(parse_rate_limit_error(&resp), None);
     }
 
     #[test]
     fn parse_rate_limit_error_with_empty_body() {
-        let resp = HttpResponse {
-            status: 429,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(429, vec![]);
         assert_eq!(parse_rate_limit_error(&resp), None);
     }
 
@@ -813,10 +628,7 @@ mod tests {
 
     #[test]
     fn rate_limit_429_returns_error() {
-        let resp = HttpResponse {
-            status: 429,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(429, vec![]);
         assert!(check_rate_limit(&resp).is_err());
     }
 
@@ -825,10 +637,7 @@ mod tests {
         let body = serde_json::json!({
             "message": "API rate limit exceeded"
         });
-        let resp = HttpResponse {
-            status: 429,
-            body: serde_json::to_vec(&body).unwrap(),
-        };
+        let resp = HttpResponse::new(429, serde_json::to_vec(&body).unwrap());
         let err = check_rate_limit(&resp).unwrap_err();
         assert!(
             err.contains("60 seconds"),
@@ -839,22 +648,24 @@ mod tests {
 
     #[test]
     fn rate_limit_200_ok() {
-        let resp = HttpResponse {
-            status: 200,
-            body: vec![],
-        };
+        let resp = HttpResponse::new(200, vec![]);
         assert!(check_rate_limit(&resp).is_ok());
     }
 
     // ── merge_pr ─────────────────────────────────────────────────
 
-    fn test_creds() -> GitHubAppCredentials {
-        // Use a minimal RSA key for JWT generation in tests
-        GitHubAppCredentials {
-            app_id: 12345,
-            private_key: include_str!("../../tests/fixtures/test_rsa_key.pem").to_string(),
-            installation_id: 99999,
-        }
+    const TEST_KEY: &str = include_str!("../../tests/fixtures/test_rsa_key.pem");
+
+    fn test_app_authority() -> crate::security::broker::github::AppAuthority {
+        crate::security::broker::github::app_authority_from_key(12345, TEST_KEY).unwrap()
+    }
+
+    fn test_authority() -> InstallationAuthority {
+        // A fixture key, signed with here exactly as production signs with the
+        // stored one — the difference production makes is where the key came
+        // from, which is the broker's business rather than this client's.
+        crate::security::broker::github::installation_authority_from_key(12345, 99999, TEST_KEY)
+            .unwrap()
     }
 
     fn mock_with_token_and(url_pattern: &str, status: u16) -> MockHttpClient {
@@ -865,41 +676,32 @@ mod tests {
         MockHttpClient::new()
             .respond_to(
                 "access_tokens",
-                HttpResponse {
-                    status: 201,
-                    body: serde_json::to_vec(&token_body).unwrap(),
-                },
+                HttpResponse::new(201, serde_json::to_vec(&token_body).unwrap()),
             )
-            .respond_to(
-                url_pattern,
-                HttpResponse {
-                    status,
-                    body: vec![],
-                },
-            )
+            .respond_to(url_pattern, HttpResponse::new(status, vec![]))
     }
 
     #[tokio::test]
     async fn merge_pr_success() {
         let http = mock_with_token_and("pulls/42/merge", 200);
-        let creds = test_creds();
-        let result = merge_pr(&http, &creds, "owner", "repo", 42, "squash").await;
+        let auth = test_authority();
+        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn merge_pr_failure_returns_error() {
         let http = mock_with_token_and("pulls/42/merge", 405);
-        let creds = test_creds();
-        let result = merge_pr(&http, &creds, "owner", "repo", 42, "merge").await;
+        let auth = test_authority();
+        let result = merge_pr(&http, &auth, "owner", "repo", 42, "merge").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn merge_pr_rate_limited() {
         let http = mock_with_token_and("pulls/1/merge", 429);
-        let creds = test_creds();
-        let result = merge_pr(&http, &creds, "owner", "repo", 1, "merge").await;
+        let auth = test_authority();
+        let result = merge_pr(&http, &auth, "owner", "repo", 1, "merge").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("rate limit"));
     }
@@ -909,8 +711,8 @@ mod tests {
     #[tokio::test]
     async fn delete_branch_success() {
         let http = mock_with_token_and("refs/heads/feature", 204);
-        let creds = test_creds();
-        let result = delete_branch(&http, &creds, "owner", "repo", "feature").await;
+        let auth = test_authority();
+        let result = delete_branch(&http, &auth, "owner", "repo", "feature").await;
         assert!(result.is_ok());
     }
 
@@ -918,16 +720,16 @@ mod tests {
     async fn delete_branch_already_deleted_is_ok() {
         // 422 means branch already deleted — should not error
         let http = mock_with_token_and("refs/heads/old", 422);
-        let creds = test_creds();
-        let result = delete_branch(&http, &creds, "owner", "repo", "old").await;
+        let auth = test_authority();
+        let result = delete_branch(&http, &auth, "owner", "repo", "old").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn delete_branch_forbidden_returns_error() {
         let http = mock_with_token_and("refs/heads/protected", 403);
-        let creds = test_creds();
-        let result = delete_branch(&http, &creds, "owner", "repo", "protected").await;
+        let auth = test_authority();
+        let result = delete_branch(&http, &auth, "owner", "repo", "protected").await;
         assert!(result.is_err());
     }
 
@@ -945,17 +747,11 @@ mod tests {
         MockHttpClient::new()
             .respond_to(
                 "access_tokens",
-                HttpResponse {
-                    status: 201,
-                    body: serde_json::to_vec(&token_body).unwrap(),
-                },
+                HttpResponse::new(201, serde_json::to_vec(&token_body).unwrap()),
             )
             .respond_to(
                 url_pattern,
-                HttpResponse {
-                    status,
-                    body: serde_json::to_vec(&body).unwrap(),
-                },
+                HttpResponse::new(status, serde_json::to_vec(&body).unwrap()),
             )
     }
 
@@ -974,8 +770,8 @@ mod tests {
             "head": { "sha": "abc123" }
         });
         let http = mock_with_token_and_body("pulls/42", 200, pr_json);
-        let creds = test_creds();
-        let pr = fetch_pr(&http, &creds, "owner", "repo", 42).await.unwrap();
+        let auth = test_authority();
+        let pr = fetch_pr(&http, &auth, "owner", "repo", 42).await.unwrap();
         assert_eq!(pr.title, "Fix bug");
         assert_eq!(pr.head.sha, "abc123");
         assert!(!pr.merged);
@@ -984,8 +780,8 @@ mod tests {
     #[tokio::test]
     async fn fetch_pr_not_found() {
         let http = mock_with_token_and("pulls/999", 404);
-        let creds = test_creds();
-        let result = fetch_pr(&http, &creds, "owner", "repo", 999).await;
+        let auth = test_authority();
+        let result = fetch_pr(&http, &auth, "owner", "repo", 999).await;
         assert!(result.is_err());
     }
 
@@ -1003,8 +799,8 @@ mod tests {
             }]
         });
         let http = mock_with_token_and_body("check-runs", 200, body);
-        let creds = test_creds();
-        let result = fetch_check_runs(&http, &creds, "owner", "repo", "abc123")
+        let auth = test_authority();
+        let result = fetch_check_runs(&http, &auth, "owner", "repo", "abc123")
             .await
             .unwrap();
         assert_eq!(result.check_runs.len(), 1);
@@ -1016,16 +812,16 @@ mod tests {
     #[tokio::test]
     async fn close_pr_success() {
         let http = mock_with_token_and("pulls/42", 200);
-        let creds = test_creds();
-        let result = close_pr(&http, &creds, "owner", "repo", 42).await;
+        let auth = test_authority();
+        let result = close_pr(&http, &auth, "owner", "repo", 42).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn close_pr_failure() {
         let http = mock_with_token_and("pulls/42", 422);
-        let creds = test_creds();
-        let result = close_pr(&http, &creds, "owner", "repo", 42).await;
+        let auth = test_authority();
+        let result = close_pr(&http, &auth, "owner", "repo", 42).await;
         assert!(result.is_err());
     }
 
@@ -1040,8 +836,8 @@ mod tests {
             }]
         });
         let http = mock_with_token_and_body("runs/100/jobs", 200, body);
-        let creds = test_creds();
-        let result = fetch_run_jobs(&http, &creds, "owner", "repo", 100)
+        let auth = test_authority();
+        let result = fetch_run_jobs(&http, &auth, "owner", "repo", 100)
             .await
             .unwrap();
         assert_eq!(result.jobs.len(), 1);

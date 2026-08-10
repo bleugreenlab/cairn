@@ -4,8 +4,8 @@ use cairn_core::internal::services::Clock;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_core::issues::{comments, crud};
 use cairn_core::models::{
-    CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueKind, IssueProgress,
-    IssueStatus, UpdateIssue,
+    CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress, IssueStatus,
+    UpdateIssue,
 };
 use cairn_core::transitions::Resolution;
 use cairn_db::turso::params;
@@ -29,7 +29,6 @@ fn create_issue_input(project_id: &str, title: &str) -> CreateIssue {
         description: Some("description".to_string()),
         backend_override: None,
         label_ids: None,
-        kind: IssueKind::Issue,
     }
 }
 
@@ -85,54 +84,6 @@ async fn create_list_and_get_issues_use_project_numbering() {
             .collect::<Vec<_>>(),
         vec![second.id.as_str(), first.id.as_str()]
     );
-}
-
-/// The kind survives every path a row takes back out of storage — the created
-/// row, a targeted get, and a list — and a thread takes an ordinary issue number
-/// from the same sequence, because a thread's identity IS an issue number
-/// (CAIRN-3387).
-#[tokio::test]
-async fn issue_kind_round_trips_through_create_get_and_list() {
-    let (_temp, db, project_id) = project_fixture("IKD").await;
-
-    let issue = create_issue_at(&db, &project_id, "Ordinary", 100).await;
-    let thread = crud::create(
-        &db,
-        &FixedClock(200),
-        CreateIssue {
-            kind: IssueKind::Thread,
-            ..create_issue_input(&project_id, "Thread")
-        },
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(issue.kind, IssueKind::Issue);
-    assert_eq!(thread.kind, IssueKind::Thread);
-    assert_eq!(thread.number, 2, "a thread takes the next issue number");
-
-    assert_eq!(
-        crud::get(&db, &thread.id).await.unwrap().unwrap().kind,
-        IssueKind::Thread
-    );
-    assert_eq!(
-        crud::get(&db, &issue.id).await.unwrap().unwrap().kind,
-        IssueKind::Issue
-    );
-
-    let listed = crud::list(&db, &project_id).await.unwrap();
-    assert_eq!(
-        listed
-            .iter()
-            .map(|issue| (issue.number, issue.kind))
-            .collect::<Vec<_>>(),
-        vec![(2, IssueKind::Thread), (1, IssueKind::Issue)]
-    );
-
-    // Serde carries it too: the frontend and every other consumer read the same
-    // discriminator the database holds.
-    let encoded = serde_json::to_value(&thread).unwrap();
-    assert_eq!(encoded["kind"], serde_json::json!("thread"));
 }
 
 #[tokio::test]

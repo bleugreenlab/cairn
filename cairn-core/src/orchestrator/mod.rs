@@ -21,6 +21,7 @@ pub mod lifecycle;
 pub mod object_plane;
 pub mod parent_wake;
 pub mod recipes;
+pub mod replay_base;
 pub mod session;
 pub mod settings;
 pub mod skills;
@@ -43,8 +44,8 @@ use crate::db::DbState;
 use crate::effects::executor::EffectExecutor;
 use crate::effects::types::WorkflowEffect;
 use crate::embeddings::{
-    spawn_embed_worker, EmbedJob, EmbeddingClient, PositionConfig, PositionKind, PositionMeta,
-    VibeState,
+    spawn_embed_worker, turns::SemanticSearch, EmbedJob, EmbeddingClient, PositionConfig,
+    PositionKind, PositionMeta, VibeState,
 };
 use crate::identity::IdentityStore;
 use crate::mcp::gateway::McpGateway;
@@ -94,6 +95,7 @@ pub struct OrchestratorBuilder {
     provider_usage_snapshots: ProviderUsageSnapshots,
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
+    recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     boot_at: i64,
 }
 
@@ -115,6 +117,7 @@ impl OrchestratorBuilder {
         let identity_store = Arc::new(Mutex::new(None));
         let account_manager = Arc::new(AccountManager::new(db.clone(), services.emitter.clone()));
         let notifier = Notifier::new(services.emitter.clone());
+        let recent_turn_end_check_requests = Arc::new(Mutex::new(HashMap::new()));
 
         Self {
             db,
@@ -149,6 +152,7 @@ impl OrchestratorBuilder {
             provider_usage_snapshots: Arc::new(RwLock::new(HashMap::new())),
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
             team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
+            recent_turn_end_check_requests,
             boot_at: chrono::Utc::now().timestamp(),
         }
     }
@@ -358,6 +362,8 @@ impl OrchestratorBuilder {
             attached_ui: Arc::new(Mutex::new(AttachedUi::default())),
             vibe_state: self.vibe_state,
             embed_tx: Arc::new(Mutex::new(None)),
+            embed_client: std::sync::OnceLock::new(),
+            semantic_search: std::sync::OnceLock::new(),
             anon_device_manager,
             account_manager: self.account_manager,
             notifier: self.notifier,
@@ -383,6 +389,8 @@ impl OrchestratorBuilder {
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            recent_turn_end_check_requests: self.recent_turn_end_check_requests,
+            main_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         }
@@ -911,6 +919,14 @@ pub struct Orchestrator {
         Mutex<HashMap<String, crate::orchestrator::build_services::BuildServiceRuntimeDiagnostic>>,
     >,
     turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
+    /// Request identities from the newest review wave for each job. Kept after
+    /// settlement so the equally short-lived Work history can join a completed
+    /// executor row back to its exact check lane without guessing by command.
+    recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    /// The newest default-branch verdict wave for each project. Replacing an
+    /// entry signals the stale wave before the new head enters its settle window.
+    pub(crate) main_checks_in_flight:
+        Arc<Mutex<HashMap<String, crate::execution::checks_main::MainCheckRun>>>,
     /// Job ids with a synchronous when:write batch in flight. Runtime-only.
     write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Runner-owned persistent commit-addressed execution workspaces.
@@ -949,6 +965,13 @@ pub struct Orchestrator {
     vibe_state: Option<Arc<VibeState>>,
     /// Sender into the async event-embed worker. None until the worker is started.
     embed_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EmbedJob>>>>,
+    /// The `/embed` gateway client, built once so the embed worker and search's
+    /// semantic lane share one connection pool. Built lazily because it needs
+    /// the account managers, which are wired after the struct is assembled.
+    embed_client: std::sync::OnceLock<EmbeddingClient>,
+    /// Search's semantic lane: the query-embedding client plus the resident
+    /// copy of the span vectors it scans.
+    semantic_search: std::sync::OnceLock<Arc<SemanticSearch>>,
 
     // === Team connection state (multi-team) ===
     /// Multi-team manager: handles DB-backed team configs, JWT refresh, credential resolution
@@ -1172,6 +1195,13 @@ impl Orchestrator {
         for executor in &executors {
             inventory.checked_out_count += executor.inventory.checked_out_count;
             inventory.idle_count += executor.inventory.idle_count;
+            inventory.idle_retention_budget_total = inventory
+                .idle_retention_budget_total
+                .saturating_add(executor.inventory.idle_retention_budget_total);
+            inventory.idle_retention_pressured |= executor.inventory.idle_retention_pressured;
+            inventory.excess_idle_count = inventory
+                .excess_idle_count
+                .saturating_add(executor.inventory.excess_idle_count);
             inventory.transient_occupancy += executor.inventory.transient_occupancy;
             inventory.resident_occupancy += executor.inventory.resident_occupancy;
             inventory.active_transient_reservation.memory_bytes = inventory
@@ -1285,10 +1315,10 @@ impl Orchestrator {
     pub fn cancel_cell_request(&self, request_id: &str) -> bool {
         let cancelled = self.fleet.cancel_request(request_id);
         if cancelled {
-            let _ = self.services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "build_slots", "action": "cancel", "requestId": request_id}),
-            );
+            let _ = self
+                .services
+                .emitter
+                .emit("substrate-health-change", serde_json::json!({}));
         }
         cancelled
     }
@@ -1370,8 +1400,16 @@ impl Orchestrator {
     }
 
     /// Set the external MCP gateway after construction (mirrors `set_executor`).
+    ///
+    /// The gateway is wrapped in
+    /// [`crate::mcp::untrusted::UntrustedGateway`] on the way in, so everything
+    /// an external MCP server returns is sanitized before any Cairn code sees
+    /// it. Wrapping here rather than at each host's wiring is what makes that a
+    /// property of the system instead of a convention: this is the only way a
+    /// gateway is installed, so an unwrapped one is unreachable.
     pub fn set_mcp_gateway(&self, gateway: Arc<dyn McpGateway>) -> Result<(), Arc<dyn McpGateway>> {
-        self.mcp_gateway.set(gateway)
+        self.mcp_gateway
+            .set(crate::mcp::untrusted::UntrustedGateway::wrap(gateway))
     }
 
     /// The configured MCP gateway, if a host has set one.
@@ -1535,7 +1573,10 @@ impl Orchestrator {
     /// cache exceeds `DEDUPE_CACHE_SWEEP_THRESHOLD` entries, drop everything
     /// older than the dedupe window (those entries can no longer suppress
     /// anything). Bounded growth, no background task required.
-    pub fn emit_attention_event(&self, event: AttentionEvent) {
+    pub fn emit_attention_event(&self, mut event: AttentionEvent) {
+        if event.route_provenance.is_none() {
+            event.route_provenance = crate::routes::current_provenance();
+        }
         let key = event.fact.key();
         log::debug!(
             "attention_emit: issue={} kind={} status={} attention={}",
@@ -1611,6 +1652,7 @@ impl Orchestrator {
             attention: ctx.attention,
             status: ctx.status,
             updated_at: idle.updated_at,
+            route_provenance: None,
         });
     }
 
@@ -1659,9 +1701,24 @@ impl Orchestrator {
         .await
     }
 
+    /// The shared `/embed` gateway client.
+    pub fn embedding_client(&self) -> &EmbeddingClient {
+        self.embed_client.get_or_init(|| {
+            EmbeddingClient::new(self.api_config.clone(), self.embed_token_provider())
+        })
+    }
+
+    /// Search's semantic lane. Always available; it answers only when an
+    /// account is connected and span vectors exist, and search degrades to the
+    /// text index whenever it does not.
+    pub fn semantic_search(&self) -> &Arc<SemanticSearch> {
+        self.semantic_search
+            .get_or_init(|| Arc::new(SemanticSearch::new(self.embedding_client().clone())))
+    }
+
     pub fn start_embed_worker(&self) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let client = EmbeddingClient::new(self.api_config.clone(), self.embed_token_provider());
+        let client = self.embedding_client().clone();
         spawn_embed_worker(
             rx,
             client,
@@ -1672,6 +1729,18 @@ impl Orchestrator {
         if let Ok(mut guard) = self.embed_tx.lock() {
             *guard = Some(tx);
         }
+
+        // The semantic lane's corpus sweep. `has_account` deliberately asks the
+        // ACCOUNT manager, not the token provider: every install registers an
+        // anonymous device token, so a usable token says nothing about consent.
+        // Live turns embed regardless; walking back through pre-existing
+        // transcripts is what requires a connected account.
+        let account_manager = self.account_manager.clone();
+        crate::embeddings::turns::spawn_turn_embedding_sweep(
+            self.embedding_client().clone(),
+            self.db.local.clone(),
+            Arc::new(move || account_manager.get_jwt().ok().flatten().is_some()),
+        );
     }
 
     /// Claim the turn-end-check single-flight slot for a job. Returns the job's
@@ -1686,6 +1755,10 @@ impl Orchestrator {
         }
         let cancel = TurnEndCancel::default();
         map.insert(job_id.to_string(), cancel.clone());
+        drop(map);
+        if let Ok(mut jobs) = self.recent_turn_end_check_requests.lock() {
+            jobs.remove(job_id);
+        }
         Some(cancel)
     }
 
@@ -1740,12 +1813,28 @@ impl Orchestrator {
             .runtime_status()
     }
 
+    pub(crate) fn recent_turn_end_check_request_ids(
+        &self,
+        job_id: &str,
+    ) -> HashMap<String, String> {
+        self.recent_turn_end_check_requests
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(job_id).cloned())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn set_turn_end_check_request_id(
         &self,
         job_id: &str,
         check_name: String,
         request_id: String,
     ) {
+        if let Ok(mut jobs) = self.recent_turn_end_check_requests.lock() {
+            jobs.entry(job_id.to_string())
+                .or_default()
+                .insert(check_name.clone(), request_id.clone());
+        }
         if let Ok(checks) = self.turn_end_checks_in_flight.lock() {
             if let Some(cancel) = checks.get(job_id) {
                 cancel.set_request_id(check_name, request_id);
@@ -2037,6 +2126,7 @@ impl Orchestrator {
     ///
     /// Must be called from within a tokio runtime context.
     pub async fn run_default_advance_reconcile(&self) {
+        crate::projects::crud::reconcile_project_repositories(&self.db.local).await;
         crate::projects::crud::reconcile_default_branches(&self.db.local).await;
         crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
         crate::execution::checks_main::spawn_all_current(self).await;
@@ -2046,6 +2136,7 @@ impl Orchestrator {
     pub fn spawn_default_advance_reconcile(&self) {
         let orch = self.clone();
         tokio::spawn(async move {
+            crate::projects::crud::reconcile_project_repositories(&orch.db.local).await;
             // One-time at startup, before the catch-up: re-detect and persist each
             // local project's real default branch, correcting any row left on the
             // unverified 'main' schema default. The catch-up and merges resolve
@@ -2062,12 +2153,33 @@ impl Orchestrator {
 
     /// Drain durable sibling intents periodically, including work re-queued when
     /// a branch is protected by an in-flight RunBatch bracket.
+    ///
+    /// This loop is the ONLY thing that ever revisits a deferred base advance, so
+    /// its liveness is the liveness of the whole recovery path. Each pass
+    /// therefore runs as its own task and is joined here: a panic inside the
+    /// sweep surfaces as a `JoinError` on this side instead of unwinding the
+    /// loop. Run inline, one panic — a database assertion, a subprocess parse —
+    /// silently retires the sweep for the lifetime of the process, and every
+    /// branch whose advance was deferred waits forever on a worker that no longer
+    /// exists, with nothing in the logs and nothing on the branch to say so.
     pub fn spawn_reconcile_intent_sweep(&self) {
         let orch = self.clone();
         tokio::spawn(async move {
             loop {
-                crate::orchestrator::base_advance::sweep_reconcile_intents(&orch).await;
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let pass = orch.clone();
+                let joined = crate::orchestrator::base_advance::supervised_sweep_pass(async move {
+                    crate::orchestrator::base_advance::sweep_reconcile_intents(&pass).await;
+                })
+                .await;
+                if let Err(error) = joined {
+                    log::error!(
+                        "jj reconcile sweep pass ended abnormally and was not completed; \
+                         retrying on the next cycle. Deferred base advances stay queued until a \
+                         pass succeeds: {error}"
+                    );
+                }
+                tokio::time::sleep(crate::orchestrator::base_advance::RECONCILE_SWEEP_INTERVAL)
+                    .await;
             }
         });
     }
@@ -2639,7 +2751,7 @@ impl Orchestrator {
 
     fn refresh_provider_model_catalog_blocking(&self, backend_name: &str) -> ProviderModelCatalog {
         let backend = backend_for_name(Some(backend_name));
-        let (models, error) = if backend_name == "ollama" {
+        let (mut models, error) = if backend_name == "ollama" {
             crate::backends::ollama::models::discover_catalog_blocking(self)
         } else {
             match backend.discover_models() {
@@ -2647,11 +2759,26 @@ impl Orchestrator {
                 Err(error) => (Vec::new(), Some(error)),
             }
         };
+        let mut refreshed_at = Some(chrono::Utc::now().timestamp());
+        // A failed refresh must not erase the last usable catalog. The error is
+        // retained so clients can label these models as stale and offer Retry;
+        // the prior successful timestamp remains the truthful age of the data.
+        if error.is_some() && models.is_empty() {
+            if let Some(previous) = self
+                .model_catalog
+                .read()
+                .ok()
+                .and_then(|catalog| catalog.get(backend_name).cloned())
+            {
+                models = previous.models;
+                refreshed_at = previous.refreshed_at;
+            }
+        }
         let entry = ProviderModelCatalog {
             backend: backend_name.to_string(),
             models,
             options: backend.option_descriptors(),
-            refreshed_at: Some(chrono::Utc::now().timestamp()),
+            refreshed_at,
             error,
         };
         if let Ok(mut catalog) = self.model_catalog.write() {
@@ -3096,6 +3223,33 @@ mod tests {
         assert!(lock.holds.sample_count <= JJ_STORE_LOCK_SAMPLE_CAPACITY as u64);
     }
 
+    #[tokio::test]
+    async fn review_request_ids_survive_settlement_until_the_next_wave() {
+        let orch = Orchestrator::builder(
+            test_db().await,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+
+        assert!(orch.try_begin_turn_end_checks("job-1").is_some());
+        orch.set_turn_end_check_request_id(
+            "job-1",
+            "rust-tests".to_string(),
+            "request-1".to_string(),
+        );
+        orch.end_turn_end_checks("job-1");
+        assert_eq!(
+            orch.recent_turn_end_check_request_ids("job-1")
+                .get("rust-tests")
+                .map(String::as_str),
+            Some("request-1")
+        );
+
+        assert!(orch.try_begin_turn_end_checks("job-1").is_some());
+        assert!(orch.recent_turn_end_check_request_ids("job-1").is_empty());
+    }
+
     async fn insert_account_jwt(db: &DbState, jwt: &str) {
         let enc = encrypt_jwt_for_storage(jwt).unwrap();
         db.local
@@ -3273,6 +3427,7 @@ mod tests {
                     supported_reasoning_efforts: Vec::new(),
                     context_window: Some(258_400),
                     canonical_slug: None,
+                    serving_account_ids: Vec::new(),
                     pricing: None,
                     supported_parameters: Vec::new(),
                     router: false,
@@ -3385,6 +3540,7 @@ mod tests {
                     supported_reasoning_efforts: Vec::new(),
                     context_window: Some(200_000),
                     canonical_slug: None,
+                    serving_account_ids: Vec::new(),
                     pricing: None,
                     supported_parameters: Vec::new(),
                     router: false,

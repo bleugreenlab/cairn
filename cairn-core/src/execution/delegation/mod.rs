@@ -291,6 +291,7 @@ mod call_packet_tests {
     fn empty_snapshot() -> ExecutionSnapshot {
         ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "r".to_string(),
                 name: "n".to_string(),

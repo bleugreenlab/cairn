@@ -36,6 +36,7 @@ use crate::storage::{LocalDb, RowExt};
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
 
 use super::common::{connect_for_read, job_status_icon};
+use super::transcript::DigestCoordinate;
 use super::transcript::{
     format_transcript_digest_with, group_turn_blocks, load_job_events_ordered, DigestMeta,
     DigestOptions, EventRow, TurnBlock,
@@ -151,8 +152,7 @@ pub(crate) async fn compose_thread_seed(
     let meta = DigestMeta {
         label: &coordinates.label,
         project: &coordinates.project_key,
-        number: coordinates.number,
-        exec_seq: coordinates.exec_seq,
+        coordinate: coordinates.digest_coordinate(),
         status: &coordinates.status,
     };
 
@@ -474,6 +474,17 @@ fn render_arc_data(data: &serde_json::Value) -> String {
         out.push('\n');
     }
 
+    if let Some(working) = data
+        .get("working")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        out.push_str("\n### Working (volatile)\n\n");
+        out.push_str(working);
+        out.push('\n');
+    }
+
     if let Some(rulings) = data.get("rulings").and_then(|value| value.as_array()) {
         if !rulings.is_empty() {
             out.push_str("\n### Rulings\n\n");
@@ -528,6 +539,9 @@ fn render_ruling(ruling: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("accepted");
     let mut line = format!("- **{status}** — {text}\n");
+    if let Some(slug) = ruling.get("slug").and_then(|value| value.as_str()) {
+        line.push_str(&format!("  - slug: `{slug}`\n"));
+    }
     if let Some(rationale) = ruling
         .get("rationale")
         .and_then(|value| value.as_str())
@@ -683,10 +697,25 @@ fn one_line(value: &str) -> String {
 struct NodeCoordinates {
     base_uri: String,
     project_key: String,
+    /// The owning thread, when this job is one. Threads have no issue number,
+    /// so this is what the seed header names instead of an issue coordinate.
+    thread_name: Option<String>,
     number: i32,
     exec_seq: i32,
     label: String,
     status: String,
+}
+
+impl NodeCoordinates {
+    fn digest_coordinate(&self) -> DigestCoordinate<'_> {
+        match self.thread_name.as_deref() {
+            Some(name) => DigestCoordinate::Thread { name },
+            None => DigestCoordinate::Issue {
+                number: self.number,
+                exec_seq: self.exec_seq,
+            },
+        }
+    }
 }
 
 /// Resolve the node's canonical address. Chapter URIs are only worth writing if
@@ -700,12 +729,19 @@ async fn node_coordinates(
         .await
         .ok()
         .flatten()?;
+    // Every join to the issue side is optional: this composes the seed for a
+    // THREAD, which owns no issue at all. Requiring one resolved to no row, so
+    // composition failed with "the node has no addressable coordinates" for
+    // exactly the sessions rolling compaction exists to serve.
     let mut rows = conn
         .query(
-            "SELECT p.key, i.number, COALESCE(e.seq, 1), COALESCE(j.node_name, j.uri_segment), j.status
+            "SELECT p.key, i.number, COALESCE(e.seq, 1),
+                    COALESCE(j.node_name, j.uri_segment), j.status, t.name
              FROM jobs j
-             JOIN issues i ON i.id = j.issue_id
-             JOIN projects p ON p.id = i.project_id
+             LEFT JOIN issues i ON i.id = j.issue_id
+             LEFT JOIN jobs parent ON j.parent_job_id = parent.id
+             LEFT JOIN threads t ON t.id = COALESCE(j.thread_id, parent.thread_id)
+             JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id)
              LEFT JOIN executions e ON e.id = j.execution_id
              WHERE j.id = ?1 LIMIT 1",
             params![job_id],
@@ -716,8 +752,9 @@ async fn node_coordinates(
     Some(NodeCoordinates {
         base_uri,
         project_key: row.text(0).ok()?,
-        number: row.i64(1).ok()? as i32,
-        exec_seq: row.i64(2).ok()? as i32,
+        thread_name: row.opt_text(5).ok()?,
+        number: row.opt_i64(1).ok()?.unwrap_or_default() as i32,
+        exec_seq: row.opt_i64(2).ok()?.unwrap_or_default() as i32,
         label: row
             .opt_text(3)
             .ok()?
@@ -1030,6 +1067,7 @@ async fn load_children(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::jobs::DigestPreview;
     use crate::storage::migrated_test_db;
 
     const THREAD_JOB: &str = "job-thread";
@@ -1039,6 +1077,27 @@ mod tests {
     /// Composition time for every test. The fixture's newest event is at 141, so
     /// a child's last activity reads as a couple of hours old.
     const NOW: i64 = 10_000;
+
+    #[test]
+    fn ruling_slug_survives_into_the_rebuilt_seed() {
+        let rendered = render_arc_data(&serde_json::json!({"rulings": [{
+            "slug": "no-budget-kills", "text": "No budget kills", "status": "accepted",
+            "rationale": "Quality wins", "provenance": ["cairn://p/CAIRN/3404"]
+        }]}));
+        assert!(rendered.contains("slug: `no-budget-kills`"));
+    }
+
+    #[test]
+    fn volatile_working_state_is_carried_beside_durable_intent() {
+        let data = serde_json::json!({
+            "current_intent": "Keep the durable direction.",
+            "working": "Ratify A, then watch B, then start C."
+        });
+        let rendered = render_arc_data(&data);
+        assert!(rendered.starts_with("Keep the durable direction."));
+        assert!(rendered.contains("### Working (volatile)"));
+        assert!(rendered.contains("Ratify A, then watch B, then start C."));
+    }
 
     /// A thread with fourteen turns: four old ones behind the recency window,
     /// then ten recent. Of the four old turns, one is plain conversation, two
@@ -1430,6 +1489,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_preview_measures_the_composed_seed_and_not_what_it_drops() {
+        // A composition carries three plausible sizes: the seed it produces, the
+        // bytes it drops (`source_bytes`), and what those dropped turns weigh as
+        // chapters (`candidate_bytes`). Only the first answers "how big will this
+        // thread be after I compact it", which is the question the menu is asked.
+        let db = thread_fixture("thread-seed-preview-boundary.db").await;
+        mark_done_child(&db).await;
+        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        let preview = DigestPreview::of(&seed.content);
+
+        // Cairn's ~4-characters-per-token convention, rounded up so a short seed
+        // never reads as zero tokens.
+        let characters = seed.content.chars().count() as i64;
+        assert_eq!(preview.estimated_tokens, (characters + 3) / 4);
+
+        assert!(
+            seed.source_bytes > 0 && seed.candidate_bytes > 0,
+            "the fixture must actually drop turns for this comparison to mean anything"
+        );
+        assert_ne!(preview.estimated_tokens, (seed.source_bytes + 3) / 4);
+        assert_ne!(preview.estimated_tokens, (seed.candidate_bytes + 3) / 4);
+    }
+
+    #[tokio::test]
+    async fn the_projected_size_follows_the_arc_it_copies() {
+        // The arc is copied into every seed verbatim, so authoring more of one is
+        // exactly the kind of sprawl the number exists to make visible.
+        let db = thread_fixture("thread-seed-preview-arc.db").await;
+        mark_done_child(&db).await;
+
+        write_arc(&db, 1, "Short intent.").await;
+        let small = DigestPreview::of(
+            &compose_thread_seed(&db, THREAD_JOB, NOW)
+                .await
+                .unwrap()
+                .content,
+        );
+
+        write_arc(&db, 2, &"A much longer statement of intent. ".repeat(40)).await;
+        let large = DigestPreview::of(
+            &compose_thread_seed(&db, THREAD_JOB, NOW)
+                .await
+                .unwrap()
+                .content,
+        );
+
+        assert!(
+            large.estimated_tokens > small.estimated_tokens,
+            "a longer arc must project a larger seed: {} vs {}",
+            large.estimated_tokens,
+            small.estimated_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn the_projected_size_follows_the_transcript() {
+        // A new turn both enters the recency window and pushes the oldest kept
+        // turn out of it, so the seed a compaction would create is a different
+        // one and the number must move with it.
+        let db = thread_fixture("thread-seed-preview-transcript.db").await;
+        mark_done_child(&db).await;
+        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+
+        let before = DigestPreview::of(
+            &compose_thread_seed(&db, THREAD_JOB, NOW)
+                .await
+                .unwrap()
+                .content,
+        );
+
+        turn(
+            &db,
+            15,
+            "One more recent turn, with rather more to say than the ones before it.",
+            Some("AND_A_REPLY_TO_MATCH"),
+        )
+        .await;
+        let after = DigestPreview::of(
+            &compose_thread_seed(&db, THREAD_JOB, NOW)
+                .await
+                .unwrap()
+                .content,
+        );
+
+        assert_ne!(
+            after.estimated_tokens, before.estimated_tokens,
+            "a new turn left the projected seed size unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn an_unmarked_child_is_never_folded_into_a_chapter() {
         // Without the terminal mark, the same turns are conversation. They may be
         // compacted as interstitial chapters, but never attributed to the child.
@@ -1604,55 +1756,27 @@ mod tests {
         assert!(compose_thread_seed(&db, THREAD_JOB, NOW).await.is_err());
     }
 
-    /// The compactor reads one named artifact, and the thread recipe is what
-    /// creates it. Nothing else connects those two slices, and the failure mode
-    /// if they drift is silent rather than loud: a renamed artifact node does
-    /// not error anywhere, it just means every composed seed reports that no arc
-    /// was authored, forever. That is the whole top preservation tier going
-    /// missing without a single failing test — so pin the name here, against the
-    /// recipe that actually ships.
     #[test]
-    fn the_shipped_thread_recipe_declares_the_arc_this_composer_reads() {
-        let recipe =
-            crate::models::RecipeFile::from_yaml(include_str!("../../../../recipes/thread.yaml"))
-                .expect("the bundled thread recipe parses")
-                .into_recipe(Some("default".to_string()), None);
-
-        let arc = recipe
-            .nodes
-            .iter()
-            .filter_map(|node| node.artifact_config.as_ref())
-            .find(|config| config.name == ARC_ARTIFACT_NAME)
-            .unwrap_or_else(|| {
-                panic!(
-                    "the thread recipe declares no `{ARC_ARTIFACT_NAME}` artifact, so every \
-                     composed seed would silently report an unauthored arc"
-                )
-            });
-
-        // The schema is the read contract: the provenance-first shape this
-        // composer renders, with provenance required on every ruling.
-        let schema = arc.schema.as_ref().expect("the arc carries a schema");
-        let properties = schema
-            .get("properties")
-            .and_then(|value| value.as_object())
+    fn the_canonical_arc_schema_declares_the_fields_this_composer_reads() {
+        let schema =
+            crate::output_schemas::load_embedded_preset_schema(crate::threads::ARC_ARTIFACT_NAME)
+                .expect("the arc preset is embedded");
+        let properties = schema["properties"]
+            .as_object()
             .expect("the arc schema declares properties");
         for field in ["current_intent", "rulings", "open_questions"] {
             assert!(
                 properties.contains_key(field),
-                "the arc schema dropped `{field}`, which this composer renders"
+                "the arc schema dropped field"
             );
         }
         let ruling_required = properties["rulings"]["items"]["required"]
             .as_array()
             .expect("a ruling declares required fields");
         for field in ["text", "status", "rationale", "provenance"] {
-            assert!(
-                ruling_required
-                    .iter()
-                    .any(|value| value.as_str() == Some(field)),
-                "a ruling no longer requires `{field}` — an unprovenanced ruling gets relitigated"
-            );
+            assert!(ruling_required
+                .iter()
+                .any(|value| value.as_str() == Some(field)));
         }
     }
 

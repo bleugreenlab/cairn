@@ -10,14 +10,141 @@ static IMESSAGE_RUNTIME: OnceLock<Mutex<Option<Arc<imessage::IMessageProvider>>>
 static IMESSAGE_ROUTER_BLOCKER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static IMESSAGE_ADMISSION_STATE: OnceLock<Mutex<Option<(&'static str, String)>>> = OnceLock::new();
 static IMESSAGE_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static OPERATOR_PRESENCE_STATE: OnceLock<Mutex<OperatorPresenceState>> = OnceLock::new();
+static DESKTOP_ACTIVITY_STATE: OnceLock<Mutex<DesktopActivityState>> = OnceLock::new();
+static OPERATOR_PRESENCE_CHANGED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static ROUTE_SUBMISSIONS: OnceLock<
+    Mutex<Option<mpsc::UnboundedSender<crate::routes::ChannelSubmission>>>,
+> = OnceLock::new();
 const ADMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const ADMISSION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+const DESKTOP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct AdmissionFailureReporter {
     last_error: Option<String>,
     last_reported_at: Option<Instant>,
     suppressed: u64,
+}
+
+fn route_submission_slot(
+) -> &'static Mutex<Option<mpsc::UnboundedSender<crate::routes::ChannelSubmission>>> {
+    ROUTE_SUBMISSIONS.get_or_init(|| Mutex::new(None))
+}
+
+/// Hands a channel route to the optional external-channel runtime. Non-channel
+/// sinks are independent of channel admission, so absence here is deliberately soft.
+pub fn submit_route(
+    submission: crate::routes::ChannelSubmission,
+) -> Result<(), Box<crate::routes::ChannelSubmission>> {
+    let sender = route_submission_slot()
+        .lock()
+        .expect("route submission slot poisoned")
+        .clone();
+    let Some(sender) = sender else {
+        return Err(Box::new(submission));
+    };
+    sender.send(submission).map_err(|error| {
+        *route_submission_slot()
+            .lock()
+            .expect("route submission slot poisoned") = None;
+        Box::new(error.0)
+    })
+}
+
+fn resolve_presence_with_lock(
+    state: &mut OperatorPresenceState,
+    inferred: OperatorPresence,
+    locked: bool,
+    now: Instant,
+) -> OperatorPresence {
+    if locked && state.mode == OperatorPresenceMode::Active {
+        state.mode = OperatorPresenceMode::Auto;
+    }
+    resolve_presence(state, inferred, now)
+}
+
+fn select_inferred_presence(
+    desktop: Option<OperatorPresence>,
+    channel_fallback: OperatorPresence,
+) -> OperatorPresence {
+    desktop.unwrap_or(channel_fallback)
+}
+
+#[derive(Debug, Default)]
+struct DesktopActivityState {
+    last_sample: Option<DesktopPresenceSample>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DesktopPresenceSample {
+    sampled_at: Instant,
+    idle_seconds: u64,
+    locked: bool,
+}
+
+fn desktop_activity_state() -> &'static Mutex<DesktopActivityState> {
+    DESKTOP_ACTIVITY_STATE.get_or_init(|| Mutex::new(DesktopActivityState::default()))
+}
+
+/// Records activity observed by the desktop app. The runner owns the timestamp
+/// so callers cannot forge freshness with a client clock.
+pub fn report_desktop_presence(idle_seconds: u64, locked: bool) {
+    desktop_activity_state()
+        .lock()
+        .expect("desktop activity state lock poisoned")
+        .last_sample = Some(DesktopPresenceSample {
+        sampled_at: Instant::now(),
+        idle_seconds,
+        locked,
+    });
+    OPERATOR_PRESENCE_CHANGED
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_one();
+}
+
+fn desktop_inferred_presence(
+    sample: Option<DesktopPresenceSample>,
+    now: Instant,
+) -> Option<(OperatorPresence, bool)> {
+    sample.map(|sample| {
+        let sample_age = now.saturating_duration_since(sample.sampled_at);
+        let effective_idle = Duration::from_secs(sample.idle_seconds).saturating_add(sample_age);
+        let presence = if !sample.locked && effective_idle < DESKTOP_ACTIVITY_TIMEOUT {
+            OperatorPresence::Present
+        } else {
+            OperatorPresence::Away
+        };
+        (presence, sample.locked)
+    })
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorPresenceStatus {
+    pub mode: OperatorPresenceMode,
+    pub presence: OperatorPresence,
+}
+
+/// Returns the runner's single resolved presence truth without requiring a
+/// channel runtime. A missing provider fails closed to away unless the operator
+/// has explicitly pinned active, so presence consumers always have a state.
+pub async fn operator_presence_status() -> OperatorPresenceStatus {
+    let runtime = runtime_slot()
+        .lock()
+        .expect("channel runtime lock poisoned")
+        .clone();
+    let presence = operator_presence(
+        runtime
+            .as_deref()
+            .map(|provider| provider as &dyn ChannelProvider),
+    )
+    .await;
+    let mode = presence_state()
+        .lock()
+        .expect("operator presence state lock poisoned")
+        .mode;
+    OperatorPresenceStatus { mode, presence }
 }
 
 fn admission_state_slot() -> &'static Mutex<Option<(&'static str, String)>> {
@@ -50,8 +177,8 @@ pub(super) fn set_router_blocker(error: Option<String>) {
         .expect("channel router blocker lock poisoned") = error;
 }
 
-/// Why an outbound message exists. Operator responses and standing subscriptions
-/// are explicit operator intent and must never be treated as attention pushes.
+/// Why an outbound message exists. Direct operator responses remain conversation;
+/// standing subscriptions are Cairn-initiated pushes and obey presence policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OutboundInitiator {
@@ -62,7 +189,7 @@ pub enum OutboundInitiator {
 
 impl OutboundInitiator {
     pub fn is_presence_aware(self) -> bool {
-        matches!(self, Self::CairnPush)
+        matches!(self, Self::OperatorSubscription | Self::CairnPush)
     }
 }
 
@@ -132,10 +259,100 @@ fn runtime_slot() -> &'static Mutex<Option<Arc<imessage::IMessageProvider>>> {
     IMESSAGE_RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum OperatorPresence {
     Present,
     Away,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum OperatorPresenceMode {
+    #[default]
+    Auto,
+    Active,
+    Idle,
+}
+
+#[derive(Debug)]
+struct OperatorPresenceState {
+    mode: OperatorPresenceMode,
+}
+
+impl Default for OperatorPresenceState {
+    fn default() -> Self {
+        Self {
+            mode: OperatorPresenceMode::Auto,
+        }
+    }
+}
+
+fn presence_state() -> &'static Mutex<OperatorPresenceState> {
+    OPERATOR_PRESENCE_STATE.get_or_init(|| Mutex::new(OperatorPresenceState::default()))
+}
+
+fn resolve_presence(
+    state: &mut OperatorPresenceState,
+    inferred: OperatorPresence,
+    _now: Instant,
+) -> OperatorPresence {
+    match state.mode {
+        OperatorPresenceMode::Auto => inferred,
+        OperatorPresenceMode::Active => OperatorPresence::Present,
+        OperatorPresenceMode::Idle => OperatorPresence::Away,
+    }
+}
+
+pub fn set_operator_presence_mode(mode: OperatorPresenceMode) {
+    let mut state = presence_state()
+        .lock()
+        .expect("operator presence state lock poisoned");
+    state.mode = mode;
+    OPERATOR_PRESENCE_CHANGED
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_one();
+}
+
+pub(super) async fn wait_for_presence_change() {
+    OPERATOR_PRESENCE_CHANGED
+        .get_or_init(tokio::sync::Notify::new)
+        .notified()
+        .await;
+}
+
+pub async fn operator_presence(provider: Option<&dyn ChannelProvider>) -> OperatorPresence {
+    let mode = presence_state()
+        .lock()
+        .expect("operator presence state lock poisoned")
+        .mode;
+    let desktop_inferred = desktop_inferred_presence(
+        desktop_activity_state()
+            .lock()
+            .expect("desktop activity state lock poisoned")
+            .last_sample,
+        Instant::now(),
+    );
+    let channel_fallback = match desktop_inferred {
+        Some(_) => OperatorPresence::Away,
+        None => match provider {
+            Some(provider) => provider.operator_presence().await,
+            None if mode == OperatorPresenceMode::Active => OperatorPresence::Present,
+            None => OperatorPresence::Away,
+        },
+    };
+    let inferred = select_inferred_presence(
+        desktop_inferred.map(|(presence, _)| presence),
+        channel_fallback,
+    );
+    resolve_presence_with_lock(
+        &mut presence_state()
+            .lock()
+            .expect("operator presence state lock poisoned"),
+        inferred,
+        desktop_inferred.is_some_and(|(_, locked)| locked),
+        Instant::now(),
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +366,8 @@ pub struct ChannelRuntimeStatus {
     pub last_receipt_at: Option<i64>,
     pub last_receipt_rowid: Option<i64>,
     pub unsolicited_inbound: Vec<ChannelInboundSummary>,
+    pub presence_mode: OperatorPresenceMode,
+    pub operator_presence: OperatorPresence,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,6 +407,16 @@ pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> Channel
         .clone();
     let health = runtime.as_ref().map(|provider| provider.health());
     let liveness = runtime.as_ref().map(|provider| provider.watch_liveness());
+    let operator_presence = operator_presence(
+        runtime
+            .as_deref()
+            .map(|provider| provider as &dyn ChannelProvider),
+    )
+    .await;
+    let presence_mode = presence_state()
+        .lock()
+        .expect("operator presence state lock poisoned")
+        .mode;
     let router_blocker = router_blocker_slot()
         .lock()
         .expect("channel router blocker lock poisoned")
@@ -223,6 +452,8 @@ pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> Channel
         last_receipt_at: liveness.and_then(|value| value.last_receipt_at),
         last_receipt_rowid: liveness.and_then(|value| value.last_receipt_rowid),
         unsolicited_inbound,
+        presence_mode,
+        operator_presence,
     }
 }
 
@@ -250,6 +481,7 @@ pub mod router;
 
 /// Starts the configured external channel service on runner hosts.
 pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
+    crate::routes::spawn_attention_routes(orch.clone());
     tokio::spawn(async move {
         loop {
             let config = crate::config::settings::load_settings(&orch.config_dir)
@@ -539,9 +771,9 @@ pub trait ChannelProvider: Send + Sync {
     async fn send(&self, message: &OutboundMessage) -> Result<SentIds, String>;
     fn subscribe(&self) -> mpsc::Receiver<InboundEvent>;
     fn health(&self) -> ChannelHealth;
-    /// Presence on the machine that owns this provider account. An unreadable
-    /// signal is away: deferral may remove a redundant alert, but uncertainty
-    /// must never suppress one.
+    /// Headless fallback for a provider running on the same console as the
+    /// runner. Remotely placed providers must use the default Away result:
+    /// service placement is never evidence of operator presence.
     async fn operator_presence(&self) -> OperatorPresence {
         OperatorPresence::Away
     }
@@ -583,6 +815,116 @@ pub fn render_text_floor(ask: &OutboundAsk) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial(operator_presence)]
+    async fn presence_change_is_retained_until_the_router_waits() {
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        tokio::time::timeout(Duration::from_millis(50), wait_for_presence_change())
+            .await
+            .expect("a presence change emitted before the wait must retain a wake permit");
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+        wait_for_presence_change().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(operator_presence)]
+    async fn presence_status_remains_operable_without_a_channel_runtime() {
+        assert!(runtime_slot().lock().unwrap().is_none());
+
+        set_operator_presence_mode(OperatorPresenceMode::Active);
+        let active = operator_presence_status().await;
+        assert_eq!(active.mode, OperatorPresenceMode::Active);
+        assert_eq!(active.presence, OperatorPresence::Present);
+
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+        let idle = operator_presence_status().await;
+        assert_eq!(idle.mode, OperatorPresenceMode::Idle);
+        assert_eq!(idle.presence, OperatorPresence::Away);
+
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+    }
+
+    #[test]
+    fn desktop_inference_is_independent_of_remote_channel_residency() {
+        assert_eq!(
+            select_inferred_presence(Some(OperatorPresence::Present), OperatorPresence::Away,),
+            OperatorPresence::Present
+        );
+        assert_eq!(
+            select_inferred_presence(Some(OperatorPresence::Away), OperatorPresence::Present),
+            OperatorPresence::Away
+        );
+    }
+
+    #[test]
+    fn desktop_activity_expires_after_the_presence_window() {
+        let start = Instant::now();
+        assert_eq!(desktop_inferred_presence(None, start), None);
+        let sample = DesktopPresenceSample {
+            sampled_at: start,
+            idle_seconds: 0,
+            locked: false,
+        };
+        assert_eq!(
+            desktop_inferred_presence(
+                Some(sample),
+                start + DESKTOP_ACTIVITY_TIMEOUT - Duration::from_millis(1),
+            ),
+            Some((OperatorPresence::Present, false))
+        );
+        assert_eq!(
+            desktop_inferred_presence(Some(sample), start + DESKTOP_ACTIVITY_TIMEOUT),
+            Some((OperatorPresence::Away, false))
+        );
+    }
+
+    #[test]
+    fn manual_presence_remains_pinned_despite_contrary_inference() {
+        let start = Instant::now();
+        let mut state = OperatorPresenceState {
+            mode: OperatorPresenceMode::Idle,
+        };
+
+        assert_eq!(
+            resolve_presence(&mut state, OperatorPresence::Present, start),
+            OperatorPresence::Away
+        );
+        assert_eq!(
+            resolve_presence(
+                &mut state,
+                OperatorPresence::Present,
+                start + Duration::from_secs(3_600)
+            ),
+            OperatorPresence::Away
+        );
+        assert_eq!(state.mode, OperatorPresenceMode::Idle);
+    }
+
+    #[test]
+    fn screen_lock_releases_a_manual_active_pin() {
+        let mut state = OperatorPresenceState {
+            mode: OperatorPresenceMode::Active,
+        };
+        assert_eq!(
+            resolve_presence_with_lock(&mut state, OperatorPresence::Away, true, Instant::now()),
+            OperatorPresence::Away
+        );
+        assert_eq!(state.mode, OperatorPresenceMode::Auto);
+    }
+
+    #[test]
+    fn matching_inference_does_not_clear_a_manual_presence() {
+        let start = Instant::now();
+        let mut state = OperatorPresenceState {
+            mode: OperatorPresenceMode::Active,
+        };
+        assert_eq!(
+            resolve_presence(&mut state, OperatorPresence::Present, start),
+            OperatorPresence::Present
+        );
+        assert_eq!(state.mode, OperatorPresenceMode::Active);
+    }
 
     #[tokio::test]
     async fn admission_failures_are_paced_collapsed_and_recover_promptly() {

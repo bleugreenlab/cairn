@@ -1,5 +1,6 @@
 pub mod abnormal_exit;
 pub mod auth;
+pub mod authorization;
 pub mod build_identity;
 pub mod change_validation;
 pub mod check_environment;
@@ -17,6 +18,8 @@ pub mod query;
 pub mod read;
 pub mod run_contract;
 pub mod scratch;
+pub mod security;
+pub mod thread_name;
 pub mod toolchain_path;
 pub mod uri;
 pub mod write_contract;

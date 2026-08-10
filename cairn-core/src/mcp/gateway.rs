@@ -19,8 +19,28 @@
 use async_trait::async_trait;
 use cairn_common::read::ImageBlock;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::config::mcp_servers::McpServerConfig;
+use crate::security::BrokeredMcpConfig;
+
+/// A bidirectional byte stream suitable for an MCP client transport.
+pub trait DuplexIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+impl<T> DuplexIo for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+/// Factory for a machine-local MCP facade reached through service placement.
+///
+/// The gateway asks for a stream only when its machine-scoped pool has no live
+/// connection. Core owns placement; transport owns the MCP protocol lifecycle.
+#[async_trait]
+pub trait PlacedFacade: Send + Sync {
+    /// Stable machine identity used by the gateway connection pool.
+    fn key(&self) -> &str;
+
+    /// Open a fresh byte stream to the facade process on that machine.
+    async fn open(&self) -> Result<Box<dyn DuplexIo>, String>;
+}
 
 /// The result of a proxied external MCP `tools/call`.
 ///
@@ -101,18 +121,47 @@ pub struct McpResourceDef {
 /// Host-implemented bridge to external MCP servers.
 ///
 /// All methods take a `session_key` (the run's job id) so connections are
-/// pooled and isolated per agent session. `config` is the already
-/// env-expanded server configuration resolved from workspace + project
-/// settings; the gateway connects lazily on first use.
+/// pooled and isolated per agent session; the gateway connects lazily on first
+/// use.
+///
+/// `config` arrives as a [`BrokeredMcpConfig`] rather than an
+/// `McpServerConfig` because an expanded configuration carries resolved
+/// credentials in `env`, `headers`, `url`, and `args`. The brokered carrier has
+/// no `Debug`, no `serde`, and no `Clone`, so a gateway implementation can
+/// connect with it but cannot log it, persist it, or hold it in a struct that
+/// later gets serialized. Reach the fields with
+/// [`BrokeredMcpConfig::resolved`] at the point of connecting, and no earlier.
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait McpGateway: Send + Sync {
+    /// List tools through a machine-scoped placed facade.
+    async fn list_placed_tools(
+        &self,
+        _facade: Arc<dyn PlacedFacade>,
+    ) -> Result<McpToolCatalog, String> {
+        Err("this host cannot reach placed MCP facades".to_string())
+    }
+
+    /// Execute one tool-call round through a machine-scoped placed facade.
+    async fn call_placed_tool_once(
+        &self,
+        _facade: Arc<dyn PlacedFacade>,
+        _tool: &str,
+        _args: serde_json::Value,
+        _timeout_ms: Option<u32>,
+    ) -> Result<McpCallOutcome, String> {
+        Err("this host cannot reach placed MCP facades".to_string())
+    }
+
+    /// Tear down the pooled connection for one placed machine.
+    async fn close_placed(&self, _key: &str) {}
+
     /// List the tools advertised by `server`.
     async fn list_tools(
         &self,
         session_key: &str,
         server: &str,
-        config: &McpServerConfig,
+        config: &BrokeredMcpConfig,
     ) -> Result<McpToolCatalog, String>;
 
     /// List the resources advertised by `server` (empty if unsupported).
@@ -120,7 +169,7 @@ pub trait McpGateway: Send + Sync {
         &self,
         session_key: &str,
         server: &str,
-        config: &McpServerConfig,
+        config: &BrokeredMcpConfig,
     ) -> Result<Vec<McpResourceDef>, String>;
 
     /// Proxy a `resources/read` for an external resource `uri`.
@@ -128,7 +177,7 @@ pub trait McpGateway: Send + Sync {
         &self,
         session_key: &str,
         server: &str,
-        config: &McpServerConfig,
+        config: &BrokeredMcpConfig,
         uri: &str,
     ) -> Result<String, String>;
 
@@ -138,7 +187,7 @@ pub trait McpGateway: Send + Sync {
         &self,
         session_key: &str,
         server: &str,
-        config: &McpServerConfig,
+        config: &BrokeredMcpConfig,
         tool: &str,
         args: serde_json::Value,
         input_responses: Option<serde_json::Value>,
@@ -160,7 +209,7 @@ pub trait McpGateway: Send + Sync {
         &self,
         session_key: &str,
         server: &str,
-        config: &McpServerConfig,
+        config: &BrokeredMcpConfig,
         tool: &str,
         args: serde_json::Value,
         timeout_ms: Option<u32>,
@@ -189,7 +238,7 @@ pub trait McpGateway: Send + Sync {
         &self,
         _session_key: &str,
         _server: &str,
-        _config: &McpServerConfig,
+        _config: &BrokeredMcpConfig,
         task_id: &str,
     ) -> Result<McpTaskOutcome, String> {
         Err(format!(
@@ -201,7 +250,7 @@ pub trait McpGateway: Send + Sync {
         &self,
         _session_key: &str,
         _server: &str,
-        _config: &McpServerConfig,
+        _config: &BrokeredMcpConfig,
         task_id: &str,
         input_responses: serde_json::Value,
         operation_id: Option<&str>,

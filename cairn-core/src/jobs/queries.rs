@@ -87,10 +87,148 @@ pub async fn get_node_name_from_execution(
     find_node_in_snapshot(&snapshot, node_id).map(|node| node.name.clone())
 }
 
-/// The job's canonical node URI (`cairn://p/{KEY}/{number}/{seq}/{segment}`,
-/// nesting a sub-agent task under its parent node). This is the one canonical
-/// job-id → node-URI resolution: message wake links, pending-delivery
-/// recipients, and per-job scratch-dir naming all resolve through here.
+/// The newest run belonging to a job, which is the identity its worktree fence is
+/// resolved through.
+///
+/// A surface a *user* opens on a job — a terminal from the `+` menu, a REPL from
+/// the same menu — arrives with no run context, but it is still that job's agent
+/// the process is opened for and still that agent's fence that should govern it.
+/// Answering "no run identity" there means no policy is built and the process
+/// spawns unconfined, so the identity is read from the job instead of from the
+/// caller. Owner-agnostic: it keys on the job alone, so a thread session resolves
+/// exactly as an issue node does.
+pub(crate) async fn latest_run_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                    cairn_db::turso::params![job_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(row.text(0)?)),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Resolve the job a node coordinate addresses — the inverse of
+/// [`home_uri_for_job_conn`], and owner-aware in exactly the same way.
+///
+/// `task_name: None` names the node (or thread session) itself; `Some` names a
+/// sub-agent task beneath it. `(0, 0, name)` is the reserved thread coordinate
+/// that [`cairn_common::uri::NodeAddress`] defines; every other coordinate names
+/// an execution node under an issue.
+///
+/// This is the ONE place the two ownerships are told apart when resolving, so a
+/// thread's terminals, browsers, tasks, and collections resolve through the same
+/// call an issue node's do. Four near-identical issue-shaped copies of this
+/// query previously lived beside the surfaces that needed them, which is why
+/// terminals and browsers could not be addressed from a thread at all: their
+/// resolvers had no arm for an owner without an issue.
+///
+/// Read-only by construction. Resolving a thread that has never run returns
+/// `Ok(None)` rather than minting a session; only a write may do that.
+pub(crate) async fn job_id_for_node_coordinate_conn(
+    conn: &cairn_db::turso::Connection,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: Option<&str>,
+) -> Result<Option<String>, DbError> {
+    if let cairn_common::uri::NodeAddress::Thread { name } =
+        cairn_common::uri::NodeAddress::new(number, exec_seq, node_id)
+    {
+        return match task_name {
+            None => crate::threads::session_job_id_by_name_conn(conn, project_key, name).await,
+            Some(task) => {
+                crate::threads::task_job_id_by_name_conn(conn, project_key, name, task).await
+            }
+        };
+    }
+
+    let key = project_key.to_uppercase();
+    let mut rows = match task_name {
+        None => {
+            conn.query(
+                "SELECT j.id
+                 FROM jobs j
+                 JOIN issues i ON j.issue_id = i.id
+                 JOIN projects p ON i.project_id = p.id
+                 JOIN executions e ON j.execution_id = e.id
+                 WHERE p.key = ?1 AND i.number = ?2 AND e.seq = ?3
+                   -- Top-level nodes have no parent; a workflow is a child job
+                   -- (for the delegation tree) yet is addressable as a node by
+                   -- its segment, so its own sub-resources resolve.
+                   AND (j.parent_job_id IS NULL OR j.agent_config_id = 'workflow')
+                   AND j.uri_segment = ?4
+                 LIMIT 1",
+                params![key.as_str(), number, exec_seq, node_id],
+            )
+            .await?
+        }
+        Some(task) => {
+            conn.query(
+                "SELECT child.id
+                 FROM jobs parent
+                 JOIN jobs child ON child.parent_job_id = parent.id
+                 JOIN issues i ON parent.issue_id = i.id
+                 JOIN projects p ON i.project_id = p.id
+                 JOIN executions e ON parent.execution_id = e.id
+                 WHERE p.key = ?1 AND i.number = ?2 AND e.seq = ?3
+                   AND parent.parent_job_id IS NULL AND parent.uri_segment = ?4
+                   AND child.uri_segment = ?5
+                 LIMIT 1",
+                params![key.as_str(), number, exec_seq, node_id, task],
+            )
+            .await?
+        }
+    };
+    rows.next().await?.map(|row| row.text(0)).transpose()
+}
+
+/// [`job_id_for_node_coordinate_conn`] against a routed database.
+pub(crate) async fn job_id_for_node_coordinate(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: Option<&str>,
+) -> Result<Option<String>, DbError> {
+    let (project_key, node_id) = (project_key.to_string(), node_id.to_string());
+    let task_name = task_name.map(str::to_string);
+    db.read(move |conn| {
+        let (project_key, node_id) = (project_key.clone(), node_id.clone());
+        let task_name = task_name.clone();
+        Box::pin(async move {
+            job_id_for_node_coordinate_conn(
+                conn,
+                &project_key,
+                number,
+                exec_seq,
+                &node_id,
+                task_name.as_deref(),
+            )
+            .await
+        })
+    })
+    .await
+}
+
+/// The job's canonical home URI. Issue jobs resolve to their node URI
+/// (`cairn://p/{KEY}/{number}/{seq}/{segment}`, nesting sub-agent tasks under
+/// their parent); a thread's session resolves to `cairn://p/{KEY}/{thread-name}`
+/// and the tasks it spawns nest beneath it the same way. This is the one
+/// canonical job-id → home-URI resolution.
 /// `Ok(None)` when the job can't be resolved (unknown id, or no `uri_segment`
 /// assigned yet).
 pub async fn home_uri_for_job(db: &LocalDb, job_id: &str) -> Result<Option<String>, DbError> {
@@ -110,13 +248,19 @@ pub(crate) async fn home_uri_for_job_conn(
 ) -> Result<Option<String>, DbError> {
     let mut rows = conn
         .query(
-            "SELECT p.key, i.number, COALESCE(e.seq, 1), j.uri_segment, parent.uri_segment, j.agent_config_id
-             FROM jobs j
-             JOIN issues i ON i.id = j.issue_id
-             JOIN projects p ON p.id = i.project_id
-             LEFT JOIN executions e ON e.id = j.execution_id
-             LEFT JOIN jobs parent ON j.parent_job_id = parent.id
-             WHERE j.id = ?1 LIMIT 1",
+            &format!(
+                "SELECT p.key, i.number, COALESCE(e.seq, 1), j.uri_segment,
+                        parent.uri_segment, j.agent_config_id, t.name,
+                        (j.thread_id IS NOT NULL AND {session}) AS is_thread_session
+                 FROM jobs j
+                 LEFT JOIN issues i ON i.id = j.issue_id
+                 LEFT JOIN jobs parent ON j.parent_job_id = parent.id
+                 LEFT JOIN threads t ON t.id = COALESCE(j.thread_id, parent.thread_id)
+                 JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id)
+                 LEFT JOIN executions e ON e.id = j.execution_id
+                 WHERE j.id = ?1 LIMIT 1",
+                session = crate::threads::SESSION_JOB_SHAPE
+            ),
             params![job_id],
         )
         .await?;
@@ -124,9 +268,29 @@ pub(crate) async fn home_uri_for_job_conn(
         return Ok(None);
     };
     let key = row.text(0)?;
+    let segment = row.opt_text(3)?;
+    // Only a thread's session job is the thread address itself; everything else
+    // under it hangs beneath. A task reaches its thread through its parent, and
+    // the pre-cutover jobs migration 0157 re-pointed carry the thread's id
+    // directly — so "has a thread id" cannot be the test, or a task would
+    // resolve to the very same home URI as the session it belongs to. This is
+    // the same rule that decides session identity, spelled once.
+    //
+    // Resolving a task here is what gives it a home URI at all: without one the
+    // run cannot start, and every task spawned from a thread died at
+    // `session_start_failed` before its agent spoke.
+    if let Some(name) = row.opt_text(6)? {
+        let is_session = row.opt_i64(7)?.unwrap_or_default() != 0;
+        return Ok(match (is_session, segment) {
+            (true, _) => Some(cairn_common::uri::build_thread_uri(&key, &name)),
+            (false, Some(segment)) => Some(cairn_common::uri::build_thread_task_uri(
+                &key, &name, &segment,
+            )),
+            (false, None) => None,
+        });
+    }
     let number = row.i64(1)? as i32;
     let seq = row.i64(2)? as i32;
-    let segment = row.opt_text(3)?;
     let parent_segment = row.opt_text(4)?;
     let is_workflow = row.opt_text(5)?.as_deref() == Some("workflow");
     let parent_segment = (!is_workflow).then_some(parent_segment).flatten();
@@ -300,6 +464,9 @@ pub async fn get_job(db: &LocalDb, job_id: &str) -> Result<Job, CairnError> {
 
 pub async fn list_jobs_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<Job>, CairnError> {
     list_jobs_by_predicate(db, "issue_id = ?1", issue_id, "created_at ASC").await
+}
+pub async fn list_jobs_for_thread(db: &LocalDb, thread_id: &str) -> Result<Vec<Job>, CairnError> {
+    list_jobs_by_predicate(db, "thread_id = ?1", thread_id, "created_at DESC").await
 }
 
 pub async fn list_child_jobs(
@@ -494,22 +661,52 @@ pub(crate) fn derive_node_activity(
     }
 }
 
-/// Batched live-activity indicators for every job in an execution (top-level
+/// Which jobs a batch of live-activity indicators covers.
+///
+/// Activity is a property of a job's head turn, not of whatever owns the job, so
+/// one query answers for either owner and only the scoping predicate differs. A
+/// thread's scope deliberately spans every job it owns — its session plus the
+/// sub-agent tasks that session spawns — which is exactly the set its pane
+/// renders tabs and badges for.
+#[derive(Debug, Clone, Copy)]
+pub enum NodeStatusScope<'a> {
+    Execution(&'a str),
+    Thread(&'a str),
+}
+
+impl NodeStatusScope<'_> {
+    fn predicate(&self) -> &'static str {
+        match self {
+            Self::Execution(_) => "j.execution_id = ?1",
+            Self::Thread(_) => "j.thread_id = ?1",
+        }
+    }
+
+    fn owner_id(&self) -> &str {
+        match self {
+            Self::Execution(id) | Self::Thread(id) => id,
+        }
+    }
+}
+
+/// Batched live-activity indicators for every job in one scope (top-level
 /// nodes AND task jobs), computed in one query. Reusable for any status surface
 /// that needs the running/awaiting-input/idle distinction without a per-node
 /// fan-out of `get_head_turn_for_job` + `get_pending_prompt_for_job` +
 /// `get_pending_permission_for_job`.
 pub async fn node_status_indicators(
     db: &LocalDb,
-    execution_id: &str,
+    scope: NodeStatusScope<'_>,
 ) -> Result<Vec<NodeStatusIndicator>, CairnError> {
-    let execution_id = execution_id.to_string();
-    db.read(|conn| {
-        let execution_id = execution_id.clone();
+    let owner_id = scope.owner_id().to_string();
+    let predicate = scope.predicate();
+    db.read(move |conn| {
+        let owner_id = owner_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT
+                    &format!(
+                        "SELECT
                         j.id,
                         COALESCE(
                             (SELECT ct.state
@@ -533,8 +730,9 @@ pub async fn node_status_indicators(
                                AND pr.status = 'pending'
                         ) AS has_pending_permission
                      FROM jobs j
-                     WHERE j.execution_id = ?1",
-                    params![execution_id.as_str()],
+                     WHERE {predicate}"
+                    ),
+                    params![owner_id.as_str()],
                 )
                 .await?;
             let mut out = Vec::new();
@@ -553,6 +751,91 @@ pub async fn node_status_indicators(
                 });
             }
             Ok::<Vec<NodeStatusIndicator>, DbError>(out)
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+/// Live status for one thread — the unit a thread row renders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStatusIndicator {
+    thread_id: String,
+    /// Rolled up across every job the thread owns with
+    /// `AwaitingInput > Running > Idle` precedence, so a thread reads as live
+    /// while either its own session or a task it delegated is working.
+    activity: NodeActivity,
+}
+
+/// Batched, project-scoped live activity for every thread, one row per thread.
+///
+/// A thread's status column is permanently `active` and says nothing, so what a
+/// thread row actually wants to show is whether work is happening under it right
+/// now. That is the same head-turn question `node_status_indicators` answers,
+/// rolled up per thread and computed for the whole project in one statement
+/// rather than a per-row fan-out.
+pub async fn thread_status_indicators(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<Vec<ThreadStatusIndicator>, CairnError> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT
+                        t.id,
+                        COALESCE(
+                            (SELECT ct.state
+                               FROM turns ct
+                              WHERE ct.id = j.current_turn_id),
+                            (SELECT tu.state
+                               FROM turns tu
+                              WHERE tu.job_id = j.id
+                              ORDER BY tu.created_at DESC, tu.sequence DESC
+                              LIMIT 1)
+                        ) AS head_turn_state,
+                        EXISTS (
+                            SELECT 1 FROM prompts p
+                             WHERE p.turn_id = j.current_turn_id
+                               AND p.response IS NULL
+                        ) AS has_pending_prompt,
+                        EXISTS (
+                            SELECT 1 FROM permission_requests pr
+                             LEFT JOIN runs r ON pr.run_id = r.id
+                             WHERE COALESCE(pr.job_id, r.job_id) = j.id
+                               AND pr.status = 'pending'
+                        ) AS has_pending_permission
+                     FROM threads t
+                     LEFT JOIN jobs j ON j.thread_id = t.id
+                     WHERE t.project_id = ?1",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            // Every thread gets a row, including one whose LEFT JOIN found no
+            // job at all: a thread with no work under it is idle, not absent.
+            let mut by_thread: HashMap<String, NodeActivity> = HashMap::new();
+            while let Some(row) = rows.next().await? {
+                let thread_id = row.text(0)?;
+                let activity = derive_node_activity(
+                    row.opt_text(1)?.as_deref(),
+                    row.i64(2)? != 0,
+                    row.i64(3)? != 0,
+                );
+                let entry = by_thread.entry(thread_id).or_insert(NodeActivity::Idle);
+                *entry = rollup_activity([*entry, activity]);
+            }
+            Ok::<Vec<ThreadStatusIndicator>, DbError>(
+                by_thread
+                    .into_iter()
+                    .map(|(thread_id, activity)| ThreadStatusIndicator {
+                        thread_id,
+                        activity,
+                    })
+                    .collect(),
+            )
         })
     })
     .await
@@ -720,6 +1003,35 @@ const ISSUE_STATUS_JOB_ROWS_SQL: &str = "SELECT
         LIMIT 1
    )";
 
+const ISSUE_STATUS_PR_ROWS_SQL: &str = "WITH current_jobs AS (
+    SELECT i.id AS issue_id, j.id AS job_id
+      FROM issues i
+      JOIN jobs j ON j.issue_id = i.id
+     WHERE i.project_id = ?1
+       AND i.status IN ('active', 'waiting')
+       AND j.execution_id = (
+           SELECT e.id FROM executions e
+            WHERE e.issue_id = i.id
+            ORDER BY e.seq DESC
+            LIMIT 1
+       )
+), owned_merge_requests AS (
+    SELECT cj.issue_id, m.*
+      FROM current_jobs cj
+      JOIN merge_requests m ON m.job_id = cj.job_id
+    UNION ALL
+    SELECT cj.issue_id, m.*
+      FROM current_jobs cj
+      JOIN action_runs ar ON ar.parent_job_id = cj.job_id
+      JOIN merge_requests m ON m.job_id = ar.id
+)
+SELECT issue_id, github_pr_number, github_pr_url, status, github_state,
+       github_review, github_mergeable, checks_status, is_local
+  FROM owned_merge_requests
+ ORDER BY issue_id,
+          CASE status WHEN 'open' THEN 0 ELSE 1 END,
+          updated_at DESC";
+
 pub async fn issue_status_indicators(
     db: &LocalDb,
     project_id: &str,
@@ -799,38 +1111,7 @@ pub async fn issue_status_indicators(
             }
             let mut pr_rows: Vec<PrRow> = Vec::new();
             let mut rows = conn
-                .query(
-                    "SELECT
-                        i.id AS issue_id,
-                        m.github_pr_number,
-                        m.github_pr_url,
-                        m.status,
-                        m.github_state,
-                        m.github_review,
-                        m.github_mergeable,
-                        m.checks_status,
-                        m.is_local
-                     FROM issues i
-                     JOIN jobs j ON j.issue_id = i.id
-                       AND j.execution_id = (
-                           SELECT e.id FROM executions e
-                            WHERE e.issue_id = i.id
-                            ORDER BY e.seq DESC
-                            LIMIT 1
-                       )
-                     JOIN merge_requests m
-                       ON m.job_id = j.id
-                          OR m.job_id IN (
-                              SELECT ar.id FROM action_runs ar
-                               WHERE ar.parent_job_id = j.id
-                          )
-                     WHERE i.project_id = ?1
-                       AND i.status IN ('active', 'waiting')
-                     ORDER BY i.id,
-                        CASE m.status WHEN 'open' THEN 0 ELSE 1 END,
-                        m.updated_at DESC",
-                    params![project_id.as_str()],
-                )
+                .query(ISSUE_STATUS_PR_ROWS_SQL, params![project_id.as_str()])
                 .await?;
             while let Some(row) = rows.next().await? {
                 pr_rows.push(PrRow {
@@ -968,8 +1249,9 @@ fn has_single_downstream_action(snapshot_json: &str, node_id: &str) -> Result<bo
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_node_activity, issue_status_indicators, node_status_indicators, NodeActivity,
-        ISSUE_STATUS_JOB_ROWS_SQL,
+        derive_node_activity, home_uri_for_job, issue_status_indicators, node_status_indicators,
+        thread_status_indicators, NodeActivity, NodeStatusScope, ISSUE_STATUS_JOB_ROWS_SQL,
+        ISSUE_STATUS_PR_ROWS_SQL,
     };
     use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
     use cairn_db::turso::params;
@@ -1129,6 +1411,35 @@ mod tests {
             !plan.iter().any(|step| step.contains("SCAN ms")),
             "issue status must not scan message streams, got {plan:?}"
         );
+
+        let sql = format!("EXPLAIN QUERY PLAN {ISSUE_STATUS_PR_ROWS_SQL}");
+        let pr_plan: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, params!["p"]).await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps)
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            pr_plan.iter().any(|step| step.contains("idx_mr_job")),
+            "merge requests must use their owner index, got {pr_plan:?}"
+        );
+        assert!(
+            pr_plan
+                .iter()
+                .any(|step| step.contains("idx_action_runs_parent_job")),
+            "action-run ownership must use its parent index, got {pr_plan:?}"
+        );
+        assert!(
+            !pr_plan.iter().any(|step| step.contains("MULTI-INDEX OR")),
+            "PR ownership branches must remain independently indexable, got {pr_plan:?}"
+        );
     }
 
     #[tokio::test]
@@ -1271,7 +1582,9 @@ mod tests {
         )
         .await;
 
-        let indicators = node_status_indicators(&db, "e").await.unwrap();
+        let indicators = node_status_indicators(&db, NodeStatusScope::Execution("e"))
+            .await
+            .unwrap();
         let by_job: HashMap<String, NodeActivity> = indicators
             .into_iter()
             .map(|indicator| (indicator.job_id, indicator.activity))
@@ -1287,10 +1600,262 @@ mod tests {
         assert_eq!(by_job["j-reseed"], NodeActivity::Running);
     }
 
+    /// A thread's live activity is its own to report: its session job carries no
+    /// execution, so the execution-scoped query could never see it and every
+    /// thread row rendered a permanently idle indicator. The thread scope spans
+    /// the session and the tasks it spawns, and stops at the thread's edge.
+    #[tokio::test]
+    async fn thread_scope_reports_the_session_and_its_tasks_only() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'CAIRN', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('th', 'p', 'roadmap', 'active', 'none', 1, 1),
+                    ('th-other', 'p', 'neighbour', 'active', 'none', 1, 1)",
+        )
+        .await;
+        // The session job: branchless, parentless, and owned by a thread rather
+        // than an execution.
+        exec(
+            &db,
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j-session', 'th', 'p', 'thread', 'idle', 1, 1, 'thread')",
+        )
+        .await;
+        // A sub-agent task the session spawned carries the thread's id too.
+        exec(
+            &db,
+            "INSERT INTO jobs(id, thread_id, parent_job_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j-task', 'th', 'j-session', 'p', 'Survey', 'complete', 1, 1, 'survey')",
+        )
+        .await;
+        // A neighbouring thread's session must not leak into this scope.
+        exec(
+            &db,
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j-other', 'th-other', 'p', 'thread', 'idle', 1, 1, 'thread')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO sessions(id, job_id, created_at, updated_at)
+             VALUES ('s-thread', 'j-session', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-thread', 's-thread', 'j-session', 1, 'running', 'follow_up', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "UPDATE jobs SET current_turn_id = 't-thread' WHERE id = 'j-session'",
+        )
+        .await;
+
+        let by_job: HashMap<String, NodeActivity> =
+            node_status_indicators(&db, NodeStatusScope::Thread("th"))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|indicator| (indicator.job_id, indicator.activity))
+                .collect();
+
+        assert_eq!(
+            by_job.len(),
+            2,
+            "the thread's session and its task, and no more"
+        );
+        assert_eq!(
+            by_job["j-session"],
+            NodeActivity::Running,
+            "a running head turn is live activity even though the job status is idle"
+        );
+        assert_eq!(by_job["j-task"], NodeActivity::Idle);
+    }
+
+    /// Every thread in the project gets exactly one row, and a thread reads as
+    /// live when EITHER its own session or a task it delegated is working — the
+    /// same `AwaitingInput > Running > Idle` precedence an issue row rolls up.
+    #[tokio::test]
+    async fn thread_status_indicators_roll_up_per_thread_and_cover_every_thread() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'CAIRN', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('busy', 'p', 'busy', 'active', 'none', 1, 1),
+                    ('asking', 'p', 'asking', 'active', 'none', 1, 1),
+                    ('quiet', 'p', 'quiet', 'active', 'none', 1, 1),
+                    ('empty', 'p', 'empty', 'active', 'none', 1, 1)",
+        )
+        .await;
+        // `busy` is idle itself but has a running task under it.
+        exec(
+            &db,
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('busy-session', 'busy', 'p', 'thread', 'idle', 1, 1, 'thread'),
+                    ('busy-task', 'busy', 'p', 'Survey', 'running', 1, 1, 'survey'),
+                    ('asking-session', 'asking', 'p', 'thread', 'idle', 1, 1, 'thread'),
+                    ('quiet-session', 'quiet', 'p', 'thread', 'idle', 1, 1, 'thread')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO sessions(id, job_id, created_at, updated_at)
+             VALUES ('s-busy', 'busy-task', 1, 1), ('s-asking', 'asking-session', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-busy', 's-busy', 'busy-task', 1, 'running', 'follow_up', 1, 1),
+                    ('t-asking', 's-asking', 'asking-session', 1, 'yielded', 'follow_up', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "UPDATE jobs SET current_turn_id = 't-busy' WHERE id = 'busy-task'",
+        )
+        .await;
+        exec(
+            &db,
+            "UPDATE jobs SET current_turn_id = 't-asking' WHERE id = 'asking-session'",
+        )
+        .await;
+        // A yielded turn is idle by turn state alone; the unanswered prompt is
+        // what makes the thread actionable.
+        exec(
+            &db,
+            "INSERT INTO runs(id, job_id, created_at, updated_at)
+             VALUES ('r-asking', 'asking-session', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO prompts(id, run_id, turn_id, questions, response, created_at)
+             VALUES ('p-asking', 'r-asking', 't-asking', '[]', NULL, 1)",
+        )
+        .await;
+
+        let by_thread: HashMap<String, NodeActivity> = thread_status_indicators(&db, "p")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|indicator| (indicator.thread_id, indicator.activity))
+            .collect();
+
+        assert_eq!(by_thread.len(), 4, "every thread in the project gets a row");
+        assert_eq!(
+            by_thread["busy"],
+            NodeActivity::Running,
+            "a running task makes its thread read as live"
+        );
+        assert_eq!(by_thread["asking"], NodeActivity::AwaitingInput);
+        assert_eq!(by_thread["quiet"], NodeActivity::Idle);
+        assert_eq!(
+            by_thread["empty"],
+            NodeActivity::Idle,
+            "a thread with no jobs at all is idle, not absent"
+        );
+    }
+
+    /// A thread's session and a task it spawned both resolve a home URI, and the
+    /// task takes the thread-scoped `/task/{segment}` form the thread read
+    /// surface addresses.
+    ///
+    /// The task inherits no issue and no execution seq, so the issue-shaped
+    /// builder could produce nothing for it and the run died at
+    /// `session_start_failed` before its agent ever spoke. Every existing
+    /// fixture here is issue-shaped, which is how that shipped.
+    #[tokio::test]
+    async fn a_thread_session_and_the_task_it_spawns_both_resolve_a_home_uri() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'CAIRN', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('t', 'p', 'thread-ux', 'active', 'none', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs (id, thread_id, project_id, status, uri_segment, node_name,
+                               created_at, updated_at)
+             VALUES ('j-session', 't', 'p', 'running', 'thread', 'Thread', 1, 1)",
+        )
+        .await;
+        // Delegation books its packets in a synthetic execution carrying no issue,
+        // and the task job hangs off the session by parent_job_id alone.
+        exec(
+            &db,
+            "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq)
+             VALUES ('e', 'delegation', 'p', 'running', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs (id, parent_job_id, execution_id, project_id, status, uri_segment,
+                               node_name, created_at, updated_at)
+             VALUES ('j-task', 'j-session', 'e', 'p', 'pending', 'post-migration',
+                     'post-migration smoke test', 2, 2)",
+        )
+        .await;
+
+        assert_eq!(
+            home_uri_for_job(&db, "j-session").await.unwrap().as_deref(),
+            Some("cairn://p/CAIRN/thread-ux"),
+            "a thread's session is the thread address itself"
+        );
+        assert_eq!(
+            home_uri_for_job(&db, "j-task").await.unwrap().as_deref(),
+            Some("cairn://p/CAIRN/thread-ux/task/post-migration"),
+            "a task the session spawned nests beneath the thread, and is never the thread itself"
+        );
+
+        // Migration 0157 re-pointed the pre-cutover thread-issue's jobs at the
+        // thread, so a task can carry the thread's id directly. It is still a
+        // task, and must not resolve to the session's own home URI.
+        exec(
+            &db,
+            "INSERT INTO jobs (id, thread_id, parent_job_id, project_id, status, uri_segment,
+                               node_name, created_at, updated_at)
+             VALUES ('j-migrated', 't', 'j-session', 'p', 'complete', 'survey-agent',
+                     'Survey', 3, 3)",
+        )
+        .await;
+        assert_eq!(
+            home_uri_for_job(&db, "j-migrated")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cairn://p/CAIRN/thread-ux/task/survey-agent"),
+        );
+    }
+
     #[tokio::test]
     async fn empty_execution_yields_no_indicators() {
         let db = test_db().await;
-        let indicators = node_status_indicators(&db, "missing").await.unwrap();
+        let indicators = node_status_indicators(&db, NodeStatusScope::Execution("missing"))
+            .await
+            .unwrap();
         assert!(indicators.is_empty());
     }
 

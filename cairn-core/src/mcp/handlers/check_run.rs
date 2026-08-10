@@ -34,6 +34,8 @@ struct CheckRunPayload {
     branch: Option<String>,
     #[serde(default)]
     observation_handle: Option<String>,
+    #[serde(default)]
+    retry: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -138,6 +140,7 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
         let task_run_id = run_id.to_string();
         let task_suite = suite.to_string();
         let task_branch = payload.branch.clone();
+        let task_retry = payload.retry;
         let task_handle = handle.clone();
         tokio::spawn(async move {
             let progress_handle = task_handle.clone();
@@ -157,6 +160,7 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
                     &task_run_id,
                     &task_suite,
                     task_branch.as_deref(),
+                    task_retry,
                     progress,
                 )
                 .await

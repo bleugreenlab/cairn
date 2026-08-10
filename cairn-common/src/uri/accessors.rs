@@ -19,7 +19,8 @@ impl CairnResource {
             | ProjectIssues { project, .. }
             | ProjectCheckResults { project, .. }
             | Issue { project, .. }
-            | ThreadAlias { project, .. }
+            | ProjectThreads { project, .. }
+            | Thread { project, .. }
             | Node { project, .. }
             | NodeChat { project, .. }
             | NodeChatRaw { project, .. }
@@ -71,6 +72,14 @@ impl CairnResource {
             | NodeMemory { project, .. }
             | ProjectRecipes { project, .. }
             | ProjectRecipe { project, .. }
+            | ProjectRoutes { project, .. }
+            | ProjectRoute { project, .. }
+            | ProjectRouteHistory { project, .. }
+            | ProjectRouteHistoryEntry { project, .. }
+            | ProjectResponses { project, .. }
+            | ProjectResponse { project, .. }
+            | ProjectResponseHistory { project, .. }
+            | ProjectResponseHistoryEntry { project, .. }
             | ProjectAgents { project, .. }
             | ProjectAgent { project, .. }
             | ProjectActions { project, .. }
@@ -97,9 +106,7 @@ impl CairnResource {
             Self::Settings | Self::Projects | Self::ProjectSettings { .. } => None,
             Self::Project { .. } => Some(format!("/p/{}/issues", project)),
             Self::Issue { number, .. } => Some(format!("/p/{}/i/{}", project, number)),
-            // A thread alias has no route of its own: it resolves to a numbered
-            // issue before anything navigates, and the issue owns the route.
-            Self::ThreadAlias { .. } => None,
+            Self::ProjectThreads { .. } | Self::Thread { .. } => None,
             Self::Node {
                 number,
                 exec_seq,
@@ -257,6 +264,8 @@ impl CairnResource {
             | Self::IssueExecution { .. }
             | Self::NodeDiff { .. }
             | Self::NodeRebase { .. }
+            | Self::Packs
+            | Self::Pack { .. }
             | Self::Skills
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
@@ -269,6 +278,18 @@ impl CairnResource {
             | Self::Recipe { .. }
             | Self::ProjectRecipes { .. }
             | Self::ProjectRecipe { .. }
+            | Self::Routes
+            | Self::Route { .. }
+            | Self::RouteHistory { .. }
+            | Self::RouteHistoryEntry { .. }
+            | Self::ProjectRoutes { .. }
+            | Self::ProjectRoute { .. }
+            | Self::ProjectRouteHistory { .. }
+            | Self::ProjectRouteHistoryEntry { .. }
+            | Self::Responses
+            | Self::Response { .. }
+            | Self::ResponseHistory { .. }
+            | Self::ResponseHistoryEntry { .. }
             | Self::Agents
             | Self::Agent { .. }
             | Self::ProjectAgents { .. }
@@ -286,6 +307,9 @@ impl CairnResource {
             | Self::Logs
             | Self::Executors
             | Self::Executor { .. }
+            | Self::ExecutorAction { .. }
+            | Self::Grants
+            | Self::Grant { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -300,7 +324,11 @@ impl CairnResource {
             // an issue number here would send it down the issue-content path.
             | Self::ProjectImages { .. }
             | Self::ProjectCheckResults { .. }
-            | Self::ProjectCheckObservation { .. } => None,
+            | Self::ProjectCheckObservation { .. }
+            | Self::ProjectResponses { .. }
+            | Self::ProjectResponse { .. }
+            | Self::ProjectResponseHistory { .. }
+            | Self::ProjectResponseHistoryEntry { .. } => None,
         }
     }
 
@@ -315,7 +343,8 @@ impl CairnResource {
             | Self::ProjectCheckResults { project, .. }
             | Self::ProjectCheckObservation { project, .. }
             | Self::Issue { project, .. }
-            | Self::ThreadAlias { project, .. }
+            | Self::ProjectThreads { project, .. }
+            | Self::Thread { project, .. }
             | Self::Node { project, .. }
             | Self::NodeChat { project, .. }
             | Self::NodeChatRaw { project, .. }
@@ -372,13 +401,27 @@ impl CairnResource {
             | Self::ProjectRecipe { project, .. }
             | Self::ProjectWorkflows { project }
             | Self::ProjectWorkflow { project, .. }
+            | Self::ProjectRoutes { project }
+            | Self::ProjectRoute { project, .. }
+            | Self::ProjectRouteHistory { project, .. }
+            | Self::ProjectRouteHistoryEntry { project, .. }
+            | Self::ProjectResponses { project }
+            | Self::ProjectResponse { project, .. }
+            | Self::ProjectResponseHistory { project, .. }
+            | Self::ProjectResponseHistoryEntry { project, .. }
             | Self::ProjectAgents { project }
             | Self::ProjectAgent { project, .. }
             | Self::ProjectActions { project }
             | Self::ProjectAction { project, .. }
             | Self::NodeSymbols { project, .. }
             | Self::ProjectSymbols { project, .. } => Some(project),
-            Self::Skills
+            Self::Routes
+            | Self::Route { .. }
+            | Self::RouteHistory { .. }
+            | Self::RouteHistoryEntry { .. }
+            | Self::Packs
+            | Self::Pack { .. }
+            | Self::Skills
             | Self::Skill { .. }
             | Self::Labels
             | Self::Label { .. }
@@ -386,6 +429,10 @@ impl CairnResource {
             | Self::Recipe { .. }
             | Self::Workflows
             | Self::Workflow { .. }
+            | Self::Responses
+            | Self::Response { .. }
+            | Self::ResponseHistory { .. }
+            | Self::ResponseHistoryEntry { .. }
             | Self::Agents
             | Self::Agent { .. }
             | Self::Actions
@@ -397,6 +444,9 @@ impl CairnResource {
             | Self::Logs
             | Self::Executors
             | Self::Executor { .. }
+            | Self::ExecutorAction { .. }
+            | Self::Grants
+            | Self::Grant { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -453,9 +503,8 @@ impl CairnResource {
             | Self::NodeMemories { number, .. }
             | Self::NodeMemory { number, .. }
             | Self::NodeSymbols { number, .. } => Some(*number),
-            // The number an alias stands for is not in the URI: only a lookup
-            // knows it, so reporting one here would be an invention.
-            Self::ThreadAlias { .. }
+            Self::ProjectThreads { .. }
+            | Self::Thread { .. }
             | Self::Project { .. }
             | Self::ProjectIssues { .. }
             | Self::ProjectCheckResults { .. }
@@ -463,6 +512,8 @@ impl CairnResource {
             | Self::ProjectTerminal { .. }
             | Self::ProjectBrowser { .. }
             | Self::ProjectBrowserNetworkRequest { .. }
+            | Self::Packs
+            | Self::Pack { .. }
             | Self::Skills
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
@@ -475,6 +526,22 @@ impl CairnResource {
             | Self::Recipe { .. }
             | Self::ProjectRecipes { .. }
             | Self::ProjectRecipe { .. }
+            | Self::Routes
+            | Self::Route { .. }
+            | Self::RouteHistory { .. }
+            | Self::RouteHistoryEntry { .. }
+            | Self::ProjectRoutes { .. }
+            | Self::ProjectRoute { .. }
+            | Self::ProjectRouteHistory { .. }
+            | Self::ProjectRouteHistoryEntry { .. }
+            | Self::Responses
+            | Self::Response { .. }
+            | Self::ResponseHistory { .. }
+            | Self::ResponseHistoryEntry { .. }
+            | Self::ProjectResponses { .. }
+            | Self::ProjectResponse { .. }
+            | Self::ProjectResponseHistory { .. }
+            | Self::ProjectResponseHistoryEntry { .. }
             | Self::Agents
             | Self::Agent { .. }
             | Self::ProjectAgents { .. }
@@ -495,6 +562,9 @@ impl CairnResource {
             | Self::Logs
             | Self::Executors
             | Self::Executor { .. }
+            | Self::ExecutorAction { .. }
+            | Self::Grants
+            | Self::Grant { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch

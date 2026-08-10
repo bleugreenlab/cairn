@@ -22,6 +22,7 @@ use crate::config::project_settings::load_project_settings;
 use crate::mcp::handlers::skills_resources;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
+use cairn_common::authorization::{AuthorityMutation, AuthorityRequest};
 use cairn_common::uri::{parse_uri, CairnResource};
 
 /// Where a `cairn://mcp` mutation lands.
@@ -54,7 +55,7 @@ fn parse_mcp_scope(payload: Option<&serde_json::Value>) -> Result<McpWriteScope,
 }
 
 /// True when `item` is a workspace-scoped `cairn://mcp` create/patch/delete —
-/// the out-of-worktree `settings.yaml` write the worktree fence must gate.
+/// the mutation that wires a tool's capability into every future agent.
 ///
 /// An item whose `scope` is malformed returns false here on purpose: it is
 /// rejected with the scope error by the dispatcher before any side effect, so
@@ -76,6 +77,131 @@ pub(crate) fn is_workspace_mcp_mutation(item: &ChangeItem) -> bool {
     )
 }
 
+/// The normalized authority request a workspace `cairn://mcp` mutation makes,
+/// derived from the configuration it would actually leave behind.
+///
+/// Returns `None` for anything that is not a workspace-scope MCP mutation —
+/// project-scope writes stay on their direct path under the project's own
+/// authority. The server identity comes from the resolved target (the URI's
+/// server segment, or `payload.name` on create), which is the same key the
+/// registry is written under, so the scope names the entry that actually
+/// changes.
+///
+/// This resolves the **resultant** configuration rather than reading the
+/// payload, which is why it is async: a patch's identity is the merge of the
+/// existing entry with the change, and a delete's identity is the entry as it
+/// stands right now. Both need the registry. The pre-persist re-check performs
+/// the same resolution against live state, so a config that moved in between
+/// produces a different fingerprint and re-prompts instead of riding in on a
+/// grant issued for something else.
+pub(crate) async fn workspace_mcp_authority(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    item: &ChangeItem,
+) -> Option<Result<AuthorityRequest, String>> {
+    if !is_workspace_mcp_mutation(item) {
+        return None;
+    }
+    let Some(CairnResource::Mcp { server, .. }) = parse_uri(&item.target) else {
+        return None;
+    };
+    let empty = serde_json::json!({});
+    let payload = item.payload.as_ref().unwrap_or(&empty);
+    let (mutation, name) = classify_workspace_mcp(item.mode, server, payload)?;
+
+    let existing = match existing_servers(orch, request, McpWriteScope::Workspace).await {
+        Ok(existing) => existing,
+        // A registry we cannot read is not a registry we may write. Failing
+        // closed here means the batch is refused rather than proceeding to an
+        // authorization it could not compute the subject of.
+        Err(error) => return Some(Err(format!("could not read the MCP registry: {error}"))),
+    };
+
+    let config = match resultant_config(&existing, &name, mutation, payload) {
+        Ok(config) => config,
+        Err(error) => return Some(Err(error)),
+    };
+
+    Some(mcp_authority_request(&name, mutation, config.as_ref()))
+}
+
+/// Which registry entry a workspace `cairn://mcp` change names, and how it
+/// changes it. The pure half of [`workspace_mcp_authority`], split out so the
+/// naming rules can be exercised without a registry behind them.
+///
+/// `None` for a mode that is not a registry mutation (invoking a tool is an
+/// `Append`, and must never look like a boundary) and for a create whose name
+/// is unusable, which dispatch rejects with the field error — there is no
+/// target to name a scope for.
+fn classify_workspace_mcp(
+    mode: ChangeMode,
+    server: Option<String>,
+    payload: &serde_json::Value,
+) -> Option<(AuthorityMutation, String)> {
+    match mode {
+        ChangeMode::Create => Some((AuthorityMutation::Create, require_name(payload).ok()?)),
+        ChangeMode::Patch => Some((AuthorityMutation::Update, server?)),
+        ChangeMode::Delete => Some((AuthorityMutation::Delete, server?)),
+        _ => None,
+    }
+}
+
+/// The configuration that would exist under `name` once this mutation applied:
+/// the merge for a create/patch, and the entry as it currently stands for a
+/// delete (so a stale approval cannot remove a server that has since been
+/// substituted).
+///
+/// `None` means "no entry" — a delete or patch of something absent. Dispatch
+/// rejects those with a not-found error; fingerprinting them distinctly rather
+/// than collapsing them into a default keeps the two cases apart.
+fn resultant_config(
+    existing: &HashMap<String, McpServerConfig>,
+    name: &str,
+    mutation: AuthorityMutation,
+    payload: &serde_json::Value,
+) -> Result<Option<McpServerConfig>, String> {
+    match mutation {
+        AuthorityMutation::Create => {
+            let config = apply_payload_fields(base_config(), payload)?;
+            validate_config(&config)?;
+            Ok(Some(config))
+        }
+        AuthorityMutation::Update => match existing.get(name) {
+            None => Ok(None),
+            Some(base) => {
+                let config = apply_payload_fields(base.clone(), payload)?;
+                validate_config(&config)?;
+                Ok(Some(config))
+            }
+        },
+        AuthorityMutation::Delete => Ok(existing.get(name).cloned()),
+    }
+}
+
+/// Build the normalized request for one workspace MCP mutation, binding it to
+/// the resultant configuration's identity. One function so the gate and the
+/// pre-persist re-check cannot drift into naming different things.
+fn mcp_authority_request(
+    name: &str,
+    mutation: AuthorityMutation,
+    config: Option<&McpServerConfig>,
+) -> Result<AuthorityRequest, String> {
+    let fingerprint = mcp_servers::fingerprint_mcp_config(
+        crate::authorization::WORKSPACE_ID,
+        None,
+        name,
+        mutation.as_str(),
+        config,
+    );
+    crate::authorization::normalize::workspace_mcp_write(
+        crate::authorization::WORKSPACE_ID,
+        name,
+        mutation,
+        fingerprint,
+    )
+    .map_err(|error| error.0)
+}
+
 fn base_config() -> McpServerConfig {
     McpServerConfig {
         transport: "stdio".to_string(),
@@ -86,6 +212,10 @@ fn base_config() -> McpServerConfig {
         headers: HashMap::new(),
         enabled: true,
         oauth: None,
+        // Declared secrets are authored by hand in settings/project config;
+        // the resource mutation surface does not offer them, so a server
+        // created here starts with the keychain as its only declaration.
+        secrets: Vec::new(),
     }
 }
 
@@ -257,6 +387,50 @@ async fn existing_servers(
     }
 }
 
+/// The final authorization check, immediately before the registry changes.
+///
+/// The gate in the write handler decided whether to prompt; this decides
+/// whether THIS write may land. Between the two, a grant can expire, be
+/// revoked, or be consumed by a concurrent authorization, and a once-grant is
+/// consumed atomically right here so exactly one mutation can ever use it.
+/// Project-scope writes never reach this: they are direct under the project's
+/// own authority.
+async fn authorize_workspace_mcp(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    scope: McpWriteScope,
+    name: &str,
+    mutation: AuthorityMutation,
+    config: Option<&McpServerConfig>,
+) -> Result<(), String> {
+    if scope != McpWriteScope::Workspace {
+        return Ok(());
+    }
+    // Re-derived from the configuration about to be written, not carried over
+    // from the gate. That is what closes the substitution gap: a grant issued
+    // for one resultant configuration authorizes only a write that produces the
+    // same one, so a server whose command changed between the prompt and the
+    // write re-prompts rather than inheriting the approval.
+    let authority = mcp_authority_request(name, mutation, config)
+        .map_err(|error| format!("Refused: {error}"))?;
+    let Some(actor) = crate::authorization::resolve_actor(orch, request).await else {
+        return Err(
+            "Denied: a workspace MCP mutation requires an authenticated run to authorize"
+                .to_string(),
+        );
+    };
+    let decision = crate::authorization::authorize(&actor, &authority).await?;
+    if decision.is_allowed() {
+        return Ok(());
+    }
+    Err(crate::authorization::refusal_message(
+        &authority,
+        decision
+            .reason()
+            .unwrap_or(cairn_common::authorization::AuthorityReason::WorkspaceToolCapability),
+    ))
+}
+
 async fn write_server(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -326,6 +500,15 @@ pub(super) async fn apply_mcp_create(
             scope_label(scope)
         ));
     }
+    authorize_workspace_mcp(
+        orch,
+        request,
+        scope,
+        &name,
+        AuthorityMutation::Create,
+        Some(&config),
+    )
+    .await?;
     write_server(orch, request, scope, &name, &config).await?;
     Ok(format!("Added {} MCP server '{name}'", scope_label(scope)))
 }
@@ -355,6 +538,15 @@ pub(super) async fn apply_mcp_patch(
             scope_label(scope)
         ));
     }
+    authorize_workspace_mcp(
+        orch,
+        request,
+        scope,
+        server,
+        AuthorityMutation::Update,
+        Some(&config),
+    )
+    .await?;
     write_server(orch, request, scope, server, &config).await?;
     Ok(format!(
         "Updated {} MCP server '{server}'",
@@ -387,6 +579,17 @@ pub(super) async fn apply_mcp_delete(
             scope_label(scope)
         ));
     }
+    // Bound to the entry as it stands right now, so an approval to remove one
+    // server cannot be spent removing a different one that took its name.
+    authorize_workspace_mcp(
+        orch,
+        request,
+        scope,
+        server,
+        AuthorityMutation::Delete,
+        existing.get(server),
+    )
+    .await?;
     remove_server(orch, request, scope, server).await?;
     Ok(format!(
         "Removed {} MCP server '{server}'",
@@ -457,6 +660,170 @@ mod tests {
             ChangeMode::Create,
             serde_json::json!({"name": "x", "scope": "bogus"})
         )));
+    }
+
+    /// The naming half of `workspace_mcp_authority`: what a change item is
+    /// recognized as before the registry is consulted.
+    fn classify(item: &ChangeItem) -> Option<(AuthorityMutation, String)> {
+        if !is_workspace_mcp_mutation(item) {
+            return None;
+        }
+        let Some(CairnResource::Mcp { server, .. }) = parse_uri(&item.target) else {
+            return None;
+        };
+        let empty = serde_json::json!({});
+        classify_workspace_mcp(item.mode, server, item.payload.as_ref().unwrap_or(&empty))
+    }
+
+    fn stdio(command: &str, args: &[&str]) -> McpServerConfig {
+        McpServerConfig {
+            command: Some(command.to_string()),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            ..base_config()
+        }
+    }
+
+    #[test]
+    fn workspace_mcp_mutations_name_their_tool_scope() {
+        let (mutation, name) = classify(&item(
+            "cairn://mcp",
+            ChangeMode::Create,
+            serde_json::json!({"name": "linear", "command": "npx"}),
+        ))
+        .expect("a workspace create is an authority boundary");
+        let created = mcp_authority_request(&name, mutation, Some(&stdio("npx", &[]))).unwrap();
+        assert_eq!(
+            created.scope.shorthand(),
+            "workspace/default/tool/mcp/linear:write"
+        );
+        assert_eq!(created.mutation, AuthorityMutation::Create);
+
+        let (mutation, name) = classify(&item(
+            "cairn://mcp/linear",
+            ChangeMode::Delete,
+            serde_json::json!({}),
+        ))
+        .expect("a workspace delete is an authority boundary");
+        let removed = mcp_authority_request(&name, mutation, Some(&stdio("npx", &[]))).unwrap();
+        assert_eq!(
+            removed.scope, created.scope,
+            "installing and removing the same server touch the same place"
+        );
+        assert_eq!(removed.mutation, AuthorityMutation::Delete);
+        assert_ne!(
+            removed.facts.mcp_config, created.facts.mcp_config,
+            "an approval to install must not also be an approval to remove"
+        );
+    }
+
+    #[test]
+    fn enabling_a_server_is_a_reconfiguration_of_the_same_place() {
+        let (mutation, name) = classify(&item(
+            "cairn://mcp/linear",
+            ChangeMode::Patch,
+            serde_json::json!({"enabled": false}),
+        ))
+        .expect("a workspace patch is an authority boundary");
+        assert_eq!(mutation, AuthorityMutation::Update);
+        let toggled = mcp_authority_request(&name, mutation, Some(&stdio("npx", &[]))).unwrap();
+        assert_eq!(
+            toggled.scope.shorthand(),
+            "workspace/default/tool/mcp/linear:write"
+        );
+    }
+
+    #[test]
+    fn a_patch_fingerprints_the_merge_not_the_payload() {
+        // The identity that matters is what would be registered, which for a
+        // patch is the existing entry plus the change. Fingerprinting the
+        // payload would make "set enabled=false" mean the same thing on every
+        // server in the workspace.
+        let existing = HashMap::from([("linear".to_string(), stdio("npx", &["linear-mcp"]))]);
+        let merged = resultant_config(
+            &existing,
+            "linear",
+            AuthorityMutation::Update,
+            &serde_json::json!({"enabled": false}),
+        )
+        .unwrap()
+        .expect("the entry exists, so the merge does too");
+        assert_eq!(merged.command.as_deref(), Some("npx"));
+        assert_eq!(merged.args, vec!["linear-mcp"]);
+        assert!(!merged.enabled);
+
+        let other = HashMap::from([("linear".to_string(), stdio("curl", &["evil"]))]);
+        let substituted = resultant_config(
+            &other,
+            "linear",
+            AuthorityMutation::Update,
+            &serde_json::json!({"enabled": false}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            mcp_authority_request("linear", AuthorityMutation::Update, Some(&merged))
+                .unwrap()
+                .facts
+                .mcp_config,
+            mcp_authority_request("linear", AuthorityMutation::Update, Some(&substituted))
+                .unwrap()
+                .facts
+                .mcp_config,
+            "the same patch over a substituted base is a different resultant config"
+        );
+    }
+
+    #[test]
+    fn a_delete_binds_to_the_entry_as_it_stands() {
+        // A stale approval to remove one server must not be spendable on a
+        // different server that has since taken the name.
+        let approved = HashMap::from([("linear".to_string(), stdio("npx", &["linear-mcp"]))]);
+        let substituted = HashMap::from([("linear".to_string(), stdio("curl", &["evil"]))]);
+        let of = |servers: &HashMap<String, McpServerConfig>| {
+            let config = resultant_config(
+                servers,
+                "linear",
+                AuthorityMutation::Delete,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+            mcp_authority_request("linear", AuthorityMutation::Delete, config.as_ref())
+                .unwrap()
+                .facts
+                .mcp_config
+        };
+        assert_ne!(of(&approved), of(&substituted));
+    }
+
+    #[test]
+    fn project_scoped_mcp_writes_are_not_authority_boundaries() {
+        // Configuring the project's own MCP servers is exercising the authority
+        // a run already has in its project, not expanding blast radius. It must
+        // stay direct, or ordinary project setup starts prompting.
+        assert!(classify(&item(
+            "cairn://mcp",
+            ChangeMode::Create,
+            serde_json::json!({"name": "linear", "command": "npx", "scope": "project"})
+        ))
+        .is_none());
+        assert!(classify(&item(
+            "cairn://mcp/linear",
+            ChangeMode::Delete,
+            serde_json::json!({"scope": "project"})
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn reading_or_invoking_a_server_is_not_an_authority_boundary() {
+        // Calling an already-configured tool is the single most important thing
+        // that must never prompt.
+        assert!(classify(&item(
+            "cairn://mcp/linear/create_issue",
+            ChangeMode::Append,
+            serde_json::json!({})
+        ))
+        .is_none());
     }
 
     #[test]

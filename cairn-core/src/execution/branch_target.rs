@@ -11,8 +11,8 @@
 use std::collections::HashSet;
 
 use crate::models::{
-    AgentGitConfig, AgentNodeConfig, BranchMode, BranchTarget, ExecutionSnapshot, Recipe,
-    RecipeNode, RecipeNodeType,
+    AgentGitConfig, AgentNodeConfig, BranchMode, BranchTarget, ExecutionSnapshot, RecipeNode,
+    RecipeNodeType,
 };
 
 /// The target an execution takes when its launch named none: the recipe's FIRST
@@ -103,53 +103,6 @@ fn transform_for_target(
     });
 }
 
-/// Why a graph that has already been resolved for its branch target cannot run
-/// on a thread, or `None` when it can.
-///
-/// A thread owns no branch and never opens a pull request — that is the whole
-/// content of the kind. So the question is not "is this issue a thread" but
-/// "would this execution produce the state the kind forbids", asked of the
-/// topology that will actually run. Both are true of a graph resolved to `base`
-/// (every agent node lands on [`BranchMode::None`] and every `pr` node is
-/// pruned), which is why a thread can run a base-target recipe at all.
-pub fn thread_incompatibility(nodes: &[RecipeNode]) -> Option<&'static str> {
-    if nodes
-        .iter()
-        .any(|node| node.node_type == RecipeNodeType::Pr)
-    {
-        return Some("it would open a pull request");
-    }
-    if nodes.iter().any(|node| {
-        node.node_type == RecipeNodeType::Agent
-            && node
-                .agent_config
-                .as_ref()
-                .and_then(|config| config.git_config.as_ref())
-                .map(|git| git.branch_mode.clone())
-                .unwrap_or_default()
-                != BranchMode::None
-    }) {
-        return Some("it would mint a branch");
-    }
-    None
-}
-
-/// [`thread_incompatibility`] for a recipe that has not been snapshotted yet:
-/// resolve the target an unnamed launch would take, apply the same transform,
-/// and ask the same question. The create-and-start door refuses before its
-/// insert and the execution door refuses after the snapshot exists, but there is
-/// one rule between them rather than one per door.
-pub fn recipe_thread_incompatibility(recipe: &Recipe) -> Option<&'static str> {
-    let mut nodes = recipe.nodes.clone();
-    let mut edges = recipe.edges.clone();
-    transform_for_target(
-        &mut nodes,
-        &mut edges,
-        default_target(&recipe.branch_targets),
-    );
-    thread_incompatibility(&nodes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,9 +111,8 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    const COORDINATOR_YAML: &str = include_str!("../../../../recipes/coordinator.yaml");
-    const THREAD_YAML: &str = include_str!("../../../../recipes/thread.yaml");
-    const BUILD_YAML: &str = include_str!("../../../../recipes/build.yaml");
+    const COORDINATOR_YAML: &str = include_str!("../../../../packs/core/recipes/coordinator.yaml");
+    const BUILD_YAML: &str = include_str!("../../../../packs/core/recipes/build.yaml");
 
     fn snapshot_from_yaml(yaml: &str) -> (ExecutionSnapshot, Vec<BranchTarget>) {
         let recipe = RecipeFile::from_yaml(yaml)
@@ -315,99 +267,6 @@ mod tests {
                 .any(|node| node.node_type == RecipeNodeType::Pr),
             "the identity transform leaves build's PR node in place"
         );
-
-        // A base-only recipe resolves to `base` instead of being refused.
-        let (mut thread, thread_declared) = snapshot_from_yaml(THREAD_YAML);
-        apply_branch_target(&mut thread, None, &thread_declared).unwrap();
-        assert_eq!(thread.branch_target, BranchTarget::Base);
-    }
-
-    /// A thread owns no branch, and its recipe says so by declaring `base`
-    /// alone: the default resolution lands there, and `new` — which would mint a
-    /// branch and hand the thread an ending — is refused.
-    #[test]
-    fn the_thread_recipe_is_base_only() {
-        let (mut snapshot, declared) = snapshot_from_yaml(THREAD_YAML);
-        assert_eq!(declared, vec![BranchTarget::Base]);
-
-        apply_branch_target(&mut snapshot, Some(BranchTarget::New), &declared)
-            .expect_err("a thread may not mint a branch");
-        apply_branch_target(&mut snapshot, None, &declared).unwrap();
-        assert_eq!(snapshot.branch_target, BranchTarget::Base);
-
-        let thread = snapshot
-            .recipe
-            .nodes
-            .iter()
-            .find(|node| node.node_type == RecipeNodeType::Agent)
-            .expect("the thread agent node");
-        assert_eq!(
-            thread
-                .agent_config
-                .as_ref()
-                .and_then(|c| c.git_config.as_ref())
-                .map(|g| g.branch_mode.clone()),
-            Some(BranchMode::None)
-        );
-        // The arc survives the transform: context-self edges are never touched.
-        assert!(snapshot
-            .recipe
-            .nodes
-            .iter()
-            .any(|node| node.node_type == RecipeNodeType::Artifact));
-    }
-
-    /// The thread rule, asked of the graph rather than of the issue. Pinned over
-    /// the recipes Cairn ships so a recipe edit that would quietly let a thread
-    /// mint a branch fails here, and so the two doors that ask it (the execution
-    /// start and the create-and-start dispatch) keep answering identically.
-    #[test]
-    fn only_a_branchless_graph_may_run_on_a_thread() {
-        let recipe = |yaml| {
-            RecipeFile::from_yaml(yaml)
-                .expect("bundled recipe parses")
-                .into_recipe(Some("default".to_string()), None)
-        };
-
-        // The thread recipe resolves to `base`, so it mints nothing and ships
-        // nothing: the one bundled recipe a thread may run.
-        assert_eq!(recipe_thread_incompatibility(&recipe(THREAD_YAML)), None);
-
-        // Every shipping recipe is refused, naming what it would produce rather
-        // than restating the kind.
-        assert_eq!(
-            recipe_thread_incompatibility(&recipe(BUILD_YAML)),
-            Some("it would open a pull request")
-        );
-        assert_eq!(
-            recipe_thread_incompatibility(&recipe(COORDINATOR_YAML)),
-            Some("it would open a pull request"),
-            "the coordinator declares [new, base] and an unnamed launch takes `new`"
-        );
-
-        // A graph with no PR node but an authored branch is refused for the
-        // other reason — the branch alone is disqualifying, since owning one is
-        // what makes a thing terminal.
-        let mut branching = recipe(THREAD_YAML);
-        for node in &mut branching.nodes {
-            if node.node_type == RecipeNodeType::Agent {
-                node.agent_config.as_mut().unwrap().git_config = Some(AgentGitConfig {
-                    branch_mode: BranchMode::Isolate,
-                    require_parent_head: false,
-                });
-            }
-        }
-        assert_eq!(
-            thread_incompatibility(&branching.nodes),
-            Some("it would mint a branch")
-        );
-
-        // And the transform is what makes a shipping recipe eligible: the same
-        // coordinator, resolved to `base`, passes the same rule.
-        let (mut standing, declared) = snapshot_from_yaml(COORDINATOR_YAML);
-        assert!(thread_incompatibility(&standing.recipe.nodes).is_some());
-        apply_branch_target(&mut standing, Some(BranchTarget::Base), &declared).unwrap();
-        assert_eq!(thread_incompatibility(&standing.recipe.nodes), None);
     }
 
     #[test]

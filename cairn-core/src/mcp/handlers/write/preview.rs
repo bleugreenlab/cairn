@@ -291,14 +291,13 @@ async fn load_tool_result_for_event(
         .map_err(|e| e.to_string())
 }
 
-async fn build_current_event_uri(
-    orch: &Orchestrator,
+pub(crate) async fn build_current_event_uri(
+    db: &crate::storage::LocalDb,
     run_id: &str,
     event_seq: i32,
 ) -> Option<String> {
     let run_id = run_id.to_string();
-    orch.db
-        .local
+    db
         .read(|conn| {
             let run_id = run_id.clone();
             Box::pin(async move {
@@ -607,7 +606,7 @@ pub(super) async fn preview_change(
     let (event_uri, preview_status_error) = match request.run_id.as_deref() {
         Some(run_id) => match find_current_change_event(orch, run_id, request.tool_use_id.as_deref()).await {
             Ok(Some(event)) => {
-                let event_uri = build_current_event_uri(orch, run_id, event.sequence).await;
+                let event_uri = build_current_event_uri(&orch.db.local, run_id, event.sequence).await;
                 if let Err(error) = update_preview_status(orch, run_id, event.sequence, "pending", None).await {
                     (event_uri, Some(error))
                 } else {

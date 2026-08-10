@@ -103,7 +103,10 @@ fn commenting_write(run_id: &str) -> McpCallbackRequest {
 
 async fn dispatch(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     let cursors = Mutex::new(HashMap::new());
-    dispatch_tool(orch, request, &cursors).await.content
+    dispatch_tool(orch, request, &cursors)
+        .await
+        .into_inner()
+        .content
 }
 
 async fn comment_count(db: &LocalDb) -> i64 {

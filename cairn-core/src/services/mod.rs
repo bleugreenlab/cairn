@@ -37,7 +37,7 @@ pub use completion::{
 pub use emitter::EventEmitter;
 pub use fs::{FileSystem, RealFileSystem};
 pub use git::{GitClient, GitOutput, RealGitClient};
-pub use http::{HttpClient, HttpConfig, HttpResponse, RealHttpClient};
+pub use http::{HttpClient, HttpConfig, HttpMethod, HttpResponse, RealHttpClient, RedirectTarget};
 pub use process::{
     ChildProcess, CommandOutput, KillOnDrop, ProcessSpawner, RealChildProcess, RealProcessSpawner,
     SpawnConfig,
@@ -81,7 +81,7 @@ pub mod testing {
     pub use super::emitter::{CapturingEmitter, MockEventEmitter};
     pub use super::fs::MockFileSystem;
     pub use super::git::MockGitClient;
-    pub use super::http::MockHttpClient;
+    pub use super::http::{MockHttpClient, RecordedRequest};
     pub use super::process::{MockChildProcess, MockProcessSpawner, RecordingProcessSpawner};
     pub use super::pty::MockPtyFactory;
 

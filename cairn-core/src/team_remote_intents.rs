@@ -365,8 +365,24 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
                 "session" => PermissionScope::Session,
                 _ => return Err("scope must be once or session".into()),
             };
+            // A remote intent carries only the containment scope, and it holds
+            // no operator capability: it arrives over sync from another client,
+            // which is not this install's operator answering their own prompt.
+            // It can therefore deny or cancel anything and allow a containment
+            // crossing, while an authority allow is refused by the resolver and
+            // leaves the prompt pending for the operator here.
             let outcome = crate::mcp::handlers::permission::answer_node_permission(
-                orch, &project, number, exec_seq, &node_id, &segment, decision, scope,
+                orch,
+                &project,
+                number,
+                exec_seq,
+                &node_id,
+                &segment,
+                crate::mcp::handlers::permission::PermissionAnswer::from_surface(
+                    decision,
+                    crate::mcp::handlers::permission::AnswerSurface::RemoteIntent,
+                )
+                .with_containment_scope(scope),
             )
             .await?;
             Ok(json!({"outcome": if outcome.duplicate {"duplicate"} else {"created"}}))

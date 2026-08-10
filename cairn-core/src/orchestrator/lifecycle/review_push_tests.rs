@@ -1,20 +1,229 @@
-use super::review_push::{bounded_rearm_candidates, spawn_turn_end_checks};
-use super::{create_review_push_for_pr_open, evaluate_review_readiness};
+use super::review_push::{
+    bounded_rearm_candidates, finish_superseded_turn_end_checks, rearm_one_bounded_failed_review,
+    release_cooled_infrastructure_suppression, spawn_turn_end_checks,
+};
+use super::{
+    create_review_push_for_pr_open, evaluate_review_readiness, record_bounded_rearm_lookup_failure,
+};
 use crate::db::DbState;
 use crate::orchestrator::attention_push::{
     latest_push_fingerprint, list_pending, stamp_delivered, Boundary, Push, Wake,
 };
 use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
 use crate::services::testing::TestServicesBuilder;
-use crate::storage::{LocalDb, SearchIndex};
+use crate::storage::{LocalDb, RowExt, SearchIndex};
 use std::sync::Arc;
 
 const ISSUE_URI: &str = "cairn://p/PRJ/7";
-const PLANBUILD_YAML: &str = include_str!("../../../../../recipes/planbuild.yaml");
+const PLANBUILD_YAML: &str = include_str!("../../../../../packs/core/recipes/planbuild.yaml");
 const REVIEW_KEY: &str = "review:cairn://p/PRJ/7";
 
 async fn test_db() -> LocalDb {
     crate::storage::migrated_test_db("review-push.db").await
+}
+
+#[tokio::test]
+async fn cancelled_wave_rearms_after_a_dormant_nodes_base_advances() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+
+    let stale = orch
+        .try_begin_turn_end_checks("j-prod")
+        .expect("claim the stale wave's single-flight slot");
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod").await;
+    assert!(
+        stale.is_cancelled(),
+        "the base advance cancels the stale wave"
+    );
+
+    orch.end_turn_end_checks("j-prod");
+    finish_superseded_turn_end_checks(&orch, "j-prod", stale.is_cancelled());
+
+    assert!(
+        wave_scheduled(&orch, "j-prod"),
+        "a dormant PR owner receives a successor without another agent turn"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let backing = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(backing.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::JjEnv::resolve(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, backing.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/CAIRN-3604-builder-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    std::fs::write(workspace.join("agent-only.rs"), "wave path\n").unwrap();
+    crate::jj::seal(&jj, &workspace, "agent branch", None).unwrap();
+    let commit = crate::jj::head_commit(&jj, &workspace).unwrap();
+    let tree_hash = crate::jj::logical_tree_hash(&jj, &store, &commit).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+
+    insert_artifact(&orch.db.local, "create-pr", 1).await;
+    insert_failed_check(&orch.db.local, "infrastructure", 1).await;
+    attach_planbuild_topology(&orch.db.local, "j-prod", NodeRole::Builder).await;
+    orch.db
+        .local
+        .execute("UPDATE jobs SET status='running' WHERE id='j-prod'", ())
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET tree_hash=?1 WHERE job_id='j-prod'",
+            (tree_hash.as_str(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+
+    let candidate = super::review_push::BoundedRearmCandidate {
+        job_id: "j-prod".to_string(),
+        tree_hash,
+        ran_at: 1,
+    };
+    assert!(
+        super::review_push::bounded_candidate_matches_current_tree(&orch, &candidate)
+            .await
+            .unwrap(),
+        "the wave path must derive the managed store and resolve its agent-only branch"
+    );
+    assert!(
+        rearm_one_bounded_failed_review(&orch).await,
+        "the maintenance cadence must nominate the dormant running PR owner"
+    );
+    assert!(
+        wave_scheduled(&orch, "j-prod"),
+        "the maintenance cadence must autonomously dispatch a fresh wave"
+    );
+}
+
+#[tokio::test]
+async fn bounded_rearm_lookup_failure_becomes_visible_infrastructure_evidence() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_failed_check(&db, "capacity", 1).await;
+    let orch = test_orchestrator(db);
+
+    record_bounded_rearm_lookup_failure(&orch, "j-prod", "object database unavailable")
+        .await
+        .unwrap();
+
+    let row = orch
+        .db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT failure_kind, output_tail, infra_failure_streak
+                           FROM check_result_cache WHERE job_id='j-prod'",
+                        (),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("check result");
+                Ok::<_, crate::storage::DbError>((row.text(0)?, row.text(1)?, row.i64(2)?))
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(row.0, "infrastructure");
+    assert!(row.1.contains("object database unavailable"), "{}", row.1);
+    assert_eq!(row.2, 2);
+}
+
+/// `check_result_cache` holds two row families, and the wave-preparation repaint
+/// must only ever touch one of them. The other is the hot projection of an
+/// immutable observation: painting `infrastructure` over a green would leave the
+/// row contradicting the very observation it names, and would strip that green of
+/// reuse, because the reusable lookup requires a null `failure_kind`.
+#[tokio::test]
+async fn bounded_rearm_lookup_failure_leaves_a_recorded_verdict_alone() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_failed_check(&db, "capacity", 1).await;
+    // A genuine green for a DIFFERENT check on the same job: a real immutable
+    // observation, plus the hot row that projects it. This is the exact shape the
+    // repaint must not touch — the row names the observation, so contradicting it
+    // would make the cache disagree with the evidence it points at.
+    db.execute_script(
+        "INSERT INTO check_result_observations
+           (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+            environment_fingerprint, exit_code, verdict, complete, reusable,
+            parser_version, result_schema_version, ran_at, duration_ms, job_id,
+            cadence, output_tail)
+         VALUES('obs-1','p-rev','commit','tree','typecheck','input-tc','env-a',0,'passed',1,1,
+                1,1,1,5,'j-prod','review','ok');
+         INSERT INTO check_result_cache
+           (project_id, tree_hash, input_hash, check_name, environment_fingerprint,
+            result_schema_version, source_observation_id, exit_code, passed,
+            output_tail, duration_ms, ran_at, job_id, failure_kind, infra_failure_streak)
+         VALUES('p-rev','tree','input-tc','typecheck','env-a',1,'obs-1',0,1,'ok',5,1,'j-prod',NULL,0);",
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+
+    record_bounded_rearm_lookup_failure(&orch, "j-prod", "object database unavailable")
+        .await
+        .unwrap();
+
+    let rows = orch
+        .db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT check_name, passed, COALESCE(failure_kind,''), infra_failure_streak
+                           FROM check_result_cache WHERE job_id='j-prod'
+                          ORDER BY check_name",
+                        (),
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push((row.text(0)?, row.i64(1)?, row.text(2)?, row.i64(3)?));
+                }
+                Ok::<_, crate::storage::DbError>(out)
+            })
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            ("review".to_string(), 0, "infrastructure".to_string(), 2),
+            ("typecheck".to_string(), 1, String::new(), 0),
+        ],
+        "the infra row takes the failure and the streak; the recorded verdict is untouched"
+    );
 }
 
 #[tokio::test]
@@ -33,16 +242,101 @@ async fn bounded_rearm_selects_retryable_review_work() {
 
     orch.db
         .local
+        .execute("UPDATE jobs SET status='running' WHERE id='j-prod'", ())
+        .await
+        .unwrap();
+    orch.db
+        .local
         .execute(
-            "UPDATE check_result_cache SET infra_failure_streak=?1",
+            // `ran_at` is Unix MILLISECONDS; ten minutes back is past the cooldown.
+            "UPDATE check_result_cache SET infra_failure_streak=?1, ran_at=(unixepoch()-600)*1000",
             (crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,),
         )
         .await
         .unwrap();
     assert_eq!(
-        bounded_rearm_candidates(&orch.db).await.unwrap(),
-        Vec::new(),
-        "the scheduler must not route around the persisted retry bound"
+        bounded_rearm_candidates(&orch.db).await.unwrap()[0].job_id,
+        "j-prod",
+        "a dormant open-PR owner is retried after the bounded cooldown even while its job remains running"
+    );
+
+    orch.db
+        .local
+        .execute("UPDATE turns SET state='running' WHERE id='t-prod'", ())
+        .await
+        .unwrap();
+    assert!(
+        bounded_rearm_candidates(&orch.db).await.unwrap().is_empty(),
+        "a live agent turn must never be mistaken for dormant review work"
+    );
+    orch.db
+        .local
+        .execute("UPDATE turns SET state='complete' WHERE id='t-prod'", ())
+        .await
+        .unwrap();
+    release_cooled_infrastructure_suppression(&orch, "j-prod")
+        .await
+        .unwrap();
+    let streak: i64 = orch
+        .db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT infra_failure_streak FROM check_result_cache WHERE job_id='j-prod'",
+                        (),
+                    )
+                    .await?;
+                rows.next().await?.expect("check result").i64(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(streak, 0, "the paced re-arm must admit a fresh execution");
+
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET infra_failure_streak=?1, ran_at=unixepoch()*1000",
+            (crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,),
+        )
+        .await
+        .unwrap();
+    assert!(
+        bounded_rearm_candidates(&orch.db).await.unwrap().is_empty(),
+        "the attempt bound remains a hot-loop circuit breaker during the cooldown"
+    );
+
+    orch.db
+        .local
+        .execute_script(
+            "UPDATE turns SET start_reason='memory_review' WHERE id='t-prod';
+             INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment,
+                              node_name, branch, created_at, updated_at)
+               VALUES('j-later','e-rev','p-rev','i-rev','running','later','builder','later',2,2);
+             INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+               VALUES('t-later','s-later','j-later',1,'complete','follow_up',2,2);
+             INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name,
+                confirmed, created_at, updated_at)
+               VALUES('a-later','j-later','create-pr',1,'{}',1,'create-pr',1,2,2);
+             INSERT INTO check_result_cache
+               (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                output_tail, duration_ms, ran_at, job_id, failure_kind, infra_failure_streak)
+               VALUES('p-rev','tree','later-input','review',-1,0,'failed',0,2,
+                      'j-later','infrastructure',1);",
+        )
+        .await
+        .unwrap();
+    let candidates = bounded_rearm_candidates(&orch.db).await.unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["j-later"],
+        "a completed memory-review head must not starve later dormant PR recovery"
     );
 }
 

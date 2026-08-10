@@ -6,7 +6,7 @@
 //! - Full audit trail of what configuration was used
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::agent::OutputSchema;
 use super::common::{Model, ModelSelection, Preset, RuntimeExtras};
@@ -234,6 +234,68 @@ pub struct TriggerContext {
     pub initiated_via: Option<String>,
 }
 
+/// Why each agent in an execution got the model it got.
+///
+/// Recorded on the snapshot because the snapshot is already the durable record
+/// every job reads from: a routing decision that lived anywhere else would not
+/// survive the config file that produced it. Old snapshots deserialize with
+/// `model_routing: None`, which reads as "this execution predates routing"
+/// rather than "nothing routed it".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouting {
+    /// Label slugs the launching issue carried at resolve time, sorted.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// The binding table's declared generation, when it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    /// How many rules the table carried. Zero means the mechanism ran and
+    /// asserted nothing, which is a different fact from having no table.
+    #[serde(default)]
+    pub rule_count: usize,
+    /// Keyed by agent id. Written as the resolver consults the plan, so an agent
+    /// introduced by a launch-time rebind or graph edit is recorded like any other.
+    #[serde(default)]
+    pub decisions: BTreeMap<String, ModelRoutingDecision>,
+}
+
+/// One agent's routing decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRoutingDecision {
+    pub source: ModelRoutingSource,
+    /// The rule that decided (or, for `DemotionRefused`, the rule that was
+    /// refused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// The label slugs that made the rule match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_labels: Vec<String>,
+    /// The tier the rule named, whether or not it was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Always present, always readable by a human. This is the line that answers
+    /// "why this model" when someone reads the execution months later.
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelRoutingSource {
+    /// A human pinned this agent at launch; the table was not consulted for it.
+    ExplicitLaunch,
+    /// A rule matched and was applied.
+    LabelBinding,
+    /// No labels, or no rule matched: the agent's own authored tier stands.
+    AgentDefault,
+    /// A rule matched but would have lowered this agent's tier, so it was not
+    /// applied. Whether a rule demotes is agent-relative, so this cannot be
+    /// caught when the table is written -- and refusing the whole launch over one
+    /// broad rule would be worse than recording the refusal here.
+    DemotionRefused,
+}
+
 /// Complete execution snapshot - everything needed to run/display an execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -259,6 +321,10 @@ pub struct ExecutionSnapshot {
     /// debugging. Pre-existing snapshots deserialize as `New`.
     #[serde(default)]
     pub branch_target: BranchTarget,
+    /// Why each agent got the model it got. `None` on snapshots frozen before
+    /// label routing existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_routing: Option<ModelRouting>,
     /// When the snapshot was created
     pub created_at: i64,
 }
@@ -274,6 +340,60 @@ pub struct SnapshotOverrides {
     pub recipe: Option<RecipeSnapshot>,
     /// Override or add agents (keyed by agent ID)
     pub agents: Option<HashMap<String, AgentSnapshot>>,
+}
+
+/// Fields whose change invalidates a frozen `selection`.
+///
+/// `selection` is the atomic backend+model pair the runtime actually reads;
+/// `tier` and `backend` are the authored inputs it was resolved from. A patch
+/// that moves an input while leaving the frozen output in place would be
+/// accepted, stored, and then ignored at run time — the caller asking for opus
+/// and getting sonnet, with nothing anywhere reporting a problem. Dropping the
+/// stale `selection` routes the merged snapshot back through the resolver, which
+/// is the same path that produced it in the first place.
+const SELECTION_INPUTS: &[&str] = &["tier", "backend", "backendPreference"];
+
+/// The authored inputs a frozen `selection` is resolved from, for callers that
+/// need to recognize a patch as an explicit model choice rather than merge one.
+pub(crate) fn selection_inputs() -> &'static [&'static str] {
+    SELECTION_INPUTS
+}
+
+/// Shallow-merge a partial agent-snapshot patch over a stored snapshot and
+/// validate the result as a complete [`AgentSnapshot`].
+///
+/// One merge grammar, two doors: the post-create `executions/{seq}` patch edits
+/// an execution that is already running, and a launch delta edits the snapshot
+/// an execution is about to freeze. They differ in when they apply and in what
+/// each door authorizes, not in what a patch means, so they share this.
+///
+/// `base` is `None` for an agent the snapshot does not yet carry, in which case
+/// the patch must itself be a complete snapshot and says so if it is not.
+pub fn merge_agent_patch(
+    base: Option<&AgentSnapshot>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<AgentSnapshot, String> {
+    let merged = match base {
+        Some(base) => {
+            let mut fields = match serde_json::to_value(base) {
+                Ok(serde_json::Value::Object(fields)) => fields,
+                Ok(_) | Err(_) => return Err("Stored agent snapshot is not an object".to_string()),
+            };
+            for (key, value) in patch {
+                fields.insert(key.clone(), value.clone());
+            }
+            if !patch.contains_key("selection")
+                && SELECTION_INPUTS.iter().any(|key| patch.contains_key(*key))
+            {
+                fields.remove("selection");
+            }
+            serde_json::Value::Object(fields)
+        }
+        None => serde_json::Value::Object(patch.clone()),
+    };
+
+    serde_json::from_value::<AgentSnapshot>(merged)
+        .map_err(|e| format!("Invalid agent snapshot after merge: {e}"))
 }
 
 impl ExecutionSnapshot {
@@ -292,6 +412,7 @@ impl ExecutionSnapshot {
             presets: None,
             delegated_packets: Vec::new(),
             branch_target: BranchTarget::default(),
+            model_routing: None,
             created_at: chrono::Utc::now().timestamp(),
         }
     }
@@ -339,6 +460,7 @@ mod tests {
     fn test_snapshot_serialization_roundtrip() {
         let snapshot = ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Test Recipe".to_string(),

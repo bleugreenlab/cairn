@@ -10,16 +10,20 @@
 //! ## Secrets
 //!
 //! Plaintext secrets are not stored. Values in `command`, `args`, `env`, `url`,
-//! and `headers` support `${VAR}` interpolation, expanded at connect time. Each
-//! reference resolves from the OS keychain first (see [`super::secrets`]) and
-//! then from the app process environment. The keychain path is what lets a
+//! and `headers` support `${VAR}` interpolation, expanded at connect time.
+//! Expansion goes through the credential broker
+//! ([`crate::security::broker`]), which is the only thing in the system that
+//! turns one of these references into plaintext: it resolves from the OS
+//! keychain first (see [`super::secrets`]) and then from the app process
+//! environment, and registers whatever it resolved for scrubbing before the
+//! value can be injected anywhere. The keychain path is what lets a
 //! Finder/Dock-launched app — which inherits a minimal environment — reach
 //! token-bearing servers: the user enters the secret in the settings UI, it is
 //! stored in the keychain, and `settings.yaml` keeps only the `${VAR}`
 //! reference.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 /// Configuration for a single external MCP server.
@@ -65,6 +69,22 @@ pub struct McpServerConfig {
     /// keychain, never in `settings.yaml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthServerConfig>,
+    /// Which of this server's `${VAR}` references carry credentials.
+    ///
+    /// The declared-secret signal the broker consumes. A value stored in the OS
+    /// keychain is already declared by the choice of store, so this list exists
+    /// for the other case: a `${VAR}` that resolves from the *process
+    /// environment* and really is a token, which nothing about the bytes can
+    /// distinguish from `${HOME}`. Naming it here makes the resolved value a
+    /// scrub target.
+    ///
+    /// Deliberately not "every referenced var". `${VAR}` interpolation reaches
+    /// `command`, `args`, and `url` as well as `env` and `headers`, so most
+    /// references are ordinary configuration; registering those would refuse
+    /// every model-authored write that mentions the path. See
+    /// `security::broker` for the full reasoning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
 }
 
 /// Non-secret OAuth configuration persisted in `settings.yaml`. The interactive
@@ -85,6 +105,168 @@ pub struct OAuthServerConfig {
     pub scopes: Vec<String>,
 }
 
+// ============================================================================
+// Configuration identity
+// ============================================================================
+
+/// Digest algorithm behind [`fingerprint_mcp_config`].
+pub const MCP_CONFIG_FINGERPRINT_ALGORITHM: &str = "sha256";
+
+/// Version of the canonical encoding fed to that digest. Bump on any change to
+/// the field set or its order, so a digest can never mean two things.
+///
+/// v2 added the `secrets` declaration. It is identity-bearing because removing
+/// a var from it downgrades that credential from "scrubbed everywhere" to "in
+/// the clear if the server echoes it", and a standing grant must not carry a
+/// server across that change silently. Bumping re-prompts on the next
+/// reconfigure, which is the intended cost.
+pub const MCP_CONFIG_FINGERPRINT_ENCODING_VERSION: u32 = 2;
+
+/// Domain separator. Keeps these digests from colliding with any other
+/// sha256-over-config in the system, now or later.
+const MCP_CONFIG_FINGERPRINT_DOMAIN: &str = "cairn.authority.mcp-config";
+
+/// A canonical encoder: every field is written as a length-prefixed key and a
+/// length-prefixed value, so no value can impersonate a field boundary and two
+/// different configurations cannot produce the same byte stream by splicing.
+struct CanonicalEncoder {
+    hasher: sha2::Sha256,
+}
+
+impl CanonicalEncoder {
+    fn new(domain: &str, version: u32) -> Self {
+        let mut encoder = Self {
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+        };
+        encoder.field("domain", domain);
+        encoder.field("encoding", &version.to_string());
+        encoder
+    }
+
+    fn field(&mut self, key: &str, value: &str) {
+        use sha2::Digest;
+        self.hasher.update((key.len() as u64).to_be_bytes());
+        self.hasher.update(key.as_bytes());
+        self.hasher.update((value.len() as u64).to_be_bytes());
+        self.hasher.update(value.as_bytes());
+    }
+
+    /// An ordered sequence: the count is hashed too, so a list cannot be
+    /// lengthened or shortened without changing the digest.
+    fn sequence(&mut self, key: &str, values: &[String]) {
+        self.field(key, &values.len().to_string());
+        for (index, value) in values.iter().enumerate() {
+            self.field(&format!("{key}[{index}]"), value);
+        }
+    }
+
+    /// An unordered map, canonicalized by sorting keys. `HashMap` iteration
+    /// order is arbitrary and varies run to run, so without this the same
+    /// configuration would fingerprint differently on each attempt and no
+    /// standing grant could ever be reused.
+    fn map(&mut self, key: &str, values: &HashMap<String, String>) {
+        let sorted: BTreeMap<&String, &String> = values.iter().collect();
+        self.field(key, &sorted.len().to_string());
+        for (name, value) in sorted {
+            self.field(&format!("{key}.key"), name);
+            self.field(&format!("{key}.value"), value);
+        }
+    }
+
+    fn finish(self) -> String {
+        use sha2::Digest;
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+/// Fingerprint the **resultant** configuration of an MCP registry mutation:
+/// what would be registered under this name once the change has been applied,
+/// or — for a delete — the entry that would be removed.
+///
+/// This is the identity an authority grant binds to, so it must cover
+/// everything that decides what gets executed or connected to, and nothing that
+/// does not. `config` is `None` only when there is genuinely no entry (an
+/// unresolvable target), which fingerprints distinctly from any real one rather
+/// than collapsing into some default.
+///
+/// # Secrets
+///
+/// Values are hashed **exactly as authored**. A `${TOKEN}` reference contributes
+/// the literal seven characters `${TOKEN}`, so repointing a server at a
+/// different secret changes its identity and re-prompts, while nothing here
+/// reads the keychain, the process environment, or any resolved bearer value.
+/// The digest is one-way regardless, but not resolving is what keeps a secret
+/// value from ever entering this code path at all.
+pub fn fingerprint_mcp_config(
+    workspace_id: &str,
+    project_id: Option<&str>,
+    server: &str,
+    mutation: &str,
+    config: Option<&McpServerConfig>,
+) -> cairn_common::authorization::McpConfigFingerprint {
+    let mut encoder = CanonicalEncoder::new(
+        MCP_CONFIG_FINGERPRINT_DOMAIN,
+        MCP_CONFIG_FINGERPRINT_ENCODING_VERSION,
+    );
+    encoder.field("workspace", workspace_id);
+    encoder.field("project", project_id.unwrap_or(""));
+    encoder.field("server", server);
+    encoder.field("mutation", mutation);
+
+    match config {
+        None => encoder.field("config", "absent"),
+        Some(config) => {
+            // Destructured exhaustively, not field-accessed, on purpose. The
+            // whole value of this constraint is the claim that every
+            // security-relevant field changes the digest; a field added to
+            // `McpServerConfig` later must be a compile error HERE rather than a
+            // digest that silently keeps its old value while the configuration
+            // it names has changed. If you are reading this because the
+            // destructure stopped compiling: decide whether the new field is
+            // identity-bearing, and either hash it or bind it to `_` with a note
+            // saying why it is not.
+            let McpServerConfig {
+                transport,
+                command,
+                args,
+                env,
+                url,
+                headers,
+                enabled,
+                oauth,
+                secrets,
+            } = config;
+            encoder.field("config", "present");
+            encoder.field("transport", transport);
+            encoder.field("command", command.as_deref().unwrap_or(""));
+            encoder.sequence("args", args);
+            encoder.map("env", env);
+            encoder.field("url", url.as_deref().unwrap_or(""));
+            encoder.map("headers", headers);
+            encoder.field("enabled", if *enabled { "true" } else { "false" });
+            // Identity-bearing: which references are treated as credentials
+            // decides whether their resolved values are scrubbed from observed
+            // output, so widening or narrowing it is a change to what the
+            // approval covered.
+            encoder.sequence("secrets", secrets);
+            match oauth.as_ref() {
+                None => encoder.field("oauth", "absent"),
+                Some(oauth) => {
+                    encoder.field("oauth", "present");
+                    encoder.field("oauth.clientId", oauth.client_id.as_deref().unwrap_or(""));
+                    encoder.sequence("oauth.scopes", &oauth.scopes);
+                }
+            }
+        }
+    }
+
+    cairn_common::authorization::McpConfigFingerprint {
+        algorithm: MCP_CONFIG_FINGERPRINT_ALGORITHM.to_string(),
+        encoding_version: MCP_CONFIG_FINGERPRINT_ENCODING_VERSION,
+        digest: encoder.finish(),
+    }
+}
+
 fn default_transport() -> String {
     "stdio".to_string()
 }
@@ -99,9 +281,13 @@ fn is_enabled(enabled: &bool) -> bool {
 
 impl McpServerConfig {
     /// Return a copy with every `${VAR}` reference replaced by `resolve(var)`.
-    /// This is the resolver seam: connect-time expansion (`expanded`) and the
-    /// settings connection-test both build on it with different sources.
-    pub fn expand_vars(&self, resolve: &dyn Fn(&str) -> String) -> McpServerConfig {
+    ///
+    /// The pure substitution mechanism, with no opinion about where a value
+    /// comes from. Crate-visible on purpose: supplying the resolver is the
+    /// credential broker's job, and a second caller with its own closure is
+    /// exactly the parallel resolution chain that left the settings-save
+    /// connection test registering nothing.
+    pub(crate) fn expand_vars(&self, resolve: &dyn Fn(&str) -> String) -> McpServerConfig {
         let map = |s: &str| expand_with(s, resolve);
         McpServerConfig {
             transport: self.transport.clone(),
@@ -118,19 +304,64 @@ impl McpServerConfig {
             // OAuth config is non-secret and carries no `${VAR}` references; the
             // bearer token is resolved separately from the keychain at connect.
             oauth: self.oauth.clone(),
+            // The declaration names variables, not values, so it survives
+            // expansion unchanged.
+            secrets: self.secrets.clone(),
         }
     }
 
-    /// Connect-time expansion for `server_name` (the scoped credential key):
-    /// each `${VAR}` resolves from the OS keychain first, then the process environment, then an empty string. A
-    /// missing secret surfaces as a connect/auth failure from the server, not a
-    /// panic here.
-    pub(crate) fn expanded(&self, server_name: &str) -> McpServerConfig {
-        self.expand_vars(&|var| {
-            super::secrets::get_secret(server_name, var)
-                .or_else(|| std::env::var(var).ok())
-                .unwrap_or_default()
-        })
+    /// Connect-time expansion for `credential_key` (the scoped credential key).
+    ///
+    /// Every `${VAR}` resolves through the credential broker, which is what
+    /// makes a resolved credential a scrub target before it can be injected
+    /// anywhere. A missing secret expands to an empty string and surfaces as a
+    /// connect/auth failure from the server, not a panic here.
+    ///
+    /// The result deliberately is not an `McpServerConfig`: an expanded config
+    /// carries credentials, and `McpServerConfig` is `Serialize` because the
+    /// *authored* form lives in `settings.yaml`. See
+    /// [`crate::security::BrokeredMcpConfig`].
+    pub(crate) fn brokered(
+        &self,
+        credential_key: &str,
+        purpose: &str,
+    ) -> crate::security::BrokeredMcpConfig {
+        crate::security::broker::mcp_server(credential_key, self, &HashMap::new(), purpose)
+    }
+
+    /// Whether `var` is declared to carry a credential. See [`Self::secrets`].
+    pub fn declares_secret(&self, var: &str) -> bool {
+        self.secrets.iter().any(|declared| declared == var)
+    }
+
+    /// Why this server cannot connect yet, or `None` when it can.
+    ///
+    /// Both checks are synchronous and reuse machinery the connect path already
+    /// relies on, so a readiness verdict and a connect attempt agree by
+    /// construction rather than by convention. A readiness probe must never
+    /// perform network I/O, so the OAuth check reads the stored credential
+    /// directly rather than going through the refreshing token path.
+    ///
+    /// This gates PACK-origin servers only (see [`resolve_mcp_servers`]).
+    /// Content the user did not author must be inert until it can actually
+    /// work; configuration the user DID author still fails loudly.
+    pub fn readiness(&self, credential_key: &str) -> Option<NotReady> {
+        let missing: Vec<String> = self
+            .referenced_vars()
+            .into_iter()
+            .filter(|var| !crate::security::broker::mcp_var_is_set(credential_key, self, var))
+            .collect();
+        if !missing.is_empty() {
+            return Some(NotReady::MissingVars { vars: missing });
+        }
+
+        if self.oauth.is_some()
+            && crate::mcp::oauth::store::status(credential_key).state == "needs_auth"
+        {
+            return Some(NotReady::NeedsAuth);
+        }
+
+        None
     }
 
     /// The set of `${VAR}` names referenced across all string fields. Drives the
@@ -155,6 +386,41 @@ impl McpServerConfig {
         }
         vars
     }
+}
+
+/// Why a configured MCP server cannot connect yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "reason")]
+pub enum NotReady {
+    /// `${VAR}` references with no value in the keychain or the environment.
+    MissingVars { vars: Vec<String> },
+    /// OAuth is configured but no usable token is stored.
+    NeedsAuth,
+}
+
+impl NotReady {
+    /// Compact rendering for logs and the catalog resource.
+    pub fn summary(&self) -> String {
+        match self {
+            NotReady::MissingVars { vars } => format!("missing_vars({})", vars.join(", ")),
+            NotReady::NeedsAuth => "needs_auth".to_string(),
+        }
+    }
+}
+
+/// Where a workspace-visible MCP server came from, and whether it can connect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMcpEntry {
+    #[serde(flatten)]
+    pub config: McpServerConfig,
+    /// `workspace` for a user-authored entry, `pack:<id>` for a pack default.
+    pub origin: String,
+    /// Present when the server is configured but cannot connect yet. A
+    /// pack-origin entry in this state is withheld from agents; the settings
+    /// surface still shows it so the user can supply what it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_ready: Option<NotReady>,
 }
 
 /// Append every `${VAR}` name found in `input` to `out`.
@@ -200,19 +466,47 @@ pub fn expand_env_vars(input: &str) -> String {
     expand_with(input, &|name| std::env::var(name).unwrap_or_default())
 }
 
-/// Resolve the effective MCP server registry for a run: workspace servers from
-/// `~/.cairn/settings.yaml` overlaid by the project's `.cairn/config.yaml`
-/// (project wins on key collision). `project_path` is `None` for project-less
-/// (workspace-only) contexts.
+/// Resolve the effective MCP server registry for a run: installed packs' server
+/// definitions, overlaid by workspace servers from `~/.cairn/settings.yaml`,
+/// overlaid by the project's `.cairn/config.yaml` (the innermost scope wins on a
+/// key collision). `project_path` is `None` for project-less (workspace-only)
+/// contexts.
+///
+/// Packs sit at the bottom of the chain rather than being merged into the user's
+/// settings, so a pack default and a user's fork of it stay distinguishable —
+/// the same pack-owned / user-forked model the file-backed resources use.
 pub(crate) fn resolve_mcp_servers(
     config_dir: &Path,
     project_path: Option<&Path>,
 ) -> HashMap<String, McpServerConfig> {
-    let mut servers: HashMap<String, McpServerConfig> =
-        super::settings::load_settings_file(config_dir)
-            .ok()
-            .and_then(|f| f.mcp_servers)
-            .unwrap_or_default();
+    let workspace = load_settings_mcp_servers(config_dir);
+    let mut servers: HashMap<String, McpServerConfig> = HashMap::new();
+
+    for (name, entry) in super::pack::mcp::load_pack_mcp_servers(config_dir) {
+        if workspace.contains_key(&name) {
+            // The user forked this server into their own settings; that entry is
+            // theirs and resolves ungated below.
+            continue;
+        }
+        // A pack server arrives without the user having configured anything, so
+        // it must be inert until it can actually connect. Left ungated, every
+        // holder of a connector pack would get a failing spawn or an
+        // unauthenticated request in every session.
+        if let Some(reason) = entry
+            .config
+            .readiness(&super::secrets::credential_key(&name, None))
+        {
+            log::debug!(
+                "Withholding MCP server `{name}` from agents: provided by pack `{}` and not ready ({})",
+                entry.pack_id,
+                reason.summary()
+            );
+            continue;
+        }
+        servers.insert(name, entry.config);
+    }
+
+    servers.extend(workspace);
 
     if let Some(project_path) = project_path {
         if let Some(project_servers) =
@@ -231,17 +525,70 @@ pub(crate) fn resolve_mcp_servers(
     servers
 }
 
-/// Load the workspace-level external MCP server registry from
-/// `~/.cairn/settings.yaml`. Returns an empty map if the file is missing,
-/// unparsable, or has no `mcpServers` block.
-///
-/// This is the registry the management UI edits; project-level overlays live in
-/// each project's `.cairn/config.yaml` and are out of scope for workspace edits.
-pub fn load_workspace_mcp_servers(config_dir: &Path) -> HashMap<String, McpServerConfig> {
+/// The raw `mcpServers` block of `~/.cairn/settings.yaml` — the servers the user
+/// authored, with no pack layer beneath. Returns an empty map if the file is
+/// missing, unparsable, or has no `mcpServers` block.
+pub fn load_settings_mcp_servers(config_dir: &Path) -> HashMap<String, McpServerConfig> {
     super::settings::load_settings_file(config_dir)
         .ok()
         .and_then(|f| f.mcp_servers)
         .unwrap_or_default()
+}
+
+/// Load the workspace-level external MCP server registry: every installed pack's
+/// servers, overlaid by the user's own `settings.yaml` entries.
+///
+/// This is the registry the management UI edits and authorizes against, so it is
+/// deliberately unfiltered — a disabled or not-yet-ready server is present and
+/// can be toggled, configured, or authorized. Use [`workspace_mcp_entries`] when
+/// the caller needs to render *why* a server is not live.
+pub fn load_workspace_mcp_servers(config_dir: &Path) -> HashMap<String, McpServerConfig> {
+    let mut servers: HashMap<String, McpServerConfig> =
+        super::pack::mcp::load_pack_mcp_servers(config_dir)
+            .into_iter()
+            .map(|(name, entry)| (name, entry.config))
+            .collect();
+    servers.extend(load_settings_mcp_servers(config_dir));
+    servers
+}
+
+/// The workspace registry annotated with each server's origin and, when it
+/// cannot connect yet, the reason. This is what lets a surface render "needs
+/// path" or "needs auth" and offer the authorize action, rather than silently
+/// showing a server that does nothing.
+pub fn workspace_mcp_entries(config_dir: &Path) -> BTreeMap<String, WorkspaceMcpEntry> {
+    let mut entries = BTreeMap::new();
+    let workspace = load_settings_mcp_servers(config_dir);
+
+    for (name, entry) in super::pack::mcp::load_pack_mcp_servers(config_dir) {
+        if workspace.contains_key(&name) {
+            continue;
+        }
+        let not_ready = entry
+            .config
+            .readiness(&super::secrets::credential_key(&name, None));
+        entries.insert(
+            name,
+            WorkspaceMcpEntry {
+                config: entry.config,
+                origin: format!("pack:{}", entry.pack_id),
+                not_ready,
+            },
+        );
+    }
+
+    for (name, config) in workspace {
+        entries.insert(
+            name,
+            WorkspaceMcpEntry {
+                config,
+                origin: "workspace".to_string(),
+                not_ready: None,
+            },
+        );
+    }
+
+    entries
 }
 
 /// Load the project-level external MCP server registry from
@@ -276,7 +623,13 @@ pub fn upsert_workspace_mcp_server(
 /// Remove one workspace MCP server by `name`. Succeeds even if the server (or
 /// the file) does not exist. Drops the `mcpServers` block entirely when it
 /// becomes empty so the file stays clean.
+///
+/// A server supplied by an installed pack is removed by recording the removal
+/// against that pack, not by editing a settings file that never mentioned it.
+/// The pack stays installed and keeps updating; this one server stops being
+/// offered. Removing an item must not require uninstalling the pack around it.
 pub fn delete_workspace_mcp_server(config_dir: &Path, name: &str) -> Result<(), String> {
+    super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Mcp, name);
     super::settings::mutate_workspace_settings(config_dir, "cairn: update mcp servers", |root| {
         delete_mcp_server(root, name);
         Ok(())
@@ -410,7 +763,198 @@ fn write_settings_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::secrets::mock_keychain;
     use tempfile::TempDir;
+
+    /// Install a pack in `config_dir` whose `mcp.yaml` holds `servers`.
+    fn install_pack_with_servers(config_dir: &Path, id: &str, servers: &str) {
+        let dir = config_dir.join("packs").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pack.yaml"),
+            format!(
+                "cairnVersion: 1\nid: {id}\nname: {id}\nversion: 1.0.0\n\
+                 installedAt: now\ncontentHash: h\nsource:\n  kind: bundled\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("mcp.yaml"), servers).unwrap();
+    }
+
+    #[test]
+    fn a_pack_server_resolves_and_a_settings_entry_shadows_it() {
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        install_pack_with_servers(
+            ws.path(),
+            "demo",
+            "mcpServers:\n  demo:\n    command: pack-cmd\n  other:\n    command: other-cmd\n",
+        );
+
+        let servers = resolve_mcp_servers(ws.path(), None);
+        assert_eq!(servers["demo"].command.as_deref(), Some("pack-cmd"));
+        assert_eq!(servers["other"].command.as_deref(), Some("other-cmd"));
+
+        // The user forks one of them into their own settings: their entry wins,
+        // and the sibling pack default is untouched.
+        std::fs::write(
+            ws.path().join("settings.yaml"),
+            "mcpServers:\n  demo:\n    command: /usr/local/bin/demo\n",
+        )
+        .unwrap();
+        let servers = resolve_mcp_servers(ws.path(), None);
+        assert_eq!(
+            servers["demo"].command.as_deref(),
+            Some("/usr/local/bin/demo")
+        );
+        assert_eq!(servers["other"].command.as_deref(), Some("other-cmd"));
+
+        let entries = workspace_mcp_entries(ws.path());
+        assert_eq!(entries["demo"].origin, "workspace");
+        assert_eq!(entries["other"].origin, "pack:demo");
+
+        // Disabling the fork removes it from agent-facing resolution entirely;
+        // the pack layer does not resurrect it.
+        std::fs::write(
+            ws.path().join("settings.yaml"),
+            "mcpServers:\n  demo:\n    command: /usr/local/bin/demo\n    enabled: false\n",
+        )
+        .unwrap();
+        assert!(!resolve_mcp_servers(ws.path(), None).contains_key("demo"));
+    }
+
+    #[test]
+    fn a_pack_server_with_an_unresolved_var_is_inert_until_it_can_connect() {
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        install_pack_with_servers(
+            ws.path(),
+            "matlab",
+            "mcpServers:\n  readiness-matlab:\n    command: ${READINESS_MATLAB_BIN}\n",
+        );
+
+        // Unconfigured: withheld from agents, but visible and explained in the
+        // surface the user acts on.
+        assert!(!resolve_mcp_servers(ws.path(), None).contains_key("readiness-matlab"));
+        let entries = workspace_mcp_entries(ws.path());
+        assert_eq!(
+            entries["readiness-matlab"].not_ready,
+            Some(NotReady::MissingVars {
+                vars: vec!["READINESS_MATLAB_BIN".to_string()]
+            })
+        );
+        assert_eq!(entries["readiness-matlab"].origin, "pack:matlab");
+
+        // Supplying the value is the only step: nothing else has to be flipped.
+        crate::config::secrets::set_secret(
+            "readiness-matlab",
+            "READINESS_MATLAB_BIN",
+            "/opt/matlab-mcp",
+        )
+        .unwrap();
+        assert!(resolve_mcp_servers(ws.path(), None).contains_key("readiness-matlab"));
+        assert!(workspace_mcp_entries(ws.path())["readiness-matlab"]
+            .not_ready
+            .is_none());
+    }
+
+    #[test]
+    fn a_user_authored_server_with_an_unresolved_var_is_never_gated() {
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        std::fs::write(
+            ws.path().join("settings.yaml"),
+            "mcpServers:\n  mine:\n    command: ${DEFINITELY_UNSET_FOR_THIS_TEST}\n",
+        )
+        .unwrap();
+
+        // Their configuration, their failure to see. Swallowing it would be
+        // worse than the connect error.
+        assert!(resolve_mcp_servers(ws.path(), None).contains_key("mine"));
+        assert!(workspace_mcp_entries(ws.path())["mine"].not_ready.is_none());
+    }
+
+    #[test]
+    fn an_oauth_pack_server_is_ready_only_with_a_usable_credential() {
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        install_pack_with_servers(
+            ws.path(),
+            "linear",
+            "mcpServers:\n  readiness-linear:\n    type: http\n    url: https://mcp.example.test/mcp\n    oauth:\n      scopes: []\n",
+        );
+
+        // Ships enabled, but no stored credential means it does nothing yet.
+        assert!(!resolve_mcp_servers(ws.path(), None).contains_key("readiness-linear"));
+        assert_eq!(
+            workspace_mcp_entries(ws.path())["readiness-linear"].not_ready,
+            Some(NotReady::NeedsAuth)
+        );
+
+        // Readiness follows token USABILITY, not mere presence: an expired token
+        // with no refresh is still needs-auth.
+        let mut auth = crate::mcp::oauth::store::StoredAuth {
+            issuer: Some("https://auth.example.test".into()),
+            resource: "https://mcp.example.test/mcp".into(),
+            authorization_endpoint: "https://auth.example.test/authorize".into(),
+            token_endpoint: "https://auth.example.test/token".into(),
+            registration_endpoint: None,
+            client_id: "client".into(),
+            client_secret: None,
+            access_token: "token".into(),
+            refresh_token: None,
+            expires_at: Some(chrono::Utc::now().timestamp() - 10),
+            scopes: vec![],
+            needs_scopes: vec![],
+        };
+        crate::mcp::oauth::store::save("readiness-linear", &auth).unwrap();
+        assert!(!resolve_mcp_servers(ws.path(), None).contains_key("readiness-linear"));
+
+        // A live token promotes it, with no other state to change.
+        auth.expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        crate::mcp::oauth::store::save("readiness-linear", &auth).unwrap();
+        assert!(resolve_mcp_servers(ws.path(), None).contains_key("readiness-linear"));
+        assert!(workspace_mcp_entries(ws.path())["readiness-linear"]
+            .not_ready
+            .is_none());
+    }
+
+    /// Deleting a pack-provided server removes THAT server, not the pack around
+    /// it. Wanting a pack's skill but not its connector is an ordinary thing to
+    /// want, and the removal has to survive the next sync.
+    #[test]
+    fn deleting_a_pack_provided_server_removes_just_that_item() {
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        install_pack_with_servers(
+            ws.path(),
+            "connectors",
+            "mcpServers:\n  alpha:\n    type: http\n    url: https://alpha.test/mcp\n  beta:\n    type: http\n    url: https://beta.test/mcp\n",
+        );
+        assert!(resolve_mcp_servers(ws.path(), None).contains_key("alpha"));
+
+        delete_workspace_mcp_server(ws.path(), "alpha").unwrap();
+
+        let servers = resolve_mcp_servers(ws.path(), None);
+        assert!(!servers.contains_key("alpha"), "the removed server is gone");
+        assert!(
+            servers.contains_key("beta"),
+            "its pack stays installed and keeps supplying everything else"
+        );
+
+        // The removal is recorded against the pack, so a sync cannot undo it.
+        let lock = crate::config::pack::lock::read_lock(ws.path(), "connectors").unwrap();
+        assert!(lock.is_removed(crate::config::pack::PackItemKind::Mcp, "alpha"));
+
+        // And it is reversible without reinstalling anything.
+        crate::config::pack::lock::restore_removed_items(
+            &crate::services::RealFileSystem,
+            ws.path(),
+            "connectors",
+        )
+        .unwrap();
+        assert!(resolve_mcp_servers(ws.path(), None).contains_key("alpha"));
+    }
 
     #[test]
     fn resolve_overlays_project_over_workspace() {
@@ -519,6 +1063,7 @@ args: ["@playwright/mcp@latest"]
             headers: HashMap::from([("Authorization".to_string(), "Bearer ${KEY}".to_string())]),
             enabled: true,
             oauth: None,
+            secrets: Vec::new(),
         };
         let e = cfg.expand_vars(&|var| match var {
             "BIN" => "server".to_string(),
@@ -550,6 +1095,7 @@ args: ["@playwright/mcp@latest"]
             )]),
             enabled: true,
             oauth: None,
+            secrets: Vec::new(),
         };
         let vars = cfg.referenced_vars();
         assert!(vars.contains("BIN"));
@@ -572,6 +1118,7 @@ args: ["@playwright/mcp@latest"]
             headers: HashMap::new(),
             enabled: true,
             oauth: None,
+            secrets: Vec::new(),
         }
     }
 
@@ -803,5 +1350,211 @@ args: ["@playwright/mcp@latest"]
         assert!(raw.contains("axon"));
         // The bug we are guarding against: no maxThinkingTokens was added.
         assert!(!raw.contains("maxThinkingTokens"));
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    fn base() -> McpServerConfig {
+        McpServerConfig {
+            transport: "stdio".to_string(),
+            command: Some("npx".to_string()),
+            args: vec!["linear-mcp".to_string()],
+            env: HashMap::from([("TOKEN".to_string(), "${LINEAR_TOKEN}".to_string())]),
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            oauth: None,
+            secrets: Vec::new(),
+        }
+    }
+
+    fn digest_of(config: &McpServerConfig) -> String {
+        fingerprint_mcp_config("default", None, "linear", "create", Some(config)).digest
+    }
+
+    #[test]
+    fn identical_configurations_share_an_identity() {
+        assert_eq!(digest_of(&base()), digest_of(&base()));
+    }
+
+    #[test]
+    fn map_iteration_order_does_not_change_the_identity() {
+        // HashMap order varies run to run. If it leaked into the digest, the
+        // same configuration would fingerprint differently on each attempt and
+        // no standing grant could ever be reused.
+        let mut wide = base();
+        wide.env = HashMap::from([
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+            ("C".to_string(), "3".to_string()),
+            ("D".to_string(), "4".to_string()),
+        ]);
+        wide.headers = HashMap::from([
+            ("X-One".to_string(), "1".to_string()),
+            ("X-Two".to_string(), "2".to_string()),
+        ]);
+        let first = digest_of(&wide);
+        for _ in 0..16 {
+            let mut shuffled = wide.clone();
+            shuffled.env = wide.env.clone().into_iter().collect();
+            shuffled.headers = wide.headers.clone().into_iter().collect();
+            assert_eq!(first, digest_of(&shuffled));
+        }
+    }
+
+    #[test]
+    fn argument_order_is_identity_bearing() {
+        let mut one = base();
+        one.args = vec!["a".to_string(), "b".to_string()];
+        let mut other = base();
+        other.args = vec!["b".to_string(), "a".to_string()];
+        assert_ne!(
+            digest_of(&one),
+            digest_of(&other),
+            "argument order decides what a command does"
+        );
+    }
+
+    #[test]
+    fn every_security_relevant_field_changes_the_identity() {
+        let original = digest_of(&base());
+        let mut variants: Vec<(&str, McpServerConfig)> = Vec::new();
+
+        let mut transport = base();
+        transport.transport = "http".to_string();
+        transport.url = Some("https://example.test".to_string());
+        variants.push(("transport+url", transport));
+
+        let mut command = base();
+        command.command = Some("curl".to_string());
+        variants.push(("command", command));
+
+        let mut args = base();
+        args.args = vec!["linear-mcp".to_string(), "--unsafe".to_string()];
+        variants.push(("args", args));
+
+        let mut env_value = base();
+        env_value.env = HashMap::from([("TOKEN".to_string(), "${OTHER_TOKEN}".to_string())]);
+        variants.push(("env secret reference", env_value));
+
+        let mut env_key = base();
+        env_key.env = HashMap::from([("OTHER".to_string(), "${LINEAR_TOKEN}".to_string())]);
+        variants.push(("env key", env_key));
+
+        let mut headers = base();
+        headers.headers = HashMap::from([("Authorization".to_string(), "${K}".to_string())]);
+        variants.push(("headers", headers));
+
+        let mut enabled = base();
+        enabled.enabled = false;
+        variants.push(("enabled", enabled));
+
+        let mut oauth = base();
+        oauth.oauth = Some(OAuthServerConfig {
+            client_id: Some("client".to_string()),
+            scopes: vec!["read".to_string()],
+        });
+        variants.push(("oauth", oauth.clone()));
+
+        let mut scopes = oauth.clone();
+        scopes.oauth = Some(OAuthServerConfig {
+            client_id: Some("client".to_string()),
+            scopes: vec!["read".to_string(), "write".to_string()],
+        });
+        assert_ne!(digest_of(&oauth), digest_of(&scopes), "oauth scopes");
+
+        for (field, variant) in variants {
+            assert_ne!(
+                original,
+                digest_of(&variant),
+                "changing {field} must change the configuration identity, or a standing grant \
+                 would authorize the changed server without asking"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_secret_tests {
+    use super::*;
+
+    fn authored() -> McpServerConfig {
+        McpServerConfig {
+            transport: "stdio".to_string(),
+            command: Some("npx".to_string()),
+            args: vec!["linear-mcp".to_string()],
+            env: HashMap::from([("TOKEN".to_string(), "${LINEAR_TOKEN}".to_string())]),
+            url: None,
+            headers: HashMap::new(),
+            enabled: true,
+            oauth: None,
+            secrets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn identity_covers_the_server_the_scope_and_the_mutation() {
+        let config = authored();
+        let create = fingerprint_mcp_config("default", None, "linear", "create", Some(&config));
+        assert_ne!(
+            create.digest,
+            fingerprint_mcp_config("default", None, "linear", "delete", Some(&config)).digest,
+            "an approval to install is not an approval to remove"
+        );
+        assert_ne!(
+            create.digest,
+            fingerprint_mcp_config("default", None, "github", "create", Some(&config)).digest,
+            "the same config under another name is another server"
+        );
+        assert_ne!(
+            create.digest,
+            fingerprint_mcp_config("default", Some("proj"), "linear", "create", Some(&config))
+                .digest,
+            "scope is part of what was approved"
+        );
+        assert_ne!(
+            create.digest,
+            fingerprint_mcp_config("default", None, "linear", "create", None).digest,
+            "an absent entry is not some default entry"
+        );
+    }
+
+    #[test]
+    fn the_authored_form_is_what_gets_hashed_never_a_resolved_secret() {
+        // If the digest were taken after expansion, two installs of the same
+        // server would disagree whenever the environment did -- and a secret's
+        // plaintext would have had to be read into the authorization path to
+        // get there.
+        let expanded = authored().expand_vars(&|_var| "super-secret-value".to_string());
+        assert_eq!(
+            expanded.env.get("TOKEN").map(String::as_str),
+            Some("super-secret-value"),
+            "fixture sanity: expansion really does substitute"
+        );
+        assert_ne!(
+            fingerprint_mcp_config("default", None, "linear", "create", Some(&authored())).digest,
+            fingerprint_mcp_config("default", None, "linear", "create", Some(&expanded)).digest,
+            "authored and expanded are different inputs; only the authored one may reach here"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_carries_no_configuration_text() {
+        let mut secretive = authored();
+        secretive.env =
+            HashMap::from([("TOKEN".to_string(), "literal-plaintext-token".to_string())]);
+        let printed = format!(
+            "{:?}",
+            fingerprint_mcp_config("default", None, "linear", "create", Some(&secretive))
+        );
+        assert!(
+            !printed.contains("literal-plaintext-token"),
+            "a fingerprint is persisted and rendered; it must never carry authored values"
+        );
+        assert!(!printed.contains("npx"));
+        assert!(printed.contains("sha256"));
     }
 }

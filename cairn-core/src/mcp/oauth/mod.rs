@@ -392,7 +392,9 @@ pub fn build_authorize_url(
         q.append_pair("state", state);
         q.append_pair("code_challenge", code_challenge);
         q.append_pair("code_challenge_method", "S256");
-        q.append_pair("resource", resource);
+        if !resource.is_empty() {
+            q.append_pair("resource", resource);
+        }
         if let Some(scope) = scope {
             q.append_pair("scope", scope);
         }
@@ -476,8 +478,10 @@ pub async fn exchange_code(
         ("redirect_uri", redirect_uri.to_string()),
         ("client_id", client_id.to_string()),
         ("code_verifier", code_verifier.to_string()),
-        ("resource", resource.to_string()),
     ];
+    if !resource.is_empty() {
+        form.push(("resource", resource.to_string()));
+    }
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret.to_string()));
     }
@@ -501,8 +505,10 @@ pub(crate) async fn refresh_access_token(
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", refresh_token.to_string()),
         ("client_id", client_id.to_string()),
-        ("resource", resource.to_string()),
     ];
+    if !resource.is_empty() {
+        form.push(("resource", resource.to_string()));
+    }
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret.to_string()));
     }

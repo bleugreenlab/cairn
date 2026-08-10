@@ -28,6 +28,75 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ContentionEstimate {
+    pub co_resident_compile_jobs: u32,
+    pub co_resident_light_jobs: u32,
+    /// Fixed-point multiplier where 1000 means no slowdown.
+    pub multiplier_millis: u32,
+    pub source: ContentionEvidence,
+    pub sample_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<ContentionFallback>,
+}
+
+impl ContentionEstimate {
+    pub fn adjusted_ms(&self, base_ms: u64) -> u64 {
+        base_ms
+            .saturating_mul(self.multiplier_millis as u64)
+            .saturating_add(999)
+            / 1_000
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "{} compile-class and {} light co-resident job(s), {:.2}x slowdown from {}",
+            self.co_resident_compile_jobs,
+            self.co_resident_light_jobs,
+            self.multiplier_millis as f64 / 1_000.0,
+            self.source.describe()
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContentionEvidence {
+    Machine,
+    Global,
+    Prior,
+}
+
+impl ContentionEvidence {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Machine => "this machine's curve",
+            Self::Global => "the fleet curve",
+            Self::Prior => "the labeled conservative prior",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContentionFallback {
+    NoMachineCurve,
+    NoGlobalCurve,
+    ProfileLookupFailed,
+}
+
+/// Co-resident work and measured CPU at the instant an execution began.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionLoadContext {
+    pub co_resident_compile_jobs: u32,
+    pub co_resident_light_jobs: u32,
+    /// CPU utilization in thousandths, preserving an integer wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_utilization_millis: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PlacementPolicyEvidence {
     pub profile_name: String,
     pub work_class: PlacementWorkClass,
@@ -164,6 +233,13 @@ pub enum CellCommandClass {
 }
 
 impl CellCommandClass {
+    pub fn is_compile_class(self) -> bool {
+        matches!(
+            self,
+            Self::CargoCheck | Self::CargoTest | Self::CargoClippy | Self::Build
+        )
+    }
+
     pub fn classify(command: &str) -> Self {
         let command = command.to_ascii_lowercase();
         if command.contains("cargo clippy") || command.contains("check:rust") {
@@ -371,7 +447,43 @@ pub struct LearnedResourceEstimate {
 /// Bumped to 36 for CAIRN-3514: measured CPU admission adds policy in the
 /// runner-to-executor direction and publishes the executor's hysteresis verdict
 /// and numeric pressure evidence in the other direction.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 36;
+/// Bumped to 37 for CAIRN-3610: completed executions carry start-time load context.
+///
+/// Bumped to 38 for CAIRN-3626: process batches can carry files that the executor
+/// materializes inside the selected cell before spawning commands.
+///
+/// Bumped to 39 for CAIRN-3635: runtime policy and inventory health carry a
+/// machine-wide idle-cell budget. Older executors enforce only per-project
+/// limits, which cannot bound a machine serving many projects.
+///
+/// Bumped to 40 for CAIRN-3649: categorized storage includes Cairn-managed
+/// caches outside the executor home.
+///
+/// Bumped to 43 for CAIRN-3705 because the conservative protocol guard covers
+/// check execution internals even though failed-verdict reuse and manual retry do
+/// not alter executor wire semantics.
+///
+/// Bumped to 44 for CAIRN-3706: check request and process-item shaping moved into
+/// the guarded physical wire boundary. The move preserves payload semantics but
+/// deliberately requires one executor artifact rollout under the fail-closed policy.
+///
+/// Bumped to 45 for CAIRN-3738: capacity held by a resident process is now named
+/// as held. An executor that reported no command-occupied cell used to leave the
+/// generic evidence installed when the request joined the queue — "queued for
+/// admission evaluation", naming no holder and no position — so a request queued
+/// behind a dev instance waited without being told what held it.
+/// `ExecutorSubstrateEvidence` now fills that silence with the active-cell count
+/// and the request's ranked admission position.
+///
+/// Bumped to 46 for CAIRN-3824: an executor now scrubs registered credentials
+/// out of the output it emits, so the bytes on the wire are no longer verbatim
+/// child output. The per-batch relay capability it injects as `CAIRN_MCP_SECRET`
+/// is registered for the life of the batch, which means an executor at this
+/// version cannot hand a batch's own capability back through that batch's
+/// stdout. An older executor emits the value unredacted; the runner scrubs again
+/// on ingestion, so the pairing is safe in both directions, and the bump exists
+/// because the wire content itself changed, not because a field did.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 46;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -466,7 +578,13 @@ pub struct ExecutorDistributionManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<SidecarArtifact>,
 }
-pub const MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+/// Whole-request budget for managed object downloads and uploads.
+///
+/// A fetch includes runner-side Git pack construction before headers and body
+/// transfer afterward. This must therefore be a transfer-scale bound; treating it
+/// as a short RPC deadline can interrupt the body at the deadline even while the
+/// executor link and HTTP connection remain healthy.
+pub const MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS: u64 = 600;
 pub const EXECUTOR_PROGRESS_FRESHNESS_MS: u64 = 75_000;
 
 /// How often the executor asserts that it is alive, and how often it recomputes
@@ -1209,7 +1327,7 @@ pub struct CellRequest {
     /// Zero from a requester that does not state it, which is read as "now".
     #[serde(default)]
     pub waiting_since_unix_ms: u64,
-    pub timeout_ms: u32,
+    pub timeout_ms: u64,
     pub mutation_policy: MutationPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requesting_job_id: Option<String>,
@@ -1397,8 +1515,19 @@ pub struct CellExecutionMeta {
     /// out of every warmth-keyed profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmth: Option<ExecutionWarmth>,
+    /// The machine load observed immediately before this command started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_context: Option<ExecutionLoadContext>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub environment_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_environment_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2275,6 +2404,42 @@ pub struct QueuedCellRequest {
     pub subscriber_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub substrate_hold: Option<ExecutorSubstrateEvidence>,
+    /// The newest runner-side placement decision for this exact request attempt.
+    /// Executor queue state explains that a request waits; this explains why the
+    /// fleet could not move it somewhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<QueuedPlacementEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedPlacementEvidence {
+    pub decided_at_unix_ms: u64,
+    pub mobility: PlacementMobility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_executor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<QueuedPlacementTarget>,
+    #[serde(default)]
+    pub rejected: Vec<QueuedPlacementRejection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedPlacementTarget {
+    pub executor_name: String,
+    pub executor_id: String,
+    pub available_memory_bytes: Option<u64>,
+    pub free_volume_bytes: Option<u64>,
+    pub reservation: ResourceReservation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedPlacementRejection {
+    pub executor_name: String,
+    pub executor_id: String,
+    pub reason: PlacementRejectionReason,
 }
 
 /// What the live resident processes across the fleet cost. This counts work, not
@@ -2375,6 +2540,12 @@ pub struct CellCompletion {
     pub finished_at_unix_ms: u64,
     pub duration_ms: u64,
     pub verdict: CellCompletionVerdict,
+    /// Tail of output already captured for a failed process batch. Bounded by
+    /// the executor before it enters the fleet snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_output_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_event_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_reservation: Option<ResourceReservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2422,7 +2593,7 @@ pub struct FleetSnapshot {
 /// paths that still exist and went unmeasured — so it alone decides
 /// `DiskAccountingPartial` — while entries that disappeared mid-scan ride along
 /// as the `vanishedEntries` count.
-pub const SUBSTRATE_HEALTH_SCHEMA_VERSION: u32 = 6;
+pub const SUBSTRATE_HEALTH_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -2977,6 +3148,8 @@ pub struct DiskCategoryAccounting {
     #[serde(rename = "liveSlotsBytes")]
     pub live_cells_bytes: u64,
     pub warm_caches_bytes: u64,
+    #[serde(default)]
+    pub external_managed_caches_bytes: u64,
     pub quarantines_bytes: u64,
     pub temporary_other_bytes: u64,
 }
@@ -3030,6 +3203,12 @@ pub struct ExecutorRuntimePolicy {
     /// Idle cells retained per project while the volume is not pressured.
     #[serde(default = "default_idle_retention_ceiling_per_project")]
     pub idle_retention_ceiling_per_project: usize,
+    /// Machine-wide idle-cell budget under measured disk pressure.
+    #[serde(default = "default_idle_retention_floor_total")]
+    pub idle_retention_floor_total: usize,
+    /// Machine-wide idle-cell budget while disk is not pressured.
+    #[serde(default = "default_idle_retention_ceiling_total")]
+    pub idle_retention_ceiling_total: usize,
     /// Free bytes at or below which retention collapses from ceiling to floor.
     #[serde(default = "default_idle_retention_pressure_free_bytes")]
     pub idle_retention_pressure_free_bytes: u64,
@@ -3104,6 +3283,13 @@ pub const IDLE_RETENTION_FLOOR_PER_PROJECT: usize = 1;
 /// bound.
 pub const IDLE_RETENTION_CEILING_PER_PROJECT: usize = 16;
 
+/// Machine-wide idle-cell bounds. Per-project retention protects one project's
+/// locality, but cannot bound a machine serving an unbounded number of projects.
+/// The global ceiling is the hard footprint guard; pressure keeps only the two
+/// warmest free cells on the machine, irrespective of project.
+pub const IDLE_RETENTION_FLOOR_TOTAL: usize = 2;
+pub const IDLE_RETENTION_CEILING_TOTAL: usize = 16;
+
 /// Free bytes on the executor volume at or below which idle retention collapses
 /// to its floor and the coldest cells above it are evicted.
 ///
@@ -3147,6 +3333,14 @@ const fn default_idle_retention_ceiling_per_project() -> usize {
     IDLE_RETENTION_CEILING_PER_PROJECT
 }
 
+const fn default_idle_retention_floor_total() -> usize {
+    IDLE_RETENTION_FLOOR_TOTAL
+}
+
+const fn default_idle_retention_ceiling_total() -> usize {
+    IDLE_RETENTION_CEILING_TOTAL
+}
+
 const fn default_idle_retention_pressure_free_bytes() -> u64 {
     IDLE_RETENTION_PRESSURE_FREE_BYTES
 }
@@ -3161,6 +3355,8 @@ impl Default for ExecutorRuntimePolicy {
             maximum_queue_depth: 512,
             idle_retention_floor_per_project: default_idle_retention_floor_per_project(),
             idle_retention_ceiling_per_project: default_idle_retention_ceiling_per_project(),
+            idle_retention_floor_total: default_idle_retention_floor_total(),
+            idle_retention_ceiling_total: default_idle_retention_ceiling_total(),
             idle_retention_pressure_free_bytes: default_idle_retention_pressure_free_bytes(),
             quarantine_forensic_window_ms: default_quarantine_forensic_window_ms(),
             cpu_admission: CpuAdmissionPolicy::default(),
@@ -3185,6 +3381,16 @@ impl ExecutorRuntimePolicy {
         if self.idle_retention_ceiling_per_project < self.idle_retention_floor_per_project {
             return Err(
                 "executor idle-retention ceiling per project must be at least the floor".into(),
+            );
+        }
+        if self.idle_retention_floor_total == 0 {
+            return Err(
+                "executor machine-wide idle-retention floor must be greater than zero".into(),
+            );
+        }
+        if self.idle_retention_ceiling_total < self.idle_retention_floor_total {
+            return Err(
+                "executor machine-wide idle-retention ceiling must be at least the floor".into(),
             );
         }
         if self.idle_retention_pressure_free_bytes == 0 {
@@ -3493,6 +3699,10 @@ pub enum PlacementReason {
     /// built the same tree, which is precisely backwards for a caller waiting on
     /// the answer.
     PredictedEarliestVerdict,
+    /// An admission-ready executor with no work ahead had no usable duration
+    /// history for this command at this warmth. Spill-eligible work was placed
+    /// there to acquire the observations future earliest-verdict decisions need.
+    BootstrapExploration,
     /// Nothing in the fleet had complete, fresh placement readings, so no
     /// measured comparison was possible and the work stayed on its home
     /// executor. Named explicitly because it is exactly the state that must not
@@ -3507,6 +3717,7 @@ impl PlacementReason {
             Self::ColocatedHome => "colocatedHome",
             Self::OnlyCandidate => "onlyCandidate",
             Self::PredictedEarliestVerdict => "predictedEarliestVerdict",
+            Self::BootstrapExploration => "bootstrapExploration",
             Self::MeasuredBlindFleet => "measuredBlindFleet",
         }
     }
@@ -3640,6 +3851,9 @@ pub enum ReservationFallback {
     BelowConfidenceFloor,
     /// The caller stated its own demand and the resolver did not overrule it.
     CallerDeclared,
+    /// The learned memory peak approached the machine's entire budget, which is
+    /// evidence of host-wide pressure rather than this command's isolated demand.
+    MemoryObservationQuarantined,
 }
 
 impl ReservationFallback {
@@ -3650,6 +3864,7 @@ impl ReservationFallback {
             Self::ProfileLookupFailed => "profileLookupFailed",
             Self::BelowConfidenceFloor => "belowConfidenceFloor",
             Self::CallerDeclared => "callerDeclared",
+            Self::MemoryObservationQuarantined => "memoryObservationQuarantined",
         }
     }
 }
@@ -4031,6 +4246,10 @@ pub struct PlacementPrediction {
     pub preparation: PreparationForecast,
     /// Predicted execution time once started.
     pub run: DurationEstimate,
+    /// Run duration before and after contention is priced.
+    pub base_run_ms: u64,
+    pub adjusted_run_ms: u64,
+    pub contention: ContentionEstimate,
     /// Queue wait plus run duration — the two legs that carry honest time.
     pub predicted_verdict_ms: u64,
     /// What the runner established about this machine's warmth for this work.
@@ -4204,6 +4423,9 @@ pub struct CellInventoryHealth {
     /// between the policy's floor and ceiling as the volume fills and drains.
     #[serde(default)]
     pub idle_retention_budget_per_project: usize,
+    /// Hard machine-wide idle-cell budget currently enforced.
+    #[serde(default)]
+    pub idle_retention_budget_total: usize,
     /// True while measured free space holds retention down at its floor.
     #[serde(default)]
     pub idle_retention_pressured: bool,
@@ -4710,10 +4932,24 @@ pub enum ProcessSandboxMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ProcessBatchFile {
+    /// Environment variable whose value becomes the executor-local materialized path.
+    pub env: String,
+    pub contents: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessBatch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ProcessBatchFile>,
     pub sequential: bool,
     pub stop_on_error: bool,
     pub sandbox_mode: ProcessSandboxMode,
+    /// Legacy wire field from estimate-derived check deadlines. Current runners
+    /// leave it empty because duration estimates have no termination authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeout_bases: Vec<Option<DurationEstimate>>,
     pub items: Vec<ProcessBatchItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_context_id: Option<String>,
@@ -4753,7 +4989,9 @@ pub struct ProcessBatchItem {
     pub env: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
-    pub timeout_ms: u32,
+    /// Elapsed-time kill bound in milliseconds. Zero means unbounded and is used
+    /// by checks, whose duration estimates inform placement but never termination.
+    pub timeout_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_resource_identity: Option<CommandResourceIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4790,6 +5028,14 @@ pub struct ProcessBatchItemOutcome {
     pub tracked_modifications: Option<TrackedModificationEvidence>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub environment_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_environment_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6272,6 +6518,7 @@ mod tests {
             checked_out_count: 2,
             idle_count: 1,
             idle_retention_budget_per_project: 16,
+            idle_retention_budget_total: 16,
             idle_retention_pressured: false,
             excess_idle_count: 0,
             transient_occupancy: 1,
@@ -6344,6 +6591,7 @@ mod tests {
                         managed_objects_bytes: 1,
                         live_cells_bytes: 2,
                         warm_caches_bytes: 3,
+                        external_managed_caches_bytes: 7,
                         quarantines_bytes: 4,
                         temporary_other_bytes: 5,
                     },
@@ -6675,6 +6923,7 @@ mod tests {
                     learned_estimate: Some(learned_estimate.clone()),
                     subscriber_count: 1,
                     substrate_hold: Some(substrate_state.clone()),
+                    placement: None,
                 }],
                 executing_requests: vec![ExecutingCellRequest {
                     command_resource_identity: None,
@@ -6705,10 +6954,13 @@ mod tests {
                     finished_at_unix_ms: 33,
                     duration_ms: 1,
                     verdict: CellCompletionVerdict::Succeeded,
+                    failure_output_tail: None,
+                    transcript_event_uri: None,
                     resource_reservation: Some(reservation.clone()),
                     learned_estimate: Some(learned_estimate),
                     actuals: Some(CellExecutionMeta {
                         warmth: None,
+                        load_context: None,
                         executor_id: "executor-a".into(),
                         executor_device_id: "device".into(),
                         executor_connection_generation: 2,
@@ -6728,6 +6980,10 @@ mod tests {
                             disk_boundary: "cell".into(),
                         }),
                         environment_fingerprint: String::new(),
+                        verdict_platform: None,
+                        verdict_arch: None,
+                        toolchain_fingerprint: None,
+                        verdict_environment_hash: None,
                     }),
                     cached: false,
                     subscriber_count: 1,
@@ -7750,6 +8006,7 @@ mod tests {
             timed_out: false,
             metadata: CellExecutionMeta {
                 warmth: None,
+                load_context: None,
                 executor_id: "e".into(),
                 executor_device_id: "d".into(),
                 executor_connection_generation: 1,
@@ -7763,6 +8020,10 @@ mod tests {
                 disk_delta_bytes: None,
                 measurement_quality: None,
                 environment_fingerprint: String::new(),
+                verdict_platform: None,
+                verdict_arch: None,
+                toolchain_fingerprint: None,
+                verdict_environment_hash: None,
             },
             mutation_delta: Some(Box::new(MutationDelta {
                 base_commit: "b".into(),
@@ -7813,5 +8074,22 @@ mod tests {
         let output_value = serde_json::to_value(output).unwrap();
         assert_eq!(output_value["event"], "output");
         assert_eq!(output_value["stream"], "stderr");
+    }
+
+    #[test]
+    fn legacy_cell_execution_meta_decodes_without_execution_facts() {
+        let meta: CellExecutionMeta = serde_json::from_value(serde_json::json!({
+            "slotId": "cell-1",
+            "cellEpoch": 2,
+            "startedAtUnixMs": 3,
+            "finishedAtUnixMs": 4
+        }))
+        .unwrap();
+
+        assert_eq!(meta.cell_id, "cell-1");
+        assert_eq!(meta.verdict_platform, None);
+        assert_eq!(meta.verdict_arch, None);
+        assert_eq!(meta.toolchain_fingerprint, None);
+        assert_eq!(meta.verdict_environment_hash, None);
     }
 }

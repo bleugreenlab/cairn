@@ -6,7 +6,6 @@
 //! enriched `=== uri [suffix] ===` header and an always-valid continue footer.
 
 pub mod batch;
-pub(crate) mod durable_images;
 pub mod file;
 pub(crate) mod object_read;
 pub(crate) mod overlay;

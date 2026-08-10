@@ -27,7 +27,8 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "m
 tantivy = "0.26.1"
 # Embedded Turso — the local DB engine. Copied verbatim from cairn-core's pin;
 # core keeps its own turso dep until step 5 re-points its remaining callers here.
-turso = { git = "https://github.com/tursodatabase/turso", rev = "496c24ed85d2a7cf4963f12537e3c539144765a7", default-features = false, features = ["sync"] }
+# Must stay identical to src-tauri/Cargo.toml (CAIRN-2147 ABI invariant).
+turso = { git = "https://github.com/tursodatabase/turso", rev = "964faddd16b20ed7d5c090a879a138dbabeee508", default-features = false, features = ["sync"] }
 # Direct rustls handle so `LocalDb::ensure_crypto_provider` can install a
 # process-wide default `CryptoProvider` before turso's sync TLS client is built.
 # See the doc comment on `ensure_crypto_provider` in storage/local_db.rs.

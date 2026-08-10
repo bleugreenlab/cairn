@@ -13,8 +13,8 @@ use super::common::{
 };
 use super::transcript::{
     format_raw_transcript, format_transcript_digest_with, get_nth_run_id, get_single_event,
-    load_job_events_ordered, load_turn_events, parse_raw_transcript_format, DigestMeta,
-    DigestOptions, RawTranscriptFormat,
+    load_job_events_ordered, load_turn_events, parse_raw_transcript_format, DigestCoordinate,
+    DigestMeta, DigestOptions, RawTranscriptFormat,
 };
 
 use crate::storage::{LocalDb, RowExt};
@@ -26,12 +26,54 @@ use cairn_common::uri::{
     build_task_checks_uri, build_task_permission_uri,
 };
 
-/// Resolve the job id a node- or task-scoped URI addresses.
+/// Resolve the job id a node- or task-scoped URI addresses, read-only.
 ///
 /// `task_name: None` resolves a node job; `Some` resolves a sub-agent task job.
-/// The one resolver every node-scoped surface shares -- todos, progress,
+/// The one resolver every node-scoped READ surface shares -- todos, progress,
 /// artifacts, memories, messages, wakes, checks -- so a URI names the same job
 /// whichever collection hangs off it.
+///
+/// A thread that has never run resolves to nothing here, reported as the
+/// degradation that points at its overview. Minting the session job is a write,
+/// and belongs to [`resolve_node_or_task_job_id`] alone: a read must never
+/// bring into existence the thing it was asked to look at.
+pub(crate) async fn resolve_node_or_task_job_id_for_read(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: Option<&str>,
+) -> Result<String, String> {
+    crate::jobs::queries::job_id_for_node_coordinate(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| match task_name {
+        Some(task_name) => match cairn_common::uri::NodeAddress::new(number, exec_seq, node_name) {
+            cairn_common::uri::NodeAddress::Thread { name } => {
+                format!("Task '{task_name}' not found under thread '{name}'")
+            }
+            cairn_common::uri::NodeAddress::Node { .. } => {
+                format!("Task '{task_name}' not found under node '{node_name}'")
+            }
+        },
+        None => super::common::node_job_not_found_message(project_key, number, exec_seq, node_name),
+    })
+}
+
+/// Resolve the job id a node- or task-scoped URI addresses, for a WRITE.
+///
+/// Identical to [`resolve_node_or_task_job_id_for_read`] but for one asymmetry:
+/// writing to a thread's own resource mints its session job when the thread has
+/// never run, because that write IS the thread starting. Everything else --
+/// including every task coordinate -- resolves read-only.
 pub(crate) async fn resolve_node_or_task_job_id(
     db: &LocalDb,
     project_key: &str,
@@ -40,19 +82,37 @@ pub(crate) async fn resolve_node_or_task_job_id(
     node_name: &str,
     task_name: Option<&str>,
 ) -> Result<String, String> {
-    match task_name {
-        None => {
-            let (_, job) =
-                connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await?;
-            Ok(job.id)
-        }
-        Some(task_name) => {
-            let (_, _parent_job, task_job) =
-                connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-                    .await?;
-            Ok(task_job.id)
-        }
+    if let (cairn_common::uri::NodeAddress::Thread { name }, None) = (
+        cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
+        task_name,
+    ) {
+        let (project_key, name) = (project_key.to_string(), name.to_string());
+        return db
+            .write(move |conn| {
+                let project_key = project_key.clone();
+                let name = name.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2 LIMIT 1",
+                            cairn_db::turso::params![project_key.to_uppercase(), name.as_str()],
+                        )
+                        .await?;
+                    let thread_id = rows
+                        .next()
+                        .await?
+                        .map(|row| row.get::<String>(0))
+                        .transpose()?
+                        .ok_or_else(|| crate::storage::DbError::Row(format!("Thread '{name}' not found")))?;
+                    drop(rows);
+                    crate::threads::ensure_thread_session_conn(conn, &thread_id, None).await
+                })
+            })
+            .await
+            .map_err(|error| error.to_string());
     }
+    resolve_node_or_task_job_id_for_read(db, project_key, number, exec_seq, node_name, task_name)
+        .await
 }
 
 fn job_status_icon(status: &str) -> &'static str {
@@ -263,13 +323,19 @@ pub(super) async fn read_job_todos(
     node_name: &str,
     task_name: Option<&str>,
 ) -> String {
-    let job_id =
-        match resolve_node_or_task_job_id(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(job_id) => job_id,
-            Err(error) => return error,
-        };
+    let job_id = match resolve_node_or_task_job_id_for_read(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => return error,
+    };
 
     let todos = match crate::todos::get_todos_for_job(db, &job_id).await {
         Ok(todos) => todos,
@@ -286,19 +352,36 @@ pub(super) async fn read_node_wakes(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
-    let job_id =
-        match resolve_node_or_task_job_id(db, project_key, number, exec_seq, node_name, None).await
-        {
-            Ok(job_id) => job_id,
-            Err(error) => return error,
-        };
+    let job_id = match resolve_node_or_task_job_id_for_read(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        None,
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => return error,
+    };
+    render_job_wakes(
+        db,
+        node_name,
+        &build_node_wakes_uri(project_key, number, exec_seq, node_name),
+        &job_id,
+    )
+    .await
+}
+
+pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_id: &str) -> String {
     let subscriptions =
-        match crate::orchestrator::wakes::list_subscriptions_for_job(db, &job_id).await {
+        match crate::orchestrator::wakes::list_subscriptions_for_job(db, job_id).await {
             Ok(subscriptions) => subscriptions,
             Err(error) => return error,
         };
     let pending =
-        match crate::orchestrator::wakes::peek_pending_suppressed_for_job(db, &job_id).await {
+        match crate::orchestrator::wakes::peek_pending_suppressed_for_job(db, job_id).await {
             Ok(pending) => pending,
             Err(error) => return error,
         };
@@ -306,12 +389,11 @@ pub(super) async fn read_node_wakes(
     // attention is routed by deriving the parent issue's current driver at wake
     // time (CAIRN-3293), so this section is the only place the watch is visible.
     let coordinated =
-        match crate::orchestrator::wakes::coordinated_child_issue_uris_for_job(db, &job_id).await {
+        match crate::orchestrator::wakes::coordinated_child_issue_uris_for_job(db, job_id).await {
             Ok(coordinated) => coordinated,
             Err(error) => return error,
         };
-    let uri = build_node_wakes_uri(project_key, number, exec_seq, node_name);
-    let mut out = format!("# Wakes — {node_name}\n\n`{uri}`\n\n");
+    let mut out = format!("# Wakes — {label}\n\n`{uri}`\n\n");
     if subscriptions.is_empty() {
         out.push_str("No wake subscriptions.\n");
     } else {
@@ -1421,8 +1503,7 @@ pub(super) async fn read_node_chat(
     let meta = DigestMeta {
         label: node_name,
         project: project_key,
-        number,
-        exec_seq,
+        coordinate: DigestCoordinate::Issue { number, exec_seq },
         status: &job.status,
     };
     render_job_chat_digest(
@@ -1494,8 +1575,7 @@ pub(crate) async fn render_reseed_digest(db: &LocalDb, job: &crate::db_records::
     let meta = DigestMeta {
         label,
         project: &job.project_id,
-        number: 0,
-        exec_seq: 0,
+        coordinate: DigestCoordinate::Unaddressed,
         status: &job.status,
     };
     render_job_chat_digest(
@@ -1533,9 +1613,18 @@ pub(super) async fn read_node_chat_raw(
             Err(error) => return error,
         };
 
+    render_job_chat_raw(db, &conn, &job.id, format).await
+}
+
+pub(super) async fn render_job_chat_raw(
+    db: &LocalDb,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    format: RawTranscriptFormat,
+) -> String {
     let event_rows = load_job_events_ordered(
-        &conn,
-        &job.id,
+        conn,
+        job_id,
         db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
     )
@@ -1570,6 +1659,16 @@ pub(super) async fn read_node_chat_turn(
             Err(error) => return error,
         };
 
+    render_job_chat_turn(db, &conn, &job.id, node_name, turn_seq).await
+}
+
+pub(super) async fn render_job_chat_turn(
+    db: &LocalDb,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    label: &str,
+    turn_seq: i32,
+) -> String {
     // Get session_id from the job's first run
     let session_id: Option<String> = match conn
         .query(
@@ -1580,7 +1679,7 @@ pub(super) async fn read_node_chat_turn(
             ORDER BY created_at ASC
             LIMIT 1
             ",
-            (job.id.as_str(),),
+            (job_id,),
         )
         .await
     {
@@ -1619,24 +1718,14 @@ pub(super) async fn read_node_chat_turn(
             .and_then(|row| row.text(0).ok())
         {
             Some(id) => id,
-            None => {
-                return format!(
-                    "Turn {} not found for node '{}' in issue {}-{}",
-                    turn_seq, node_name, project_key, number
-                )
-            }
+            None => return format!("Turn {} not found for node '{}'", turn_seq, label),
         },
-        Err(_) => {
-            return format!(
-                "Turn {} not found for node '{}' in issue {}-{}",
-                turn_seq, node_name, project_key, number
-            )
-        }
+        Err(_) => return format!("Turn {} not found for node '{}'", turn_seq, label),
     };
 
     // Load events for this turn
     let event_rows = load_turn_events(
-        &conn,
+        conn,
         &turn_id,
         db.team_id().map(|_| db.content_store().as_ref()),
         db.private_route_db().map(|db| db.as_ref()),
@@ -1644,10 +1733,7 @@ pub(super) async fn read_node_chat_turn(
     .await;
 
     if event_rows.is_empty() {
-        return format!(
-            "No events found for turn {} in node '{}' of issue {}-{}",
-            turn_seq, node_name, project_key, number
-        );
+        return format!("No events found for turn {} in node '{}'", turn_seq, label);
     }
 
     // Format as full transcript (no truncation for focused turn slices)
@@ -1830,13 +1916,33 @@ pub(super) async fn artifact_affordance_block(
     kind: cairn_common::contract::ResourceKind,
 ) -> Option<String> {
     let db = orch.db.for_project(project_key).await;
-    let job_id =
-        resolve_node_or_task_job_id(&db, project_key, number, exec_seq, node_name, task_name)
-            .await
-            .ok()?;
+    let job_id = resolve_node_or_task_job_id_for_read(
+        &db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+    )
+    .await
+    .ok()?;
+    job_artifact_affordance_block(orch, &job_id, task_name, artifact_name, kind).await
+}
+
+/// [`artifact_affordance_block`] for a job that is already resolved — a thread's
+/// session job, which is addressed by thread name rather than by node
+/// coordinates. Same contract, same schema, so the arc advertises on read what
+/// it enforces on write.
+pub(super) async fn job_artifact_affordance_block(
+    orch: &crate::orchestrator::Orchestrator,
+    job_id: &str,
+    task_name: Option<&str>,
+    artifact_name: Option<&str>,
+    kind: cairn_common::contract::ResourceKind,
+) -> Option<String> {
     let contract = crate::mcp::handlers::comments_artifacts::resolve_artifact_contract(
         orch,
-        &job_id,
+        job_id,
         task_name,
         artifact_name,
     )
@@ -2048,8 +2154,7 @@ pub(super) async fn read_task_chat(
     let meta = DigestMeta {
         label: task_name,
         project: project_key,
-        number,
-        exec_seq,
+        coordinate: DigestCoordinate::Issue { number, exec_seq },
         status: &task_job.status,
     };
     format_transcript_digest_with(
@@ -2372,15 +2477,26 @@ pub(super) async fn read_node_chat_event(
             Err(error) => return error,
         };
 
+    render_job_chat_event(db, &conn, &job.id, node_name, run_seq, event_seq).await
+}
+
+pub(super) async fn render_job_chat_event(
+    db: &LocalDb,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    label: &str,
+    run_seq: i32,
+    event_seq: i32,
+) -> String {
     // Get the Nth run (1-indexed run_seq)
-    let run_id = match get_nth_run_id(&conn, &job.id, run_seq).await {
+    let run_id = match get_nth_run_id(conn, job_id, run_seq).await {
         Some(id) => id,
-        None => return format!("Run {} not found for node '{}'", run_seq, node_name),
+        None => return format!("Run {} not found for node '{}'", run_seq, label),
     };
 
     // Get the specific event
     get_single_event(
-        &conn,
+        conn,
         &run_id,
         event_seq,
         db.team_id().map(|_| db.content_store().as_ref()),

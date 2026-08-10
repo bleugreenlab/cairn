@@ -48,16 +48,18 @@ fn get_selected_recipe(
     }
     Ok(file_recipe.recipe)
 }
+use crate::config::model_routing::IssueLabels;
 use crate::config::presets::{
     available_selections, load_effective_presets, resolve_agent_snapshot,
     resolve_selection_with_provenance, LaunchSelectionOverride, PresetsConfig, ResolutionSource,
 };
 use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
+use crate::execution::model_routing::LaunchSelectionPlan;
 use crate::execution::Initiator;
 use crate::models::{
-    BranchTarget, Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, Model, ModelSelection,
-    RecipeNode, RecipeNodeType, RecipeSnapshot, RuntimeExtras, SkillSnapshot, SnapshotOverrides,
-    TriggerContext, TriggerType,
+    BranchTarget, Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, LaunchCustomization,
+    Model, ModelRoutingDecision, ModelSelection, RecipeNode, RecipeNodeType, RecipeSnapshot,
+    RuntimeExtras, SkillSnapshot, TriggerContext, TriggerType,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -96,6 +98,7 @@ pub(crate) fn start_recipe_execution_and_advance(
     backend: Option<&str>,
     initiated_via: Option<&str>,
     branch_target: Option<BranchTarget>,
+    customization: Option<LaunchCustomization>,
     trigger_type: TriggerType,
 ) -> Result<Execution, String> {
     let execution = start_recipe_execution_impl(
@@ -103,7 +106,7 @@ pub(crate) fn start_recipe_execution_and_advance(
         issue_id,
         recipe_id,
         project_id,
-        None,
+        customization,
         backend,
         None,
         initiated_via,
@@ -129,7 +132,10 @@ pub(crate) fn start_recipe_execution_and_advance(
 /// at the current point in time. Caller is responsible for creating jobs
 /// (`create_jobs_for_execution`) and advancing the DAG.
 ///
-/// Optional `overrides` can customize the recipe graph and agents before execution starts.
+/// Optional `customization` adjusts the graph and agents before the snapshot is
+/// frozen: a composer's finished graph, or an agent caller's delta compiled
+/// against the resolved recipe. Both arrive here as one [`SnapshotOverrides`]
+/// and take the same application path below.
 ///
 /// `initiated_via` stamps attribution on the snapshot's trigger context
 /// (`Some("external")` for an authenticated external/CLI caller, `None` for the
@@ -145,7 +151,7 @@ pub fn start_recipe_execution_impl(
     issue_id: &str,
     recipe_id: Option<&str>,
     project_id: &str,
-    overrides: Option<SnapshotOverrides>,
+    customization: Option<LaunchCustomization>,
     backend: Option<&str>,
     initiator: Option<Initiator>,
     initiated_via: Option<&str>,
@@ -166,25 +172,6 @@ pub fn start_recipe_execution_impl(
     // there, not in the private DB. The id-keyed resolvers cannot be used yet —
     // the execution row does not exist — so resolve by project id.
     let db = resolve_owning_db_for_project(orch, project_id)?;
-
-    // A thread owns no branch and never opens a pull request. Whether an
-    // execution would violate that is a property of the graph that runs, not of
-    // the issue, so the kind is resolved here while the refusal waits until the
-    // branch target has been applied below — a recipe resolved to `base` mints no
-    // branch and has had its `pr` nodes pruned, which is exactly a thread's
-    // posture. This is the one door every start comes through (the desktop
-    // command, an executions-collection append, create-and-start, and the
-    // scheduler), so refusing here holds for all of them, and it refuses before
-    // any execution row is written.
-    let issue_identity = {
-        let db = db.clone();
-        let issue_id = issue_id.to_string();
-        run_recipe_db(async move {
-            crate::issues::crud::identity(&db, &issue_id)
-                .await
-                .map_err(|error| format!("Failed to resolve issue kind: {error}"))
-        })?
-    };
 
     // CAIRN-2629: if a PEER device was chosen as the runner, enforce that it has a
     // local clone of this project before stamping ownership on it — otherwise its
@@ -219,10 +206,30 @@ pub fn start_recipe_execution_impl(
         None => return Err("No recipe specified for execution".to_string()),
     };
 
-    // Build execution snapshot. An execution-wide backend override (external
-    // driver / quickstart) becomes a per-agent Backend override applied at
-    // resolve-early time; the snapshot then stores fully concrete selections.
-    let override_sel = backend.map(|b| LaunchSelectionOverride::Backend(b.to_string()));
+    let effective_presets = load_effective_presets(&orch.config_dir, Some(&project_path));
+
+    // The per-agent resolution plan for this launch, built once and consulted by
+    // every resolve_agent_snapshot call below. It carries three inputs: the
+    // execution-wide backend override (external driver / quickstart), the
+    // project's label bindings applied to this issue's labels, and the agents a
+    // human already chose a model for. Computing the pinned set here, before the
+    // customization is consumed, is what keeps "an explicit choice wins" a single
+    // decision rather than a property of the order later layers apply in.
+    let pinned = customization
+        .as_ref()
+        .map(LaunchCustomization::pinned_agent_ids)
+        .unwrap_or_default();
+    let plan = plan_for_launch(
+        &db,
+        &project_path,
+        Some(issue_id),
+        backend,
+        pinned,
+        &effective_presets,
+    )?;
+
+    // Build execution snapshot. Resolution is early: the snapshot stores fully
+    // concrete per-agent selections rather than the inputs they came from.
     let mut snapshot = build_execution_snapshot_from_files(
         &orch.config_dir,
         Some(&project_path),
@@ -231,10 +238,38 @@ pub fn start_recipe_execution_impl(
         project_id,
         trigger_type.clone(),
         None,
-        override_sel.as_ref(),
+        &plan,
     )?;
     snapshot.trigger_context.initiated_via = initiated_via.map(str::to_string);
-    let effective_presets = load_effective_presets(&orch.config_dir, Some(&project_path));
+
+    // A delta is compiled against the recipe as it just resolved, into exactly
+    // the overrides the composer would have sent. Everything below this line
+    // sees one grammar and cannot tell which door the launch came through.
+    let overrides = match customization {
+        None => None,
+        Some(LaunchCustomization::Snapshot(overrides)) => Some(overrides),
+        Some(LaunchCustomization::Deltas(deltas)) => {
+            let resolve_agent =
+                |agent_id: &str| -> Result<Option<crate::models::AgentSnapshot>, String> {
+                    match config_agents::get_agent(&orch.config_dir, agent_id, Some(&project_path))
+                    {
+                        Ok(Some(file_agent)) => {
+                            let routing = plan
+                                .for_agent(agent_id, file_agent.tier.as_ref().map(Model::as_str));
+                            resolve_agent_snapshot(
+                                &file_agent,
+                                routing.selection.as_ref(),
+                                &effective_presets,
+                            )
+                            .map(Some)
+                        }
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(format!("Failed to load agent '{agent_id}': {error}")),
+                    }
+                };
+            Some(deltas.compile(&snapshot, &resolve_agent)?)
+        }
+    };
 
     // Apply overrides if provided
     if let Some(overrides) = overrides {
@@ -249,6 +284,8 @@ pub fn start_recipe_execution_impl(
                 let normalized = if agent_snapshot.selection.is_some() {
                     agent_snapshot
                 } else {
+                    let authored = agent_snapshot.tier.clone();
+                    let routing = plan.for_agent(&agent_id, authored.as_ref().map(Model::as_str));
                     resolve_agent_snapshot(
                         &crate::config::agents::FileAgent {
                             id: agent_snapshot.id.clone(),
@@ -269,7 +306,7 @@ pub fn start_recipe_execution_impl(
                             is_project_scoped: true,
                             file_path: std::path::PathBuf::new(),
                         },
-                        override_sel.as_ref(),
+                        routing.selection.as_ref(),
                         &effective_presets,
                     )?
                 };
@@ -297,9 +334,11 @@ pub fn start_recipe_execution_impl(
                 if let Ok(Some(file_agent)) =
                     config_agents::get_agent(&orch.config_dir, &agent_id, Some(&project_path))
                 {
+                    let routing =
+                        plan.for_agent(&agent_id, file_agent.tier.as_ref().map(Model::as_str));
                     let agent_snapshot = resolve_agent_snapshot(
                         &file_agent,
-                        override_sel.as_ref(),
+                        routing.selection.as_ref(),
                         &effective_presets,
                     )?;
                     snapshot.agents.insert(agent_id.clone(), agent_snapshot);
@@ -316,20 +355,10 @@ pub fn start_recipe_execution_impl(
         &recipe.branch_targets,
     )?;
 
-    // Now that the graph is resolved, a thread can be asked the only question
-    // that matters: would THIS execution mint a branch or open a pull request?
-    if let Some(identity) = issue_identity {
-        if identity.kind == crate::models::IssueKind::Thread {
-            if let Some(reason) =
-                crate::execution::branch_target::thread_incompatibility(&snapshot.recipe.nodes)
-            {
-                return Err(format!(
-                    "Refusing to start an execution on {}-{}: it is a thread and {reason}. A thread owns no branch and never opens a pull request. Start it with a recipe that runs on the base branch and ships no PR, or put branch-bearing work in a child issue of this thread — the child carries its own execution and merges to the project's base branch.",
-                    identity.project_key, identity.number
-                ));
-            }
-        }
-    }
+    // Freeze why every agent got the model it got, against the agent map the
+    // execution will actually run.
+    plan.record_frozen(&snapshot.agents, &effective_presets);
+    snapshot.model_routing = Some(plan.into_provenance());
 
     let snapshot_json = snapshot.to_json()?;
 
@@ -371,76 +400,6 @@ pub fn start_recipe_execution_impl(
     })
 }
 
-/// Why the recipe a create-and-start names could not run on a thread, or `None`
-/// when it could.
-///
-/// The create door has to answer BEFORE the issue row exists, so a create that
-/// cannot start leaves no half-made thread behind. It resolves the recipe
-/// through the same lookup the start itself uses and then asks the shared rule,
-/// so the two doors cannot drift apart.
-///
-/// It answers fail-closed: `Some(reason)` — a refusal — unless it can positively
-/// show the execution would be branchless. A recipe that is not named, a project
-/// that does not resolve, and a recipe that does not resolve are all refusals,
-/// because create-and-start is not one transaction and a start that fails after
-/// the insert strands the thread. A resolution failure still carries the
-/// resolver's own error text, so an unknown recipe id reads as an unknown recipe
-/// id rather than as something about threads.
-pub async fn thread_recipe_refusal(
-    orch: &Orchestrator,
-    project_key: &str,
-    recipe_id: Option<&str>,
-) -> Option<String> {
-    // FAIL CLOSED. Create-and-start is "create then start", not one
-    // transaction: once the insert happens, a start that fails leaves the thread
-    // behind. So this door refuses unless it can positively show the execution
-    // would be branchless — "we could not tell" is a refusal, not permission.
-    // Each unprovable case says which one it was, so the caller is not sent
-    // after the wrong bug.
-    let Some(recipe_id) = recipe_id else {
-        return Some(
-            "it names no recipe, so the execution that would run cannot be shown to be branchless"
-                .to_string(),
-        );
-    };
-    let db = orch.db.for_project(project_key).await;
-    let key = project_key.to_uppercase();
-    let project_id = db
-        .read(move |conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query("SELECT id FROM projects WHERE key = ?1 LIMIT 1", (key,))
-                    .await?;
-                Ok(match rows.next().await? {
-                    Some(row) => row.get::<String>(0).ok(),
-                    None => None,
-                })
-            })
-        })
-        .await
-        .ok()
-        .flatten();
-    let Some(project_id) = project_id else {
-        return Some(format!("project {project_key} could not be resolved"));
-    };
-    let Ok(Some(repo_path)) = project_repo_path(&db, &project_id).await else {
-        return Some(format!("project {project_key} has no resolvable checkout"));
-    };
-    // The recipe's own resolution error is carried verbatim rather than being
-    // flattened into a thread refusal: an unknown recipe id is an unknown recipe
-    // id whatever kind of issue named it.
-    let recipe = match get_selected_recipe(
-        &orch.config_dir,
-        std::path::Path::new(&repo_path),
-        &project_id,
-        recipe_id,
-    ) {
-        Ok(recipe) => recipe,
-        Err(error) => return Some(format!("its recipe could not be resolved — {error}")),
-    };
-    crate::execution::branch_target::recipe_thread_incompatibility(&recipe).map(ToString::to_string)
-}
-
 /// Start executing a recipe manually (no issue, just project).
 ///
 /// Creates an execution record for a manual trigger. Caller is responsible for
@@ -471,7 +430,8 @@ pub fn start_manual_execution_impl(
         project_id,
         TriggerType::Manual,
         None,
-        None,
+        // No issue means no labels, so nothing to route from.
+        &LaunchSelectionPlan::empty(None),
     )?;
     crate::execution::branch_target::apply_branch_target(
         &mut snapshot,
@@ -537,9 +497,19 @@ pub(crate) fn start_event_triggered_execution(
 
     let db = resolve_owning_db_for_project(orch, project_id)?;
 
-    // Build execution snapshot with event payload
+    // Build execution snapshot with event payload. An event-triggered launch is
+    // still a launch: when it carries an issue, that issue's labels route it.
     let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
-    let snapshot = build_execution_snapshot_from_files(
+    let effective_presets = load_effective_presets(&orch.config_dir, Some(&project_path));
+    let plan = plan_for_launch(
+        &db,
+        &project_path,
+        issue_id,
+        None,
+        std::collections::HashSet::new(),
+        &effective_presets,
+    )?;
+    let mut snapshot = build_execution_snapshot_from_files(
         &orch.config_dir,
         Some(&project_path),
         &recipe.id,
@@ -547,8 +517,10 @@ pub(crate) fn start_event_triggered_execution(
         project_id,
         trigger_type,
         Some(event_payload),
-        None,
+        &plan,
     )?;
+    plan.record_frozen(&snapshot.agents, &effective_presets);
+    snapshot.model_routing = Some(plan.into_provenance());
     let snapshot_json = snapshot.to_json()?;
 
     // Calculate next seq if issue-scoped
@@ -654,6 +626,11 @@ pub struct ResolvedAgentRow {
     /// Atomic options for the dropdown (each a backend+model pair). MAY ship
     /// empty now and be filled in the composer follow-up.
     available: Vec<ModelSelection>,
+    /// Why this row resolved the way it did, when the launching issue's labels
+    /// had a say. Present on every routed row so the operator can see the reason
+    /// before pressing Start rather than discover it afterwards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing: Option<ModelRoutingDecision>,
 }
 
 /// Per-node launch overrides, keyed by node id — one selection knob per node.
@@ -676,10 +653,11 @@ pub fn resolve_recipe_launch(
     orch: &Orchestrator,
     recipe_id: &str,
     project_id: &str,
+    issue_id: Option<&str>,
     overrides: Option<LaunchOverrides>,
 ) -> Result<LaunchPlan, String> {
     let db = resolve_owning_db_for_project(orch, project_id)?;
-    let project_path = project_path_for_recipe(db, project_id.to_string())?;
+    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
     let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
     let presets = load_effective_presets(&orch.config_dir, Some(&project_path));
     let overrides = overrides.unwrap_or_default();
@@ -696,11 +674,29 @@ pub fn resolve_recipe_launch(
         edges: recipe.edges.clone(),
     });
 
+    // The preview applies the same plan the start path will. Nothing is pinned
+    // yet -- the composer's pin is the operator confirming what this shows them,
+    // which is only a meaningful confirmation if they saw the routed model here.
+    let plan = plan_for_launch(
+        &db,
+        &project_path,
+        issue_id,
+        None,
+        std::collections::HashSet::new(),
+        &presets,
+    )?;
+
     let config_dir = orch.config_dir.clone();
-    let nodes = resolve_launch_nodes(&recipe_snapshot.nodes, &presets, &overrides, |agent_id| {
-        config_agents::get_agent(&config_dir, agent_id, Some(&project_path))
-            .map_err(|e| e.to_string())
-    });
+    let nodes = resolve_launch_nodes(
+        &recipe_snapshot.nodes,
+        &presets,
+        &overrides,
+        &plan,
+        |agent_id| {
+            config_agents::get_agent(&config_dir, agent_id, Some(&project_path))
+                .map_err(|e| e.to_string())
+        },
+    );
 
     Ok(LaunchPlan {
         recipe: recipe_snapshot,
@@ -716,6 +712,7 @@ fn resolve_launch_nodes(
     recipe_nodes: &[RecipeNode],
     presets: &PresetsConfig,
     overrides: &LaunchOverrides,
+    plan: &LaunchSelectionPlan,
     load_agent: impl Fn(&str) -> Result<Option<config_agents::FileAgent>, String>,
 ) -> Vec<ResolvedLaunchNode> {
     let global = available_selections(presets);
@@ -773,7 +770,17 @@ fn resolve_launch_nodes(
             }
         };
 
-        let resolved = match overrides.nodes.get(&node.id) {
+        // A per-node override in the preview payload is an explicit choice and
+        // is never contested; every other row asks the plan.
+        let node_override = overrides.nodes.get(&node.id);
+        let routing = match node_override {
+            Some(_) => None,
+            None => Some(plan.for_agent(&agent_id, file_agent.tier.as_ref().map(Model::as_str))),
+        };
+        let effective =
+            node_override.or_else(|| routing.as_ref().and_then(|r| r.selection.as_ref()));
+
+        let resolved = match effective {
             Some(LaunchSelectionOverride::Concrete(selection)) => {
                 Ok(crate::config::presets::ResolvedSelection {
                     selection: selection.clone(),
@@ -811,6 +818,7 @@ fn resolve_launch_nodes(
                         fence: file_agent.fence,
                         source: r.source,
                         available: available.clone(),
+                        routing: routing.as_ref().map(|r| r.decision.clone()),
                     }),
                     None,
                     available,
@@ -830,6 +838,46 @@ fn resolve_launch_nodes(
         });
     }
     nodes
+}
+
+/// Build the per-agent resolution plan for one launch.
+///
+/// A launch with no issue has no labels, so it gets an empty plan whose behavior
+/// is exactly what it was before routing existed. A launch with an issue reads
+/// that issue's labels and the project's binding table -- and a malformed table
+/// refuses the launch here, before an execution row exists, rather than
+/// degrading into "everything resolves to its default" in silence.
+fn plan_for_launch(
+    db: &Arc<LocalDb>,
+    project_path: &Path,
+    issue_id: Option<&str>,
+    backend: Option<&str>,
+    pinned: std::collections::HashSet<String>,
+    presets: &PresetsConfig,
+) -> Result<LaunchSelectionPlan, String> {
+    let backend = backend.map(str::to_string);
+    let Some(issue_id) = issue_id else {
+        return Ok(LaunchSelectionPlan::empty(backend));
+    };
+    let table = crate::config::model_routing::load_model_routing(project_path)?;
+    let labels = issue_labels_for_launch(db.clone(), issue_id.to_string())?;
+    Ok(LaunchSelectionPlan::new(
+        backend, table, labels, pinned, presets,
+    ))
+}
+
+fn issue_labels_for_launch(db: Arc<LocalDb>, issue_id: String) -> Result<IssueLabels, String> {
+    run_recipe_db(async move {
+        db.read(|conn| {
+            let issue_id = issue_id.clone();
+            Box::pin(
+                async move { crate::labels::attach::list_labels_for_issue(conn, &issue_id).await },
+            )
+        })
+        .await
+        .map_err(|e| format!("Failed to read issue labels for model routing: {e}"))
+    })
+    .map(|labels| IssueLabels::new(labels.into_iter().map(|label| (label.id, label.name))))
 }
 
 fn project_path_for_recipe(
@@ -973,7 +1021,12 @@ where
             .block_on(future)
     })
     .join()
-    .map_err(|_| "Recipe database task panicked".to_string())?
+    .map_err(|payload| {
+        format!(
+            "Recipe database task panicked: {}",
+            crate::storage::panic_message(&*payload)
+        )
+    })?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -985,7 +1038,7 @@ fn build_execution_snapshot_from_files(
     project_id: &str,
     trigger_type: TriggerType,
     event_payload: Option<serde_json::Value>,
-    override_sel: Option<&LaunchSelectionOverride>,
+    plan: &LaunchSelectionPlan,
 ) -> Result<ExecutionSnapshot, String> {
     let recipe = get_recipe_from_files(config_dir, project_path, recipe_id)?;
     let recipe_snapshot = RecipeSnapshot {
@@ -1018,7 +1071,9 @@ fn build_execution_snapshot_from_files(
                     .entry(skill_id.clone())
                     .or_insert_with(|| skill_snapshot.clone());
             }
-            let snapshot = resolve_agent_snapshot(&file_agent, override_sel, &presets)?;
+            let routing = plan.for_agent(&agent_id, file_agent.tier.as_ref().map(Model::as_str));
+            let snapshot =
+                resolve_agent_snapshot(&file_agent, routing.selection.as_ref(), &presets)?;
             agents.insert(agent_id, snapshot);
         }
     }
@@ -1091,6 +1146,11 @@ mod tests {
         }
     }
 
+    /// A plan that routes nothing, for the rows these tests are about.
+    fn plan() -> LaunchSelectionPlan {
+        LaunchSelectionPlan::empty(None)
+    }
+
     fn file_agent(id: &str, tier: Option<&str>) -> config_agents::FileAgent {
         config_agents::FileAgent {
             id: id.to_string(),
@@ -1116,7 +1176,7 @@ mod tests {
         let presets = default_presets_config(Some(31999));
         let nodes = [agent_node("n1", "builder")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, |_id| {
+        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
             Ok(Some(file_agent("builder", Some("md"))))
         });
         assert_eq!(out.len(), 1);
@@ -1137,7 +1197,7 @@ mod tests {
         let presets = default_presets_config(Some(31999));
         let nodes = [agent_node("n1", "weird")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, |_id| {
+        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
             Ok(Some(file_agent("weird", Some("xl"))))
         });
         let row = &out[0];
@@ -1160,7 +1220,7 @@ mod tests {
             "n1".to_string(),
             LaunchSelectionOverride::Concrete(pin.clone()),
         );
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, |_id| {
+        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
             Ok(Some(file_agent("builder", Some("md"))))
         });
         let resolved = out[0].resolved.as_ref().unwrap();
@@ -1172,12 +1232,105 @@ mod tests {
             .any(|s| s.model.as_str() == "custom-xl"));
     }
 
+    /// The regression guard for generation zero: with no labels and no rules,
+    /// every preview row resolves exactly as it did before routing existed, and
+    /// says so rather than staying silent.
+    #[test]
+    fn an_unrouted_row_resolves_to_the_agent_default_and_records_why() {
+        let presets = default_presets_config(Some(31999));
+        let nodes = [agent_node("n1", "builder")];
+        let overrides = LaunchOverrides::default();
+        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
+            Ok(Some(file_agent("builder", Some("md"))))
+        });
+        let resolved = out[0].resolved.as_ref().unwrap();
+        assert_eq!(resolved.selection.model.as_str(), "sonnet");
+        let routing = resolved.routing.as_ref().expect("every row records why");
+        assert_eq!(
+            routing.source,
+            crate::models::ModelRoutingSource::AgentDefault
+        );
+        assert_eq!(routing.note, "no labels on issue");
+    }
+
+    /// The composer's preview applies the same plan the start path will, so the
+    /// operator sees the routed model -- and its reason -- before pressing Start.
+    #[test]
+    fn a_matching_rule_moves_the_preview_row_and_names_itself() {
+        let presets = default_presets_config(Some(31999));
+        let table: crate::config::model_routing::ModelRoutingTable = serde_yaml::from_str(
+            "rules:\n  - id: migration-builder\n    when:\n      all: [migration]\n    agents: [builder]\n    tier: lg\n",
+        )
+        .expect("test table parses");
+        let labels = IssueLabels::new([("migration".to_string(), "Migration".to_string())]);
+        let routed = LaunchSelectionPlan::new(
+            None,
+            table,
+            labels,
+            std::collections::HashSet::new(),
+            &presets,
+        );
+
+        let nodes = [agent_node("n1", "builder"), agent_node("n2", "review")];
+        let overrides = LaunchOverrides::default();
+        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &routed, |id| {
+            Ok(Some(file_agent(id, Some("md"))))
+        });
+
+        let builder = out[0].resolved.as_ref().unwrap();
+        assert_eq!(builder.selection.model.as_str(), "opus");
+        let routing = builder.routing.as_ref().expect("a routed row says why");
+        assert_eq!(
+            routing.source,
+            crate::models::ModelRoutingSource::LabelBinding
+        );
+        assert_eq!(routing.rule.as_deref(), Some("migration-builder"));
+        assert_eq!(routing.tier.as_deref(), Some("lg"));
+
+        // The rule is scoped to the builder; nothing else moves.
+        let review = out[1].resolved.as_ref().unwrap();
+        assert_eq!(review.selection.model.as_str(), "sonnet");
+    }
+
+    /// A per-node override in the preview payload is an explicit choice: the
+    /// table is not consulted for that row at all.
+    #[test]
+    fn a_node_override_is_never_contested_by_a_rule() {
+        let presets = default_presets_config(Some(31999));
+        let table: crate::config::model_routing::ModelRoutingTable = serde_yaml::from_str(
+            "rules:\n  - id: migration-builder\n    when:\n      all: [migration]\n    tier: lg\n",
+        )
+        .unwrap();
+        let routed = LaunchSelectionPlan::new(
+            None,
+            table,
+            IssueLabels::new([("migration".to_string(), "Migration".to_string())]),
+            std::collections::HashSet::new(),
+            &presets,
+        );
+        let nodes = [agent_node("n1", "builder")];
+        let mut overrides = LaunchOverrides::default();
+        overrides.nodes.insert(
+            "n1".to_string(),
+            LaunchSelectionOverride::Tier("sm".to_string()),
+        );
+        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &routed, |_id| {
+            Ok(Some(file_agent("builder", Some("md"))))
+        });
+        let resolved = out[0].resolved.as_ref().unwrap();
+        assert_eq!(resolved.selection.model.as_str(), "haiku");
+        assert!(
+            resolved.routing.is_none(),
+            "a row the operator chose carries no routing reason"
+        );
+    }
+
     #[test]
     fn missing_agent_is_per_node_error() {
         let presets = default_presets_config(Some(31999));
         let nodes = [agent_node("n1", "ghost")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, |_id| Ok(None));
+        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| Ok(None));
         assert!(out[0].error.as_ref().unwrap().contains("not found"));
         assert!(out[0].resolved.is_none());
         assert!(!out[0].available.is_empty());

@@ -46,21 +46,24 @@ fn ollama_host_for_model_in_project(
                 .into_iter()
                 .find(|entry| entry.model == model || entry.id == model)
         })
-        .and_then(|entry| entry.canonical_slug);
+        .map(|entry| entry.serving_account_ids);
     select_priority_host(accounts, served_ids.as_deref())
 }
 
+/// Pick the first configured account that serves `model`. An empty or absent
+/// serving list means the catalog is cold or the model predates discovery, so
+/// fall back to the highest-priority host to keep first launch possible.
 fn select_priority_host(
     accounts: Vec<(String, String)>,
-    served_ids: Option<&str>,
+    served_ids: Option<&[String]>,
 ) -> Option<(String, String)> {
     let first = accounts.first().cloned()?;
-    let Some(served_ids) = served_ids else {
+    let Some(served_ids) = served_ids.filter(|ids| !ids.is_empty()) else {
         return Some(first);
     };
     accounts
         .into_iter()
-        .find(|(id, _)| served_ids.split(',').any(|served| served == id))
+        .find(|(id, _)| served_ids.iter().any(|served| served == id))
         .or(Some(first))
 }
 
@@ -145,14 +148,18 @@ mod tests {
         ]
     }
 
+    fn served(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     #[test]
     fn routing_uses_highest_priority_serving_host() {
         assert_eq!(
-            select_priority_host(hosts(), Some("high,low")),
+            select_priority_host(hosts(), Some(&served(&["high", "low"]))),
             Some(("high".into(), "http://high".into()))
         );
         assert_eq!(
-            select_priority_host(hosts(), Some("low")),
+            select_priority_host(hosts(), Some(&served(&["low"]))),
             Some(("low".into(), "http://low".into()))
         );
     }
@@ -164,7 +171,11 @@ mod tests {
             Some(("high".into(), "http://high".into()))
         );
         assert_eq!(
-            select_priority_host(hosts(), Some("removed")),
+            select_priority_host(hosts(), Some(&[])),
+            Some(("high".into(), "http://high".into()))
+        );
+        assert_eq!(
+            select_priority_host(hosts(), Some(&served(&["removed"]))),
             Some(("high".into(), "http://high".into()))
         );
     }

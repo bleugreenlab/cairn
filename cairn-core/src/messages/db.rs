@@ -12,6 +12,27 @@ fn db_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
 }
 
+pub async fn query_for_thread(
+    db: &LocalDb,
+    thread_id: &str,
+    since: Option<i64>,
+) -> Result<Vec<Message>, String> {
+    let thread_id = thread_id.to_string();
+    db.read(move |conn| {
+        let thread_id = thread_id.clone();
+        Box::pin(async move {
+            let sql = format!(
+                "SELECT {} FROM messages WHERE channel_type = 'thread' AND channel_id = ?1 AND (?2 IS NULL OR created_at >= ?2) ORDER BY created_at ASC LIMIT 200",
+                MESSAGE_COLUMNS
+            );
+            let rows = conn.query(&sql, params![thread_id, since]).await?;
+            collect_messages(rows).await
+        })
+    })
+    .await
+    .map_err(|error| db_error("Failed to query thread messages", error))
+}
+
 /// Canonical message column list. Every read path uses this so adding columns
 /// only needs one edit here and a matching row-index update in
 /// [`message_from_row`].

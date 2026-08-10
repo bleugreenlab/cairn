@@ -8,7 +8,7 @@ use cairn_common::uri::CairnResource;
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
-    _request: &McpCallbackRequest,
+    request: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
     dry_run: bool,
@@ -20,7 +20,7 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
-            apply_settings_patch(orch, payload, dry_run)
+            apply_settings_patch(orch, request, payload, dry_run)
                 .await
                 .map_err(|error| build_failure(index, item, error))?
         }

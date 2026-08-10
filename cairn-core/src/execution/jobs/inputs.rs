@@ -374,14 +374,14 @@ async fn build_trigger_context_conn(
             }
         }
     } else if let Some(issue_id) = &job.issue_id {
-        if let Some((title, description, kind)) =
+        if let Some((title, description)) =
             load_issue_title_description_conn(conn, issue_id).await?
         {
             data["issue"] = serde_json::json!({
                 "id": issue_id,
                 "title": title,
                 "description": description,
-                "kind": kind,
+                "kind": "issue",
             });
         }
     }
@@ -412,22 +412,20 @@ async fn load_issue_by_project_key_number_conn(
         .transpose()
 }
 
-/// Title, description, and kind. The kind rides along because it decides how the
-/// trigger context reads as a prompt: an issue states work to do, a thread
-/// opens a conversation.
+/// Load an issue title and description for prompt context.
 async fn load_issue_title_description_conn(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
-) -> DbResult<Option<(String, Option<String>, Option<String>)>> {
+) -> DbResult<Option<(String, Option<String>)>> {
     let mut rows = conn
         .query(
-            "SELECT title, description, kind FROM issues WHERE id = ?1",
+            "SELECT title, description FROM issues WHERE id = ?1",
             (issue_id,),
         )
         .await?;
     rows.next()
         .await?
-        .map(|row| Ok::<_, DbError>((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)))
+        .map(|row| Ok::<_, DbError>((row.text(0)?, row.opt_text(1)?)))
         .transpose()
 }
 
@@ -1062,6 +1060,7 @@ mod port_model_tests {
     fn snapshot(nodes: Vec<RecipeNode>, edges: Vec<RecipeEdge>) -> ExecutionSnapshot {
         ExecutionSnapshot {
             branch_target: Default::default(),
+            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),
@@ -1528,13 +1527,14 @@ mod port_model_tests {
         assert!(!node_ships_a_pr(&snap, "coordinator"));
     }
 
-    const BUILD_YAML: &str = include_str!("../../../../../recipes/build.yaml");
-    const PLANBUILD_YAML: &str = include_str!("../../../../../recipes/planbuild.yaml");
-    const TASK_LIST_YAML: &str = include_str!("../../../../../recipes/task-list.yaml");
-    const COORDINATOR_YAML: &str = include_str!("../../../../../recipes/coordinator.yaml");
-    const MEMORY_TRIAGE_YAML: &str = include_str!("../../../../../recipes/memory-triage.yaml");
-    const SETUP_YAML: &str = include_str!("../../../../../recipes/setup.yaml");
-    const THREAD_YAML: &str = include_str!("../../../../../recipes/thread.yaml");
+    const BUILD_YAML: &str = include_str!("../../../../../packs/core/recipes/build.yaml");
+    const PLANBUILD_YAML: &str = include_str!("../../../../../packs/core/recipes/planbuild.yaml");
+    const TASK_LIST_YAML: &str = include_str!("../../../../../packs/core/recipes/task-list.yaml");
+    const COORDINATOR_YAML: &str =
+        include_str!("../../../../../packs/core/recipes/coordinator.yaml");
+    const MEMORY_TRIAGE_YAML: &str =
+        include_str!("../../../../../packs/core/recipes/memory-triage.yaml");
+    const SETUP_YAML: &str = include_str!("../../../../../packs/core/recipes/setup.yaml");
 
     /// The bundled recipes, parsed the way an execution snapshot is built from
     /// them. `into_recipe` reassigns node ids, so agent nodes are keyed by their
@@ -1612,78 +1612,6 @@ mod port_model_tests {
         )
         .expect("the coordinator recipe declares the base target");
         assert!(!node_ships_a_pr(&snap, &coordinator));
-    }
-
-    /// The thread recipe is the standing shape by construction rather than by
-    /// transform: it ships no PR node at all, so its agent has no terminal
-    /// contract to deliver and stands idle at clean turn-end under either branch
-    /// target. That absence IS the feature — a thread with an output artifact
-    /// would carry the completion pressure threads exist to remove.
-    #[test]
-    fn the_thread_recipe_ships_nothing_and_stands_idle() {
-        let snap = bundled_snapshot(THREAD_YAML);
-        assert!(
-            !snap
-                .recipe
-                .nodes
-                .iter()
-                .any(|node| node.node_type == crate::models::RecipeNodeType::Pr),
-            "a thread never terminates via PR"
-        );
-        let thread = agent_node_id(&snap, "thread");
-        assert!(!node_ships_a_pr(&snap, &thread));
-        assert!(is_long_running_node(&snap, &thread, false));
-    }
-
-    /// The arc is the thread's living document, declared on a `context-self`
-    /// edge so it never advances the DAG. Its field names are the contract the
-    /// session compactor reads (CAIRN-3388), so they are pinned here rather than
-    /// left to the YAML alone.
-    #[test]
-    fn the_thread_recipe_declares_the_arc_living_doc() {
-        let snap = bundled_snapshot(THREAD_YAML);
-        let thread = agent_node_id(&snap, "thread");
-        let targets = resolve_ctx_self_schemas_with_snapshot(&snap, &thread);
-        assert_eq!(targets.len(), 1, "the thread owns exactly one living doc");
-        assert_eq!(targets[0].artifact_name.as_deref(), Some("arc"));
-
-        let OutputSchema::Custom(schema) = &targets[0].schema else {
-            panic!("the arc declares an inline schema");
-        };
-        let props = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("the arc schema declares properties");
-        let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["current_intent", "open_questions", "rulings"]);
-
-        // Provenance is required ON EACH RULING, not merely offered: a
-        // conclusion inherited without a link to where it was argued is the
-        // failure the register exists to prevent.
-        let ruling = props
-            .get("rulings")
-            .and_then(|r| r.get("items"))
-            .expect("rulings declares an item shape");
-        let required: Vec<&str> = ruling
-            .get("required")
-            .and_then(|r| r.as_array())
-            .expect("a ruling has required fields")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        for field in ["text", "status", "rationale", "provenance"] {
-            assert!(required.contains(&field), "a ruling requires `{field}`");
-        }
-        assert_eq!(
-            ruling
-                .get("properties")
-                .and_then(|p| p.get("provenance"))
-                .and_then(|p| p.get("minItems"))
-                .and_then(|m| m.as_u64()),
-            Some(1),
-            "an empty provenance list is not provenance"
-        );
     }
 
     /// A consumer on a direct context edge must not receive the producer's

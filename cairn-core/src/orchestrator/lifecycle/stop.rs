@@ -156,7 +156,7 @@ fn fail_pending_run_tool_results(
             queued_message_id: None,
             raw: Some(serde_json::json!({ "synthetic": true, "reason": "user_stop" })),
         };
-        let data = serde_json::to_string(&event).unwrap_or_default();
+        let data = event.observed().to_event_json();
         let event_insert = EventInsert {
             id: event_id.clone(),
             run_id: run_id.to_string(),
@@ -1011,6 +1011,11 @@ pub fn kill_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     kill_session_with_reason(orch, run_id, "user_stop")
 }
 
+/// Exit reason for a provider turn deliberately interrupted immediately before
+/// an automatic same-session recovery. It remains a crashed/interrupted turn,
+/// but terminal failure attention must not fire between the two turns.
+pub(crate) const PROVIDER_SILENCE_RECOVERY_EXIT_REASON: &str = "provider_silence_recovery";
+
 /// Kill a session with a specific exit reason.
 pub fn kill_session_with_reason(
     orch: &Orchestrator,
@@ -1055,7 +1060,7 @@ pub fn kill_session_with_reason(
     drop(processes);
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
-    let final_status = if exit_reason == "crash" {
+    let final_status = if matches!(exit_reason, "crash" | PROVIDER_SILENCE_RECOVERY_EXIT_REASON) {
         RunStatus::Crashed
     } else {
         RunStatus::Exited
@@ -1063,7 +1068,11 @@ pub fn kill_session_with_reason(
 
     let _ = set_exit_reason(orch, run_id, exit_reason);
 
-    finalize_run(orch, run_id, final_status);
+    if exit_reason == PROVIDER_SILENCE_RECOVERY_EXIT_REASON {
+        super::finalize_run_for_recovery(orch, run_id, final_status);
+    } else {
+        finalize_run(orch, run_id, final_status);
+    }
 
     Ok(())
 }

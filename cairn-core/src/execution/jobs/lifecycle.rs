@@ -297,13 +297,24 @@ async fn retain_resolvable_pushes(
     recipient: &str,
     pushes: Vec<crate::orchestrator::attention_push::Push>,
 ) -> Vec<crate::orchestrator::attention_push::Push> {
+    use futures_util::{stream, StreamExt};
+
     let mut retained = Vec::with_capacity(pushes.len());
-    for push in pushes {
-        let Some(coordinate) = push_job_coordinate(&push.content_ref) else {
-            retained.push(push);
-            continue;
-        };
-        match push_job_coordinate_exists(db, coordinate).await {
+    let mut probed = stream::iter(pushes.into_iter().enumerate())
+        .map(|(index, push)| async move {
+            let exists = match push_job_coordinate(&push.content_ref) {
+                Some(coordinate) => push_job_coordinate_exists(db, coordinate).await,
+                None => Ok(true),
+            };
+            (index, push, exists)
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    probed.sort_by_key(|(index, _, _)| *index);
+
+    for (_, push, exists) in probed {
+        match exists {
             Ok(true) => retained.push(push),
             Ok(false) => {
                 match crate::orchestrator::attention_push::delete_pending_by_id(db, &push.id).await {
@@ -443,7 +454,8 @@ where
 
 /// The parent's durable coordinate, as an inheriting child needs to see it.
 pub(crate) struct ParentCoordinate {
-    /// The branch the child continues. Its absence is fatal to inheritance.
+    /// The branch the child continues. Its absence preserves a deliberately
+    /// branchless parent's base coordinate.
     pub branch: Option<String>,
     /// The parent's archival `jobs.base_commit`, the verified fallback rung of
     /// [`inherited_head`] — never the primary coordinate.
@@ -463,9 +475,10 @@ pub(crate) struct CoordinateRequest<'a> {
 
 /// Select the durable coordinate a job starts from, one outcome per branch mode.
 ///
-/// `inherit` is the only mode that reads another job: the child continues its
-/// parent's branch and starts at that branch's **live head**, not at the base
-/// branch either of them was cut from.
+/// `inherit` is the only mode that reads another job. A branch-bearing child
+/// continues its parent's branch at its **live head**. When the parent is
+/// deliberately branchless, the child preserves that mode and starts from the
+/// live base ref recorded on its own row by the delegation edge.
 ///
 /// Two grades of inheritance, and the difference is what happens when the store
 /// cannot produce that head. Plain `inherit` degrades through
@@ -508,12 +521,10 @@ where
             )
         })?;
         let parent = load_parent(parent_job_id)?;
-        let branch = parent.branch.ok_or_else(|| {
-            format!(
-                "Job {job_id} cannot start: its parent job {parent_job_id} has no branch, \
-                 so there is no logical head to inherit"
-            )
-        })?;
+        let Some(branch) = parent.branch else {
+            let base = crate::jj::resolve_base_rev(jj, store, request.base_ref, git_rev_parse);
+            return Ok((None, Some(base)));
+        };
         if behavior.requires_parent_head {
             let head = crate::jj::bookmark_commit(jj, store, &branch).ok_or_else(|| {
                 format!(
@@ -930,11 +941,120 @@ pub fn resume_job_from_digest(
     )
 }
 
+/// Cairn's approximate-token convention: ~4 characters per token, the same ratio
+/// the frontend's `estimateTokens` (`src/components/chat/tokenEstimate.ts`) uses,
+/// so a size read in the UI is on the scale the rest of Cairn reports. The two
+/// count characters slightly differently — Unicode scalar values here, UTF-16
+/// code units there — which is immaterial at this precision.
+///
+/// No real tokenizer belongs at this boundary: the seed goes to whichever
+/// provider the rebuilt session runs on, and each tokenizes it differently.
+const SEED_CHARS_PER_TOKEN: usize = 4;
+
+/// The size of the seed a forced digest resume would create right now.
+///
+/// The measured boundary is the seed *event*: the framing header plus the
+/// composed body, which is exactly the string rotation delivers and stores. Two
+/// things are deliberately outside it. The fixed continuation trigger appended at
+/// delivery is its own event and a constant handful of tokens, so counting it
+/// would add noise without changing a judgement. The agent's system prompt and
+/// tool definitions are outside it because no reseed changes them: this number is
+/// the projected size of the compacted seed, not the resumed session's context
+/// occupancy.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DigestPreview {
+    /// Estimated tokens in that seed content, at [`SEED_CHARS_PER_TOKEN`].
+    pub estimated_tokens: i64,
+}
+
+impl DigestPreview {
+    /// Measure one composed seed. Reachable across the crate so the seed
+    /// composers' own test fixtures can assert on the number the menu shows,
+    /// rather than on a second calculation that resembles it.
+    pub(crate) fn of(seed_content: &str) -> Self {
+        Self {
+            estimated_tokens: seed_content.chars().count().div_ceil(SEED_CHARS_PER_TOKEN) as i64,
+        }
+    }
+}
+
+/// Compose — but never apply — the seed [`resume_job_from_digest`] would deliver,
+/// and measure it.
+///
+/// Read-only in the strong sense: it runs the same [`compose_forced_reseed`] the
+/// action runs and then throws the seed away, so the size an operator reads in
+/// the tab menu cannot describe anything other than what pressing the action
+/// would create. Both paths are previewable — a thread's compacted seed and an
+/// ordinary node's full-fidelity digest — because composition is read-only on
+/// both.
+pub fn preview_job_digest(orch: &Orchestrator, job_id: &str) -> Result<DigestPreview, String> {
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let job = run_db(load_job(
+        owning_db.clone(),
+        job_id.to_string(),
+        "Job not found",
+    ))?;
+    let session_id = job
+        .current_session_id
+        .clone()
+        .ok_or_else(|| "This job has no agent session to preview a digest for.".to_string())?;
+    let session = run_db(load_session_optional(owning_db.clone(), session_id))?
+        .ok_or_else(|| "This job's current session could not be loaded.".to_string())?;
+
+    Ok(DigestPreview::of(
+        compose_forced_reseed(orch, &owning_db, &job, &session)?.framed(),
+    ))
+}
+
 pub fn continue_job_or_enqueue(
     orch: &Orchestrator,
     job_id: &str,
     message: Option<&str>,
     identity_override: Option<crate::identity::UserIdentity>,
+    request_id: Option<&str>,
+) -> Result<Run, String> {
+    continue_job_or_enqueue_inner(orch, job_id, message, identity_override, request_id, || {})
+}
+
+fn enqueue_continuation_message(
+    db: &LocalDb,
+    job_id: &str,
+    content: &str,
+    request_id: Option<&str>,
+) -> Result<crate::messages::queued::QueuedMessage, String> {
+    match request_id {
+        Some(request_id) => crate::messages::queued::enqueue_idempotent(
+            db,
+            job_id,
+            content,
+            crate::messages::queued::Delivery::Queue,
+            request_id,
+        ),
+        None => crate::messages::queued::enqueue(
+            db,
+            job_id,
+            content,
+            crate::messages::queued::Delivery::Queue,
+        ),
+    }
+}
+
+fn continue_job_or_enqueue_inner(
+    orch: &Orchestrator,
+    job_id: &str,
+    message: Option<&str>,
+    identity_override: Option<crate::identity::UserIdentity>,
+    request_id: Option<&str>,
+    before_resume: impl FnOnce(),
 ) -> Result<Run, String> {
     // Only a message-bearing send can be queued; a bare continue has nothing to
     // enqueue, so it falls straight through to the resume (and its guard).
@@ -951,12 +1071,7 @@ pub fn continue_job_or_enqueue(
             }
         })?;
         if crate::messages::delivery::head_turn_active_sync(&owning_db, job_id) {
-            crate::messages::queued::enqueue(
-                &owning_db,
-                job_id,
-                text,
-                crate::messages::queued::Delivery::Queue,
-            )?;
+            enqueue_continuation_message(&owning_db, job_id, text, request_id)?;
             // Make the pending-queue chip appear immediately: QueryProvider
             // invalidates `queuedMessages` on this db-change, the same mechanism
             // the composer's own enqueue path relies on.
@@ -966,10 +1081,7 @@ pub fn continue_job_or_enqueue(
             );
             // Return the job's latest run to honor the Run return contract; the
             // frontend ignores the value. `list_runs_for_job` orders newest-first,
-            // matching the frontend's `runs[0]` "latest" convention. Fall through to
-            // the resume only in the pathological case where an active turn has no
-            // run row at all — the message is already recorded, so the fall-through
-            // must not record it a second time.
+            // matching the frontend's `runs[0]` "latest" convention.
             if let Some(run) = crate::runs::queries::list_runs_for_job(owning_db.clone(), job_id)
                 .map_err(|e| e.to_string())?
                 .into_iter()
@@ -977,19 +1089,44 @@ pub fn continue_job_or_enqueue(
             {
                 return Ok(run);
             }
-        } else if let Err(error) =
-            crate::messages::queued::record_direct_delivery(&owning_db, job_id, text)
-        {
-            // An idle child takes the operator's text straight into the resume
-            // below, so the queue never sees it. Recording it delivered-on-arrival
-            // is what keeps the operator-message record complete: the watchers'
-            // catch-up digest reads that record, and the `user` transcript event
-            // this resume is about to store is indistinguishable from a launch
-            // prompt or a machinery-delivered payload (CAIRN-3390). It also carries
-            // the watchers' catch-up push, so an operator message reaches them
-            // whichever branch it took (CAIRN-3342). Best-effort: bookkeeping that
-            // fails must not cost the operator the resume itself.
-            log::warn!("recording an operator message for job {job_id} failed: {error}");
+            return Err("active turn has no run row after message was queued".to_string());
+        }
+        before_resume();
+
+        match continue_job_impl(
+            orch,
+            job_id,
+            message,
+            identity_override,
+            Some(ResumeContext {
+                supersede_pending_retry: true,
+                ..Default::default()
+            }),
+        ) {
+            Ok(run) => {
+                // Stamp the operator record delivered only after the authoritative
+                // turn-start path accepts the resume. Stamping before this point
+                // creates a delivered-only orphan if another turn wins the race.
+                if let Err(error) =
+                    crate::messages::queued::record_direct_delivery(&owning_db, job_id, text)
+                {
+                    log::warn!("recording an operator message for job {job_id} failed: {error}");
+                }
+                return Ok(run);
+            }
+            Err(error) if crate::messages::delivery::head_turn_active_sync(&owning_db, job_id) => {
+                enqueue_continuation_message(&owning_db, job_id, text, request_id)?;
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    serde_json::json!({"table": "queued_messages", "action": "update"}),
+                );
+                return crate::runs::queries::list_runs_for_job(owning_db, job_id)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .next()
+                    .ok_or(error);
+            }
+            Err(error) => return Err(error),
         }
     }
     continue_job_impl(
@@ -1002,6 +1139,17 @@ pub fn continue_job_or_enqueue(
             ..Default::default()
         }),
     )
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn continue_job_or_enqueue_with_before_resume_for_test(
+    orch: &Orchestrator,
+    job_id: &str,
+    message: Option<&str>,
+    request_id: &str,
+    before_resume: impl FnOnce(),
+) -> Result<Run, String> {
+    continue_job_or_enqueue_inner(orch, job_id, message, None, Some(request_id), before_resume)
 }
 
 // ============================================================================
@@ -1160,6 +1308,25 @@ fn continue_job_impl_with_intent(
     continuation_intent: ContinuationIntent,
 ) -> Result<Run, String> {
     let resume_started = std::time::Instant::now();
+    // A closed thread takes no new turns, and this is the boundary that decides
+    // what a turn is. Everything else dormancy gates — a prompt, a wake, a queued
+    // push — exists to reach this function, and the desktop composer reaches it
+    // WITHOUT them: it holds the session job id and resumes it directly, so a gate
+    // anywhere upstream would leave the app's own send path ungated and make the
+    // read-only composer the enforcement rather than the courtesy it should be.
+    // Taken before the launch lock so a refused resume touches nothing.
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    if crate::threads::is_dormant_thread_session_sync(&owning_db, job_id) {
+        return Err(crate::threads::dormant_thread_refusal());
+    }
     let launch_wait_started = std::time::Instant::now();
     let launch_lock = orch.job_launch_lock(job_id);
     // A poisoned lock means some earlier launch panicked. What it guards is
@@ -1391,26 +1558,24 @@ fn continue_job_launch_locked(
 
     let now = chrono::Utc::now().timestamp() as i32;
 
-    // Desired backend for this turn, mirroring cold-start backend selection
-    // (agent `backend_preference`, else inferred from the model). Used to detect
-    // a model change that crosses providers so the session can rotate.
-    // Resolve-early: prefer the snapshot's stored selection backend so a resumed
-    // session uses what it was launched with, never a re-resolution against
-    // changed settings. backend_preference / model-derivation are fallbacks.
-    let desired_backend = agent_config
-        .as_ref()
-        .and_then(|ac| ac.selection.as_ref().map(|s| s.backend.clone()))
-        .or_else(|| {
-            agent_config
-                .as_ref()
-                .and_then(|ac| ac.backend_preference.clone())
-        })
-        .or_else(|| {
-            job.model
-                .as_deref()
-                .and_then(crate::backends::backend_for_model)
-                .map(str::to_string)
-        });
+    // Desired backend for this turn, asked of the one resolution the spawn below
+    // asks — `jobs.model` first, the agent's selection only where it names that
+    // same model. Used to detect a model change that crosses providers so the
+    // session can rotate. Resolving it any other way here would let the rotation
+    // and the process disagree about which provider this turn runs on.
+    //
+    // This IS resolve-early, keyed to the durable fact: `jobs.model` is what the
+    // job launched with, while the agent config is re-resolved against current
+    // settings every turn. Preferring the config's selection let a workspace's
+    // model settings move an ongoing session onto another provider without any
+    // model edit (CAIRN-3798).
+    let desired_backend = crate::backends::effective_backend_name(
+        agent_config.as_ref().and_then(|ac| ac.selection.as_ref()),
+        agent_config
+            .as_ref()
+            .and_then(|ac| ac.backend_preference.as_deref()),
+        job.model.as_deref(),
+    );
 
     // ---- Session identity check -----------------------------------------
     // Load Session and derive explicit continue semantics. When the requested
@@ -1806,9 +1971,9 @@ fn continue_job_launch_locked(
         .unwrap_or_default()
     };
     let has_pushes = !drained_pushes.is_empty();
-    // CAIRN-1891: resolve each push's content_ref to its rendered resource content
-    // so the resumed agent acts without a round-trip read. Uses the same in-process
-    // backs `cairn read`; run on a scoped DB runtime so it can borrow orch.
+    // Keep resume assembly independent of full resource reads. Every push carries
+    // its canonical URI and a compact summary; only bounded, targeted database
+    // details are resolved for direct messages, catch-up, and terminal outcomes.
     let push_prompt = if has_pushes {
         let pushes = drained_pushes.clone();
         crate::storage::run_db_blocking(move || async move {
@@ -1822,11 +1987,15 @@ fn continue_job_launch_locked(
     } else {
         None
     };
-    // CAIRN-1891: the persisted carrying event is the wake-card payload
-    // (`{active, catchup}`) PLUS the `resolved` content the agent received, so the
-    // transcript renders a card and its detail modal shows the full content (not
-    // just the resource ref). The agent gets the same resolved content inline in
-    // the prompt below.
+    let mut event =
+        crate::resume_timing::ResumeTimingEvent::new("resume_pushes_ready").elapsed(resume_started);
+    event.job_id = Some(job_id);
+    event.session_id = Some(&session_id);
+    event.count = Some(drained_pushes.len());
+    event.bytes = push_prompt.as_ref().map(String::len);
+    event.emit();
+    // Persist the same compact content the agent received alongside the wake-card
+    // payload. The detail modal retains the summary and canonical resource links.
     let push_summary = if has_pushes {
         Some(
             crate::orchestrator::attention_push::push_event_content_json(
@@ -2018,6 +2187,14 @@ fn continue_job_launch_locked(
             now,
             Some(&turn_id),
         )?;
+        if !trigger.synthetic {
+            let mut event = crate::resume_timing::ResumeTimingEvent::new("user_message_persisted")
+                .elapsed(resume_started);
+            event.job_id = Some(job_id);
+            event.run_id = Some(&run_id);
+            event.session_id = Some(&session_id);
+            event.emit();
+        }
     }
 
     // ---- Warm process or new session ------------------------------------
@@ -2615,12 +2792,42 @@ fn finish_forced_session_reseed(
     Ok(outcome)
 }
 
-fn force_session_reseed(
+/// A forced reseed's seed, composed but not yet applied.
+///
+/// This is the whole read-only half of [`force_session_reseed`]: everything up to
+/// the rotation that makes it durable. It exists as its own value so the size an
+/// operator is shown before pressing the action and the seed the action actually
+/// delivers are measurements of one construction, not two that can drift apart.
+enum ComposedReseed {
+    /// A thread compacts. The composition also carries the accounting its
+    /// generation record needs, so applying it costs no second composition.
+    Thread {
+        seed: Box<crate::resources::ThreadSeed>,
+        framed: String,
+    },
+    /// An ordinary node reseeds from its whole transcript at full fidelity.
+    Digest { framed: String },
+}
+
+impl ComposedReseed {
+    /// The seed content exactly as rotation would deliver and store it: framing
+    /// header first, then the composed body.
+    fn framed(&self) -> &str {
+        match self {
+            ComposedReseed::Thread { framed, .. } | ComposedReseed::Digest { framed } => framed,
+        }
+    }
+}
+
+/// Compose the seed a forced digest resume would deliver, without mutating
+/// anything. Fails rather than returning a partial seed, exactly as the automatic
+/// reseed paths do.
+fn compose_forced_reseed(
     orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
     job: &DbJob,
     session: &Session,
-) -> Result<ReseedOutcome, String> {
+) -> Result<ComposedReseed, String> {
     // An operator forcing a digest resume on a thread gets the thread's own seed
     // shape; there is only one way to reconstruct a thread's context.
     if thread_compaction_capability(owning_db, &job.id).is_enabled() {
@@ -2633,21 +2840,12 @@ fn force_session_reseed(
         .flatten()
         .map(|last_event_at| orch.services.clock.now().saturating_sub(last_event_at));
         let framed = build_thread_seed_content(&seed.content, idle_secs);
-        return apply_thread_compaction(
-            orch,
-            owning_db,
-            job,
-            session,
-            DecidedCompaction {
-                seed,
-                framed,
-                trigger: CompactionTrigger::Manual,
-                occupancy: None,
-            },
-        );
+        return Ok(ComposedReseed::Thread {
+            seed: Box::new(seed),
+            framed,
+        });
     }
 
-    // Construct the complete seed before any process or session mutation.
     let digest = {
         let db = owning_db.clone();
         let job = job.clone();
@@ -2660,14 +2858,35 @@ fn force_session_reseed(
             "Cannot resume from digest because this job has no resumable transcript.".to_string(),
         );
     }
+    Ok(ComposedReseed::Digest {
+        framed: build_reseed_seed_content(&digest),
+    })
+}
 
-    rotate_with_seed(
-        orch,
-        owning_db,
-        job,
-        session,
-        build_reseed_seed_content(&digest),
-    )
+fn force_session_reseed(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    session: &Session,
+) -> Result<ReseedOutcome, String> {
+    // Construct the complete seed before any process or session mutation.
+    match compose_forced_reseed(orch, owning_db, job, session)? {
+        ComposedReseed::Thread { seed, framed } => apply_thread_compaction(
+            orch,
+            owning_db,
+            job,
+            session,
+            DecidedCompaction {
+                seed: *seed,
+                framed,
+                trigger: CompactionTrigger::Manual,
+                occupancy: None,
+            },
+        ),
+        ComposedReseed::Digest { framed } => {
+            rotate_with_seed(orch, owning_db, job, session, framed)
+        }
+    }
 }
 
 /// Stop the live process and rotate to a fresh session carrying `seed_content`.
@@ -3505,6 +3724,36 @@ mod tests {
     }
 
     #[test]
+    fn the_projected_size_covers_the_framing_actually_delivered() {
+        use super::{build_reseed_seed_content, build_thread_seed_content, DigestPreview};
+
+        // The header is not decoration: it is part of the seed event the rebuilt
+        // session receives, so a projection that measured only the composed body
+        // would under-report every seed by the same hidden amount. Measuring the
+        // framed string is what makes the number describe what gets delivered.
+        let body = "COMPOSED_BODY";
+        for framed in [
+            build_thread_seed_content(body, None),
+            build_reseed_seed_content(body),
+        ] {
+            let preview = DigestPreview::of(&framed);
+            assert_eq!(
+                preview.estimated_tokens,
+                (framed.chars().count() as i64 + 3) / 4
+            );
+            assert!(
+                preview.estimated_tokens > DigestPreview::of(body).estimated_tokens,
+                "the framing header fell outside the measured seed: {framed}"
+            );
+        }
+
+        // Sub-thousand seeds still round up rather than to zero: a short seed is
+        // small, never absent.
+        assert_eq!(DigestPreview::of("abc").estimated_tokens, 1);
+        assert_eq!(DigestPreview::of("").estimated_tokens, 0);
+    }
+
+    #[test]
     fn a_warm_session_with_no_reading_is_left_alone() {
         use super::decide_thread_compaction;
 
@@ -3653,6 +3902,108 @@ mod tests {
             decide_continue_action("claude", Some("sess"), Some("codex"), false),
             ContinueSessionAction::RotateToBackend("codex".to_string())
         );
+    }
+
+    #[test]
+    fn a_move_back_off_codex_rotates_too() {
+        // The other direction of the same change, which used to be invisible.
+        // `backend_for_model` answers None for every Claude model, so a caller
+        // that passed the inference straight through supplied None here — read as
+        // "nothing to compare" — and a Codex session with a native handle then
+        // took the Resume arm below, handing a Codex thread id to the Claude CLI
+        // the spawn actually starts. Spelling the model's provider is what makes
+        // the check symmetric.
+        assert_eq!(
+            decide_continue_action(
+                "codex",
+                Some("thread-existing"),
+                Some(crate::backends::resolved_backend_for_model("fable")),
+                false
+            ),
+            ContinueSessionAction::RotateToBackend("claude".to_string())
+        );
+        // ...and the move onto Codex still rotates, from the same resolution.
+        assert_eq!(
+            decide_continue_action(
+                "claude",
+                Some("sess"),
+                Some(crate::backends::resolved_backend_for_model("gpt-5.6-sol")),
+                false
+            ),
+            ContinueSessionAction::RotateToBackend("codex".to_string())
+        );
+        // A session already on the provider its model resolves to is left alone.
+        assert_eq!(
+            decide_continue_action(
+                "claude",
+                Some("sess"),
+                Some(crate::backends::resolved_backend_for_model("opus")),
+                false
+            ),
+            ContinueSessionAction::MaybeReseed
+        );
+    }
+
+    /// CAIRN-3798, at the boundary that produced it. An ongoing thread carries
+    /// its model on `jobs.model`; the Thread agent's own default has since
+    /// resolved to a Codex model. Resuming must leave the Claude session exactly
+    /// where it is — the persisted model was never edited, and rotating it onto
+    /// Codex both destroyed the conversation and handed Codex a model it rejects
+    /// (HTTP 400 for `fable` on a ChatGPT account).
+    #[test]
+    fn an_agent_default_does_not_rotate_an_untouched_thread() {
+        let thread_agent_default =
+            crate::models::ModelSelection::new("codex", crate::models::Model::new("gpt-5.6-sol"));
+        let desired = crate::backends::effective_backend_name(
+            Some(&thread_agent_default),
+            Some("codex"),
+            Some("fable"),
+        );
+        assert_eq!(desired.as_deref(), Some("claude"));
+        assert_eq!(
+            decide_continue_action("claude", Some("sess"), desired.as_deref(), false),
+            ContinueSessionAction::MaybeReseed,
+            "an untouched fable thread must stay on the session it is running"
+        );
+        // And the spawn resolves the same pair: Claude, carrying `fable`.
+        assert_eq!(
+            crate::backends::backend_for_name(desired.as_deref()).name(),
+            "Claude"
+        );
+    }
+
+    /// The other half of the same rule: a model the operator actually chose in
+    /// the thread's model menu still moves the session onto its provider. What
+    /// changed is who may name the provider, not whether a switch takes effect.
+    #[test]
+    fn an_operator_model_switch_still_rotates() {
+        let thread_agent_default =
+            crate::models::ModelSelection::new("claude", crate::models::Model::new("fable"));
+        let desired = crate::backends::effective_backend_name(
+            Some(&thread_agent_default),
+            None,
+            Some("gpt-5.6-sol"),
+        );
+        assert_eq!(desired.as_deref(), Some("codex"));
+        assert_eq!(
+            decide_continue_action("claude", Some("sess"), desired.as_deref(), false),
+            ContinueSessionAction::RotateToBackend("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn every_model_resolves_to_a_spelled_provider() {
+        use crate::backends::resolved_backend_for_model;
+        for claude_model in ["sonnet", "opus", "haiku", "fable"] {
+            assert_eq!(
+                resolved_backend_for_model(claude_model),
+                "claude",
+                "{claude_model} runs on Claude, and the resolution must say so"
+            );
+        }
+        assert_eq!(resolved_backend_for_model("gpt-5.6-sol"), "codex");
+        assert_eq!(resolved_backend_for_model("codex-mini"), "codex");
+        assert_eq!(resolved_backend_for_model("openrouter/auto"), "openrouter");
     }
 
     #[test]
@@ -3952,18 +4303,19 @@ mod tests {
         );
     }
 
-    /// Inheritance is a hard requirement, not a preference. A parent whose
-    /// branch is missing leaves nothing to seed from, and the refusal names the
-    /// parent and what it lacks so the broken edge is legible from the message.
+    /// A branchless parent is a real authored coordinate, not broken lineage.
+    /// Its child remains branchless and resolves the parent's inherited base ref
+    /// live rather than minting a writable branch.
     #[test]
     #[serial_test::serial(jj)]
-    fn a_parent_without_a_branch_refuses_the_spawn() {
+    fn a_branchless_parent_preserves_the_base_coordinate() {
         let Some(fx) = inherit_fixture() else {
-            eprintln!("skipping a_parent_without_a_branch_refuses_the_spawn: no jj");
+            eprintln!("skipping a_branchless_parent_preserves_the_base_coordinate: no jj");
             return;
         };
+        let base_tip = fx.second.clone();
 
-        let error = select_job_coordinate(
+        let (branch, base_commit) = select_job_coordinate(
             &inherits(),
             child_request(Some("parent-job")),
             &fx.jj,
@@ -3975,13 +4327,12 @@ mod tests {
                 })
             },
             || unreachable!("an inheriting job mints nothing"),
-            |_| None,
+            move |revision| (revision == "main").then(|| base_tip.clone()),
         )
-        .expect_err("a child with no parent branch must not fall through to base");
+        .expect("a branchless parent delegates from its live base ref");
 
-        assert!(error.contains("parent job parent-job"), "{error}");
-        assert!(error.contains("no branch"), "{error}");
-        assert!(error.contains("child-job"), "{error}");
+        assert_eq!(branch, None);
+        assert_eq!(base_commit.as_deref(), Some(fx.second.as_str()));
     }
 
     /// The same refusal one step earlier: a job that inherits but was never

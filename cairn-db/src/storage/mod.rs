@@ -1,11 +1,15 @@
 mod blocking;
 mod error;
+mod executor_desktop_automation;
 mod local_db;
 mod migration;
 mod migrations;
+mod response_invocations;
+mod route_firings;
 mod row;
 mod search_index;
 
+pub mod authority;
 pub mod content_store;
 pub mod events;
 pub mod pack_catalog;
@@ -16,8 +20,12 @@ pub mod render;
 /// within cairn-db; cairn-core re-exports this exact alias at `crate::db::TeamId`.
 pub type TeamId = String;
 
-pub use blocking::run_db_blocking;
+pub use blocking::{panic_message, run_db_blocking};
 pub use error::{DbError, DbResult};
+pub use executor_desktop_automation::{
+    delete_executor_desktop_automation, get_executor_desktop_automation,
+    upsert_executor_desktop_automation, ExecutorDesktopAutomation,
+};
 pub use local_db::{
     db_set_paths, db_set_size, install_crypto_provider, move_db_set, LocalDb, RetryConfig,
 };
@@ -28,6 +36,14 @@ pub use migration::{
 pub use migrations::{
     Lineage, PrivateReason, RekeyTableManifest, ScopeTarget, TableScope, PROJECT_REKEY_MANIFEST,
     TABLE_SCOPES, TEAM_MIGRATIONS, TURSO_MIGRATIONS,
+};
+pub use response_invocations::{
+    count_response_invocations, get_response_invocation, insert_response_invocation,
+    list_response_invocations, NewResponseInvocation, ResponseInvocationRecord,
+};
+pub use route_firings::{
+    count_route_firings, firing_snapshot, get_route_firing, has_recent_fact, insert_route_firing,
+    list_route_firings, NewRouteFiring, RouteFiringRecord,
 };
 pub use row::{
     next_i64, next_opt_text, next_text, query_opt_i64_conn, query_opt_text_conn, query_text_conn,

@@ -46,6 +46,7 @@ pub(super) async fn dispatch(
                 }
                 None => None,
             };
+            let overrides = parse_launch_overrides(index, item, item.payload.as_ref())?;
             if dry_run {
                 format!(
                     "Would start an execution for {project}-{number}{}",
@@ -61,6 +62,7 @@ pub(super) async fn dispatch(
                     recipe,
                     backend,
                     branch_target,
+                    overrides,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?
@@ -105,4 +107,25 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+/// Parse the optional `overrides` object shared by both launch doors: an append
+/// to an issue's executions collection and the `execution` block on an
+/// issue-create. Every refusal the grammar can raise lands here, at write time,
+/// before an execution row exists — an override that cannot be honoured must not
+/// become a run the caller then has to stop.
+pub(super) fn parse_launch_overrides(
+    index: usize,
+    item: &ChangeItem,
+    payload: Option<&serde_json::Value>,
+) -> ResourceMutationResult<Option<crate::models::LaunchDeltas>> {
+    let Some(value) = payload
+        .and_then(|payload| payload.get("overrides"))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let deltas = crate::models::LaunchDeltas::parse(value)
+        .map_err(|error| build_failure(index, item, format!("payload.{error}")))?;
+    Ok((!deltas.is_empty()).then_some(deltas))
 }

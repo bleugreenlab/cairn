@@ -151,16 +151,13 @@ impl CairnCmd {
         }
 
         if let Some(suffix) = target.strip_prefix(CAIRN_HOME_PREFIX) {
-            let home_uri = self
-                .home_uri
-                .as_ref()
-                .map(|uri| uri.as_ref().clone())
-                .ok_or_else(|| {
-                    format!(
-                        "Cannot resolve home-relative Cairn URI without home_uri: {}",
-                        target
-                    )
-                })?;
+            let Some(home_uri) = self.home_uri.as_ref().map(|uri| uri.as_ref().clone()) else {
+                // The host is authoritative for home resolution and derives it
+                // from the authenticated run. Forwarding raw is also the pooled
+                // Codex behavior; it keeps a healthy run usable if an MCP client
+                // process was launched without the advisory CAIRN_HOME_URI env.
+                return Ok(ResolvedTarget::CairnUri(target.to_string()));
+            };
             let resolved = if suffix == "diff" {
                 Self::owning_node_diff_uri(&home_uri)
                     .unwrap_or_else(|| format!("{}/diff", home_uri.trim_end_matches('/')))
@@ -386,8 +383,10 @@ mod tests {
     fn test_resolve_home_shorthand_without_home_uri() {
         let mcp = create_test_mcp_with_home_uri(None);
 
-        let err = mcp.resolve_target("cairn:~/messages").unwrap_err();
-        assert!(err.contains("home_uri"));
+        assert_eq!(
+            mcp.resolve_target("cairn:~/messages"),
+            Ok(ResolvedTarget::CairnUri("cairn:~/messages".to_string()))
+        );
     }
 
     #[test]

@@ -28,8 +28,9 @@ fn emit_terminal_change(orch: &Orchestrator, action: &str) {
 }
 
 /// Durable running rows are attachable only while their session exists in this
-/// host. A new host starts with an empty PtyState, so fence the orphaned rows
-/// into recovery before any terminal query can advertise them.
+/// host. A new host starts with an empty PtyState, so settle runner-local orphans
+/// as exited and fence executor-backed orphans into recovery before any terminal
+/// query can advertise them.
 pub async fn prepare_terminal_recovery(orch: &Orchestrator) -> Result<u64, String> {
     let sessions: HashSet<String> = orch
         .pty_state
@@ -43,18 +44,36 @@ pub async fn prepare_terminal_recovery(orch: &Orchestrator) -> Result<u64, Strin
         let sessions = sessions.clone();
         Box::pin(async move {
             let mut rows = conn
-                .query("SELECT id, session_id FROM job_terminals WHERE status = 'running'", ())
+                .query(
+                    "SELECT id, session_id, residency_holder FROM job_terminals
+                     WHERE status IN ('running', 'recovering')",
+                    (),
+                )
                 .await?;
-            let mut orphaned = Vec::new();
+            let mut local_orphans = Vec::new();
+            let mut resident_orphans = Vec::new();
             while let Some(row) = rows.next().await? {
                 let id = row.text(0)?;
                 if !sessions.contains(&row.text(1)?) {
-                    orphaned.push(id);
+                    if row.opt_text(2)?.is_some() {
+                        resident_orphans.push(id);
+                    } else {
+                        local_orphans.push(id);
+                    }
                 }
             }
             drop(rows);
             let mut updated = 0;
-            for id in orphaned {
+            let now = chrono::Utc::now().timestamp();
+            for id in local_orphans {
+                updated += conn.execute(
+                    "UPDATE job_terminals
+                     SET status = 'exited', exited_at = COALESCE(exited_at, ?2)
+                     WHERE id = ?1 AND status IN ('running', 'recovering')",
+                    params![id.as_str(), now],
+                ).await?;
+            }
+            for id in resident_orphans {
                 updated += conn.execute(
                     "UPDATE job_terminals SET status = 'recovering' WHERE id = ?1 AND status = 'running'",
                     (id.as_str(),),
@@ -66,6 +85,7 @@ pub async fn prepare_terminal_recovery(orch: &Orchestrator) -> Result<u64, Strin
     if updated > 0 {
         emit_terminal_change(orch, "update");
     }
+    crate::mcp::handlers::terminal::reconcile_exited_terminal_wakes(orch).await?;
     Ok(updated)
 }
 
@@ -202,6 +222,7 @@ async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String
     }
     if changed > 0 {
         emit_terminal_change(orch, "update");
+        crate::mcp::handlers::terminal::reconcile_exited_terminal_wakes(orch).await?;
     }
     Ok(changed)
 }
@@ -246,6 +267,9 @@ mod tests {
                  INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p', 'w', 'P', 'P', '/tmp', 1, 1);
                  INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i', 'p', 1, 'I', 'active', 'active', 'none', 1, 1);
                  INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES('j', 'p', 'i', 'running', 'job-session', 1, 1);
+                 INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at) VALUES('t', 'p', 'thread-ux', 'active', 'none', 1, 1);
+                 INSERT INTO jobs(id, project_id, thread_id, status, uri_segment, node_name, created_at, updated_at) VALUES('t-job', 'p', 't', 'idle', 'thread', 'Thread', 1, 1);
+                 INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug) VALUES('thread-terminal', 't-job', 'thread-session', 'thread command', 'running', 10, 'thread-term');
                  INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug) VALUES('job-terminal', 'j', 'job-session', 'job command', 'running', 20, 'job');
                  INSERT INTO job_terminals(id, project_id, session_id, command, status, created_at, slug) VALUES('project-terminal', 'p', 'project-session', 'project command', 'running', 30, 'project');",
             )
@@ -406,13 +430,49 @@ mod tests {
 
         let terminals = get_running_terminals(&db).await.unwrap();
 
-        assert_eq!(terminals.len(), 2);
+        assert_eq!(terminals.len(), 3);
         assert_eq!(terminals[0].id, "project-terminal");
         assert_eq!(terminals[0].job_id, None);
         assert_eq!(terminals[0].created_at, 30);
         assert_eq!(terminals[1].id, "job-terminal");
         assert_eq!(terminals[1].job_id.as_deref(), Some("j"));
         assert_eq!(terminals[1].created_at, 20);
+        assert_eq!(terminals[2].id, "thread-terminal");
+        assert_eq!(terminals[2].created_at, 10);
+    }
+
+    /// This listing is what draws the facet strip, so a terminal missing from it
+    /// is a terminal the user cannot reach. A thread's job has no issue and no
+    /// execution, and joining them inwards dropped every thread-owned terminal:
+    /// the operator's thread terminal ran, accepted typing, and had no chip
+    /// (CAIRN-3841).
+    #[tokio::test]
+    async fn a_threads_running_terminal_is_listed_and_names_its_thread() {
+        let db = active_terminal_db().await;
+
+        let terminals = get_running_terminals(&db).await.unwrap();
+
+        let thread = terminals
+            .iter()
+            .find(|terminal| terminal.id == "thread-terminal")
+            .expect("a thread's running terminal belongs in the running listing");
+        assert_eq!(thread.job_id.as_deref(), Some("t-job"));
+        assert_eq!(thread.slug.as_deref(), Some("thread-term"));
+        assert_eq!(thread.project_key, "P");
+        assert_eq!(thread.project_id, "p");
+        // No issue coordinate to report, and the thread named instead of it.
+        assert_eq!(thread.issue_id, None);
+        assert_eq!(thread.issue_number, None);
+        assert_eq!(thread.exec_seq, None);
+        assert_eq!(thread.thread_name.as_deref(), Some("thread-ux"));
+
+        // An issue node's terminal keeps its own coordinate and claims no thread.
+        let node = terminals
+            .iter()
+            .find(|terminal| terminal.id == "job-terminal")
+            .expect("an issue node's terminal is still listed");
+        assert_eq!(node.issue_number, Some(1));
+        assert_eq!(node.thread_name, None);
     }
 }
 
@@ -646,6 +706,14 @@ pub struct ActiveTerminal {
     exec_seq: Option<i32>,
     project_key: String,
     created_at: i64,
+    /// The thread this terminal's job belongs to, when its owner is a thread
+    /// rather than an issue node. A thread has no issue, so `issue_number` is
+    /// then `None` and there is no issue coordinate to route or label by; this
+    /// names where the terminal lives instead. It takes precedence over the
+    /// other coordinates rather than being a fallback for their absence: a
+    /// thread's *task* runs in a synthetic delegation execution and so still
+    /// reports an `exec_seq`.
+    thread_name: Option<String>,
 }
 
 fn terminal_from_row(row: &cairn_db::turso::Row) -> DbResult<JobTerminal> {
@@ -1010,13 +1078,18 @@ pub async fn close_job_terminal(orch: &Orchestrator, terminal_id: String) -> Res
 pub async fn get_running_terminals(db: &DbState) -> Result<Vec<ActiveTerminal>, String> {
     db.local.read(|conn| Box::pin(async move {
         let mut all = Vec::new();
-        let mut rows = conn.query("SELECT jt.id, jt.session_id, jt.command, jt.job_id, j.issue_id, i.number, i.project_id, jt.slug, j.node_name, e.seq, p.key, jt.created_at FROM job_terminals jt JOIN jobs j ON j.id = jt.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id LEFT JOIN executions e ON e.id = j.execution_id WHERE jt.status = 'running' AND jt.job_id IS NOT NULL ORDER BY jt.created_at DESC", ()).await?;
+        // Owner-aware in the same shape as `home_uri_for_job_conn`: a thread's
+        // job has no issue and no execution, so joining them inwards silently
+        // dropped every thread-owned terminal from this listing. That listing is
+        // what draws the facet strip, so a thread terminal ran with no chip to
+        // reach it by (CAIRN-3841).
+        let mut rows = conn.query("SELECT jt.id, jt.session_id, jt.command, jt.job_id, j.issue_id, i.number, COALESCE(i.project_id, j.project_id), jt.slug, j.node_name, e.seq, p.key, jt.created_at, t.name FROM job_terminals jt JOIN jobs j ON j.id = jt.job_id LEFT JOIN issues i ON i.id = j.issue_id LEFT JOIN jobs parent ON parent.id = j.parent_job_id LEFT JOIN threads t ON t.id = COALESCE(j.thread_id, parent.thread_id) JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id) LEFT JOIN executions e ON e.id = j.execution_id WHERE jt.status = 'running' AND jt.job_id IS NOT NULL ORDER BY jt.created_at DESC", ()).await?;
         while let Some(row) = rows.next().await? {
-            all.push((row.i64(11)?, ActiveTerminal { id: row.text(0)?, session_id: row.text(1)?, command: row.text(2)?, job_id: row.opt_text(3)?, issue_id: row.opt_text(4)?, issue_number: row.opt_i64(5)?.map(|v| v as i32), project_id: row.text(6)?, slug: row.opt_text(7)?, node_name: row.opt_text(8)?, exec_seq: row.opt_i64(9)?.map(|v| v as i32), project_key: row.text(10)?, created_at: row.i64(11)? }));
+            all.push((row.i64(11)?, ActiveTerminal { id: row.text(0)?, session_id: row.text(1)?, command: row.text(2)?, job_id: row.opt_text(3)?, issue_id: row.opt_text(4)?, issue_number: row.opt_i64(5)?.map(|v| v as i32), project_id: row.text(6)?, slug: row.opt_text(7)?, node_name: row.opt_text(8)?, exec_seq: row.opt_i64(9)?.map(|v| v as i32), project_key: row.text(10)?, created_at: row.i64(11)?, thread_name: row.opt_text(12)? }));
         }
         let mut rows = conn.query("SELECT jt.id, jt.session_id, jt.command, p.id, p.key, jt.slug, jt.created_at FROM job_terminals jt JOIN projects p ON p.id = jt.project_id WHERE jt.status = 'running' AND jt.project_id IS NOT NULL AND jt.job_id IS NULL ORDER BY jt.created_at DESC", ()).await?;
         while let Some(row) = rows.next().await? {
-            all.push((row.i64(6)?, ActiveTerminal { id: row.text(0)?, session_id: row.text(1)?, command: row.text(2)?, job_id: None, issue_id: None, issue_number: None, project_id: row.text(3)?, slug: row.opt_text(5)?, node_name: None, exec_seq: None, project_key: row.text(4)?, created_at: row.i64(6)? }));
+            all.push((row.i64(6)?, ActiveTerminal { id: row.text(0)?, session_id: row.text(1)?, command: row.text(2)?, job_id: None, issue_id: None, issue_number: None, project_id: row.text(3)?, slug: row.opt_text(5)?, node_name: None, exec_seq: None, project_key: row.text(4)?, created_at: row.i64(6)?, thread_name: None }));
         }
         all.sort_by_key(|(created_at, _)| std::cmp::Reverse(*created_at));
         Ok(all.into_iter().map(|(_, terminal)| terminal).collect())

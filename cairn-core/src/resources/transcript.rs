@@ -720,9 +720,25 @@ fn figure_for_tool_io(tool_name: Option<&str>, text: &str) -> Option<String> {
 pub(super) struct DigestMeta<'a> {
     pub label: &'a str,
     pub project: &'a str,
-    pub number: i32,
-    pub exec_seq: i32,
+    pub coordinate: DigestCoordinate<'a>,
     pub status: &'a str,
+}
+
+/// How a transcript header names the work it belongs to.
+///
+/// The coordinate is the reader's way back to the surrounding work, so it has
+/// to be an address they can actually follow. Threads have no issue number or
+/// execution seq; rendering them through the issue shape produced the literal
+/// `CAIRN-0/0`, which names nothing and reads as a real coordinate.
+#[derive(Clone, Copy)]
+pub(super) enum DigestCoordinate<'a> {
+    /// An issue node or one of its tasks: `CAIRN-3744/2`.
+    Issue { number: i32, exec_seq: i32 },
+    /// A thread session or one of its tasks: `CAIRN/thread-ux`.
+    Thread { name: &'a str },
+    /// No addressable coordinate. The cold-resume seed holds only the job, and
+    /// its header is explicitly cosmetic.
+    Unaddressed,
 }
 
 /// A tool result keyed by toolUseId, used to attach metrics/errors to buffered
@@ -1544,12 +1560,17 @@ pub(super) fn format_transcript_digest_with(
         .map(|date| date.format("%Y-%m-%d").to_string())
         .unwrap_or_default();
 
+    let coordinate = match meta.coordinate {
+        DigestCoordinate::Issue { number, exec_seq } => {
+            format!(" — {}-{}/{}", meta.project, number, exec_seq)
+        }
+        DigestCoordinate::Thread { name } => format!(" — {}/{}", meta.project, name),
+        DigestCoordinate::Unaddressed => String::new(),
+    };
     let mut out = format!(
-        "# {} — {}-{}/{} · {} run{} · {} turn{} · {} event{} · {} · {}\n",
+        "# {}{} · {} run{} · {} turn{} · {} event{} · {} · {}\n",
         meta.label,
-        meta.project,
-        meta.number,
-        meta.exec_seq,
+        coordinate,
         run_count,
         plural(run_count),
         blocks.len(),
@@ -2225,8 +2246,10 @@ mod tests {
         DigestMeta {
             label: "builder",
             project: "CAIRN",
-            number: 1666,
-            exec_seq: 1,
+            coordinate: DigestCoordinate::Issue {
+                number: 1666,
+                exec_seq: 1,
+            },
             status: "complete",
         }
     }

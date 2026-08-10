@@ -9,17 +9,20 @@ mod hash;
 mod labels;
 mod mcp;
 mod memories;
+pub mod packs;
 mod projects;
 mod recipes;
+mod responses;
+mod routes;
 mod settings;
 mod skills;
 
 pub(crate) use blocking::{blocking_append_kind, run_blocking_group, validate_blocking_group};
 pub(crate) use dispatch::dispatch_resource_change;
 pub(crate) use hash::hash_resource_target;
-pub(crate) use mcp::is_workspace_mcp_mutation;
+pub(crate) use mcp::workspace_mcp_authority;
 pub(crate) use projects::project_write_crossing_path;
-pub(crate) use settings::is_workspace_settings_mutation;
+pub(crate) use settings::workspace_settings_authority;
 
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
@@ -172,10 +175,22 @@ pub(super) async fn target_resource_for_request(
 ) -> Result<CairnResource, String> {
     let target =
         super::common::resolve_home_relative_resource_uri(&orch.db, request, &item.target).await?;
-    parse_uri(&target).ok_or_else(|| {
+    let routed = match target
+        .strip_prefix("cairn://p/")
+        .and_then(|rest| rest.split('/').next())
+    {
+        Some(project) => orch.db.for_project(project).await,
+        None => orch.db.local.clone(),
+    };
+    let target = match super::threads::resolve_migrated_thread_uri(&routed, &target).await? {
+        Some((resolved, _)) => resolved,
+        None => target,
+    };
+    let resource = parse_uri(&target).ok_or_else(|| {
         crate::mcp::handlers::resources::task_terminal_hint(&target)
             .unwrap_or_else(|| format!("Unrecognized URI format: {}", item.target))
-    })
+    })?;
+    super::delegate_thread_descendant(resource)
 }
 
 #[cfg(test)]

@@ -32,7 +32,7 @@ async fn resolve_target_memory_id(
     target: &MemoryResourceTarget<'_>,
 ) -> Result<String, String> {
     crate::memories::db::resolve_node_memory_id(
-        &orch.db.local,
+        orch.db.for_project(target.project).await.as_ref(),
         target.project,
         target.number,
         target.exec_seq,
@@ -160,7 +160,7 @@ pub(super) async fn apply_node_memory_append(
         .map_err(|e| format!("payload.scope: {e}"))?;
 
     let target_job_id = crate::resources::node::resolve_node_or_task_job_id(
-        &orch.db.local,
+        orch.db.for_project(target.project).await.as_ref(),
         target.project,
         target.number,
         target.exec_seq,
@@ -168,8 +168,9 @@ pub(super) async fn apply_node_memory_append(
         None,
     )
     .await?;
-    let target_project_id = run_context::project_id_by_key(&orch.db.local, target.project).await?;
-    let node_seq = crate::memories::db::next_node_memory_seq(&orch.db.local, &target_job_id)
+    let target_db = orch.db.for_project(target.project).await;
+    let target_project_id = run_context::project_id_by_key(&target_db, target.project).await?;
+    let node_seq = crate::memories::db::next_node_memory_seq(&target_db, &target_job_id)
         .await
         .map_err(|e| e.to_string())?;
     let scope_value = match scope {
@@ -179,7 +180,7 @@ pub(super) async fn apply_node_memory_append(
         // (e.g. `agent-1`), which is only a layout label. Fall back to the node
         // id when the job carries no agent config id.
         crate::models::MemoryScope::Role => {
-            crate::memories::db::role_for_job(&orch.db.local, &target_job_id)
+            crate::memories::db::role_for_job(&target_db, &target_job_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .unwrap_or_else(|| target.node_id.to_string())
@@ -195,7 +196,7 @@ pub(super) async fn apply_node_memory_append(
     };
     let provenance_uri = appending_turn_uri(orch, request).await?;
     let memory = crate::memories::commands::create(
-        &orch.db.local,
+        &target_db,
         crate::models::CreateMemory {
             name,
             content,
@@ -242,7 +243,11 @@ pub(super) async fn apply_node_memory_patch(
         status,
     };
 
-    let memory = crate::memories::commands::update(&orch.db.local, input).await?;
+    let memory = crate::memories::commands::update(
+        orch.db.for_project(target.project).await.as_ref(),
+        input,
+    )
+    .await?;
     let memory_uri = build_node_memory_uri(
         target.project,
         target.number,
@@ -259,9 +264,12 @@ pub(super) async fn apply_node_memory_delete(
     target: MemoryResourceTarget<'_>,
 ) -> Result<String, String> {
     let memory_id = resolve_target_memory_id(orch, &target).await?;
-    crate::memories::db::delete_memory(&orch.db.local, &memory_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    crate::memories::db::delete_memory(
+        orch.db.for_project(target.project).await.as_ref(),
+        &memory_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let memory_uri = build_node_memory_uri(
         target.project,
         target.number,
@@ -285,7 +293,8 @@ pub(super) async fn apply_memory_triage_action(
     let reason = super::payload_trimmed_non_empty_str(payload, "reason", &[])
         .ok_or("payload.reason is required and must be a non-empty string")?;
 
-    let memory = crate::memories::db::load_memory(&orch.db.local, &memory_id)
+    let target_db = orch.db.for_project(target.project).await;
+    let memory = crate::memories::db::load_memory(&target_db, &memory_id)
         .await
         .map_err(|e| e.to_string())?;
     if memory.status != MemoryStatus::Claimed {
@@ -296,13 +305,13 @@ pub(super) async fn apply_memory_triage_action(
     }
 
     let (deferred_scope, deferred_scope_value) = if decision == MemoryTriageDecision::Defer {
-        parse_deferred_scope(&orch.db.local, payload).await?
+        parse_deferred_scope(&target_db, payload).await?
     } else {
         (None, None)
     };
 
     crate::memories::db::record_triage_decision(
-        &orch.db.local,
+        &target_db,
         &memory_id,
         decision.clone(),
         reason,

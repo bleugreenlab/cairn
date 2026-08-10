@@ -486,8 +486,8 @@ pub(super) async fn prepare_session(
                 let backend = job
                     .model
                     .as_deref()
-                    .and_then(crate::backends::backend_for_model)
-                    .unwrap_or("claude")
+                    .map(crate::backends::resolved_backend_for_model)
+                    .unwrap_or(crate::backends::CLAUDE_FAMILY_BACKEND)
                     .to_string();
                 let session_id = if let Some(sid) = job.current_session_id.as_deref() {
                     sid.to_string()
@@ -729,6 +729,15 @@ pub(crate) async fn insert_child_job_session_run(
                 }
             };
 
+            // A call spawned by a thread's session belongs to that thread, the
+            // same way a delegated task does: `list_jobs_for_thread` is keyed on
+            // this column alone, so without it the call is unlistable and
+            // unopenable in the thread's pane.
+            let thread_id = match input.parent_job_id.as_deref() {
+                Some(parent) => crate::threads::inherited_thread_id_conn(conn, parent).await?,
+                None => None,
+            };
+
             conn.execute(
                 "INSERT INTO jobs(
                     id, execution_id, recipe_node_id, parent_job_id,
@@ -736,7 +745,7 @@ pub(crate) async fn insert_child_job_session_run(
                     status, agent_config_id, issue_id, project_id, task_description,
                     created_at, updated_at, completed_at, parent_tool_use_id, task_index,
                     started_at, model, node_name, base_branch, current_turn_id, uri_segment,
-                    pack_anchor, output_contract
+                    pack_anchor, output_contract, thread_id
                 )
                 VALUES (
                     ?1, ?2, NULL, ?3,
@@ -744,7 +753,7 @@ pub(crate) async fn insert_child_job_session_run(
                     'running', ?7, ?8, ?9, ?10,
                     ?11, ?11, NULL, ?12, ?13,
                     ?11, ?14, NULL, NULL, NULL, ?15,
-                    ?16, ?17
+                    ?16, ?17, ?18
                 )",
                 params![
                     input.job_id.as_str(),
@@ -764,6 +773,7 @@ pub(crate) async fn insert_child_job_session_run(
                     uri_segment.as_str(),
                     pack_anchor.as_deref(),
                     input.output_contract.as_deref(),
+                    thread_id.as_deref(),
                 ],
             )
             .await
@@ -777,8 +787,8 @@ pub(crate) async fn insert_child_job_session_run(
             let session_backend = input
                 .model
                 .as_deref()
-                .and_then(crate::backends::backend_for_model)
-                .unwrap_or("claude");
+                .map(crate::backends::resolved_backend_for_model)
+                .unwrap_or(crate::backends::CLAUDE_FAMILY_BACKEND);
             insert_session_conn(
                 conn,
                 &input.session_id,
@@ -1073,11 +1083,11 @@ mod pack_anchor_tests {
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
              VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
-            INSERT INTO issues (id, project_id, number, title, status, kind, created_at, updated_at)
-             VALUES ('thread', 'proj', 1, 'Thread', 'active', 'thread', 1, 1);
-            INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
+            INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('thread', 'proj', 'thread', 'active', 'none', 1, 1);
+            INSERT INTO issues (id, project_id, number, title, status, parent_thread_id, created_at, updated_at)
              VALUES ('child', 'proj', 2, 'Child', 'active', 'thread', 1, 1);
-            INSERT INTO jobs (id, project_id, issue_id, status, branch, created_at, updated_at)
+            INSERT INTO jobs (id, project_id, thread_id, status, branch, created_at, updated_at)
              VALUES ('job-thread', 'proj', 'thread', 'running', 'agent/thread-int', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, base_branch, created_at, updated_at)
              VALUES ('job-child', 'proj', 'child', 'pending', 'main', 1, 1);

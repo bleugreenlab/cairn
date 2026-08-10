@@ -1,81 +1,34 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::security::sanitize::{truncate_string, truncate_utf8};
+use crate::security::{RedactionPolicy, Sanitizer};
 
 const MAX_RECORDS_PER_BROWSER: usize = 500;
 const MAX_BYTES_PER_BROWSER: usize = 8 * 1024 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
-const MAX_CAPTURE_PAYLOAD_BYTES: usize = 256 * 1024;
-const REDACTED: &str = "[REDACTED]";
+/// Bound on a captured error string, applied after sanitization.
+const MAX_ERROR_CHARS: usize = 4096;
+/// Bound on a captured initiator stack, applied after sanitization.
+const MAX_STACK_CHARS: usize = 8192;
+/// Ceiling on ONE capture, applied at both ends of the pipeline: the webview
+/// plugin refuses a larger payload from the page, and the archive refuses one
+/// that reaches it anyway. Batching does not relax it — it is per capture, not
+/// per invoke.
+pub const MAX_CAPTURE_PAYLOAD_BYTES: usize = 256 * 1024;
 
-const BUILTIN_SENSITIVE_NAMES: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-    "api-key",
-    "apikey",
-    "api_key",
-    "x-api-key",
-    "password",
-    "passwd",
-    "secret",
-    "client-secret",
-    "client_secret",
-    "session",
-    "session-id",
-    "session_id",
-    "access-token",
-    "access_token",
-    "refresh-token",
-    "refresh_token",
-    "id-token",
-    "id_token",
-    "token",
-];
-
-#[derive(Debug, Clone)]
-pub struct RedactionPolicy {
-    sensitive_names: HashSet<String>,
-}
-
-impl Default for RedactionPolicy {
-    fn default() -> Self {
-        Self::new(std::iter::empty())
-    }
-}
-
-impl RedactionPolicy {
-    pub fn new(extra_names: impl IntoIterator<Item = String>) -> Self {
-        let mut sensitive_names = BUILTIN_SENSITIVE_NAMES
-            .iter()
-            .map(|name| normalize_name(name))
-            .collect::<HashSet<_>>();
-        sensitive_names.extend(extra_names.into_iter().map(|name| normalize_name(&name)));
-        Self { sensitive_names }
-    }
-
-    fn is_sensitive(&self, name: &str) -> bool {
-        let normalized = normalize_name(name);
-        self.sensitive_names.contains(&normalized)
-            || normalized.ends_with("token")
-            || normalized.ends_with("secret")
-            || normalized.ends_with("password")
-            || normalized.ends_with("sessionid")
-            || normalized.ends_with("apikey")
-    }
-}
-
-fn normalize_name(name: &str) -> String {
-    name.chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
+/// Captures one `submit_browser_network_capture` invoke may carry.
+///
+/// A busy page emits network events continuously, and one invoke per event made
+/// this the largest blocking-command consumer in the runner (CAIRN-3787). The
+/// webview plugin therefore coalesces a page's events and flushes them as one
+/// batch; this bound governs both ends of that pipeline — the plugin cuts a
+/// batch here, and the runner rejects anything larger as a protocol error.
+pub const MAX_CAPTURES_PER_BATCH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -476,100 +429,55 @@ fn is_valid_request_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
 }
 
+/// Sanitize one captured request/response against the shared structural policy.
+///
+/// Captured page traffic is untrusted third-party data, so this is the one
+/// caller that runs the sanitizer in `ExactAndStructural` mode: over-redacting
+/// a header here costs nothing, while under-redacting hands a page's bearer
+/// token to whoever reads the archive.
 fn sanitize_record(record: &mut BrowserNetworkRecord, policy: &RedactionPolicy) {
+    let mut sanitizer = Sanitizer::structural(policy);
     record.method = record
         .method
         .chars()
         .take(32)
         .collect::<String>()
         .to_uppercase();
-    record.url = sanitize_url(&record.url, policy);
-    record.request_headers = sanitize_headers(&record.request_headers, policy);
-    record.response_headers = sanitize_headers(&record.response_headers, policy);
-    sanitize_body(&mut record.request_body, policy);
-    sanitize_body(&mut record.response_body, policy);
+    record.url = sanitizer.url(&record.url);
+    record.request_headers = sanitizer.headers(&record.request_headers);
+    record.response_headers = sanitizer.headers(&record.response_headers);
+    sanitize_body(&mut record.request_body, policy, &mut sanitizer);
+    sanitize_body(&mut record.response_body, policy, &mut sanitizer);
     if let Some(error) = &mut record.error {
-        *error = redact_unstructured(error);
-        truncate_string(error, 4096);
+        sanitizer.text_in_place(error);
+        truncate_string(error, MAX_ERROR_CHARS);
     }
     if let Some(url) = &mut record.redirect.final_url {
-        *url = sanitize_url(url, policy);
+        *url = sanitizer.url(url);
     }
     if let Some(url) = &mut record.initiator.document_url {
-        *url = sanitize_url(url, policy);
+        *url = sanitizer.url(url);
     }
     if let Some(stack) = &mut record.initiator.stack {
-        *stack = redact_unstructured(stack);
-        truncate_string(stack, 8192);
+        sanitizer.text_in_place(stack);
+        truncate_string(stack, MAX_STACK_CHARS);
     }
 }
 
-fn sanitize_url(raw: &str, policy: &RedactionPolicy) -> String {
-    let Ok(mut url) = reqwest::Url::parse(raw) else {
-        return redact_unstructured(raw);
-    };
-    if !url.username().is_empty() {
-        let _ = url.set_username(REDACTED);
-    }
-    if url.password().is_some() {
-        let _ = url.set_password(Some(REDACTED));
-    }
-    // URL fragments are client-only and frequently contain OAuth credentials.
-    // They are not required to identify the network request, so omit them.
-    url.set_fragment(None);
-    let pairs = url
-        .query_pairs()
-        .map(|(name, value)| {
-            let value = if policy.is_sensitive(&name) {
-                REDACTED.to_string()
-            } else {
-                redact_unstructured(&value)
-            };
-            (name.into_owned(), value)
-        })
-        .collect::<Vec<_>>();
-    url.set_query(None);
-    if !pairs.is_empty() {
-        url.query_pairs_mut().extend_pairs(pairs);
-    }
-    url.to_string()
-}
-
-fn sanitize_headers(
-    headers: &[(String, String)],
-    policy: &RedactionPolicy,
-) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .take(128)
-        .map(|(name, value)| {
-            let clean_name = name.chars().take(256).collect::<String>();
-            let clean_value = if policy.is_sensitive(name) {
-                REDACTED.to_string()
-            } else {
-                let mut value = redact_unstructured(value);
-                truncate_string(&mut value, 8192);
-                value
-            };
-            (clean_name, clean_value)
-        })
-        .collect()
-}
-
-fn sanitize_body(body: &mut CapturedBody, policy: &RedactionPolicy) {
+fn sanitize_body(body: &mut CapturedBody, policy: &RedactionPolicy, sanitizer: &mut Sanitizer<'_>) {
     match body {
-        CapturedBody::Json { value, .. } => redact_json(value, policy),
-        CapturedBody::Text { text, .. } => *text = redact_unstructured(text),
+        CapturedBody::Json { value, .. } => sanitizer.json(value),
+        CapturedBody::Text { text, .. } => sanitizer.text_in_place(text),
         CapturedBody::Form { fields, .. } => {
             fields.truncate(256);
             for field in fields {
                 field.name = field.name.chars().take(256).collect();
                 if let Some(value) = &mut field.value {
-                    *value = if policy.is_sensitive(&field.name) {
-                        REDACTED.to_string()
+                    if policy.is_sensitive(&field.name) {
+                        *value = crate::security::REDACTED.to_string();
                     } else {
-                        redact_unstructured(value)
-                    };
+                        sanitizer.text_in_place(value);
+                    }
                 }
                 if let Some(file) = &mut field.file {
                     file.name = file.name.chars().take(512).collect();
@@ -589,41 +497,12 @@ fn sanitize_body(body: &mut CapturedBody, policy: &RedactionPolicy) {
             reason: description,
         } => {
             if let Some(description) = description {
-                *description = redact_unstructured(description);
+                sanitizer.text_in_place(description);
                 truncate_string(description, 1024);
             }
         }
         CapturedBody::CrossOriginOmitted => {}
     }
-}
-
-fn redact_json(value: &mut Value, policy: &RedactionPolicy) {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if policy.is_sensitive(key) {
-                    *value = Value::String(REDACTED.to_string());
-                } else {
-                    redact_json(value, policy);
-                }
-            }
-        }
-        Value::Array(values) => values
-            .iter_mut()
-            .for_each(|value| redact_json(value, policy)),
-        Value::String(text) => *text = redact_unstructured(text),
-        _ => {}
-    }
-}
-
-fn redact_unstructured(text: &str) -> String {
-    let bearer = Regex::new(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}").expect("valid regex");
-    let jwt = Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
-        .expect("valid regex");
-    let assignment = Regex::new(r"(?i)\b(token|secret|password|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*[^\s,;&]+" ).expect("valid regex");
-    let text = bearer.replace_all(text, REDACTED);
-    let text = jwt.replace_all(&text, REDACTED);
-    assignment.replace_all(&text, REDACTED).into_owned()
 }
 
 fn bound_body(body: &mut CapturedBody, max_bytes: usize) {
@@ -681,23 +560,6 @@ fn bound_body(body: &mut CapturedBody, max_bytes: usize) {
     }
 }
 
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.truncate(end);
-}
-
-fn truncate_string(value: &mut String, max_chars: usize) {
-    if value.chars().count() > max_chars {
-        *value = value.chars().take(max_chars).collect();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,20 +611,6 @@ mod tests {
         let stored = archive.get("browser", "realm-1").unwrap();
         assert!(!serde_json::to_string(&stored).unwrap().contains("raw"));
         assert!(stored.url.contains("%5BREDACTED%5D"));
-    }
-
-    #[test]
-    fn strips_url_userinfo_and_fragments_at_the_host_boundary() {
-        let policy = RedactionPolicy::default();
-        let sanitized = sanitize_url(
-            "https://user:password@example.test/path?safe=yes#access_token=fragment-secret",
-            &policy,
-        );
-        assert!(!sanitized.contains("user"));
-        assert!(!sanitized.contains("password"));
-        assert!(!sanitized.contains("fragment-secret"));
-        assert!(!sanitized.contains('#'));
-        assert!(sanitized.contains("safe=yes"));
     }
 
     #[test]
